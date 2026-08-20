@@ -3353,6 +3353,18 @@ impl super::StorageCluster {
             .finish_bucket_delete_finalize_work(root);
     }
 
+    pub(crate) fn finish_bucket_delete_begin_work(&self, root: &BucketDeleteBeginRoot) {
+        self.local_map
+            .runtime_state()
+            .finish_bucket_delete_begin_work(root);
+    }
+
+    pub(crate) fn promote_bucket_delete_begin_to_finalize(&self, root: &BucketDeleteBeginRoot) {
+        self.local_map
+            .runtime_state()
+            .promote_bucket_delete_begin_to_finalize(root);
+    }
+
     pub(crate) fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
         if self.operation_epoch() != self.cluster_epoch() {
             return None;

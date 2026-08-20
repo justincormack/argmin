@@ -110,10 +110,41 @@ PGs to reclaim in parallel. Physical deletion remains idempotent because a
 worker can crash after deleting some shard files but before clearing reclaim
 metadata.
 
+Each frontend runs a bounded reclaim worker pool sized by both available CPU
+parallelism and the installed metadata-PG count. Process-local root ownership
+prevents duplicate queue hints from occupying multiple workers; durable claims
+remain the cross-process authority. The shared maintenance admission limit is
+at least the pool width, so adding workers increases actual cleanup throughput
+rather than only increasing threads waiting for one permit.
+
 Fresh process-local queue hints and eligible deferred retries receive fair
 worker admission. Sustained foreground cleanup hints must not starve a root
 that already made partial durable progress and entered its retry cooldown; the
 worker alternates between the two sources whenever both have runnable work.
+Bucket finalization distinguishes productive bounded scan continuation from a
+blocked retry. A clean frontier advance receives a small immediate burst so a
+bucket spanning a few scan windows completes without returning to the back of
+the global retry queue. Claim contention, visible data, outstanding reclaim,
+and transient failures retain cooldown and fair rotation.
+
+New `DeleteBucket` operations reserve finalizer capacity before installing the
+durable deleting state. The process rejects distinct new deletions with
+`SlowDown` when admitted plus outstanding finalizers reach a worker-scaled
+high-water mark. Exact retries for an already admitted bucket incarnation do
+not consume another slot. One per-root state tracks every in-flight retry and
+whether durable work remains outstanding, so finalization racing an exact retry
+cannot temporarily free and then overcommit capacity. Failed begin attempts
+release their reservation only after rollback is proven; retained durable
+attempts keep capacity while background begin recovery runs. Successful
+attempts atomically promote the root to queued finalization, and terminal
+cleanup releases capacity after the final in-flight retry exits. Durable state
+remains the recovery authority, so this backpressure is an admission bound
+rather than a correctness queue. Recovery-discovered begin roots consume the
+same capacity. The per-incarnation capacity record retains each exact begin
+execution generation: stale roots and cross-runtime duplicate hints retire only
+that exact begin, while a successful begin atomically promotes it to finalizer
+work. Only terminal finalization clears all remaining begin and finalizer state
+for the bucket incarnation.
 
 Terminal cleanup is retryable protocol state, not best-effort cleanup. If a
 reclaim or bucket-finalizer metadata command has already become terminal but

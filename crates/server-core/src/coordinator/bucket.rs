@@ -399,6 +399,14 @@ impl Coordinator {
                                 );
                                 continue;
                             }
+                            Ok(storage::BucketDeleteFinalizeOutcome::Continue) => {
+                                let _ = observability::event(
+                                    TRACE_TARGET,
+                                    "bucket_create_finalize_deleting_continue",
+                                    Some(format_args!("bucket={:?}", name)),
+                                );
+                                return Err(ServerError::BucketAlreadyExists);
+                            }
                             Ok(storage::BucketDeleteFinalizeOutcome::Pending) => {
                                 let _ = observability::event(
                                     TRACE_TARGET,
@@ -564,7 +572,6 @@ impl Coordinator {
             ),
         );
         self.remove_bucket_fast_path(&name);
-        route.enqueue_bucket_delete_finalize(bucket_incarnation_generation);
         let _ = observability::emit_flight_event(
             TRACE_TARGET,
             "bucket_delete_finalize_enqueued",

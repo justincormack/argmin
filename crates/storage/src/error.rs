@@ -2064,6 +2064,7 @@ impl OperationFailureDiagnosticCategory {
 pub(crate) enum BucketWriteDrainError {
     Store(StoreError),
     Metadata(MetadataError),
+    BucketDeleteFinalizeBackpressure,
 }
 
 impl BucketWriteDrainError {
@@ -2073,6 +2074,9 @@ impl BucketWriteDrainError {
         match self {
             Self::Store(error) => OperationFailureDiagnosticCategory::from_store(error),
             Self::Metadata(error) => OperationFailureDiagnosticCategory::from_metadata(error),
+            Self::BucketDeleteFinalizeBackpressure => OperationFailureDiagnosticCategory::Store(
+                StoreFailureDiagnosticCategory::ResourceExhausted,
+            ),
         }
         .cause_label()
     }
@@ -2294,6 +2298,11 @@ impl From<BucketWriteDrainError> for BucketWriteDrainFailure {
             BucketWriteDrainError::Metadata(error) => {
                 OperationFailureDiagnosticCategory::from_metadata(error)
             }
+            BucketWriteDrainError::BucketDeleteFinalizeBackpressure => {
+                OperationFailureDiagnosticCategory::Store(
+                    StoreFailureDiagnosticCategory::ResourceExhausted,
+                )
+            }
         };
         let kind = match error {
             BucketWriteDrainError::Store(error) => match error.operation_failure_class() {
@@ -2316,6 +2325,9 @@ impl From<BucketWriteDrainError> for BucketWriteDrainFailure {
                 BucketWriteDrainFailureKind::BucketNotFound { name }
             }
             BucketWriteDrainError::Metadata(_) => BucketWriteDrainFailureKind::InternalError,
+            BucketWriteDrainError::BucketDeleteFinalizeBackpressure => {
+                BucketWriteDrainFailureKind::SlowDown
+            }
         };
         Self {
             kind,
@@ -5337,6 +5349,11 @@ mod tests {
     #[test]
     fn bucket_write_drain_errors_convert_to_exhaustive_logical_failures() {
         let failure = |error| BucketWriteDrainFailure::from(error).into_kind();
+
+        assert_eq!(
+            failure(BucketWriteDrainError::BucketDeleteFinalizeBackpressure),
+            BucketWriteDrainFailureKind::SlowDown
+        );
 
         for class in [
             StoreOperationFailureClass::ResourceExhausted,

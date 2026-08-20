@@ -14,7 +14,7 @@ use crate::cluster::{
 use crate::{
     BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome, BucketDeleteFinalizeRoot, BucketName,
     BucketWriteDrainError, GenerationId, MetadataError, ObjectKey, ObjectPgActionError,
-    ReclaimWorkItem, StorageCluster, StoreError,
+    ProcessLocalRegistryKey, ReclaimWorkItem, StorageCluster, StoreError,
 };
 
 use super::{StorageMaintenanceAdmission, StorageMaintenanceStartError, TRACE_TARGET};
@@ -23,12 +23,26 @@ const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis
 const BUCKET_DELETE_BEGIN_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const BUCKET_DELETE_FINALIZE_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const BUCKET_DELETE_FINALIZE_ERROR_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
+const BUCKET_DELETE_FINALIZE_CONTINUATION_BURST: usize = 4;
 const RECLAIM_DURABLE_SCAN_BATCH_PGS: usize = 8;
 const RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
 const RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
 const RECLAIM_DURABLE_SCAN_INCOMPLETE_RETRY: Duration = Duration::from_secs(1);
+const RECLAIM_WORKER_MAX_PARALLELISM: usize = 8;
+const BUCKET_DELETE_FINALIZE_OUTSTANDING_PER_WORKER: usize = 128;
 
 type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
+
+pub(crate) fn reclaim_worker_parallelism(storage: &StorageCluster) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(RECLAIM_WORKER_MAX_PARALLELISM)
+        .min(storage.metadata_pg_ids().len().max(1))
+}
+
+pub(crate) fn bucket_delete_finalize_admission_capacity(storage: &StorageCluster) -> usize {
+    reclaim_worker_parallelism(storage) * BUCKET_DELETE_FINALIZE_OUTSTANDING_PER_WORKER
+}
 
 static RECLAIM_SWEEPER_REGISTRY: OnceLock<Mutex<Vec<Weak<StorageReclaimSweeper>>>> =
     OnceLock::new();
@@ -37,6 +51,7 @@ static RECLAIM_SWEEPER_REGISTRY: OnceLock<Mutex<Vec<Weak<StorageReclaimSweeper>>
 #[derive(Default, Clone)]
 pub struct StorageReclaimWorkerTestHooks {
     pub target_registry_key: Option<crate::ProcessLocalRegistryKey>,
+    pub worker_parallelism_override: Option<usize>,
     pub durable_scan_delay_override: Option<Duration>,
     pub after_idle_return: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_work_dequeued: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -91,6 +106,71 @@ fn reclaim_worker_test_hooks(
 struct DeferredReclaimWork<T> {
     queue_owner: Arc<StorageCluster>,
     root: T,
+}
+
+#[derive(Default)]
+struct ActiveReclaimRoots {
+    objects: HashMap<ObjectPayloadReclaimRoot, ProcessLocalRegistryKey>,
+    begins: HashMap<BucketDeleteBeginRoot, ProcessLocalRegistryKey>,
+    finalizers: HashMap<BucketDeleteFinalizeRoot, ProcessLocalRegistryKey>,
+}
+
+impl ActiveReclaimRoots {
+    fn try_acquire(
+        &mut self,
+        queue_owner: &StorageCluster,
+        work: &ReclaimWorkItem,
+    ) -> Result<(), ProcessLocalRegistryKey> {
+        let owner = queue_owner.process_local_registry_key();
+        let existing = match work {
+            ReclaimWorkItem::ObjectPayload(root) => self.objects.get(root).copied(),
+            ReclaimWorkItem::BucketDeleteBegin(root) => self.begins.get(root).copied(),
+            ReclaimWorkItem::BucketDelete(root) => self.finalizers.get(root).copied(),
+        };
+        if let Some(existing) = existing {
+            return Err(existing);
+        }
+        match work {
+            ReclaimWorkItem::ObjectPayload(root) => {
+                self.objects.insert(root.clone(), owner);
+            }
+            ReclaimWorkItem::BucketDeleteBegin(root) => {
+                self.begins.insert(root.clone(), owner);
+            }
+            ReclaimWorkItem::BucketDelete(root) => {
+                self.finalizers.insert(root.clone(), owner);
+            }
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, work: &ReclaimWorkItem) {
+        match work {
+            ReclaimWorkItem::ObjectPayload(root) => {
+                self.objects.remove(root);
+            }
+            ReclaimWorkItem::BucketDeleteBegin(root) => {
+                self.begins.remove(root);
+            }
+            ReclaimWorkItem::BucketDelete(root) => {
+                self.finalizers.remove(root);
+            }
+        }
+    }
+
+    fn exclusions(
+        &self,
+    ) -> (
+        HashSet<ObjectPayloadReclaimRoot>,
+        HashSet<BucketDeleteBeginRoot>,
+        HashSet<BucketDeleteFinalizeRoot>,
+    ) {
+        (
+            self.objects.keys().cloned().collect(),
+            self.begins.keys().cloned().collect(),
+            self.finalizers.keys().cloned().collect(),
+        )
+    }
 }
 
 struct DeferredReclaimQueues {
@@ -210,18 +290,20 @@ fn take_immediate_reclaim_work(
     object_retry_after: &HashMap<u32, Instant>,
     begin_retry_after: &HashMap<BucketDeleteBeginRoot, Instant>,
     finalize_retry_after: &HashMap<BucketDeleteFinalizeRoot, Instant>,
-) -> Option<(Arc<StorageCluster>, ReclaimWorkItem)> {
+) -> Option<(Arc<StorageCluster>, ReclaimWorkItem, bool)> {
     for source in [*next_source, (*next_source).next()] {
         let selected = match source {
             ImmediateReclaimSource::Queued => current
                 .try_take_reclaim_work()
-                .map(|work| (Arc::clone(current), work)),
-            ImmediateReclaimSource::Deferred => deferred.take(
-                current,
-                object_retry_after,
-                begin_retry_after,
-                finalize_retry_after,
-            ),
+                .map(|work| (Arc::clone(current), work, false)),
+            ImmediateReclaimSource::Deferred => deferred
+                .take(
+                    current,
+                    object_retry_after,
+                    begin_retry_after,
+                    finalize_retry_after,
+                )
+                .map(|(owner, work)| (owner, work, true)),
         };
         if selected.is_some() {
             *next_source = source.next();
@@ -229,6 +311,47 @@ fn take_immediate_reclaim_work(
         }
     }
     None
+}
+
+fn enqueue_durable_reclaim_work_with_active_exclusions_if_due(
+    storage_node: &Arc<StorageCluster>,
+    admission: &Arc<StorageMaintenanceAdmission>,
+    active_roots: &Mutex<ActiveReclaimRoots>,
+    schedule: &mut DurableReclaimScanSchedule,
+) {
+    let (objects, begins, finalizers) = active_roots
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .exclusions();
+    enqueue_durable_reclaim_work_if_due(
+        storage_node,
+        admission,
+        &objects,
+        &begins,
+        &finalizers,
+        schedule,
+    );
+}
+
+fn acknowledge_duplicate_reclaim_hint(
+    queue_owner: &StorageCluster,
+    work: &ReclaimWorkItem,
+    active_owner: ProcessLocalRegistryKey,
+) {
+    if queue_owner.process_local_registry_key() == active_owner {
+        return;
+    }
+    match work {
+        ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
+            queue_owner.finish_object_payload_reclaim_work(bucket, key, *generation_id);
+        }
+        ReclaimWorkItem::BucketDelete(root) => {
+            queue_owner.finish_bucket_delete_finalize_work(root);
+        }
+        ReclaimWorkItem::BucketDeleteBegin(root) => {
+            queue_owner.finish_bucket_delete_begin_work(root);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +569,7 @@ fn object_payload_reclaim_worker_should_defer(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketDeleteFinalizeWorkerDisposition {
     Finish,
+    Continue,
     RetryAfter(Duration),
 }
 
@@ -453,6 +577,7 @@ fn bucket_write_error_is_retryable(error: &BucketWriteDrainError) -> bool {
     match error {
         BucketWriteDrainError::Store(error) => store_error_is_retryable(error),
         BucketWriteDrainError::Metadata(error) => metadata_error_is_command_contention(error),
+        BucketWriteDrainError::BucketDeleteFinalizeBackpressure => true,
     }
 }
 
@@ -461,6 +586,9 @@ fn bucket_delete_finalize_worker_disposition(
 ) -> BucketDeleteFinalizeWorkerDisposition {
     match result {
         Ok(outcome) if outcome.is_terminal() => BucketDeleteFinalizeWorkerDisposition::Finish,
+        Ok(BucketDeleteFinalizeOutcome::Continue) => {
+            BucketDeleteFinalizeWorkerDisposition::Continue
+        }
         Ok(BucketDeleteFinalizeOutcome::Pending) => {
             BucketDeleteFinalizeWorkerDisposition::RetryAfter(BUCKET_DELETE_FINALIZE_RETRY_COOLDOWN)
         }
@@ -586,7 +714,7 @@ fn enqueue_durable_reclaim_work_if_due(
 pub struct StorageReclaimSweeper {
     storage_handle: StorageClusterRouteHandle,
     stop: Arc<AtomicBool>,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl StorageReclaimSweeper {
@@ -614,20 +742,59 @@ impl StorageReclaimSweeper {
     ) -> Result<Arc<Self>, StorageMaintenanceStartError> {
         let admission = StorageMaintenanceAdmission::acquire_shared(&storage_handle);
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
+        let worker_count = {
+            let default = reclaim_worker_parallelism(&storage_handle.current());
+            #[cfg(feature = "test-hooks")]
+            {
+                reclaim_worker_test_hooks(storage_handle.current().process_local_registry_key())
+                    .worker_parallelism_override
+                    .unwrap_or(default)
+                    .clamp(1, RECLAIM_WORKER_MAX_PARALLELISM)
+            }
+            #[cfg(not(feature = "test-hooks"))]
+            {
+                default
+            }
+        };
+        let active_roots = Arc::new(Mutex::new(ActiveReclaimRoots::default()));
         let sweeper = Arc::new(Self {
             storage_handle: storage_handle.clone(),
             stop,
-            handle: Mutex::new(None),
+            handles: Mutex::new(Vec::new()),
         });
-        let handle = std::thread::Builder::new()
-            .name("argmin-reclaim".to_string())
-            .spawn(move || run_reclaim_worker(storage_handle, admission, worker_stop))
-            .map_err(|error| StorageMaintenanceStartError::worker_spawn("reclaim", error))?;
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let worker_handle = storage_handle.clone();
+            let worker_admission = Arc::clone(&admission);
+            let worker_stop = Arc::clone(&sweeper.stop);
+            let worker_active_roots = Arc::clone(&active_roots);
+            let handle = match std::thread::Builder::new()
+                .name(format!("argmin-reclaim-{worker_index}"))
+                .spawn(move || {
+                    run_reclaim_worker(
+                        worker_handle,
+                        worker_admission,
+                        worker_stop,
+                        worker_active_roots,
+                        worker_index == 0,
+                    );
+                }) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    sweeper.stop.store(true, Ordering::SeqCst);
+                    storage_handle.current().wake_reclaim_workers();
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    return Err(StorageMaintenanceStartError::worker_spawn("reclaim", error));
+                }
+            };
+            handles.push(handle);
+        }
         *sweeper
-            .handle
+            .handles
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(handle);
+            .unwrap_or_else(|error| error.into_inner()) = handles;
         Ok(sweeper)
     }
 
@@ -636,7 +803,7 @@ impl StorageReclaimSweeper {
         Arc::new(Self {
             storage_handle,
             stop: Arc::new(AtomicBool::new(true)),
-            handle: Mutex::new(None),
+            handles: Mutex::new(Vec::new()),
         })
     }
 
@@ -652,12 +819,13 @@ impl StorageReclaimSweeper {
     pub(crate) fn test_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         self.storage_handle.current().wake_reclaim_workers();
-        if let Some(handle) = self
-            .handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
+        let handles = std::mem::take(
+            &mut *self
+                .handles
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for handle in handles {
             let _ = handle.join();
         }
     }
@@ -673,12 +841,13 @@ impl Drop for StorageReclaimSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.storage_handle.current().wake_reclaim_workers();
-        if let Some(handle) = self
-            .handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
+        let handles = std::mem::take(
+            &mut *self
+                .handles
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for handle in handles {
             let _ = handle.join();
         }
     }
@@ -688,6 +857,8 @@ fn run_reclaim_worker(
     storage_handle: StorageClusterRouteHandle,
     admission: Arc<StorageMaintenanceAdmission>,
     stop: Arc<AtomicBool>,
+    active_roots: Arc<Mutex<ActiveReclaimRoots>>,
+    scans_durable_roots: bool,
 ) {
     let mut object_retry_after: HashMap<u32, Instant> = HashMap::new();
     let mut begin_retry_after: HashMap<BucketDeleteBeginRoot, Instant> = HashMap::new();
@@ -695,19 +866,21 @@ fn run_reclaim_worker(
     let mut deferred = DeferredReclaimQueues::new();
     let mut next_immediate_source = ImmediateReclaimSource::Queued;
     let mut scan_schedule = DurableReclaimScanSchedule::immediate();
-    let mut pending_work: Option<(Arc<StorageCluster>, ReclaimWorkItem)> = None;
+    let mut pending_work: Option<(Arc<StorageCluster>, ReclaimWorkItem, bool)> = None;
+    let mut finalizer_continuation_bursts: HashMap<BucketDeleteFinalizeRoot, usize> =
+        HashMap::new();
 
     while !stop.load(Ordering::SeqCst) {
         let current = storage_handle.current();
-        enqueue_durable_reclaim_work_if_due(
-            &current,
-            &admission,
-            &deferred.object_roots,
-            &deferred.begin_roots,
-            &deferred.finalizer_roots,
-            &mut scan_schedule,
-        );
-        let Some((queue_owner, work)) = pending_work
+        if scans_durable_roots {
+            enqueue_durable_reclaim_work_with_active_exclusions_if_due(
+                &current,
+                &admission,
+                &active_roots,
+                &mut scan_schedule,
+            );
+        }
+        let Some((queue_owner, work, already_owned)) = pending_work
             .take()
             .or_else(|| {
                 take_immediate_reclaim_work(
@@ -720,15 +893,13 @@ fn run_reclaim_worker(
                 )
             })
             .or_else(|| {
-                if deferred.is_empty() {
+                if deferred.is_empty() || !scans_durable_roots {
                     return None;
                 }
-                enqueue_durable_reclaim_work_if_due(
+                enqueue_durable_reclaim_work_with_active_exclusions_if_due(
                     &current,
                     &admission,
-                    &deferred.object_roots,
-                    &deferred.begin_roots,
-                    &deferred.finalizer_roots,
+                    &active_roots,
                     &mut scan_schedule,
                 );
                 take_immediate_reclaim_work(
@@ -740,7 +911,10 @@ fn run_reclaim_worker(
                     &finalize_retry_after,
                 )
             })
-            .or_else(|| wait_for_runtime_map_reclaim_work(&storage_handle, &stop))
+            .or_else(|| {
+                wait_for_runtime_map_reclaim_work(&storage_handle, &stop)
+                    .map(|(owner, work)| (owner, work, false))
+            })
         else {
             #[cfg(feature = "test-hooks")]
             if !stop.load(Ordering::SeqCst) {
@@ -752,6 +926,18 @@ fn run_reclaim_worker(
             }
             continue;
         };
+
+        if !already_owned {
+            let acquisition = active_roots
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .try_acquire(&queue_owner, &work);
+            if let Err(active_owner) = acquisition {
+                acknowledge_duplicate_reclaim_hint(&queue_owner, &work, active_owner);
+                continue;
+            }
+        }
+        let owned_work = work.clone();
 
         #[cfg(feature = "test-hooks")]
         if let Some(hook) =
@@ -767,7 +953,7 @@ fn run_reclaim_worker(
             hook(Arc::clone(&execution_node));
         }
         let Some(_cleanup_permit) = admission.try_reclaim_cleanup() else {
-            pending_work = Some((queue_owner, work));
+            pending_work = Some((queue_owner, work, true));
             std::thread::sleep(OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN);
             continue;
         };
@@ -775,17 +961,6 @@ fn run_reclaim_worker(
         match work {
             ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
                 let root = (bucket, key, generation_id);
-                if deferred.object_roots.contains(&root) {
-                    if deferred
-                        .objects
-                        .iter()
-                        .find(|deferred| deferred.root == root)
-                        .is_some_and(|deferred| !Arc::ptr_eq(&deferred.queue_owner, &queue_owner))
-                    {
-                        queue_owner.finish_object_payload_reclaim_work(&root.0, &root.1, root.2);
-                    }
-                    continue;
-                }
                 let pg_id = execution_node.object_payload_reclaim_pg_id(&root.0, &root.1);
                 if object_retry_after
                     .get(&pg_id)
@@ -814,21 +989,14 @@ fn run_reclaim_worker(
                     } else {
                         queue_owner.finish_object_payload_reclaim_work(&root.0, &root.1, root.2);
                         object_retry_after.remove(&pg_id);
+                        active_roots
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .release(&owned_work);
                     }
                 }
             }
             ReclaimWorkItem::BucketDelete(root) => {
-                if deferred.finalizer_roots.contains(&root) {
-                    if deferred
-                        .finalizers
-                        .iter()
-                        .find(|deferred| deferred.root == root)
-                        .is_some_and(|deferred| !Arc::ptr_eq(&deferred.queue_owner, &queue_owner))
-                    {
-                        queue_owner.finish_bucket_delete_finalize_work(&root);
-                    }
-                    continue;
-                }
                 if finalize_retry_after
                     .get(&root)
                     .is_some_and(|retry_after| *retry_after > Instant::now())
@@ -850,6 +1018,7 @@ fn run_reclaim_worker(
                         BucketDeleteFinalizeWorkerDisposition::Finish => {
                             queue_owner.finish_bucket_delete_finalize_work(&root);
                             finalize_retry_after.remove(&root);
+                            finalizer_continuation_bursts.remove(&root);
                             begin_retry_after.retain(|begin, _| {
                                 begin.bucket() != &root.bucket
                                     || begin.bucket_incarnation_generation()
@@ -865,8 +1034,35 @@ fn run_reclaim_worker(
                                     || begin.bucket_incarnation_generation()
                                         != root.bucket_incarnation_generation
                             });
+                            active_roots
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .release(&owned_work);
+                        }
+                        BucketDeleteFinalizeWorkerDisposition::Continue => {
+                            finalize_retry_after.remove(&root);
+                            let burst = finalizer_continuation_bursts
+                                .entry(root.clone())
+                                .or_insert(0);
+                            *burst += 1;
+                            if *burst < BUCKET_DELETE_FINALIZE_CONTINUATION_BURST {
+                                pending_work = Some((
+                                    Arc::clone(&queue_owner),
+                                    ReclaimWorkItem::BucketDelete(root),
+                                    true,
+                                ));
+                            } else {
+                                *burst = 0;
+                                defer_bucket_delete_finalize(
+                                    &mut deferred.finalizers,
+                                    &mut deferred.finalizer_roots,
+                                    Arc::clone(&queue_owner),
+                                    root,
+                                );
+                            }
                         }
                         BucketDeleteFinalizeWorkerDisposition::RetryAfter(delay) => {
+                            finalizer_continuation_bursts.remove(&root);
                             finalize_retry_after.insert(root.clone(), Instant::now() + delay);
                             defer_bucket_delete_finalize(
                                 &mut deferred.finalizers,
@@ -879,9 +1075,6 @@ fn run_reclaim_worker(
                 }
             }
             ReclaimWorkItem::BucketDeleteBegin(root) => {
-                if deferred.begin_roots.contains(&root) {
-                    continue;
-                }
                 if begin_retry_after
                     .get(&root)
                     .is_some_and(|retry_after| *retry_after > Instant::now())
@@ -901,14 +1094,20 @@ fn run_reclaim_worker(
                     match result {
                         Ok(()) => {
                             begin_retry_after.remove(&root);
-                            queue_owner.enqueue_bucket_delete_finalize(BucketDeleteFinalizeRoot {
-                                bucket: root.bucket().clone(),
-                                bucket_incarnation_generation: root.bucket_incarnation_generation(),
-                            });
+                            queue_owner.promote_bucket_delete_begin_to_finalize(&root);
+                            active_roots
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .release(&owned_work);
                         }
                         Err(error) => {
                             if bucket_delete_begin_root_is_stale(&execution_node, &root) {
                                 begin_retry_after.remove(&root);
+                                queue_owner.finish_bucket_delete_begin_work(&root);
+                                active_roots
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .release(&owned_work);
                             } else if bucket_write_error_is_retryable(&error) {
                                 begin_retry_after.insert(
                                     root.clone(),
@@ -921,6 +1120,10 @@ fn run_reclaim_worker(
                                 );
                             } else {
                                 begin_retry_after.remove(&root);
+                                active_roots
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .release(&owned_work);
                             }
                         }
                     }
@@ -929,14 +1132,14 @@ fn run_reclaim_worker(
         }
 
         if pending_work.is_none() && !deferred.is_empty() {
-            enqueue_durable_reclaim_work_if_due(
-                &execution_node,
-                &admission,
-                &deferred.object_roots,
-                &deferred.begin_roots,
-                &deferred.finalizer_roots,
-                &mut scan_schedule,
-            );
+            if scans_durable_roots {
+                enqueue_durable_reclaim_work_with_active_exclusions_if_due(
+                    &execution_node,
+                    &admission,
+                    &active_roots,
+                    &mut scan_schedule,
+                );
+            }
             if let Some(work) = take_immediate_reclaim_work(
                 &execution_node,
                 &mut deferred,
@@ -1096,6 +1299,14 @@ mod tests {
                 BUCKET_DELETE_FINALIZE_ERROR_RETRY_COOLDOWN
             ),
             "an error after durable bucket deletion must remain retryable so a later terminal outcome can clear the exact outstanding root"
+        );
+    }
+
+    #[test]
+    fn bucket_delete_finalize_worker_continues_productive_scan_without_cooldown() {
+        assert_eq!(
+            bucket_delete_finalize_worker_disposition(&Ok(BucketDeleteFinalizeOutcome::Continue)),
+            BucketDeleteFinalizeWorkerDisposition::Continue
         );
     }
 

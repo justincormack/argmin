@@ -6549,6 +6549,59 @@ fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
 }
 
 #[test]
+fn reclaim_worker_pool_executes_distinct_roots_concurrently() {
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2, 3]);
+    let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+    initial
+        .test_seed_missing_bucket_finalize_work(&trusted_bucket_name("parallel-finalizer-first"))
+        .unwrap();
+    initial
+        .test_seed_missing_bucket_finalize_work(&trusted_bucket_name("parallel-finalizer-second"))
+        .unwrap();
+
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let release_rx_for_hook = Arc::clone(&release_rx);
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
+        reclaim_worker_parallelism_override: Some(2),
+        before_reclaim_work_execute: Some(Arc::new(move |_storage_cluster| {
+            arrived_tx.send(()).unwrap();
+            release_rx_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(TEST_EVENT_TIMEOUT)
+                .expect("test must release every concurrently admitted reclaim worker");
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+
+    arrived_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .expect("first reclaim worker must reach execution");
+    arrived_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .expect("a second reclaim worker must execute while the first remains blocked");
+    release_tx.send(()).unwrap();
+    release_tx.send(()).unwrap();
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    while initial.test_bucket_delete_finalize_outstanding_depth() != 0 && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(initial.test_bucket_delete_finalize_outstanding_depth(), 0);
+    drop(worker);
+}
+
+#[test]
 fn reclaim_worker_resamples_runtime_map_after_dequeue() {
     const TOKEN: DeterministicFaultToken =
         DeterministicFaultToken::new("reclaim-work-dequeued-before-route-execution");
@@ -7731,11 +7784,152 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
                 .unwrap(),
             "stale BucketDeleteBegin must not delete the recreated bucket"
         );
-        if Instant::now() >= deadline {
+        if expired.test_bucket_delete_finalize_outstanding_depth() == 0 {
             break;
         }
+        assert!(
+            Instant::now() < deadline,
+            "stale BucketDeleteBegin must release its finalizer admission capacity"
+        );
         thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(
+        expired.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "stale BucketDeleteBegin must not retain finalizer admission capacity"
+    );
+}
+
+#[test]
+fn reclaim_worker_drops_only_stale_begin_when_newer_same_incarnation_begin_is_queued() {
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("bucket-delete-begin-stale-same-incarnation");
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    let stale_subject = initial
+        .test_capture_bucket_delete_begin_subject(&bucket)
+        .unwrap();
+    direct_coord
+        .put_bucket_versioning(&PutBucketVersioningRequest {
+            bucket: bucket_request_with_expected_owner(bucket.as_str(), test_requester(), None),
+            state: BucketVersioningState::Enabled,
+        })
+        .unwrap();
+    let current_subject = initial
+        .test_seed_bucket_delete_attempt(
+            &bucket,
+            storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::test_support::TestBucketDeleteAttemptPhase::StreamCleanup,
+            "same-incarnation replacement begin".to_string(),
+        )
+        .unwrap();
+
+    initial.test_enqueue_bucket_delete_begin_subject(&stale_subject);
+    initial.test_enqueue_bucket_delete_begin_subject(&current_subject);
+    assert_eq!(
+        initial.test_bucket_delete_finalize_outstanding_depth(),
+        1,
+        "same-incarnation C1 and C2 must share one capacity slot"
+    );
+
+    let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+
+    wait_until_bucket_deleting_or_missing(
+        &initial,
+        &bucket,
+        "stale C1 cleanup erased the queued same-incarnation C2 delete",
+    );
+}
+
+#[test]
+fn duplicate_bucket_delete_begin_clears_replacement_queue_owner_capacity() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("duplicate-bucket-delete-begin-runtime-owner");
+
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("bucket-delete-begin-duplicate-runtime-owner");
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    let subject = initial
+        .test_capture_bucket_delete_begin_subject(&bucket)
+        .unwrap();
+
+    let expired = process_local_cluster_with_route_map_validity(
+        &initial,
+        RouteMapValidity::until_ms(1).unwrap(),
+    );
+    let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    assert_ne!(
+        expired.process_local_registry_key(),
+        replacement.process_local_registry_key(),
+        "runtime-map generations must own independent reclaim queues"
+    );
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&expired));
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let gate_for_hook = Arc::clone(&gate);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_hook = Arc::clone(&attempts);
+    let runtime_handle_for_hook = runtime_handle.clone();
+    let replacement_for_hook = Arc::clone(&replacement);
+    let duplicate_subject = subject.clone();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(expired.process_local_registry_key()),
+        before_reclaim_work_execute: Some(Arc::new(move |_execution_cluster| {
+            if attempts_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                runtime_handle_for_hook
+                    .install(Arc::clone(&replacement_for_hook))
+                    .unwrap();
+                replacement_for_hook.test_enqueue_bucket_delete_begin_subject(&duplicate_subject);
+                gate_for_hook.wait_at(TOKEN);
+            }
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let _worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&expired));
+    let _gate_release_guard = gate.release_on_drop();
+    expired.test_enqueue_bucket_delete_begin_subject(&subject);
+    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+    assert_eq!(
+        replacement.test_bucket_delete_finalize_outstanding_depth(),
+        1,
+        "the duplicate queue owner must account for its durable begin hint"
+    );
+    gate.release();
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    while replacement.test_bucket_delete_finalize_outstanding_depth() != 0
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        replacement.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "duplicate suppression must clear the duplicate queue owner's capacity"
+    );
+
+    wait_until_bucket_deleting_or_missing(
+        &initial,
+        &bucket,
+        "original BucketDeleteBegin did not recover after duplicate acknowledgement",
+    );
 }
 
 #[test]

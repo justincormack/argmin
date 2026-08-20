@@ -1039,6 +1039,7 @@ impl ReadRuntime {
             storage::BucketDeleteFinalizeOutcome::NotFound
             | storage::BucketDeleteFinalizeOutcome::NotDeleting
             | storage::BucketDeleteFinalizeOutcome::StaleIncarnation
+            | storage::BucketDeleteFinalizeOutcome::Continue
             | storage::BucketDeleteFinalizeOutcome::Pending
             | storage::BucketDeleteFinalizeOutcome::Finalized => Ok(()),
         }

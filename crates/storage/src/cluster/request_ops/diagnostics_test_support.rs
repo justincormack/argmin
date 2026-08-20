@@ -1476,6 +1476,7 @@ impl super::StorageCluster {
             }
             BucketDeleteFinalizeOutcome::NotDeleting
             | BucketDeleteFinalizeOutcome::StaleIncarnation
+            | BucketDeleteFinalizeOutcome::Continue
             | BucketDeleteFinalizeOutcome::Pending => {
                 unreachable!("test bucket metadata delete bypasses finalization checks")
             }

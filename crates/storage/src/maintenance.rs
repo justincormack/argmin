@@ -20,6 +20,7 @@ use crate::types::{
 use crate::{PgId, StorageNodeFailureClass, StoreError};
 
 mod reclaim;
+pub(crate) use reclaim::bucket_delete_finalize_admission_capacity;
 pub use reclaim::StorageReclaimSweeper;
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
@@ -47,7 +48,7 @@ const SHARD_BACKFILL_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
 const BACKGROUND_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 1;
 const BACKGROUND_ROUTINE_BACKFILL_LIMIT: usize = 1;
-const BACKGROUND_RECLAIM_CLEANUP_LIMIT: usize = 1;
+const BACKGROUND_RECLAIM_CLEANUP_LIMIT: usize = 8;
 const BACKGROUND_LIFECYCLE_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
 const BACKGROUND_ROUTINE_METADATA_CHECKPOINT_LIMIT: usize = 1;

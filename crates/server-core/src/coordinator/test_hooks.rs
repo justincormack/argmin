@@ -12,6 +12,7 @@ use super::Coordinator;
 pub(super) struct ReclamationTestHooks {
     pub(super) target: Option<(String, String)>,
     pub(super) target_reclaim_worker_registry_key: Option<ProcessLocalRegistryKey>,
+    pub(super) reclaim_worker_parallelism_override: Option<usize>,
     pub(super) probe_multipart_complete_auth_lookup: bool,
     pub(super) reclaim_worker_durable_scan_delay_override: Option<Duration>,
     pub(super) after_reclaim_worker_idle_return: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -241,6 +242,7 @@ pub(super) fn install_reclamation_test_hooks(
     let storage_reclaim_guard = storage::test_support::install_reclaim_worker_test_hooks(
         storage::test_support::StorageReclaimWorkerTestHooks {
             target_registry_key: hooks.target_reclaim_worker_registry_key,
+            worker_parallelism_override: hooks.reclaim_worker_parallelism_override.or(Some(1)),
             durable_scan_delay_override: hooks.reclaim_worker_durable_scan_delay_override,
             after_idle_return: hooks.after_reclaim_worker_idle_return.clone(),
             after_work_dequeued: hooks.after_reclaim_work_dequeued.clone(),

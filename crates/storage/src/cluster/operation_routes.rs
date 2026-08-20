@@ -1486,14 +1486,70 @@ impl ActiveBucketRoute<'_> {
         &self,
         bucket_identity: crate::cluster::BucketIdentityGenerations,
     ) -> Result<(), crate::BucketWriteDrainFailure> {
-        self.admission
+        self.begin_bucket_delete_if_current_with_finalize_capacity(
+            bucket_identity,
+            crate::maintenance::bucket_delete_finalize_admission_capacity(
+                &self.admission.cluster,
+            ),
+        )
+    }
+
+    fn begin_bucket_delete_if_current_with_finalize_capacity(
+        &self,
+        bucket_identity: crate::cluster::BucketIdentityGenerations,
+        finalize_capacity: usize,
+    ) -> Result<(), crate::BucketWriteDrainFailure> {
+        let root = crate::BucketDeleteFinalizeRoot {
+            bucket: self.bucket.clone(),
+            bucket_incarnation_generation: bucket_identity.bucket_incarnation_generation,
+        };
+        let runtime_state = self.admission.cluster.local_map.runtime_state();
+        let mut finalize_admission = Some(
+            runtime_state
+            .try_admit_bucket_delete_finalize(root, finalize_capacity)
+            .ok_or(crate::BucketWriteDrainError::BucketDeleteFinalizeBackpressure)
+            .map_err(crate::BucketWriteDrainFailure::from)?,
+        );
+        let result = self
+            .admission
             .cluster
             .begin_bucket_delete_if_current_with_route_validation(
                 self.mutation_effect_route(),
                 || self.admission.require_valid_now_raw(),
                 bucket_identity,
+                || {
+                    finalize_admission
+                        .take()
+                        .expect("bucket delete admission must be unresolved")
+                        .retain(crate::BucketDeleteBeginRoot {
+                            bucket: self.bucket.clone(),
+                            bucket_execution_generation: bucket_identity
+                                .bucket_execution_generation,
+                            bucket_incarnation_generation: bucket_identity
+                                .bucket_incarnation_generation,
+                        });
+                },
             )
-            .map_err(crate::BucketWriteDrainFailure::from)
+            .map_err(crate::BucketWriteDrainFailure::from);
+        if result.is_ok() {
+            finalize_admission
+                .take()
+                .expect("successful bucket delete admission must be unresolved")
+                .commit();
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_bucket_delete_with_finalize_capacity_for_test(
+        &self,
+        bucket_identity: crate::cluster::BucketIdentityGenerations,
+        finalize_capacity: usize,
+    ) -> Result<(), crate::BucketWriteDrainFailure> {
+        self.begin_bucket_delete_if_current_with_finalize_capacity(
+            bucket_identity,
+            finalize_capacity,
+        )
     }
 
     pub fn enqueue_bucket_delete_finalize(&self, bucket_incarnation_generation: u64) {

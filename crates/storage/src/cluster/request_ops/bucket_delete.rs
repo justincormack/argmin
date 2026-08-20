@@ -2453,6 +2453,7 @@ impl super::StorageCluster {
             },
             || Ok(()),
             bucket_identity,
+            || {},
         )
     }
 
@@ -2478,6 +2479,7 @@ impl super::StorageCluster {
                 bucket_execution_generation: root.bucket_execution_generation,
                 bucket_incarnation_generation: root.bucket_incarnation_generation,
             },
+            || {},
         )
     }
 
@@ -2486,6 +2488,7 @@ impl super::StorageCluster {
         route: super::BucketMetadataMutationEffectRoute<'_>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         expected_bucket_identity: BucketIdentityGenerations,
+        mut on_durable_attempt_retained: impl FnMut(),
     ) -> Result<(), BucketWriteDrainError> {
         let publisher = crate::metadata_command::metadata_command_publisher!(BeginBucketDelete);
         let super::BucketMetadataMutationEffectRoute {
@@ -2722,67 +2725,68 @@ impl super::StorageCluster {
         .for_pg(pg_id);
         let mut loop_iteration = 0u64;
         let mut attempt_phase = BucketDeleteAttemptPhase::Initial;
-        let mut can_resume_at_mark_deleting = self
-            .bucket_delete_matching_attempt_outcome(
-                node_store.bucket_write_reservation_client().as_ref(),
-                bucket_pg_id,
-                &durable_drain,
-            )?
-            .is_some_and(|record| {
-                record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
-                    && record.phase == BucketDeleteAttemptPhase::FinalVisibilityProven
-            });
-        let mut can_resume_at_final_visibility = self
-            .bucket_delete_matching_attempt_outcome(
-                node_store.bucket_write_reservation_client().as_ref(),
-                bucket_pg_id,
-                &durable_drain,
-            )?
-            .is_some_and(|record| {
-                record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
-                    && record.phase == BucketDeleteAttemptPhase::FinalVisibilityCheck
-            });
-        let mut can_resume_at_stream_cleanup = self
-            .bucket_delete_matching_attempt_outcome(
-                node_store.bucket_write_reservation_client().as_ref(),
-                bucket_pg_id,
-                &durable_drain,
-            )?
-            .is_some_and(|record| {
-                record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
-                    && record.phase == BucketDeleteAttemptPhase::StreamCleanup
-            });
-        let mut can_resume_at_reservation_wait = self
-            .bucket_delete_matching_attempt_outcome(
-                node_store.bucket_write_reservation_client().as_ref(),
-                bucket_pg_id,
-                &durable_drain,
-            )?
-            .is_some_and(|record| {
-                record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
-                    && record.phase == BucketDeleteAttemptPhase::ReservationWait
-            });
-        let mut can_resume_at_post_reservation_object_drain = self
-            .bucket_delete_matching_attempt_outcome(
-                node_store.bucket_write_reservation_client().as_ref(),
-                bucket_pg_id,
-                &durable_drain,
-            )?
-            .is_some_and(|record| {
-                record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
-                    && record.phase == BucketDeleteAttemptPhase::PostReservationObjectDrain
-            });
-        let mut can_resume_at_post_reservation_stream_cleanup = self
-            .bucket_delete_matching_attempt_outcome(
-                node_store.bucket_write_reservation_client().as_ref(),
-                bucket_pg_id,
-                &durable_drain,
-            )?
-            .is_some_and(|record| {
-                record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
-                    && record.phase == BucketDeleteAttemptPhase::PostReservationStreamCleanup
-            });
-        let result = (|| loop {
+        let result = (|| {
+            let mut can_resume_at_mark_deleting = self
+                .bucket_delete_matching_attempt_outcome(
+                    node_store.bucket_write_reservation_client().as_ref(),
+                    bucket_pg_id,
+                    &durable_drain,
+                )?
+                .is_some_and(|record| {
+                    record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                        && record.phase == BucketDeleteAttemptPhase::FinalVisibilityProven
+                });
+            let mut can_resume_at_final_visibility = self
+                .bucket_delete_matching_attempt_outcome(
+                    node_store.bucket_write_reservation_client().as_ref(),
+                    bucket_pg_id,
+                    &durable_drain,
+                )?
+                .is_some_and(|record| {
+                    record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                        && record.phase == BucketDeleteAttemptPhase::FinalVisibilityCheck
+                });
+            let mut can_resume_at_stream_cleanup = self
+                .bucket_delete_matching_attempt_outcome(
+                    node_store.bucket_write_reservation_client().as_ref(),
+                    bucket_pg_id,
+                    &durable_drain,
+                )?
+                .is_some_and(|record| {
+                    record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                        && record.phase == BucketDeleteAttemptPhase::StreamCleanup
+                });
+            let mut can_resume_at_reservation_wait = self
+                .bucket_delete_matching_attempt_outcome(
+                    node_store.bucket_write_reservation_client().as_ref(),
+                    bucket_pg_id,
+                    &durable_drain,
+                )?
+                .is_some_and(|record| {
+                    record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                        && record.phase == BucketDeleteAttemptPhase::ReservationWait
+                });
+            let mut can_resume_at_post_reservation_object_drain = self
+                .bucket_delete_matching_attempt_outcome(
+                    node_store.bucket_write_reservation_client().as_ref(),
+                    bucket_pg_id,
+                    &durable_drain,
+                )?
+                .is_some_and(|record| {
+                    record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                        && record.phase == BucketDeleteAttemptPhase::PostReservationObjectDrain
+                });
+            let mut can_resume_at_post_reservation_stream_cleanup = self
+                .bucket_delete_matching_attempt_outcome(
+                    node_store.bucket_write_reservation_client().as_ref(),
+                    bucket_pg_id,
+                    &durable_drain,
+                )?
+                .is_some_and(|record| {
+                    record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                        && record.phase == BucketDeleteAttemptPhase::PostReservationStreamCleanup
+                });
+            loop {
             loop_iteration += 1;
             attempt_phase = BucketDeleteAttemptPhase::Initial;
             require_valid_route()?;
@@ -3873,7 +3877,8 @@ impl super::StorageCluster {
                 }
             }
 
-            return Ok(());
+                return Ok(());
+            }
         })();
 
         match result {
@@ -3917,7 +3922,17 @@ impl super::StorageCluster {
                     ),
                 );
                 if Self::bucket_delete_begin_error_should_rollback_drain(&error, attempt_phase) {
-                    self.rollback_durable_bucket_delete_drain(&durable_drain)?;
+                    if let Err(rollback_error) =
+                        self.rollback_durable_bucket_delete_drain(&durable_drain)
+                    {
+                        self.enqueue_bucket_delete_begin(
+                            bucket,
+                            current_bucket_execution_generation,
+                            current_bucket_incarnation_generation,
+                        );
+                        on_durable_attempt_retained();
+                        return Err(rollback_error);
+                    }
                 } else if matches!(
                     error,
                     BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
@@ -4011,6 +4026,7 @@ impl super::StorageCluster {
                         current_bucket_execution_generation,
                         current_bucket_incarnation_generation,
                     );
+                    on_durable_attempt_retained();
                 } else {
                     if !reservation_wait_blocker_already_recorded {
                         self.record_bucket_delete_attempt_outcome_for_drain_with_client(
@@ -4034,6 +4050,7 @@ impl super::StorageCluster {
                         current_bucket_execution_generation,
                         current_bucket_incarnation_generation,
                     );
+                    on_durable_attempt_retained();
                 }
                 Err(error)
             }
@@ -4662,7 +4679,7 @@ impl super::StorageCluster {
             next_pg_id,
         )?;
         if window.next_pg_id.is_some() {
-            return Ok(BucketDeleteFinalizeOutcome::Pending);
+            return Ok(BucketDeleteFinalizeOutcome::Continue);
         }
 
         self.delete_bucket_from_acting_set(

@@ -4,7 +4,314 @@
 use super::*;
 use crate::metadata_command::DeleteFinalizedBucketCommand;
 use crate::test_support::StorageClusterLifecycleTestSupport as _;
-use crate::BucketAclSummary;
+use crate::{BucketAclSummary, BucketIdentityGenerations, BucketState};
+
+#[test]
+fn bucket_delete_finalize_admission_bounds_distinct_roots_and_allows_exact_retries() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+            &[0],
+            EcShape { k: 2, m: 1 },
+        )
+        .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let runtime = cluster.local_map.runtime_state();
+    let first = BucketDeleteFinalizeRoot {
+        bucket: crate::tests::bucket_name("delete-admission-first"),
+        bucket_incarnation_generation: 1,
+    };
+    let second = BucketDeleteFinalizeRoot {
+        bucket: crate::tests::bucket_name("delete-admission-second"),
+        bucket_incarnation_generation: 1,
+    };
+
+    let first_admission = runtime
+        .try_admit_bucket_delete_finalize(first.clone(), 1)
+        .expect("the first distinct delete should reserve capacity");
+    let duplicate_admission = runtime
+        .try_admit_bucket_delete_finalize(first.clone(), 1)
+        .expect("an exact retry must not be rejected by its own reservation");
+    assert!(
+        runtime
+            .try_admit_bucket_delete_finalize(second.clone(), 1)
+            .is_none(),
+        "a distinct delete must see backpressure at the capacity boundary"
+    );
+    drop(first_admission);
+    assert!(
+        runtime
+            .try_admit_bucket_delete_finalize(second.clone(), 1)
+            .is_none(),
+        "one failed exact retry must not release another retry's shared reservation"
+    );
+    drop(duplicate_admission);
+    let released_admission = runtime
+        .try_admit_bucket_delete_finalize(second.clone(), 1)
+        .expect("capacity must release after every failed exact retry exits");
+    drop(released_admission);
+
+    let first_admission = runtime
+        .try_admit_bucket_delete_finalize(first.clone(), 1)
+        .expect("the first root should reserve capacity again");
+    first_admission.commit();
+    assert!(
+        runtime
+            .try_admit_bucket_delete_finalize(second.clone(), 1)
+            .is_none(),
+        "committing admission must retain capacity until finalization finishes"
+    );
+    let delayed_exact_retry = runtime
+        .try_admit_bucket_delete_finalize(first.clone(), 1)
+        .expect("an exact retry must share outstanding capacity");
+    runtime.finish_bucket_delete_finalize_work(&first);
+    assert!(
+        runtime
+            .try_admit_bucket_delete_finalize(second.clone(), 1)
+            .is_none(),
+        "an in-flight exact retry must retain capacity after finalization finishes"
+    );
+    delayed_exact_retry.commit();
+    assert_eq!(
+        runtime.test_bucket_delete_finalize_outstanding_depth(),
+        1,
+        "a delayed exact retry commit must restore one outstanding root"
+    );
+    assert!(
+        runtime
+            .try_admit_bucket_delete_finalize(second.clone(), 1)
+            .is_none(),
+        "a delayed exact retry commit must not exceed the capacity bound"
+    );
+    runtime.finish_bucket_delete_finalize_work(&first);
+    assert!(
+        runtime
+            .try_admit_bucket_delete_finalize(second, 1)
+            .is_some(),
+        "terminal finalization must release admission capacity"
+    );
+}
+
+#[test]
+fn recovered_bucket_delete_begin_counts_toward_finalize_admission_capacity() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+            &[0],
+            EcShape { k: 2, m: 1 },
+        )
+        .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let runtime = cluster.local_map.runtime_state();
+    let bucket = crate::tests::bucket_name("delete-recovered-begin-capacity");
+    let finalize_root = BucketDeleteFinalizeRoot {
+        bucket: bucket.clone(),
+        bucket_incarnation_generation: 7,
+    };
+
+    assert!(
+        runtime.enqueue_bucket_delete_begin(crate::BucketDeleteBeginRoot {
+            bucket,
+            bucket_execution_generation: 11,
+            bucket_incarnation_generation: 7,
+        })
+    );
+    assert_eq!(
+        runtime.test_bucket_delete_finalize_outstanding_depth(),
+        1,
+        "a recovered durable begin must consume finalizer capacity"
+    );
+    assert!(
+        runtime
+            .try_admit_bucket_delete_finalize(
+                BucketDeleteFinalizeRoot {
+                    bucket: crate::tests::bucket_name("delete-recovered-begin-blocked"),
+                    bucket_incarnation_generation: 1,
+                },
+                1,
+            )
+            .is_none(),
+        "new deletes must see backpressure from recovered begin work"
+    );
+    runtime.finish_bucket_delete_finalize_work(&finalize_root);
+}
+
+#[test]
+fn finishing_stale_begin_preserves_newer_begin_for_same_bucket_incarnation() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+            &[0],
+            EcShape { k: 2, m: 1 },
+        )
+        .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let runtime = cluster.local_map.runtime_state();
+    let bucket = crate::tests::bucket_name("delete-begin-same-incarnation");
+    let stale = crate::BucketDeleteBeginRoot {
+        bucket: bucket.clone(),
+        bucket_execution_generation: 10,
+        bucket_incarnation_generation: 20,
+    };
+    let current = crate::BucketDeleteBeginRoot {
+        bucket: bucket.clone(),
+        bucket_execution_generation: 11,
+        bucket_incarnation_generation: 20,
+    };
+    let finalize_root = current.finalize_root();
+
+    assert!(runtime.enqueue_bucket_delete_begin(stale.clone()));
+    assert!(runtime.enqueue_bucket_delete_begin(current.clone()));
+    assert_eq!(
+        runtime.try_take_reclaim_work(),
+        Some(ReclaimWorkItem::BucketDeleteBegin(stale.clone()))
+    );
+
+    runtime.finish_bucket_delete_begin_work(&stale);
+
+    assert_eq!(
+        runtime.test_bucket_delete_finalize_outstanding_depth(),
+        1,
+        "retiring stale C1 must retain the shared capacity slot for C2"
+    );
+    assert_eq!(
+        runtime.try_take_reclaim_work(),
+        Some(ReclaimWorkItem::BucketDeleteBegin(current.clone())),
+        "retiring stale C1 must not erase same-incarnation C2"
+    );
+
+    runtime.promote_bucket_delete_begin_to_finalize(&current);
+    assert_eq!(
+        runtime.try_take_reclaim_work(),
+        Some(ReclaimWorkItem::BucketDelete(finalize_root.clone()))
+    );
+    assert_eq!(runtime.test_bucket_delete_finalize_outstanding_depth(), 1);
+    runtime.finish_bucket_delete_finalize_work(&finalize_root);
+    assert_eq!(runtime.test_bucket_delete_finalize_outstanding_depth(), 0);
+}
+
+#[test]
+fn bucket_delete_retained_attempt_keeps_finalize_admission_capacity() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+            &[0],
+            EcShape { k: 2, m: 1 },
+        )
+        .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let bucket = crate::tests::bucket_name("delete-retained-admission");
+    create_test_bucket(&cluster, &bucket);
+    let info = cluster.test_head_bucket_raw(&bucket).unwrap();
+    let identity = BucketIdentityGenerations {
+        bucket_execution_generation: info.bucket_execution_generation,
+        bucket_incarnation_generation: info.bucket_incarnation_generation,
+    };
+    let _hook =
+        cluster.test_install_after_bucket_delete_final_visibility_proven_hook(Arc::new(|| {
+            Err(StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 0,
+                now_ms: 1,
+            })
+        }));
+    let handle =
+        crate::StorageClusterRouteHandle::from_static_cluster(Arc::clone(&cluster)).unwrap();
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_bucket_route(&bucket).unwrap();
+
+    let error = route
+        .begin_bucket_delete_with_finalize_capacity_for_test(identity, 1)
+        .unwrap_err();
+    assert_eq!(error.kind(), &crate::BucketWriteDrainFailureKind::SlowDown);
+    let runtime = cluster.local_map.runtime_state();
+    assert_eq!(
+        runtime.test_bucket_delete_finalize_outstanding_depth(),
+        1,
+        "a durable retained delete attempt must continue consuming capacity"
+    );
+    assert!(
+        runtime
+            .try_admit_bucket_delete_finalize(
+                BucketDeleteFinalizeRoot {
+                    bucket: crate::tests::bucket_name("delete-retained-admission-blocked"),
+                    bucket_incarnation_generation: 1,
+                },
+                1,
+            )
+            .is_none(),
+        "a retained durable attempt must apply backpressure to another root"
+    );
+}
+
+#[test]
+fn bucket_delete_backpressure_precedes_durable_delete_state() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+            &[0],
+            EcShape { k: 2, m: 1 },
+        )
+        .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let bucket = crate::tests::bucket_name("delete-backpressure-target");
+    create_test_bucket(&cluster, &bucket);
+    let info = cluster.test_head_bucket_raw(&bucket).unwrap();
+    let identity = BucketIdentityGenerations {
+        bucket_execution_generation: info.bucket_execution_generation,
+        bucket_incarnation_generation: info.bucket_incarnation_generation,
+    };
+    let runtime = cluster.local_map.runtime_state();
+    let blocker = runtime
+        .try_admit_bucket_delete_finalize(
+            BucketDeleteFinalizeRoot {
+                bucket: crate::tests::bucket_name("delete-backpressure-blocker"),
+                bucket_incarnation_generation: 1,
+            },
+            1,
+        )
+        .unwrap();
+    let handle =
+        crate::StorageClusterRouteHandle::from_static_cluster(Arc::clone(&cluster)).unwrap();
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_bucket_route(&bucket).unwrap();
+
+    let error = route
+        .begin_bucket_delete_with_finalize_capacity_for_test(identity, 1)
+        .unwrap_err();
+    assert_eq!(error.kind(), &crate::BucketWriteDrainFailureKind::SlowDown);
+    assert_eq!(
+        cluster.test_head_bucket_raw(&bucket).unwrap().state,
+        BucketState::Active,
+        "backpressure must reject before installing the durable delete drain or mark"
+    );
+
+    drop(blocker);
+    route
+        .begin_bucket_delete_with_finalize_capacity_for_test(identity, 1)
+        .unwrap();
+    assert_eq!(
+        cluster.test_head_bucket_raw(&bucket).unwrap().state,
+        BucketState::Deleting
+    );
+    assert_eq!(cluster.test_bucket_delete_finalize_outstanding_depth(), 1);
+}
 
 #[test]
 fn bucket_delete_progress_observation_binds_the_exact_bucket() {
@@ -490,7 +797,7 @@ fn bucket_delete_finalizer_resumes_bounded_pg_scan_after_reopen() {
 
         assert_eq!(
             cluster.try_finalize_bucket_delete(&bucket).unwrap(),
-            crate::BucketDeleteFinalizeOutcome::Pending
+            crate::BucketDeleteFinalizeOutcome::Continue
         );
         let bucket_pg = map
             .node(NodeId::new(1))
@@ -513,7 +820,7 @@ fn bucket_delete_finalizer_resumes_bounded_pg_scan_after_reopen() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
     assert_eq!(
         cluster.try_finalize_bucket_delete(&bucket).unwrap(),
-        crate::BucketDeleteFinalizeOutcome::Pending
+        crate::BucketDeleteFinalizeOutcome::Continue
     );
     {
         let bucket_pg = reopened

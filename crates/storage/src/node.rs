@@ -668,6 +668,13 @@ impl BucketDeleteBeginRoot {
     pub fn bucket_incarnation_generation(&self) -> u64 {
         self.bucket_incarnation_generation
     }
+
+    pub(crate) fn finalize_root(&self) -> BucketDeleteFinalizeRoot {
+        BucketDeleteFinalizeRoot {
+            bucket: self.bucket.clone(),
+            bucket_incarnation_generation: self.bucket_incarnation_generation,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -696,6 +703,9 @@ pub enum BucketDeleteFinalizeOutcome {
     NotFound,
     NotDeleting,
     StaleIncarnation,
+    /// The finalizer made durable forward progress and can continue without a
+    /// retry cooldown. This is distinct from a blocked `Pending` attempt.
+    Continue,
     Pending,
     Finalized,
 }

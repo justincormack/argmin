@@ -1704,7 +1704,92 @@ struct LocalReclaimQueueState {
     object_payload_outstanding_by_pg: HashMap<u32, usize>,
     queued_bucket_delete_begins: HashSet<LocalBucketDeleteBeginRoot>,
     queued_bucket_deletes: HashSet<BucketDeleteFinalizeRoot>,
-    outstanding_bucket_deletes: HashSet<BucketDeleteFinalizeRoot>,
+    bucket_delete_admissions: HashMap<BucketDeleteFinalizeRoot, LocalBucketDeleteAdmissionState>,
+}
+
+#[derive(Debug, Default)]
+struct LocalBucketDeleteAdmissionState {
+    in_flight: usize,
+    begin_roots: HashSet<LocalBucketDeleteBeginRoot>,
+    finalizer_outstanding: bool,
+}
+
+impl LocalBucketDeleteAdmissionState {
+    fn has_outstanding_work(&self) -> bool {
+        self.finalizer_outstanding || !self.begin_roots.is_empty()
+    }
+}
+
+pub(crate) struct LocalBucketDeleteFinalizeAdmission<'a> {
+    runtime: &'a LocalClusterRuntimeState,
+    root: BucketDeleteFinalizeRoot,
+    resolved: bool,
+}
+
+impl LocalBucketDeleteFinalizeAdmission<'_> {
+    pub(crate) fn commit(mut self) {
+        let (state_lock, cv) = &self.runtime.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let admission = state
+            .bucket_delete_admissions
+            .get_mut(&self.root)
+            .expect("bucket delete admission must remain registered until resolved");
+        debug_assert!(admission.in_flight > 0);
+        admission.in_flight -= 1;
+        admission.finalizer_outstanding = true;
+        if state.queued_bucket_deletes.insert(self.root.clone()) {
+            state
+                .work_queue
+                .push_back(ReclaimWorkItem::BucketDelete(self.root.clone()));
+            LocalClusterRuntimeState::emit_reclaim_queue_action(&state, "bucket_delete", "admit");
+            cv.notify_one();
+        }
+        self.resolved = true;
+    }
+
+    pub(crate) fn retain(mut self, begin_root: LocalBucketDeleteBeginRoot) {
+        assert_eq!(
+            begin_root.finalize_root(),
+            self.root,
+            "retained bucket delete begin must match its admission root"
+        );
+        let (state_lock, _) = &self.runtime.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let admission = state
+            .bucket_delete_admissions
+            .get_mut(&self.root)
+            .expect("bucket delete admission must remain registered until resolved");
+        debug_assert!(admission.in_flight > 0);
+        admission.in_flight -= 1;
+        admission.begin_roots.insert(begin_root);
+        self.resolved = true;
+    }
+}
+
+impl Drop for LocalBucketDeleteFinalizeAdmission<'_> {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        let mut state = self
+            .runtime
+            .reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(admission) = state.bucket_delete_admissions.get_mut(&self.root) {
+            debug_assert!(admission.in_flight > 0);
+            admission.in_flight -= 1;
+            if admission.in_flight == 0 && !admission.has_outstanding_work() {
+                state.bucket_delete_admissions.remove(&self.root);
+            }
+        }
+        LocalClusterRuntimeState::emit_reclaim_queue_action(
+            &state,
+            "bucket_delete",
+            "admission_cancel",
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -1724,7 +1809,7 @@ impl LocalClusterRuntimeState {
                     object_payload_outstanding_by_pg: HashMap::new(),
                     queued_bucket_delete_begins: HashSet::new(),
                     queued_bucket_deletes: HashSet::new(),
-                    outstanding_bucket_deletes: HashSet::new(),
+                    bucket_delete_admissions: HashMap::new(),
                 }),
                 Condvar::new(),
             ),
@@ -2065,7 +2150,11 @@ impl LocalClusterRuntimeState {
     pub(crate) fn enqueue_bucket_delete_finalize(&self, root: BucketDeleteFinalizeRoot) -> bool {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        state.outstanding_bucket_deletes.insert(root.clone());
+        state
+            .bucket_delete_admissions
+            .entry(root.clone())
+            .or_default()
+            .finalizer_outstanding = true;
         if state.queued_bucket_deletes.insert(root.clone()) {
             state
                 .work_queue
@@ -2079,9 +2168,46 @@ impl LocalClusterRuntimeState {
         }
     }
 
+    pub(crate) fn try_admit_bucket_delete_finalize(
+        &self,
+        root: BucketDeleteFinalizeRoot,
+        capacity: usize,
+    ) -> Option<LocalBucketDeleteFinalizeAdmission<'_>> {
+        let mut state = self
+            .reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let already_tracked = state.bucket_delete_admissions.contains_key(&root);
+        if !already_tracked && state.bucket_delete_admissions.len() >= capacity {
+            Self::emit_reclaim_queue_action(&state, "bucket_delete", "admission_reject");
+            return None;
+        }
+        state
+            .bucket_delete_admissions
+            .entry(root.clone())
+            .or_default()
+            .in_flight += 1;
+        if !already_tracked {
+            Self::emit_reclaim_queue_action(&state, "bucket_delete", "admission_reserve");
+        }
+        Some(LocalBucketDeleteFinalizeAdmission {
+            runtime: self,
+            root,
+            resolved: false,
+        })
+    }
+
     pub(crate) fn enqueue_bucket_delete_begin(&self, root: LocalBucketDeleteBeginRoot) -> bool {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let finalize_root = root.finalize_root();
+        state
+            .bucket_delete_admissions
+            .entry(finalize_root)
+            .or_default()
+            .begin_roots
+            .insert(root.clone());
         if state.queued_bucket_delete_begins.insert(root.clone()) {
             state
                 .work_queue
@@ -2092,6 +2218,60 @@ impl LocalClusterRuntimeState {
         } else {
             Self::emit_reclaim_queue_action(&state, "bucket_delete_begin", "deduplicate");
             false
+        }
+    }
+
+    pub(crate) fn finish_bucket_delete_begin_work(&self, root: &LocalBucketDeleteBeginRoot) {
+        let mut state = self
+            .reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.queued_bucket_delete_begins.remove(root);
+        state.work_queue.retain(
+            |work| !matches!(work, ReclaimWorkItem::BucketDeleteBegin(queued) if queued == root),
+        );
+        let finalize_root = root.finalize_root();
+        let mut remove_admission = false;
+        let finished =
+            if let Some(admission) = state.bucket_delete_admissions.get_mut(&finalize_root) {
+                let removed = admission.begin_roots.remove(root);
+                remove_admission = admission.in_flight == 0 && !admission.has_outstanding_work();
+                removed
+            } else {
+                false
+            };
+        if remove_admission {
+            state.bucket_delete_admissions.remove(&finalize_root);
+        }
+        if finished {
+            Self::emit_reclaim_queue_action(&state, "bucket_delete_begin", "finish");
+        }
+    }
+
+    pub(crate) fn promote_bucket_delete_begin_to_finalize(
+        &self,
+        root: &LocalBucketDeleteBeginRoot,
+    ) {
+        let (state_lock, cv) = &self.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|error| error.into_inner());
+        state.queued_bucket_delete_begins.remove(root);
+        state.work_queue.retain(
+            |work| !matches!(work, ReclaimWorkItem::BucketDeleteBegin(queued) if queued == root),
+        );
+        let finalize_root = root.finalize_root();
+        let admission = state
+            .bucket_delete_admissions
+            .entry(finalize_root.clone())
+            .or_default();
+        admission.begin_roots.remove(root);
+        admission.finalizer_outstanding = true;
+        if state.queued_bucket_deletes.insert(finalize_root.clone()) {
+            state
+                .work_queue
+                .push_back(ReclaimWorkItem::BucketDelete(finalize_root));
+            Self::emit_reclaim_queue_action(&state, "bucket_delete_begin", "promote");
+            cv.notify_one();
         }
     }
 
@@ -2114,7 +2294,20 @@ impl LocalClusterRuntimeState {
             }
             ReclaimWorkItem::ObjectPayload(_) => true,
         });
-        if state.outstanding_bucket_deletes.remove(root) {
+        let mut remove_admission = false;
+        let finished = if let Some(admission) = state.bucket_delete_admissions.get_mut(root) {
+            let was_outstanding = admission.has_outstanding_work();
+            admission.begin_roots.clear();
+            admission.finalizer_outstanding = false;
+            remove_admission = admission.in_flight == 0 && !admission.has_outstanding_work();
+            was_outstanding
+        } else {
+            false
+        };
+        if remove_admission {
+            state.bucket_delete_admissions.remove(root);
+        }
+        if finished {
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "finish");
         }
     }
@@ -2125,8 +2318,10 @@ impl LocalClusterRuntimeState {
             .0
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .outstanding_bucket_deletes
-            .len()
+            .bucket_delete_admissions
+            .values()
+            .filter(|admission| admission.has_outstanding_work())
+            .count()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -2297,7 +2492,11 @@ impl LocalClusterRuntimeState {
                 object_payload_outstanding_depth: state.outstanding_objects.len(),
                 bucket_delete_begin_depth: state.queued_bucket_delete_begins.len(),
                 bucket_delete_finalize_depth: state.queued_bucket_deletes.len(),
-                bucket_delete_finalize_outstanding_depth: state.outstanding_bucket_deletes.len(),
+                bucket_delete_finalize_outstanding_depth: state
+                    .bucket_delete_admissions
+                    .values()
+                    .filter(|admission| admission.has_outstanding_work())
+                    .count(),
             },
         );
     }
