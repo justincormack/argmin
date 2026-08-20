@@ -5890,11 +5890,119 @@ enum ControlPlaneRaftWalRecord {
     Purge(LogIdOf<ControlPlaneRaftTypeConfig>),
 }
 
+macro_rules! define_control_plane_raft_wal_record_kinds {
+    ($($kind:ident = $tag:literal),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum ControlPlaneRaftWalRecordKind {
+            $($kind),+
+        }
+
+        impl ControlPlaneRaftWalRecordKind {
+            #[cfg(test)]
+            const ALL: &'static [Self] = &[$(Self::$kind),+];
+
+            fn as_u8(self) -> u8 {
+                match self {
+                    $(Self::$kind => $tag),+
+                }
+            }
+
+            fn from_u8(value: u8) -> Result<Self, u8> {
+                match value {
+                    $($tag => Ok(Self::$kind)),+,
+                    value => Err(value),
+                }
+            }
+        }
+    };
+}
+
+define_control_plane_raft_wal_record_kinds!(
+    SaveVote = 1,
+    Append = 2,
+    SaveCommitted = 3,
+    TruncateAfter = 4,
+    Purge = 5,
+);
+
+impl ControlPlaneRaftWalRecord {
+    fn kind(&self) -> ControlPlaneRaftWalRecordKind {
+        match self {
+            Self::SaveVote(_) => ControlPlaneRaftWalRecordKind::SaveVote,
+            Self::Append(_) => ControlPlaneRaftWalRecordKind::Append,
+            Self::SaveCommitted(_) => ControlPlaneRaftWalRecordKind::SaveCommitted,
+            Self::TruncateAfter(_) => ControlPlaneRaftWalRecordKind::TruncateAfter,
+            Self::Purge(_) => ControlPlaneRaftWalRecordKind::Purge,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ControlPlaneRaftWalFrame {
     cluster_name: String,
     local_node_id: ControlPlaneRaftNodeId,
     record: ControlPlaneRaftWalRecord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneRaftWalFrameFormatError {
+    Truncated,
+    ChecksumMismatch { expected: u64, actual: u64 },
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for ControlPlaneRaftWalFrameFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => {
+                formatter.write_str("truncated control-plane OpenRaft WAL frame")
+            }
+            Self::ChecksumMismatch { expected, actual } => write!(
+                formatter,
+                "control-plane OpenRaft WAL frame checksum mismatch: expected {expected:#x}, actual {actual:#x}"
+            ),
+            Self::UnknownMagic => {
+                formatter.write_str("invalid control-plane OpenRaft WAL frame magic")
+            }
+            Self::UnsupportedVersion(version) => write!(
+                formatter,
+                "unsupported control-plane OpenRaft WAL frame version {version}"
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ControlPlaneRaftWalFrameDecodeError {
+    Format(ControlPlaneRaftWalFrameFormatError),
+    Invalid(ControlPlaneError),
+}
+
+impl ControlPlaneRaftWalFrameDecodeError {
+    fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::Format(error) => raft_artifact_protocol_error(error.to_string()),
+            Self::Invalid(error) => error,
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CONTROL_PLANE_RAFT_WAL_REPLAY_ATTEMPTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_control_plane_raft_wal_replay_attempts() {
+    CONTROL_PLANE_RAFT_WAL_REPLAY_ATTEMPTS.set(0);
+}
+
+#[cfg(test)]
+fn control_plane_raft_wal_replay_attempts() -> usize {
+    CONTROL_PLANE_RAFT_WAL_REPLAY_ATTEMPTS.get()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6010,11 +6118,6 @@ const CONTROL_PLANE_RAFT_WAL_FILE_MAGIC: &[u8] = b"ARGMINCPRAFTWALFILE";
 const CONTROL_PLANE_RAFT_WAL_FILE_VERSION: u16 = 2;
 #[cfg(test)]
 const CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN: usize = 8;
-const CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_VOTE: u8 = 1;
-const CONTROL_PLANE_RAFT_WAL_RECORD_APPEND: u8 = 2;
-const CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_COMMITTED: u8 = 3;
-const CONTROL_PLANE_RAFT_WAL_RECORD_TRUNCATE_AFTER: u8 = 4;
-const CONTROL_PLANE_RAFT_WAL_RECORD_PURGE: u8 = 5;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
 const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 2;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
@@ -7160,11 +7263,11 @@ impl ControlPlaneRaftWalFrame {
         Ok(out)
     }
 
-    fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+    fn decode_frame_classified(bytes: &[u8]) -> Result<Self, ControlPlaneRaftWalFrameDecodeError> {
         let min_len = CONTROL_PLANE_RAFT_WAL_MAGIC.len() + 2 + CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN;
         if bytes.len() < min_len {
-            return Err(raft_artifact_protocol_error(
-                "truncated control-plane OpenRaft WAL frame",
+            return Err(ControlPlaneRaftWalFrameDecodeError::Format(
+                ControlPlaneRaftWalFrameFormatError::Truncated,
             ));
         }
         let (body, checksum_bytes) =
@@ -7176,31 +7279,52 @@ impl ControlPlaneRaftWalFrame {
         );
         let actual_checksum = raft_artifact_checksum(body);
         if actual_checksum != expected_checksum {
-            return Err(raft_artifact_protocol_error(format!(
-                "control-plane OpenRaft WAL frame checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
-            )));
+            return Err(ControlPlaneRaftWalFrameDecodeError::Format(
+                ControlPlaneRaftWalFrameFormatError::ChecksumMismatch {
+                    expected: expected_checksum,
+                    actual: actual_checksum,
+                },
+            ));
         }
 
         let mut reader = RaftArtifactReader::with_context(body, "control-plane OpenRaft WAL frame");
-        let magic = reader.read_exact(CONTROL_PLANE_RAFT_WAL_MAGIC.len())?;
+        let magic = reader
+            .read_exact(CONTROL_PLANE_RAFT_WAL_MAGIC.len())
+            .map_err(ControlPlaneRaftWalFrameDecodeError::Invalid)?;
         if magic != CONTROL_PLANE_RAFT_WAL_MAGIC {
-            return Err(raft_artifact_protocol_error(
-                "invalid control-plane OpenRaft WAL frame magic",
+            return Err(ControlPlaneRaftWalFrameDecodeError::Format(
+                ControlPlaneRaftWalFrameFormatError::UnknownMagic,
             ));
         }
-        let version = reader.read_u16()?;
+        let version = reader
+            .read_u16()
+            .map_err(ControlPlaneRaftWalFrameDecodeError::Invalid)?;
         if version != CONTROL_PLANE_RAFT_WAL_VERSION {
-            return Err(raft_artifact_protocol_error(format!(
-                "unsupported control-plane OpenRaft WAL frame version {version}"
-            )));
+            return Err(ControlPlaneRaftWalFrameDecodeError::Format(
+                ControlPlaneRaftWalFrameFormatError::UnsupportedVersion(version),
+            ));
         }
-        let frame = Self {
-            cluster_name: reader.read_string()?,
-            local_node_id: reader.read_u64()?,
-            record: reader.read_wal_record()?,
-        };
-        reader.finish()?;
-        Ok(frame)
+        let decoded: Result<Self, ControlPlaneError> = (|| {
+            let frame = Self {
+                cluster_name: reader.read_string()?,
+                local_node_id: reader.read_u64()?,
+                record: reader.read_wal_record()?,
+            };
+            reader.finish()?;
+            Ok(frame)
+        })();
+        match decoded {
+            Ok(frame) => Ok(frame),
+            Err(_) if reader.was_truncated() => Err(ControlPlaneRaftWalFrameDecodeError::Format(
+                ControlPlaneRaftWalFrameFormatError::Truncated,
+            )),
+            Err(error) => Err(ControlPlaneRaftWalFrameDecodeError::Invalid(error)),
+        }
+    }
+
+    fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+        Self::decode_frame_classified(bytes)
+            .map_err(ControlPlaneRaftWalFrameDecodeError::into_control_plane_error)
     }
 
     fn validate_identity(
@@ -7280,6 +7404,12 @@ impl ControlPlaneRaftWalFile {
         config: ControlPlaneRaftWalReplayConfig<'_>,
     ) -> Result<ControlPlaneRaftLogStoreRestartArtifact, ControlPlaneError> {
         let records = self.read_records_from(config.replay_offset)?;
+        #[cfg(test)]
+        CONTROL_PLANE_RAFT_WAL_REPLAY_ATTEMPTS.set(
+            CONTROL_PLANE_RAFT_WAL_REPLAY_ATTEMPTS
+                .get()
+                .saturating_add(1),
+        );
         let artifact = config
             .base
             .replay_wal_records(&records.records)
@@ -8561,13 +8691,12 @@ fn write_raft_wal_record(
     out: &mut Vec<u8>,
     record: &ControlPlaneRaftWalRecord,
 ) -> Result<(), ControlPlaneError> {
+    write_raft_u8(out, record.kind().as_u8());
     match record {
         ControlPlaneRaftWalRecord::SaveVote(vote) => {
-            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_VOTE);
             write_raft_vote(out, *vote);
         }
         ControlPlaneRaftWalRecord::Append(entries) => {
-            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_APPEND);
             write_raft_u32(
                 out,
                 raft_len_as_u32(entries.len(), "raft WAL append entries")?,
@@ -8577,15 +8706,12 @@ fn write_raft_wal_record(
             }
         }
         ControlPlaneRaftWalRecord::SaveCommitted(committed) => {
-            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_COMMITTED);
             write_raft_option_log_id(out, *committed);
         }
         ControlPlaneRaftWalRecord::TruncateAfter(last_log_id) => {
-            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_TRUNCATE_AFTER);
             write_raft_option_log_id(out, *last_log_id);
         }
         ControlPlaneRaftWalRecord::Purge(log_id) => {
-            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_PURGE);
             write_raft_log_id(out, *log_id);
         }
     }
@@ -9193,6 +9319,7 @@ struct RaftArtifactReader<'a> {
     payload: &'a [u8],
     offset: usize,
     context: &'static str,
+    truncated: bool,
 }
 
 impl<'a> RaftArtifactReader<'a> {
@@ -9205,7 +9332,12 @@ impl<'a> RaftArtifactReader<'a> {
             payload,
             offset: 0,
             context,
+            truncated: false,
         }
+    }
+
+    fn was_truncated(&self) -> bool {
+        self.truncated
     }
 
     fn finish(&self) -> Result<(), ControlPlaneError> {
@@ -9221,13 +9353,18 @@ impl<'a> RaftArtifactReader<'a> {
     }
 
     fn read_exact(&mut self, len: usize) -> Result<&'a [u8], ControlPlaneError> {
-        let end = self.offset.checked_add(len).ok_or_else(|| {
-            raft_artifact_protocol_error(format!("{} offset overflow", self.context))
-        })?;
-        let bytes = self
-            .payload
-            .get(self.offset..end)
-            .ok_or_else(|| raft_artifact_protocol_error(format!("truncated {}", self.context)))?;
+        if len > self.remaining_len() {
+            self.truncated = true;
+            return Err(raft_artifact_protocol_error(format!(
+                "truncated {}",
+                self.context
+            )));
+        }
+        let end = self
+            .offset
+            .checked_add(len)
+            .expect("length bounded by remaining payload must not overflow");
+        let bytes = &self.payload[self.offset..end];
         self.offset = end;
         Ok(bytes)
     }
@@ -9407,11 +9544,11 @@ impl<'a> RaftArtifactReader<'a> {
     }
 
     fn read_wal_record(&mut self) -> Result<ControlPlaneRaftWalRecord, ControlPlaneError> {
-        match self.read_u8()? {
-            CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_VOTE => {
+        match ControlPlaneRaftWalRecordKind::from_u8(self.read_u8()?) {
+            Ok(ControlPlaneRaftWalRecordKind::SaveVote) => {
                 Ok(ControlPlaneRaftWalRecord::SaveVote(self.read_vote()?))
             }
-            CONTROL_PLANE_RAFT_WAL_RECORD_APPEND => {
+            Ok(ControlPlaneRaftWalRecordKind::Append) => {
                 let entry_count =
                     self.read_collection_len("raft WAL append entries", RAFT_ENTRY_MIN_LEN)?;
                 let mut entries = Vec::with_capacity(entry_count);
@@ -9420,16 +9557,16 @@ impl<'a> RaftArtifactReader<'a> {
                 }
                 Ok(ControlPlaneRaftWalRecord::Append(entries))
             }
-            CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_COMMITTED => Ok(
+            Ok(ControlPlaneRaftWalRecordKind::SaveCommitted) => Ok(
                 ControlPlaneRaftWalRecord::SaveCommitted(self.read_option_log_id()?),
             ),
-            CONTROL_PLANE_RAFT_WAL_RECORD_TRUNCATE_AFTER => Ok(
+            Ok(ControlPlaneRaftWalRecordKind::TruncateAfter) => Ok(
                 ControlPlaneRaftWalRecord::TruncateAfter(self.read_option_log_id()?),
             ),
-            CONTROL_PLANE_RAFT_WAL_RECORD_PURGE => {
+            Ok(ControlPlaneRaftWalRecordKind::Purge) => {
                 Ok(ControlPlaneRaftWalRecord::Purge(self.read_log_id()?))
             }
-            value => Err(raft_artifact_protocol_error(format!(
+            Err(value) => Err(raft_artifact_protocol_error(format!(
                 "unknown control-plane OpenRaft WAL record tag {value}"
             ))),
         }

@@ -55,16 +55,67 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
     let tmp = test_util::tempdir();
     let wal_path = tmp.path().join("raft.wal");
     let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+    let command_entry = normal_entry(
+        3,
+        1,
+        2,
+        ControlPlaneCommand::MarkNodeAvailability {
+            node_id: NodeId::new(1),
+            availability: NodeAvailabilityState::Unavailable,
+        },
+    );
     let records = vec![
         ControlPlaneRaftWalRecord::SaveVote(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
         ControlPlaneRaftWalRecord::Append(vec![
             bootstrap_membership_entry(1),
             blank_entry(3, 1, 1),
+            command_entry,
         ]),
+        ControlPlaneRaftWalRecord::SaveCommitted(None),
         ControlPlaneRaftWalRecord::SaveCommitted(Some(raft_log_id(3, 1, 1))),
+        ControlPlaneRaftWalRecord::TruncateAfter(None),
         ControlPlaneRaftWalRecord::TruncateAfter(Some(raft_log_id(3, 1, 1))),
         ControlPlaneRaftWalRecord::Purge(raft_log_id(3, 1, 1)),
     ];
+    assert_eq!(
+        records
+            .iter()
+            .map(ControlPlaneRaftWalRecord::kind)
+            .collect::<BTreeSet<_>>(),
+        ControlPlaneRaftWalRecordKind::ALL
+            .iter()
+            .copied()
+            .collect()
+    );
+    let append_entry_kinds = records
+        .iter()
+        .filter_map(|record| match record {
+            ControlPlaneRaftWalRecord::Append(entries) => Some(entries),
+            _ => None,
+        })
+        .flatten()
+        .map(control_plane_raft_entry_payload_tag)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        append_entry_kinds,
+        ControlPlaneRaftEntryPayloadTag::ALL.into_iter().collect()
+    );
+    let save_committed_arms = records
+        .iter()
+        .filter_map(|record| match record {
+            ControlPlaneRaftWalRecord::SaveCommitted(log_id) => Some(log_id.is_some()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let truncate_after_arms = records
+        .iter()
+        .filter_map(|record| match record {
+            ControlPlaneRaftWalRecord::TruncateAfter(log_id) => Some(log_id.is_some()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(save_committed_arms, BTreeSet::from([false, true]));
+    assert_eq!(truncate_after_arms, BTreeSet::from([false, true]));
     for record in &records {
         wal.append_record(record).unwrap();
     }
@@ -86,8 +137,8 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
             raft_test_hex(&checksum::sha256::digest(&bytes))
         ),
         (
-            542,
-            "e41d7b4697dc4902bcc608946cdcd89fa2dc23b9070eedeb1a27f07cc92fc44f".to_owned()
+            714,
+            "496e771c7dc786a55182d3afc7f4e351b33c51d71f7e808e706199e859fbd6af".to_owned()
         )
     );
 }
@@ -139,10 +190,12 @@ fn control_plane_raft_wal_file_header_failures_are_typed() {
 
 #[test]
 fn control_plane_raft_wal_frame_rejects_malformed_frames() {
-    assert_error_contains(
-        ControlPlaneRaftWalFrame::decode_frame(b"short"),
-        "truncated control-plane OpenRaft WAL frame",
-    );
+    assert!(matches!(
+        ControlPlaneRaftWalFrame::decode_frame_classified(b"short"),
+        Err(ControlPlaneRaftWalFrameDecodeError::Format(
+            ControlPlaneRaftWalFrameFormatError::Truncated
+        ))
+    ));
 
     let frame = ControlPlaneRaftWalFrame::new(
         "test-cluster",
@@ -154,29 +207,62 @@ fn control_plane_raft_wal_frame_rejects_malformed_frames() {
     let mut bad_magic = encoded.clone();
     bad_magic[0] ^= 0xff;
     refresh_raft_wal_frame_checksum(&mut bad_magic);
-    assert_error_contains(
-        ControlPlaneRaftWalFrame::decode_frame(&bad_magic),
-        "invalid control-plane OpenRaft WAL frame magic",
-    );
+    assert!(matches!(
+        ControlPlaneRaftWalFrame::decode_frame_classified(&bad_magic),
+        Err(ControlPlaneRaftWalFrameDecodeError::Format(
+            ControlPlaneRaftWalFrameFormatError::UnknownMagic
+        ))
+    ));
 
-    let mut unsupported_version = encoded.clone();
-    unsupported_version[CONTROL_PLANE_RAFT_WAL_MAGIC.len() + 1] =
-        unsupported_version[CONTROL_PLANE_RAFT_WAL_MAGIC.len() + 1].wrapping_add(1);
-    refresh_raft_wal_frame_checksum(&mut unsupported_version);
-    assert_error_contains(
-        ControlPlaneRaftWalFrame::decode_frame(&unsupported_version),
-        "unsupported control-plane OpenRaft WAL frame version",
-    );
+    for version in [0, CONTROL_PLANE_RAFT_WAL_VERSION + 1] {
+        let mut unsupported_version = encoded.clone();
+        let version_offset = CONTROL_PLANE_RAFT_WAL_MAGIC.len();
+        unsupported_version[version_offset..version_offset + std::mem::size_of::<u16>()]
+            .copy_from_slice(&version.to_be_bytes());
+        refresh_raft_wal_frame_checksum(&mut unsupported_version);
+        assert!(matches!(
+            ControlPlaneRaftWalFrame::decode_frame_classified(&unsupported_version),
+            Err(ControlPlaneRaftWalFrameDecodeError::Format(
+                ControlPlaneRaftWalFrameFormatError::UnsupportedVersion(candidate)
+            )) if candidate == version
+        ));
+    }
 
     let mut bad_checksum = encoded.clone();
     let last = bad_checksum
         .last_mut()
         .expect("encoded WAL frame should include checksum");
     *last ^= 0xff;
-    assert_error_contains(
-        ControlPlaneRaftWalFrame::decode_frame(&bad_checksum),
-        "control-plane OpenRaft WAL frame checksum mismatch",
-    );
+    assert!(matches!(
+        ControlPlaneRaftWalFrame::decode_frame_classified(&bad_checksum),
+        Err(ControlPlaneRaftWalFrameDecodeError::Format(
+            ControlPlaneRaftWalFrameFormatError::ChecksumMismatch { .. }
+        ))
+    ));
+
+    let mut truncated_payload = encoded.clone();
+    truncated_payload.remove(truncated_payload.len() - CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN - 1);
+    refresh_raft_wal_frame_checksum(&mut truncated_payload);
+    assert!(matches!(
+        ControlPlaneRaftWalFrame::decode_frame_classified(&truncated_payload),
+        Err(ControlPlaneRaftWalFrameDecodeError::Format(
+            ControlPlaneRaftWalFrameFormatError::Truncated
+        ))
+    ));
+
+    let mut maximum_cluster_name_length = encoded.clone();
+    let cluster_name_length_offset =
+        CONTROL_PLANE_RAFT_WAL_MAGIC.len() + std::mem::size_of::<u16>();
+    maximum_cluster_name_length[cluster_name_length_offset
+        ..cluster_name_length_offset + std::mem::size_of::<u32>()]
+        .copy_from_slice(&u32::MAX.to_be_bytes());
+    refresh_raft_wal_frame_checksum(&mut maximum_cluster_name_length);
+    assert!(matches!(
+        ControlPlaneRaftWalFrame::decode_frame_classified(&maximum_cluster_name_length),
+        Err(ControlPlaneRaftWalFrameDecodeError::Format(
+            ControlPlaneRaftWalFrameFormatError::Truncated
+        ))
+    ));
 
     let mut trailing = encoded.clone();
     let checksum_start = trailing.len() - CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN;

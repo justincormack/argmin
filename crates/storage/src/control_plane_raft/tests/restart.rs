@@ -1158,6 +1158,80 @@ fn control_plane_openraft_durable_startup_rejects_unsupported_wal_file_without_m
 }
 
 #[test]
+fn control_plane_openraft_durable_startup_rejects_unsupported_wal_frame_without_replay() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let cluster_name = "control-plane-raft-unsupported-wal-frame-startup-test";
+        for version in [0, CONTROL_PLANE_RAFT_WAL_VERSION + 1] {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let sentinel_path = durable_artifact_sentinel_path(&path);
+            let wal_path = durable_artifact_wal_path(&path);
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+                state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+
+            let wal = test_raft_wal_file(&wal_path, cluster_name, 1);
+            wal.append_record(&ControlPlaneRaftWalRecord::Append(vec![
+                bootstrap_membership_entry(1),
+            ]))
+            .unwrap();
+            wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
+                ControlPlaneRaftLeaderId,
+            >::new_committed(
+                3, 1,
+            )))
+            .unwrap();
+            OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .unwrap()
+                .write_all(&[0, 0, 0])
+                .unwrap();
+
+            let mut wal_bytes = std::fs::read(&wal_path).unwrap();
+            let first_frame_end = wal_file_frame_end(&wal_bytes, 0);
+            let second_frame_end = wal_file_frame_end(&wal_bytes, first_frame_end);
+            let second_frame_start = first_frame_end + CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN;
+            let version_offset = second_frame_start + CONTROL_PLANE_RAFT_WAL_MAGIC.len();
+            wal_bytes[version_offset..version_offset + std::mem::size_of::<u16>()]
+                .copy_from_slice(&version.to_be_bytes());
+            let checksum_start = second_frame_end - CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN;
+            let checksum = checksum::crc64::checksum(
+                &wal_bytes[second_frame_start..checksum_start],
+            );
+            wal_bytes[checksum_start..second_frame_end]
+                .copy_from_slice(&checksum.to_be_bytes());
+            std::fs::write(&wal_path, &wal_bytes).unwrap();
+
+            let artifact_bytes = std::fs::read(&path).unwrap();
+            let sentinel_bytes = std::fs::read(&sentinel_path).unwrap();
+            reset_control_plane_raft_wal_replay_attempts();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    cluster_name,
+                    1,
+                    &path,
+                )
+                .await,
+                &format!("unsupported control-plane OpenRaft WAL frame version {version}"),
+            );
+
+            assert_eq!(control_plane_raft_wal_replay_attempts(), 0);
+            assert_eq!(std::fs::read(&path).unwrap(), artifact_bytes);
+            assert_eq!(std::fs::read(&sentinel_path).unwrap(), sentinel_bytes);
+            assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
+            assert!(!durable_artifact_tmp_path(&path).exists());
+        }
+    });
+}
+
+#[test]
 fn control_plane_raft_durable_restart_artifact_store_rejects_mismatched_sentinel() {
     let tmp = test_util::tempdir();
     let path = tmp.path().join("raft.state");
