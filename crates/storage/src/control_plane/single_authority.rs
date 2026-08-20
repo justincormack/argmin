@@ -490,38 +490,64 @@ fn single_authority_initialized_tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(tmp_path)
 }
 
+enum FixedControlPlaneSidecarReadError {
+    Truncated,
+    Invalid(ControlPlaneError),
+}
+
 fn read_fixed_control_plane_sidecar<const N: usize>(
     path: &Path,
     context: &'static str,
-) -> Result<Option<[u8; N]>, ControlPlaneError> {
+) -> Result<Option<[u8; N]>, FixedControlPlaneSidecarReadError> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(ControlPlaneError::io(context, source)),
+        Err(source) => {
+            return Err(FixedControlPlaneSidecarReadError::Invalid(
+                ControlPlaneError::io(context, source),
+            ));
+        }
     };
-    if metadata.len() != N as u64 {
-        return Err(ControlPlaneError::AuthorityClockCheckpoint {
+    if metadata.len() < N as u64 {
+        return Err(FixedControlPlaneSidecarReadError::Truncated);
+    }
+    if metadata.len() > N as u64 {
+        return Err(FixedControlPlaneSidecarReadError::Invalid(
+            ControlPlaneError::AuthorityClockCheckpoint {
             message: format!(
                 "{} length {} does not match required fixed length {N}",
                 path.display(),
                 metadata.len()
             ),
-        });
+            },
+        ));
     }
-    let mut file =
-        std::fs::File::open(path).map_err(|source| ControlPlaneError::io(context, source))?;
+    let mut file = std::fs::File::open(path).map_err(|source| {
+        FixedControlPlaneSidecarReadError::Invalid(ControlPlaneError::io(context, source))
+    })?;
     let mut bytes = [0u8; N];
-    file.read_exact(&mut bytes)
-        .map_err(|source| ControlPlaneError::io(context, source))?;
+    if let Err(source) = file.read_exact(&mut bytes) {
+        return if source.kind() == ErrorKind::UnexpectedEof {
+            Err(FixedControlPlaneSidecarReadError::Truncated)
+        } else {
+            Err(FixedControlPlaneSidecarReadError::Invalid(
+                ControlPlaneError::io(context, source),
+            ))
+        };
+    }
     let mut trailing = [0u8; 1];
     if file
         .read(&mut trailing)
-        .map_err(|source| ControlPlaneError::io(context, source))?
+        .map_err(|source| {
+            FixedControlPlaneSidecarReadError::Invalid(ControlPlaneError::io(context, source))
+        })?
         != 0
     {
-        return Err(ControlPlaneError::AuthorityClockCheckpoint {
-            message: format!("{} grew while it was being read", path.display()),
-        });
+        return Err(FixedControlPlaneSidecarReadError::Invalid(
+            ControlPlaneError::AuthorityClockCheckpoint {
+                message: format!("{} grew while it was being read", path.display()),
+            },
+        ));
     }
     Ok(Some(bytes))
 }
@@ -558,17 +584,63 @@ fn store_control_plane_sidecar(
     Ok(())
 }
 
-fn load_single_authority_clock_checkpoint_binding(
-    durable_state_path: &Path,
-) -> Result<Option<ControlPlaneAuthorityClockCheckpointBinding>, ControlPlaneError> {
-    let identity_path = single_authority_identity_path(durable_state_path);
-    let Some(bytes) = read_fixed_control_plane_sidecar::<CONTROL_PLANE_STATE_IDENTITY_LEN>(
-        &identity_path,
-        "load single-authority control-plane durable identity",
-    )?
-    else {
-        return Ok(None);
-    };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SingleAuthorityIdentityFormatError {
+    Truncated,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for SingleAuthorityIdentityFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("single-authority durable identity is truncated"),
+            Self::UnknownMagic => {
+                formatter.write_str("single-authority durable identity magic mismatch")
+            }
+            Self::UnsupportedVersion(version) => write!(
+                formatter,
+                "unsupported single-authority durable identity version {version}"
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SingleAuthorityIdentityDecodeError {
+    Format(SingleAuthorityIdentityFormatError),
+    Invalid(ControlPlaneError),
+}
+
+impl SingleAuthorityIdentityDecodeError {
+    fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::Format(error) => ControlPlaneError::AuthorityClockCheckpoint {
+                message: error.to_string(),
+            },
+            Self::Invalid(error) => error,
+        }
+    }
+}
+
+fn decode_single_authority_clock_checkpoint_binding(
+    bytes: &[u8],
+) -> Result<ControlPlaneAuthorityClockCheckpointBinding, SingleAuthorityIdentityDecodeError> {
+    if bytes.len() < CONTROL_PLANE_STATE_IDENTITY_LEN {
+        return Err(SingleAuthorityIdentityDecodeError::Format(
+            SingleAuthorityIdentityFormatError::Truncated,
+        ));
+    }
+    if bytes.len() != CONTROL_PLANE_STATE_IDENTITY_LEN {
+        return Err(SingleAuthorityIdentityDecodeError::Invalid(
+            ControlPlaneError::AuthorityClockCheckpoint {
+                message: format!(
+                    "single-authority durable identity length {} does not match required fixed length {CONTROL_PLANE_STATE_IDENTITY_LEN}",
+                    bytes.len()
+                ),
+            },
+        ));
+    }
     let (body, checksum_bytes) = bytes.split_at(CONTROL_PLANE_STATE_IDENTITY_LEN - 8);
     if checksum::crc64::checksum(body)
         != u64::from_be_bytes(
@@ -577,39 +649,79 @@ fn load_single_authority_clock_checkpoint_binding(
                 .expect("identity checksum has fixed length"),
         )
     {
-        return Err(ControlPlaneError::AuthorityClockCheckpoint {
-            message: "single-authority durable identity checksum mismatch".to_owned(),
-        });
+        return Err(SingleAuthorityIdentityDecodeError::Invalid(
+            ControlPlaneError::AuthorityClockCheckpoint {
+                message: "single-authority durable identity checksum mismatch".to_owned(),
+            },
+        ));
     }
-    if &body[..8] != CONTROL_PLANE_STATE_IDENTITY_MAGIC {
-        return Err(ControlPlaneError::AuthorityClockCheckpoint {
-            message: "single-authority durable identity magic mismatch".to_owned(),
-        });
+    if &body[..CONTROL_PLANE_STATE_IDENTITY_MAGIC.len()] != CONTROL_PLANE_STATE_IDENTITY_MAGIC {
+        return Err(SingleAuthorityIdentityDecodeError::Format(
+            SingleAuthorityIdentityFormatError::UnknownMagic,
+        ));
     }
+    let version_offset = CONTROL_PLANE_STATE_IDENTITY_MAGIC.len();
     let version = u16::from_be_bytes(
-        body[8..10]
+        body[version_offset..version_offset + 2]
             .try_into()
             .expect("identity version has fixed length"),
     );
     if version != CONTROL_PLANE_STATE_IDENTITY_VERSION {
-        return Err(ControlPlaneError::AuthorityClockCheckpoint {
-            message: format!("unsupported single-authority durable identity version {version}"),
-        });
+        return Err(SingleAuthorityIdentityDecodeError::Format(
+            SingleAuthorityIdentityFormatError::UnsupportedVersion(version),
+        ));
     }
     let mut binding = [0u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
-    binding.copy_from_slice(&body[10..]);
-    Ok(Some(ControlPlaneAuthorityClockCheckpointBinding(binding)))
+    binding.copy_from_slice(&body[version_offset + 2..]);
+    Ok(ControlPlaneAuthorityClockCheckpointBinding(binding))
+}
+
+fn load_single_authority_clock_checkpoint_binding_classified(
+    durable_state_path: &Path,
+) -> Result<Option<ControlPlaneAuthorityClockCheckpointBinding>, SingleAuthorityIdentityDecodeError>
+{
+    let identity_path = single_authority_identity_path(durable_state_path);
+    let Some(bytes) = read_fixed_control_plane_sidecar::<CONTROL_PLANE_STATE_IDENTITY_LEN>(
+        &identity_path,
+        "load single-authority control-plane durable identity",
+    )
+    .map_err(|error| match error {
+        FixedControlPlaneSidecarReadError::Truncated => SingleAuthorityIdentityDecodeError::Format(
+            SingleAuthorityIdentityFormatError::Truncated,
+        ),
+        FixedControlPlaneSidecarReadError::Invalid(error) => {
+            SingleAuthorityIdentityDecodeError::Invalid(error)
+        }
+    })?
+    else {
+        return Ok(None);
+    };
+    decode_single_authority_clock_checkpoint_binding(&bytes).map(Some)
+}
+
+fn load_single_authority_clock_checkpoint_binding(
+    durable_state_path: &Path,
+) -> Result<Option<ControlPlaneAuthorityClockCheckpointBinding>, ControlPlaneError> {
+    load_single_authority_clock_checkpoint_binding_classified(durable_state_path)
+        .map_err(SingleAuthorityIdentityDecodeError::into_control_plane_error)
+}
+
+fn encode_single_authority_clock_checkpoint_binding(
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(CONTROL_PLANE_STATE_IDENTITY_LEN);
+    bytes.extend_from_slice(CONTROL_PLANE_STATE_IDENTITY_MAGIC);
+    bytes.extend_from_slice(&CONTROL_PLANE_STATE_IDENTITY_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&binding.0);
+    bytes.extend_from_slice(&checksum::crc64::checksum(&bytes).to_be_bytes());
+    bytes
 }
 
 fn store_single_authority_clock_checkpoint_binding(
     durable_state_path: &Path,
     binding: ControlPlaneAuthorityClockCheckpointBinding,
 ) -> Result<(), ControlPlaneError> {
-    let mut bytes = Vec::with_capacity(CONTROL_PLANE_STATE_IDENTITY_LEN);
-    bytes.extend_from_slice(CONTROL_PLANE_STATE_IDENTITY_MAGIC);
-    bytes.extend_from_slice(&CONTROL_PLANE_STATE_IDENTITY_VERSION.to_be_bytes());
-    bytes.extend_from_slice(&binding.0);
-    bytes.extend_from_slice(&checksum::crc64::checksum(&bytes).to_be_bytes());
+    let bytes = encode_single_authority_clock_checkpoint_binding(binding);
     store_control_plane_sidecar(
         &single_authority_identity_path(durable_state_path),
         &single_authority_identity_tmp_path(durable_state_path),
@@ -631,7 +743,15 @@ fn load_single_authority_initialized_binding(
     let Some(bytes) = read_fixed_control_plane_sidecar::<SINGLE_AUTHORITY_INITIALIZED_LEN>(
         &initialized_path,
         "load single-authority control-plane initialization marker",
-    )?
+    )
+    .map_err(|error| match error {
+        FixedControlPlaneSidecarReadError::Truncated => {
+            ControlPlaneError::AuthorityClockCheckpoint {
+                message: "single-authority initialization marker is truncated".to_owned(),
+            }
+        }
+        FixedControlPlaneSidecarReadError::Invalid(error) => error,
+    })?
     else {
         return Ok(None);
     };
@@ -712,7 +832,16 @@ fn load_authority_clock_restart_checkpoint_classified(
         &checkpoint_path,
         "load control-plane authority clock checkpoint",
     )
-    .map_err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::Invalid)?
+    .map_err(|error| match error {
+        FixedControlPlaneSidecarReadError::Truncated => {
+            ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(
+                ControlPlaneAuthorityClockRestartCheckpointFormatError::Truncated,
+            )
+        }
+        FixedControlPlaneSidecarReadError::Invalid(error) => {
+            ControlPlaneAuthorityClockRestartCheckpointDecodeError::Invalid(error)
+        }
+    })?
     else {
         return Ok(None);
     };
@@ -929,6 +1058,57 @@ pub(crate) fn prepare_unsupported_authority_clock_checkpoint_restart_for_test(
     journal.sync_all().map_err(|source| {
         ControlPlaneError::io(
             "sync recoverable single-authority journal tail for checkpoint-ordering test",
+            source,
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn prepare_unsupported_single_authority_identity_restart_for_test(
+    durable_state_path: &Path,
+    version: u16,
+) -> Result<(), ControlPlaneError> {
+    if !matches!(version, 0 | 2) {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "test durable-identity version must be one of the retained adjacent fixtures"
+                .to_owned(),
+        });
+    }
+
+    let binding = ControlPlaneAuthorityClockCheckpointBinding([0x42; 32]);
+    store_single_authority_clock_checkpoint_binding(durable_state_path, binding)?;
+    let identity_path = single_authority_identity_path(durable_state_path);
+    let mut identity = std::fs::read(&identity_path).map_err(|source| {
+        ControlPlaneError::io(
+            "read single-authority identity for unsupported-version test",
+            source,
+        )
+    })?;
+    let version_offset = CONTROL_PLANE_STATE_IDENTITY_MAGIC.len();
+    identity[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+    let checksum_offset = identity.len() - std::mem::size_of::<u64>();
+    let checksum = checksum::crc64::checksum(&identity[..checksum_offset]);
+    identity[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&identity_path)
+        .map_err(|source| {
+            ControlPlaneError::io(
+                "open single-authority identity for unsupported-version test",
+                source,
+            )
+        })?;
+    file.write_all(&identity).map_err(|source| {
+        ControlPlaneError::io(
+            "write single-authority identity for unsupported-version test",
+            source,
+        )
+    })?;
+    file.sync_all().map_err(|source| {
+        ControlPlaneError::io(
+            "sync single-authority identity for unsupported-version test",
             source,
         )
     })?;

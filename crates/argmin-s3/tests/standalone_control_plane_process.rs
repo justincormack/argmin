@@ -1,6 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
@@ -12,7 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use storage::test_support::{
     observe_single_authority_durable_state, prepare_unsupported_authority_clock_checkpoint_restart,
-    TestUnsupportedAuthorityClockCheckpointVersion,
+    prepare_unsupported_single_authority_identity_restart,
+    TestUnsupportedAuthorityClockCheckpointVersion, TestUnsupportedSingleAuthorityIdentityVersion,
 };
 
 struct TestDir {
@@ -207,6 +209,17 @@ fn remove_socket_if_present(path: &Path) {
     }
 }
 
+fn create_control_plane_state_lock_file(state_path: &Path) {
+    let file_name = state_path
+        .file_name()
+        .expect("test state path should have a file name");
+    let mut lock_name = OsString::from(file_name);
+    lock_name.push(".lock");
+    let mut lock_path = state_path.to_path_buf();
+    lock_path.set_file_name(lock_name);
+    File::create(lock_path).expect("empty process lock file should be created");
+}
+
 #[test]
 fn unsupported_authority_clock_checkpoint_versions_fail_before_standalone_open_or_binding() {
     let bin = argmin_s3_bin();
@@ -268,6 +281,60 @@ fn unsupported_authority_clock_checkpoint_versions_fail_before_standalone_open_o
                 .expect("post-failure durable state should be observable"),
             expected,
             "checkpoint rejection must preserve the checkpoint, recoverable journal tail, and every other durable artifact"
+        );
+    }
+}
+
+#[test]
+fn unsupported_single_authority_identity_versions_fail_before_state_creation_or_binding() {
+    let bin = argmin_s3_bin();
+    for version in [
+        TestUnsupportedSingleAuthorityIdentityVersion::Zero,
+        TestUnsupportedSingleAuthorityIdentityVersion::Two,
+    ] {
+        let test_dir = TestDir::new();
+        let state_dir = test_dir.path.join("state");
+        fs::create_dir(&state_dir).expect("state directory should be created");
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
+            .expect("state directory should be private");
+        let state_path = state_dir.join("control.state");
+        create_control_plane_state_lock_file(&state_path);
+        let control_socket = test_dir.path.join("control.sock");
+        let recovery_socket = storage::control_plane_clock_recovery_socket_path(&control_socket);
+        let expected = prepare_unsupported_single_authority_identity_restart(&state_path, version)
+            .expect("unsupported durable-identity fixture should be installed");
+
+        let run = format!("unsupported-identity-v{}", version.encoded_version());
+        let mut process = spawn_standalone_control_plane(
+            &bin,
+            &test_dir.path,
+            &state_path,
+            &control_socket,
+            &run,
+        );
+        wait_for_failure(&mut process, &test_dir.path, &run);
+
+        let logs = process_logs(&test_dir.path, &run);
+        assert!(
+            logs.contains(&format!(
+                "unsupported single-authority durable identity version {}",
+                version.encoded_version()
+            )),
+            "standalone restart did not report the retained identity-version rejection\n{logs}"
+        );
+        assert!(
+            !control_socket.exists(),
+            "ordinary listener was bound before durable-identity rejection"
+        );
+        assert!(
+            !recovery_socket.exists(),
+            "clock-recovery listener was bound before durable-identity rejection"
+        );
+        assert_eq!(
+            observe_single_authority_durable_state(&state_path)
+                .expect("post-failure durable state should be observable"),
+            expected,
+            "identity rejection must preserve the invalid identity without creating or replacing any durable state artifact"
         );
     }
 }

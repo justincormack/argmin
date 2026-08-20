@@ -55,6 +55,90 @@ fn authority_clock_durable_state_binding_matches_frozen_versioned_vectors() {
 }
 
 #[test]
+fn single_authority_durable_identity_v1_layout_and_format_failures_are_exact() {
+    let binding = ControlPlaneAuthorityClockCheckpointBinding([
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ]);
+    let current = encode_single_authority_clock_checkpoint_binding(binding);
+    assert_eq!(
+        hex_encode(&current),
+        "41524743504944000001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1ff53237eea69307b9"
+    );
+    assert_eq!(
+        decode_single_authority_clock_checkpoint_binding(&current).unwrap(),
+        binding
+    );
+
+    for truncated_len in [0, 7, 8, 9, CONTROL_PLANE_STATE_IDENTITY_LEN - 1] {
+        assert!(matches!(
+            decode_single_authority_clock_checkpoint_binding(&current[..truncated_len]),
+            Err(SingleAuthorityIdentityDecodeError::Format(
+                SingleAuthorityIdentityFormatError::Truncated
+            ))
+        ));
+    }
+
+    let mut oversized = current.clone();
+    oversized.push(0);
+    assert!(matches!(
+        decode_single_authority_clock_checkpoint_binding(&oversized),
+        Err(SingleAuthorityIdentityDecodeError::Invalid(
+            ControlPlaneError::AuthorityClockCheckpoint { message }
+        )) if message.contains("length")
+    ));
+
+    let mut bad_checksum = current.clone();
+    *bad_checksum.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        decode_single_authority_clock_checkpoint_binding(&bad_checksum),
+        Err(SingleAuthorityIdentityDecodeError::Invalid(
+            ControlPlaneError::AuthorityClockCheckpoint { message }
+        )) if message == "single-authority durable identity checksum mismatch"
+    ));
+
+    let mut bad_magic = current.clone();
+    bad_magic[0] ^= 0xff;
+    reseal_crc64_suffix(&mut bad_magic);
+    assert!(matches!(
+        decode_single_authority_clock_checkpoint_binding(&bad_magic),
+        Err(SingleAuthorityIdentityDecodeError::Format(
+            SingleAuthorityIdentityFormatError::UnknownMagic
+        ))
+    ));
+
+    for version in [0u16, 2] {
+        let mut unsupported = current.clone();
+        let version_offset = CONTROL_PLANE_STATE_IDENTITY_MAGIC.len();
+        unsupported[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+        reseal_crc64_suffix(&mut unsupported);
+        assert!(matches!(
+            decode_single_authority_clock_checkpoint_binding(&unsupported),
+            Err(SingleAuthorityIdentityDecodeError::Format(
+                SingleAuthorityIdentityFormatError::UnsupportedVersion(actual)
+            )) if actual == version
+        ));
+    }
+
+    let tmp = test_util::tempdir();
+    let state_path = tmp.path().join("control-plane.state");
+    assert!(
+        load_single_authority_clock_checkpoint_binding_classified(&state_path)
+            .unwrap()
+            .is_none()
+    );
+    let identity_path = single_authority_identity_path(&state_path);
+    std::fs::write(&identity_path, &current[..9]).unwrap();
+    assert!(matches!(
+        load_single_authority_clock_checkpoint_binding_classified(&state_path),
+        Err(SingleAuthorityIdentityDecodeError::Format(
+            SingleAuthorityIdentityFormatError::Truncated
+        ))
+    ));
+}
+
+#[test]
 fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_requires_version_bump()
 {
     const EMPTY_STATE_V28: &str = concat!(
