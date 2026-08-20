@@ -696,15 +696,60 @@ pub fn load_authority_clock_restart_checkpoint(
     durable_state_path: &Path,
     expected_binding: ControlPlaneAuthorityClockCheckpointBinding,
 ) -> Result<Option<ControlPlaneAuthorityClockRestartCheckpoint>, ControlPlaneError> {
+    load_authority_clock_restart_checkpoint_classified(durable_state_path, expected_binding)
+        .map_err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::into_control_plane_error)
+}
+
+fn load_authority_clock_restart_checkpoint_classified(
+    durable_state_path: &Path,
+    expected_binding: ControlPlaneAuthorityClockCheckpointBinding,
+) -> Result<
+    Option<ControlPlaneAuthorityClockRestartCheckpoint>,
+    ControlPlaneAuthorityClockRestartCheckpointDecodeError,
+> {
     let checkpoint_path = authority_clock_restart_checkpoint_path(durable_state_path);
     let Some(bytes) = read_fixed_control_plane_sidecar::<CONTROL_PLANE_CLOCK_CHECKPOINT_LEN>(
         &checkpoint_path,
         "load control-plane authority clock checkpoint",
-    )?
+    )
+    .map_err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::Invalid)?
     else {
         return Ok(None);
     };
-    ControlPlaneAuthorityClockRestartCheckpoint::decode(&bytes, expected_binding).map(Some)
+    ControlPlaneAuthorityClockRestartCheckpoint::decode_classified(&bytes, expected_binding)
+        .map(Some)
+}
+
+pub fn load_authority_clock_restart_checkpoint_for_startup(
+    durable_state_path: &Path,
+    expected_binding: ControlPlaneAuthorityClockCheckpointBinding,
+) -> Result<Option<ControlPlaneAuthorityClockRestartCheckpoint>, ControlPlaneError> {
+    match load_authority_clock_restart_checkpoint_classified(
+        durable_state_path,
+        expected_binding,
+    ) {
+        Ok(checkpoint) => Ok(checkpoint),
+        Err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(
+            error @ (ControlPlaneAuthorityClockRestartCheckpointFormatError::UnknownMagic
+            | ControlPlaneAuthorityClockRestartCheckpointFormatError::UnsupportedVersion(_)),
+        )) => Err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(error)
+            .into_control_plane_error()),
+        Err(
+            error @ (ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(
+                ControlPlaneAuthorityClockRestartCheckpointFormatError::Truncated,
+            )
+            | ControlPlaneAuthorityClockRestartCheckpointDecodeError::Invalid(
+                ControlPlaneError::AuthorityClockCheckpoint { .. },
+            )),
+        ) => {
+            eprintln!(
+                "control-plane authority clock checkpoint is invalid; treating restart continuity evidence as absent: {}",
+                error.into_control_plane_error()
+            );
+            Ok(None)
+        }
+        Err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::Invalid(error)) => Err(error),
+    }
 }
 
 pub fn invalidate_authority_clock_restart_checkpoint(

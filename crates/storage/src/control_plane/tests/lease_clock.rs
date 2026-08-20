@@ -1374,6 +1374,150 @@ fn file_backed_authority_does_not_replace_blocked_restart_checkpoint() {
 }
 
 #[test]
+fn authority_clock_restart_checkpoint_v2_layouts_and_format_failures_are_exact() {
+    const BINDING_BYTES: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+    let binding = ControlPlaneAuthorityClockCheckpointBinding(BINDING_BYTES);
+    let absent = ControlPlaneAuthorityClockRestartCheckpoint::new(
+        binding,
+        0x0102_0304_0506_0708,
+        None,
+        0x1112_1314_1516_1718,
+        0x2122_2324_2526_2728,
+    );
+    let present = ControlPlaneAuthorityClockRestartCheckpoint::new(
+        binding,
+        0x3132_3334_3536_3738,
+        Some(0x4142_4344_4546_4748),
+        0x5152_5354_5556_5758,
+        0x6162_6364_6566_6768,
+    );
+    let absent_bytes = absent.encode();
+    let present_bytes = present.encode();
+
+    assert_eq!(
+        hex_encode(&absent_bytes),
+        "4152474350434c4b0002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f010203040506070800000000000000000011121314151617182122232425262728d78e0c180d3a4014"
+    );
+    assert_eq!(
+        hex_encode(&present_bytes),
+        "4152474350434c4b0002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f31323334353637380141424344454647485152535455565758616263646566676821d8fc8b9f1d5b91"
+    );
+    assert_eq!(
+        ControlPlaneAuthorityClockRestartCheckpoint::decode_classified(&absent_bytes, binding)
+            .unwrap(),
+        absent
+    );
+    assert_eq!(
+        ControlPlaneAuthorityClockRestartCheckpoint::decode_classified(&present_bytes, binding)
+            .unwrap(),
+        present
+    );
+
+    for truncated_len in [0, 7, 8, 9, CONTROL_PLANE_CLOCK_CHECKPOINT_LEN - 1] {
+        assert!(matches!(
+            ControlPlaneAuthorityClockRestartCheckpoint::decode_classified(
+                &absent_bytes[..truncated_len],
+                binding,
+            ),
+            Err(
+                ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(
+                    ControlPlaneAuthorityClockRestartCheckpointFormatError::Truncated
+                )
+            )
+        ));
+    }
+
+    let mut bad_magic = absent_bytes.clone();
+    bad_magic[0] ^= 0xff;
+    reseal_crc64_suffix(&mut bad_magic);
+    assert!(matches!(
+        ControlPlaneAuthorityClockRestartCheckpoint::decode_classified(&bad_magic, binding),
+        Err(
+            ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(
+                ControlPlaneAuthorityClockRestartCheckpointFormatError::UnknownMagic
+            )
+        )
+    ));
+
+    for version in [
+        CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION - 1,
+        CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION + 1,
+    ] {
+        let mut unsupported = absent_bytes.clone();
+        let version_offset = CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC.len();
+        unsupported[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+        reseal_crc64_suffix(&mut unsupported);
+        assert!(matches!(
+            ControlPlaneAuthorityClockRestartCheckpoint::decode_classified(&unsupported, binding),
+            Err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(
+                ControlPlaneAuthorityClockRestartCheckpointFormatError::UnsupportedVersion(
+                    actual
+                )
+            )) if actual == version
+        ));
+    }
+}
+
+#[test]
+fn authority_clock_restart_checkpoint_startup_policy_is_format_specific_and_nonmutating() {
+    let tmp = test_util::tempdir();
+    let state_path = tmp.path().join("control-plane.state");
+    let checkpoint_path = authority_clock_restart_checkpoint_path(&state_path);
+    let binding = ControlPlaneAuthorityClockCheckpointBinding([0x41; 32]);
+    let current =
+        ControlPlaneAuthorityClockRestartCheckpoint::new(binding, 1, Some(2), 3, 4).encode();
+
+    let mut hard_failures = Vec::new();
+    let mut bad_magic = current.clone();
+    bad_magic[0] ^= 0xff;
+    reseal_crc64_suffix(&mut bad_magic);
+    hard_failures.push((bad_magic, "checkpoint magic mismatch".to_owned()));
+    for version in [
+        CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION - 1,
+        CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION + 1,
+    ] {
+        let mut unsupported = current.clone();
+        let version_offset = CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC.len();
+        unsupported[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+        reseal_crc64_suffix(&mut unsupported);
+        hard_failures.push((
+            unsupported,
+            format!("unsupported checkpoint version {version}"),
+        ));
+    }
+    for (bytes, expected_message) in hard_failures {
+        std::fs::write(&checkpoint_path, &bytes).unwrap();
+        assert!(matches!(
+            load_authority_clock_restart_checkpoint_for_startup(&state_path, binding),
+            Err(ControlPlaneError::AuthorityClockCheckpoint { message })
+                if message == expected_message
+        ));
+        assert_eq!(std::fs::read(&checkpoint_path).unwrap(), bytes);
+    }
+
+    let mut bad_checksum = current.clone();
+    *bad_checksum.last_mut().unwrap() ^= 0xff;
+    for bytes in [current[..9].to_vec(), bad_checksum, current.clone()] {
+        std::fs::write(&checkpoint_path, &bytes).unwrap();
+        let expected_binding = if bytes == current {
+            ControlPlaneAuthorityClockCheckpointBinding([0x42; 32])
+        } else {
+            binding
+        };
+        assert_eq!(
+            load_authority_clock_restart_checkpoint_for_startup(&state_path, expected_binding,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read(&checkpoint_path).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn authority_clock_restart_checkpoint_file_round_trips_and_rejects_corruption() {
     let tmp = test_util::tempdir();
     let state_path = tmp.path().join("control-plane.state");

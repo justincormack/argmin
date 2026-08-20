@@ -373,17 +373,12 @@ mod tests {
         *last ^= 1;
         std::fs::write(checkpoint_path, bytes).unwrap();
 
-        assert_eq!(
-            load_process_authority_clock_restart_checkpoint(&state_path, binding).unwrap(),
-            None
-        );
-        let clock = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
-            Some(999),
-            1_000,
-            Some(1_000),
-            None,
-        )
-        .unwrap();
+        let restart_checkpoint =
+            load_authority_clock_restart_checkpoint_for_startup(&state_path, binding).unwrap();
+        assert_eq!(restart_checkpoint, None);
+        let clock = storage::clock::with_time_override(1_000, || {
+            initialize_process_authority_clock(&state_path, Some(999), restart_checkpoint).unwrap()
+        });
         assert!(!clock
             .status(ControlPlaneAuthorityClockContext::new(
                 Some(999),
@@ -392,6 +387,42 @@ mod tests {
                 true,
             ))
             .established());
+        assert_eq!(
+            load_authority_clock_restart_checkpoint(&state_path, binding).unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn corrupt_authority_clock_checkpoint_without_timestamp_state_is_retained() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-corrupt-unused-authority-clock-checkpoint-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state_path = tmp.join("control-plane.state");
+        let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft("test-cluster", 1);
+        storage::clock::with_time_override(1_000, || {
+            store_authority_clock_restart_checkpoint(&state_path, binding, 1, None).unwrap();
+        });
+        let mut checkpoint_path = state_path.as_os_str().to_os_string();
+        checkpoint_path.push(".clock");
+        let checkpoint_path = PathBuf::from(checkpoint_path);
+        let mut corrupted = std::fs::read(&checkpoint_path).unwrap();
+        *corrupted.last_mut().unwrap() ^= 1;
+        std::fs::write(&checkpoint_path, &corrupted).unwrap();
+
+        let restart_checkpoint =
+            load_authority_clock_restart_checkpoint_for_startup(&state_path, binding).unwrap();
+        assert_eq!(restart_checkpoint, None);
+        let clock = storage::clock::with_time_override(1_000, || {
+            initialize_process_authority_clock(&state_path, None, restart_checkpoint).unwrap()
+        });
+
+        assert!(clock.is_established());
+        assert_eq!(std::fs::read(checkpoint_path).unwrap(), corrupted);
         std::fs::remove_dir_all(tmp).unwrap();
     }
 

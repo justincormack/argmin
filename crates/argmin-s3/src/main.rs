@@ -36,9 +36,9 @@ use server_core::sse::{
 };
 use storage::control_plane::{
     ensure_control_plane_state_parent_directory, invalidate_authority_clock_restart_checkpoint,
-    load_authority_clock_restart_checkpoint, ClusterRuntimeMapSnapshot,
+    load_authority_clock_restart_checkpoint_for_startup, ClusterRuntimeMapSnapshot,
     ControlPlaneAdminAuthCredentialInput, ControlPlaneAuthorityClock,
-    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneAuthorityClockCheckpointTarget,
+    ControlPlaneAuthorityClockCheckpointTarget, ControlPlaneAuthorityClockRestartCheckpoint,
     ControlPlaneError, ControlPlaneFrontendAuthCredentialInput,
     ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
     ControlPlaneStorageNodeAuthCredentialInput, FileControlPlaneStore, SingleAuthorityControlPlane,
@@ -46,7 +46,8 @@ use storage::control_plane::{
 };
 #[cfg(test)]
 use storage::control_plane::{
-    store_authority_clock_restart_checkpoint, ClusterControlSnapshot, ControlPlaneAdmin,
+    load_authority_clock_restart_checkpoint, store_authority_clock_restart_checkpoint,
+    ClusterControlSnapshot, ControlPlaneAdmin, ControlPlaneAuthorityClockCheckpointBinding,
     ControlPlaneAuthorityClockContext, ControlPlaneRpcResponsePublication,
     LeaseHorizonAuthorityBinding, PgMetadataTransferProof, UnixControlPlaneClient,
 };
@@ -1512,7 +1513,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                     eprintln!("failed to load control-plane durable identity: {error}");
                     std::process::exit(1);
                 });
-            let restart_clock_checkpoint = load_process_authority_clock_restart_checkpoint(
+            let restart_clock_checkpoint = load_authority_clock_restart_checkpoint_for_startup(
                 store.path(),
                 authority_clock_checkpoint_binding,
             )
@@ -1528,24 +1529,15 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 eprintln!("failed to bootstrap control-plane state: {error}");
                 std::process::exit(1);
             });
-            let mut authority_clock =
-                ControlPlaneAuthorityClock::new_from_process_clock_with_restart_checkpoint(
-                    authority.snapshot().max_committed_timestamp_ms(),
-                    restart_clock_checkpoint,
-                )
-                .unwrap_or_else(|error| {
-                    eprintln!("failed to initialize control-plane authority clock: {error}");
-                    std::process::exit(1);
-                });
-            if !authority_clock.is_established() {
-                invalidate_authority_clock_restart_checkpoint(Path::new(state_path))
-                    .unwrap_or_else(|error| {
-                        eprintln!(
-                            "failed to invalidate blocked authority clock checkpoint: {error}"
-                        );
-                        std::process::exit(1);
-                    });
-            }
+            let mut authority_clock = initialize_process_authority_clock(
+                Path::new(state_path),
+                authority.snapshot().max_committed_timestamp_ms(),
+                restart_clock_checkpoint,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("failed to initialize control-plane authority clock: {error}");
+                std::process::exit(1);
+            });
             if let Some(previous_authority) = authority.snapshot().lease_grant_horizon_authority() {
                 if !authority_clock
                     .resume_single_authority_lease_horizon_generation(previous_authority)
@@ -2219,6 +2211,22 @@ fn uncertified_initial_control_plane_topology(
     storage::derive_uncertified_initial_control_plane_topology(&endpoints, &config.storage_pg_ids)
 }
 
+fn initialize_process_authority_clock(
+    durable_state_path: &Path,
+    committed_timestamp_high_water_ms: Option<u64>,
+    restart_checkpoint: Option<ControlPlaneAuthorityClockRestartCheckpoint>,
+) -> Result<ControlPlaneAuthorityClock, ControlPlaneError> {
+    let authority_clock =
+        ControlPlaneAuthorityClock::new_from_process_clock_with_restart_checkpoint(
+            committed_timestamp_high_water_ms,
+            restart_checkpoint,
+        )?;
+    if !authority_clock.is_established() {
+        invalidate_authority_clock_restart_checkpoint(durable_state_path)?;
+    }
+    Ok(authority_clock)
+}
+
 fn bootstrap_empty_control_plane(
     authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
     config: &ServerConfig,
@@ -2238,25 +2246,6 @@ fn bootstrap_empty_control_plane(
         epoch
     );
     Ok(())
-}
-
-fn load_process_authority_clock_restart_checkpoint(
-    durable_state_path: &Path,
-    binding: ControlPlaneAuthorityClockCheckpointBinding,
-) -> Result<
-    Option<storage::control_plane::ControlPlaneAuthorityClockRestartCheckpoint>,
-    ControlPlaneError,
-> {
-    match load_authority_clock_restart_checkpoint(durable_state_path, binding) {
-        Ok(checkpoint) => Ok(checkpoint),
-        Err(error @ ControlPlaneError::AuthorityClockCheckpoint { .. }) => {
-            eprintln!(
-                "control-plane authority clock checkpoint is invalid; starting non-serving until authenticated recovery: {error}"
-            );
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
 }
 
 fn configured_storage_node_auth_credential_input(

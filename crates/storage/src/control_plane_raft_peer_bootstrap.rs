@@ -36,7 +36,9 @@ use crate::control_plane_raft::{
 use crate::control_plane_raft_durability::{
     ControlPlaneRaftCheckpointMonitor, ControlPlaneRaftOuterIdentityPublisher,
 };
-use crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost;
+use crate::control_plane_raft_host::{
+    ControlPlaneRaftAuthorityHost, PreparedControlPlaneRaftAuthorityClock,
+};
 use crate::StaticInitialControlPlaneTopology;
 
 /// Logical credential material for one Raft peer principal.
@@ -240,6 +242,7 @@ pub struct PreparedControlPlaneRaftAuthority<'a> {
     bootstrap: ControlPlaneRaftPeerBootstrap,
     authority: Arc<ControlPlaneRaftAuthority>,
     durability: crate::control_plane_raft_durability::ControlPlaneRaftAuthorityDurability,
+    authority_clock: PreparedControlPlaneRaftAuthorityClock,
     outer_identity: ControlPlaneRaftOuterIdentityStartup<'a>,
 }
 
@@ -250,6 +253,7 @@ impl fmt::Debug for PreparedControlPlaneRaftAuthority<'_> {
             .field("bootstrap", &self.bootstrap)
             .field("authority", &"<opaque>")
             .field("durability", &self.durability)
+            .field("authority_clock", &"<classified>")
             .field("outer_identity", &self.outer_identity)
             .finish()
     }
@@ -503,8 +507,8 @@ impl ControlPlaneRaftPeerBootstrap {
             .await
     }
 
-    /// Open and validate durable state before the deployment publishes any
-    /// inbound peer listener.
+    /// Classify the authority-clock checkpoint, then open and validate durable
+    /// state before the deployment publishes any inbound peer listener.
     ///
     /// The returned typestate owns the exact authority and durability
     /// lifecycle needed to complete startup after process-owned socket
@@ -527,6 +531,14 @@ impl ControlPlaneRaftPeerBootstrap {
             ));
         }
 
+        // This must precede opening the authority: opening may replay or
+        // publish durable Raft state, while an unsupported checkpoint format
+        // is a hard startup incompatibility.
+        let authority_clock = PreparedControlPlaneRaftAuthorityClock::load(
+            artifact_path,
+            &self.cluster_name,
+            self.local_node_id,
+        )?;
         let authority = Arc::new(
             self.open_durable_authority(artifact_path, outer_identity.is_established())
                 .await?,
@@ -536,6 +548,7 @@ impl ControlPlaneRaftPeerBootstrap {
             bootstrap: self.clone(),
             authority,
             durability,
+            authority_clock,
             outer_identity,
         })
     }
@@ -551,9 +564,10 @@ impl PreparedControlPlaneRaftAuthority<'_> {
     /// Publish peer listeners and complete startup as one storage-owned
     /// lifecycle.
     ///
-    /// Storage owns checkpoint monitoring, membership initialization, startup
-    /// convergence, certified topology establishment, initial durability
-    /// publication, and steady-state host construction in that order.
+    /// Storage owns authority-clock host initialization, checkpoint
+    /// monitoring, membership initialization, startup convergence, certified
+    /// topology establishment, and initial durability publication in that
+    /// order.
     pub async fn start(
         self,
         listener_inputs: Vec<ControlPlaneRaftPeerServerListenerInput>,
@@ -565,10 +579,16 @@ impl PreparedControlPlaneRaftAuthority<'_> {
             bootstrap,
             authority,
             durability,
+            authority_clock,
             outer_identity,
         } = self;
-        let mut startup_failure_guard = AuthorityStartupFailureGuard::new(Arc::clone(&authority));
         let runtime = durability.runtime();
+        let mut startup_failure_guard = AuthorityStartupFailureGuard::new(Arc::clone(&authority));
+        let prepared_host = ControlPlaneRaftAuthorityHost::start_prepared(
+            runtime.clone(),
+            Arc::clone(&authority),
+            authority_clock,
+        )?;
         let peer_server_durability = durability.peer_server_durability()?;
         let peer_server = ControlPlaneRaftPeerServerBootstrap::for_authority(
             Arc::clone(&authority),
@@ -599,18 +619,18 @@ impl PreparedControlPlaneRaftAuthority<'_> {
             durability.store_restart_artifact()?;
         }
 
-        if bootstrap.startup_requires_local_leader() {
+        if bootstrap.startup_requires_local_leader() || initialized_membership {
             authority
                 .wait_for_current_leader(
                     bootstrap.local_node_id,
                     startup_timeout,
-                    "single-node control-plane startup leadership",
+                    "control-plane initial-membership startup leadership",
                 )
                 .await?;
             wait_for_local_authority_serving(
                 &authority,
                 startup_timeout,
-                "single-node control-plane startup",
+                "control-plane initial-membership startup",
             )
             .await?;
         } else if !outer_identity.is_configured() {
@@ -647,7 +667,7 @@ impl PreparedControlPlaneRaftAuthority<'_> {
             }
         }
 
-        let host = ControlPlaneRaftAuthorityHost::start_durable(runtime, authority)?;
+        let host = prepared_host.finish_startup()?;
         startup_failure_guard.disarm();
         Ok(ControlPlaneRaftAuthorityService {
             host,
@@ -1137,9 +1157,16 @@ impl ControlPlaneRaftPeerTestClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_plane::ControlPlaneRuntimeMapSource;
     use crate::control_plane_auth::{ControlPlaneAuthOperation, ControlPlaneAuthRejectionReason};
     use crate::control_plane_raft::ControlPlaneRaftTopologyIdentity;
+    use crate::{
+        derive_static_initial_control_plane_topology, derive_static_initial_pg_placement,
+        StaticStorageFailureDomain, StaticStorageNodeEndpoint, StaticStoragePlacementNode,
+    };
     use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     struct NoopPeerServerCheckpoint;
@@ -1259,6 +1286,8 @@ mod tests {
             .host()
             .linearized_authority_serving()
             .expect("returned host should share the serving authority");
+        ControlPlaneRuntimeMapSource::runtime_map_snapshot(service.host(), 0)
+            .expect("fresh startup should bind its first leadership term on clock-backed access");
 
         authority
             .durability_publication()
@@ -1271,6 +1300,98 @@ mod tests {
         runtime
             .block_on(authority.shutdown())
             .expect("started authority should shut down");
+    }
+
+    #[test]
+    fn restarted_single_node_binds_converged_term_before_clock_backed_access() {
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("authority.state");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("restart test runtime should build");
+        let bootstrap = ControlPlaneRaftPeerBootstrap::single_node("restart-owner", 1);
+
+        let first_prepared = runtime
+            .block_on(bootstrap.prepare_durable_authority(
+                runtime.handle().clone(),
+                &artifact_path,
+                ControlPlaneRaftOuterIdentityStartup::NotConfigured,
+            ))
+            .expect("fresh authority should prepare");
+        let first_authority = Arc::clone(&first_prepared.authority);
+        let first_service = runtime
+            .block_on(first_prepared.start(
+                Vec::new(),
+                1024,
+                Duration::from_secs(1),
+                Arc::new(|| {}),
+            ))
+            .expect("fresh authority should start");
+        ControlPlaneRuntimeMapSource::runtime_map_snapshot(first_service.host(), 0)
+            .expect("fresh authority clock-backed read should succeed");
+
+        let mut checkpoint_path = artifact_path.as_os_str().to_os_string();
+        checkpoint_path.push(".clock");
+        assert!(
+            PathBuf::from(checkpoint_path).is_file(),
+            "fresh startup must persist a valid clock sidecar for restart"
+        );
+        first_authority
+            .durability_publication()
+            .expect("fresh authority should retain its publication domain")
+            .poison("stop first restart-test authority");
+        let ControlPlaneRaftAuthorityService {
+            host: first_host,
+            _checkpoint_monitor: first_checkpoint_monitor,
+            _peer_server_loops: first_peer_server_loops,
+            ..
+        } = first_service;
+        first_checkpoint_monitor
+            .join_for_test()
+            .expect("first checkpoint monitor should stop after poison");
+        runtime
+            .block_on(first_authority.shutdown())
+            .expect("first authority should shut down");
+        drop(first_host);
+        drop(first_peer_server_loops);
+        drop(first_authority);
+
+        let restarted_prepared = runtime
+            .block_on(bootstrap.prepare_durable_authority(
+                runtime.handle().clone(),
+                &artifact_path,
+                ControlPlaneRaftOuterIdentityStartup::NotConfigured,
+            ))
+            .expect("valid restart artifact and clock sidecar should prepare");
+        let restarted_authority = Arc::clone(&restarted_prepared.authority);
+        assert!(runtime
+            .block_on(restarted_authority.is_initialized())
+            .expect("restored membership should inspect"));
+
+        let restarted_service = runtime
+            .block_on(restarted_prepared.start(
+                Vec::new(),
+                1024,
+                Duration::from_secs(1),
+                Arc::new(|| {}),
+            ))
+            .expect("restored authority should start");
+        ControlPlaneRuntimeMapSource::runtime_map_snapshot(restarted_service.host(), 0)
+            .expect("restart must bind its converged term before clock-backed access");
+
+        restarted_authority
+            .durability_publication()
+            .expect("restored authority should retain its publication domain")
+            .poison("stop second restart-test authority");
+        restarted_service
+            ._checkpoint_monitor
+            .join_for_test()
+            .expect("second checkpoint monitor should stop after poison");
+        runtime
+            .block_on(restarted_authority.shutdown())
+            .expect("restored authority should shut down");
     }
 
     #[test]
@@ -1309,6 +1430,131 @@ mod tests {
             ControlPlaneError::StaticTopologyFailure { .. }
         ));
         assert!(!artifact_path.exists());
+    }
+
+    #[test]
+    fn prepared_startup_rejects_hard_clock_formats_before_open_or_outer_identity_publication() {
+        struct RecordingPublisher(AtomicBool);
+
+        impl ControlPlaneRaftOuterIdentityPublisher for RecordingPublisher {
+            fn publish(
+                &self,
+                _authority_artifact_path: &Path,
+            ) -> Result<
+                (),
+                crate::control_plane_raft_durability::ControlPlaneRaftOuterIdentityPublicationError,
+            > {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("authority.state");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("startup test runtime should build");
+
+        // Seed a current restart artifact and matching clock sidecar. The
+        // tested startup below uses the complete prepared-authority typestate,
+        // rather than opening an authority and invoking the host directly.
+        let seed_authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                        "test-cluster",
+                        1,
+                        &artifact_path,
+                    ),
+                )
+                .expect("seed authority should initialize"),
+        );
+        let seed_durability = seed_authority
+            .durability_lifecycle(runtime.handle().clone())
+            .expect("seed authority should issue durability");
+        seed_durability
+            .store_restart_artifact()
+            .expect("seed restart artifacts should persist");
+        runtime
+            .block_on(seed_authority.shutdown())
+            .expect("seed authority should shut down");
+        drop(seed_durability);
+        drop(seed_authority);
+
+        let artifact_before = std::fs::read(&artifact_path).unwrap();
+        let mut checkpoint_path = artifact_path.as_os_str().to_os_string();
+        checkpoint_path.push(".clock");
+        let checkpoint_path = PathBuf::from(checkpoint_path);
+        let current_checkpoint = std::fs::read(&checkpoint_path).unwrap();
+
+        let placement = derive_static_initial_pg_placement(
+            1,
+            1,
+            0,
+            StaticStorageFailureDomain::None,
+            &["host-a".to_owned(), "host-b".to_owned()],
+            &["disk-a".to_owned(), "disk-b".to_owned()],
+            &[
+                StaticStoragePlacementNode::new(1, "host-a", "disk-a"),
+                StaticStoragePlacementNode::new(2, "host-b", "disk-b"),
+            ],
+        )
+        .expect("static placement should derive");
+        let topology = derive_static_initial_control_plane_topology(
+            1,
+            &"aa".repeat(32),
+            &[1, 2],
+            &[
+                StaticStorageNodeEndpoint::new(1, "/tmp/node-1.sock"),
+                StaticStorageNodeEndpoint::new(2, "/tmp/node-2.sock"),
+            ],
+            placement,
+        )
+        .expect("static topology should derive");
+        let bootstrap = replicated_bootstrap(
+            1,
+            ControlPlaneRaftPeerTopologyBinding::StaticInitial(topology),
+            Vec::new(),
+            None,
+        )
+        .expect("static peer bootstrap should build");
+        let publisher = RecordingPublisher(AtomicBool::new(false));
+
+        let mut hard_failures = Vec::new();
+        let mut bad_magic = current_checkpoint.clone();
+        bad_magic[0] ^= 0xff;
+        reseal_crc64_suffix_for_test(&mut bad_magic);
+        hard_failures.push((bad_magic, "checkpoint magic mismatch".to_owned()));
+        for version in [1u16, 3u16] {
+            let mut unsupported = current_checkpoint.clone();
+            unsupported[8..10].copy_from_slice(&version.to_be_bytes());
+            reseal_crc64_suffix_for_test(&mut unsupported);
+            hard_failures.push((
+                unsupported,
+                format!("unsupported checkpoint version {version}"),
+            ));
+        }
+
+        for (bytes, expected_message) in hard_failures {
+            std::fs::write(&checkpoint_path, &bytes).unwrap();
+            let error = runtime
+                .block_on(bootstrap.prepare_durable_authority(
+                    runtime.handle().clone(),
+                    &artifact_path,
+                    ControlPlaneRaftOuterIdentityStartup::Publish(&publisher),
+                ))
+                .expect_err("hard checkpoint formats must prevent prepared startup");
+            assert!(matches!(
+                error,
+                ControlPlaneError::AuthorityClockCheckpoint { message }
+                    if message == expected_message
+            ));
+            assert!(!publisher.0.load(Ordering::SeqCst));
+            assert_eq!(std::fs::read(&artifact_path).unwrap(), artifact_before);
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -1389,6 +1635,12 @@ mod tests {
             credential_version,
             secret.as_bytes().to_vec(),
         )
+    }
+
+    fn reseal_crc64_suffix_for_test(bytes: &mut [u8]) {
+        let checksum_offset = bytes.len() - std::mem::size_of::<u64>();
+        let checksum = checksum::crc64::checksum(&bytes[..checksum_offset]);
+        bytes[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
     }
 
     #[test]

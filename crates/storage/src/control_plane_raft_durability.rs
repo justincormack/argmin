@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 
 use tokio::runtime::Handle;
 
+#[cfg(test)]
+use crate::control_plane::ControlPlaneAuthorityClockRestartCheckpoint;
 use crate::control_plane::{
     invalidate_authority_clock_restart_checkpoint, load_authority_clock_restart_checkpoint,
     store_authority_clock_restart_checkpoint, ControlPlaneAuthorityClockCheckpointTarget,
-    ControlPlaneAuthorityClockRestartCheckpoint, ControlPlaneError,
+    ControlPlaneError,
 };
 use crate::control_plane_raft::{
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus,
@@ -321,6 +323,7 @@ impl ControlPlaneRaftAuthorityDurability {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn load_authority_clock_restart_checkpoint(
         &self,
     ) -> Result<Option<ControlPlaneAuthorityClockRestartCheckpoint>, ControlPlaneError> {
@@ -328,21 +331,6 @@ impl ControlPlaneRaftAuthorityDurability {
             &self.inner.artifact_path,
             self.authority.authority_clock_checkpoint_binding(),
         )
-    }
-
-    pub(crate) fn load_authority_clock_restart_checkpoint_for_startup(
-        &self,
-    ) -> Result<Option<ControlPlaneAuthorityClockRestartCheckpoint>, ControlPlaneError> {
-        match self.load_authority_clock_restart_checkpoint() {
-            Ok(checkpoint) => Ok(checkpoint),
-            Err(error @ ControlPlaneError::AuthorityClockCheckpoint { .. }) => {
-                eprintln!(
-                    "control-plane authority clock checkpoint is invalid; starting non-serving until authenticated recovery: {error}"
-                );
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
     }
 
     pub(crate) fn invalidate_authority_clock_restart_checkpoint(

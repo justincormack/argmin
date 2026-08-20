@@ -39,6 +39,48 @@ impl ControlPlaneAuthorityClockCheckpointBinding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneAuthorityClockRestartCheckpointFormatError {
+    Truncated,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for ControlPlaneAuthorityClockRestartCheckpointFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("checkpoint is truncated"),
+            Self::UnknownMagic => formatter.write_str("checkpoint magic mismatch"),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported checkpoint version {version}")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ControlPlaneAuthorityClockRestartCheckpointDecodeError {
+    Format(ControlPlaneAuthorityClockRestartCheckpointFormatError),
+    Invalid(ControlPlaneError),
+}
+
+impl ControlPlaneAuthorityClockRestartCheckpointDecodeError {
+    fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::Format(error) => ControlPlaneError::AuthorityClockCheckpoint {
+                message: error.to_string(),
+            },
+            Self::Invalid(error) => error,
+        }
+    }
+}
+
+impl From<ControlPlaneError> for ControlPlaneAuthorityClockRestartCheckpointDecodeError {
+    fn from(error: ControlPlaneError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPlaneAuthorityClockRestartCheckpoint {
     binding: ControlPlaneAuthorityClockCheckpointBinding,
     authority_generation: u64,
@@ -130,17 +172,23 @@ impl ControlPlaneAuthorityClockRestartCheckpoint {
         bytes
     }
 
-    fn decode(
+    fn decode_classified(
         bytes: &[u8],
         expected_binding: ControlPlaneAuthorityClockCheckpointBinding,
-    ) -> Result<Self, ControlPlaneError> {
+    ) -> Result<Self, ControlPlaneAuthorityClockRestartCheckpointDecodeError> {
+        if bytes.len() < CONTROL_PLANE_CLOCK_CHECKPOINT_LEN {
+            return Err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(
+                ControlPlaneAuthorityClockRestartCheckpointFormatError::Truncated,
+            ));
+        }
         if bytes.len() != CONTROL_PLANE_CLOCK_CHECKPOINT_LEN {
             return Err(ControlPlaneError::AuthorityClockCheckpoint {
                 message: format!(
                     "checkpoint length {} does not match required fixed length {CONTROL_PLANE_CLOCK_CHECKPOINT_LEN}",
                     bytes.len()
                 ),
-            });
+            }
+            .into());
         }
         let (body, encoded_checksum) =
             bytes.split_at(bytes.len() - CONTROL_PLANE_CLOCK_CHECKPOINT_CHECKSUM_LEN);
@@ -153,10 +201,14 @@ impl ControlPlaneAuthorityClockRestartCheckpoint {
         if actual_checksum != expected_checksum {
             return Err(ControlPlaneError::AuthorityClockCheckpoint {
                 message: "checkpoint checksum mismatch".to_owned(),
-            });
+            }
+            .into());
         }
         let mut offset = 0usize;
-        let mut take = |len: usize| -> Result<&[u8], ControlPlaneError> {
+        let mut take = |len: usize| -> Result<
+            &[u8],
+            ControlPlaneAuthorityClockRestartCheckpointDecodeError,
+        > {
             let end = offset.checked_add(len).ok_or_else(|| {
                 ControlPlaneError::AuthorityClockCheckpoint {
                     message: "checkpoint offset overflow".to_owned(),
@@ -172,9 +224,9 @@ impl ControlPlaneAuthorityClockRestartCheckpoint {
         };
         if take(CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC.len())? != CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC
         {
-            return Err(ControlPlaneError::AuthorityClockCheckpoint {
-                message: "checkpoint magic mismatch".to_owned(),
-            });
+            return Err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(
+                ControlPlaneAuthorityClockRestartCheckpointFormatError::UnknownMagic,
+            ));
         }
         let version = u16::from_be_bytes(
             take(2)?
@@ -182,16 +234,19 @@ impl ControlPlaneAuthorityClockRestartCheckpoint {
                 .expect("clock checkpoint version has fixed length"),
         );
         if version != CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION {
-            return Err(ControlPlaneError::AuthorityClockCheckpoint {
-                message: format!("unsupported checkpoint version {version}"),
-            });
+            return Err(ControlPlaneAuthorityClockRestartCheckpointDecodeError::Format(
+                ControlPlaneAuthorityClockRestartCheckpointFormatError::UnsupportedVersion(
+                    version,
+                ),
+            ));
         }
         let binding = Self::read_binding(take(CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN)?);
         if binding != expected_binding {
             return Err(ControlPlaneError::AuthorityClockCheckpoint {
                 message: "checkpoint durable-state identity does not match this authority"
                     .to_owned(),
-            });
+            }
+            .into());
         }
         let authority_generation = u64::from_be_bytes(
             take(8)?
@@ -201,7 +256,8 @@ impl ControlPlaneAuthorityClockRestartCheckpoint {
         if authority_generation == 0 {
             return Err(ControlPlaneError::AuthorityClockCheckpoint {
                 message: "checkpoint authority generation must be nonzero".to_owned(),
-            });
+            }
+            .into());
         }
         let timestamp_tag = take(1)?[0];
         let encoded_timestamp = u64::from_be_bytes(
@@ -214,13 +270,15 @@ impl ControlPlaneAuthorityClockRestartCheckpoint {
             0 => {
                 return Err(ControlPlaneError::AuthorityClockCheckpoint {
                     message: "absent checkpoint timestamp must use canonical zero value".to_owned(),
-                });
+                }
+                .into());
             }
             1 => Some(encoded_timestamp),
             tag => {
                 return Err(ControlPlaneError::AuthorityClockCheckpoint {
                     message: format!("invalid checkpoint timestamp option tag {tag}"),
-                });
+                }
+                .into());
             }
         };
         let wall_time_ms = u64::from_be_bytes(
@@ -236,7 +294,8 @@ impl ControlPlaneAuthorityClockRestartCheckpoint {
         if offset != body.len() {
             return Err(ControlPlaneError::AuthorityClockCheckpoint {
                 message: "checkpoint has trailing bytes".to_owned(),
-            });
+            }
+            .into());
         }
         Ok(Self::new(
             binding,

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,12 +10,14 @@ use placement::NodeId;
 use tokio::runtime::Handle;
 
 use crate::control_plane::{
-    ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneAdmin,
-    ControlPlaneAuthorityClock, ControlPlaneAuthorityClockContext, ControlPlaneError,
-    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
-    ControlPlaneRpcResponsePublication, ControlPlaneRuntimeMapDiagnosticSnapshot,
-    ControlPlaneRuntimeMapSource, ControlPlaneRuntimeMapStatus, FencedPgMetadataTransferSnapshot,
-    LeaseHorizonAuthorityBinding, NodeHeartbeat, PgMetadataTransferProof,
+    load_authority_clock_restart_checkpoint_for_startup, ClusterControlSnapshot,
+    ClusterRuntimeMapSnapshot, ControlPlaneAdmin, ControlPlaneAuthorityClock,
+    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneAuthorityClockContext,
+    ControlPlaneAuthorityClockRestartCheckpoint, ControlPlaneError, ControlPlaneHeartbeatRefresh,
+    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRpcResponsePublication,
+    ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapSource,
+    ControlPlaneRuntimeMapStatus, FencedPgMetadataTransferSnapshot, LeaseHorizonAuthorityBinding,
+    NodeHeartbeat, PgMetadataTransferProof,
 };
 use crate::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use crate::control_plane_raft::{
@@ -48,6 +51,88 @@ pub(crate) struct DurableAuthorityHostLifecycle {
     runtime: Handle,
     durability: ControlPlaneRaftAuthorityDurability,
     authority_clock: Arc<Mutex<ControlPlaneAuthorityClock>>,
+}
+
+/// Authority-clock restart evidence classified before a durable Raft
+/// authority is opened or any of its listeners are published.
+///
+/// The binding is retained so this capability cannot be consumed by a
+/// different cluster/node authority after preflight.
+pub(crate) struct PreparedControlPlaneRaftAuthorityClock {
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+    restart_checkpoint: Option<ControlPlaneAuthorityClockRestartCheckpoint>,
+}
+
+/// A host whose checkpoint and clock state have been validated, but whose
+/// fresh-cluster leadership-term decision may still depend on startup
+/// membership convergence.
+pub(crate) struct PreparedControlPlaneRaftAuthorityHost {
+    host: ControlPlaneRaftAuthorityHost,
+    initial_term_binding_pending: bool,
+}
+
+impl PreparedControlPlaneRaftAuthorityHost {
+    pub(crate) fn finish_startup(self) -> Result<ControlPlaneRaftAuthorityHost, ControlPlaneError> {
+        if self.initial_term_binding_pending {
+            let status =
+                block_on_control_plane_raft(&self.host.runtime, self.host.authority.status())?;
+            let mut authority_clock = self
+                .host
+                .authority_clock
+                .as_ref()
+                .expect("prepared durable host must retain its authority clock")
+                .lock()
+                .expect("control-plane authority clock mutex poisoned");
+            if status.local_leader() {
+                let current_term = status.current_term().ok_or_else(|| {
+                    ControlPlaneError::invariant_failure(
+                        "local OpenRaft leader has no current term at startup",
+                    )
+                })?;
+                authority_clock.bind_initial_raft_leadership_term(Some(current_term));
+            } else {
+                // A fresh joining follower must not retain the first-term
+                // allowance after startup convergence.
+                authority_clock.bind_initial_raft_leadership_term(None);
+            }
+        }
+        Ok(self.host)
+    }
+}
+
+impl PreparedControlPlaneRaftAuthorityClock {
+    pub(crate) fn load(
+        artifact_path: &Path,
+        cluster_name: &str,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> Result<Self, ControlPlaneError> {
+        let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft(cluster_name, node_id);
+        Self::load_for_binding(artifact_path, binding)
+    }
+
+    fn load_for_binding(
+        artifact_path: &Path,
+        binding: ControlPlaneAuthorityClockCheckpointBinding,
+    ) -> Result<Self, ControlPlaneError> {
+        let restart_checkpoint =
+            load_authority_clock_restart_checkpoint_for_startup(artifact_path, binding)?;
+        Ok(Self {
+            binding,
+            restart_checkpoint,
+        })
+    }
+
+    fn into_restart_checkpoint(
+        self,
+        authority: &ControlPlaneRaftAuthority,
+    ) -> Result<Option<ControlPlaneAuthorityClockRestartCheckpoint>, ControlPlaneError> {
+        if self.binding != authority.authority_clock_checkpoint_binding() {
+            return Err(ControlPlaneError::invariant_failure(
+                "prepared authority-clock restart evidence belongs to another Raft authority",
+            ));
+        }
+        Ok(self.restart_checkpoint)
+    }
 }
 
 impl std::fmt::Debug for ControlPlaneRaftAuthorityHost {
@@ -84,21 +169,51 @@ impl ControlPlaneRaftHeartbeatLeaseExpiry {
 }
 
 impl ControlPlaneRaftAuthorityHost {
+    pub(crate) fn start_prepared(
+        runtime: Handle,
+        authority: Arc<ControlPlaneRaftAuthority>,
+        prepared_clock: PreparedControlPlaneRaftAuthorityClock,
+    ) -> Result<PreparedControlPlaneRaftAuthorityHost, ControlPlaneError> {
+        let restart_checkpoint = prepared_clock.into_restart_checkpoint(&authority)?;
+        Self::start_with_restart_checkpoint(runtime, authority, restart_checkpoint)
+    }
+
+    #[cfg(test)]
     pub(crate) fn start_durable(
         runtime: Handle,
         authority: Arc<ControlPlaneRaftAuthority>,
     ) -> Result<Self, ControlPlaneError> {
+        let artifact_path = authority
+            .configured_durable_artifact_path()
+            .map_err(|error| {
+                error.into_durability_failure(
+                    "control-plane Raft authority host requires configured durable state",
+                )
+            })?;
+        let prepared_clock = PreparedControlPlaneRaftAuthorityClock::load_for_binding(
+            &artifact_path,
+            authority.authority_clock_checkpoint_binding(),
+        )?;
+        Self::start_prepared(runtime, authority, prepared_clock)?.finish_startup()
+    }
+
+    fn start_with_restart_checkpoint(
+        runtime: Handle,
+        authority: Arc<ControlPlaneRaftAuthority>,
+        restart_checkpoint: Option<ControlPlaneAuthorityClockRestartCheckpoint>,
+    ) -> Result<PreparedControlPlaneRaftAuthorityHost, ControlPlaneError> {
         if let Some(lifecycle) = authority
             .authority_host_lifecycle_slot()
             .get()
             .map(Arc::clone)
         {
-            return Ok(Self::from_durable_lifecycle(authority, &lifecycle));
+            return Ok(PreparedControlPlaneRaftAuthorityHost {
+                host: Self::from_durable_lifecycle(authority, &lifecycle),
+                initial_term_binding_pending: false,
+            });
         }
         let durability = authority.durability_lifecycle(runtime)?;
         let runtime = durability.runtime();
-        let restart_checkpoint =
-            durability.load_authority_clock_restart_checkpoint_for_startup()?;
         let initial_snapshot =
             block_on_control_plane_raft(&runtime, authority.current_control_plane_snapshot())?;
         let initial_status = block_on_control_plane_raft(&runtime, authority.status())?;
@@ -113,13 +228,11 @@ impl ControlPlaneRaftAuthorityHost {
         if let Some(previous_authority) = initial_snapshot.lease_grant_horizon_authority() {
             authority_clock.advance_generation_past_lease_horizon(previous_authority)?;
         }
-        if initial_status.local_leader() {
-            authority_clock.bind_initial_raft_leadership_term(initial_status.current_term());
-        } else if !authority.initialized_membership_in_process() {
-            // A restored or joining follower must not use the fresh-cluster
-            // first-term exception when it later becomes leader.
-            authority_clock.bind_initial_raft_leadership_term(None);
-        }
+        let initial_term_binding_pending = prepare_initial_raft_leadership_term(
+            &mut authority_clock,
+            initial_status.local_leader(),
+            initial_status.current_term(),
+        )?;
         let lifecycle = Arc::new(DurableAuthorityHostLifecycle {
             runtime,
             durability,
@@ -130,7 +243,10 @@ impl ControlPlaneRaftAuthorityHost {
                 .authority_host_lifecycle_slot()
                 .get_or_init(|| lifecycle),
         );
-        Ok(Self::from_durable_lifecycle(authority, &lifecycle))
+        Ok(PreparedControlPlaneRaftAuthorityHost {
+            host: Self::from_durable_lifecycle(authority, &lifecycle),
+            initial_term_binding_pending,
+        })
     }
 
     fn from_durable_lifecycle(
@@ -452,6 +568,24 @@ impl ControlPlaneRaftAuthorityHost {
             .expect("OpenRaft heartbeat test hook mutex poisoned")
             .take()
     }
+}
+
+fn prepare_initial_raft_leadership_term(
+    authority_clock: &mut ControlPlaneAuthorityClock,
+    local_leader: bool,
+    current_term: Option<u64>,
+) -> Result<bool, ControlPlaneError> {
+    if !local_leader {
+        // The authority may be fresh, restored, or joining. Startup owns the
+        // first point at which its converged local role is known, so defer
+        // binding or closing the one-shot allowance until then.
+        return Ok(true);
+    }
+    let current_term = current_term.ok_or_else(|| {
+        ControlPlaneError::invariant_failure("local OpenRaft leader has no current term at startup")
+    })?;
+    authority_clock.bind_initial_raft_leadership_term(Some(current_term));
+    Ok(false)
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -878,6 +1012,7 @@ fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Out
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -988,5 +1123,100 @@ mod tests {
         runtime
             .block_on(authority.shutdown())
             .expect("authority should shut down");
+    }
+
+    #[test]
+    fn restored_nonleading_clock_defers_term_binding_until_startup_converges() {
+        let binding =
+            ControlPlaneAuthorityClockCheckpointBinding::for_raft("restored-nonleading-clock", 1);
+        let checkpoint =
+            ControlPlaneAuthorityClockRestartCheckpoint::new(binding, 4, Some(1_000), 1_000, 50);
+        let mut clock = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
+            Some(1_000),
+            1_001,
+            Some(51),
+            Some(checkpoint),
+        )
+        .expect("valid restored clock should initialize");
+
+        assert!(
+            prepare_initial_raft_leadership_term(&mut clock, false, Some(3))
+                .expect("non-leading preparation should defer"),
+            "restored membership must not close term binding before convergence"
+        );
+        clock.bind_initial_raft_leadership_term(Some(4));
+        clock
+            .validate_raft_leadership_term(4)
+            .expect("converged startup term should remain clock-authorized");
+    }
+
+    #[test]
+    fn durable_host_rejects_unknown_and_unsupported_clock_checkpoint_formats_without_publication() {
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("authority.state");
+        let runtime = runtime();
+        let authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                        "clock-checkpoint-format-boundary",
+                        1,
+                        &artifact_path,
+                    ),
+                )
+                .expect("durable authority should initialize"),
+        );
+        authority
+            .durability_lifecycle(runtime.handle().clone())
+            .expect("authority should issue its durability lifecycle")
+            .store_restart_artifact()
+            .expect("initial restart artifact and clock checkpoint should persist");
+        let artifact_before = std::fs::read(&artifact_path).unwrap();
+        let mut checkpoint_path = artifact_path.as_os_str().to_os_string();
+        checkpoint_path.push(".clock");
+        let checkpoint_path = PathBuf::from(checkpoint_path);
+        let current_checkpoint = std::fs::read(&checkpoint_path).unwrap();
+
+        let mut hard_failures = Vec::new();
+        let mut bad_magic = current_checkpoint.clone();
+        bad_magic[0] ^= 0xff;
+        reseal_crc64_suffix_for_test(&mut bad_magic);
+        hard_failures.push((bad_magic, "checkpoint magic mismatch".to_owned()));
+        for version in [1u16, 3u16] {
+            let mut unsupported = current_checkpoint.clone();
+            unsupported[8..10].copy_from_slice(&version.to_be_bytes());
+            reseal_crc64_suffix_for_test(&mut unsupported);
+            hard_failures.push((
+                unsupported,
+                format!("unsupported checkpoint version {version}"),
+            ));
+        }
+
+        for (bytes, expected_message) in hard_failures {
+            std::fs::write(&checkpoint_path, &bytes).unwrap();
+            let error = ControlPlaneRaftAuthorityHost::start_durable(
+                runtime.handle().clone(),
+                Arc::clone(&authority),
+            )
+            .expect_err("hard checkpoint formats must prevent durable host publication");
+            assert!(matches!(
+                error,
+                ControlPlaneError::AuthorityClockCheckpoint { message }
+                    if message == expected_message
+            ));
+            assert!(authority.authority_host_lifecycle_slot().get().is_none());
+            assert_eq!(std::fs::read(&artifact_path).unwrap(), artifact_before);
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), bytes);
+        }
+
+        runtime
+            .block_on(authority.shutdown())
+            .expect("authority should shut down");
+    }
+
+    fn reseal_crc64_suffix_for_test(bytes: &mut [u8]) {
+        let checksum_offset = bytes.len() - std::mem::size_of::<u64>();
+        let checksum = checksum::crc64::checksum(&bytes[..checksum_offset]);
+        bytes[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
     }
 }
