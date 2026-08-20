@@ -1582,6 +1582,123 @@ pub mod test_support {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TestUnsupportedAuthorityClockCheckpointVersion {
+        One,
+        Three,
+    }
+
+    impl TestUnsupportedAuthorityClockCheckpointVersion {
+        #[must_use]
+        pub const fn encoded_version(self) -> u16 {
+            match self {
+                Self::One => 1,
+                Self::Three => 3,
+            }
+        }
+    }
+
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct TestSingleAuthorityDurableStateObservation {
+        artifacts: Vec<(std::ffi::OsString, Vec<u8>)>,
+    }
+
+    impl fmt::Debug for TestSingleAuthorityDurableStateObservation {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("TestSingleAuthorityDurableStateObservation")
+                .field("artifact_count", &self.artifacts.len())
+                .field(
+                    "total_bytes",
+                    &self
+                        .artifacts
+                        .iter()
+                        .map(|(_, bytes)| bytes.len())
+                        .sum::<usize>(),
+                )
+                .finish()
+        }
+    }
+
+    fn control_plane_artifact_test_failure(
+        _error: crate::control_plane::ControlPlaneError,
+    ) -> TestStorageFailure {
+        TestStorageFailure {
+            diagnostic_cause_label: "control_plane_artifact_failure",
+        }
+    }
+
+    fn control_plane_artifact_test_io_failure(
+        context: &'static str,
+        source: std::io::Error,
+    ) -> TestStorageFailure {
+        TestStorageFailure::from_store(StoreError::Io { context, source })
+    }
+
+    pub fn prepare_unsupported_authority_clock_checkpoint_restart(
+        durable_state_path: &std::path::Path,
+        version: TestUnsupportedAuthorityClockCheckpointVersion,
+    ) -> Result<TestSingleAuthorityDurableStateObservation, TestStorageFailure> {
+        crate::control_plane::prepare_unsupported_authority_clock_checkpoint_restart_for_test(
+            durable_state_path,
+            version.encoded_version(),
+        )
+        .map_err(control_plane_artifact_test_failure)?;
+        observe_single_authority_durable_state(durable_state_path)
+    }
+
+    pub fn observe_single_authority_durable_state(
+        durable_state_path: &std::path::Path,
+    ) -> Result<TestSingleAuthorityDurableStateObservation, TestStorageFailure> {
+        let parent = durable_state_path.parent().ok_or_else(|| {
+            control_plane_artifact_test_io_failure(
+                "inspect single-authority test state parent",
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "state path has no parent"),
+            )
+        })?;
+        let mut entries = std::fs::read_dir(parent)
+            .map_err(|source| {
+                control_plane_artifact_test_io_failure(
+                    "enumerate single-authority test state",
+                    source,
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| {
+                control_plane_artifact_test_io_failure(
+                    "inspect single-authority test state entry",
+                    source,
+                )
+            })?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        let mut artifacts = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let file_type = entry.file_type().map_err(|source| {
+                control_plane_artifact_test_io_failure(
+                    "inspect single-authority test artifact type",
+                    source,
+                )
+            })?;
+            if !file_type.is_file() {
+                return Err(control_plane_artifact_test_io_failure(
+                    "inspect single-authority test artifact",
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "state directory contains a non-file artifact",
+                    ),
+                ));
+            }
+            let bytes = std::fs::read(entry.path()).map_err(|source| {
+                control_plane_artifact_test_io_failure(
+                    "read single-authority test artifact",
+                    source,
+                )
+            })?;
+            artifacts.push((entry.file_name(), bytes));
+        }
+        Ok(TestSingleAuthorityDurableStateObservation { artifacts })
+    }
+
     /// Logical multipart observations and storage-owned semantic fault setup
     /// for cross-crate coordinator tests.
     ///

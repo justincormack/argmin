@@ -853,6 +853,88 @@ fn store_authority_clock_restart_checkpoint_value(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn prepare_unsupported_authority_clock_checkpoint_restart_for_test(
+    durable_state_path: &Path,
+    version: u16,
+) -> Result<(), ControlPlaneError> {
+    if !matches!(version, 1 | 3) {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "test checkpoint version must be one of the retained adjacent fixtures"
+                .to_owned(),
+        });
+    }
+
+    let checkpoint_path = authority_clock_restart_checkpoint_path(durable_state_path);
+    let mut checkpoint = std::fs::read(&checkpoint_path).map_err(|source| {
+        ControlPlaneError::io(
+            "read authority-clock checkpoint for unsupported-version test",
+            source,
+        )
+    })?;
+    if checkpoint.len() != CONTROL_PLANE_CLOCK_CHECKPOINT_LEN {
+        return Err(ControlPlaneError::AuthorityClockCheckpoint {
+            message: format!(
+                "test checkpoint length {} does not match required fixed length {CONTROL_PLANE_CLOCK_CHECKPOINT_LEN}",
+                checkpoint.len()
+            ),
+        });
+    }
+    let version_offset = CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC.len();
+    checkpoint[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+    let checksum_offset = checkpoint.len() - CONTROL_PLANE_CLOCK_CHECKPOINT_CHECKSUM_LEN;
+    let checksum = checksum::crc64::checksum(&checkpoint[..checksum_offset]);
+    checkpoint[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&checkpoint_path)
+            .map_err(|source| {
+                ControlPlaneError::io(
+                    "open authority-clock checkpoint for unsupported-version test",
+                    source,
+                )
+            })?;
+        file.write_all(&checkpoint).map_err(|source| {
+            ControlPlaneError::io(
+                "write authority-clock checkpoint for unsupported-version test",
+                source,
+            )
+        })?;
+        file.sync_all().map_err(|source| {
+            ControlPlaneError::io(
+                "sync authority-clock checkpoint for unsupported-version test",
+                source,
+            )
+        })?;
+    }
+
+    let journal_path = single_authority_journal_path(durable_state_path);
+    let mut journal = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal_path)
+        .map_err(|source| {
+            ControlPlaneError::io(
+                "open single-authority journal for checkpoint-ordering test",
+                source,
+            )
+        })?;
+    journal.write_all(&[0xa3, 0xc1]).map_err(|source| {
+        ControlPlaneError::io(
+            "append recoverable single-authority journal tail for checkpoint-ordering test",
+            source,
+        )
+    })?;
+    journal.sync_all().map_err(|source| {
+        ControlPlaneError::io(
+            "sync recoverable single-authority journal tail for checkpoint-ordering test",
+            source,
+        )
+    })?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct SingleAuthorityJournalRecord {
     binding: ControlPlaneAuthorityClockCheckpointBinding,
