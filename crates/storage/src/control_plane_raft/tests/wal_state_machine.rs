@@ -51,18 +51,88 @@ fn control_plane_raft_wal_frame_codec_round_trips_records() {
 }
 
 #[test]
-fn control_plane_raft_wal_file_header_rejects_unsupported_versions() {
+fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
+    let tmp = test_util::tempdir();
+    let wal_path = tmp.path().join("raft.wal");
+    let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+    let records = vec![
+        ControlPlaneRaftWalRecord::SaveVote(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+        ControlPlaneRaftWalRecord::Append(vec![
+            bootstrap_membership_entry(1),
+            blank_entry(3, 1, 1),
+        ]),
+        ControlPlaneRaftWalRecord::SaveCommitted(Some(raft_log_id(3, 1, 1))),
+        ControlPlaneRaftWalRecord::TruncateAfter(Some(raft_log_id(3, 1, 1))),
+        ControlPlaneRaftWalRecord::Purge(raft_log_id(3, 1, 1)),
+    ];
+    for record in &records {
+        wal.append_record(record).unwrap();
+    }
+
+    let bytes = fs::read(&wal_path).unwrap();
+    let (base_offset, header_len) = wal.journal.decode_file_header(&bytes).unwrap();
+    assert_eq!(base_offset, 0);
+    assert_eq!(header_len, CONTROL_PLANE_RAFT_WAL_JOURNAL_FORMAT.header_len());
+    let decoded = wal.read_records_from(0).unwrap();
+    assert_eq!(decoded.records, records);
+    assert!(!decoded.truncated_tail);
+    assert_eq!(
+        decoded.clean_len,
+        u64::try_from(bytes.len() - header_len).unwrap()
+    );
+    assert_eq!(
+        (
+            bytes.len(),
+            raft_test_hex(&checksum::sha256::digest(&bytes))
+        ),
+        (
+            542,
+            "e41d7b4697dc4902bcc608946cdcd89fa2dc23b9070eedeb1a27f07cc92fc44f".to_owned()
+        )
+    );
+}
+
+#[test]
+fn control_plane_raft_wal_file_header_failures_are_typed() {
+    use crate::durable_journal::DurableJournalFileHeaderFormatError;
+
+    let tmp = test_util::tempdir();
+    let wal = test_raft_wal_file(tmp.path().join("raft.wal"), "test-cluster", 1);
+    let header = wal.journal.encode_file_header(0x0102_0304_0506_0708);
+    assert!(matches!(
+        wal.journal.decode_file_header_classified(&header[..3]),
+        Err(DurableJournalFileHeaderFormatError::Truncated)
+    ));
+
+    let mut bad_magic = header.clone();
+    bad_magic[0] ^= 0xff;
+    refresh_raft_wal_frame_checksum(&mut bad_magic);
+    assert!(matches!(
+        wal.journal.decode_file_header_classified(&bad_magic),
+        Err(DurableJournalFileHeaderFormatError::UnknownMagic)
+    ));
+
+    let mut bad_checksum = header.clone();
+    *bad_checksum.last_mut().unwrap() ^= 0xff;
+    assert!(matches!(
+        wal.journal.decode_file_header_classified(&bad_checksum),
+        Err(DurableJournalFileHeaderFormatError::ChecksumMismatch { .. })
+    ));
+
     for version in [
         CONTROL_PLANE_RAFT_WAL_FILE_VERSION - 1,
         CONTROL_PLANE_RAFT_WAL_FILE_VERSION + 1,
     ] {
-        let mut header = ControlPlaneRaftWalFile::encode_file_header(0);
+        let mut unsupported = header.clone();
         let version_offset = CONTROL_PLANE_RAFT_WAL_FILE_MAGIC.len();
-        header[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
-        refresh_raft_wal_frame_checksum(&mut header);
-        assert_error_contains(
-            ControlPlaneRaftWalFile::decode_file_header(&header),
-            &format!("unsupported control-plane OpenRaft WAL file header version {version}"),
+        unsupported[version_offset..version_offset + 2]
+            .copy_from_slice(&version.to_be_bytes());
+        refresh_raft_wal_frame_checksum(&mut unsupported);
+        assert_eq!(
+            wal.journal
+                .decode_file_header_classified(&unsupported)
+                .unwrap_err(),
+            DurableJournalFileHeaderFormatError::UnsupportedVersion(version)
         );
     }
 }
@@ -235,7 +305,7 @@ fn control_plane_raft_wal_file_replays_records() {
     }
     let metrics_after = observability::control_plane_raft_wal_metrics_snapshot();
     let physical_record_bytes = fs::metadata(wal.path()).unwrap().len()
-        - u64::try_from(ControlPlaneRaftWalFile::file_header_len()).unwrap();
+        - u64::try_from(CONTROL_PLANE_RAFT_WAL_JOURNAL_FORMAT.header_len()).unwrap();
     assert!(
         metrics_after.append_total
             >= metrics_before
@@ -336,6 +406,10 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         },
         state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
     };
+    let checkpoint_artifact_bytes = checkpoint_artifact.encode_durable_artifact().unwrap();
+    let decoded_checkpoint_artifact =
+        ControlPlaneRaftRestartArtifact::decode_durable_artifact(&checkpoint_artifact_bytes)
+            .unwrap();
 
     let suffix_vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(4, 1);
     wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(suffix_vote))
@@ -352,16 +426,34 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         "WAL compaction should physically remove the checkpointed prefix"
     );
     let compacted_bytes = fs::read(&wal_path).unwrap();
-    let (compacted_base, _) =
-        ControlPlaneRaftWalFile::decode_file_header(&compacted_bytes).unwrap();
+    let (compacted_base, _) = wal
+        .journal
+        .decode_file_header(&compacted_bytes)
+        .unwrap();
     assert_eq!(compacted_base, checkpoint_offset);
+    assert_eq!(
+        (
+            checkpoint_offset,
+            checkpoint_artifact_bytes.len(),
+            raft_test_hex(&checksum::sha256::digest(&checkpoint_artifact_bytes)),
+            compacted_bytes.len(),
+            raft_test_hex(&checksum::sha256::digest(&compacted_bytes))
+        ),
+        (
+            75,
+            236,
+            "93d125ad13a2343872ff4a8cd45540a3fc810d2f683a83513b9029e0a69fe0ec".to_owned(),
+            112,
+            "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62".to_owned()
+        )
+    );
     assert_eq!(
         wal.clean_len()
             .expect("compacted WAL clean length should read"),
         suffix_end
     );
 
-    let (restored_log_store, restored_state_machine) = checkpoint_artifact
+    let (restored_log_store, restored_state_machine) = decoded_checkpoint_artifact
         .restore_with_wal_file(test_raft_wal_file(&wal_path, "test-cluster", 1))
         .expect("checkpoint artifact should restore with compacted WAL suffix");
     assert_eq!(
@@ -473,8 +565,10 @@ fn control_plane_raft_authority_checkpoint_compacts_wal_prefix() {
         // durability lane publishes its cached offsets. Read the published
         // status first and prove that the physical WAL covers that prefix.
         let compacted_bytes = fs::read(&wal_path).unwrap();
-        let (wal_base_offset, _) =
-            ControlPlaneRaftWalFile::decode_file_header(&compacted_bytes).unwrap();
+        let (wal_base_offset, _) = wal
+            .journal
+            .decode_file_header(&compacted_bytes)
+            .unwrap();
         assert_eq!(wal_base_offset, artifact.wal_replay_offset);
         let compacted_clean_len = wal
             .clean_len()
@@ -1861,7 +1955,7 @@ fn control_plane_raft_wal_file_rejects_corrupt_first_and_middle_frame_lengths() 
         }
 
         let mut bytes = fs::read(&path).unwrap();
-        let first_start = ControlPlaneRaftWalFile::file_header_len();
+        let first_start = CONTROL_PLANE_RAFT_WAL_JOURNAL_FORMAT.header_len();
         let target_start = if target_frame == 0 {
             first_start
         } else {
@@ -1935,7 +2029,7 @@ fn control_plane_raft_wal_status_offsets_do_not_decode_frames() {
                 .wal_offsets
                 .map(ControlPlaneRaftWalOffsets::clean_len),
             Some(
-                u64::try_from(bytes.len() - ControlPlaneRaftWalFile::file_header_len())
+                u64::try_from(bytes.len() - CONTROL_PLANE_RAFT_WAL_JOURNAL_FORMAT.header_len())
                     .expect("test WAL length should fit u64")
             )
         );
@@ -2146,14 +2240,10 @@ fn control_plane_raft_wal_backed_log_store_torn_header_poisons_after_acceptance(
         let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
         let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
             ControlPlaneRaftLogStoreRestartArtifact::default(),
-            wal,
+            wal.clone(),
         )
         .expect("missing WAL should initialize");
-        fs::write(
-            &wal_path,
-            &ControlPlaneRaftWalFile::encode_file_header(0)[..3],
-        )
-        .unwrap();
+        fs::write(&wal_path, &wal.journal.encode_file_header(0)[..3]).unwrap();
 
         let (accepted, durability) =
             append_and_wait_for_durability(&mut store, vec![bootstrap_membership_entry(1)]).await;
@@ -2547,7 +2637,7 @@ fn control_plane_raft_wal_backed_log_store_parent_sync_error_publishes_then_pois
         );
         let metrics_after = observability::control_plane_raft_wal_metrics_snapshot();
         let physical_record_bytes = fs::metadata(&wal_path).unwrap().len()
-            - u64::try_from(ControlPlaneRaftWalFile::file_header_len()).unwrap();
+            - u64::try_from(CONTROL_PLANE_RAFT_WAL_JOURNAL_FORMAT.header_len()).unwrap();
         assert!(
             metrics_after.frame_bytes_total
                 >= metrics_before

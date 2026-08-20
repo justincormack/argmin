@@ -2290,9 +2290,18 @@ fn refresh_raft_wal_frame_checksum(frame: &mut Vec<u8>) {
     append_raft_artifact_checksum(frame);
 }
 
+fn raft_test_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").unwrap();
+    }
+    encoded
+}
+
 fn wal_file_frame_end(bytes: &[u8], start: usize) -> usize {
     let start = if start == 0 && bytes.starts_with(CONTROL_PLANE_RAFT_WAL_FILE_MAGIC) {
-        ControlPlaneRaftWalFile::file_header_len()
+        CONTROL_PLANE_RAFT_WAL_JOURNAL_FORMAT.header_len()
     } else {
         start
     };

@@ -13,6 +13,14 @@ const FRAME_LENGTH_LEN: usize = std::mem::size_of::<u32>();
 const FRAME_PREFIX_LEN: usize = FRAME_LENGTH_LEN * 2;
 const CHECKSUM_LEN: usize = std::mem::size_of::<u64>();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableJournalFileHeaderFormatError {
+    Truncated,
+    ChecksumMismatch { expected: u64, actual: u64 },
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DurableJournalFormat {
     pub file_magic: &'static [u8],
@@ -639,12 +647,20 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         &self,
         bytes: &[u8],
     ) -> Result<(u64, usize), ControlPlaneError> {
+        self.decode_file_header_classified(bytes)
+            .map_err(|error| self.file_header_format_error(error))
+    }
+
+    pub(crate) fn decode_file_header_classified(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(u64, usize), DurableJournalFileHeaderFormatError> {
         let header_len = self.format.header_len();
         if bytes.is_empty() {
             return Ok((0, header_len));
         }
         if bytes.len() < header_len {
-            return Err(self.protocol_error(format!("truncated {} file header", self.format.label)));
+            return Err(DurableJournalFileHeaderFormatError::Truncated);
         }
         let (header, checksum_bytes) = bytes[..header_len].split_at(header_len - CHECKSUM_LEN);
         let expected_checksum = u64::from_be_bytes(
@@ -654,15 +670,13 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         );
         let actual_checksum = checksum::crc64::checksum(header);
         if actual_checksum != expected_checksum {
-            return Err(self.protocol_error(format!(
-                "{} file header checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}",
-                self.format.label
-            )));
+            return Err(DurableJournalFileHeaderFormatError::ChecksumMismatch {
+                expected: expected_checksum,
+                actual: actual_checksum,
+            });
         }
         if &header[..self.format.file_magic.len()] != self.format.file_magic {
-            return Err(
-                self.protocol_error(format!("invalid {} file header magic", self.format.label))
-            );
+            return Err(DurableJournalFileHeaderFormatError::UnknownMagic);
         }
         let version_start = self.format.file_magic.len();
         let version = u16::from_be_bytes(
@@ -671,10 +685,9 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
                 .expect("journal header version has fixed width"),
         );
         if version != self.format.file_version {
-            return Err(self.protocol_error(format!(
-                "unsupported {} file header version {version}",
-                self.format.label
-            )));
+            return Err(DurableJournalFileHeaderFormatError::UnsupportedVersion(
+                version,
+            ));
         }
         let offset_start = version_start + std::mem::size_of::<u16>();
         let base_offset = u64::from_be_bytes(
@@ -683,6 +696,33 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
                 .expect("journal header base offset has fixed width"),
         );
         Ok((base_offset, header_len))
+    }
+
+    fn file_header_format_error(
+        &self,
+        error: DurableJournalFileHeaderFormatError,
+    ) -> ControlPlaneError {
+        let message = match error {
+            DurableJournalFileHeaderFormatError::Truncated => {
+                format!("truncated {} file header", self.format.label)
+            }
+            DurableJournalFileHeaderFormatError::ChecksumMismatch { expected, actual } => {
+                format!(
+                    "{} file header checksum mismatch: expected {expected:#x}, actual {actual:#x}",
+                    self.format.label
+                )
+            }
+            DurableJournalFileHeaderFormatError::UnknownMagic => {
+                format!("invalid {} file header magic", self.format.label)
+            }
+            DurableJournalFileHeaderFormatError::UnsupportedVersion(version) => {
+                format!(
+                    "unsupported {} file header version {version}",
+                    self.format.label
+                )
+            }
+        };
+        self.protocol_error(message)
     }
 
     fn ensure_file_header(&self, file: &mut File) -> Result<(), DurableJournalAppendError> {

@@ -7247,64 +7247,6 @@ impl ControlPlaneRaftWalFile {
     fn compact_through(&self, replay_offset: u64) -> Result<(), ControlPlaneError> {
         self.journal.compact_through(replay_offset)
     }
-
-    #[cfg(test)]
-    fn encode_file_header(base_offset: u64) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::file_header_len());
-        out.extend_from_slice(CONTROL_PLANE_RAFT_WAL_FILE_MAGIC);
-        write_raft_u16(&mut out, CONTROL_PLANE_RAFT_WAL_FILE_VERSION);
-        write_raft_u64(&mut out, base_offset);
-        append_raft_artifact_checksum(&mut out);
-        out
-    }
-
-    #[cfg(test)]
-    fn decode_file_header(bytes: &[u8]) -> Result<(u64, usize), ControlPlaneError> {
-        let header_len = Self::file_header_len();
-        if bytes.is_empty() {
-            return Ok((0, header_len));
-        }
-        if bytes.len() < header_len {
-            return Err(raft_artifact_protocol_error(
-                "truncated control-plane OpenRaft WAL file header",
-            ));
-        }
-        let (header, checksum_bytes) =
-            bytes[..header_len].split_at(header_len - CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN);
-        let expected_checksum = u64::from_be_bytes(
-            checksum_bytes
-                .try_into()
-                .expect("checksum split length is fixed"),
-        );
-        let actual_checksum = raft_artifact_checksum(header);
-        if actual_checksum != expected_checksum {
-            return Err(raft_artifact_protocol_error(format!(
-                "control-plane OpenRaft WAL file header checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
-            )));
-        }
-        let mut reader =
-            RaftArtifactReader::with_context(header, "control-plane OpenRaft WAL file header");
-        let magic = reader.read_exact(CONTROL_PLANE_RAFT_WAL_FILE_MAGIC.len())?;
-        if magic != CONTROL_PLANE_RAFT_WAL_FILE_MAGIC {
-            return Err(raft_artifact_protocol_error(
-                "invalid control-plane OpenRaft WAL file header magic",
-            ));
-        }
-        let version = reader.read_u16()?;
-        if version != CONTROL_PLANE_RAFT_WAL_FILE_VERSION {
-            return Err(raft_artifact_protocol_error(format!(
-                "unsupported control-plane OpenRaft WAL file header version {version}"
-            )));
-        }
-        let base_offset = reader.read_u64()?;
-        reader.finish()?;
-        Ok((base_offset, header_len))
-    }
-
-    #[cfg(test)]
-    fn file_header_len() -> usize {
-        CONTROL_PLANE_RAFT_WAL_FILE_MAGIC.len() + 2 + 8 + CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN
-    }
 }
 
 #[cfg(test)]

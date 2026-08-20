@@ -81,6 +81,108 @@ fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_req
 }
 
 #[test]
+fn single_authority_journal_v2_full_file_layout_is_exact() {
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let binding = ControlPlaneAuthorityClockCheckpointBinding([0x5a; 32]);
+    let snapshot_digest = single_authority_snapshot_digest(&ClusterControlSnapshot::empty());
+    let checkpoint = SingleAuthorityJournalRecord {
+        binding,
+        previous_chain_digest: snapshot_digest,
+        resulting_chain_digest: snapshot_digest,
+        command: None,
+    }
+    .encode()
+    .unwrap();
+    let command = ControlPlaneCommand::SetNodeMembership {
+        node_id: NodeId::new(7),
+        membership: NodeMembershipState::Active,
+    };
+    let encoded_command = encode_control_plane_command(&command).unwrap();
+    let command_record = SingleAuthorityJournalRecord {
+        binding,
+        previous_chain_digest: snapshot_digest,
+        resulting_chain_digest: single_authority_command_chain_digest(
+            snapshot_digest,
+            &encoded_command,
+        ),
+        command: Some(command),
+    }
+    .encode()
+    .unwrap();
+
+    store.journal.append_frame(&checkpoint).unwrap();
+    store.journal.append_frame(&command_record).unwrap();
+
+    let bytes = std::fs::read(store.journal_path()).unwrap();
+    let (base_offset, header_len) = store.journal.decode_file_header(&bytes).unwrap();
+    assert_eq!(base_offset, 0);
+    assert_eq!(
+        header_len,
+        SINGLE_AUTHORITY_JOURNAL_FILE_MAGIC.len()
+            + std::mem::size_of::<u16>()
+            + std::mem::size_of::<u64>()
+            + std::mem::size_of::<u64>()
+    );
+    let frames = store.journal.read_frames_from(0).unwrap();
+    assert_eq!(frames.frames, vec![checkpoint, command_record]);
+    assert!(!frames.truncated_tail);
+    assert_eq!(frames.clean_len, (bytes.len() - header_len) as u64);
+    assert_eq!(
+        (bytes.len(), hex_encode(&checksum::sha256::digest(&bytes))),
+        (
+            209,
+            "e39c6bd428b31a7755d1ef54206a242bf1f1a09fc8cb836486a1cd242d682fa3".to_owned()
+        )
+    );
+}
+
+#[test]
+fn single_authority_journal_file_header_failures_are_typed() {
+    use crate::durable_journal::DurableJournalFileHeaderFormatError;
+
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let header = store.journal.encode_file_header(0x0102_0304_0506_0708);
+    assert!(matches!(
+        store.journal.decode_file_header_classified(&header[..3]),
+        Err(DurableJournalFileHeaderFormatError::Truncated)
+    ));
+
+    let mut bad_magic = header.clone();
+    bad_magic[0] ^= 0xff;
+    reseal_crc64_suffix(&mut bad_magic);
+    assert!(matches!(
+        store.journal.decode_file_header_classified(&bad_magic),
+        Err(DurableJournalFileHeaderFormatError::UnknownMagic)
+    ));
+
+    let mut bad_checksum = header.clone();
+    *bad_checksum.last_mut().unwrap() ^= 0xff;
+    assert!(matches!(
+        store.journal.decode_file_header_classified(&bad_checksum),
+        Err(DurableJournalFileHeaderFormatError::ChecksumMismatch { .. })
+    ));
+
+    for version in [
+        SINGLE_AUTHORITY_JOURNAL_FILE_VERSION - 1,
+        SINGLE_AUTHORITY_JOURNAL_FILE_VERSION + 1,
+    ] {
+        let mut unsupported = header.clone();
+        let version_offset = SINGLE_AUTHORITY_JOURNAL_FILE_MAGIC.len();
+        unsupported[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+        reseal_crc64_suffix(&mut unsupported);
+        assert_eq!(
+            store
+                .journal
+                .decode_file_header_classified(&unsupported)
+                .unwrap_err(),
+            DurableJournalFileHeaderFormatError::UnsupportedVersion(version)
+        );
+    }
+}
+
+#[test]
 fn file_backed_authority_restarts_with_never_reused_epoch_and_incarnation() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
