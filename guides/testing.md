@@ -178,8 +178,8 @@ For external AWS-backed workflows, prefer the wrapper scripts under
   - runs `s3-tests` against that process as an external endpoint
   - forwards extra arguments to `cargo nextest run -p s3-tests`
 - `./scripts/uat-multihost-raft`
-  - deploys a static-manifest three-authority, three-storage-node, split-frontend
-    cluster to three distinct SSH hosts
+  - deploys a static-manifest three- or four-authority, matching storage-node,
+    split-frontend cluster to distinct SSH hosts
   - uses authenticated TLS/TCP for Raft, control-plane, and storage RPC traffic
   - verifies persistent S3 data through Raft leader loss and a storage-node
     restart
@@ -200,11 +200,15 @@ Use `--no-cleanup` only when every child run must be retained.
 ## Multihost Raft and Data-Plane Smoke
 
 `./scripts/uat-multihost-raft` is the production-shaped cross-host integration
-gate. It requires exactly three SSH host aliases and three advertised IPv4
-addresses. Each alias must support noninteractive SSH, identify a distinct
-machine through `/etc/machine-id`, provide `systemd-run --user`, and allow the
-selected five-port range between all hosts. The test generates a private test
-PKI and scoped credentials for each run; it does not use operator credentials.
+gate. It requires three or four SSH host aliases and the same number of
+advertised IPv4 addresses. Each alias must support noninteractive SSH, identify
+a distinct machine through `/etc/machine-id`, provide `systemd-run --user`, and
+allow the selected five-port range between all hosts. Failure tolerance remains
+one host in both shapes; a fourth host broadens placement and process coverage
+but does not make the cluster tolerant of two simultaneous host failures. The
+test generates a private test PKI and scoped credentials for each run; it does
+not use operator credentials.
+
 By default the harness builds `argmin-s3` and `uat_pg_backfill_smoke` locally
 before contacting the remote hosts, and deploys the exact executable artifacts
 reported by Cargo. `--binary` and `--client-binary` remain available when an
@@ -222,6 +226,45 @@ one-MiB persistent objects, and three leader-loss/restart cycles:
   --release \
   --no-cleanup-fail
 ```
+
+For startup debugging on four machines, skip route churn and outages and repeat
+a complete cross-frontend CRUD probe instead:
+
+```bash
+./scripts/uat-multihost-raft \
+  --hosts grey0,grey1,grey2,grey3 \
+  --addresses 192.0.2.10,192.0.2.11,192.0.2.12,192.0.2.13 \
+  --release \
+  --startup-only \
+  --startup-crud-rounds 10 \
+  --no-cleanup-fail
+```
+
+Each startup round creates a fresh bucket through one frontend, writes through
+every frontend, reads, heads, and lists through every frontend, then deletes
+through a different frontend. The harness captures every frontend's runtime-map
+readiness and diagnostics plus every authority's clock status before traffic,
+after each successful round, and once more before shutdown on failure. With
+`--no-cleanup-fail`, these snapshots are under the reported local artifact
+directory in `metrics/cluster-*`; per-process logs, traces, unit status,
+journals, clock tracking, durable file inventories, and the timestamped
+`metrics/data-plane-client.log` operation transcript are retained alongside
+them. This mode distinguishes listener health from a cluster that cannot admit
+S3 mutations.
+
+For real machine loss, `--host-fault-driver PATH` replaces the normal
+three-service stop with a local operator-provided executable. The harness calls
+it as `PATH down HOST ADDRESS`, requires three consecutive failed SSH probes and
+requires every surviving host to observe all five advertised service ports as
+unreachable, then verifies the surviving cluster. It calls
+`PATH up HOST ADDRESS`, requires three consecutive successful SSH probes, and
+starts fresh authority, storage, and frontend processes over the retained
+state. Unit names from every process generation are retained separately from
+active-unit tracking so failure collection can still request pre-power-cycle
+status and journals after the host returns. The driver must return only after
+the requested power action has been accepted and must be idempotent because
+failure cleanup attempts to power an offline host back on. The harness
+deliberately does not embed a vendor-specific power API or credentials.
 
 Add `--quantitative` for the sustained persistent-storage release gate:
 

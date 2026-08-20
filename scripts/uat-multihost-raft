@@ -10,27 +10,32 @@ usage() {
 Usage: ./scripts/uat-multihost-raft [options]
 
 Run the authenticated static-manifest Raft authority and data-plane soak across
-three real hosts. Each host runs an authority, storage node, and independently
-authenticated frontend. SSH is used only for deployment and process
-supervision; all Argmin traffic uses the configured TLS/TCP endpoints directly.
+three or four real hosts. Each host runs an authority, storage node, and
+independently authenticated frontend. SSH is used only for deployment and process
+supervision; all Argmin traffic uses the configured TLS/TCP endpoints
+directly.
 Unless explicit binary paths are supplied, the required server and UAT client
 binaries are built locally before any remote setup.
 
 Options:
-  --hosts H0,H1,H2       SSH host aliases (or ARGMIN_MULTIHOST_RAFT_HOSTS)
-  --addresses A0,A1,A2   Advertised IPv4 addresses (or ARGMIN_MULTIHOST_RAFT_ADDRS)
+  --hosts HOSTS          Three or four SSH aliases (or ARGMIN_MULTIHOST_RAFT_HOSTS)
+  --addresses ADDRS      Matching advertised IPv4 addresses (or ARGMIN_MULTIHOST_RAFT_ADDRS)
   --binary PATH          Deploy a prebuilt argmin-s3 binary; standard target paths build it
   --client-binary PATH   Use a prebuilt UAT client; standard target paths build it
   --release              Build and deploy target/release/argmin-s3
   --remote-root PATH     Common absolute remote root (default: /home/argmin-test/argmin-soak)
   --ssh-config PATH      Explicit SSH client config (or ARGMIN_MULTIHOST_RAFT_SSH_CONFIG)
   --storage-profile P    persistent or volatile-test (default: persistent)
-  --port-base PORT       Raft port; control/recovery/storage use the next three (default: 24000)
+  --port-base PORT       Raft port; other endpoints use the next four (default: 24000)
   --pg-count N           Bootstrap PG count (default: 116)
   --retained-epochs N    Committed route epoch advances before failover (default: 256)
   --data-objects N       Persistent S3 objects checked across failures (default: 8)
   --heartbeat-lease-ms N Storage-node heartbeat lease (default: 5000)
   --repeat N             Whole-host service outage/rejoin cycles (default: 3)
+  --startup-crud-rounds N
+                         CRUD rounds through every frontend before fault testing (default: 1)
+  --startup-only         Stop after startup CRUD and cluster diagnostics
+  --host-fault-driver P  Local executable invoked as P down|up HOST ADDRESS
   --quantitative         Enforce the sustained persistent-storage release gate
   --sustained-seconds N  Quantitative steady interval (default: 300)
   --no-cleanup           Preserve remote and local state after every run
@@ -39,8 +44,9 @@ Options:
 
 Example:
   ./scripts/uat-multihost-raft \
-    --hosts grey0,grey1,grey2 \
-    --addresses 192.168.1.124,192.168.1.155,192.168.1.116
+    --hosts grey0,grey1,grey2,grey3 \
+    --addresses 192.168.1.124,192.168.1.155,192.168.1.116,192.168.1.117 \
+    --startup-only --startup-crud-rounds 10 --no-cleanup-fail
 EOF
 }
 
@@ -96,15 +102,43 @@ build_cargo_binary() {
         die "Cargo-built $binary_name binary is not executable: $output_path"
 }
 
-split_exact_three() {
+split_host_list() {
     local value="$1"
     local label="$2"
     local -n output="$3"
     IFS=, read -r -a output <<<"$value"
-    ((${#output[@]} == 3)) || die "$label must contain exactly three comma-separated values"
+    ((${#output[@]} == 3 || ${#output[@]} == 4)) ||
+        die "$label must contain three or four comma-separated values"
     local item
     for item in "${output[@]}"; do
         [[ -n "$item" ]] || die "$label cannot contain an empty value"
+    done
+}
+
+route_acting_set_for_attempt() {
+    local attempt="$1"
+    local -n output_pg_id="$2"
+    local -n output_first_node="$3"
+    local -n output_second_node="$4"
+    local zero_based_attempt=$((attempt - 1))
+    local route_pass=$((zero_based_attempt / pg_count))
+    output_pg_id=$((zero_based_attempt % pg_count))
+    output_first_node=$((((output_pg_id + route_pass) % host_count) + 1))
+    # shellcheck disable=SC2034 # Assigned through a caller-provided nameref.
+    output_second_node=$(((output_first_node % host_count) + 1))
+}
+
+validate_route_rotation() {
+    local attempts=$((pg_count * (host_count + 1)))
+    local attempt pg_id first_node second_node previous_pair pair
+    declare -A previous_pairs=()
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        route_acting_set_for_attempt "$attempt" pg_id first_node second_node
+        pair="$first_node,$second_node"
+        previous_pair="${previous_pairs[$pg_id]:-}"
+        [[ -z "$previous_pair" || "$previous_pair" != "$pair" ]] ||
+            die "internal route rotation repeats PG $pg_id acting pair $pair on consecutive passes"
+        previous_pairs["$pg_id"]="$pair"
     done
 }
 
@@ -153,6 +187,9 @@ retained_epochs="${ARGMIN_MULTIHOST_RAFT_RETAINED_EPOCHS:-256}"
 data_object_count="${ARGMIN_MULTIHOST_RAFT_DATA_OBJECTS:-8}"
 heartbeat_lease_ms="${ARGMIN_MULTIHOST_RAFT_HEARTBEAT_LEASE_MS:-5000}"
 repeat_count="${ARGMIN_MULTIHOST_RAFT_REPEAT:-3}"
+startup_crud_rounds="${ARGMIN_MULTIHOST_RAFT_STARTUP_CRUD_ROUNDS:-1}"
+startup_only=0
+host_fault_driver="${ARGMIN_MULTIHOST_RAFT_HOST_FAULT_DRIVER:-}"
 quantitative=0
 sustained_seconds="${ARGMIN_MULTIHOST_RAFT_SUSTAINED_SECONDS:-300}"
 max_durable_bytes_per_second=1048576
@@ -233,6 +270,20 @@ while (($# > 0)); do
             repeat_count="$2"
             shift 2
             ;;
+        --startup-crud-rounds)
+            [[ $# -ge 2 ]] || die "--startup-crud-rounds requires a value"
+            startup_crud_rounds="$2"
+            shift 2
+            ;;
+        --startup-only)
+            startup_only=1
+            shift
+            ;;
+        --host-fault-driver)
+            [[ $# -ge 2 ]] || die "--host-fault-driver requires a value"
+            host_fault_driver="$2"
+            shift 2
+            ;;
         --quantitative)
             quantitative=1
             shift
@@ -265,17 +316,18 @@ done
 ((release == 0 || ${#binary} == 0)) || die "--binary cannot be combined with --release"
 [[ "$remote_root" == /* && "$remote_root" != "/" ]] || die "--remote-root must be a non-root absolute path"
 [[ "$remote_root" != *[[:space:]]* ]] || die "--remote-root cannot contain whitespace"
-declare -a ssh_options=() scp_options=()
+declare -a ssh_options=(-o BatchMode=yes -o ConnectTimeout=3)
+declare -a scp_options=(-o BatchMode=yes -o ConnectTimeout=3)
 if [[ -n "$ssh_config" ]]; then
     [[ -f "$ssh_config" ]] || die "--ssh-config does not name a regular file: $ssh_config"
-    ssh_options=(-F "$ssh_config")
-    scp_options=(-F "$ssh_config")
+    ssh_options+=(-F "$ssh_config")
+    scp_options+=(-F "$ssh_config")
 fi
 case "$storage_profile" in
     persistent|volatile-test) ;;
     *) die "--storage-profile must be persistent or volatile-test" ;;
 esac
-for numeric in "$port_base" "$pg_count" "$retained_epochs" "$data_object_count" "$heartbeat_lease_ms" "$repeat_count" "$sustained_seconds" "$max_durable_bytes_per_second" "$max_wal_file_sync_us" "$max_checkpoint_store_us" "$max_rpc_operation_us"; do
+for numeric in "$port_base" "$pg_count" "$retained_epochs" "$data_object_count" "$heartbeat_lease_ms" "$repeat_count" "$startup_crud_rounds" "$sustained_seconds" "$max_durable_bytes_per_second" "$max_wal_file_sync_us" "$max_checkpoint_store_us" "$max_rpc_operation_us"; do
     [[ "$numeric" =~ ^[1-9][0-9]*$ ]] || die "numeric options must be positive integers"
 done
 ((port_base >= 1024 && port_base <= 65531)) || die "--port-base must be between 1024 and 65531"
@@ -284,6 +336,7 @@ done
 ((heartbeat_lease_ms >= 2000 && heartbeat_lease_ms <= 10000)) ||
     die "--heartbeat-lease-ms must be between 2000 and 10000"
 if ((quantitative)); then
+    ((startup_only == 0)) || die "--quantitative cannot be combined with --startup-only"
     ((release == 1)) || die "--quantitative requires --release"
     [[ "$storage_profile" == "persistent" ]] ||
         die "--quantitative requires --storage-profile persistent"
@@ -296,12 +349,23 @@ if ((quantitative)); then
 fi
 
 declare -a hosts addresses
-split_exact_three "$hosts_value" "--hosts" hosts
-split_exact_three "$addresses_value" "--addresses" addresses
+split_host_list "$hosts_value" "--hosts" hosts
+split_host_list "$addresses_value" "--addresses" addresses
+((${#hosts[@]} == ${#addresses[@]})) ||
+    die "--hosts and --addresses must contain the same number of values"
+host_count=${#hosts[@]}
+validate_route_rotation
 for address in "${addresses[@]}"; do
     [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
         die "--addresses currently requires literal IPv4 addresses: $address"
 done
+if [[ -n "$host_fault_driver" ]]; then
+    if [[ "$host_fault_driver" != /* ]]; then
+        host_fault_driver="$ROOT/$host_fault_driver"
+    fi
+    [[ -x "$host_fault_driver" ]] ||
+        die "--host-fault-driver is not executable: $host_fault_driver"
+fi
 
 declare -A machine_id_hosts=()
 declare -a server_build=() client_build=()
@@ -383,41 +447,60 @@ printf '%s' 'argmin-multihost-primary-secret' >"$material_dir/s3-secret-access-k
 printf '%s' 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' >"$material_dir/sse-s3-wrapping-key"
 chmod 600 "$material_dir/s3-secret-access-key" "$material_dir/sse-s3-wrapping-key"
 
-declare -a current_units=("" "" "")
-declare -a unit_generations=(0 0 0)
-declare -a storage_units=("" "" "")
-declare -a storage_unit_generations=(0 0 0)
-declare -a frontend_units=("" "" "")
-declare -a frontend_unit_generations=(0 0 0)
+declare -a current_units=() unit_generations=()
+declare -a storage_units=() storage_unit_generations=()
+declare -a frontend_units=() frontend_unit_generations=()
+declare -A diagnostic_unit_hosts=()
 command_process_number=1
 cleanup_started=0
+powered_off_number=0
 metrics_dir="$local_run/metrics"
 mkdir -p "$metrics_dir"
 
-declare -a quantitative_baseline_checkpoint_bytes=(0 0 0)
-declare -a quantitative_baseline_wal_bytes=(0 0 0)
-declare -a quantitative_baseline_checkpoint_errors=(0 0 0)
-declare -a quantitative_baseline_checkpoint_compaction_errors=(0 0 0)
-declare -a quantitative_baseline_wal_errors=(0 0 0)
-declare -a quantitative_baseline_rpc_write_errors=(0 0 0)
-declare -a quantitative_baseline_seconds=(0 0 0)
-declare -a quantitative_checkpoint_bytes=(0 0 0)
-declare -a quantitative_wal_bytes=(0 0 0)
-declare -a quantitative_checkpoint_store_us_max=(0 0 0)
-declare -a quantitative_wal_file_sync_us_max=(0 0 0)
-declare -a quantitative_rpc_operation_us_max=(0 0 0)
+declare -a quantitative_baseline_checkpoint_bytes=()
+declare -a quantitative_baseline_wal_bytes=()
+declare -a quantitative_baseline_checkpoint_errors=()
+declare -a quantitative_baseline_checkpoint_compaction_errors=()
+declare -a quantitative_baseline_wal_errors=()
+declare -a quantitative_baseline_rpc_write_errors=()
+declare -a quantitative_baseline_seconds=()
+declare -a quantitative_checkpoint_bytes=()
+declare -a quantitative_wal_bytes=()
+declare -a quantitative_checkpoint_store_us_max=()
+declare -a quantitative_wal_file_sync_us_max=()
+declare -a quantitative_rpc_operation_us_max=()
+for ((index = 0; index < host_count; index++)); do
+    current_units[index]=""
+    unit_generations[index]=0
+    storage_units[index]=""
+    storage_unit_generations[index]=0
+    frontend_units[index]=""
+    frontend_unit_generations[index]=0
+    quantitative_baseline_checkpoint_bytes[index]=0
+    quantitative_baseline_wal_bytes[index]=0
+    quantitative_baseline_checkpoint_errors[index]=0
+    quantitative_baseline_checkpoint_compaction_errors[index]=0
+    quantitative_baseline_wal_errors[index]=0
+    quantitative_baseline_rpc_write_errors[index]=0
+    quantitative_baseline_seconds[index]=0
+    quantitative_checkpoint_bytes[index]=0
+    quantitative_wal_bytes[index]=0
+    quantitative_checkpoint_store_us_max[index]=0
+    quantitative_wal_file_sync_us_max[index]=0
+    quantitative_rpc_operation_us_max[index]=0
+done
 
 collect_artifacts() {
     local index host host_dir unit
-    for index in 0 1 2; do
+    for ((index = 0; index < host_count; index++)); do
         host="${hosts[$index]}"
         host_dir="$local_run/$host"
         mkdir -p "$host_dir"
         scp "${scp_options[@]}" -q -r "$host:$remote_run/logs/." "$host_dir/logs" 2>/dev/null || true
         remote_exec_quiet "$host" find "$remote_run" -maxdepth 3 -type f -printf '%P %s bytes\n' \
             >"$host_dir/files.txt" 2>&1 || true
-        for unit in "${current_units[$index]}" "${storage_units[$index]}" "${frontend_units[$index]}"; do
-            [[ -n "$unit" ]] || continue
+        for unit in "${!diagnostic_unit_hosts[@]}"; do
+            [[ "${diagnostic_unit_hosts[$unit]}" == "$index" ]] || continue
             remote_exec_quiet "$host" systemctl --user status "$unit" --no-pager \
                 >"$host_dir/$unit-status.txt" 2>&1 || true
             remote_exec_quiet "$host" journalctl --user-unit "$unit" --no-pager \
@@ -429,7 +512,7 @@ collect_artifacts() {
 
 stop_processes() {
     local index
-    for index in 0 1 2; do
+    for ((index = 0; index < host_count; index++)); do
         if [[ -n "${frontend_units[$index]}" ]]; then
             remote_exec_quiet "${hosts[$index]}" systemctl --user stop "${frontend_units[$index]}" \
                 >/dev/null 2>&1 || true
@@ -451,6 +534,13 @@ cleanup() {
     ((cleanup_started == 0)) || exit "$status"
     cleanup_started=1
     set +e
+    if ((status != 0)) && declare -F capture_cluster_diagnostics >/dev/null; then
+        capture_cluster_diagnostics failure
+    fi
+    if ((powered_off_number != 0)) && declare -F power_up_host >/dev/null; then
+        power_up_host "$powered_off_number" ||
+            echo "warning: failed to restore powered-off host $powered_off_number" >&2
+    fi
     stop_processes
     if ((status != 0 || keep_always)); then
         collect_artifacts
@@ -470,8 +560,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "== argmin-s3 multihost Raft and data-plane soak =="
-echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value storage_profile=$storage_profile pg_count=$pg_count retained_epochs=$retained_epochs data_objects=$data_object_count heartbeat_lease_ms=$heartbeat_lease_ms repeat=$repeat_count quantitative=$quantitative sustained_seconds=$sustained_seconds"
+echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value host_count=$host_count storage_profile=$storage_profile pg_count=$pg_count retained_epochs=$retained_epochs data_objects=$data_object_count heartbeat_lease_ms=$heartbeat_lease_ms repeat=$repeat_count startup_crud_rounds=$startup_crud_rounds startup_only=$startup_only quantitative=$quantitative sustained_seconds=$sustained_seconds"
 echo "binary=$binary client_binary=$client_binary remote_run=$remote_run"
+if [[ -n "$host_fault_driver" ]]; then
+    echo "host_fault_driver=$host_fault_driver"
+fi
 if [[ "$storage_profile" == "volatile-test" ]]; then
     echo "NOTE: volatile-test storage is a functional/locking profile and is not durability release evidence"
 fi
@@ -484,11 +577,15 @@ openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 2 \
 chmod 600 "$material_dir/ca.key"
 chmod 644 "$material_dir/ca.crt"
 
+server_san=""
+for address in "${addresses[@]}"; do
+    server_san+="${server_san:+,}IP:$address"
+done
 cat >"$material_dir/server.ext" <<EOF
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
-subjectAltName=IP:${addresses[0]},IP:${addresses[1]},IP:${addresses[2]}
+subjectAltName=$server_san
 EOF
 openssl req -new -newkey rsa:2048 -nodes -sha256 \
     -subj "/CN=argmin-multihost-$run_id" \
@@ -501,7 +598,7 @@ chmod 644 "$material_dir/server.crt"
 
 declare -A generated_auth_secrets=()
 for role in raft storage admin; do
-    for number in 1 2 3; do
+    for ((number = 1; number <= host_count; number++)); do
         secret_path="$material_dir/$role-$number.key"
         (umask 077 && openssl rand -base64 32 >"$secret_path")
         secret="$(<"$secret_path")"
@@ -512,7 +609,7 @@ for role in raft storage admin; do
         generated_auth_secrets["$secret"]="$role-$number"
     done
 done
-for number in 1 2 3; do
+for ((number = 1; number <= host_count; number++)); do
     for role in frontend admin maintenance; do
         credential="frontend-$number"
         if [[ "$role" != "frontend" ]]; then
@@ -530,7 +627,7 @@ for number in 1 2 3; do
 done
 
 declare -a mount_paths
-for index in 0 1 2; do
+for ((index = 0; index < host_count; index++)); do
     host="${hosts[$index]}"
     remote_exec "$host" mkdir -p "$remote_run/material" "$remote_run/logs" "$remote_run/state-$((index + 1))"
     remote_exec "$host" chmod 700 "$remote_run" "$remote_run/material" "$remote_run/logs" "$remote_run/state-$((index + 1))"
@@ -606,7 +703,7 @@ certificate_ref = "file:$remote_run/material/server.crt"
 private_key_ref = "file:$remote_run/material/server.key"
 EOF
 
-for index in 0 1 2; do
+for ((index = 0; index < host_count; index++)); do
     number=$((index + 1))
     raft_node_id=$((100 + number))
     address="${addresses[$index]}"
@@ -727,7 +824,7 @@ secret_ref = "file:$remote_run/material/admin-$number.key"
 EOF
 done
 
-for number in 1 2 3; do
+for ((number = 1; number <= host_count; number++)); do
     cat >>"$manifest_path" <<EOF
 
 [[processes]]
@@ -784,11 +881,11 @@ deploy_material=(
     "$material_dir/sse-s3-wrapping-key"
 )
 for role in raft storage admin; do
-    for number in 1 2 3; do
+    for ((number = 1; number <= host_count; number++)); do
         deploy_material+=("$material_dir/$role-$number.key")
     done
 done
-for number in 1 2 3; do
+for ((number = 1; number <= host_count; number++)); do
     deploy_material+=(
         "$material_dir/frontend-$number.key"
         "$material_dir/frontend-$number-admin.key"
@@ -796,7 +893,7 @@ for number in 1 2 3; do
     )
 done
 
-for index in 0 1 2; do
+for ((index = 0; index < host_count; index++)); do
     host="${hosts[$index]}"
     echo "== deploy to $host =="
     print_command scp "${scp_options[@]}" -q "$binary" "$host:$remote_run/argmin-s3.next"
@@ -814,11 +911,11 @@ for index in 0 1 2; do
         "$remote_run/material/sse-s3-wrapping-key"
     )
     for role in raft storage admin; do
-        for number in 1 2 3; do
+        for ((number = 1; number <= host_count; number++)); do
             sensitive_paths+=("$remote_run/material/$role-$number.key")
         done
     done
-    for number in 1 2 3; do
+    for ((number = 1; number <= host_count; number++)); do
         sensitive_paths+=(
             "$remote_run/material/frontend-$number.key"
             "$remote_run/material/frontend-$number-admin.key"
@@ -830,7 +927,7 @@ for index in 0 1 2; do
     [[ "$remote_digest" == "$binary_digest" ]] || die "deployed binary checksum mismatch on $host"
 done
 
-for index in 0 1 2; do
+for ((index = 0; index < host_count; index++)); do
     number=$((index + 1))
     host="${hosts[$index]}"
     remote_exec "$host" env \
@@ -862,6 +959,7 @@ start_authority() {
     unit_generations[index]=$((unit_generations[index] + 1))
     local unit="$run_name-control-$number-${unit_generations[$index]}"
     current_units[index]="$unit"
+    diagnostic_unit_hosts["$unit"]="$index"
     remote_exec "$host" systemd-run --user --collect --unit "$unit" \
         --property "WorkingDirectory=$remote_run" \
         --property "StandardOutput=append:$remote_run/logs/control-$number.log" \
@@ -906,8 +1004,8 @@ wait_authority_listener() {
 wait_for_raft_network() {
     local source_index target_index deadline
     deadline=$((SECONDS + 30))
-    for source_index in 0 1 2; do
-        for target_index in 0 1 2; do
+    for ((source_index = 0; source_index < host_count; source_index++)); do
+        for ((target_index = 0; target_index < host_count; target_index++)); do
             while ! remote_exec_quiet "${hosts[$source_index]}" timeout 1 bash -c \
                 "echo >/dev/tcp/${addresses[$target_index]}/$raft_port" >/dev/null 2>&1; do
                 if ((SECONDS >= deadline)); then
@@ -926,6 +1024,7 @@ start_storage() {
     storage_unit_generations[index]=$((storage_unit_generations[index] + 1))
     local unit="$run_name-storage-$number-${storage_unit_generations[$index]}"
     storage_units[index]="$unit"
+    diagnostic_unit_hosts["$unit"]="$index"
     remote_exec "$host" systemd-run --user --collect --unit "$unit" \
         --property "WorkingDirectory=$remote_run" \
         --property "StandardOutput=append:$remote_run/logs/storage-$number.log" \
@@ -970,8 +1069,8 @@ wait_storage_listener() {
 wait_for_storage_network() {
     local source_index target_index deadline
     deadline=$((SECONDS + 60))
-    for source_index in 0 1 2; do
-        for target_index in 0 1 2; do
+    for ((source_index = 0; source_index < host_count; source_index++)); do
+        for ((target_index = 0; target_index < host_count; target_index++)); do
             while ! remote_exec_quiet "${hosts[$source_index]}" timeout 1 bash -c \
                 "echo >/dev/tcp/${addresses[$target_index]}/$storage_port" >/dev/null 2>&1; do
                 if ((SECONDS >= deadline)); then
@@ -990,6 +1089,7 @@ start_frontend() {
     frontend_unit_generations[index]=$((frontend_unit_generations[index] + 1))
     local unit="$run_name-frontend-$number-${frontend_unit_generations[$index]}"
     frontend_units[index]="$unit"
+    diagnostic_unit_hosts["$unit"]="$index"
     remote_exec "$host" systemd-run --user --collect --unit "$unit" \
         --property "WorkingDirectory=$remote_run" \
         --property "StandardOutput=append:$remote_run/logs/frontend-$number.log" \
@@ -1025,6 +1125,86 @@ stop_host_services() {
     current_units[index]=""
 }
 
+target_service_ports_unreachable_from_survivors() {
+    local target_number="$1"
+    local target_index=$((target_number - 1))
+    local target_address="${addresses[$target_index]}"
+    local source_index
+    local -a service_ports=(
+        "$raft_port" "$control_port" "$recovery_port" "$storage_port" "$frontend_port"
+    )
+    for ((source_index = 0; source_index < host_count; source_index++)); do
+        ((source_index != target_index)) || continue
+        # The single-quoted script expands positional parameters on the remote host.
+        # shellcheck disable=SC2016
+        remote_exec_quiet "${hosts[$source_index]}" bash -c '
+            target_address="$1"
+            shift
+            for port in "$@"; do
+                if timeout 1 bash -c "echo >/dev/tcp/$target_address/$port" \
+                    >/dev/null 2>&1; then
+                    exit 1
+                fi
+            done
+        ' _ "$target_address" "${service_ports[@]}" >/dev/null 2>&1 || return 1
+    done
+}
+
+wait_for_host_ssh_state() {
+    local number="$1"
+    local expected="$2"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    local deadline=$((SECONDS + 300))
+    local reachable consecutive_observations=0
+    local required_observations=3
+    while ((SECONDS < deadline)); do
+        if remote_exec_quiet "$host" true >/dev/null 2>&1; then
+            reachable=1
+        else
+            reachable=0
+        fi
+        if [[ "$expected" == "up" && "$reachable" -eq 1 ]] ||
+            [[ "$expected" == "down" && "$reachable" -eq 0 ]]; then
+            consecutive_observations=$((consecutive_observations + 1))
+        else
+            consecutive_observations=0
+        fi
+        if ((consecutive_observations >= required_observations)); then
+            if [[ "$expected" == "up" ]] ||
+                target_service_ports_unreachable_from_survivors "$number"; then
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    echo "error: $host did not become SSH-$expected after host fault request" >&2
+    return 1
+}
+
+power_down_host() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    powered_off_number="$number"
+    print_command "$host_fault_driver" down "$host" "${addresses[$index]}"
+    "$host_fault_driver" down "$host" "${addresses[$index]}" || return 1
+    wait_for_host_ssh_state "$number" down || return 1
+    frontend_units[index]=""
+    storage_units[index]=""
+    current_units[index]=""
+}
+
+power_up_host() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    print_command "$host_fault_driver" up "$host" "${addresses[$index]}"
+    "$host_fault_driver" up "$host" "${addresses[$index]}" || return 1
+    wait_for_host_ssh_state "$number" up || return 1
+    powered_off_number=0
+}
+
 wait_frontend_listener() {
     local number="$1"
     local index=$((number - 1))
@@ -1048,7 +1228,7 @@ wait_frontend_listener() {
 
 assert_all_service_units_active() {
     local number index host unit label
-    for number in 1 2 3; do
+    for ((number = 1; number <= host_count; number++)); do
         index=$((number - 1))
         host="${hosts[$index]}"
         for label in authority storage frontend; do
@@ -1113,6 +1293,7 @@ wait_runtime_map_ready() {
 
 data_plane_bucket_file="$local_run/data-plane-bucket"
 data_plane_body_file="$local_run/data-plane-body"
+data_plane_client_log="$metrics_dir/data-plane-client.log"
 data_plane_keys=()
 
 run_data_client_on() {
@@ -1120,6 +1301,12 @@ run_data_client_on() {
     shift
     local index=$((number - 1))
     local data_plane_endpoint="http://${addresses[$index]}:$frontend_port"
+    {
+        printf '\n[%s] frontend=%s endpoint=%s command=' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "$number" "$data_plane_endpoint"
+        printf ' %q' "$client_binary" "$@"
+        printf '\n'
+    } >>"$data_plane_client_log"
     print_command env \
         "S3_TEST_ENDPOINT=$data_plane_endpoint" \
         "S3_TEST_BUCKET_PREFIX=argmin-multihost-" \
@@ -1135,7 +1322,69 @@ run_data_client_on() {
         "AWS_TEST_ACCESS_KEY=argmin-multihost-primary" \
         "AWS_TEST_SECRET_KEY=argmin-multihost-primary-secret" \
         "AWS_TEST_REGION=us-east-1" \
-        "$client_binary" "$@"
+        "$client_binary" "$@" 2>&1 | tee -a "$data_plane_client_log"
+}
+
+capture_cluster_diagnostics() {
+    local label="$1"
+    local output_dir="$metrics_dir/cluster-$label"
+    local number index host
+    mkdir -p "$output_dir"
+    for ((number = 1; number <= host_count; number++)); do
+        index=$((number - 1))
+        host="${hosts[$index]}"
+        if ((number == powered_off_number)); then
+            printf 'host powered off during diagnostic capture\n' \
+                >"$output_dir/host-$number-unavailable.txt"
+            continue
+        fi
+        remote_exec_quiet "$host" env \
+            "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+            "ARGMIN_PROCESS_ID=frontend-$number" \
+            "$remote_run/argmin-s3" control-plane-runtime-map-ready \
+            "$remote_run/unused.sock" \
+            >"$output_dir/frontend-$number-runtime-map-ready.txt" 2>&1 || true
+        remote_exec_quiet "$host" env \
+            "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+            "ARGMIN_PROCESS_ID=frontend-$number" \
+            "$remote_run/argmin-s3" control-plane-runtime-map-diagnostics \
+            "$remote_run/unused.sock" \
+            >"$output_dir/frontend-$number-runtime-map-diagnostics.txt" 2>&1 || true
+        remote_exec_quiet "$host" env \
+            "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+            "ARGMIN_PROCESS_ID=control-$number" \
+            "$remote_run/argmin-s3" control-plane-authority-clock-status \
+            "$remote_run/unused.sock" \
+            >"$output_dir/control-$number-authority-clock.txt" 2>&1 || true
+    done
+}
+
+run_startup_crud_round() {
+    local round="$1"
+    local bucket_file="$local_run/startup-bucket-$round"
+    local create_frontend=$((((round - 1) % host_count) + 1))
+    local cleanup_frontend=$(((create_frontend % host_count) + 1))
+    local number key key_number
+    local -a startup_keys
+    rm -f -- "$bucket_file"
+    run_data_client_on "$create_frontend" create-put \
+        "$bucket_file" "startup-$round-create" "$data_plane_body_file"
+    for ((number = 1; number <= host_count; number++)); do
+        key="startup-$round-frontend-$number"
+        run_data_client_on "$number" put "$bucket_file" "$key" "$data_plane_body_file"
+    done
+    for ((number = 1; number <= host_count; number++)); do
+        run_data_client_on "$number" get \
+            "$bucket_file" "startup-$round-create" "$data_plane_body_file"
+        run_data_client_on "$number" head \
+            "$bucket_file" "startup-$round-frontend-$number" "$data_plane_body_file"
+        startup_keys=("startup-$round-create")
+        for ((key_number = 1; key_number <= host_count; key_number++)); do
+            startup_keys+=("startup-$round-frontend-$key_number")
+        done
+        run_data_client_on "$number" list-contains "$bucket_file" "${startup_keys[@]}"
+    done
+    run_data_client_on "$cleanup_frontend" cleanup "$bucket_file" "${startup_keys[@]}"
 }
 
 put_data_plane_object_on() {
@@ -1158,7 +1407,7 @@ verify_data_plane_objects_on() {
 
 verify_data_plane_objects_across_running_frontends() {
     local number index verified=0
-    for number in 1 2 3; do
+    for ((number = 1; number <= host_count; number++)); do
         index=$((number - 1))
         [[ -n "${frontend_units[$index]}" ]] || continue
         verify_data_plane_objects_on "$number"
@@ -1498,7 +1747,7 @@ capture_quantitative_result() {
 assert_no_quantitative_auth_failures() {
     local index number host output grep_status
     local pattern='authentication (failed|rejected)|auth rejected'
-    for index in 0 1 2; do
+    for ((index = 0; index < host_count; index++)); do
         number=$((index + 1))
         host="${hosts[$index]}"
         if output="$(remote_exec_quiet "$host" grep -nE "$pattern" \
@@ -1516,10 +1765,10 @@ assert_no_quantitative_auth_failures() {
 }
 
 echo "== start static authenticated TCP authorities =="
-start_authority 2
-wait_authority_listener 2
-start_authority 3
-wait_authority_listener 3
+for ((number = 2; number <= host_count; number++)); do
+    start_authority "$number"
+    wait_authority_listener "$number"
+done
 start_authority 1
 wait_authority_listener 1
 wait_for_raft_network
@@ -1527,14 +1776,36 @@ wait_clock_status true
 echo "initial_authority_clock=$last_status"
 
 echo "== start authenticated TLS/TCP storage nodes =="
-for number in 1 2 3; do
+for ((number = 1; number <= host_count; number++)); do
     start_storage "$number"
 done
-for number in 1 2 3; do
+for ((number = 1; number <= host_count; number++)); do
     wait_storage_listener "$number"
 done
 wait_for_storage_network
 wait_runtime_map_ready
+
+echo "== start split-role frontends and run startup CRUD diagnostics =="
+for ((number = 1; number <= host_count; number++)); do
+    start_frontend "$number"
+done
+for ((number = 1; number <= host_count; number++)); do
+    wait_frontend_listener "$number"
+done
+openssl rand -out "$data_plane_body_file" 1048576
+capture_cluster_diagnostics startup-before-crud
+for ((startup_round = 1; startup_round <= startup_crud_rounds; startup_round++)); do
+    echo "== startup CRUD round $startup_round/$startup_crud_rounds =="
+    run_startup_crud_round "$startup_round"
+    capture_cluster_diagnostics "startup-after-crud-$startup_round"
+done
+echo "startup_crud_complete rounds=$startup_crud_rounds frontends=$host_count"
+
+if ((startup_only)); then
+    assert_all_service_units_active
+    echo "OK: argmin-s3 multihost startup and CRUD diagnostic passed"
+    exit 0
+fi
 
 echo "== build retained route history =="
 baseline_output="$(admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" 0 1 2 2>&1)"
@@ -1547,19 +1818,13 @@ fi
 
 route_advances=0
 route_attempts=0
-max_route_attempts=$((retained_epochs + (3 * pg_count)))
+max_route_attempts=$((retained_epochs + (host_count * pg_count)))
 while ((route_advances < retained_epochs)); do
     route_attempts=$((route_attempts + 1))
     ((route_attempts <= max_route_attempts)) ||
         die "only observed $route_advances route epoch advances after $max_route_attempts attempts"
-    pg_id=$(((route_attempts - 1) % pg_count))
-    if ((route_attempts % 3 == 1)); then
-        acting_set=(1 2)
-    elif ((route_attempts % 3 == 2)); then
-        acting_set=(2 3)
-    else
-        acting_set=(1 3)
-    fi
+    route_acting_set_for_attempt "$route_attempts" pg_id first_node second_node
+    acting_set=("$first_node" "$second_node")
     print_command admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}"
     route_output="$(admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}" 2>&1)"
     printf '%s\n' "$route_output" >&2
@@ -1579,30 +1844,23 @@ echo "retained_route_history advances=$route_advances attempts=$route_attempts f
 admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
 wait_runtime_map_ready
 
-echo "== start split-role frontends and seed cross-frontend S3 workload =="
-for number in 1 2 3; do
-    start_frontend "$number"
-done
-for number in 1 2 3; do
-    wait_frontend_listener "$number"
-done
-openssl rand -out "$data_plane_body_file" 1048576
+echo "== seed persistent cross-frontend S3 workload =="
 run_data_client_on 1 create-put "$data_plane_bucket_file" object-000 "$data_plane_body_file"
 data_plane_keys+=(object-000)
 for ((object_index = 1; object_index < data_object_count; object_index++)); do
     printf -v object_key 'object-%03d' "$object_index"
-    frontend_number=$(((object_index % 3) + 1))
+    frontend_number=$(((object_index % host_count) + 1))
     put_data_plane_object_on "$frontend_number" "$object_key"
 done
 verify_data_plane_objects_across_running_frontends
 run_data_client_on 2 cleanup-versioned-stress 1 2 2 multihost-versioned "$data_plane_body_file"
-echo "data_plane_cross_frontend_seed objects=${#data_plane_keys[@]} frontends=3 body_bytes=$(wc -c <"$data_plane_body_file")"
+echo "data_plane_cross_frontend_seed objects=${#data_plane_keys[@]} frontends=$host_count body_bytes=$(wc -c <"$data_plane_body_file")"
 
 if ((quantitative)); then
     echo "== begin quantitative outage and sustained interval =="
     admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
     wait_runtime_map_ready
-    for number in 1 2 3; do
+    for ((number = 1; number <= host_count; number++)); do
         transfer_leadership_to "$number"
         wait_runtime_map_ready
         capture_quantitative_baseline "$number"
@@ -1611,19 +1869,27 @@ if ((quantitative)); then
 fi
 
 for ((iteration = 1; iteration <= repeat_count; iteration++)); do
-    target_number=$((((iteration - 1) % 3) + 1))
+    target_number=$((((iteration - 1) % host_count) + 1))
     target_raft_node=$((100 + target_number))
-    survivor_number=$((target_number % 3 + 1))
+    survivor_number=$((target_number % host_count + 1))
     wait_runtime_map_ready
     pre_host_outage_epoch="$last_runtime_epoch"
-    echo "== host-service outage iteration $iteration: stop frontend, storage, and Raft node $target_raft_node =="
+    if [[ -n "$host_fault_driver" ]]; then
+        echo "== host power outage iteration $iteration: power off ${hosts[$((target_number - 1))]} and Raft node $target_raft_node =="
+    else
+        echo "== host-service outage iteration $iteration: stop frontend, storage, and Raft node $target_raft_node =="
+    fi
     transfer_leadership_to "$target_number"
 
     if ((quantitative)); then
         wait_runtime_map_ready
         accumulate_quantitative_generation "$target_number" before-restart
     fi
-    stop_host_services "$target_number"
+    if [[ -n "$host_fault_driver" ]]; then
+        power_down_host "$target_number" || die "failed to power down host $target_number"
+    else
+        stop_host_services "$target_number"
+    fi
     if ((quantitative)); then
         reset_quantitative_generation_baseline "$target_number"
     fi
@@ -1635,8 +1901,11 @@ for ((iteration = 1; iteration <= repeat_count; iteration++)); do
     wait_clock_status true "$((transferred_term + 1))"
 
     verify_data_plane_objects_across_running_frontends
-    echo "host_outage_reads_verified host=$target_number surviving_frontends=2 objects=${#data_plane_keys[@]}"
+    echo "host_outage_reads_verified host=$target_number surviving_frontends=$((host_count - 1)) objects=${#data_plane_keys[@]}"
 
+    if [[ -n "$host_fault_driver" ]]; then
+        power_up_host "$target_number" || die "failed to power up host $target_number"
+    fi
     start_authority "$target_number"
     wait_authority_listener "$target_number"
     stabilize_rejoined_clock "$((transferred_term + 1))"
@@ -1658,7 +1927,7 @@ if ((quantitative)); then
     echo "== complete quantitative sustained multihost release interval =="
     quantitative_read_rounds=0
     while ((SECONDS < quantitative_deadline)); do
-        frontend_number=$(((quantitative_read_rounds % 3) + 1))
+        frontend_number=$(((quantitative_read_rounds % host_count) + 1))
         verify_data_plane_objects_on "$frontend_number"
         quantitative_read_rounds=$((quantitative_read_rounds + 1))
         remaining_seconds=$((quantitative_deadline - SECONDS))
@@ -1671,7 +1940,7 @@ if ((quantitative)); then
 
     admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
     wait_runtime_map_ready
-    for number in 1 2 3; do
+    for ((number = 1; number <= host_count; number++)); do
         transfer_leadership_to "$number"
         wait_runtime_map_ready
         capture_quantitative_result "$number"
@@ -1686,7 +1955,7 @@ assert_all_service_units_active
 run_data_client_on 1 cleanup "$data_plane_bucket_file" "${data_plane_keys[@]}"
 
 echo "== final durable state =="
-for index in 0 1 2; do
+for ((index = 0; index < host_count; index++)); do
     number=$((index + 1))
     remote_exec "${hosts[$index]}" test -s "$remote_run/state-$number/control.state"
     remote_exec "${hosts[$index]}" find "$remote_run/state-$number" -maxdepth 1 -type f -printf '%f %s bytes\n'
