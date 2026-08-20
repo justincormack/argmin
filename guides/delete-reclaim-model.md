@@ -110,6 +110,11 @@ PGs to reclaim in parallel. Physical deletion remains idempotent because a
 worker can crash after deleting some shard files but before clearing reclaim
 metadata.
 
+Fresh process-local queue hints and eligible deferred retries receive fair
+worker admission. Sustained foreground cleanup hints must not starve a root
+that already made partial durable progress and entered its retry cooldown; the
+worker alternates between the two sources whenever both have runnable work.
+
 Terminal cleanup is retryable protocol state, not best-effort cleanup. If a
 reclaim or bucket-finalizer metadata command has already become terminal but
 the matching durable claim or pending cleanup marker survives a crash, startup

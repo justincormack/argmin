@@ -6667,6 +6667,64 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
 }
 
 #[test]
+fn deferred_bucket_finalize_is_not_starved_by_continuously_queued_hint() {
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let pg_ids = (0..17).collect::<Vec<_>>();
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
+    let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let bucket = trusted_bucket_name("deferred-finalize-queued-fairness");
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    drop(direct_coord);
+    initial.test_begin_current_bucket_delete(&bucket).unwrap();
+    let root = initial
+        .test_seed_current_bucket_finalize_work(&bucket)
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_hook = Arc::clone(&attempts);
+    let initial_for_hook = Arc::clone(&initial);
+    let duplicate_root = root.clone();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
+        before_reclaim_work_execute: Some(Arc::new(move |_execution_cluster| {
+            let attempt = attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+            assert!(attempt < 1_000, "deferred finalizer was starved");
+            thread::sleep(Duration::from_millis(1));
+            initial_for_hook.test_duplicate_bucket_finalize_work(&duplicate_root);
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let _worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    loop {
+        match initial.test_bucket_presence(&bucket).unwrap() {
+            storage::test_support::TestBucketPresence::Missing => break,
+            storage::test_support::TestBucketPresence::Deleting if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            presence => panic!(
+                "deferred finalizer did not make progress through queued hints: {presence:?}"
+            ),
+        }
+    }
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 3,
+        "the test must cross more than one bounded finalizer scan"
+    );
+}
+
+#[test]
 fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owners() {
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -6794,6 +6852,126 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
         replacement.test_object_payload_reclaim_outstanding_depth(),
         0,
         "duplicate reclaim must acknowledge the replacement generation"
+    );
+}
+
+#[test]
+fn deferred_object_reclaim_is_not_starved_by_continuously_queued_hint() {
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let bucket = trusted_bucket_name("deferred-object-queued-fairness");
+    let key = trusted_object_key("key");
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&initial),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                test_requester(),
+                None,
+            ),
+            data: b"first payload",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let reclaim_subject = storage::test_support::capture_object_payload_reclaim_subject(
+        &initial,
+        &bucket,
+        &key,
+        VersionId::Null,
+    )
+    .unwrap();
+    let payload_lease =
+        storage::test_support::acquire_object_payload_reclaim_lease(&initial, &reclaim_subject)
+            .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                test_requester(),
+                None,
+            ),
+            data: b"replacement payload",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let noise_roots = ["object-fairness-noise-a", "object-fairness-noise-b"].map(|name| {
+        let noise_bucket = trusted_bucket_name(name);
+        coord
+            .create_bucket_for_owner("default-owner", noise_bucket.as_str(), false)
+            .unwrap();
+        initial
+            .test_begin_current_bucket_delete(&noise_bucket)
+            .unwrap();
+        initial
+            .test_seed_current_bucket_finalize_work(&noise_bucket)
+            .unwrap()
+    });
+    drop(coord);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_hook = Arc::clone(&attempts);
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
+        before_reclaim_work_execute: Some(Arc::new(move |execution_cluster| {
+            let attempt = attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+            assert!(attempt < 1_000, "deferred object reclaim was starved");
+            thread::sleep(Duration::from_millis(1));
+            execution_cluster
+                .test_duplicate_bucket_finalize_work(&noise_roots[attempt % noise_roots.len()]);
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let _worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    while attempts.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 3,
+        "the payload lease must defer object reclaim before it is released"
+    );
+    drop(payload_lease);
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    while initial.test_object_payload_reclaim_outstanding_depth() != 0 && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        initial.test_object_payload_reclaim_outstanding_depth(),
+        0,
+        "deferred object reclaim must make progress through queued hints"
     );
 }
 
@@ -7091,6 +7269,69 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
             }
         }
     }
+}
+
+#[test]
+fn deferred_bucket_delete_begin_is_not_starved_by_continuously_queued_hint() {
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("deferred-delete-begin-queued-fairness");
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    let bucket_subject = initial
+        .test_capture_bucket_delete_begin_subject(&bucket)
+        .unwrap();
+
+    let expired = process_local_cluster_with_route_map_validity(
+        &initial,
+        RouteMapValidity::until_ms(1).unwrap(),
+    );
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&expired));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_hook = Arc::clone(&attempts);
+    let duplicate_subject = bucket_subject.clone();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(expired.process_local_registry_key()),
+        before_reclaim_work_execute: Some(Arc::new(move |execution_cluster| {
+            let attempt = attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+            assert!(attempt < 1_000, "deferred bucket-delete begin was starved");
+            thread::sleep(Duration::from_millis(1));
+            execution_cluster.test_enqueue_bucket_delete_begin_subject(&duplicate_subject);
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let _worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&expired));
+    expired.test_enqueue_bucket_delete_begin_subject(&bucket_subject);
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    while attempts.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 3,
+        "the expired route must defer bucket-delete begin before route refresh"
+    );
+    assert_eq!(
+        initial.test_bucket_presence(&bucket).unwrap(),
+        storage::test_support::TestBucketPresence::Active,
+        "the expired route must not begin bucket deletion"
+    );
+
+    install_same_store_next_epoch_runtime_map(&runtime_handle);
+    wait_until_bucket_deleting_or_missing(
+        &initial,
+        &bucket,
+        "deferred BucketDeleteBegin did not make progress through queued hints",
+    );
 }
 
 #[test]

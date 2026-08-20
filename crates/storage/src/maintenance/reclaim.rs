@@ -93,6 +93,144 @@ struct DeferredReclaimWork<T> {
     root: T,
 }
 
+struct DeferredReclaimQueues {
+    objects: VecDeque<DeferredReclaimWork<ObjectPayloadReclaimRoot>>,
+    object_roots: HashSet<ObjectPayloadReclaimRoot>,
+    begins: VecDeque<BucketDeleteBeginRoot>,
+    begin_roots: HashSet<BucketDeleteBeginRoot>,
+    finalizers: VecDeque<DeferredReclaimWork<BucketDeleteFinalizeRoot>>,
+    finalizer_roots: HashSet<BucketDeleteFinalizeRoot>,
+    next_class: DeferredReclaimClass,
+}
+
+impl DeferredReclaimQueues {
+    fn new() -> Self {
+        Self {
+            objects: VecDeque::new(),
+            object_roots: HashSet::new(),
+            begins: VecDeque::new(),
+            begin_roots: HashSet::new(),
+            finalizers: VecDeque::new(),
+            finalizer_roots: HashSet::new(),
+            next_class: DeferredReclaimClass::ObjectPayload,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.objects.is_empty() && self.begins.is_empty() && self.finalizers.is_empty()
+    }
+
+    fn take(
+        &mut self,
+        current: &Arc<StorageCluster>,
+        object_retry_after: &HashMap<u32, Instant>,
+        begin_retry_after: &HashMap<BucketDeleteBeginRoot, Instant>,
+        finalize_retry_after: &HashMap<BucketDeleteFinalizeRoot, Instant>,
+    ) -> Option<(Arc<StorageCluster>, ReclaimWorkItem)> {
+        let now = Instant::now();
+        let object_position = self.objects.iter().position(|deferred| {
+            let pg_id = current.object_payload_reclaim_pg_id(&deferred.root.0, &deferred.root.1);
+            object_retry_after
+                .get(&pg_id)
+                .is_none_or(|retry_after| *retry_after <= now)
+        });
+        let begin_position = self.begins.iter().position(|root| {
+            begin_retry_after
+                .get(root)
+                .is_none_or(|retry_after| *retry_after <= now)
+        });
+        let finalizer_position = self.finalizers.iter().position(|deferred| {
+            finalize_retry_after
+                .get(&deferred.root)
+                .is_none_or(|retry_after| *retry_after <= now)
+        });
+        let class = select_deferred_reclaim_class(
+            &mut self.next_class,
+            object_position.is_some(),
+            begin_position.is_some(),
+            finalizer_position.is_some(),
+        )?;
+        Some(match class {
+            DeferredReclaimClass::ObjectPayload => {
+                let deferred = self
+                    .objects
+                    .remove(object_position.expect("selected ready deferred object reclaim"))
+                    .expect("selected deferred object reclaim");
+                self.object_roots.remove(&deferred.root);
+                (
+                    deferred.queue_owner,
+                    ReclaimWorkItem::ObjectPayload(deferred.root),
+                )
+            }
+            DeferredReclaimClass::BucketDeleteBegin => {
+                let root = self
+                    .begins
+                    .remove(begin_position.expect("selected ready deferred bucket-delete begin"))
+                    .expect("selected deferred bucket-delete begin");
+                self.begin_roots.remove(&root);
+                (
+                    Arc::clone(current),
+                    ReclaimWorkItem::BucketDeleteBegin(root),
+                )
+            }
+            DeferredReclaimClass::BucketDeleteFinalize => {
+                let deferred = self
+                    .finalizers
+                    .remove(finalizer_position.expect("selected ready deferred bucket finalizer"))
+                    .expect("selected deferred bucket finalizer");
+                self.finalizer_roots.remove(&deferred.root);
+                (
+                    deferred.queue_owner,
+                    ReclaimWorkItem::BucketDelete(deferred.root),
+                )
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImmediateReclaimSource {
+    Queued,
+    Deferred,
+}
+
+impl ImmediateReclaimSource {
+    fn next(self) -> Self {
+        match self {
+            Self::Queued => Self::Deferred,
+            Self::Deferred => Self::Queued,
+        }
+    }
+}
+
+fn take_immediate_reclaim_work(
+    current: &Arc<StorageCluster>,
+    deferred: &mut DeferredReclaimQueues,
+    next_source: &mut ImmediateReclaimSource,
+    object_retry_after: &HashMap<u32, Instant>,
+    begin_retry_after: &HashMap<BucketDeleteBeginRoot, Instant>,
+    finalize_retry_after: &HashMap<BucketDeleteFinalizeRoot, Instant>,
+) -> Option<(Arc<StorageCluster>, ReclaimWorkItem)> {
+    for source in [*next_source, (*next_source).next()] {
+        let selected = match source {
+            ImmediateReclaimSource::Queued => current
+                .try_take_reclaim_work()
+                .map(|work| (Arc::clone(current), work)),
+            ImmediateReclaimSource::Deferred => deferred.take(
+                current,
+                object_retry_after,
+                begin_retry_after,
+                finalize_retry_after,
+            ),
+        };
+        if selected.is_some() {
+            *next_source = source.next();
+            return selected;
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeferredReclaimClass {
     ObjectPayload,
@@ -552,17 +690,10 @@ fn run_reclaim_worker(
     stop: Arc<AtomicBool>,
 ) {
     let mut object_retry_after: HashMap<u32, Instant> = HashMap::new();
-    let mut deferred_objects: VecDeque<DeferredReclaimWork<ObjectPayloadReclaimRoot>> =
-        VecDeque::new();
-    let mut deferred_object_roots: HashSet<ObjectPayloadReclaimRoot> = HashSet::new();
     let mut begin_retry_after: HashMap<BucketDeleteBeginRoot, Instant> = HashMap::new();
-    let mut deferred_begins: VecDeque<BucketDeleteBeginRoot> = VecDeque::new();
-    let mut deferred_begin_roots: HashSet<BucketDeleteBeginRoot> = HashSet::new();
     let mut finalize_retry_after: HashMap<BucketDeleteFinalizeRoot, Instant> = HashMap::new();
-    let mut deferred_finalizers: VecDeque<DeferredReclaimWork<BucketDeleteFinalizeRoot>> =
-        VecDeque::new();
-    let mut deferred_finalizer_roots: HashSet<BucketDeleteFinalizeRoot> = HashSet::new();
-    let mut next_deferred_class = DeferredReclaimClass::ObjectPayload;
+    let mut deferred = DeferredReclaimQueues::new();
+    let mut next_immediate_source = ImmediateReclaimSource::Queued;
     let mut scan_schedule = DurableReclaimScanSchedule::immediate();
     let mut pending_work: Option<(Arc<StorageCluster>, ReclaimWorkItem)> = None;
 
@@ -571,76 +702,43 @@ fn run_reclaim_worker(
         enqueue_durable_reclaim_work_if_due(
             &current,
             &admission,
-            &deferred_object_roots,
-            &deferred_begin_roots,
-            &deferred_finalizer_roots,
+            &deferred.object_roots,
+            &deferred.begin_roots,
+            &deferred.finalizer_roots,
             &mut scan_schedule,
         );
         let Some((queue_owner, work)) = pending_work
             .take()
             .or_else(|| {
-                current
-                    .try_take_reclaim_work()
-                    .map(|work| (Arc::clone(&current), work))
+                take_immediate_reclaim_work(
+                    &current,
+                    &mut deferred,
+                    &mut next_immediate_source,
+                    &object_retry_after,
+                    &begin_retry_after,
+                    &finalize_retry_after,
+                )
             })
             .or_else(|| {
-                if deferred_objects.is_empty()
-                    && deferred_begins.is_empty()
-                    && deferred_finalizers.is_empty()
-                {
+                if deferred.is_empty() {
                     return None;
                 }
                 enqueue_durable_reclaim_work_if_due(
                     &current,
                     &admission,
-                    &deferred_object_roots,
-                    &deferred_begin_roots,
-                    &deferred_finalizer_roots,
+                    &deferred.object_roots,
+                    &deferred.begin_roots,
+                    &deferred.finalizer_roots,
                     &mut scan_schedule,
                 );
-                current
-                    .try_take_reclaim_work()
-                    .map(|work| (Arc::clone(&current), work))
-                    .or_else(|| {
-                        let class = select_deferred_reclaim_class(
-                            &mut next_deferred_class,
-                            !deferred_objects.is_empty(),
-                            !deferred_begins.is_empty(),
-                            !deferred_finalizers.is_empty(),
-                        )?;
-                        Some(match class {
-                            DeferredReclaimClass::ObjectPayload => {
-                                let deferred = deferred_objects
-                                    .pop_front()
-                                    .expect("selected deferred object reclaim");
-                                deferred_object_roots.remove(&deferred.root);
-                                (
-                                    deferred.queue_owner,
-                                    ReclaimWorkItem::ObjectPayload(deferred.root),
-                                )
-                            }
-                            DeferredReclaimClass::BucketDeleteBegin => {
-                                let root = deferred_begins
-                                    .pop_front()
-                                    .expect("selected deferred bucket-delete begin");
-                                deferred_begin_roots.remove(&root);
-                                (
-                                    Arc::clone(&current),
-                                    ReclaimWorkItem::BucketDeleteBegin(root),
-                                )
-                            }
-                            DeferredReclaimClass::BucketDeleteFinalize => {
-                                let deferred = deferred_finalizers
-                                    .pop_front()
-                                    .expect("selected deferred bucket finalizer");
-                                deferred_finalizer_roots.remove(&deferred.root);
-                                (
-                                    deferred.queue_owner,
-                                    ReclaimWorkItem::BucketDelete(deferred.root),
-                                )
-                            }
-                        })
-                    })
+                take_immediate_reclaim_work(
+                    &current,
+                    &mut deferred,
+                    &mut next_immediate_source,
+                    &object_retry_after,
+                    &begin_retry_after,
+                    &finalize_retry_after,
+                )
             })
             .or_else(|| wait_for_runtime_map_reclaim_work(&storage_handle, &stop))
         else {
@@ -677,8 +775,9 @@ fn run_reclaim_worker(
         match work {
             ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
                 let root = (bucket, key, generation_id);
-                if deferred_object_roots.contains(&root) {
-                    if deferred_objects
+                if deferred.object_roots.contains(&root) {
+                    if deferred
+                        .objects
                         .iter()
                         .find(|deferred| deferred.root == root)
                         .is_some_and(|deferred| !Arc::ptr_eq(&deferred.queue_owner, &queue_owner))
@@ -693,8 +792,8 @@ fn run_reclaim_worker(
                     .is_some_and(|retry_after| *retry_after > Instant::now())
                 {
                     defer_object_payload_reclaim(
-                        &mut deferred_objects,
-                        &mut deferred_object_roots,
+                        &mut deferred.objects,
+                        &mut deferred.object_roots,
                         Arc::clone(&queue_owner),
                         root,
                     );
@@ -707,8 +806,8 @@ fn run_reclaim_worker(
                             Instant::now() + OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN,
                         );
                         defer_object_payload_reclaim(
-                            &mut deferred_objects,
-                            &mut deferred_object_roots,
+                            &mut deferred.objects,
+                            &mut deferred.object_roots,
                             Arc::clone(&queue_owner),
                             root,
                         );
@@ -719,8 +818,9 @@ fn run_reclaim_worker(
                 }
             }
             ReclaimWorkItem::BucketDelete(root) => {
-                if deferred_finalizer_roots.contains(&root) {
-                    if deferred_finalizers
+                if deferred.finalizer_roots.contains(&root) {
+                    if deferred
+                        .finalizers
                         .iter()
                         .find(|deferred| deferred.root == root)
                         .is_some_and(|deferred| !Arc::ptr_eq(&deferred.queue_owner, &queue_owner))
@@ -734,8 +834,8 @@ fn run_reclaim_worker(
                     .is_some_and(|retry_after| *retry_after > Instant::now())
                 {
                     defer_bucket_delete_finalize(
-                        &mut deferred_finalizers,
-                        &mut deferred_finalizer_roots,
+                        &mut deferred.finalizers,
+                        &mut deferred.finalizer_roots,
                         Arc::clone(&queue_owner),
                         root,
                     );
@@ -755,12 +855,12 @@ fn run_reclaim_worker(
                                     || begin.bucket_incarnation_generation()
                                         != root.bucket_incarnation_generation
                             });
-                            deferred_begin_roots.retain(|begin| {
+                            deferred.begin_roots.retain(|begin| {
                                 begin.bucket() != &root.bucket
                                     || begin.bucket_incarnation_generation()
                                         != root.bucket_incarnation_generation
                             });
-                            deferred_begins.retain(|begin| {
+                            deferred.begins.retain(|begin| {
                                 begin.bucket() != &root.bucket
                                     || begin.bucket_incarnation_generation()
                                         != root.bucket_incarnation_generation
@@ -769,8 +869,8 @@ fn run_reclaim_worker(
                         BucketDeleteFinalizeWorkerDisposition::RetryAfter(delay) => {
                             finalize_retry_after.insert(root.clone(), Instant::now() + delay);
                             defer_bucket_delete_finalize(
-                                &mut deferred_finalizers,
-                                &mut deferred_finalizer_roots,
+                                &mut deferred.finalizers,
+                                &mut deferred.finalizer_roots,
                                 Arc::clone(&queue_owner),
                                 root,
                             );
@@ -779,7 +879,7 @@ fn run_reclaim_worker(
                 }
             }
             ReclaimWorkItem::BucketDeleteBegin(root) => {
-                if deferred_begin_roots.contains(&root) {
+                if deferred.begin_roots.contains(&root) {
                     continue;
                 }
                 if begin_retry_after
@@ -787,8 +887,8 @@ fn run_reclaim_worker(
                     .is_some_and(|retry_after| *retry_after > Instant::now())
                 {
                     defer_bucket_delete_begin(
-                        &mut deferred_begins,
-                        &mut deferred_begin_roots,
+                        &mut deferred.begins,
+                        &mut deferred.begin_roots,
                         root,
                     );
                 } else {
@@ -815,8 +915,8 @@ fn run_reclaim_worker(
                                     Instant::now() + BUCKET_DELETE_BEGIN_RETRY_COOLDOWN,
                                 );
                                 defer_bucket_delete_begin(
-                                    &mut deferred_begins,
-                                    &mut deferred_begin_roots,
+                                    &mut deferred.begins,
+                                    &mut deferred.begin_roots,
                                     root,
                                 );
                             } else {
@@ -828,32 +928,35 @@ fn run_reclaim_worker(
             }
         }
 
-        if pending_work.is_none()
-            && (!deferred_objects.is_empty()
-                || !deferred_begins.is_empty()
-                || !deferred_finalizers.is_empty())
-        {
+        if pending_work.is_none() && !deferred.is_empty() {
             enqueue_durable_reclaim_work_if_due(
                 &execution_node,
                 &admission,
-                &deferred_object_roots,
-                &deferred_begin_roots,
-                &deferred_finalizer_roots,
+                &deferred.object_roots,
+                &deferred.begin_roots,
+                &deferred.finalizer_roots,
                 &mut scan_schedule,
             );
-            if let Some(work) = execution_node.try_take_reclaim_work() {
-                pending_work = Some((Arc::clone(&execution_node), work));
+            if let Some(work) = take_immediate_reclaim_work(
+                &execution_node,
+                &mut deferred,
+                &mut next_immediate_source,
+                &object_retry_after,
+                &begin_retry_after,
+                &finalize_retry_after,
+            ) {
+                pending_work = Some(work);
             } else if let Some(sleep_for) = shortest_retry_sleep(
                 shortest_retry_sleep(
                     earliest_object_payload_reclaim_retry_sleep(
                         &execution_node,
-                        &deferred_objects,
+                        &deferred.objects,
                         &object_retry_after,
                     ),
-                    earliest_bucket_delete_begin_retry_sleep(&deferred_begins, &begin_retry_after),
+                    earliest_bucket_delete_begin_retry_sleep(&deferred.begins, &begin_retry_after),
                 ),
                 earliest_bucket_delete_finalize_retry_sleep(
-                    deferred_finalizers.iter().map(|deferred| &deferred.root),
+                    deferred.finalizers.iter().map(|deferred| &deferred.root),
                     &finalize_retry_after,
                 ),
             ) {
