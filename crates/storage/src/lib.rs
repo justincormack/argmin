@@ -1630,6 +1630,22 @@ pub mod test_support {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TestUnsupportedSingleAuthorityJournalFileVersion {
+        One,
+        Three,
+    }
+
+    impl TestUnsupportedSingleAuthorityJournalFileVersion {
+        #[must_use]
+        pub const fn encoded_version(self) -> u16 {
+            match self {
+                Self::One => 1,
+                Self::Three => 3,
+            }
+        }
+    }
+
     #[derive(Clone, PartialEq, Eq)]
     pub struct TestSingleAuthorityDurableStateObservation {
         artifacts: Vec<(std::ffi::OsString, Vec<u8>)>,
@@ -1696,6 +1712,18 @@ pub mod test_support {
         version: TestUnsupportedSingleAuthorityInitializationVersion,
     ) -> Result<TestSingleAuthorityDurableStateObservation, TestStorageFailure> {
         crate::control_plane::prepare_unsupported_single_authority_initialization_restart_for_test(
+            durable_state_path,
+            version.encoded_version(),
+        )
+        .map_err(control_plane_artifact_test_failure)?;
+        observe_single_authority_durable_state(durable_state_path)
+    }
+
+    pub fn prepare_unsupported_single_authority_journal_file_restart(
+        durable_state_path: &std::path::Path,
+        version: TestUnsupportedSingleAuthorityJournalFileVersion,
+    ) -> Result<TestSingleAuthorityDurableStateObservation, TestStorageFailure> {
+        crate::control_plane::prepare_unsupported_single_authority_journal_file_restart_for_test(
             durable_state_path,
             version.encoded_version(),
         )

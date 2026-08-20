@@ -455,6 +455,102 @@ fn single_authority_journal_file_header_failures_are_typed() {
 }
 
 #[test]
+fn single_authority_journal_frame_length_boundaries_are_owner_pinned() {
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let header = store.journal.encode_file_header(0);
+
+    assert!(matches!(
+        store.journal.append_frame(&[]),
+        Err(DurableJournalAppendError::BeforeReplayableRecord(
+            ControlPlaneError::CommandDecode { message }
+        )) if message == "zero-length single-authority control-plane journal frame"
+    ));
+
+    let mut zero_length = header.clone();
+    zero_length.extend_from_slice(&0u32.to_be_bytes());
+    zero_length.extend_from_slice(&(!0u32).to_be_bytes());
+    std::fs::write(store.journal_path(), zero_length).unwrap();
+    assert!(matches!(
+        store.journal.read_frames_from(0),
+        Err(ControlPlaneError::CommandDecode { message })
+            if message == "zero-length single-authority control-plane journal frame"
+    ));
+
+    let mut maximum_length = header;
+    maximum_length.extend_from_slice(&u32::MAX.to_be_bytes());
+    maximum_length.extend_from_slice(&(!u32::MAX).to_be_bytes());
+    std::fs::write(store.journal_path(), maximum_length).unwrap();
+    let decoded = store.journal.read_frames_from(0).unwrap();
+    assert!(decoded.frames.is_empty());
+    assert!(decoded.truncated_tail);
+    assert_eq!(decoded.clean_len, 0);
+}
+
+#[test]
+fn single_authority_journal_file_version_precedes_record_decoding_on_open() {
+    for version in [
+        SINGLE_AUTHORITY_JOURNAL_FILE_VERSION - 1,
+        SINGLE_AUTHORITY_JOURNAL_FILE_VERSION + 1,
+    ] {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        drop(SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap());
+
+        let journal_path = single_authority_journal_path(&state_path);
+        let mut journal = std::fs::read(&journal_path).unwrap();
+        let header_len = FileControlPlaneStore::new(&state_path)
+            .journal
+            .encode_file_header(0)
+            .len();
+        let frame_len = u32::from_be_bytes(
+            journal[header_len..header_len + std::mem::size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let record_start = header_len + std::mem::size_of::<u32>() * 2;
+        let record_end = record_start + frame_len;
+        let record_version_offset = record_start + SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len();
+        journal[record_version_offset..record_version_offset + 2]
+            .copy_from_slice(&0u16.to_be_bytes());
+        reseal_crc64_suffix(&mut journal[record_start..record_end]);
+        assert!(matches!(
+            SingleAuthorityJournalRecord::decode(&journal[record_start..record_end]),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message == "unsupported single-authority control-plane journal record version 0"
+        ));
+
+        let file_version_offset = SINGLE_AUTHORITY_JOURNAL_FILE_MAGIC.len();
+        journal[file_version_offset..file_version_offset + 2]
+            .copy_from_slice(&version.to_be_bytes());
+        reseal_crc64_suffix(&mut journal[..header_len]);
+        std::fs::write(&journal_path, &journal).unwrap();
+
+        let snapshot_before = std::fs::read(&state_path).unwrap();
+        let identity_before = std::fs::read(single_authority_identity_path(&state_path)).unwrap();
+        let marker_before = std::fs::read(single_authority_initialized_path(&state_path)).unwrap();
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message == format!(
+                    "unsupported single-authority control-plane journal file header version {version}"
+                )
+        ));
+        assert_eq!(std::fs::read(&state_path).unwrap(), snapshot_before);
+        assert_eq!(
+            std::fs::read(single_authority_identity_path(&state_path)).unwrap(),
+            identity_before
+        );
+        assert_eq!(
+            std::fs::read(single_authority_initialized_path(&state_path)).unwrap(),
+            marker_before
+        );
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+    }
+}
+
+#[test]
 fn file_backed_authority_restarts_with_never_reused_epoch_and_incarnation() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

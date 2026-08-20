@@ -1288,6 +1288,67 @@ pub(crate) fn prepare_unsupported_single_authority_initialization_restart_for_te
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn prepare_unsupported_single_authority_journal_file_restart_for_test(
+    durable_state_path: &Path,
+    version: u16,
+) -> Result<(), ControlPlaneError> {
+    if !matches!(version, 1 | 3) {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "test journal-file version must be one of the retained adjacent fixtures"
+                .to_owned(),
+        });
+    }
+
+    let journal_path = single_authority_journal_path(durable_state_path);
+    let mut journal = std::fs::read(&journal_path).map_err(|source| {
+        ControlPlaneError::io(
+            "read single-authority journal for unsupported-file-version test",
+            source,
+        )
+    })?;
+    let header_len = SINGLE_AUTHORITY_JOURNAL_FILE_MAGIC.len()
+        + std::mem::size_of::<u16>()
+        + std::mem::size_of::<u64>()
+        + std::mem::size_of::<u64>();
+    if journal.len() < header_len {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "test single-authority journal does not contain a complete file header"
+                .to_owned(),
+        });
+    }
+    let version_offset = SINGLE_AUTHORITY_JOURNAL_FILE_MAGIC.len();
+    journal[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+    let checksum_offset = header_len - std::mem::size_of::<u64>();
+    let checksum = checksum::crc64::checksum(&journal[..checksum_offset]);
+    journal[checksum_offset..header_len].copy_from_slice(&checksum.to_be_bytes());
+    journal.extend_from_slice(&[0xa3, 0xc1]);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&journal_path)
+        .map_err(|source| {
+            ControlPlaneError::io(
+                "open single-authority journal for unsupported-file-version test",
+                source,
+            )
+        })?;
+    file.write_all(&journal).map_err(|source| {
+        ControlPlaneError::io(
+            "write single-authority journal for unsupported-file-version test",
+            source,
+        )
+    })?;
+    file.sync_all().map_err(|source| {
+        ControlPlaneError::io(
+            "sync single-authority journal for unsupported-file-version test",
+            source,
+        )
+    })?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct SingleAuthorityJournalRecord {
     binding: ControlPlaneAuthorityClockCheckpointBinding,

@@ -382,24 +382,21 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
                 return Err(self
                     .protocol_error(format!("{} frame length check mismatch", self.format.label)));
             }
-            let frame_len = frame_len as usize;
             offset += FRAME_PREFIX_LEN;
             if frame_len == 0 {
                 return Err(self.protocol_error(format!("zero-length {} frame", self.format.label)));
             }
-            let Some(frame_end) = offset.checked_add(frame_len) else {
-                return Err(self.protocol_error(format!(
-                    "{} frame length overflows usize",
-                    self.format.label
-                )));
-            };
-            if frame_end > bytes.len() {
+            let remaining = bytes.len() - offset;
+            if u64::from(frame_len) > u64::try_from(remaining).unwrap_or(u64::MAX) {
                 return Ok(DurableJournalFrames {
                     frames,
                     clean_len: logical_frame_start as u64,
                     truncated_tail: true,
                 });
             }
+            let frame_len = usize::try_from(frame_len)
+                .expect("frame length bounded by remaining addressable bytes");
+            let frame_end = offset + frame_len;
             frames.push(bytes[offset..frame_end].to_vec());
             offset = frame_end;
             clean_len = base_offset + (offset - header_len);

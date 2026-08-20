@@ -15,8 +15,10 @@ use storage::test_support::{
     observe_single_authority_durable_state, prepare_unsupported_authority_clock_checkpoint_restart,
     prepare_unsupported_single_authority_identity_restart,
     prepare_unsupported_single_authority_initialization_restart,
+    prepare_unsupported_single_authority_journal_file_restart,
     TestUnsupportedAuthorityClockCheckpointVersion, TestUnsupportedSingleAuthorityIdentityVersion,
     TestUnsupportedSingleAuthorityInitializationVersion,
+    TestUnsupportedSingleAuthorityJournalFileVersion,
 };
 
 struct TestDir {
@@ -403,6 +405,72 @@ fn unsupported_single_authority_initialization_versions_fail_before_replay_or_re
                 .expect("post-failure durable state should be observable"),
             expected,
             "initialization-marker rejection must preserve the invalid marker, recoverable journal tail, and every other durable artifact"
+        );
+    }
+}
+
+#[test]
+fn unsupported_single_authority_journal_file_versions_fail_before_replay_or_repair() {
+    let bin = argmin_s3_bin();
+    for version in [
+        TestUnsupportedSingleAuthorityJournalFileVersion::One,
+        TestUnsupportedSingleAuthorityJournalFileVersion::Three,
+    ] {
+        let test_dir = TestDir::new();
+        let state_dir = test_dir.path.join("state");
+        fs::create_dir(&state_dir).expect("state directory should be created");
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
+            .expect("state directory should be private");
+        let state_path = state_dir.join("control.state");
+        let control_socket = test_dir.path.join("control.sock");
+        let recovery_socket = storage::control_plane_clock_recovery_socket_path(&control_socket);
+
+        let mut initial = spawn_standalone_control_plane(
+            &bin,
+            &test_dir.path,
+            &state_path,
+            &control_socket,
+            "initial",
+        );
+        wait_for_listener(&mut initial, &control_socket, &test_dir.path, "initial");
+        initial.stop();
+        remove_socket_if_present(&control_socket);
+        remove_socket_if_present(&recovery_socket);
+
+        let expected =
+            prepare_unsupported_single_authority_journal_file_restart(&state_path, version)
+                .expect("unsupported journal-file fixture should be installed");
+        let run = format!("unsupported-journal-file-v{}", version.encoded_version());
+        let mut restarted = spawn_standalone_control_plane(
+            &bin,
+            &test_dir.path,
+            &state_path,
+            &control_socket,
+            &run,
+        );
+        wait_for_failure(&mut restarted, &test_dir.path, &run);
+
+        let logs = process_logs(&test_dir.path, &run);
+        assert!(
+            logs.contains(&format!(
+                "unsupported single-authority control-plane journal file header version {}",
+                version.encoded_version()
+            )),
+            "standalone restart did not report the retained journal-file version rejection\n{logs}"
+        );
+        assert!(
+            !control_socket.exists(),
+            "ordinary listener was bound before journal-file rejection"
+        );
+        assert!(
+            !recovery_socket.exists(),
+            "clock-recovery listener was bound before journal-file rejection"
+        );
+        assert_eq!(
+            observe_single_authority_durable_state(&state_path)
+                .expect("post-failure durable state should be observable"),
+            expected,
+            "journal-file rejection must preserve the unsupported header, recoverable torn tail, and every other durable artifact"
         );
     }
 }
