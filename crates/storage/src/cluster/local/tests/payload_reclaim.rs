@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::ObjectPayloadReclaimKind;
+use crate::{ObjectPayloadReclaimKind, PgMetadataStore};
 
 #[test]
 fn object_payload_reclaim_capacity_counts_dequeued_work_until_finished() {
@@ -514,6 +514,84 @@ fn object_payload_reclaim_acquires_and_releases_durable_claim() {
         object_payload_reclaim_claim_count_for_test(&map, PgId::new(object_pg)),
         0,
         "terminal reclaim command should release the durable claim"
+    );
+    assert!(!cluster
+        .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+        .unwrap());
+}
+
+#[test]
+fn object_payload_reclaim_retry_adopts_same_owner_retained_claim_before_expiry() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let committed =
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"retained claim retry");
+    cluster
+        .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+        .unwrap()
+        .unwrap();
+
+    let claimed_at = crate::clock::current_time_millis();
+    let retained = {
+        let pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let retained = PgMetadataStore::acquire_object_payload_reclaim_claim(
+            &*pg,
+            &bucket,
+            1,
+            &key,
+            committed.generation_id,
+            ObjectPayloadReclaimKind::ObjectSegments,
+            "retained-reclaim-claim",
+            &cluster.bucket_write_owner_token(),
+            map.epoch,
+            AdmittedRouteEffectFence::unbounded(map.epoch),
+            claimed_at,
+            claimed_at.checked_add(60_000),
+            claimed_at,
+        )
+        .unwrap()
+        .expect("test must retain an exact claim owned by this frontend");
+        pg.refresh_metadata_command_state_digest().unwrap();
+        retained
+    };
+    assert_eq!(retained.claim_id, "retained-reclaim-claim");
+
+    assert_eq!(
+        cluster
+            .reclaim_object_payload_if_unleased_with_outcome(
+                &bucket,
+                &key,
+                committed.generation_id,
+            )
+            .unwrap(),
+        crate::cluster::ObjectPayloadReclaimAttempt::Completed,
+        "same-owner retry must resume the retained claim without waiting for lease expiry"
+    );
+    assert_eq!(
+        object_payload_reclaim_claim_count_for_test(&map, PgId::new(object_pg)),
+        0,
+        "terminal reclaim must clear the adopted durable claim"
     );
     assert!(!cluster
         .payload_reclaim_exists(&bucket, &key, committed.generation_id)

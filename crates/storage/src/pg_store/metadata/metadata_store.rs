@@ -2772,43 +2772,17 @@ impl PgMetadataStore for PgStore {
             source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
 
-        let mut roots = Vec::new();
-        let expired_claim_root = self.query_row_cached_optional_metadata(
-            "SELECT c.bucket, c.bucket_incarnation_generation
-             FROM bucket_delete_finalize_claims c
-             JOIN buckets b
-               ON b.name = c.bucket
-              AND b.bucket_incarnation_generation = c.bucket_incarnation_generation
-              AND b.state = ?1
-             WHERE c.singleton = 0
-               AND c.lease_deadline <= ?2",
-            params![BucketState::Deleting as u8, now],
-            "get expired bucket delete finalize claim root",
-            bucket_delete_finalize_root_from_row,
-        )?;
-        if let Some(root) = expired_claim_root {
-            roots.push(root);
-        }
-
-        if roots.len() == limit {
-            return Ok(roots);
-        }
-
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT name, bucket_incarnation_generation
+                "SELECT b.name, b.bucket_incarnation_generation
                  FROM buckets b
+                 LEFT JOIN bucket_delete_finalize_claims c
+                   ON c.bucket = b.name
+                  AND c.bucket_incarnation_generation = b.bucket_incarnation_generation
                  WHERE b.state = ?1
-                   AND NOT EXISTS (
-                     SELECT 1
-                     FROM bucket_delete_finalize_claims c
-                     WHERE c.singleton = 0
-                       AND c.bucket = b.name
-                       AND c.bucket_incarnation_generation = b.bucket_incarnation_generation
-                       AND (c.lease_deadline IS NULL OR c.lease_deadline > ?3)
-                   )
-                 ORDER BY name ASC
+                   AND (c.bucket IS NULL OR c.lease_deadline <= ?3)
+                 ORDER BY CASE WHEN c.bucket IS NULL THEN 1 ELSE 0 END, b.name ASC
                  LIMIT ?2",
             )
             .map_err(|source| MetadataError::Db {
@@ -2824,21 +2798,13 @@ impl PgMetadataStore for PgStore {
                 context: "query get bucket delete finalize roots",
                 source: source.into(),
             })?;
-        for row in rows {
-            let root = row.map_err(|source| MetadataError::Db {
+        rows.map(|row| {
+            row.map_err(|source| MetadataError::Db {
                 context: "row get bucket delete finalize roots",
                 source: source.into(),
-            })?;
-            if roots.iter().any(|existing| existing == &root) {
-                continue;
-            }
-            roots.push(root);
-            if roots.len() == limit {
-                break;
-            }
-        }
-
-        Ok(roots)
+            })
+        })
+        .collect()
     }
 
     fn get_lifecycle_sweep_roots(
@@ -3135,11 +3101,62 @@ impl PgMetadataStore for PgStore {
                         && existing.generation_id == generation_id
                         && existing.reclaim_kind == reclaim_kind;
                     if same_work
-                        && existing.claim_id == claim_id
                         && existing.owner_token == owner_token
                         && existing.cluster_epoch == cluster_epoch
                     {
-                        return Ok(Some(existing));
+                        #[cfg(test)]
+                        store.maybe_run_before_object_payload_reclaim_claim_effect_check_hook();
+                        effect_fence
+                            .require_valid_for(cluster_epoch)
+                            .map_err(|source| MetadataError::RouteEffectRejected { source })?;
+                        let updated = store
+                            .conn
+                            .execute(
+                                "UPDATE object_payload_reclaim_claims \
+                                 SET claimed_at = ?1, lease_deadline = ?2 \
+                                 WHERE singleton = 0 \
+                                   AND bucket = ?3 AND bucket_incarnation_generation = ?4 \
+                                   AND key = ?5 AND generation_id = ?6 AND reclaim_kind = ?7 \
+                                   AND claim_id = ?8 AND owner_token = ?9 AND cluster_epoch = ?10",
+                                params![
+                                    claimed_at,
+                                    lease_deadline,
+                                    bucket,
+                                    bucket_incarnation_generation,
+                                    key,
+                                    generation_id.get() as i64,
+                                    reclaim_kind as u8,
+                                    &existing.claim_id,
+                                    owner_token,
+                                    cluster_epoch.get(),
+                                ],
+                            )
+                            .map_err(|source| MetadataError::Db {
+                                context: "renew object payload reclaim claim",
+                                source: source.into(),
+                            })?;
+                        if updated != 1 {
+                            return Err(MetadataError::InvariantViolation {
+                                context: "renew object payload reclaim claim",
+                                reason: format!("expected one exact claim row, updated {updated}"),
+                            });
+                        }
+                        return store
+                            .conn
+                            .query_row(
+                                "SELECT bucket, bucket_incarnation_generation, key, generation_id, reclaim_kind, \
+                                        claim_id, owner_token, cluster_epoch, pg_id, claimed_at, \
+                                        lease_deadline, attempt_count, last_error \
+                                 FROM object_payload_reclaim_claims \
+                                 WHERE singleton = 0",
+                                [],
+                                object_payload_reclaim_claim_from_row,
+                            )
+                            .optional()
+                            .map_err(|source| MetadataError::Db {
+                                context: "reload renewed object payload reclaim claim",
+                                source: source.into(),
+                            });
                     }
                     if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
                         return Ok(None);
@@ -3380,8 +3397,8 @@ impl PgMetadataStore for PgStore {
                         "SELECT bucket, bucket_incarnation_generation, claim_id, owner_token, \
                                 cluster_epoch, pg_id, claimed_at, lease_deadline, attempt_count, last_error \
                          FROM bucket_delete_finalize_claims \
-                         WHERE singleton = 0",
-                        [],
+                         WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                        params![bucket, bucket_incarnation_generation],
                         bucket_delete_finalize_claim_from_row,
                     )
                     .optional()
@@ -3391,49 +3408,13 @@ impl PgMetadataStore for PgStore {
                     })?;
                 let mut attempt_count = 1_i64;
                 if let Some(existing) = existing {
-                    let same_work = existing.bucket == *bucket
-                        && existing.bucket_incarnation_generation
-                            == bucket_incarnation_generation as u64;
-                    if same_work
-                        && existing.claim_id == claim_id
+                    if existing.claim_id == claim_id
                         && existing.owner_token == owner_token
                         && existing.cluster_epoch == cluster_epoch
                     {
                         return Ok(Some(existing));
                     }
-                    if !same_work {
-                        let existing_bucket_still_deleting = store
-                            .conn
-                            .query_row(
-                                "SELECT 1 FROM buckets \
-                                 WHERE name = ?1 AND state = ?2 AND bucket_incarnation_generation = ?3",
-                                params![
-                                    &existing.bucket,
-                                    BucketState::Deleting as u8,
-                                    existing.bucket_incarnation_generation as i64,
-                                ],
-                                |_| Ok(()),
-                            )
-                            .optional()
-                            .map_err(|source| MetadataError::Db {
-                                context: "acquire bucket delete finalize claim (check existing claim bucket)",
-                                source: source.into(),
-                            })?
-                            .is_some();
-                        if existing_bucket_still_deleting {
-                            return Ok(None);
-                        }
-                        store
-                            .conn
-                            .execute(
-                                "DELETE FROM bucket_delete_finalize_claims WHERE singleton = 0",
-                                [],
-                            )
-                            .map_err(|source| MetadataError::Db {
-                                context: "clear stale terminal bucket delete finalize claim",
-                                source: source.into(),
-                            })?;
-                    } else if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
+                    if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
                         return Ok(None);
                     } else {
                         attempt_count =
@@ -3446,8 +3427,9 @@ impl PgMetadataStore for PgStore {
                         store
                             .conn
                             .execute(
-                                "DELETE FROM bucket_delete_finalize_claims WHERE singleton = 0",
-                                [],
+                                "DELETE FROM bucket_delete_finalize_claims \
+                                 WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                                params![bucket, bucket_incarnation_generation],
                             )
                             .map_err(|source| MetadataError::Db {
                                 context: "clear expired bucket delete finalize claim",
@@ -3482,9 +3464,9 @@ impl PgMetadataStore for PgStore {
                     .conn
                     .execute(
                         "INSERT INTO bucket_delete_finalize_claims \
-                         (singleton, bucket, bucket_incarnation_generation, claim_id, owner_token, \
+                         (bucket, bucket_incarnation_generation, claim_id, owner_token, \
                           cluster_epoch, pg_id, claimed_at, lease_deadline, attempt_count, last_error) \
-                         VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
                         params![
                             bucket,
                             bucket_incarnation_generation,
@@ -3508,8 +3490,8 @@ impl PgMetadataStore for PgStore {
                         "SELECT bucket, bucket_incarnation_generation, claim_id, owner_token, \
                                 cluster_epoch, pg_id, claimed_at, lease_deadline, attempt_count, last_error \
                          FROM bucket_delete_finalize_claims \
-                         WHERE singleton = 0",
-                        [],
+                         WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                        params![bucket, bucket_incarnation_generation],
                         bucket_delete_finalize_claim_from_row,
                     )
                     .optional()
@@ -3542,7 +3524,7 @@ impl PgMetadataStore for PgStore {
                     .conn
                     .execute(
                         "DELETE FROM bucket_delete_finalize_claims \
-                         WHERE singleton = 0 AND bucket = ?1 AND bucket_incarnation_generation = ?2 \
+                         WHERE bucket = ?1 AND bucket_incarnation_generation = ?2 \
                            AND claim_id = ?3 AND owner_token = ?4 AND cluster_epoch = ?5",
                         params![
                             bucket,
@@ -3560,8 +3542,9 @@ impl PgMetadataStore for PgStore {
                     let claim_exists = store
                         .conn
                         .query_row(
-                            "SELECT 1 FROM bucket_delete_finalize_claims WHERE singleton = 0",
-                            [],
+                            "SELECT 1 FROM bucket_delete_finalize_claims \
+                             WHERE bucket = ?1 AND bucket_incarnation_generation = ?2",
+                            params![bucket, bucket_incarnation_generation],
                             |_| Ok(()),
                         )
                         .optional()
@@ -3588,13 +3571,14 @@ impl PgMetadataStore for PgStore {
 
     fn bucket_delete_finalize_claim(
         &self,
+        bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, MetadataError> {
         self.query_row_cached_optional_metadata(
             "SELECT bucket, bucket_incarnation_generation, claim_id, owner_token, \
                     cluster_epoch, pg_id, claimed_at, lease_deadline, attempt_count, last_error \
              FROM bucket_delete_finalize_claims \
-             WHERE singleton = 0",
-            [],
+             WHERE bucket = ?1",
+            params![bucket],
             "bucket delete finalize claim",
             bucket_delete_finalize_claim_from_row,
         )

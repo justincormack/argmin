@@ -3613,7 +3613,7 @@ fn unix_bucket_write_reservation_client_releases_finalizer_claim_after_route_exp
     .unwrap();
     let pg = node.get_pg(0).unwrap();
     assert!(
-        PgMetadataStore::bucket_delete_finalize_claim(&*pg)
+        PgMetadataStore::bucket_delete_finalize_claim(&*pg, &bucket)
             .unwrap()
             .is_none(),
         "retained finalizer-claim release must work after active route expiry"
@@ -4386,7 +4386,7 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
         for (pg_id, expected) in [(correct_pg_id, &correct_claim), (wrong_pg_id, &wrong_claim)] {
             let pg = node.get_pg(pg_id).unwrap();
             assert_eq!(
-                PgMetadataStore::bucket_delete_finalize_claim(&*pg).unwrap(),
+                PgMetadataStore::bucket_delete_finalize_claim(&*pg, &expected.bucket).unwrap(),
                 Some(expected.clone()),
                 "wrong-PG finalizer-claim operation must not mutate PG {pg_id}"
             );

@@ -1191,7 +1191,34 @@ fn object_payload_reclaim_claim_is_single_owner_and_expires() {
         )
         .unwrap()
         .expect("same owner should reacquire idempotently");
-    assert_eq!(idempotent, first);
+    assert_eq!(idempotent.claim_id, "claim-a");
+    assert_eq!(idempotent.owner_token, "owner-a");
+    assert_eq!(idempotent.claimed_at, 12);
+    assert_eq!(idempotent.lease_deadline, Some(40));
+    assert_eq!(idempotent.attempt_count, 1);
+
+    let adopted = store
+        .acquire_object_payload_reclaim_claim(
+            &bucket,
+            3,
+            &key,
+            generation_id,
+            ObjectPayloadReclaimKind::ObjectSegments,
+            "claim-c",
+            "owner-a",
+            ClusterEpoch::INITIAL,
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+            13,
+            Some(50),
+            13,
+        )
+        .unwrap()
+        .expect("same owner should adopt its exact retained claim");
+    assert_eq!(adopted.claim_id, "claim-a");
+    assert_eq!(adopted.owner_token, "owner-a");
+    assert_eq!(adopted.claimed_at, 13);
+    assert_eq!(adopted.lease_deadline, Some(50));
+    assert_eq!(adopted.attempt_count, 1);
 
     let stolen = store
         .acquire_object_payload_reclaim_claim(
@@ -1204,9 +1231,9 @@ fn object_payload_reclaim_claim_is_single_owner_and_expires() {
             "owner-b",
             ClusterEpoch::INITIAL,
             AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
-            21,
-            Some(40),
-            21,
+            51,
+            Some(70),
+            51,
         )
         .unwrap()
         .expect("expired claim should be stealable");
@@ -1472,7 +1499,11 @@ fn object_payload_reclaim_claim_does_not_clear_expired_different_root() {
         )
         .unwrap()
         .expect("original claim identity must remain visible");
-    assert_eq!(still_owned, first);
+    assert_eq!(still_owned.claim_id, first.claim_id);
+    assert_eq!(still_owned.owner_token, first.owner_token);
+    assert_eq!(still_owned.claimed_at, 22);
+    assert_eq!(still_owned.lease_deadline, Some(50));
+    assert_eq!(still_owned.attempt_count, first.attempt_count);
 
     store
         .release_object_payload_reclaim_claim(
@@ -1560,7 +1591,7 @@ fn bucket_delete_finalize_claim_requires_deleting_bucket_and_incarnation() {
         .unwrap_err();
     assert!(matches!(
         wrong_incarnation,
-        MetadataError::ReclaimClaimConflict { .. }
+        MetadataError::ReclaimClaimNotFound { .. }
     ));
 
     let stolen = store
@@ -1653,7 +1684,7 @@ fn delete_finalized_bucket_clears_finalizer_claim() {
             )
             .unwrap()
             .is_some(),
-        "finalized bucket deletion must clear the singleton PG claim before later bucket work"
+        "finalized bucket deletion must clear its exact finalizer claim"
     );
 }
 
@@ -1865,7 +1896,7 @@ fn get_bucket_delete_finalize_roots_returns_deleting_buckets_in_order() {
 }
 
 #[test]
-fn bucket_delete_finalize_claim_does_not_clear_expired_different_bucket() {
+fn bucket_delete_finalize_claims_are_independent_between_buckets() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 11).unwrap();
     let bucket_a = trusted_bucket_name("finalize-claim-bucket-a");
@@ -1885,28 +1916,34 @@ fn bucket_delete_finalize_claim_does_not_clear_expired_different_bucket() {
             "owner-a",
             ClusterEpoch::INITIAL,
             10,
-            Some(20),
+            Some(40),
             10,
         )
         .unwrap()
         .expect("first bucket finalizer should be claimable");
     assert_eq!(first.claim_id, "claim-a");
 
-    assert!(
-        store
-            .acquire_bucket_delete_finalize_claim(
-                &bucket_b,
-                bucket_b_record.bucket_incarnation_generation,
-                "claim-b",
-                "owner-b",
-                ClusterEpoch::INITIAL,
-                21,
-                Some(40),
-                21,
-            )
-            .unwrap()
-            .is_none(),
-        "expired different-bucket finalizer claim must remain the PG work-class owner"
+    let second = store
+        .acquire_bucket_delete_finalize_claim(
+            &bucket_b,
+            bucket_b_record.bucket_incarnation_generation,
+            "claim-b",
+            "owner-b",
+            ClusterEpoch::INITIAL,
+            11,
+            Some(40),
+            11,
+        )
+        .unwrap()
+        .expect("a different bucket in the same PG must be independently claimable");
+    assert_eq!(second.claim_id, "claim-b");
+    assert_eq!(
+        store.bucket_delete_finalize_claim(&bucket_a).unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(
+        store.bucket_delete_finalize_claim(&bucket_b).unwrap(),
+        Some(second.clone())
     );
 
     let still_owned = store
@@ -1916,13 +1953,28 @@ fn bucket_delete_finalize_claim_does_not_clear_expired_different_bucket() {
             "claim-a",
             "owner-a",
             ClusterEpoch::INITIAL,
-            22,
-            Some(50),
-            22,
+            12,
+            Some(40),
+            12,
         )
         .unwrap()
         .expect("original finalizer claim identity must remain visible");
     assert_eq!(still_owned, first);
+
+    store
+        .release_bucket_delete_finalize_claim(
+            &bucket_b,
+            bucket_b_record.bucket_incarnation_generation,
+            "claim-b",
+            "owner-b",
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+    assert_eq!(
+        store.bucket_delete_finalize_claim(&bucket_a).unwrap(),
+        Some(first.clone()),
+        "releasing another bucket's claim must not affect this root"
+    );
 
     store
         .release_bucket_delete_finalize_claim(
@@ -1936,7 +1988,7 @@ fn bucket_delete_finalize_claim_does_not_clear_expired_different_bucket() {
 }
 
 #[test]
-fn bucket_delete_finalize_claim_clears_expired_non_deleting_different_bucket() {
+fn bucket_delete_finalize_claim_ignores_non_deleting_different_bucket_claim() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 11).unwrap();
     let bucket_a = trusted_bucket_name("finalize-stale-claim-a");
@@ -1980,7 +2032,7 @@ fn bucket_delete_finalize_claim_clears_expired_non_deleting_different_bucket() {
             21,
         )
         .unwrap()
-        .expect("expired non-deleting different-bucket claim should be cleared");
+        .expect("another bucket's stale claim must not block this exact root");
     assert_eq!(claimed_a.bucket, bucket_a);
     assert_eq!(claimed_a.claim_id, "claim-a");
     assert_eq!(claimed_a.attempt_count, 1);
@@ -2035,7 +2087,7 @@ fn bucket_delete_finalize_roots_include_expired_claim_before_earlier_bucket() {
                 bucket_incarnation_generation: bucket_a_record.bucket_incarnation_generation,
             },
         ],
-        "expired singleton claim work must be rediscovered before unrelated roots"
+        "expired exact-claim work must be rediscovered before unclaimed roots"
     );
     assert_eq!(
         store.get_bucket_delete_finalize_roots(21, 1).unwrap(),

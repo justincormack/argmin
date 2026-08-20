@@ -3999,12 +3999,13 @@ impl ObjectPayloadReclaimMetadataRoute for UnixObjectPayloadReclaimMetadataRoute
                 ))
             })?;
         if let Some(record) = &response.record {
+            // A same-owner retry proposes a fresh ID but resumes the exact
+            // capability selected by the storage node before renewing it.
             if record.bucket != self.bucket
                 || record.bucket_incarnation_generation != request.bucket_incarnation_generation
                 || record.key != self.key
                 || record.generation_id != self.generation_id
                 || record.reclaim_kind != request.reclaim_kind
-                || record.claim_id != request.claim_id
                 || record.owner_token != request.owner_token
                 || record.cluster_epoch != self.route_cluster_epoch
                 || record.pg_id != self.pg_id.get()

@@ -29,7 +29,9 @@ const RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
 const RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
 const RECLAIM_DURABLE_SCAN_INCOMPLETE_RETRY: Duration = Duration::from_secs(1);
 const RECLAIM_WORKER_MAX_PARALLELISM: usize = 8;
-const BUCKET_DELETE_FINALIZE_OUTSTANDING_PER_WORKER: usize = 128;
+// Outstanding delete roots retain durable drains, so bound accepted roots while
+// leaving each worker enough queued work to hide retry and scan latency.
+const BUCKET_DELETE_FINALIZE_OUTSTANDING_PER_WORKER: usize = 4;
 
 type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
 

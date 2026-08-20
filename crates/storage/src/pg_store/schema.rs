@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 3;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 4;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -480,7 +480,6 @@ CREATE TABLE object_payload_reclaim_claims (
 /// Durable bucket delete finalizer worker claim.
 const CREATE_BUCKET_DELETE_FINALIZE_CLAIMS_TABLE: &str = "\
 CREATE TABLE bucket_delete_finalize_claims (
-    singleton       INTEGER PRIMARY KEY CHECK (singleton = 0),
     bucket          TEXT NOT NULL,
     bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
     claim_id        TEXT NOT NULL CHECK (length(claim_id) BETWEEN 1 AND 256),
@@ -491,6 +490,7 @@ CREATE TABLE bucket_delete_finalize_claims (
     lease_deadline  INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
     attempt_count   INTEGER NOT NULL CHECK (attempt_count >= 0),
     last_error      TEXT,
+    PRIMARY KEY (bucket, bucket_incarnation_generation),
     FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
 ) STRICT";
 
@@ -1221,6 +1221,10 @@ mod tests {
             version: 3,
             catalogue: include_str!("schema_manifests/pg_schema_v3.catalogue"),
         },
+        FrozenPgSchemaManifest {
+            version: 4,
+            catalogue: include_str!("schema_manifests/pg_schema_v4.catalogue"),
+        },
     ];
 
     fn canonical_pg_schema_catalogue(conn: &Connection) -> String {
@@ -1345,7 +1349,7 @@ mod tests {
             .iter()
             .map(|manifest| manifest.version)
             .collect::<Vec<_>>();
-        assert_eq!(frozen_versions, [1, 2, 3]);
+        assert_eq!(frozen_versions, [1, 2, 3, 4]);
         for manifest in FROZEN_PG_SCHEMA_MANIFESTS {
             validate_frozen_pg_schema_catalogue(manifest.catalogue);
         }
@@ -1474,7 +1478,7 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        for version in [1, 2, 4] {
+        for version in [1, 2, 3, 5] {
             let conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "user_version", version).unwrap();
 

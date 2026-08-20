@@ -5860,10 +5860,10 @@ impl LocalStorageNodeClient {
     fn bucket_delete_finalize_claim(
         &self,
         pg_id: BucketPgId,
-        _bucket: &BucketName,
+        bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::bucket_delete_finalize_claim(&*pg)?)
+        Ok(PgMetadataStore::bucket_delete_finalize_claim(&*pg, bucket)?)
     }
 
     fn get_lifecycle_sweep_roots(

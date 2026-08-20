@@ -1425,10 +1425,10 @@ fn finalized_bucket_delete_releases_finalizer_claim_for_next_same_pg_bucket() {
         .test_begin_bucket_delete_if_current(&bucket_b)
         .unwrap();
     assert_eq!(
-            cluster.try_finalize_bucket_delete(&bucket_b).unwrap(),
-            crate::BucketDeleteFinalizeOutcome::Finalized,
-            "a terminal bucket finalizer must release its singleton PG claim before unrelated same-PG work"
-        );
+        cluster.try_finalize_bucket_delete(&bucket_b).unwrap(),
+        crate::BucketDeleteFinalizeOutcome::Finalized,
+        "a terminal bucket finalizer must release its exact claim before later same-PG work"
+    );
 }
 
 #[test]
@@ -1495,6 +1495,94 @@ fn finalized_bucket_delete_waits_for_reclaim_then_finalizes_after_worker_progres
             .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
             .unwrap(),
         "worker progress should clear the reclaim root after the read lease releases"
+    );
+    assert_eq!(
+        cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+        crate::BucketDeleteFinalizeOutcome::Finalized
+    );
+    assert_clean_metadata_command_stream(&map, &[1, object_pg]);
+}
+
+#[test]
+fn bucket_finalizer_does_not_adopt_a_live_worker_payload_reclaim_claim() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    let committed =
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"single-flight reclaim");
+    cluster
+        .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+        .unwrap()
+        .unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
+
+    let hook_invocations = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let hook_invocations_for_hook = Arc::clone(&hook_invocations);
+    let _hook = cluster.test_install_after_reclaim_claim_acquired_hook(Arc::new(move || {
+        let invocation = hook_invocations_for_hook.fetch_add(1, Ordering::SeqCst);
+        if invocation == 0 {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test must release the live reclaim worker");
+        }
+        Ok(())
+    }));
+
+    let worker_cluster = Arc::clone(&cluster);
+    let worker_bucket = bucket.clone();
+    let worker_key = key.clone();
+    let worker = thread::spawn(move || {
+        worker_cluster.reclaim_object_payload_if_unleased_with_outcome(
+            &worker_bucket,
+            &worker_key,
+            committed.generation_id,
+        )
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("worker must acquire the durable reclaim claim");
+
+    let nested_outcome = cluster.try_finalize_bucket_delete(&bucket);
+    release_tx.send(()).unwrap();
+    let worker_outcome = worker.join().unwrap();
+
+    assert_eq!(
+        nested_outcome.unwrap(),
+        crate::BucketDeleteFinalizeOutcome::Pending,
+        "the finalizer must defer while the queued worker owns the exact reclaim execution"
+    );
+    assert_eq!(
+        hook_invocations.load(Ordering::SeqCst),
+        1,
+        "the nested finalizer must not reacquire the live worker's durable claim"
+    );
+    assert_eq!(
+        worker_outcome.unwrap(),
+        crate::cluster::ObjectPayloadReclaimAttempt::Completed
     );
     assert_eq!(
         cluster.try_finalize_bucket_delete(&bucket).unwrap(),

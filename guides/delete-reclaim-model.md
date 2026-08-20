@@ -95,20 +95,26 @@ Payload reclaim workers must not depend on the process-local wakeup queue for
 correctness. The queue is a latency hint; durable reclaim metadata is the source
 of truth.
 
-The Phase 9.6 model uses one durable reclaim owner per PG/work-class at a time:
+The Phase 9.6 model uses token-fenced durable reclaim ownership:
 
-- object payload reclaim is claimed on the object metadata PG that owns the
-  reclaim root; the claim identity includes the bucket incarnation so stale
-  workers cannot release or steal a newer claim after bucket delete/recreate
-- bucket delete finalization is claimed on the bucket PG that owns the deleting
-  bucket row
+- object payload reclaim has one durable claim per object metadata PG; the
+  claim identifies the exact payload root and includes the bucket incarnation
+  so stale workers cannot release or steal a newer claim after bucket
+  delete/recreate
+- bucket delete finalization has one durable claim per deleting bucket
+  incarnation, allowing independent buckets on the same PG to finalize in
+  parallel
 - a claim is token-fenced, expires if its worker stops, and can be stolen only
   after re-reading the durable root on the PG primary
 
-This avoids same-PG duplicate cleanup races while still allowing independent
-PGs to reclaim in parallel. Physical deletion remains idempotent because a
-worker can crash after deleting some shard files but before clearing reclaim
-metadata.
+Each frontend also serializes live object-payload reclaim executions by exact
+payload root across queued workers, durable scans, and nested bucket-finalizer
+calls. A same-owner retry may resume a retained durable claim only after the
+previous local execution has left this single-flight boundary. This prevents
+two executions from reentrantly acquiring the same node fence while still
+allowing independent bucket finalizers and independent object roots to run in
+parallel. Physical deletion remains idempotent because a worker can crash after
+deleting some shard files but before clearing reclaim metadata.
 
 Each frontend runs a bounded reclaim worker pool sized by both available CPU
 parallelism and the installed metadata-PG count. Process-local root ownership

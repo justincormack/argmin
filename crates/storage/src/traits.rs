@@ -588,8 +588,8 @@ pub(crate) trait PgMetadataStore {
     /// Return deleting bucket finalizer roots on this metadata PG.
     ///
     /// Used by bucket finalizer workers to recover durable roots when local
-    /// wakeup hints were lost across process restart. Expired singleton
-    /// finalizer claims are returned first so their exact work remains
+    /// wakeup hints were lost across process restart. Expired exact-root
+    /// finalizer claims are returned first so their work remains
     /// recoverable even when another deleting bucket sorts earlier.
     fn get_bucket_delete_finalize_roots(
         &self,
@@ -611,6 +611,8 @@ pub(crate) trait PgMetadataStore {
 
     /// Acquire the single durable object-payload reclaim claim for this PG.
     ///
+    /// A retry from the same owner and epoch renews and returns the existing
+    /// exact-root capability, even when the retry proposes a new claim ID.
     /// Returns `Ok(None)` when the reclaim root is absent or a non-expired
     /// claim owned by another worker is active.
     #[allow(clippy::too_many_arguments)]
@@ -644,7 +646,7 @@ pub(crate) trait PgMetadataStore {
         cluster_epoch: ClusterEpoch,
     ) -> Result<(), MetadataError>;
 
-    /// Acquire the single durable bucket-delete finalizer claim for this PG.
+    /// Acquire the durable bucket-delete finalizer claim for one bucket incarnation.
     #[allow(clippy::too_many_arguments)]
     fn acquire_bucket_delete_finalize_claim(
         &self,
@@ -671,6 +673,7 @@ pub(crate) trait PgMetadataStore {
     /// Read the current durable bucket-delete finalizer claim for diagnostics.
     fn bucket_delete_finalize_claim(
         &self,
+        bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, MetadataError>;
 
     /// Acquire a durable lifecycle sweep claim for one bucket incarnation.

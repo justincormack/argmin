@@ -1400,6 +1400,7 @@ impl From<&PgRouteSnapshot> for LocalPgRoute {
 #[derive(Debug)]
 pub(crate) struct LocalClusterRuntimeState {
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
+    active_object_payload_reclaims: Mutex<HashSet<LocalReclaimRoot>>,
     placed_segment_shard_repair_queue: (Mutex<LocalPlacedSegmentShardRepairQueueState>, Condvar),
     metadata_command_pg_locks: Mutex<HashMap<PgId, Arc<MetadataCommandPgLock>>>,
     metadata_command_recovery_flights:
@@ -1696,6 +1697,26 @@ impl Drop for MetadataCommandRecoveryGuard {
 type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
 type LocalBucketDeleteBeginRoot = crate::BucketDeleteBeginRoot;
 
+pub(crate) struct LocalObjectPayloadReclaimExecution<'a> {
+    runtime: &'a LocalClusterRuntimeState,
+    root: LocalReclaimRoot,
+}
+
+impl Drop for LocalObjectPayloadReclaimExecution<'_> {
+    fn drop(&mut self) {
+        let removed = self
+            .runtime
+            .active_object_payload_reclaims
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.root);
+        debug_assert!(
+            removed,
+            "active object payload reclaim must remain registered"
+        );
+    }
+}
+
 #[derive(Debug)]
 struct LocalReclaimQueueState {
     work_queue: VecDeque<ReclaimWorkItem>,
@@ -1813,6 +1834,7 @@ impl LocalClusterRuntimeState {
                 }),
                 Condvar::new(),
             ),
+            active_object_payload_reclaims: Mutex::new(HashSet::new()),
             placed_segment_shard_repair_queue: (
                 Mutex::new(LocalPlacedSegmentShardRepairQueueState {
                     work_queue: VecDeque::new(),
@@ -2084,6 +2106,26 @@ impl LocalClusterRuntimeState {
         pg_id: u32,
     ) -> ReclaimQueueInsert {
         self.enqueue_object_payload_reclaim_for_pg(bucket, key, generation_id, pg_id)
+    }
+
+    pub(crate) fn try_acquire_object_payload_reclaim_execution(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Option<LocalObjectPayloadReclaimExecution<'_>> {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let mut active = self
+            .active_object_payload_reclaims
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !active.insert(root.clone()) {
+            return None;
+        }
+        Some(LocalObjectPayloadReclaimExecution {
+            runtime: self,
+            root,
+        })
     }
 
     pub(crate) fn enqueue_object_payload_reclaim_for_pg(

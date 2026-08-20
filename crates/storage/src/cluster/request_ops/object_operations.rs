@@ -3513,6 +3513,13 @@ impl super::StorageCluster {
             );
         };
         emit_outcome("started");
+        let runtime_state = self.local_map.runtime_state();
+        let Some(_execution) = runtime_state
+            .try_acquire_object_payload_reclaim_execution(bucket, key, generation_id)
+        else {
+            emit_outcome("deferred_active");
+            return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
+        };
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let retained_mutation_client =
             self.retained_object_mutation_metadata_primary_client(bucket, key)?;

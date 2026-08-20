@@ -1775,7 +1775,7 @@
         let assert_claim_unchanged = || {
             let pg = server._node.get_pg(0).unwrap();
             assert_eq!(
-                PgMetadataStore::bucket_delete_finalize_claim(&*pg).unwrap(),
+                PgMetadataStore::bucket_delete_finalize_claim(&*pg, &bucket).unwrap(),
                 Some(claim.clone())
             );
         };
@@ -1834,7 +1834,7 @@
         });
         let pg = server._node.get_pg(0).unwrap();
         assert!(
-            PgMetadataStore::bucket_delete_finalize_claim(&*pg)
+            PgMetadataStore::bucket_delete_finalize_claim(&*pg, &bucket)
                 .unwrap()
                 .is_none(),
             "retained capability must release the exact claim after active route expiry"
@@ -5434,6 +5434,137 @@
     #[test]
     fn authenticated_tls_tcp_bucket_subresource_get_preserves_bucket_not_found() {
         authenticated_bucket_subresource_get_preserves_bucket_not_found(true);
+    }
+
+    fn authenticated_object_payload_reclaim_claim_adopts_same_owner_retry(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential =
+            storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::LocalMaintenance {
+                process_id: "reclaim-worker-1".to_owned(),
+            });
+        let mut prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        if tcp {
+            prepared = prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        }
+        let server = prepared.bind().unwrap();
+        let bucket = crate::tests::bucket_name("authenticated-reclaim-claim-adoption");
+        let key = crate::tests::object_key("retained-root");
+        let generation_id = GenerationId::new(41).unwrap();
+        let pg = server._node.get_pg(0).unwrap();
+        PgMetadataStore::put_object_segments_reclaim(
+            &*pg,
+            &crate::ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id,
+                created_at: 1,
+                segments: Vec::new(),
+            },
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        drop(pg);
+
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let node = Arc::clone(&server._node);
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(Arc::new(
+                crate::MaintenanceStorageRpcClientCapability::new(
+                    credential,
+                    9,
+                    STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                )
+                .unwrap()
+                .into(),
+            )),
+        )
+        .with_pg_topology(Arc::new(crate::PgTopology::new(&config.pg_ids).unwrap()));
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &client,
+            config.cluster_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
+        let first = route
+            .acquire_claim(
+                AcquireObjectPayloadReclaimClaimReq {
+                    reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                    bucket_incarnation_generation: 1,
+                    claim_id: "first-authenticated-claim",
+                    owner_token: "authenticated-reclaim-owner",
+                    claimed_at: 100,
+                    lease_deadline: Some(1_000),
+                    now: 100,
+                },
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+            )
+            .unwrap()
+            .expect("first authenticated request must acquire the reclaim root");
+        let adopted = route
+            .acquire_claim(
+                AcquireObjectPayloadReclaimClaimReq {
+                    reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                    bucket_incarnation_generation: 1,
+                    claim_id: "retry-proposed-claim",
+                    owner_token: "authenticated-reclaim-owner",
+                    claimed_at: 200,
+                    lease_deadline: Some(2_000),
+                    now: 200,
+                },
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+            )
+            .unwrap()
+            .expect("same authenticated owner must adopt its retained exact-root claim");
+        assert_eq!(adopted.claim_id, first.claim_id);
+        assert_eq!(adopted.owner_token, first.owner_token);
+        assert_eq!(adopted.claimed_at, 200);
+        assert_eq!(adopted.lease_deadline, Some(2_000));
+        assert_eq!(
+            PgMetadataStore::object_payload_reclaim_claim(&*node.get_pg(0).unwrap())
+                .unwrap(),
+            Some(adopted)
+        );
+
+        drop(route);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_object_payload_reclaim_claim_adopts_same_owner_retry() {
+        authenticated_object_payload_reclaim_claim_adopts_same_owner_retry(false);
+    }
+
+    #[test]
+    fn authenticated_tls_object_payload_reclaim_claim_adopts_same_owner_retry() {
+        authenticated_object_payload_reclaim_claim_adopts_same_owner_retry(true);
     }
 
     fn authenticated_bucket_pending_match_binds_requested_mutation(tcp: bool) {
