@@ -5944,6 +5944,58 @@ struct ControlPlaneRaftRestartSentinel {
     local_node_id: ControlPlaneRaftNodeId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneRaftRestartSentinelFormatError {
+    Truncated,
+    ChecksumMismatch { expected: u64, actual: u64 },
+    UnknownMagic,
+    UnsupportedVersion(u16),
+    InvalidClusterName,
+    TrailingBytes,
+}
+
+impl std::fmt::Display for ControlPlaneRaftRestartSentinelFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str(
+                "truncated control-plane OpenRaft durable restart sentinel",
+            ),
+            Self::ChecksumMismatch { expected, actual } => write!(
+                formatter,
+                "control-plane OpenRaft durable restart sentinel checksum mismatch: expected {expected:#x}, actual {actual:#x}"
+            ),
+            Self::UnknownMagic => formatter.write_str(
+                "invalid control-plane OpenRaft durable restart sentinel magic",
+            ),
+            Self::UnsupportedVersion(version) => write!(
+                formatter,
+                "unsupported control-plane OpenRaft durable restart sentinel version {version}"
+            ),
+            Self::InvalidClusterName => formatter.write_str(
+                "control-plane OpenRaft durable restart sentinel cluster name is not UTF-8",
+            ),
+            Self::TrailingBytes => formatter.write_str(
+                "control-plane OpenRaft durable restart sentinel has trailing bytes",
+            ),
+        }
+    }
+}
+
+fn read_control_plane_raft_restart_sentinel_bytes<'a>(
+    body: &'a [u8],
+    offset: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], ControlPlaneRaftRestartSentinelFormatError> {
+    let end = offset
+        .checked_add(len)
+        .ok_or(ControlPlaneRaftRestartSentinelFormatError::Truncated)?;
+    let value = body
+        .get(*offset..end)
+        .ok_or(ControlPlaneRaftRestartSentinelFormatError::Truncated)?;
+    *offset = end;
+    Ok(value)
+}
+
 const CONTROL_PLANE_RAFT_RESTART_MAGIC: &[u8] = b"ARGMINCPRAFT";
 const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 4;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
@@ -8147,14 +8199,16 @@ impl ControlPlaneRaftRestartSentinel {
         Ok(out)
     }
 
-    fn decode_durable_sentinel(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+    fn decode_durable_sentinel_classified(
+        bytes: &[u8],
+    ) -> Result<Self, ControlPlaneRaftRestartSentinelFormatError> {
         let min_len = CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len()
-            + 2
+            + std::mem::size_of::<u16>()
+            + std::mem::size_of::<u32>()
+            + std::mem::size_of::<ControlPlaneRaftNodeId>()
             + CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN;
         if bytes.len() < min_len {
-            return Err(raft_artifact_protocol_error(
-                "truncated control-plane OpenRaft durable restart sentinel",
-            ));
+            return Err(ControlPlaneRaftRestartSentinelFormatError::Truncated);
         }
         let (body, checksum_bytes) =
             bytes.split_at(bytes.len() - CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN);
@@ -8165,30 +8219,76 @@ impl ControlPlaneRaftRestartSentinel {
         );
         let actual_checksum = raft_artifact_checksum(body);
         if actual_checksum != expected_checksum {
-            return Err(raft_artifact_protocol_error(format!(
-                "control-plane OpenRaft durable restart sentinel checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
-            )));
+            return Err(
+                ControlPlaneRaftRestartSentinelFormatError::ChecksumMismatch {
+                    expected: expected_checksum,
+                    actual: actual_checksum,
+                },
+            );
         }
 
-        let mut reader = RaftArtifactReader::new(body);
-        let magic = reader.read_exact(CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len())?;
+        let mut offset = 0usize;
+        let magic = read_control_plane_raft_restart_sentinel_bytes(
+            body,
+            &mut offset,
+            CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len(),
+        )?;
         if magic != CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC {
-            return Err(raft_artifact_protocol_error(
-                "invalid control-plane OpenRaft durable restart sentinel magic",
-            ));
+            return Err(ControlPlaneRaftRestartSentinelFormatError::UnknownMagic);
         }
-        let version = reader.read_u16()?;
+        let version = u16::from_be_bytes(
+            read_control_plane_raft_restart_sentinel_bytes(
+                body,
+                &mut offset,
+                std::mem::size_of::<u16>(),
+            )?
+            .try_into()
+            .expect("sentinel version has fixed width"),
+        );
         if version != CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION {
-            return Err(raft_artifact_protocol_error(format!(
-                "unsupported control-plane OpenRaft durable restart sentinel version {version}"
-            )));
+            return Err(ControlPlaneRaftRestartSentinelFormatError::UnsupportedVersion(version));
         }
+        let cluster_name_len = u32::from_be_bytes(
+            read_control_plane_raft_restart_sentinel_bytes(
+                body,
+                &mut offset,
+                std::mem::size_of::<u32>(),
+            )?
+            .try_into()
+            .expect("sentinel cluster-name length has fixed width"),
+        );
+        let cluster_name_len = usize::try_from(cluster_name_len)
+            .map_err(|_| ControlPlaneRaftRestartSentinelFormatError::Truncated)?;
+        let cluster_name = std::str::from_utf8(read_control_plane_raft_restart_sentinel_bytes(
+            body,
+            &mut offset,
+            cluster_name_len,
+        )?)
+        .map_err(|_| ControlPlaneRaftRestartSentinelFormatError::InvalidClusterName)?
+        .to_owned();
+        let local_node_id = u64::from_be_bytes(
+            read_control_plane_raft_restart_sentinel_bytes(
+                body,
+                &mut offset,
+                std::mem::size_of::<ControlPlaneRaftNodeId>(),
+            )?
+            .try_into()
+            .expect("sentinel node ID has fixed width"),
+        );
+        if offset != body.len() {
+            return Err(ControlPlaneRaftRestartSentinelFormatError::TrailingBytes);
+        }
+
         let sentinel = Self {
-            cluster_name: reader.read_string()?,
-            local_node_id: reader.read_u64()?,
+            cluster_name,
+            local_node_id,
         };
-        reader.finish()?;
         Ok(sentinel)
+    }
+
+    fn decode_durable_sentinel(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+        Self::decode_durable_sentinel_classified(bytes)
+            .map_err(|error| raft_artifact_protocol_error(error.to_string()))
     }
 
     fn load_durable_sentinel(path: &Path) -> Result<Self, ControlPlaneError> {

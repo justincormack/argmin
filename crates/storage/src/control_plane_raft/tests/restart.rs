@@ -933,23 +933,160 @@ fn control_plane_raft_durable_restart_sentinel_round_trips_with_artifact() {
 }
 
 #[test]
-fn control_plane_raft_durable_restart_sentinel_rejects_unsupported_versions() {
+fn control_plane_raft_durable_restart_sentinel_v1_bytes_are_stable() {
     let sentinel = ControlPlaneRaftRestartSentinel {
         cluster_name: "test-cluster".to_string(),
         local_node_id: 1,
     };
-    for version in [0, CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION + 1] {
-        let mut encoded = sentinel.encode_durable_sentinel().unwrap();
-        let version_offset = CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len();
-        encoded[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
-        refresh_raft_wal_frame_checksum(&mut encoded);
-        assert_error_contains(
-            ControlPlaneRaftRestartSentinel::decode_durable_sentinel(&encoded),
-            &format!(
-                "unsupported control-plane OpenRaft durable restart sentinel version {version}"
+    let expected = [
+        0x41, 0x52, 0x47, 0x4d, 0x49, 0x4e, 0x43, 0x50, 0x52, 0x41, 0x46, 0x54, 0x53, 0x45,
+        0x45, 0x4e, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x74, 0x65, 0x73, 0x74, 0x2d, 0x63,
+        0x6c, 0x75, 0x73, 0x74, 0x65, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x54, 0xc7, 0x3b, 0x23, 0x85, 0x5a, 0xd7, 0x89,
+    ];
+
+    assert_eq!(sentinel.encode_durable_sentinel().unwrap(), expected);
+    assert_eq!(
+        ControlPlaneRaftRestartSentinel::decode_durable_sentinel_classified(&expected),
+        Ok(sentinel)
+    );
+}
+
+#[test]
+fn control_plane_raft_durable_restart_sentinel_rejects_malformed_frames_exactly() {
+    let sentinel = ControlPlaneRaftRestartSentinel {
+        cluster_name: "test-cluster".to_string(),
+        local_node_id: 1,
+    };
+    let encoded = sentinel.encode_durable_sentinel().unwrap();
+
+    for truncated_len in [
+        0,
+        CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len() - 1,
+        CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len(),
+        CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len() + 1,
+    ] {
+        assert_eq!(
+            ControlPlaneRaftRestartSentinel::decode_durable_sentinel_classified(
+                &encoded[..truncated_len]
             ),
+            Err(ControlPlaneRaftRestartSentinelFormatError::Truncated)
         );
     }
+
+    let mut checksum_mismatch = encoded.clone();
+    *checksum_mismatch.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        ControlPlaneRaftRestartSentinel::decode_durable_sentinel_classified(&checksum_mismatch),
+        Err(ControlPlaneRaftRestartSentinelFormatError::ChecksumMismatch { .. })
+    ));
+
+    let mut malformed_magic = encoded.clone();
+    malformed_magic[0] ^= 1;
+    refresh_raft_wal_frame_checksum(&mut malformed_magic);
+    assert_eq!(
+        ControlPlaneRaftRestartSentinel::decode_durable_sentinel_classified(&malformed_magic),
+        Err(ControlPlaneRaftRestartSentinelFormatError::UnknownMagic)
+    );
+
+    for version in [0, CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION + 1] {
+        let mut unsupported = encoded.clone();
+        let version_offset = CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len();
+        unsupported[version_offset..version_offset + 2]
+            .copy_from_slice(&version.to_be_bytes());
+        refresh_raft_wal_frame_checksum(&mut unsupported);
+        assert_eq!(
+            ControlPlaneRaftRestartSentinel::decode_durable_sentinel_classified(&unsupported),
+            Err(ControlPlaneRaftRestartSentinelFormatError::UnsupportedVersion(version))
+        );
+    }
+
+    let mut truncated_payload = encoded.clone();
+    let cluster_name_len_offset = CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len() + 2;
+    truncated_payload[cluster_name_len_offset..cluster_name_len_offset + 4]
+        .copy_from_slice(&u32::MAX.to_be_bytes());
+    refresh_raft_wal_frame_checksum(&mut truncated_payload);
+    assert_eq!(
+        ControlPlaneRaftRestartSentinel::decode_durable_sentinel_classified(&truncated_payload),
+        Err(ControlPlaneRaftRestartSentinelFormatError::Truncated)
+    );
+
+    let mut invalid_cluster_name = encoded.clone();
+    invalid_cluster_name[cluster_name_len_offset + 4] = 0xff;
+    refresh_raft_wal_frame_checksum(&mut invalid_cluster_name);
+    assert_eq!(
+        ControlPlaneRaftRestartSentinel::decode_durable_sentinel_classified(&invalid_cluster_name),
+        Err(ControlPlaneRaftRestartSentinelFormatError::InvalidClusterName)
+    );
+
+    let mut trailing = encoded.clone();
+    trailing.insert(trailing.len() - CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN, 0xff);
+    refresh_raft_wal_frame_checksum(&mut trailing);
+    assert_eq!(
+        ControlPlaneRaftRestartSentinel::decode_durable_sentinel_classified(&trailing),
+        Err(ControlPlaneRaftRestartSentinelFormatError::TrailingBytes)
+    );
+}
+
+#[test]
+fn control_plane_openraft_durable_startup_rejects_unsupported_sentinel_without_mutation() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let cluster_name = "control-plane-raft-unsupported-sentinel-startup-test";
+        for version in [0, CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION + 1] {
+            for artifact_present in [false, true] {
+                let tmp = test_util::tempdir();
+                let path = tmp.path().join("raft.state");
+                let sentinel_path = durable_artifact_sentinel_path(&path);
+                let wal_path = durable_artifact_wal_path(&path);
+                let artifact = ControlPlaneRaftRestartArtifact {
+                    cluster_name: cluster_name.to_string(),
+                    local_node_id: 1,
+                    wal_replay_offset: 0,
+                    log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+                    state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+                };
+
+                if artifact_present {
+                    artifact.store_durable_artifact(&path).unwrap();
+                    std::fs::write(&wal_path, b"WAL must not be inspected or replaced").unwrap();
+                } else {
+                    ControlPlaneRaftRestartSentinel::for_artifact(&artifact)
+                        .store_durable_sentinel(&sentinel_path, None)
+                        .unwrap();
+                }
+
+                let mut sentinel_bytes = std::fs::read(&sentinel_path).unwrap();
+                let version_offset = CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len();
+                sentinel_bytes[version_offset..version_offset + 2]
+                    .copy_from_slice(&version.to_be_bytes());
+                refresh_raft_wal_frame_checksum(&mut sentinel_bytes);
+                std::fs::write(&sentinel_path, &sentinel_bytes).unwrap();
+                let artifact_bytes = artifact_present.then(|| std::fs::read(&path).unwrap());
+                let wal_bytes = artifact_present.then(|| std::fs::read(&wal_path).unwrap());
+
+                assert_error_contains(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                        cluster_name,
+                        1,
+                        &path,
+                    )
+                    .await,
+                    &format!(
+                        "unsupported control-plane OpenRaft durable restart sentinel version {version}"
+                    ),
+                );
+
+                assert_eq!(std::fs::read(&sentinel_path).unwrap(), sentinel_bytes);
+                if let Some(artifact_bytes) = artifact_bytes {
+                    assert_eq!(std::fs::read(&path).unwrap(), artifact_bytes);
+                    assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes.unwrap());
+                } else {
+                    assert!(!path.exists());
+                    assert!(!wal_path.exists());
+                }
+            }
+        }
+    });
 }
 
 #[test]
