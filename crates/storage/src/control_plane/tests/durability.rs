@@ -353,6 +353,139 @@ fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_req
 }
 
 #[test]
+fn single_authority_journal_record_v2_format_failures_are_exact() {
+    let binding = ControlPlaneAuthorityClockCheckpointBinding([0x42; 32]);
+    let checkpoint = SingleAuthorityJournalRecord {
+        binding,
+        previous_chain_digest: 7,
+        resulting_chain_digest: 7,
+        command: None,
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(
+        SingleAuthorityJournalRecord::decode_classified(&checkpoint)
+            .unwrap()
+            .binding,
+        binding
+    );
+
+    for truncated_len in [
+        0,
+        SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len() - 1,
+        SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len(),
+        SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len() + 1,
+        checkpoint.len() - 1,
+    ] {
+        assert!(matches!(
+            SingleAuthorityJournalRecord::decode_classified(&checkpoint[..truncated_len]),
+            Err(SingleAuthorityJournalRecordDecodeError::Format(
+                SingleAuthorityJournalRecordFormatError::Truncated
+            ))
+        ));
+    }
+
+    let mut bad_checksum = checkpoint.clone();
+    *bad_checksum.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        SingleAuthorityJournalRecord::decode_classified(&bad_checksum),
+        Err(SingleAuthorityJournalRecordDecodeError::Invalid(
+            ControlPlaneError::CommandDecode { message }
+        )) if message.contains("journal record checksum mismatch")
+    ));
+
+    let mut bad_magic = checkpoint.clone();
+    bad_magic[0] ^= 0xff;
+    reseal_crc64_suffix(&mut bad_magic);
+    assert!(matches!(
+        SingleAuthorityJournalRecord::decode_classified(&bad_magic),
+        Err(SingleAuthorityJournalRecordDecodeError::Format(
+            SingleAuthorityJournalRecordFormatError::UnknownMagic
+        ))
+    ));
+
+    for version in [1u16, 3] {
+        let mut unsupported = checkpoint.clone();
+        let version_offset = SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len();
+        unsupported[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+        reseal_crc64_suffix(&mut unsupported);
+        assert!(matches!(
+            SingleAuthorityJournalRecord::decode_classified(&unsupported),
+            Err(SingleAuthorityJournalRecordDecodeError::Format(
+                SingleAuthorityJournalRecordFormatError::UnsupportedVersion(actual)
+            )) if actual == version
+        ));
+    }
+
+    let invalid_kind = SingleAuthorityJournalRecord {
+        binding,
+        previous_chain_digest: 7,
+        resulting_chain_digest: 7,
+        command: None,
+    }
+    .encode_parts(0xff, &[])
+    .unwrap();
+    assert!(matches!(
+        SingleAuthorityJournalRecord::decode_classified(&invalid_kind),
+        Err(SingleAuthorityJournalRecordDecodeError::Invalid(
+            ControlPlaneError::CommandDecode { message }
+        )) if message == "invalid single-authority control-plane journal record kind 255"
+    ));
+
+    for invalid_kind_length in [
+        SingleAuthorityJournalRecord {
+            binding,
+            previous_chain_digest: 7,
+            resulting_chain_digest: 7,
+            command: None,
+        }
+        .encode_parts(SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKPOINT, &[0])
+        .unwrap(),
+        SingleAuthorityJournalRecord {
+            binding,
+            previous_chain_digest: 7,
+            resulting_chain_digest: 7,
+            command: None,
+        }
+        .encode_parts(SINGLE_AUTHORITY_JOURNAL_RECORD_COMMAND, &[])
+        .unwrap(),
+    ] {
+        assert!(matches!(
+            SingleAuthorityJournalRecord::decode_classified(&invalid_kind_length),
+            Err(SingleAuthorityJournalRecordDecodeError::Invalid(
+                ControlPlaneError::CommandDecode { message }
+            )) if message == "single-authority control-plane journal record kind has invalid command length"
+        ));
+    }
+
+    let mut mismatched_length = checkpoint.clone();
+    let command_length_offset = SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len()
+        + std::mem::size_of::<u16>()
+        + CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN
+        + 2 * std::mem::size_of::<u64>()
+        + std::mem::size_of::<u8>();
+    mismatched_length[command_length_offset..command_length_offset + 4]
+        .copy_from_slice(&u32::MAX.to_be_bytes());
+    reseal_crc64_suffix(&mut mismatched_length);
+    assert!(matches!(
+        SingleAuthorityJournalRecord::decode_classified(&mismatched_length),
+        Err(SingleAuthorityJournalRecordDecodeError::Invalid(
+            ControlPlaneError::CommandDecode { message }
+        )) if message == "single-authority control-plane journal command length mismatch"
+    ));
+
+    let invalid_inner_command =
+        SingleAuthorityJournalRecord::encode_command_bytes_for_test(binding, 7, b"invalid")
+            .unwrap();
+    assert!(matches!(
+        SingleAuthorityJournalRecord::decode_classified(&invalid_inner_command),
+        Err(SingleAuthorityJournalRecordDecodeError::Invalid(
+            ControlPlaneError::CommandDecode { message }
+        )) if message == "truncated control-plane command payload"
+    ));
+}
+
+#[test]
 fn single_authority_journal_v2_full_file_layout_is_exact() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

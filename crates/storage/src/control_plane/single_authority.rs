@@ -1349,12 +1349,196 @@ pub(crate) fn prepare_unsupported_single_authority_journal_file_restart_for_test
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn prepare_unsupported_single_authority_journal_record_restart_for_test(
+    durable_state_path: &Path,
+    version: u16,
+) -> Result<(), ControlPlaneError> {
+    if !matches!(version, 1 | 3) {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "test journal-record version must be one of the retained adjacent fixtures"
+                .to_owned(),
+        });
+    }
+
+    let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+        durable_state_path.to_path_buf(),
+    ))?;
+    authority.set_node_membership(NodeId::new(0x7f), NodeMembershipState::Active)?;
+    drop(authority);
+
+    let journal_path = single_authority_journal_path(durable_state_path);
+    let mut journal = std::fs::read(&journal_path).map_err(|source| {
+        ControlPlaneError::io(
+            "read single-authority journal for unsupported-record-version test",
+            source,
+        )
+    })?;
+    let header_len = FileControlPlaneStore::new(durable_state_path.to_path_buf())
+        .journal
+        .encode_file_header(0)
+        .len();
+    let mut frame_offset = header_len;
+    let mut last_record = None;
+    while frame_offset < journal.len() {
+        if journal.len() - frame_offset < 2 * std::mem::size_of::<u32>() {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "test single-authority journal contains a truncated frame prefix"
+                    .to_owned(),
+            });
+        }
+        let frame_len = u32::from_be_bytes(
+            journal[frame_offset..frame_offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .expect("test journal frame length has fixed width"),
+        );
+        let frame_len_check = u32::from_be_bytes(
+            journal[frame_offset + std::mem::size_of::<u32>()
+                ..frame_offset + 2 * std::mem::size_of::<u32>()]
+                .try_into()
+                .expect("test journal frame length check has fixed width"),
+        );
+        if frame_len_check != !frame_len {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "test single-authority journal frame length check mismatch".to_owned(),
+            });
+        }
+        let record_start = frame_offset + 2 * std::mem::size_of::<u32>();
+        let record_end = record_start
+            .checked_add(usize::try_from(frame_len).map_err(|_| {
+                ControlPlaneError::CommandDecode {
+                    message: "test single-authority journal frame length exceeds usize".to_owned(),
+                }
+            })?)
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "test single-authority journal frame length overflows usize".to_owned(),
+            })?;
+        if record_end > journal.len() {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "test single-authority journal contains a truncated frame".to_owned(),
+            });
+        }
+        last_record = Some((record_start, record_end));
+        frame_offset = record_end;
+    }
+    let (record_start, record_end) = last_record.ok_or_else(|| {
+        ControlPlaneError::CommandDecode {
+            message: "test single-authority journal contains no records".to_owned(),
+        }
+    })?;
+    let kind_offset = record_start
+        + SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len()
+        + std::mem::size_of::<u16>()
+        + CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN
+        + 2 * std::mem::size_of::<u64>();
+    if journal.get(kind_offset).copied() != Some(SINGLE_AUTHORITY_JOURNAL_RECORD_COMMAND) {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "test single-authority journal final record is not a command".to_owned(),
+        });
+    }
+    let command_offset = kind_offset + std::mem::size_of::<u8>() + std::mem::size_of::<u32>();
+    if command_offset >= record_end - SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKSUM_LEN {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "test single-authority journal command payload is empty".to_owned(),
+        });
+    }
+    journal[command_offset] ^= 0xff;
+    let previous_chain_digest_offset = record_start
+        + SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len()
+        + std::mem::size_of::<u16>()
+        + CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN;
+    let previous_chain_digest = u64::from_be_bytes(
+        journal[previous_chain_digest_offset
+            ..previous_chain_digest_offset + std::mem::size_of::<u64>()]
+            .try_into()
+            .expect("test journal previous chain digest has fixed width"),
+    );
+    let record_checksum_offset = record_end - SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKSUM_LEN;
+    let resulting_chain_digest = single_authority_command_chain_digest(
+        previous_chain_digest,
+        &journal[command_offset..record_checksum_offset],
+    );
+    let resulting_chain_digest_offset = previous_chain_digest_offset + std::mem::size_of::<u64>();
+    journal[resulting_chain_digest_offset
+        ..resulting_chain_digest_offset + std::mem::size_of::<u64>()]
+        .copy_from_slice(&resulting_chain_digest.to_be_bytes());
+    let record_version_offset = record_start + SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len();
+    journal[record_version_offset..record_version_offset + 2]
+        .copy_from_slice(&version.to_be_bytes());
+    let record_checksum = checksum::crc64::checksum(&journal[record_start..record_checksum_offset]);
+    journal[record_checksum_offset..record_end].copy_from_slice(&record_checksum.to_be_bytes());
+    journal.extend_from_slice(&[0xa3, 0xc1]);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&journal_path)
+        .map_err(|source| {
+            ControlPlaneError::io(
+                "open single-authority journal for unsupported-record-version test",
+                source,
+            )
+        })?;
+    file.write_all(&journal).map_err(|source| {
+        ControlPlaneError::io(
+            "write single-authority journal for unsupported-record-version test",
+            source,
+        )
+    })?;
+    file.sync_all().map_err(|source| {
+        ControlPlaneError::io(
+            "sync single-authority journal for unsupported-record-version test",
+            source,
+        )
+    })?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct SingleAuthorityJournalRecord {
     binding: ControlPlaneAuthorityClockCheckpointBinding,
     previous_chain_digest: u64,
     resulting_chain_digest: u64,
     command: Option<ControlPlaneCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SingleAuthorityJournalRecordFormatError {
+    Truncated,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for SingleAuthorityJournalRecordFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter
+                .write_str("truncated single-authority control-plane journal record"),
+            Self::UnknownMagic => formatter
+                .write_str("invalid single-authority control-plane journal record magic"),
+            Self::UnsupportedVersion(version) => write!(
+                formatter,
+                "unsupported single-authority control-plane journal record version {version}"
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SingleAuthorityJournalRecordDecodeError {
+    Format(SingleAuthorityJournalRecordFormatError),
+    Invalid(ControlPlaneError),
+}
+
+impl SingleAuthorityJournalRecordDecodeError {
+    fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::Format(error) => ControlPlaneError::CommandDecode {
+                message: error.to_string(),
+            },
+            Self::Invalid(error) => error,
+        }
+    }
 }
 
 impl SingleAuthorityJournalRecord {
@@ -1418,6 +1602,11 @@ impl SingleAuthorityJournalRecord {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+        Self::decode_classified(bytes)
+            .map_err(SingleAuthorityJournalRecordDecodeError::into_control_plane_error)
+    }
+
+    fn decode_classified(bytes: &[u8]) -> Result<Self, SingleAuthorityJournalRecordDecodeError> {
         let fixed_len = SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len()
             + std::mem::size_of::<u16>()
             + CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN
@@ -1426,9 +1615,9 @@ impl SingleAuthorityJournalRecord {
             + std::mem::size_of::<u32>()
             + SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKSUM_LEN;
         if bytes.len() < fixed_len {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "truncated single-authority control-plane journal record".to_owned(),
-            });
+            return Err(SingleAuthorityJournalRecordDecodeError::Format(
+                SingleAuthorityJournalRecordFormatError::Truncated,
+            ));
         }
         let (body, checksum_bytes) =
             bytes.split_at(bytes.len() - SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKSUM_LEN);
@@ -1439,19 +1628,21 @@ impl SingleAuthorityJournalRecord {
         );
         let actual_checksum = checksum::crc64::checksum(body);
         if actual_checksum != expected_checksum {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "single-authority control-plane journal record checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
-                ),
-            });
+            return Err(SingleAuthorityJournalRecordDecodeError::Invalid(
+                ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "single-authority control-plane journal record checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
+                    ),
+                },
+            ));
         }
         let mut offset = 0;
         if &body[..SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len()]
             != SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC
         {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "invalid single-authority control-plane journal record magic".to_owned(),
-            });
+            return Err(SingleAuthorityJournalRecordDecodeError::Format(
+                SingleAuthorityJournalRecordFormatError::UnknownMagic,
+            ));
         }
         offset += SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len();
         let version = u16::from_be_bytes(
@@ -1461,11 +1652,9 @@ impl SingleAuthorityJournalRecord {
         );
         offset += std::mem::size_of::<u16>();
         if version != SINGLE_AUTHORITY_JOURNAL_RECORD_VERSION {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "unsupported single-authority control-plane journal record version {version}"
-                ),
-            });
+            return Err(SingleAuthorityJournalRecordDecodeError::Format(
+                SingleAuthorityJournalRecordFormatError::UnsupportedVersion(version),
+            ));
         }
         let mut binding = [0; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
         binding.copy_from_slice(&body[offset..offset + CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN]);
@@ -1488,41 +1677,46 @@ impl SingleAuthorityJournalRecord {
             body[offset..offset + std::mem::size_of::<u32>()]
                 .try_into()
                 .expect("journal command length has fixed length"),
-        ) as usize;
+        );
         offset += std::mem::size_of::<u32>();
-        let command_end =
-            offset
-                .checked_add(command_len)
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message:
-                        "single-authority control-plane journal command length overflows usize"
-                            .to_owned(),
-                })?;
-        if command_end != body.len() {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "single-authority control-plane journal command length mismatch"
-                    .to_owned(),
-            });
+        let remaining = body.len() - offset;
+        if u64::from(command_len) != u64::try_from(remaining).unwrap_or(u64::MAX) {
+            return Err(SingleAuthorityJournalRecordDecodeError::Invalid(
+                ControlPlaneError::CommandDecode {
+                    message: "single-authority control-plane journal command length mismatch"
+                        .to_owned(),
+                },
+            ));
         }
+        let command_len = usize::try_from(command_len)
+            .expect("command length equals remaining addressable bytes");
+        let command_end = offset + command_len;
         let command = match kind {
             SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKPOINT if command_len == 0 => None,
             SINGLE_AUTHORITY_JOURNAL_RECORD_COMMAND if command_len != 0 => {
-                Some(decode_control_plane_command(&body[offset..command_end])?)
+                Some(
+                    decode_control_plane_command(&body[offset..command_end])
+                        .map_err(SingleAuthorityJournalRecordDecodeError::Invalid)?,
+                )
             }
             SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKPOINT
             | SINGLE_AUTHORITY_JOURNAL_RECORD_COMMAND => {
-                return Err(ControlPlaneError::CommandDecode {
-                    message:
-                        "single-authority control-plane journal record kind has invalid command length"
-                            .to_owned(),
-                });
+                return Err(SingleAuthorityJournalRecordDecodeError::Invalid(
+                    ControlPlaneError::CommandDecode {
+                        message:
+                            "single-authority control-plane journal record kind has invalid command length"
+                                .to_owned(),
+                    },
+                ));
             }
             _ => {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "invalid single-authority control-plane journal record kind {kind}"
-                    ),
-                });
+                return Err(SingleAuthorityJournalRecordDecodeError::Invalid(
+                    ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "invalid single-authority control-plane journal record kind {kind}"
+                        ),
+                    },
+                ));
             }
         };
         Ok(Self {
