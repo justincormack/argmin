@@ -137,12 +137,17 @@ use peer_transport::{
     decode_control_plane_raft_peer_request_frame_kind,
     read_control_plane_raft_peer_transport_frame_with_reservation,
     reverse_raft_peer_frame_identity, write_control_plane_raft_peer_transport_frame,
+    ControlPlaneRaftAppendEntriesResponseTag, ControlPlaneRaftTransferLeaderResponseTag,
 };
 #[cfg(test)]
 use peer_transport::{
-    raft_peer_transport_rpc_error, read_control_plane_raft_peer_transport_frame_classified,
+    raft_peer_rpc_frame_reader_classified, raft_peer_transport_rpc_error,
+    read_control_plane_raft_peer_transport_frame_classified,
     ControlPlaneRaftConfiguredPeerFrameTransport, ControlPlaneRaftPeerFrameExchange,
-    ControlPlaneRaftPeerFrameExchangeError, ControlPlaneRaftPeerFrameTransport,
+    ControlPlaneRaftPeerFrameExchangeError, ControlPlaneRaftPeerFrameIdentityBranch,
+    ControlPlaneRaftPeerFrameTransport, ControlPlaneRaftPeerRpcFrameDecodeError,
+    ControlPlaneRaftPeerRpcFrameFormatError, ControlPlaneRaftPeerRpcFrameTag,
+    ControlPlaneRaftPeerRpcRequestTag, ControlPlaneRaftPeerRpcResponseTag,
     ControlPlaneRaftPeerTransportFrameFormatError, ControlPlaneRaftPeerTransportFrameReadError,
     ControlPlaneRaftPeerTransportRejection, ControlPlaneRaftUnixPeerFrameTransport,
     CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS,
@@ -5961,24 +5966,6 @@ const CONTROL_PLANE_RAFT_WAL_RECORD_PURGE: u8 = 5;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
 const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 2;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
-const CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST: u8 = 1;
-const CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE: u8 = 2;
-const CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST: u8 = 3;
-const CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE: u8 = 4;
-const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_APPEND_ENTRIES: u8 = 1;
-const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_VOTE: u8 = 2;
-const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_PRE_VOTE: u8 = 3;
-const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_TRANSFER_LEADER: u8 = 4;
-const CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_APPEND_ENTRIES: u8 = 1;
-const CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_VOTE: u8 = 2;
-const CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_TRANSFER_LEADER: u8 = 3;
-const CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_SUCCESS: u8 = 1;
-const CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_PARTIAL_SUCCESS: u8 = 2;
-const CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_CONFLICT: u8 = 3;
-const CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_HIGHER_VOTE: u8 = 4;
-const CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_SUCCESS: u8 = 1;
-const CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_VOTE_CHANGED: u8 = 2;
-const CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_LOG_NOT_FLUSHED: u8 = 3;
 const RAFT_ENTRY_MIN_LEN: usize = 8 + 8 + 8 + 1;
 const RAFT_MEMBERSHIP_CONFIG_MIN_LEN: usize = 4;
 const RAFT_MEMBERSHIP_NODE_MIN_LEN: usize = 8 + 4;
@@ -8510,7 +8497,7 @@ fn write_raft_state_machine_artifact(
     artifact: &ControlPlaneRaftStateMachineRestartArtifact,
 ) -> Result<(), ControlPlaneError> {
     write_raft_option_log_id(out, artifact.last_applied);
-    write_raft_stored_membership(out, &artifact.last_membership)?;
+    write_raft_stored_membership(out, &artifact.last_membership, None)?;
 
     let mut inner = artifact.inner.clone();
     let snapshot_artifact = inner.build_snapshot_artifact()?;
@@ -8548,14 +8535,220 @@ fn read_raft_state_machine_artifact(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RaftWireBoolean {
+    False,
+    True,
+}
+
+impl RaftWireBoolean {
+    #[cfg(test)]
+    const ALL: [Self; 2] = [Self::False, Self::True];
+
+    fn from_bool(value: bool) -> Self {
+        if value {
+            Self::True
+        } else {
+            Self::False
+        }
+    }
+
+    fn as_bool(self) -> bool {
+        match self {
+            Self::False => false,
+            Self::True => true,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::False => 0,
+            Self::True => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self, u8> {
+        match value {
+            0 => Ok(Self::False),
+            1 => Ok(Self::True),
+            value => Err(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RaftWireOptionTag {
+    Absent,
+    Present,
+}
+
+impl RaftWireOptionTag {
+    #[cfg(test)]
+    const ALL: [Self; 2] = [Self::Absent, Self::Present];
+
+    fn from_present(present: bool) -> Self {
+        if present {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Absent => 0,
+            Self::Present => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self, u8> {
+        match value {
+            0 => Ok(Self::Absent),
+            1 => Ok(Self::Present),
+            value => Err(value),
+        }
+    }
+}
+
+macro_rules! define_control_plane_raft_peer_rpc_optional_fields {
+    ($($field:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum ControlPlaneRaftPeerRpcOptionalField {
+            $($field),+
+        }
+
+        impl ControlPlaneRaftPeerRpcOptionalField {
+            const ALL: &'static [Self] = &[$(Self::$field),+];
+        }
+    };
+}
+
+define_control_plane_raft_peer_rpc_optional_fields!(
+    PeerIdentity,
+    PeerTopology,
+    AppendEntriesPrevLogId,
+    AppendEntriesLeaderCommit,
+    AppendEntriesPartialSuccessLogId,
+    VoteRequestLastLogId,
+    VoteResponseLastLogId,
+    TransferLeaderRequestLastLogId,
+    TransferLeaderExpectedLogId,
+    TransferLeaderActualLogId,
+    SnapshotLastLogId,
+    SnapshotMembershipLogId,
+);
+
+#[cfg(test)]
+thread_local! {
+    static CONTROL_PLANE_RAFT_PEER_RPC_OPTION_CAPTURE: std::cell::RefCell<
+        Option<Vec<(ControlPlaneRaftPeerRpcOptionalField, RaftWireOptionTag)>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ControlPlaneRaftPeerRpcOptionCapture {
+    active: bool,
+}
+
+#[cfg(test)]
+impl ControlPlaneRaftPeerRpcOptionCapture {
+    fn begin() -> Self {
+        CONTROL_PLANE_RAFT_PEER_RPC_OPTION_CAPTURE.with(|capture| {
+            let previous = capture.borrow_mut().replace(Vec::new());
+            assert!(
+                previous.is_none(),
+                "peer RPC option capture is already active"
+            );
+        });
+        Self { active: true }
+    }
+
+    fn finish(mut self) -> Vec<(ControlPlaneRaftPeerRpcOptionalField, RaftWireOptionTag)> {
+        self.active = false;
+        CONTROL_PLANE_RAFT_PEER_RPC_OPTION_CAPTURE.with(|capture| {
+            capture
+                .borrow_mut()
+                .take()
+                .expect("peer RPC option capture must remain active")
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for ControlPlaneRaftPeerRpcOptionCapture {
+    fn drop(&mut self) {
+        if self.active {
+            CONTROL_PLANE_RAFT_PEER_RPC_OPTION_CAPTURE.with(|capture| {
+                capture.borrow_mut().take();
+            });
+        }
+    }
+}
+
+fn write_raft_peer_option_tag(
+    out: &mut Vec<u8>,
+    field: ControlPlaneRaftPeerRpcOptionalField,
+    present: bool,
+) {
+    debug_assert!(ControlPlaneRaftPeerRpcOptionalField::ALL.contains(&field));
+    let arm = RaftWireOptionTag::from_present(present);
+    #[cfg(test)]
+    CONTROL_PLANE_RAFT_PEER_RPC_OPTION_CAPTURE.with(|capture| {
+        if let Some(observations) = capture.borrow_mut().as_mut() {
+            observations.push((field, arm));
+        }
+    });
+    write_raft_u8(out, arm.as_u8());
+}
+
+fn write_raft_peer_option_log_id(
+    out: &mut Vec<u8>,
+    field: ControlPlaneRaftPeerRpcOptionalField,
+    log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+) {
+    write_raft_peer_option_tag(out, field, log_id.is_some());
+    if let Some(log_id) = log_id {
+        write_raft_log_id(out, log_id);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlPlaneRaftEntryPayloadTag {
+    Blank,
+    Membership,
+    Normal,
+}
+
+impl ControlPlaneRaftEntryPayloadTag {
+    #[cfg(test)]
+    const ALL: [Self; 3] = [Self::Blank, Self::Membership, Self::Normal];
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Blank => 0,
+            Self::Membership => 1,
+            Self::Normal => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self, u8> {
+        match value {
+            0 => Ok(Self::Blank),
+            1 => Ok(Self::Membership),
+            2 => Ok(Self::Normal),
+            value => Err(value),
+        }
+    }
+}
+
 fn write_raft_option_snapshot(
     out: &mut Vec<u8>,
     snapshot: Option<&ControlPlaneRaftSnapshot>,
 ) -> Result<(), ControlPlaneError> {
     match snapshot {
-        None => write_raft_u8(out, 0),
+        None => write_raft_u8(out, RaftWireOptionTag::Absent.as_u8()),
         Some(snapshot) => {
-            write_raft_u8(out, 1);
+            write_raft_u8(out, RaftWireOptionTag::Present.as_u8());
             write_raft_snapshot(out, snapshot)?;
         }
     }
@@ -8575,8 +8768,16 @@ fn write_raft_snapshot_meta(
     out: &mut Vec<u8>,
     meta: &SnapshotMetaOf<ControlPlaneRaftTypeConfig>,
 ) -> Result<(), ControlPlaneError> {
-    write_raft_option_log_id(out, meta.last_log_id);
-    write_raft_stored_membership(out, &meta.last_membership)?;
+    write_raft_peer_option_log_id(
+        out,
+        ControlPlaneRaftPeerRpcOptionalField::SnapshotLastLogId,
+        meta.last_log_id,
+    );
+    write_raft_stored_membership(
+        out,
+        &meta.last_membership,
+        Some(ControlPlaneRaftPeerRpcOptionalField::SnapshotMembershipLogId),
+    )?;
     // Keep the removed OpenRaft snapshot-id field in Argmin's durable and peer
     // formats so alpha.30 artifacts and mixed-version peers remain compatible.
     // The value has always been derived from the covered log position.
@@ -8601,7 +8802,11 @@ fn write_raft_append_entries_request(
     request: &AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
 ) -> Result<(), ControlPlaneError> {
     write_raft_vote(out, request.vote);
-    write_raft_option_log_id(out, request.prev_log_id);
+    write_raft_peer_option_log_id(
+        out,
+        ControlPlaneRaftPeerRpcOptionalField::AppendEntriesPrevLogId,
+        request.prev_log_id,
+    );
     write_raft_u32(
         out,
         raft_len_as_u32(request.entries.len(), "raft append entries")?,
@@ -8609,30 +8814,48 @@ fn write_raft_append_entries_request(
     for entry in &request.entries {
         write_raft_entry(out, entry)?;
     }
-    write_raft_option_log_id(out, request.leader_commit);
+    write_raft_peer_option_log_id(
+        out,
+        ControlPlaneRaftPeerRpcOptionalField::AppendEntriesLeaderCommit,
+        request.leader_commit,
+    );
     Ok(())
+}
+
+fn control_plane_raft_append_entries_response_tag(
+    response: &AppendEntriesResponse<ControlPlaneRaftTypeConfig>,
+) -> ControlPlaneRaftAppendEntriesResponseTag {
+    match response {
+        AppendEntriesResponse::Success => ControlPlaneRaftAppendEntriesResponseTag::Success,
+        AppendEntriesResponse::PartialSuccess(_) => {
+            ControlPlaneRaftAppendEntriesResponseTag::PartialSuccess
+        }
+        AppendEntriesResponse::Conflict => ControlPlaneRaftAppendEntriesResponseTag::Conflict,
+        AppendEntriesResponse::HigherVote(_) => {
+            ControlPlaneRaftAppendEntriesResponseTag::HigherVote
+        }
+    }
 }
 
 fn write_raft_append_entries_response(
     out: &mut Vec<u8>,
     response: &AppendEntriesResponse<ControlPlaneRaftTypeConfig>,
 ) {
+    write_raft_u8(
+        out,
+        control_plane_raft_append_entries_response_tag(response).as_u8(),
+    );
     match response {
-        AppendEntriesResponse::Success => {
-            write_raft_u8(out, CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_SUCCESS);
-        }
+        AppendEntriesResponse::Success => {}
         AppendEntriesResponse::PartialSuccess(log_id) => {
-            write_raft_u8(
+            write_raft_peer_option_log_id(
                 out,
-                CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_PARTIAL_SUCCESS,
+                ControlPlaneRaftPeerRpcOptionalField::AppendEntriesPartialSuccessLogId,
+                *log_id,
             );
-            write_raft_option_log_id(out, *log_id);
         }
-        AppendEntriesResponse::Conflict => {
-            write_raft_u8(out, CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_CONFLICT);
-        }
+        AppendEntriesResponse::Conflict => {}
         AppendEntriesResponse::HigherVote(vote) => {
-            write_raft_u8(out, CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_HIGHER_VOTE);
             write_raft_vote(out, *vote);
         }
     }
@@ -8640,7 +8863,11 @@ fn write_raft_append_entries_response(
 
 fn write_raft_vote_request(out: &mut Vec<u8>, request: &VoteRequest<ControlPlaneRaftTypeConfig>) {
     write_raft_vote(out, request.vote);
-    write_raft_option_log_id(out, request.last_log_id);
+    write_raft_peer_option_log_id(
+        out,
+        ControlPlaneRaftPeerRpcOptionalField::VoteRequestLastLogId,
+        request.last_log_id,
+    );
     write_raft_bool(out, request.leadership_transfer);
 }
 
@@ -8650,7 +8877,11 @@ fn write_raft_vote_response(
 ) {
     write_raft_vote(out, response.vote);
     write_raft_bool(out, response.vote_granted);
-    write_raft_option_log_id(out, response.last_log_id);
+    write_raft_peer_option_log_id(
+        out,
+        ControlPlaneRaftPeerRpcOptionalField::VoteResponseLastLogId,
+        response.last_log_id,
+    );
 }
 
 fn write_raft_transfer_leader_request(
@@ -8659,31 +8890,63 @@ fn write_raft_transfer_leader_request(
 ) {
     write_raft_vote(out, *request.from_leader());
     write_raft_u64(out, *request.to_node_id());
-    write_raft_option_log_id(out, request.last_log_id().copied());
+    write_raft_peer_option_log_id(
+        out,
+        ControlPlaneRaftPeerRpcOptionalField::TransferLeaderRequestLastLogId,
+        request.last_log_id().copied(),
+    );
+}
+
+fn control_plane_raft_transfer_leader_response_tag(
+    response: &TransferLeaderResponse<ControlPlaneRaftTypeConfig>,
+) -> ControlPlaneRaftTransferLeaderResponseTag {
+    match response {
+        Ok(()) => ControlPlaneRaftTransferLeaderResponseTag::Success,
+        Err(TransferLeaderError::VoteChanged { .. }) => {
+            ControlPlaneRaftTransferLeaderResponseTag::VoteChanged
+        }
+        Err(TransferLeaderError::LogNotFlushed { .. }) => {
+            ControlPlaneRaftTransferLeaderResponseTag::LogNotFlushed
+        }
+    }
 }
 
 fn write_raft_transfer_leader_response(
     out: &mut Vec<u8>,
     response: &TransferLeaderResponse<ControlPlaneRaftTypeConfig>,
 ) {
+    write_raft_u8(
+        out,
+        control_plane_raft_transfer_leader_response_tag(response).as_u8(),
+    );
     match response {
-        Ok(()) => write_raft_u8(out, CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_SUCCESS),
+        Ok(()) => {}
         Err(TransferLeaderError::VoteChanged { expected, actual }) => {
-            write_raft_u8(
-                out,
-                CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_VOTE_CHANGED,
-            );
             write_raft_vote(out, *expected);
             write_raft_vote(out, *actual);
         }
         Err(TransferLeaderError::LogNotFlushed { expected, actual }) => {
-            write_raft_u8(
+            write_raft_peer_option_log_id(
                 out,
-                CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_LOG_NOT_FLUSHED,
+                ControlPlaneRaftPeerRpcOptionalField::TransferLeaderExpectedLogId,
+                *expected,
             );
-            write_raft_option_log_id(out, *expected);
-            write_raft_option_log_id(out, *actual);
+            write_raft_peer_option_log_id(
+                out,
+                ControlPlaneRaftPeerRpcOptionalField::TransferLeaderActualLogId,
+                *actual,
+            );
         }
+    }
+}
+
+fn control_plane_raft_entry_payload_tag(
+    entry: &ControlPlaneRaftEntry,
+) -> ControlPlaneRaftEntryPayloadTag {
+    match &entry.payload {
+        EntryPayload::Blank => ControlPlaneRaftEntryPayloadTag::Blank,
+        EntryPayload::Membership(_) => ControlPlaneRaftEntryPayloadTag::Membership,
+        EntryPayload::Normal(_) => ControlPlaneRaftEntryPayloadTag::Normal,
     }
 }
 
@@ -8692,14 +8955,13 @@ fn write_raft_entry(
     entry: &ControlPlaneRaftEntry,
 ) -> Result<(), ControlPlaneError> {
     write_raft_log_id(out, entry.log_id);
+    write_raft_u8(out, control_plane_raft_entry_payload_tag(entry).as_u8());
     match &entry.payload {
-        EntryPayload::Blank => write_raft_u8(out, 0),
+        EntryPayload::Blank => {}
         EntryPayload::Membership(membership) => {
-            write_raft_u8(out, 1);
             write_raft_membership(out, membership)?;
         }
         EntryPayload::Normal(command) => {
-            write_raft_u8(out, 2);
             let encoded = encode_control_plane_command(command)?;
             write_raft_bytes(out, &encoded)?;
         }
@@ -8715,8 +8977,12 @@ fn write_raft_vote(out: &mut Vec<u8>, vote: VoteOf<ControlPlaneRaftTypeConfig>) 
 fn write_raft_stored_membership(
     out: &mut Vec<u8>,
     membership: &StoredMembershipOf<ControlPlaneRaftTypeConfig>,
+    peer_optional_field: Option<ControlPlaneRaftPeerRpcOptionalField>,
 ) -> Result<(), ControlPlaneError> {
-    write_raft_option_log_id(out, *membership.log_id());
+    match peer_optional_field {
+        Some(field) => write_raft_peer_option_log_id(out, field, *membership.log_id()),
+        None => write_raft_option_log_id(out, *membership.log_id()),
+    }
     write_raft_membership(out, membership.membership())
 }
 
@@ -8749,9 +9015,9 @@ fn write_raft_membership(
 
 fn write_raft_option_vote(out: &mut Vec<u8>, vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>) {
     match vote {
-        None => write_raft_u8(out, 0),
+        None => write_raft_u8(out, RaftWireOptionTag::Absent.as_u8()),
         Some(vote) => {
-            write_raft_u8(out, 1);
+            write_raft_u8(out, RaftWireOptionTag::Present.as_u8());
             write_raft_vote(out, vote);
         }
     }
@@ -8762,9 +9028,9 @@ fn write_raft_option_log_id(
     log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
 ) {
     match log_id {
-        None => write_raft_u8(out, 0),
+        None => write_raft_u8(out, RaftWireOptionTag::Absent.as_u8()),
         Some(log_id) => {
-            write_raft_u8(out, 1);
+            write_raft_u8(out, RaftWireOptionTag::Present.as_u8());
             write_raft_log_id(out, log_id);
         }
     }
@@ -8793,7 +9059,7 @@ fn write_raft_string(out: &mut Vec<u8>, value: &str) -> Result<(), ControlPlaneE
 }
 
 fn write_raft_bool(out: &mut Vec<u8>, value: bool) {
-    write_raft_u8(out, u8::from(value));
+    write_raft_u8(out, RaftWireBoolean::from_bool(value).as_u8());
 }
 
 fn write_raft_u8(out: &mut Vec<u8>, value: u8) {
@@ -8888,14 +9154,14 @@ impl<'a> RaftArtifactReader<'a> {
     }
 
     fn read_bool(&mut self) -> Result<bool, ControlPlaneError> {
-        match self.read_u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            value => Err(raft_artifact_protocol_error(format!(
-                "invalid {} boolean value {value}",
-                self.context
-            ))),
-        }
+        RaftWireBoolean::from_u8(self.read_u8()?)
+            .map(RaftWireBoolean::as_bool)
+            .map_err(|value| {
+                raft_artifact_protocol_error(format!(
+                    "invalid {} boolean value {value}",
+                    self.context
+                ))
+            })
     }
 
     fn read_len(&mut self, field: &'static str) -> Result<usize, ControlPlaneError> {
@@ -8952,10 +9218,10 @@ impl<'a> RaftArtifactReader<'a> {
     fn read_option_vote(
         &mut self,
     ) -> Result<Option<VoteOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
-        match self.read_u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(self.read_vote()?)),
-            value => Err(raft_artifact_protocol_error(format!(
+        match RaftWireOptionTag::from_u8(self.read_u8()?) {
+            Ok(RaftWireOptionTag::Absent) => Ok(None),
+            Ok(RaftWireOptionTag::Present) => Ok(Some(self.read_vote()?)),
+            Err(value) => Err(raft_artifact_protocol_error(format!(
                 "invalid control-plane OpenRaft durable optional vote tag {value}"
             ))),
         }
@@ -8964,10 +9230,10 @@ impl<'a> RaftArtifactReader<'a> {
     fn read_option_log_id(
         &mut self,
     ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
-        match self.read_u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(self.read_log_id()?)),
-            value => Err(raft_artifact_protocol_error(format!(
+        match RaftWireOptionTag::from_u8(self.read_u8()?) {
+            Ok(RaftWireOptionTag::Absent) => Ok(None),
+            Ok(RaftWireOptionTag::Present) => Ok(Some(self.read_log_id()?)),
+            Err(value) => Err(raft_artifact_protocol_error(format!(
                 "invalid control-plane OpenRaft durable optional log-id tag {value}"
             ))),
         }
@@ -8995,20 +9261,20 @@ impl<'a> RaftArtifactReader<'a> {
     fn read_append_entries_response(
         &mut self,
     ) -> Result<AppendEntriesResponse<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
-        match self.read_u8()? {
-            CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_SUCCESS => {
+        match ControlPlaneRaftAppendEntriesResponseTag::from_u8(self.read_u8()?) {
+            Ok(ControlPlaneRaftAppendEntriesResponseTag::Success) => {
                 Ok(AppendEntriesResponse::Success)
             }
-            CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_PARTIAL_SUCCESS => Ok(
+            Ok(ControlPlaneRaftAppendEntriesResponseTag::PartialSuccess) => Ok(
                 AppendEntriesResponse::PartialSuccess(self.read_option_log_id()?),
             ),
-            CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_CONFLICT => {
+            Ok(ControlPlaneRaftAppendEntriesResponseTag::Conflict) => {
                 Ok(AppendEntriesResponse::Conflict)
             }
-            CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_HIGHER_VOTE => {
+            Ok(ControlPlaneRaftAppendEntriesResponseTag::HigherVote) => {
                 Ok(AppendEntriesResponse::HigherVote(self.read_vote()?))
             }
-            value => Err(raft_artifact_protocol_error(format!(
+            Err(value) => Err(raft_artifact_protocol_error(format!(
                 "unknown control-plane OpenRaft peer RPC append_entries response tag {value}"
             ))),
         }
@@ -9085,21 +9351,21 @@ impl<'a> RaftArtifactReader<'a> {
     fn read_transfer_leader_response(
         &mut self,
     ) -> Result<TransferLeaderResponse<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
-        match self.read_u8()? {
-            CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_SUCCESS => Ok(Ok(())),
-            CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_VOTE_CHANGED => {
+        match ControlPlaneRaftTransferLeaderResponseTag::from_u8(self.read_u8()?) {
+            Ok(ControlPlaneRaftTransferLeaderResponseTag::Success) => Ok(Ok(())),
+            Ok(ControlPlaneRaftTransferLeaderResponseTag::VoteChanged) => {
                 Ok(Err(TransferLeaderError::VoteChanged {
                     expected: self.read_vote()?,
                     actual: self.read_vote()?,
                 }))
             }
-            CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_LOG_NOT_FLUSHED => {
+            Ok(ControlPlaneRaftTransferLeaderResponseTag::LogNotFlushed) => {
                 Ok(Err(TransferLeaderError::LogNotFlushed {
                     expected: self.read_option_log_id()?,
                     actual: self.read_option_log_id()?,
                 }))
             }
-            value => Err(raft_artifact_protocol_error(format!(
+            Err(value) => Err(raft_artifact_protocol_error(format!(
                 "unknown control-plane OpenRaft peer RPC transfer_leader response tag {value}"
             ))),
         }
@@ -9107,13 +9373,15 @@ impl<'a> RaftArtifactReader<'a> {
 
     fn read_entry(&mut self) -> Result<ControlPlaneRaftEntry, ControlPlaneError> {
         let log_id = self.read_log_id()?;
-        let payload = match self.read_u8()? {
-            0 => EntryPayload::Blank,
-            1 => EntryPayload::Membership(self.read_membership()?),
-            2 => EntryPayload::Normal(decode_control_plane_command(
-                self.read_bytes("raft command payload")?,
-            )?),
-            value => {
+        let payload = match ControlPlaneRaftEntryPayloadTag::from_u8(self.read_u8()?) {
+            Ok(ControlPlaneRaftEntryPayloadTag::Blank) => EntryPayload::Blank,
+            Ok(ControlPlaneRaftEntryPayloadTag::Membership) => {
+                EntryPayload::Membership(self.read_membership()?)
+            }
+            Ok(ControlPlaneRaftEntryPayloadTag::Normal) => EntryPayload::Normal(
+                decode_control_plane_command(self.read_bytes("raft command payload")?)?,
+            ),
+            Err(value) => {
                 return Err(raft_artifact_protocol_error(format!(
                     "unknown control-plane OpenRaft durable entry payload tag {value}"
                 )));
@@ -9133,10 +9401,12 @@ impl<'a> RaftArtifactReader<'a> {
     fn read_option_snapshot(
         &mut self,
     ) -> Result<Option<ControlPlaneRaftSnapshot>, ControlPlaneError> {
-        match self.read_u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(self.read_snapshot("raft cached snapshot payload")?)),
-            value => Err(raft_artifact_protocol_error(format!(
+        match RaftWireOptionTag::from_u8(self.read_u8()?) {
+            Ok(RaftWireOptionTag::Absent) => Ok(None),
+            Ok(RaftWireOptionTag::Present) => {
+                Ok(Some(self.read_snapshot("raft cached snapshot payload")?))
+            }
+            Err(value) => Err(raft_artifact_protocol_error(format!(
                 "invalid control-plane OpenRaft durable optional snapshot tag {value}"
             ))),
         }
@@ -9245,17 +9515,17 @@ impl<'a> RaftArtifactReader<'a> {
     fn read_peer_frame_identity(
         &mut self,
     ) -> Result<Option<ControlPlaneRaftPeerFrameIdentity>, ControlPlaneError> {
-        match self.read_u8()? {
-            0 => Ok(None),
-            1 => {
+        match RaftWireOptionTag::from_u8(self.read_u8()?) {
+            Ok(RaftWireOptionTag::Absent) => Ok(None),
+            Ok(RaftWireOptionTag::Present) => {
                 let cluster_name = self.read_string()?;
-                let topology = match self.read_u8()? {
-                    0 => None,
-                    1 => Some(ControlPlaneRaftTopologyIdentity {
+                let topology = match RaftWireOptionTag::from_u8(self.read_u8()?) {
+                    Ok(RaftWireOptionTag::Absent) => None,
+                    Ok(RaftWireOptionTag::Present) => Some(ControlPlaneRaftTopologyIdentity {
                         generation: self.read_u64()?,
                         digest: self.read_string()?,
                     }),
-                    value => {
+                    Err(value) => {
                         return Err(raft_artifact_protocol_error(format!(
                             "invalid control-plane OpenRaft peer RPC topology identity tag {value}"
                         )));
@@ -9270,7 +9540,7 @@ impl<'a> RaftArtifactReader<'a> {
                     target,
                 }))
             }
-            value => Err(raft_artifact_protocol_error(format!(
+            Err(value) => Err(raft_artifact_protocol_error(format!(
                 "invalid control-plane OpenRaft peer RPC frame identity tag {value}"
             ))),
         }

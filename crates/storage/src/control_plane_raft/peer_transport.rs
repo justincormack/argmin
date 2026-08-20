@@ -23,6 +23,199 @@ pub(crate) enum ControlPlaneRaftPeerFrameKind {
     Snapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ControlPlaneRaftPeerRpcFrameTag {
+    Request,
+    Response,
+    SnapshotRequest,
+    SnapshotResponse,
+}
+
+impl ControlPlaneRaftPeerRpcFrameTag {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 4] = [
+        Self::Request,
+        Self::Response,
+        Self::SnapshotRequest,
+        Self::SnapshotResponse,
+    ];
+
+    pub(super) fn as_u8(self) -> u8 {
+        match self {
+            Self::Request => 1,
+            Self::Response => 2,
+            Self::SnapshotRequest => 3,
+            Self::SnapshotResponse => 4,
+        }
+    }
+
+    pub(super) fn from_u8(value: u8) -> Result<Self, u8> {
+        match value {
+            1 => Ok(Self::Request),
+            2 => Ok(Self::Response),
+            3 => Ok(Self::SnapshotRequest),
+            4 => Ok(Self::SnapshotResponse),
+            value => Err(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ControlPlaneRaftPeerRpcRequestTag {
+    AppendEntries,
+    Vote,
+    PreVote,
+    TransferLeader,
+}
+
+impl ControlPlaneRaftPeerRpcRequestTag {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 4] = [
+        Self::AppendEntries,
+        Self::Vote,
+        Self::PreVote,
+        Self::TransferLeader,
+    ];
+
+    pub(super) fn as_u8(self) -> u8 {
+        match self {
+            Self::AppendEntries => 1,
+            Self::Vote => 2,
+            Self::PreVote => 3,
+            Self::TransferLeader => 4,
+        }
+    }
+
+    pub(super) fn from_u8(value: u8) -> Result<Self, u8> {
+        match value {
+            1 => Ok(Self::AppendEntries),
+            2 => Ok(Self::Vote),
+            3 => Ok(Self::PreVote),
+            4 => Ok(Self::TransferLeader),
+            value => Err(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ControlPlaneRaftPeerRpcResponseTag {
+    AppendEntries,
+    Vote,
+    TransferLeader,
+}
+
+impl ControlPlaneRaftPeerRpcResponseTag {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 3] = [Self::AppendEntries, Self::Vote, Self::TransferLeader];
+
+    pub(super) fn as_u8(self) -> u8 {
+        match self {
+            Self::AppendEntries => 1,
+            Self::Vote => 2,
+            Self::TransferLeader => 3,
+        }
+    }
+
+    pub(super) fn from_u8(value: u8) -> Result<Self, u8> {
+        match value {
+            1 => Ok(Self::AppendEntries),
+            2 => Ok(Self::Vote),
+            3 => Ok(Self::TransferLeader),
+            value => Err(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ControlPlaneRaftAppendEntriesResponseTag {
+    Success,
+    PartialSuccess,
+    Conflict,
+    HigherVote,
+}
+
+impl ControlPlaneRaftAppendEntriesResponseTag {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 4] = [
+        Self::Success,
+        Self::PartialSuccess,
+        Self::Conflict,
+        Self::HigherVote,
+    ];
+
+    pub(super) fn as_u8(self) -> u8 {
+        match self {
+            Self::Success => 1,
+            Self::PartialSuccess => 2,
+            Self::Conflict => 3,
+            Self::HigherVote => 4,
+        }
+    }
+
+    pub(super) fn from_u8(value: u8) -> Result<Self, u8> {
+        match value {
+            1 => Ok(Self::Success),
+            2 => Ok(Self::PartialSuccess),
+            3 => Ok(Self::Conflict),
+            4 => Ok(Self::HigherVote),
+            value => Err(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ControlPlaneRaftTransferLeaderResponseTag {
+    Success,
+    VoteChanged,
+    LogNotFlushed,
+}
+
+impl ControlPlaneRaftTransferLeaderResponseTag {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 3] = [Self::Success, Self::VoteChanged, Self::LogNotFlushed];
+
+    pub(super) fn as_u8(self) -> u8 {
+        match self {
+            Self::Success => 1,
+            Self::VoteChanged => 2,
+            Self::LogNotFlushed => 3,
+        }
+    }
+
+    pub(super) fn from_u8(value: u8) -> Result<Self, u8> {
+        match value {
+            1 => Ok(Self::Success),
+            2 => Ok(Self::VoteChanged),
+            3 => Ok(Self::LogNotFlushed),
+            value => Err(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ControlPlaneRaftPeerFrameIdentityBranch {
+    Absent,
+    PresentWithoutTopology,
+    PresentWithTopology,
+}
+
+impl ControlPlaneRaftPeerFrameIdentityBranch {
+    #[cfg(test)]
+    pub(super) const ALL: [Self; 3] = [
+        Self::Absent,
+        Self::PresentWithoutTopology,
+        Self::PresentWithTopology,
+    ];
+
+    pub(super) fn from_identity(identity: Option<&ControlPlaneRaftPeerFrameIdentity>) -> Self {
+        match identity {
+            None => Self::Absent,
+            Some(identity) if identity.topology.is_none() => Self::PresentWithoutTopology,
+            Some(_) => Self::PresentWithTopology,
+        }
+    }
+}
+
 impl ControlPlaneRaftPeerFrameIdentity {
     #[must_use]
     pub(crate) fn new(
@@ -76,6 +269,15 @@ pub(crate) struct ControlPlaneRaftPeerSnapshotResponse {
 }
 
 impl ControlPlaneRaftPeerRpcRequest {
+    pub(super) fn wire_tag(&self) -> ControlPlaneRaftPeerRpcRequestTag {
+        match self {
+            Self::AppendEntries(_) => ControlPlaneRaftPeerRpcRequestTag::AppendEntries,
+            Self::Vote(_) => ControlPlaneRaftPeerRpcRequestTag::Vote,
+            Self::PreVote(_) => ControlPlaneRaftPeerRpcRequestTag::PreVote,
+            Self::TransferLeader(_) => ControlPlaneRaftPeerRpcRequestTag::TransferLeader,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
         self.encode_frame_with_identity(None)
@@ -95,26 +297,20 @@ impl ControlPlaneRaftPeerRpcRequest {
         let mut out = Vec::new();
         out.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
         write_raft_u16(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
-        write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST);
+        write_raft_u8(&mut out, ControlPlaneRaftPeerRpcFrameTag::Request.as_u8());
         write_raft_peer_frame_identity(&mut out, identity)?;
+        write_raft_u8(&mut out, self.wire_tag().as_u8());
         match self {
             Self::AppendEntries(request) => {
-                write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_APPEND_ENTRIES);
                 write_raft_append_entries_request(&mut out, request)?;
             }
             Self::Vote(request) => {
-                write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_VOTE);
                 write_raft_vote_request(&mut out, request);
             }
             Self::PreVote(request) => {
-                write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_PRE_VOTE);
                 write_raft_vote_request(&mut out, request);
             }
             Self::TransferLeader(request) => {
-                write_raft_u8(
-                    &mut out,
-                    CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_TRANSFER_LEADER,
-                );
                 write_raft_transfer_leader_request(&mut out, request);
             }
         }
@@ -141,22 +337,22 @@ impl ControlPlaneRaftPeerRpcRequest {
     ) -> Result<Self, ControlPlaneError> {
         decode_raft_peer_rpc_frame(
             bytes,
-            CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST,
+            ControlPlaneRaftPeerRpcFrameTag::Request,
             expected_identity,
-            |reader| match reader.read_u8()? {
-                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_APPEND_ENTRIES => {
+            |reader| match ControlPlaneRaftPeerRpcRequestTag::from_u8(reader.read_u8()?) {
+                Ok(ControlPlaneRaftPeerRpcRequestTag::AppendEntries) => {
                     Ok(Self::AppendEntries(reader.read_append_entries_request()?))
                 }
-                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_VOTE => {
+                Ok(ControlPlaneRaftPeerRpcRequestTag::Vote) => {
                     Ok(Self::Vote(reader.read_vote_request()?))
                 }
-                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_PRE_VOTE => {
+                Ok(ControlPlaneRaftPeerRpcRequestTag::PreVote) => {
                     Ok(Self::PreVote(reader.read_vote_request()?))
                 }
-                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_TRANSFER_LEADER => {
+                Ok(ControlPlaneRaftPeerRpcRequestTag::TransferLeader) => {
                     Ok(Self::TransferLeader(reader.read_transfer_leader_request()?))
                 }
-                value => Err(raft_artifact_protocol_error(format!(
+                Err(value) => Err(raft_artifact_protocol_error(format!(
                     "unknown control-plane OpenRaft peer RPC request tag {value}"
                 ))),
             },
@@ -165,6 +361,14 @@ impl ControlPlaneRaftPeerRpcRequest {
 }
 
 impl ControlPlaneRaftPeerRpcResponse {
+    pub(super) fn wire_tag(&self) -> ControlPlaneRaftPeerRpcResponseTag {
+        match self {
+            Self::AppendEntries(_) => ControlPlaneRaftPeerRpcResponseTag::AppendEntries,
+            Self::Vote(_) => ControlPlaneRaftPeerRpcResponseTag::Vote,
+            Self::TransferLeader(_) => ControlPlaneRaftPeerRpcResponseTag::TransferLeader,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
         self.encode_frame_with_identity(None)
@@ -185,25 +389,17 @@ impl ControlPlaneRaftPeerRpcResponse {
         let mut out = Vec::new();
         out.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
         write_raft_u16(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
-        write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE);
+        write_raft_u8(&mut out, ControlPlaneRaftPeerRpcFrameTag::Response.as_u8());
         write_raft_peer_frame_identity(&mut out, identity)?;
+        write_raft_u8(&mut out, self.wire_tag().as_u8());
         match self {
             Self::AppendEntries(response) => {
-                write_raft_u8(
-                    &mut out,
-                    CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_APPEND_ENTRIES,
-                );
                 write_raft_append_entries_response(&mut out, response);
             }
             Self::Vote(response) => {
-                write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_VOTE);
                 write_raft_vote_response(&mut out, response);
             }
             Self::TransferLeader(response) => {
-                write_raft_u8(
-                    &mut out,
-                    CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_TRANSFER_LEADER,
-                );
                 write_raft_transfer_leader_response(&mut out, response);
             }
         }
@@ -229,19 +425,19 @@ impl ControlPlaneRaftPeerRpcResponse {
     ) -> Result<Self, ControlPlaneError> {
         decode_raft_peer_rpc_frame(
             bytes,
-            CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE,
+            ControlPlaneRaftPeerRpcFrameTag::Response,
             expected_identity,
-            |reader| match reader.read_u8()? {
-                CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_APPEND_ENTRIES => {
+            |reader| match ControlPlaneRaftPeerRpcResponseTag::from_u8(reader.read_u8()?) {
+                Ok(ControlPlaneRaftPeerRpcResponseTag::AppendEntries) => {
                     Ok(Self::AppendEntries(reader.read_append_entries_response()?))
                 }
-                CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_VOTE => {
+                Ok(ControlPlaneRaftPeerRpcResponseTag::Vote) => {
                     Ok(Self::Vote(reader.read_vote_response()?))
                 }
-                CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_TRANSFER_LEADER => Ok(Self::TransferLeader(
+                Ok(ControlPlaneRaftPeerRpcResponseTag::TransferLeader) => Ok(Self::TransferLeader(
                     reader.read_transfer_leader_response()?,
                 )),
-                value => Err(raft_artifact_protocol_error(format!(
+                Err(value) => Err(raft_artifact_protocol_error(format!(
                     "unknown control-plane OpenRaft peer RPC response tag {value}"
                 ))),
             },
@@ -269,7 +465,10 @@ impl ControlPlaneRaftPeerSnapshotRequest {
         let mut out = Vec::new();
         out.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
         write_raft_u16(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
-        write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST);
+        write_raft_u8(
+            &mut out,
+            ControlPlaneRaftPeerRpcFrameTag::SnapshotRequest.as_u8(),
+        );
         write_raft_peer_frame_identity(&mut out, identity)?;
         write_raft_vote(&mut out, self.vote);
         write_raft_snapshot(&mut out, &self.snapshot)?;
@@ -301,7 +500,7 @@ impl ControlPlaneRaftPeerSnapshotRequest {
         }
         decode_raft_peer_rpc_frame(
             bytes,
-            CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST,
+            ControlPlaneRaftPeerRpcFrameTag::SnapshotRequest,
             expected_identity,
             |reader| {
                 let vote = reader.read_vote()?;
@@ -335,7 +534,10 @@ impl ControlPlaneRaftPeerSnapshotResponse {
         let mut out = Vec::new();
         out.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
         write_raft_u16(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
-        write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE);
+        write_raft_u8(
+            &mut out,
+            ControlPlaneRaftPeerRpcFrameTag::SnapshotResponse.as_u8(),
+        );
         write_raft_peer_frame_identity(&mut out, identity)?;
         write_raft_vote(&mut out, self.response.vote);
         append_raft_artifact_checksum(&mut out);
@@ -360,7 +562,7 @@ impl ControlPlaneRaftPeerSnapshotResponse {
     ) -> Result<Self, ControlPlaneError> {
         decode_raft_peer_rpc_frame(
             bytes,
-            CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE,
+            ControlPlaneRaftPeerRpcFrameTag::SnapshotResponse,
             expected_identity,
             |reader| {
                 Ok(Self {
@@ -2488,15 +2690,21 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ControlPlaneRaftPeerNetwork {
 }
 fn decode_raft_peer_rpc_frame<T>(
     bytes: &[u8],
-    expected_kind: u8,
+    expected_kind: ControlPlaneRaftPeerRpcFrameTag,
     expected_identity: Option<&ControlPlaneRaftPeerFrameIdentity>,
     decode_body: impl FnOnce(&mut RaftArtifactReader<'_>) -> Result<T, ControlPlaneError>,
 ) -> Result<T, ControlPlaneError> {
     let mut reader = raft_peer_rpc_frame_reader(bytes)?;
-    let kind = reader.read_u8()?;
+    let wire_kind = reader.read_u8()?;
+    let kind = ControlPlaneRaftPeerRpcFrameTag::from_u8(wire_kind).map_err(|kind| {
+        raft_artifact_protocol_error(format!(
+            "unknown control-plane OpenRaft peer RPC frame kind {kind}"
+        ))
+    })?;
     if kind != expected_kind {
         return Err(raft_artifact_protocol_error(format!(
-            "control-plane OpenRaft peer RPC frame kind {kind} does not match expected kind {expected_kind}"
+            "control-plane OpenRaft peer RPC frame kind {wire_kind} does not match expected kind {}",
+            expected_kind.as_u8()
         )));
     }
     let identity = reader.read_peer_frame_identity()?;
@@ -2508,12 +2716,55 @@ fn decode_raft_peer_rpc_frame<T>(
     Ok(decoded)
 }
 
-fn raft_peer_rpc_frame_reader(bytes: &[u8]) -> Result<RaftArtifactReader<'_>, ControlPlaneError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ControlPlaneRaftPeerRpcFrameFormatError {
+    Truncated,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl fmt::Display for ControlPlaneRaftPeerRpcFrameFormatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => {
+                formatter.write_str("truncated control-plane OpenRaft peer RPC frame")
+            }
+            Self::UnknownMagic => {
+                formatter.write_str("invalid control-plane OpenRaft peer RPC frame magic")
+            }
+            Self::UnsupportedVersion(version) => write!(
+                formatter,
+                "unsupported control-plane OpenRaft peer RPC frame version {version}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ControlPlaneRaftPeerRpcFrameFormatError {}
+
+#[derive(Debug)]
+pub(super) enum ControlPlaneRaftPeerRpcFrameDecodeError {
+    Format(ControlPlaneRaftPeerRpcFrameFormatError),
+    Invalid(ControlPlaneError),
+}
+
+impl ControlPlaneRaftPeerRpcFrameDecodeError {
+    fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::Format(error) => raft_artifact_protocol_error(error.to_string()),
+            Self::Invalid(error) => error,
+        }
+    }
+}
+
+pub(super) fn raft_peer_rpc_frame_reader_classified(
+    bytes: &[u8],
+) -> Result<RaftArtifactReader<'_>, ControlPlaneRaftPeerRpcFrameDecodeError> {
     let min_len =
         CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2 + 1 + CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN;
     if bytes.len() < min_len {
-        return Err(raft_artifact_protocol_error(
-            "truncated control-plane OpenRaft peer RPC frame",
+        return Err(ControlPlaneRaftPeerRpcFrameDecodeError::Format(
+            ControlPlaneRaftPeerRpcFrameFormatError::Truncated,
         ));
     }
     let (body, checksum_bytes) =
@@ -2525,44 +2776,57 @@ fn raft_peer_rpc_frame_reader(bytes: &[u8]) -> Result<RaftArtifactReader<'_>, Co
     );
     let actual_checksum = raft_artifact_checksum(body);
     if actual_checksum != expected_checksum {
-        return Err(raft_artifact_protocol_error(format!(
-            "control-plane OpenRaft peer RPC frame checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
-        )));
+        return Err(ControlPlaneRaftPeerRpcFrameDecodeError::Invalid(
+            raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft peer RPC frame checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
+            )),
+        ));
     }
 
     let mut reader =
         RaftArtifactReader::with_context(body, "control-plane OpenRaft peer RPC frame");
-    let magic = reader.read_exact(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len())?;
+    let magic = reader
+        .read_exact(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len())
+        .map_err(ControlPlaneRaftPeerRpcFrameDecodeError::Invalid)?;
     if magic != CONTROL_PLANE_RAFT_PEER_RPC_MAGIC {
-        return Err(raft_artifact_protocol_error(
-            "invalid control-plane OpenRaft peer RPC frame magic",
+        return Err(ControlPlaneRaftPeerRpcFrameDecodeError::Format(
+            ControlPlaneRaftPeerRpcFrameFormatError::UnknownMagic,
         ));
     }
-    let version = reader.read_u16()?;
+    let version = reader
+        .read_u16()
+        .map_err(ControlPlaneRaftPeerRpcFrameDecodeError::Invalid)?;
     if version != CONTROL_PLANE_RAFT_PEER_RPC_VERSION {
-        return Err(raft_artifact_protocol_error(format!(
-            "unsupported control-plane OpenRaft peer RPC frame version {version}"
-        )));
+        return Err(ControlPlaneRaftPeerRpcFrameDecodeError::Format(
+            ControlPlaneRaftPeerRpcFrameFormatError::UnsupportedVersion(version),
+        ));
     }
     Ok(reader)
+}
+
+fn raft_peer_rpc_frame_reader(bytes: &[u8]) -> Result<RaftArtifactReader<'_>, ControlPlaneError> {
+    raft_peer_rpc_frame_reader_classified(bytes)
+        .map_err(ControlPlaneRaftPeerRpcFrameDecodeError::into_control_plane_error)
 }
 
 pub(crate) fn decode_control_plane_raft_peer_request_frame_kind(
     bytes: &[u8],
 ) -> Result<ControlPlaneRaftPeerFrameKind, ControlPlaneError> {
     let mut reader = raft_peer_rpc_frame_reader(bytes)?;
-    match reader.read_u8()? {
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST => Ok(ControlPlaneRaftPeerFrameKind::OrdinaryRpc),
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST => {
+    match ControlPlaneRaftPeerRpcFrameTag::from_u8(reader.read_u8()?) {
+        Ok(ControlPlaneRaftPeerRpcFrameTag::Request) => {
+            Ok(ControlPlaneRaftPeerFrameKind::OrdinaryRpc)
+        }
+        Ok(ControlPlaneRaftPeerRpcFrameTag::SnapshotRequest) => {
             Ok(ControlPlaneRaftPeerFrameKind::Snapshot)
         }
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE => Err(raft_artifact_protocol_error(
+        Ok(ControlPlaneRaftPeerRpcFrameTag::Response) => Err(raft_artifact_protocol_error(
             "control-plane OpenRaft peer RPC response frame cannot be handled as a request",
         )),
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE => Err(raft_artifact_protocol_error(
+        Ok(ControlPlaneRaftPeerRpcFrameTag::SnapshotResponse) => Err(raft_artifact_protocol_error(
             "control-plane OpenRaft peer snapshot response frame cannot be handled as a request",
         )),
-        kind => Err(raft_artifact_protocol_error(format!(
+        Err(kind) => Err(raft_artifact_protocol_error(format!(
             "unknown control-plane OpenRaft peer RPC frame kind {kind}"
         ))),
     }
@@ -2572,20 +2836,22 @@ pub(crate) fn decode_control_plane_raft_peer_request_frame_identity(
     bytes: &[u8],
 ) -> Result<ControlPlaneRaftPeerFrameIdentity, ControlPlaneError> {
     let mut reader = raft_peer_rpc_frame_reader(bytes)?;
-    match reader.read_u8()? {
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST
-        | CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST => {}
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE => {
+    match ControlPlaneRaftPeerRpcFrameTag::from_u8(reader.read_u8()?) {
+        Ok(
+            ControlPlaneRaftPeerRpcFrameTag::Request
+            | ControlPlaneRaftPeerRpcFrameTag::SnapshotRequest,
+        ) => {}
+        Ok(ControlPlaneRaftPeerRpcFrameTag::Response) => {
             return Err(raft_artifact_protocol_error(
                 "control-plane OpenRaft peer RPC response frame cannot be handled as a request",
             ));
         }
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE => {
+        Ok(ControlPlaneRaftPeerRpcFrameTag::SnapshotResponse) => {
             return Err(raft_artifact_protocol_error(
                 "control-plane OpenRaft peer snapshot response frame cannot be handled as a request",
             ));
         }
-        kind => {
+        Err(kind) => {
             return Err(raft_artifact_protocol_error(format!(
                 "unknown control-plane OpenRaft peer RPC frame kind {kind}"
             )));
@@ -2602,35 +2868,39 @@ pub(crate) fn decode_control_plane_raft_peer_request_auth_operation(
     bytes: &[u8],
 ) -> Result<ControlPlaneAuthOperation, ControlPlaneError> {
     let mut reader = raft_peer_rpc_frame_reader(bytes)?;
-    match reader.read_u8()? {
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST => {
+    match ControlPlaneRaftPeerRpcFrameTag::from_u8(reader.read_u8()?) {
+        Ok(ControlPlaneRaftPeerRpcFrameTag::Request) => {
             let _identity = reader.read_peer_frame_identity()?;
-            match reader.read_u8()? {
-                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_APPEND_ENTRIES => {
+            match ControlPlaneRaftPeerRpcRequestTag::from_u8(reader.read_u8()?) {
+                Ok(ControlPlaneRaftPeerRpcRequestTag::AppendEntries) => {
                     Ok(ControlPlaneAuthOperation::RaftAppendEntries)
                 }
-                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_VOTE => Ok(ControlPlaneAuthOperation::RaftVote),
-                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_PRE_VOTE => {
+                Ok(ControlPlaneRaftPeerRpcRequestTag::Vote) => {
+                    Ok(ControlPlaneAuthOperation::RaftVote)
+                }
+                Ok(ControlPlaneRaftPeerRpcRequestTag::PreVote) => {
                     Ok(ControlPlaneAuthOperation::RaftPreVote)
                 }
-                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_TRANSFER_LEADER => {
+                Ok(ControlPlaneRaftPeerRpcRequestTag::TransferLeader) => {
                     Ok(ControlPlaneAuthOperation::RaftTransferLeader)
                 }
-                value => Err(raft_artifact_protocol_error(format!(
+                Err(value) => Err(raft_artifact_protocol_error(format!(
                     "unknown control-plane OpenRaft peer RPC request tag {value}"
                 ))),
             }
         }
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST => {
+        Ok(ControlPlaneRaftPeerRpcFrameTag::SnapshotRequest) => {
             Ok(ControlPlaneAuthOperation::RaftSnapshot)
         }
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE => Err(raft_artifact_protocol_error(
+        Ok(ControlPlaneRaftPeerRpcFrameTag::Response) => Err(raft_artifact_protocol_error(
             "control-plane OpenRaft peer RPC response frame cannot be authenticated as a request",
         )),
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE => Err(raft_artifact_protocol_error(
-            "control-plane OpenRaft peer snapshot response frame cannot be authenticated as a request",
-        )),
-        kind => Err(raft_artifact_protocol_error(format!(
+        Ok(ControlPlaneRaftPeerRpcFrameTag::SnapshotResponse) => {
+            Err(raft_artifact_protocol_error(
+                "control-plane OpenRaft peer snapshot response frame cannot be authenticated as a request",
+            ))
+        }
+        Err(kind) => Err(raft_artifact_protocol_error(format!(
             "unknown control-plane OpenRaft peer RPC frame kind {kind}"
         ))),
     }
@@ -2642,63 +2912,68 @@ fn validate_control_plane_raft_peer_auth_payload_binding(
     expected_operation: ControlPlaneAuthOperation,
 ) -> Result<(), ControlPlaneError> {
     let mut reader = raft_peer_rpc_frame_reader(bytes)?;
-    let kind = reader.read_u8()?;
+    let wire_kind = reader.read_u8()?;
+    let kind = ControlPlaneRaftPeerRpcFrameTag::from_u8(wire_kind).map_err(|kind| {
+        raft_artifact_protocol_error(format!(
+            "unknown control-plane OpenRaft peer RPC frame kind {kind}"
+        ))
+    })?;
     let identity = reader.read_peer_frame_identity()?;
     validate_raft_peer_frame_identity(&identity, expected_identity)?;
     let operation_matches = match kind {
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST => match reader.read_u8()? {
-            CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_APPEND_ENTRIES => {
-                expected_operation == ControlPlaneAuthOperation::RaftAppendEntries
+        ControlPlaneRaftPeerRpcFrameTag::Request => {
+            match ControlPlaneRaftPeerRpcRequestTag::from_u8(reader.read_u8()?) {
+                Ok(ControlPlaneRaftPeerRpcRequestTag::AppendEntries) => {
+                    expected_operation == ControlPlaneAuthOperation::RaftAppendEntries
+                }
+                Ok(ControlPlaneRaftPeerRpcRequestTag::Vote) => {
+                    expected_operation == ControlPlaneAuthOperation::RaftVote
+                }
+                Ok(ControlPlaneRaftPeerRpcRequestTag::PreVote) => {
+                    expected_operation == ControlPlaneAuthOperation::RaftPreVote
+                }
+                Ok(ControlPlaneRaftPeerRpcRequestTag::TransferLeader) => {
+                    expected_operation == ControlPlaneAuthOperation::RaftTransferLeader
+                }
+                Err(value) => {
+                    return Err(raft_artifact_protocol_error(format!(
+                        "unknown control-plane OpenRaft peer RPC request tag {value}"
+                    )));
+                }
             }
-            CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_VOTE => {
-                expected_operation == ControlPlaneAuthOperation::RaftVote
-            }
-            CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_PRE_VOTE => {
-                expected_operation == ControlPlaneAuthOperation::RaftPreVote
-            }
-            CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_TRANSFER_LEADER => {
-                expected_operation == ControlPlaneAuthOperation::RaftTransferLeader
-            }
-            value => {
-                return Err(raft_artifact_protocol_error(format!(
-                    "unknown control-plane OpenRaft peer RPC request tag {value}"
-                )));
-            }
-        },
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE => match reader.read_u8()? {
-            CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_APPEND_ENTRIES => {
-                expected_operation == ControlPlaneAuthOperation::RaftAppendEntries
-            }
-            CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_VOTE => {
-                matches!(
-                    expected_operation,
-                    ControlPlaneAuthOperation::RaftVote | ControlPlaneAuthOperation::RaftPreVote
-                )
-            }
-            CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_TRANSFER_LEADER => {
-                expected_operation == ControlPlaneAuthOperation::RaftTransferLeader
-            }
-            value => {
-                return Err(raft_artifact_protocol_error(format!(
-                    "unknown control-plane OpenRaft peer RPC response tag {value}"
-                )));
-            }
-        },
-        CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST
-        | CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE => {
-            expected_operation == ControlPlaneAuthOperation::RaftSnapshot
         }
-        kind => {
-            return Err(raft_artifact_protocol_error(format!(
-                "unknown control-plane OpenRaft peer RPC frame kind {kind}"
-            )));
+        ControlPlaneRaftPeerRpcFrameTag::Response => {
+            match ControlPlaneRaftPeerRpcResponseTag::from_u8(reader.read_u8()?) {
+                Ok(ControlPlaneRaftPeerRpcResponseTag::AppendEntries) => {
+                    expected_operation == ControlPlaneAuthOperation::RaftAppendEntries
+                }
+                Ok(ControlPlaneRaftPeerRpcResponseTag::Vote) => {
+                    matches!(
+                        expected_operation,
+                        ControlPlaneAuthOperation::RaftVote
+                            | ControlPlaneAuthOperation::RaftPreVote
+                    )
+                }
+                Ok(ControlPlaneRaftPeerRpcResponseTag::TransferLeader) => {
+                    expected_operation == ControlPlaneAuthOperation::RaftTransferLeader
+                }
+                Err(value) => {
+                    return Err(raft_artifact_protocol_error(format!(
+                        "unknown control-plane OpenRaft peer RPC response tag {value}"
+                    )));
+                }
+            }
+        }
+        ControlPlaneRaftPeerRpcFrameTag::SnapshotRequest
+        | ControlPlaneRaftPeerRpcFrameTag::SnapshotResponse => {
+            expected_operation == ControlPlaneAuthOperation::RaftSnapshot
         }
     };
     if operation_matches {
         Ok(())
     } else {
         Err(ControlPlaneError::rpc_protocol(format!(
-                "control-plane OpenRaft peer auth operation {expected_operation:?} does not match authenticated payload kind {kind}"
+                "control-plane OpenRaft peer auth operation {expected_operation:?} does not match authenticated payload kind {wire_kind}"
             )))
     }
 }
@@ -2707,19 +2982,38 @@ fn write_raft_peer_frame_identity(
     out: &mut Vec<u8>,
     identity: Option<&ControlPlaneRaftPeerFrameIdentity>,
 ) -> Result<(), ControlPlaneError> {
-    match identity {
-        None => write_raft_u8(out, 0),
-        Some(identity) => {
-            write_raft_u8(out, 1);
+    write_raft_peer_option_tag(
+        out,
+        ControlPlaneRaftPeerRpcOptionalField::PeerIdentity,
+        identity.is_some(),
+    );
+    match ControlPlaneRaftPeerFrameIdentityBranch::from_identity(identity) {
+        ControlPlaneRaftPeerFrameIdentityBranch::Absent => {}
+        ControlPlaneRaftPeerFrameIdentityBranch::PresentWithoutTopology => {
+            let identity = identity.expect("identity branch requires a present identity");
             write_raft_string(out, &identity.cluster_name)?;
-            match &identity.topology {
-                None => write_raft_u8(out, 0),
-                Some(topology) => {
-                    write_raft_u8(out, 1);
-                    write_raft_u64(out, topology.generation);
-                    write_raft_string(out, &topology.digest)?;
-                }
-            }
+            write_raft_peer_option_tag(
+                out,
+                ControlPlaneRaftPeerRpcOptionalField::PeerTopology,
+                false,
+            );
+            write_raft_u64(out, identity.source);
+            write_raft_u64(out, identity.target);
+        }
+        ControlPlaneRaftPeerFrameIdentityBranch::PresentWithTopology => {
+            let identity = identity.expect("identity branch requires a present identity");
+            let topology = identity
+                .topology
+                .as_ref()
+                .expect("identity branch requires a present topology");
+            write_raft_string(out, &identity.cluster_name)?;
+            write_raft_peer_option_tag(
+                out,
+                ControlPlaneRaftPeerRpcOptionalField::PeerTopology,
+                true,
+            );
+            write_raft_u64(out, topology.generation);
+            write_raft_string(out, &topology.digest)?;
             write_raft_u64(out, identity.source);
             write_raft_u64(out, identity.target);
         }

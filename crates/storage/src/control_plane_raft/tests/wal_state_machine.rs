@@ -3432,8 +3432,17 @@ fn control_plane_raft_snapshot_meta_decode_rejects_mismatched_legacy_snapshot_id
     source.apply_entry(blank_entry(2, 7, 1)).unwrap();
     let snapshot = source.build_snapshot().unwrap();
     let mut encoded = Vec::new();
-    write_raft_option_log_id(&mut encoded, snapshot.meta.last_log_id);
-    write_raft_stored_membership(&mut encoded, &snapshot.meta.last_membership).unwrap();
+    write_raft_peer_option_log_id(
+        &mut encoded,
+        ControlPlaneRaftPeerRpcOptionalField::SnapshotLastLogId,
+        snapshot.meta.last_log_id,
+    );
+    write_raft_stored_membership(
+        &mut encoded,
+        &snapshot.meta.last_membership,
+        Some(ControlPlaneRaftPeerRpcOptionalField::SnapshotMembershipLogId),
+    )
+    .unwrap();
     write_raft_string(&mut encoded, "control-plane-1").unwrap();
 
     let err = RaftArtifactReader::new(&encoded)

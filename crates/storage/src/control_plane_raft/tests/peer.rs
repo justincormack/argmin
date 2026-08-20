@@ -1002,6 +1002,12 @@ fn control_plane_raft_peer_rpc_frame_decode_fails_closed() {
         .encode_frame()
         .unwrap();
 
+    assert!(matches!(
+        raft_peer_rpc_frame_reader_classified(&encoded[..4]),
+        Err(ControlPlaneRaftPeerRpcFrameDecodeError::Format(
+            ControlPlaneRaftPeerRpcFrameFormatError::Truncated
+        ))
+    ));
     let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded[..4]).unwrap_err();
     assert!(matches!(
         err,
@@ -1012,6 +1018,12 @@ fn control_plane_raft_peer_rpc_frame_decode_fails_closed() {
     let mut bad_magic = encoded.clone();
     bad_magic[0] ^= 1;
     refresh_raft_peer_frame_checksum(&mut bad_magic);
+    assert!(matches!(
+        raft_peer_rpc_frame_reader_classified(&bad_magic),
+        Err(ControlPlaneRaftPeerRpcFrameDecodeError::Format(
+            ControlPlaneRaftPeerRpcFrameFormatError::UnknownMagic
+        ))
+    ));
     let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&bad_magic).unwrap_err();
     assert!(matches!(
         err,
@@ -1019,19 +1031,35 @@ fn control_plane_raft_peer_rpc_frame_decode_fails_closed() {
             if message.contains("invalid control-plane OpenRaft peer RPC frame magic")
     ));
 
-    let mut unsupported_version = encoded.clone();
-    unsupported_version[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 1] =
-        CONTROL_PLANE_RAFT_PEER_RPC_VERSION as u8 + 1;
-    refresh_raft_peer_frame_checksum(&mut unsupported_version);
-    let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&unsupported_version).unwrap_err();
-    assert!(matches!(
-        err,
-        ControlPlaneError::CommandDecode { message }
-            if message.contains("unsupported control-plane OpenRaft peer RPC frame version")
-    ));
+    for version in [1_u16, 3] {
+        let mut unsupported_version = encoded.clone();
+        unsupported_version[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len()
+            ..CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2]
+            .copy_from_slice(&version.to_be_bytes());
+        refresh_raft_peer_frame_checksum(&mut unsupported_version);
+        assert!(matches!(
+            raft_peer_rpc_frame_reader_classified(&unsupported_version),
+            Err(ControlPlaneRaftPeerRpcFrameDecodeError::Format(
+                ControlPlaneRaftPeerRpcFrameFormatError::UnsupportedVersion(actual)
+            )) if actual == version
+        ));
+        let err =
+            ControlPlaneRaftPeerRpcRequest::decode_frame(&unsupported_version).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message == format!("unsupported control-plane OpenRaft peer RPC frame version {version}")
+        ));
+    }
 
     let mut bad_checksum = encoded.clone();
     bad_checksum[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2] ^= 1;
+    assert!(matches!(
+        raft_peer_rpc_frame_reader_classified(&bad_checksum),
+        Err(ControlPlaneRaftPeerRpcFrameDecodeError::Invalid(
+            ControlPlaneError::CommandDecode { .. }
+        ))
+    ));
     let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&bad_checksum).unwrap_err();
     assert!(matches!(
         err,
@@ -1053,7 +1081,10 @@ fn control_plane_raft_peer_rpc_frame_decode_fails_closed() {
     let mut unknown_tag = Vec::new();
     unknown_tag.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
     write_raft_u16(&mut unknown_tag, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
-    write_raft_u8(&mut unknown_tag, CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST);
+    write_raft_u8(
+        &mut unknown_tag,
+        ControlPlaneRaftPeerRpcFrameTag::Request.as_u8(),
+    );
     write_raft_u8(&mut unknown_tag, 0);
     write_raft_u8(&mut unknown_tag, 99);
     append_raft_artifact_checksum(&mut unknown_tag);
@@ -1063,6 +1094,548 @@ fn control_plane_raft_peer_rpc_frame_decode_fails_closed() {
         ControlPlaneError::CommandDecode { message }
             if message.contains("unknown control-plane OpenRaft peer RPC request tag 99")
     ));
+}
+
+fn append_raft_peer_rpc_catalogue_frame(aggregate: &mut Vec<u8>, sample: u8, frame: &[u8]) {
+    write_raft_u8(aggregate, sample);
+    write_raft_u32(aggregate, u32::try_from(frame.len()).unwrap());
+    aggregate.extend_from_slice(frame);
+}
+
+fn assert_raft_peer_rpc_optional_fields_are_complete(
+    observations: Vec<(ControlPlaneRaftPeerRpcOptionalField, RaftWireOptionTag)>,
+) {
+    let mut coverage = BTreeMap::<
+        ControlPlaneRaftPeerRpcOptionalField,
+        BTreeSet<RaftWireOptionTag>,
+    >::new();
+    for (field, arm) in observations {
+        coverage.entry(field).or_default().insert(arm);
+    }
+    assert_eq!(
+        coverage.keys().copied().collect::<BTreeSet<_>>(),
+        ControlPlaneRaftPeerRpcOptionalField::ALL
+            .iter()
+            .copied()
+            .collect()
+    );
+    let expected = RaftWireOptionTag::ALL.into_iter().collect::<BTreeSet<_>>();
+    for &field in ControlPlaneRaftPeerRpcOptionalField::ALL {
+        assert_eq!(
+            coverage.get(&field),
+            Some(&expected),
+            "peer RPC optional field {field:?} does not cover both arms"
+        );
+    }
+}
+
+fn assert_raft_peer_rpc_wire_registries_are_complete() {
+    assert_eq!(
+        (0..=u8::MAX)
+            .filter_map(|tag| ControlPlaneRaftPeerRpcFrameTag::from_u8(tag).ok())
+            .collect::<Vec<_>>(),
+        ControlPlaneRaftPeerRpcFrameTag::ALL
+    );
+    assert_eq!(
+        (0..=u8::MAX)
+            .filter_map(|tag| ControlPlaneRaftPeerRpcRequestTag::from_u8(tag).ok())
+            .collect::<Vec<_>>(),
+        ControlPlaneRaftPeerRpcRequestTag::ALL
+    );
+    assert_eq!(
+        (0..=u8::MAX)
+            .filter_map(|tag| ControlPlaneRaftPeerRpcResponseTag::from_u8(tag).ok())
+            .collect::<Vec<_>>(),
+        ControlPlaneRaftPeerRpcResponseTag::ALL
+    );
+    assert_eq!(
+        (0..=u8::MAX)
+            .filter_map(|tag| ControlPlaneRaftAppendEntriesResponseTag::from_u8(tag).ok())
+            .collect::<Vec<_>>(),
+        ControlPlaneRaftAppendEntriesResponseTag::ALL
+    );
+    assert_eq!(
+        (0..=u8::MAX)
+            .filter_map(|tag| ControlPlaneRaftTransferLeaderResponseTag::from_u8(tag).ok())
+            .collect::<Vec<_>>(),
+        ControlPlaneRaftTransferLeaderResponseTag::ALL
+    );
+    assert_eq!(
+        (0..=u8::MAX)
+            .filter_map(|tag| RaftWireBoolean::from_u8(tag).ok())
+            .collect::<Vec<_>>(),
+        RaftWireBoolean::ALL
+    );
+    assert_eq!(
+        (0..=u8::MAX)
+            .filter_map(|tag| RaftWireOptionTag::from_u8(tag).ok())
+            .collect::<Vec<_>>(),
+        RaftWireOptionTag::ALL
+    );
+    assert_eq!(
+        (0..=u8::MAX)
+            .filter_map(|tag| ControlPlaneRaftEntryPayloadTag::from_u8(tag).ok())
+            .collect::<Vec<_>>(),
+        ControlPlaneRaftEntryPayloadTag::ALL
+    );
+}
+
+#[test]
+fn control_plane_raft_peer_rpc_v2_catalogue_is_exact() {
+    assert_eq!(CONTROL_PLANE_RAFT_PEER_RPC_VERSION, 2);
+    assert_raft_peer_rpc_wire_registries_are_complete();
+    let optional_capture = ControlPlaneRaftPeerRpcOptionCapture::begin();
+    let identity_without_topology =
+        ControlPlaneRaftPeerFrameIdentity::new("peer-catalogue", 11, 12);
+    let identity_with_topology = identity_without_topology
+        .clone()
+        .with_topology(13, "topology-digest");
+    let command = ControlPlaneCommand::SetNodeMembership {
+        node_id: NodeId::new(17),
+        membership: NodeMembershipState::Active,
+    };
+    let mut aggregate = Vec::new();
+    let mut sample = 0_u8;
+    let mut frame_tags = BTreeSet::new();
+    let mut identity_branches = BTreeSet::new();
+    let mut request_tags = BTreeSet::new();
+    let mut response_tags = BTreeSet::new();
+    let mut append_response_tags = BTreeSet::new();
+    let mut transfer_response_tags = BTreeSet::new();
+    let mut boolean_values = BTreeSet::new();
+    let mut entry_payload_tags = BTreeSet::new();
+    let mut append = |
+        frame_tag: ControlPlaneRaftPeerRpcFrameTag,
+        identity: Option<&ControlPlaneRaftPeerFrameIdentity>,
+        frame: Vec<u8>,
+    | {
+        sample = sample.checked_add(1).unwrap();
+        frame_tags.insert(frame_tag);
+        identity_branches.insert(ControlPlaneRaftPeerFrameIdentityBranch::from_identity(
+            identity,
+        ));
+        append_raft_peer_rpc_catalogue_frame(&mut aggregate, sample, &frame);
+    };
+
+    let append_request: AppendEntriesRequest<ControlPlaneRaftTypeConfig> = AppendEntriesRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(21, 11),
+        prev_log_id: Some(raft_log_id(20, 11, 30)),
+        entries: vec![
+            blank_entry(21, 11, 31),
+            membership_entry(21, 11, 32),
+            normal_entry(21, 11, 33, command),
+        ],
+        leader_commit: None,
+    };
+    boolean_values.insert(RaftWireBoolean::from_bool(append_request.vote.committed));
+    entry_payload_tags.extend(
+        append_request
+            .entries
+            .iter()
+            .map(control_plane_raft_entry_payload_tag),
+    );
+    let request = ControlPlaneRaftPeerRpcRequest::AppendEntries(append_request.clone());
+    request_tags.insert(request.wire_tag());
+    let frame = request
+        .encode_frame_for_peer(&identity_with_topology)
+        .unwrap();
+    let ControlPlaneRaftPeerRpcRequest::AppendEntries(decoded) =
+        ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(&frame, &identity_with_topology)
+            .unwrap()
+    else {
+        panic!("catalogue append request decoded to another request kind")
+    };
+    assert_eq!(decoded.vote, append_request.vote);
+    assert_eq!(decoded.prev_log_id, append_request.prev_log_id);
+    assert_eq!(decoded.entries, append_request.entries);
+    assert_eq!(decoded.leader_commit, append_request.leader_commit);
+    append(
+        ControlPlaneRaftPeerRpcFrameTag::Request,
+        Some(&identity_with_topology),
+        frame,
+    );
+
+    let append_request_without_previous: AppendEntriesRequest<ControlPlaneRaftTypeConfig> =
+        AppendEntriesRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(21, 11),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: Some(raft_log_id(21, 11, 33)),
+        };
+    boolean_values.insert(RaftWireBoolean::from_bool(
+        append_request_without_previous.vote.committed,
+    ));
+    let request =
+        ControlPlaneRaftPeerRpcRequest::AppendEntries(append_request_without_previous.clone());
+    request_tags.insert(request.wire_tag());
+    let frame = request.encode_frame().unwrap();
+    let ControlPlaneRaftPeerRpcRequest::AppendEntries(decoded) =
+        ControlPlaneRaftPeerRpcRequest::decode_frame(&frame).unwrap()
+    else {
+        panic!("catalogue append request decoded to another request kind")
+    };
+    assert_eq!(decoded.vote, append_request_without_previous.vote);
+    assert_eq!(
+        decoded.prev_log_id,
+        append_request_without_previous.prev_log_id
+    );
+    assert_eq!(decoded.entries, append_request_without_previous.entries);
+    assert_eq!(
+        decoded.leader_commit,
+        append_request_without_previous.leader_commit
+    );
+    append(
+        ControlPlaneRaftPeerRpcFrameTag::Request,
+        None,
+        frame,
+    );
+
+    let vote_request: VoteRequest<ControlPlaneRaftTypeConfig> = VoteRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new(22, 11),
+        last_log_id: None,
+        leadership_transfer: false,
+    };
+    boolean_values.insert(RaftWireBoolean::from_bool(vote_request.vote.committed));
+    boolean_values.insert(RaftWireBoolean::from_bool(
+        vote_request.leadership_transfer,
+    ));
+    let request = ControlPlaneRaftPeerRpcRequest::Vote(vote_request.clone());
+    request_tags.insert(request.wire_tag());
+    let frame = request
+        .encode_frame_for_peer(&identity_without_topology)
+        .unwrap();
+    let ControlPlaneRaftPeerRpcRequest::Vote(decoded) =
+        ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(&frame, &identity_without_topology)
+            .unwrap()
+    else {
+        panic!("catalogue vote request decoded to another request kind")
+    };
+    assert_eq!(decoded, vote_request);
+    append(
+        ControlPlaneRaftPeerRpcFrameTag::Request,
+        Some(&identity_without_topology),
+        frame,
+    );
+
+    let pre_vote_request: VoteRequest<ControlPlaneRaftTypeConfig> = VoteRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(23, 11),
+        last_log_id: Some(raft_log_id(22, 11, 34)),
+        leadership_transfer: true,
+    };
+    boolean_values.insert(RaftWireBoolean::from_bool(pre_vote_request.vote.committed));
+    boolean_values.insert(RaftWireBoolean::from_bool(
+        pre_vote_request.leadership_transfer,
+    ));
+    let request = ControlPlaneRaftPeerRpcRequest::PreVote(pre_vote_request.clone());
+    request_tags.insert(request.wire_tag());
+    let frame = request.encode_frame().unwrap();
+    let ControlPlaneRaftPeerRpcRequest::PreVote(decoded) =
+        ControlPlaneRaftPeerRpcRequest::decode_frame(&frame).unwrap()
+    else {
+        panic!("catalogue pre-vote request decoded to another request kind")
+    };
+    assert_eq!(decoded, pre_vote_request);
+    append(
+        ControlPlaneRaftPeerRpcFrameTag::Request,
+        None,
+        frame,
+    );
+
+    let transfer_request: TransferLeaderRequest<ControlPlaneRaftTypeConfig> =
+        TransferLeaderRequest::new(
+        Vote::<ControlPlaneRaftLeaderId>::new_committed(24, 11),
+        12,
+        None,
+    );
+    boolean_values.insert(RaftWireBoolean::from_bool(
+        transfer_request.from_leader().committed,
+    ));
+    let request = ControlPlaneRaftPeerRpcRequest::TransferLeader(transfer_request.clone());
+    request_tags.insert(request.wire_tag());
+    let frame = request
+        .encode_frame_for_peer(&identity_with_topology)
+        .unwrap();
+    let ControlPlaneRaftPeerRpcRequest::TransferLeader(decoded) =
+        ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(&frame, &identity_with_topology)
+            .unwrap()
+    else {
+        panic!("catalogue transfer-leader request decoded to another request kind")
+    };
+    assert_eq!(decoded, transfer_request);
+    append(
+        ControlPlaneRaftPeerRpcFrameTag::Request,
+        Some(&identity_with_topology),
+        frame,
+    );
+
+    let transfer_request_with_log: TransferLeaderRequest<ControlPlaneRaftTypeConfig> =
+        TransferLeaderRequest::new(
+            Vote::<ControlPlaneRaftLeaderId>::new(24, 11),
+            12,
+            Some(raft_log_id(24, 11, 34)),
+        );
+    boolean_values.insert(RaftWireBoolean::from_bool(
+        transfer_request_with_log.from_leader().committed,
+    ));
+    let request =
+        ControlPlaneRaftPeerRpcRequest::TransferLeader(transfer_request_with_log.clone());
+    request_tags.insert(request.wire_tag());
+    let frame = request.encode_frame().unwrap();
+    let ControlPlaneRaftPeerRpcRequest::TransferLeader(decoded) =
+        ControlPlaneRaftPeerRpcRequest::decode_frame(&frame).unwrap()
+    else {
+        panic!("catalogue transfer-leader request decoded to another request kind")
+    };
+    assert_eq!(decoded, transfer_request_with_log);
+    append(
+        ControlPlaneRaftPeerRpcFrameTag::Request,
+        None,
+        frame,
+    );
+
+    let append_responses = [
+        AppendEntriesResponse::Success,
+        AppendEntriesResponse::PartialSuccess(None),
+        AppendEntriesResponse::PartialSuccess(Some(raft_log_id(25, 12, 35))),
+        AppendEntriesResponse::Conflict,
+        AppendEntriesResponse::HigherVote(Vote::<ControlPlaneRaftLeaderId>::new_committed(
+            26, 12,
+        )),
+    ];
+    for response in append_responses {
+        append_response_tags.insert(control_plane_raft_append_entries_response_tag(&response));
+        match &response {
+            AppendEntriesResponse::PartialSuccess(_) => {}
+            AppendEntriesResponse::HigherVote(vote) => {
+                boolean_values.insert(RaftWireBoolean::from_bool(vote.committed));
+            }
+            AppendEntriesResponse::Success | AppendEntriesResponse::Conflict => {}
+        }
+        let expected = ControlPlaneRaftPeerRpcResponse::AppendEntries(response);
+        response_tags.insert(expected.wire_tag());
+        let frame = expected
+            .encode_frame_for_peer(&identity_without_topology)
+            .unwrap();
+        assert_eq!(
+            ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(
+                &frame,
+                &identity_without_topology
+            )
+            .unwrap(),
+            expected
+        );
+        append(
+            ControlPlaneRaftPeerRpcFrameTag::Response,
+            Some(&identity_without_topology),
+            frame,
+        );
+    }
+
+    let vote_responses: [VoteResponse<ControlPlaneRaftTypeConfig>; 2] = [
+        VoteResponse {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(27, 12),
+            vote_granted: false,
+            last_log_id: None,
+        },
+        VoteResponse {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(28, 12),
+            vote_granted: true,
+            last_log_id: Some(raft_log_id(28, 12, 36)),
+        },
+    ];
+    for response in vote_responses {
+        boolean_values.insert(RaftWireBoolean::from_bool(response.vote.committed));
+        boolean_values.insert(RaftWireBoolean::from_bool(response.vote_granted));
+        let expected = ControlPlaneRaftPeerRpcResponse::Vote(response);
+        response_tags.insert(expected.wire_tag());
+        let frame = expected.encode_frame().unwrap();
+        assert_eq!(
+            ControlPlaneRaftPeerRpcResponse::decode_frame(&frame).unwrap(),
+            expected
+        );
+        append(
+            ControlPlaneRaftPeerRpcFrameTag::Response,
+            None,
+            frame,
+        );
+    }
+
+    let transfer_responses = [
+        Ok(()),
+        Err(TransferLeaderError::VoteChanged {
+            expected: Vote::<ControlPlaneRaftLeaderId>::new_committed(29, 11),
+            actual: Vote::<ControlPlaneRaftLeaderId>::new(30, 12),
+        }),
+        Err(TransferLeaderError::LogNotFlushed {
+            expected: None,
+            actual: Some(raft_log_id(30, 12, 37)),
+        }),
+        Err(TransferLeaderError::LogNotFlushed {
+            expected: Some(raft_log_id(30, 12, 37)),
+            actual: None,
+        }),
+    ];
+    for response in transfer_responses {
+        transfer_response_tags.insert(control_plane_raft_transfer_leader_response_tag(&response));
+        match &response {
+            Ok(()) => {}
+            Err(TransferLeaderError::VoteChanged { expected, actual }) => {
+                boolean_values.insert(RaftWireBoolean::from_bool(expected.committed));
+                boolean_values.insert(RaftWireBoolean::from_bool(actual.committed));
+            }
+            Err(TransferLeaderError::LogNotFlushed { .. }) => {}
+        }
+        let expected = ControlPlaneRaftPeerRpcResponse::TransferLeader(response);
+        response_tags.insert(expected.wire_tag());
+        let frame = expected
+            .encode_frame_for_peer(&identity_with_topology)
+            .unwrap();
+        assert_eq!(
+            ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(
+                &frame,
+                &identity_with_topology
+            )
+            .unwrap(),
+            expected
+        );
+        append(
+            ControlPlaneRaftPeerRpcFrameTag::Response,
+            Some(&identity_with_topology),
+            frame,
+        );
+    }
+
+    let mut state_machine = ControlPlaneRaftStateMachine::empty();
+    state_machine
+        .apply_entry(bootstrap_membership_entry(11))
+        .unwrap();
+    let snapshot_request = ControlPlaneRaftPeerSnapshotRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(31, 11),
+        snapshot: state_machine.build_snapshot().unwrap(),
+    };
+    boolean_values.insert(RaftWireBoolean::from_bool(
+        snapshot_request.vote.committed,
+    ));
+    let frame = snapshot_request
+        .encode_frame_for_peer(&identity_with_topology)
+        .unwrap();
+    let decoded = ControlPlaneRaftPeerSnapshotRequest::decode_frame_with_identity(
+        &frame,
+        usize::MAX,
+        usize::MAX,
+        Some(&identity_with_topology),
+    )
+    .unwrap();
+    assert_eq!(decoded.vote, snapshot_request.vote);
+    assert_eq!(decoded.snapshot.meta, snapshot_request.snapshot.meta);
+    assert_eq!(
+        decoded.snapshot.snapshot.get_ref(),
+        snapshot_request.snapshot.snapshot.get_ref()
+    );
+    append(
+        ControlPlaneRaftPeerRpcFrameTag::SnapshotRequest,
+        Some(&identity_with_topology),
+        frame,
+    );
+
+    let empty_snapshot_request = ControlPlaneRaftPeerSnapshotRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new(31, 11),
+        snapshot: ControlPlaneRaftStateMachine::empty()
+            .build_snapshot()
+            .unwrap(),
+    };
+    boolean_values.insert(RaftWireBoolean::from_bool(
+        empty_snapshot_request.vote.committed,
+    ));
+    let frame = empty_snapshot_request.encode_frame().unwrap();
+    let decoded = ControlPlaneRaftPeerSnapshotRequest::decode_frame(
+        &frame,
+        usize::MAX,
+        usize::MAX,
+    )
+    .unwrap();
+    assert_eq!(decoded.vote, empty_snapshot_request.vote);
+    assert_eq!(decoded.snapshot.meta, empty_snapshot_request.snapshot.meta);
+    assert_eq!(
+        decoded.snapshot.snapshot.get_ref(),
+        empty_snapshot_request.snapshot.snapshot.get_ref()
+    );
+    append(
+        ControlPlaneRaftPeerRpcFrameTag::SnapshotRequest,
+        None,
+        frame,
+    );
+
+    let snapshot_response = ControlPlaneRaftPeerSnapshotResponse {
+        response: SnapshotResponse::new(Vote::<ControlPlaneRaftLeaderId>::new(32, 12)),
+    };
+    boolean_values.insert(RaftWireBoolean::from_bool(
+        snapshot_response.response.vote.committed,
+    ));
+    let frame = snapshot_response.encode_frame().unwrap();
+    assert_eq!(
+        ControlPlaneRaftPeerSnapshotResponse::decode_frame(&frame).unwrap(),
+        snapshot_response
+    );
+    append(
+        ControlPlaneRaftPeerRpcFrameTag::SnapshotResponse,
+        None,
+        frame,
+    );
+
+    assert_eq!(
+        frame_tags,
+        ControlPlaneRaftPeerRpcFrameTag::ALL.into_iter().collect()
+    );
+    assert_eq!(
+        identity_branches,
+        ControlPlaneRaftPeerFrameIdentityBranch::ALL
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        request_tags,
+        ControlPlaneRaftPeerRpcRequestTag::ALL.into_iter().collect()
+    );
+    assert_eq!(
+        response_tags,
+        ControlPlaneRaftPeerRpcResponseTag::ALL
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        append_response_tags,
+        ControlPlaneRaftAppendEntriesResponseTag::ALL
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        transfer_response_tags,
+        ControlPlaneRaftTransferLeaderResponseTag::ALL
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        boolean_values,
+        RaftWireBoolean::ALL.into_iter().collect()
+    );
+    assert_raft_peer_rpc_optional_fields_are_complete(optional_capture.finish());
+    assert_eq!(
+        entry_payload_tags,
+        ControlPlaneRaftEntryPayloadTag::ALL.into_iter().collect()
+    );
+
+    assert_eq!(sample, 20);
+    assert_eq!(
+        (
+            aggregate.len(),
+            raft_test_hex(&checksum::sha256::digest(&aggregate))
+        ),
+        (
+            2_452,
+            "621a9fb29dac5c5044ec398707c03f3578ec15fbb7e34d1e52fe2e0bd98dc304".to_owned()
+        )
+    );
 }
 
 #[test]
@@ -1813,6 +2386,113 @@ fn control_plane_raft_peer_server_rejects_resigned_auth_versions_before_dispatch
         );
         runtime.block_on(authority.shutdown()).unwrap();
     }
+}
+
+#[test]
+fn control_plane_raft_peer_server_rejects_authenticated_peer_rpc_versions_before_dispatch() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let cluster_name = "control-plane-raft-peer-transport-test";
+    let authority = Arc::new(
+        runtime
+            .block_on(
+                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1),
+            )
+            .unwrap(),
+    );
+    let before = runtime.block_on(authority.status()).unwrap();
+    let server_auth = test_peer_auth_policy(1);
+    let checkpoint = Arc::new(RecordingPeerServerCheckpoint::default());
+    let policy = ControlPlaneRaftPeerServerPolicy::new(
+        1,
+        test_peer_transport_policy().with_auth_policy(server_auth.clone()),
+        4096,
+    )
+    .unwrap()
+    .with_durability(
+        authority
+            .bind_peer_server_durability(checkpoint.clone())
+            .unwrap(),
+    );
+    let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 2, 1);
+    let current = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new(41, 2),
+        last_log_id: None,
+        leadership_transfer: false,
+    })
+    .encode_frame_for_peer(&identity)
+    .unwrap();
+
+    for (index, version) in [1_u16, 3].into_iter().enumerate() {
+        let mut unsupported = current.clone();
+        unsupported[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len()
+            ..CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2]
+            .copy_from_slice(&version.to_be_bytes());
+        refresh_raft_peer_frame_checksum(&mut unsupported);
+        let signed = test_peer_scoped_credential(2)
+            .sign_envelope(ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 1,
+                }),
+                operation: ControlPlaneAuthOperation::RaftVote,
+                issued_at_ms: None,
+                expires_at_ms: None,
+                sequence: None,
+                nonce: Vec::new(),
+                payload: unsupported,
+            })
+            .unwrap()
+            .encode_frame()
+            .unwrap();
+        let mut transport_request = Vec::new();
+        write_control_plane_raft_peer_transport_frame(&mut transport_request, &signed).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = RecordingPeerServerStream::new(transport_request, Arc::clone(&events));
+
+        let error = handle_control_plane_raft_peer_server_request(
+            runtime.handle(),
+            &authority,
+            &mut stream,
+            &policy,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        let ControlPlaneRaftPeerServerWorkerError::PeerRpc(error) = error else {
+            panic!("peer RPC v{version}: version rejection returned checkpoint error")
+        };
+        assert!(
+            matches!(error, ControlPlaneError::CommandDecode { ref message }
+                if message == &format!("unsupported control-plane OpenRaft peer RPC frame version {version}")),
+            "peer RPC v{version}: unexpected error: {error}"
+        );
+        assert_eq!(
+            runtime.block_on(authority.status()).unwrap(),
+            before,
+            "peer RPC v{version}: unsupported frame reached OpenRaft dispatch"
+        );
+        assert!(events.lock().unwrap().is_empty());
+        assert!(
+            checkpoint.events.lock().unwrap().is_empty(),
+            "peer RPC v{version}: unsupported frame reached checkpoint publication"
+        );
+        assert!(stream.response.is_empty());
+        let metrics = server_auth.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), u64::try_from(index + 1).unwrap());
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::RaftVote),
+            u64::try_from(index + 1).unwrap()
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Malformed),
+            u64::try_from(index + 1).unwrap()
+        );
+    }
+    runtime.block_on(authority.shutdown()).unwrap();
 }
 
 #[test]
