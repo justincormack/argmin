@@ -352,13 +352,20 @@ pub(crate) fn setup_same_process_coordinators_with_single_pg_without_background_
 pub(crate) fn setup_coordinator_with_sse_c(dir: &Path) -> Coordinator {
     use base64::Engine;
 
-    let pg_ids: Vec<u32> = (0..DEFAULT_TEST_PG_COUNT).collect();
-    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     let validator = SseCustomerValidatorConfig::from_base64(
         1,
         &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
     )
     .unwrap();
+    setup_coordinator_with_sse_c_validator(dir, validator)
+}
+
+pub(crate) fn setup_coordinator_with_sse_c_validator(
+    dir: &Path,
+    validator: SseCustomerValidatorConfig,
+) -> Coordinator {
+    let pg_ids: Vec<u32> = (0..DEFAULT_TEST_PG_COUNT).collect();
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
     Coordinator::new_with_managed_key_provider_for_storage_cluster(
         storage_cluster,
         "us-east-1".to_string(),

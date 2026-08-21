@@ -5,7 +5,7 @@ use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
-use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
+use crate::sse::{test_sse_customer_checksum_profile_fixture, SSE_C_CUSTOMER_KEY_LEN};
 use crate::system_metadata::ObjectChecksumMetadata;
 use std::sync::Arc;
 use storage::test_support::{
@@ -6515,6 +6515,83 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn current_sse_c_checksum_profile_persists_through_storage_and_logical_reads() {
+    let (validator, sse_customer, fixed_encryption, expected_checksum) =
+        test_sse_customer_checksum_profile_fixture();
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator_with_sse_c_validator(dir.path(), validator);
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
+
+    let mut system_metadata = SystemMetadata::new();
+    system_metadata.set_checksum(
+        expected_checksum.algorithm(),
+        expected_checksum.checksum_type(),
+        "initial-checksum-that-must-be-replaced".to_string(),
+    );
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "obj", test_requester(), None),
+            data: b"",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    coord
+        .storage_node()
+        .test_replace_object_encryption(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("obj"),
+            put.version_id,
+            &fixed_encryption,
+        )
+        .unwrap();
+
+    for visible_metadata in [
+        coord
+            .head_object(&GetObjectRequest {
+                sse_customer: Some(&sse_customer),
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap()
+            .system_metadata,
+        coord
+            .get_object(&GetObjectRequest {
+                sse_customer: Some(&sse_customer),
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap()
+            .system_metadata,
+    ] {
+        assert_eq!(visible_metadata.checksum(), Some(&expected_checksum));
+    }
 }
 
 #[test]

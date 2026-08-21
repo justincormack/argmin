@@ -1101,6 +1101,105 @@ fn decrypt_checksum_with_dek(
 }
 
 #[cfg(test)]
+struct SseCustomerChecksumProfileFixture {
+    validator: SseCustomerValidatorConfig,
+    request: SseCustomerRequest,
+    validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
+    validator_hmac: [u8; SSE_C_VALIDATOR_HMAC_LEN],
+    wrap_salt: [u8; SSE_C_WRAP_SALT_LEN],
+    wrap_nonce: [u8; SSE_C_WRAP_NONCE_LEN],
+    dek: [u8; SSE_C_DEK_LEN],
+    kek: [u8; SSE_C_DEK_LEN],
+    wrapped_dek: [u8; SSE_C_WRAPPED_DEK_LEN],
+    segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+    checksum_nonce: [u8; SSE_C_CHECKSUM_NONCE_LEN],
+    checksum: ObjectChecksumMetadata,
+    checksum_plaintext: Vec<u8>,
+    checksum_ciphertext: Vec<u8>,
+    encryption: ObjectEncryption,
+}
+
+#[cfg(test)]
+fn sse_customer_checksum_profile_fixture() -> SseCustomerChecksumProfileFixture {
+    let customer_key = [0x11; SSE_C_CUSTOMER_KEY_LEN];
+    let validator = SseCustomerValidatorConfig {
+        key_id: 7,
+        validator_key: [0x22; 32],
+    };
+    let request = SseCustomerRequest::new(customer_key, "fixed-vector-md5".to_string());
+    let validator_salt = [0x33; SSE_C_VALIDATOR_SALT_LEN];
+    let validator_hmac = compute_validator_hmac(&validator, &validator_salt, &customer_key);
+    let wrap_salt = [0x44; SSE_C_WRAP_SALT_LEN];
+    let wrap_nonce = [0x55; SSE_C_WRAP_NONCE_LEN];
+    let dek = [0x66; SSE_C_DEK_LEN];
+    let kek = derive_wrap_key(&customer_key, &wrap_salt).unwrap();
+    let wrapped_dek = wrap_managed_dek(&kek, &wrap_nonce, &dek, SSE_C_WRAP_AAD, "SSE-C").unwrap();
+    let segment_nonce_prefix = [0x77; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
+    let checksum_nonce = [0x88; SSE_C_CHECKSUM_NONCE_LEN];
+    let checksum = ObjectChecksumMetadata::new(
+        checksum::ChecksumAlgorithm::Sha256,
+        Some(checksum::ChecksumType::FullObject),
+        "0123456789abcdef".to_string(),
+    );
+    let checksum_plaintext = encode_checksum_metadata(&checksum).unwrap();
+    let checksum_ciphertext = seal_checksum_plaintext_with_dek(
+        &dek,
+        checksum_nonce,
+        checksum_plaintext.clone(),
+        SSE_C_CHECKSUM_AAD,
+        "SSE-C",
+    )
+    .unwrap();
+    let encryption = ObjectEncryption::SseCustomer(
+        SseCustomerObjectState::new(
+            validator.key_id,
+            validator_salt,
+            validator_hmac,
+            wrap_salt,
+            wrap_nonce,
+            wrapped_dek,
+            segment_nonce_prefix,
+        )
+        .with_encrypted_checksum_metadata(checksum_nonce, checksum_ciphertext.clone())
+        .unwrap(),
+    );
+
+    SseCustomerChecksumProfileFixture {
+        validator,
+        request,
+        validator_salt,
+        validator_hmac,
+        wrap_salt,
+        wrap_nonce,
+        dek,
+        kek,
+        wrapped_dek,
+        segment_nonce_prefix,
+        checksum_nonce,
+        checksum,
+        checksum_plaintext,
+        checksum_ciphertext,
+        encryption,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_sse_customer_checksum_profile_fixture() -> (
+    SseCustomerValidatorConfig,
+    SseCustomerRequest,
+    ObjectEncryption,
+    ObjectChecksumMetadata,
+) {
+    let fixture = sse_customer_checksum_profile_fixture();
+    (
+        fixture.validator,
+        fixture.request,
+        fixture.encryption,
+        fixture.checksum,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::system_metadata::ObjectChecksumMetadata;
@@ -1345,23 +1444,9 @@ mod tests {
         assert_eq!(SSE_C_WRAP_AAD, b"argmin:sse-c:wrap:v1");
         assert_eq!(SSE_C_CHECKSUM_AAD, b"argmin:sse-c:checksum:v1");
 
-        let customer_key = [0x11; SSE_C_CUSTOMER_KEY_LEN];
-        let validator_key = [0x22; 32];
-        let validator_salt = [0x33; SSE_C_VALIDATOR_SALT_LEN];
-        let wrap_salt = [0x44; SSE_C_WRAP_SALT_LEN];
-        let wrap_nonce = [0x55; SSE_C_WRAP_NONCE_LEN];
-        let dek = [0x66; SSE_C_DEK_LEN];
-        let segment_nonce_prefix = [0x77; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
-        let checksum_nonce = [0x88; SSE_C_CHECKSUM_NONCE_LEN];
-        let validator = SseCustomerValidatorConfig {
-            key_id: 7,
-            validator_key,
-        };
-        let request = SseCustomerRequest::new(customer_key, "fixed-vector-md5".to_string());
-
-        let validator_hmac = compute_validator_hmac(&validator, &validator_salt, &customer_key);
+        let fixture = sse_customer_checksum_profile_fixture();
         assert_eq!(
-            validator_hmac,
+            fixture.validator_hmac,
             [
                 0xea, 0x57, 0x82, 0x44, 0x46, 0x83, 0x57, 0xae, 0x9b, 0x38, 0x93, 0x4c, 0xa6, 0xb9,
                 0xf3, 0x7b, 0x57, 0xd2, 0xab, 0x78, 0x5f, 0x8a, 0xde, 0x3e, 0xb4, 0xa4, 0xe6, 0x79,
@@ -1369,9 +1454,8 @@ mod tests {
             ]
         );
 
-        let kek = derive_wrap_key(&customer_key, &wrap_salt).unwrap();
         assert_eq!(
-            kek,
+            fixture.kek,
             [
                 0xd6, 0x84, 0x1a, 0xad, 0x4f, 0x9d, 0x55, 0x9a, 0xf8, 0x73, 0xb8, 0x87, 0xf5, 0x55,
                 0x64, 0x9f, 0x7b, 0x61, 0x90, 0xa8, 0x4b, 0x42, 0xd9, 0xf5, 0x82, 0x7c, 0xf2, 0x30,
@@ -1379,10 +1463,8 @@ mod tests {
             ]
         );
 
-        let wrapped_dek =
-            wrap_managed_dek(&kek, &wrap_nonce, &dek, SSE_C_WRAP_AAD, "SSE-C").unwrap();
         assert_eq!(
-            wrapped_dek,
+            fixture.wrapped_dek,
             [
                 0x11, 0x20, 0x6a, 0xf3, 0x3d, 0x69, 0xa9, 0x44, 0x20, 0x7d, 0xd6, 0xe2, 0x0c, 0xf4,
                 0x2d, 0x58, 0x1c, 0xe7, 0x25, 0x63, 0x04, 0xc4, 0x39, 0x68, 0x1d, 0xbb, 0x6d, 0x1f,
@@ -1391,29 +1473,15 @@ mod tests {
             ]
         );
 
-        let checksum = ObjectChecksumMetadata::new(
-            ChecksumAlgorithm::Sha256,
-            Some(ChecksumType::FullObject),
-            "0123456789abcdef".to_string(),
-        );
-        let checksum_plaintext = encode_checksum_metadata(&checksum).unwrap();
         assert_eq!(
-            checksum_plaintext,
+            fixture.checksum_plaintext,
             [
                 0x01, 0x03, 0x01, 0x00, 0x10, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
                 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66,
             ]
         );
-        let checksum_ciphertext = seal_checksum_plaintext_with_dek(
-            &dek,
-            checksum_nonce,
-            checksum_plaintext,
-            SSE_C_CHECKSUM_AAD,
-            "SSE-C",
-        )
-        .unwrap();
         assert_eq!(
-            checksum_ciphertext,
+            fixture.checksum_ciphertext,
             [
                 0xc6, 0xc3, 0x32, 0x20, 0xb4, 0xad, 0x22, 0xb8, 0xae, 0xd3, 0x02, 0x28, 0x72, 0x6a,
                 0xb2, 0xd2, 0xde, 0xe6, 0x88, 0x5a, 0x87, 0x5f, 0xd0, 0x44, 0x47, 0x51, 0x69, 0xee,
@@ -1423,56 +1491,58 @@ mod tests {
 
         let make_state = |nonce, ciphertext| {
             SseCustomerObjectState::new(
-                validator.key_id,
-                validator_salt,
-                validator_hmac,
-                wrap_salt,
-                wrap_nonce,
-                wrapped_dek,
-                segment_nonce_prefix,
+                fixture.validator.key_id,
+                fixture.validator_salt,
+                fixture.validator_hmac,
+                fixture.wrap_salt,
+                fixture.wrap_nonce,
+                fixture.wrapped_dek,
+                fixture.segment_nonce_prefix,
             )
             .with_encrypted_checksum_metadata(nonce, ciphertext)
             .unwrap()
         };
-        let state = make_state(checksum_nonce, checksum_ciphertext.clone());
+        let ObjectEncryption::SseCustomer(state) = &fixture.encryption else {
+            panic!("expected SSE-C fixture state");
+        };
         assert_eq!(
-            decrypt_sse_customer_checksum(&validator, &state, &request).unwrap(),
-            Some(checksum)
+            decrypt_sse_customer_checksum(&fixture.validator, state, &fixture.request).unwrap(),
+            Some(fixture.checksum.clone())
         );
 
-        let mut wrong_nonce = checksum_nonce;
+        let mut wrong_nonce = fixture.checksum_nonce;
         wrong_nonce[0] ^= 1;
-        let wrong_nonce_state = make_state(wrong_nonce, checksum_ciphertext.clone());
+        let wrong_nonce_state = make_state(wrong_nonce, fixture.checksum_ciphertext.clone());
         assert_authentication_failure(decrypt_sse_customer_checksum(
-            &validator,
+            &fixture.validator,
             &wrong_nonce_state,
-            &request,
+            &fixture.request,
         ));
         assert_authentication_failure(decrypt_checksum_with_dek(
-            &dek,
-            &checksum_nonce,
-            &checksum_ciphertext,
+            &fixture.dek,
+            &fixture.checksum_nonce,
+            &fixture.checksum_ciphertext,
             b"argmin:sse-c:checksum:v2",
             "SSE-C",
         ));
 
-        let mut corrupted_ciphertext = checksum_ciphertext.clone();
+        let mut corrupted_ciphertext = fixture.checksum_ciphertext.clone();
         corrupted_ciphertext[0] ^= 1;
-        let corrupted_ciphertext_state = make_state(checksum_nonce, corrupted_ciphertext);
+        let corrupted_ciphertext_state = make_state(fixture.checksum_nonce, corrupted_ciphertext);
         assert_authentication_failure(decrypt_sse_customer_checksum(
-            &validator,
+            &fixture.validator,
             &corrupted_ciphertext_state,
-            &request,
+            &fixture.request,
         ));
 
-        let mut corrupted_tag = checksum_ciphertext;
+        let mut corrupted_tag = fixture.checksum_ciphertext.clone();
         let tag_byte = corrupted_tag.last_mut().unwrap();
         *tag_byte ^= 1;
-        let corrupted_tag_state = make_state(checksum_nonce, corrupted_tag);
+        let corrupted_tag_state = make_state(fixture.checksum_nonce, corrupted_tag);
         assert_authentication_failure(decrypt_sse_customer_checksum(
-            &validator,
+            &fixture.validator,
             &corrupted_tag_state,
-            &request,
+            &fixture.request,
         ));
     }
 
