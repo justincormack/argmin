@@ -6188,8 +6188,8 @@ where
         oldest_durable_backfill_epoch: history_reference_summary
             .oldest_durable_backfill_epoch
             .map(ClusterEpoch::get),
-        oldest_pending_metadata_command_epoch: history_reference_summary
-            .oldest_pending_metadata_command_epoch
+        oldest_metadata_command_resource_epoch: history_reference_summary
+            .oldest_metadata_command_resource_epoch
             .map(ClusterEpoch::get),
         oldest_object_payload_reclaim_claim_epoch: history_reference_summary
             .oldest_object_payload_reclaim_claim_epoch
@@ -7551,6 +7551,10 @@ fn write_node_heartbeat(
     write_string(out, &heartbeat.endpoint)?;
     write_u64(out, heartbeat.observed_epoch.get());
     write_u64(out, heartbeat.requested_lease_duration_ms);
+    write_u64(
+        out,
+        heartbeat.cluster_map_history_route_scan_generation.get(),
+    );
     write_cluster_map_history_route_references(
         out,
         &heartbeat.cluster_map_history_route_references,
@@ -7574,6 +7578,10 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
     let endpoint = reader.read_string()?.to_owned();
     let observed_epoch = read_cluster_epoch(reader, "heartbeat observed epoch")?;
     let requested_lease_duration_ms = reader.read_u64()?;
+    let cluster_map_history_route_scan_generation = NonZeroU64::new(reader.read_u64()?)
+        .ok_or_else(|| {
+            ControlPlaneError::rpc_protocol("heartbeat route scan generation must be nonzero")
+        })?;
     let cluster_map_history_route_references = read_cluster_map_history_route_references(reader)?;
     let observation_count = reader.read_collection_len(
         "PG observations",
@@ -7594,6 +7602,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         endpoint,
         observed_epoch,
         requested_lease_duration_ms,
+        cluster_map_history_route_scan_generation,
         cluster_map_history_route_references,
         pg_observations,
     })
@@ -7661,7 +7670,7 @@ const fn cluster_map_history_route_reference_kind_code(
         PgClusterMapHistoryRouteReferenceKind::LivePlacement => 1,
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource => 2,
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => 3,
-        PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => 4,
+        PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource => 4,
         PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim => 5,
     }
 }
@@ -7673,7 +7682,7 @@ fn read_cluster_map_history_route_reference_kind(
         1 => Ok(PgClusterMapHistoryRouteReferenceKind::LivePlacement),
         2 => Ok(PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource),
         3 => Ok(PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired),
-        4 => Ok(PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand),
+        4 => Ok(PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource),
         5 => Ok(PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim),
         value => Err(ControlPlaneError::rpc_protocol(format!(
             "invalid cluster-map history route reference kind {value}"
@@ -8035,7 +8044,7 @@ fn write_control_plane_runtime_map_diagnostics_value(
         write_u64(out, sample.observed_at_ms);
         write_option_u64(out, sample.oldest_live_placement_epoch);
         write_option_u64(out, sample.oldest_durable_backfill_epoch);
-        write_option_u64(out, sample.oldest_pending_metadata_command_epoch);
+        write_option_u64(out, sample.oldest_metadata_command_resource_epoch);
         write_option_u64(out, sample.oldest_object_payload_reclaim_claim_epoch);
     }
     write_u32(
@@ -8225,8 +8234,8 @@ fn read_control_plane_runtime_map_diagnostics(
             read_option_cluster_epoch(reader, "history reference live placement epoch")?;
         let oldest_durable_backfill_epoch =
             read_option_cluster_epoch(reader, "history reference durable backfill epoch")?;
-        let oldest_pending_metadata_command_epoch =
-            read_option_cluster_epoch(reader, "history reference pending metadata command epoch")?;
+        let oldest_metadata_command_resource_epoch =
+            read_option_cluster_epoch(reader, "history reference metadata command resource epoch")?;
         let oldest_object_payload_reclaim_claim_epoch = read_option_cluster_epoch(
             reader,
             "history reference object payload reclaim claim epoch",
@@ -8246,8 +8255,8 @@ fn read_control_plane_runtime_map_diagnostics(
             ("live placement", oldest_live_placement_epoch),
             ("durable backfill", oldest_durable_backfill_epoch),
             (
-                "pending metadata command",
-                oldest_pending_metadata_command_epoch,
+                "metadata command resource",
+                oldest_metadata_command_resource_epoch,
             ),
             (
                 "object payload reclaim claim",
@@ -8270,7 +8279,7 @@ fn read_control_plane_runtime_map_diagnostics(
             observed_at_ms,
             oldest_live_placement_epoch: oldest_live_placement_epoch.map(ClusterEpoch::get),
             oldest_durable_backfill_epoch: oldest_durable_backfill_epoch.map(ClusterEpoch::get),
-            oldest_pending_metadata_command_epoch: oldest_pending_metadata_command_epoch
+            oldest_metadata_command_resource_epoch: oldest_metadata_command_resource_epoch
                 .map(ClusterEpoch::get),
             oldest_object_payload_reclaim_claim_epoch: oldest_object_payload_reclaim_claim_epoch
                 .map(ClusterEpoch::get),

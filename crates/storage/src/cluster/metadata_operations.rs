@@ -5858,36 +5858,7 @@ impl StorageCluster {
     fn metadata_command_bucket_write_reservation_proof(
         command: &MetadataCommandEnvelope,
     ) -> Option<&BucketWriteReservationProof> {
-        match command.payload() {
-            MetadataCommandPayload::CommitDirectPutObject(commit) => {
-                Some(&commit.bucket_write_reservation)
-            }
-            MetadataCommandPayload::CommitMultipartObject(commit) => {
-                Some(&commit.bucket_write_reservation)
-            }
-            MetadataCommandPayload::CreateStreamUpload(create) => {
-                Some(&create.bucket_write_reservation)
-            }
-            MetadataCommandPayload::CommitStreamPart(commit) => {
-                Some(&commit.bucket_write_reservation)
-            }
-            MetadataCommandPayload::PutObjectMetadata(update) => {
-                Some(&update.bucket_write_reservation)
-            }
-            MetadataCommandPayload::DeleteObjectVersion(delete) => {
-                Some(&delete.bucket_write_reservation)
-            }
-            MetadataCommandPayload::InsertDeleteMarker(marker) => {
-                Some(&marker.bucket_write_reservation)
-            }
-            MetadataCommandPayload::CreateMultipartUpload(create) => {
-                Some(create.bucket_write_reservation())
-            }
-            MetadataCommandPayload::AbortMultipartUpload(abort) => {
-                Some(&abort.bucket_write_reservation)
-            }
-            _ => None,
-        }
+        command.payload().primary_bucket_write_reservation_proof()
     }
 
     #[cfg(test)]
@@ -6089,14 +6060,15 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        let release_result = self.release_applied_metadata_command_bucket_write_reservations(command);
         #[cfg(test)]
-        let release_result = release_result.and_then(|()| {
-            request_ops::maybe_run_metadata_command_terminal_reservation_release_hook(
-                Arc::as_ptr(&self.local_map) as usize,
-                command,
-            )
-        });
+        let release_result = request_ops::maybe_run_metadata_command_terminal_reservation_release_hook(
+            Arc::as_ptr(&self.local_map) as usize,
+            command,
+        )
+        .and_then(|()| self.release_applied_metadata_command_bucket_write_reservations(command));
+        #[cfg(not(test))]
+        let release_result =
+            self.release_applied_metadata_command_bucket_write_reservations(command);
         match release_result {
             Ok(()) => Ok(true),
             Err(error)

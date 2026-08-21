@@ -94,6 +94,7 @@ fn control_plane_openraft_triggered_single_node_client_write_applies_and_rejects
                     endpoint: "node-1".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 345,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -374,6 +375,7 @@ fn control_plane_openraft_read_index_runtime_map_uses_applied_tip() {
                     endpoint: "node-1".to_string(),
                     observed_epoch: current_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(1),
@@ -411,6 +413,7 @@ fn control_plane_openraft_read_index_runtime_map_uses_applied_tip() {
                     endpoint: "node-1".to_string(),
                     observed_epoch: current_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(1),

@@ -44,9 +44,9 @@ use crate::durable_journal::{
 };
 use crate::static_topology::UncertifiedInitialControlPlaneTopology;
 use crate::{
-    ClusterEpoch, PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
-    PgClusterMapHistoryRouteReferences, PgId, PgState, RouteMapValidity,
-    MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+    ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
+    PgClusterMapHistoryRouteReferenceKind, PgClusterMapHistoryRouteReferences, PgId, PgState,
+    RouteMapValidity, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
 };
 
 // PG backfill can lag a burst of placement changes; retain enough recent
@@ -57,7 +57,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 14;
+const CONTROL_PLANE_RPC_VERSION: u16 = 15;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -69,7 +69,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 28;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 29;
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
 const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
@@ -299,7 +299,9 @@ pub struct NodeControlRecord {
     last_observed_epoch: Option<ClusterEpoch>,
     last_heartbeat_ms: Option<u64>,
     lease_deadline_ms: Option<u64>,
+    cluster_map_history_route_scan_generation: Option<NonZeroU64>,
     cluster_map_history_route_references: PgClusterMapHistoryRouteReferences,
+    retiring_cluster_map_history_route_references: PgClusterMapHistoryRouteReferences,
     pg_observations: BTreeMap<PgId, NodePgObservationRecord>,
 }
 
@@ -324,7 +326,10 @@ impl NodeControlRecord {
             last_observed_epoch: None,
             last_heartbeat_ms: None,
             lease_deadline_ms: None,
+            cluster_map_history_route_scan_generation: None,
             cluster_map_history_route_references: PgClusterMapHistoryRouteReferences::default(),
+            retiring_cluster_map_history_route_references:
+                PgClusterMapHistoryRouteReferences::default(),
             pg_observations: BTreeMap::new(),
         }
     }
@@ -413,13 +418,48 @@ impl NodeControlRecord {
 
     #[must_use]
     pub fn cluster_map_history_floor_epoch(&self) -> Option<ClusterEpoch> {
-        self.cluster_map_history_route_references
-            .summary()
+        self.cluster_map_history_reference_summary()
             .oldest_required_epoch()
     }
 
     pub fn cluster_map_history_route_references(&self) -> &PgClusterMapHistoryRouteReferences {
         &self.cluster_map_history_route_references
+    }
+
+    fn retained_cluster_map_history_route_references(
+        &self,
+    ) -> impl Iterator<Item = PgClusterMapHistoryRouteReference> + '_ {
+        self.cluster_map_history_route_references
+            .iter()
+            .chain(self.retiring_cluster_map_history_route_references.iter())
+    }
+
+    fn cluster_map_history_reference_summary(&self) -> PgClusterMapHistoryReferenceSummary {
+        let mut summary = self.cluster_map_history_route_references.summary();
+        summary.merge(self.retiring_cluster_map_history_route_references.summary());
+        summary
+    }
+
+    fn record_cluster_map_history_route_references(
+        &mut self,
+        scan_generation: NonZeroU64,
+        reported: PgClusterMapHistoryRouteReferences,
+    ) {
+        if self
+            .cluster_map_history_route_scan_generation
+            .is_some_and(|current| scan_generation <= current)
+        {
+            return;
+        }
+        let retiring = PgClusterMapHistoryRouteReferences::try_from_iter(
+            self.cluster_map_history_route_references
+                .iter()
+                .filter(|reference| !reported.iter().any(|current| current == *reference)),
+        )
+        .expect("retiring history references are a subset of the bounded previous report");
+        self.cluster_map_history_route_references = reported;
+        self.retiring_cluster_map_history_route_references = retiring;
+        self.cluster_map_history_route_scan_generation = Some(scan_generation);
     }
 
     fn can_serve_primary(&self, cluster_epoch: ClusterEpoch, now_ms: u64) -> bool {
@@ -935,12 +975,8 @@ impl ClusterControlSnapshot {
         record: &PgControlRecord,
     ) -> Result<Option<PendingMetadataCommandRecovery>, ControlPlaneError> {
         let mut recovery: Option<PendingMetadataCommandRecovery> = None;
-        for node_id in &record.acting_set {
-            let Some(observation) = self
-                .node(*node_id)
-                .and_then(|node| node.pg_observation(record.pg_id))
-                .filter(|observation| observation.observed_epoch == self.cluster_epoch)
-            else {
+        for (node_id, node) in &self.nodes {
+            let Some(observation) = node.pg_observation(record.pg_id) else {
                 continue;
             };
             let Some(pending) = observation.pending_metadata_command() else {
@@ -1105,16 +1141,15 @@ impl ClusterControlSnapshot {
         refreshing_node_observed_epoch: ClusterEpoch,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let pg_routes = self.pg_routes_for_storage_node_refresh(now_ms, refreshing_node_id)?;
-        let history_route_references = self
+        let node = self
             .node(refreshing_node_id)
             .ok_or(ControlPlaneError::UnknownNode {
                 node_id: refreshing_node_id.as_u32(),
-            })?
-            .cluster_map_history_route_references();
+            })?;
         let history_protection =
             required_cluster_map_history_protection(self.pgs.values(), self.nodes.values());
         let historical_pg_routes = self.historical_pg_routes_for_storage_node_refresh(
-            history_route_references,
+            node.retained_cluster_map_history_route_references(),
             &history_protection.exact_routes,
             refreshing_node_observed_epoch,
             &pg_routes,
@@ -1290,7 +1325,7 @@ impl ClusterControlSnapshot {
 
     fn historical_pg_routes_for_storage_node_refresh(
         &self,
-        history_route_references: &PgClusterMapHistoryRouteReferences,
+        history_route_references: impl IntoIterator<Item = PgClusterMapHistoryRouteReference>,
         globally_protected_route_keys: &BTreeSet<(ClusterEpoch, PgId)>,
         observed_epoch: ClusterEpoch,
         current_routes: &[PgRouteSnapshot],
@@ -1298,7 +1333,7 @@ impl ClusterControlSnapshot {
     ) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
         let mut required_keys = BTreeSet::new();
         let mut pending_keys = Vec::new();
-        for reference in history_route_references.iter() {
+        for reference in history_route_references {
             if reference.cluster_epoch() < self.cluster_epoch {
                 add_required_historical_route_key(
                     &mut required_keys,
@@ -1476,6 +1511,16 @@ impl ClusterControlSnapshot {
                 && current.last_observed_epoch == updated.last_observed_epoch
                 && current.cluster_map_history_route_references
                     == updated.cluster_map_history_route_references
+                && current.retiring_cluster_map_history_route_references
+                    == updated.retiring_cluster_map_history_route_references
+                && (current.cluster_map_history_route_scan_generation
+                    == updated.cluster_map_history_route_scan_generation
+                    || (current
+                        .retiring_cluster_map_history_route_references
+                        .is_empty()
+                        && updated
+                            .retiring_cluster_map_history_route_references
+                            .is_empty()))
                 && current.pg_observation_state_matches(updated)
         })
     }
@@ -2077,7 +2122,7 @@ impl ClusterControlSnapshot {
                     ));
                 }
             }
-            for reference in node.cluster_map_history_route_references.iter() {
+            for reference in node.retained_cluster_map_history_route_references() {
                 if reference.cluster_epoch() > self.cluster_epoch {
                     return Err(format!(
                         "node {} has future cluster-map history route ({}, PG {}) above current {}",
@@ -2087,6 +2132,31 @@ impl ClusterControlSnapshot {
                         self.cluster_epoch
                     ));
                 }
+            }
+            if node
+                .retiring_cluster_map_history_route_references
+                .iter()
+                .any(|reference| {
+                    node.cluster_map_history_route_references
+                        .iter()
+                        .any(|current| current == reference)
+                })
+            {
+                return Err(format!(
+                    "node {} has a history route marked both current and retiring",
+                    node.node_id.as_u32()
+                ));
+            }
+            if node.cluster_map_history_route_scan_generation.is_none()
+                && (!node.cluster_map_history_route_references.is_empty()
+                    || !node
+                        .retiring_cluster_map_history_route_references
+                        .is_empty())
+            {
+                return Err(format!(
+                    "node {} has history route references without an accepted scan generation",
+                    node.node_id.as_u32()
+                ));
             }
             for observation in node.pg_observations.values() {
                 if observation.observed_epoch != self.cluster_epoch {
@@ -2106,11 +2176,34 @@ impl ClusterControlSnapshot {
                     ));
                 };
                 if !pg.acting_set.contains(&node.node_id) {
-                    return Err(format!(
-                        "node {} observation references PG {} outside the acting set",
-                        node.node_id.as_u32(),
-                        observation.pg_id.get()
-                    ));
+                    let Some(pending) = observation.pending_metadata_command else {
+                        return Err(format!(
+                            "node {} observation references PG {} outside the acting set",
+                            node.node_id.as_u32(),
+                            observation.pg_id.get()
+                        ));
+                    };
+                    let historical = self
+                        .reconstructed_pg_route_at_epoch(
+                            observation.pg_id,
+                            pending.cluster_epoch(),
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "node {} historical pending observation for PG {} has no valid route: {error}",
+                                node.node_id.as_u32(),
+                                observation.pg_id.get()
+                            )
+                        })?;
+                    if historical.state() != PgState::Active
+                        || historical.primary_node_id() != node.node_id
+                    {
+                        return Err(format!(
+                            "node {} historical pending observation for PG {} was not reported by its active primary",
+                            node.node_id.as_u32(),
+                            observation.pg_id.get()
+                        ));
+                    }
                 }
                 if pg.state == PgState::Active
                     && pg.active_primary == Some(node.node_id)
@@ -2721,6 +2814,16 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         &heartbeat,
                         current_epoch,
                     )?;
+                    let historical_pending_pg_observations =
+                        validate_historical_pending_pg_heartbeat_observations(
+                            self,
+                            heartbeat.node_id,
+                            &heartbeat.pg_observations,
+                        )?;
+                    let historical_pending_pg_ids: Vec<PgId> = historical_pending_pg_observations
+                        .iter()
+                        .map(|observation| observation.pg_id)
+                        .collect();
                     let mut next_snapshot = self.clone();
                     next_snapshot.establish_heartbeat_lease_horizon(
                         lease_horizon_authority,
@@ -2737,6 +2840,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                             .expect("node record validated before heartbeat mutation");
                         if heartbeat.node_incarnation > record.node_incarnation {
                             record.node_incarnation = heartbeat.node_incarnation;
+                            record.cluster_map_history_route_scan_generation = None;
                             epoch_changed = true;
                             affected_node = Some(heartbeat.node_id);
                         }
@@ -2748,15 +2852,48 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         record.record_observed_epoch(heartbeat.observed_epoch);
                         record.last_heartbeat_ms = Some(heartbeat_at_ms);
                         record.lease_deadline_ms = Some(lease_deadline_ms);
-                        record.cluster_map_history_route_references =
-                            heartbeat.cluster_map_history_route_references.clone();
+                        record.record_cluster_map_history_route_references(
+                            heartbeat.cluster_map_history_route_scan_generation,
+                            heartbeat.cluster_map_history_route_references.clone(),
+                        );
                         record.pg_observations.clear();
+                    }
+                    if !historical_pending_pg_ids.is_empty() {
+                        let newly_peering = mark_pgs_peering_for_pg_ids(
+                            &mut next_snapshot,
+                            self,
+                            historical_pending_pg_ids,
+                        );
+                        epoch_changed |= !newly_peering.is_empty();
                     }
                     if epoch_changed {
                         if let Some(node_id) = affected_node {
                             mark_pgs_peering_for_nodes(&mut next_snapshot, self, [node_id]);
                         }
                         next_snapshot.bump_epoch()?;
+                    }
+                    // Preserve the validated historical-primary evidence across an
+                    // epoch bump that fenced an Active route, and restore it after
+                    // an idempotent stale-heartbeat retransmission cleared the
+                    // reporter's observation map. Recovery discovery consumes only
+                    // Peering observations.
+                    let observation_epoch = next_snapshot.cluster_epoch;
+                    let record = next_snapshot
+                        .nodes
+                        .get_mut(&heartbeat.node_id)
+                        .expect("node record validated before heartbeat mutation");
+                    for observation in historical_pending_pg_observations {
+                        record.pg_observations.insert(
+                            observation.pg_id,
+                            NodePgObservationRecord {
+                                pg_id: observation.pg_id,
+                                state: PgState::Peering,
+                                observed_epoch: observation_epoch,
+                                observed_at_ms: heartbeat_at_ms,
+                                metadata_proof: observation.metadata_proof,
+                                pending_metadata_command: observation.pending_metadata_command,
+                            },
+                        );
                     }
                     let changed = next_snapshot != *self;
                     return Ok(applied_control_plane_command(
@@ -2789,6 +2926,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         .expect("node record validated before heartbeat mutation");
                     if heartbeat.node_incarnation > record.node_incarnation {
                         record.node_incarnation = heartbeat.node_incarnation;
+                        record.cluster_map_history_route_scan_generation = None;
                         epoch_changed = true;
                         affected_node = Some(heartbeat.node_id);
                     }
@@ -2807,8 +2945,10 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     record.record_observed_epoch(heartbeat.observed_epoch);
                     record.last_heartbeat_ms = Some(heartbeat_at_ms);
                     record.lease_deadline_ms = Some(lease_deadline_ms);
-                    record.cluster_map_history_route_references =
-                        heartbeat.cluster_map_history_route_references.clone();
+                    record.record_cluster_map_history_route_references(
+                        heartbeat.cluster_map_history_route_scan_generation,
+                        heartbeat.cluster_map_history_route_references.clone(),
+                    );
                     record.pg_observations.clear();
                     for observation in &heartbeat.pg_observations {
                         record.pg_observations.insert(
@@ -6101,8 +6241,34 @@ pub struct NodeHeartbeat {
     pub endpoint: String,
     pub observed_epoch: ClusterEpoch,
     pub requested_lease_duration_ms: u64,
+    pub cluster_map_history_route_scan_generation: NonZeroU64,
     pub cluster_map_history_route_references: PgClusterMapHistoryRouteReferences,
     pub pg_observations: Vec<NodePgHeartbeatObservation>,
+}
+
+impl NodeHeartbeat {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_fixture(
+        node_id: NodeId,
+        node_incarnation: u64,
+        endpoint: String,
+        observed_epoch: ClusterEpoch,
+        requested_lease_duration_ms: u64,
+        cluster_map_history_route_references: PgClusterMapHistoryRouteReferences,
+        pg_observations: Vec<NodePgHeartbeatObservation>,
+    ) -> Self {
+        Self {
+            node_id,
+            node_incarnation,
+            endpoint,
+            observed_epoch,
+            requested_lease_duration_ms,
+            cluster_map_history_route_scan_generation: NonZeroU64::MIN,
+            cluster_map_history_route_references,
+            pg_observations,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7103,6 +7269,15 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
                 reference.pg_id().get()
             ));
         }
+        for reference in record.retiring_cluster_map_history_route_references.iter() {
+            out.push_str(&format!(
+                "node_history_route_retiring={},{},{},{}\n",
+                record.node_id.as_u32(),
+                cluster_map_history_route_reference_kind_as_str(reference.kind()),
+                reference.cluster_epoch().get(),
+                reference.pg_id().get()
+            ));
+        }
         for observation in record.pg_observations.values() {
             out.push_str(&format!(
                 "node_pg={}\n",
@@ -7205,7 +7380,7 @@ fn format_historical_pg_route_record(record: &HistoricalPgRouteRecord) -> String
 
 fn format_node_record(record: &NodeControlRecord) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{}",
         record.node_id.as_u32(),
         record.membership.as_str(),
         u8::from(record.administratively_available),
@@ -7214,6 +7389,11 @@ fn format_node_record(record: &NodeControlRecord) -> String {
         option_u64(record.last_observed_epoch.map(ClusterEpoch::get)),
         option_u64(record.last_heartbeat_ms),
         option_u64(record.lease_deadline_ms),
+        option_u64(
+            record
+                .cluster_map_history_route_scan_generation
+                .map(NonZeroU64::get)
+        ),
         hex_encode(record.endpoint.as_bytes())
     )
 }
@@ -7225,7 +7405,8 @@ const fn cluster_map_history_route_reference_kind_as_str(
         PgClusterMapHistoryRouteReferenceKind::LivePlacement => "live",
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource => "backfill-source",
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => "backfill-desired",
-        PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => "pending-command",
+        // This persisted token predates bucket-write reservation references. Keep it stable.
+        PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource => "pending-command",
         PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim => {
             "object-payload-reclaim-claim"
         }
@@ -7646,6 +7827,24 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                     "duplicate node history route reference",
                 ));
             }
+        } else if let Some(value) = line.strip_prefix("node_history_route_retiring=") {
+            let (node_id, reference) = parse_node_history_route_reference(line_number, value)?;
+            let node = nodes.get_mut(&node_id).ok_or_else(|| {
+                parse_error(
+                    line_number,
+                    "retiring node history route references unknown node",
+                )
+            })?;
+            let previous_len = node.retiring_cluster_map_history_route_references.len();
+            node.retiring_cluster_map_history_route_references
+                .insert(reference)
+                .map_err(|error| parse_error(line_number, &error.to_string()))?;
+            if node.retiring_cluster_map_history_route_references.len() == previous_len {
+                return Err(parse_error(
+                    line_number,
+                    "duplicate retiring node history route reference",
+                ));
+            }
         } else if let Some(value) = line.strip_prefix("node_pg=") {
             version.ok_or_else(|| {
                 parse_error(line_number, "version must precede PG observation records")
@@ -7968,7 +8167,7 @@ fn validate_required_cluster_map_history(
         }
     }
     for node in nodes.values() {
-        for reference in node.cluster_map_history_route_references.iter() {
+        for reference in node.retained_cluster_map_history_route_references() {
             let retained = if reference.cluster_epoch() == current_epoch {
                 pgs.contains_key(&reference.pg_id())
             } else if reference.cluster_epoch() < current_epoch {
@@ -8308,8 +8507,8 @@ fn parse_node_pg_record(
 
 fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 9 {
-        return Err(parse_error(line, "node record must have nine fields"));
+    if fields.len() != 10 {
+        return Err(parse_error(line, "node record must have ten fields"));
     }
     let node_id = NodeId::new(parse_u32(line, fields[0], "node id")?);
     let membership = NodeMembershipState::from_str(fields[1])?;
@@ -8319,7 +8518,9 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
     let last_observed_epoch = parse_option_cluster_epoch(line, fields[5], "last observed epoch")?;
     let last_heartbeat_ms = parse_option_u64(line, fields[6], "last heartbeat")?;
     let lease_deadline_ms = parse_option_u64(line, fields[7], "lease deadline")?;
-    let endpoint = String::from_utf8(hex_decode(line, fields[8])?)
+    let cluster_map_history_route_scan_generation =
+        parse_option_nonzero_u64(line, fields[8], "history route scan generation")?;
+    let endpoint = String::from_utf8(hex_decode(line, fields[9])?)
         .map_err(|_| parse_error(line, "node endpoint must be valid UTF-8 after hex decoding"))?;
     Ok(NodeControlRecord {
         node_id,
@@ -8331,7 +8532,10 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
         last_observed_epoch,
         last_heartbeat_ms,
         lease_deadline_ms,
+        cluster_map_history_route_scan_generation,
         cluster_map_history_route_references: PgClusterMapHistoryRouteReferences::default(),
+        retiring_cluster_map_history_route_references: PgClusterMapHistoryRouteReferences::default(
+        ),
         pg_observations: BTreeMap::new(),
     })
 }
@@ -8352,7 +8556,7 @@ fn parse_node_history_route_reference(
         "live" => PgClusterMapHistoryRouteReferenceKind::LivePlacement,
         "backfill-source" => PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
         "backfill-desired" => PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
-        "pending-command" => PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+        "pending-command" => PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
         "object-payload-reclaim-claim" => {
             PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim
         }
@@ -8778,6 +8982,19 @@ fn parse_option_u64(
     }
 }
 
+fn parse_option_nonzero_u64(
+    line: usize,
+    value: &str,
+    field: &'static str,
+) -> Result<Option<NonZeroU64>, ControlPlaneError> {
+    parse_option_u64(line, value, field)?
+        .map(|value| {
+            NonZeroU64::new(value)
+                .ok_or_else(|| parse_error(line, &format!("{field} must be nonzero")))
+        })
+        .transpose()
+}
+
 fn parse_option_u32(
     line: usize,
     value: &str,
@@ -8901,7 +9118,8 @@ fn validate_pg_heartbeat_observations(
             .ok_or(ControlPlaneError::UnknownPg {
                 pg_id: observation.pg_id.get(),
             })?;
-        if !pg.acting_set.contains(&node_id) {
+        let current_actor = pg.acting_set.contains(&node_id);
+        if !current_actor && observation.pending_metadata_command.is_none() {
             return Err(ControlPlaneError::PgObservationNotInActingSet {
                 node_id: node_id.as_u32(),
                 pg_id: observation.pg_id.get(),
@@ -8951,6 +9169,34 @@ fn validate_pg_heartbeat_observations(
         }
     }
     Ok(pending_active_pg_observations)
+}
+
+fn validate_historical_pending_pg_heartbeat_observations(
+    snapshot: &ClusterControlSnapshot,
+    node_id: NodeId,
+    observations: &[NodePgHeartbeatObservation],
+) -> Result<Vec<NodePgHeartbeatObservation>, ControlPlaneError> {
+    let mut observed_pgs = BTreeSet::new();
+    let mut pending_observations = Vec::new();
+    for observation in observations {
+        if !observed_pgs.insert(observation.pg_id) {
+            return Err(ControlPlaneError::DuplicatePgObservation {
+                node_id: node_id.as_u32(),
+                pg_id: observation.pg_id.get(),
+            });
+        }
+        if !snapshot.pgs.contains_key(&observation.pg_id) {
+            return Err(ControlPlaneError::UnknownPg {
+                pg_id: observation.pg_id.get(),
+            });
+        }
+        let Some(pending) = observation.pending_metadata_command else {
+            continue;
+        };
+        validate_pending_metadata_command_reporter(snapshot, observation.pg_id, node_id, pending)?;
+        pending_observations.push(*observation);
+    }
+    Ok(pending_observations)
 }
 
 fn validate_pending_metadata_command_reporter(
@@ -9778,8 +10024,7 @@ fn required_cluster_map_history_protection<'a, 'b>(
     }
     for node in nodes {
         exact_routes.extend(
-            node.cluster_map_history_route_references()
-                .iter()
+            node.retained_cluster_map_history_route_references()
                 .map(|reference| (reference.cluster_epoch(), reference.pg_id())),
         );
     }

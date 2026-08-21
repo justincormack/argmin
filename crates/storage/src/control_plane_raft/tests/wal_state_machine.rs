@@ -442,7 +442,7 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         (
             75,
             236,
-            "93d125ad13a2343872ff4a8cd45540a3fc810d2f683a83513b9029e0a69fe0ec".to_owned(),
+            "5d2a53be0b19c52601431c1e6830ed1eb611acbd99573c6f4500c2c08fe73202".to_owned(),
             112,
             "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62".to_owned()
         )
@@ -3167,6 +3167,7 @@ fn control_plane_raft_state_machine_rejects_stale_lease_authority_terms() {
                     endpoint: "node-1".to_string(),
                     observed_epoch: before.cluster_epoch(),
                     requested_lease_duration_ms: 100,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },

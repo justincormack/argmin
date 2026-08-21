@@ -1066,6 +1066,93 @@
     }
 
     #[test]
+    fn storage_node_restart_preserves_older_pending_command_for_topology_recovery() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let old_epoch = config.cluster_epoch;
+        let current_epoch = ClusterEpoch::new(old_epoch.get() + 1).unwrap();
+        let bucket = crate::tests::bucket_name("split-restart-pending-route");
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "split-restart-reservation".to_owned(),
+            owner_token: "split-restart-owner".to_owned(),
+            cluster_epoch: old_epoch,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "insert-delete-marker".to_owned(),
+            created_at: 1,
+            lease_deadline: 60_000,
+            target_context: Some("object".to_owned()),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                old_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: proof,
+                bucket: bucket.clone(),
+                key: crate::tests::object_key("object"),
+                version_id: VersionId::Null,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                write_sequence: 1,
+                last_modified_millis: 1,
+                stale_payload: None,
+            }),
+        );
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                config.node_id.as_u32(),
+                &command,
+                Some(&bucket),
+            )
+            .unwrap();
+            let mut state = pg.metadata_command_replica_state().unwrap();
+            state.cluster_epoch = current_epoch;
+            pg.test_replace_metadata_command_replica_state(state)
+                .unwrap();
+        }
+
+        config.cluster_epoch = current_epoch;
+        config.pg_routes[0].cluster_epoch = current_epoch;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let heartbeat = server
+            .test_storage_node()
+            .control_plane_heartbeat(
+                config.node_id,
+                1,
+                "storage-node-7",
+                current_epoch,
+                1_000,
+                [(PgId::new(0), PgState::Peering)],
+            )
+            .unwrap();
+        let pending = heartbeat.pg_observations[0]
+            .pending_metadata_command
+            .expect("split restart must report the exact preserved pending slot");
+        assert_eq!(pending.cluster_epoch(), old_epoch);
+        assert_eq!(pending.log_index(), command.id().log_index().get());
+        assert_eq!(pending.command_checksum(), command.checksum_crc64());
+        assert!(heartbeat.cluster_map_history_route_references.iter().any(
+            |reference| reference
+                == crate::PgClusterMapHistoryRouteReference::new(
+                    crate::PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
+                    old_epoch,
+                    PgId::new(0),
+                )
+        ));
+    }
+
+    #[test]
     fn storage_node_state_initialization_guard_rejects_symlinked_native_lock() {
         let tmp = test_util::tempdir();
         let data_dir = tmp.path().join("node");
@@ -1171,6 +1258,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 10_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -1185,6 +1273,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 10_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -2690,6 +2779,7 @@
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: crate::control_plane::MAX_HEARTBEAT_LEASE_MS,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: Vec::new(),
                     },
@@ -2704,6 +2794,7 @@
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch: first.cluster_epoch(),
                         requested_lease_duration_ms: crate::control_plane::MAX_HEARTBEAT_LEASE_MS,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: Vec::new(),
                     },
@@ -2735,6 +2826,7 @@
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch,
                         requested_lease_duration_ms: crate::control_plane::MAX_HEARTBEAT_LEASE_MS,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: Vec::new(),
                     },
@@ -2815,6 +2907,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -2829,6 +2922,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -2895,6 +2989,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -2909,6 +3004,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -3016,6 +3112,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -3030,6 +3127,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -3079,7 +3177,7 @@
             crate::PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(retained_epoch),
                 oldest_durable_backfill_epoch: None,
-                oldest_pending_metadata_command_epoch: None,
+                oldest_metadata_command_resource_epoch: None,
                 oldest_object_payload_reclaim_claim_epoch: None,
             },
         )
@@ -3126,6 +3224,7 @@
                         endpoint: endpoint.to_str().unwrap().to_owned(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: Vec::new(),
                     },
@@ -3140,6 +3239,7 @@
                         endpoint: endpoint.to_str().unwrap().to_owned(),
                         observed_epoch: first.cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: Vec::new(),
                     },
@@ -3178,6 +3278,7 @@
                         .to_owned(),
                     observed_epoch: current_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(2).unwrap(),
                     cluster_map_history_route_references: history_references,
                     pg_observations: Vec::new(),
                 },
@@ -3270,6 +3371,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -3284,6 +3386,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -3348,6 +3451,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -3362,6 +3466,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -3409,7 +3514,7 @@
             crate::PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(ClusterEpoch::new(5).unwrap()),
                 oldest_durable_backfill_epoch: None,
-                oldest_pending_metadata_command_epoch: None,
+                oldest_metadata_command_resource_epoch: None,
                 oldest_object_payload_reclaim_claim_epoch: None,
             },
         )
@@ -3460,6 +3565,7 @@
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: Vec::new(),
                     },
@@ -3474,6 +3580,7 @@
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch: first.cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: Vec::new(),
                     },
@@ -3492,6 +3599,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
                         pg_id,
@@ -3515,6 +3623,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: source_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
                         pg_id,
@@ -3613,6 +3722,7 @@
                     endpoint: destination_socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: completion_epoch,
                     requested_lease_duration_ms: 5_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
                         pg_id,
@@ -3665,6 +3775,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },
@@ -3679,6 +3790,7 @@
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: Vec::new(),
                 },

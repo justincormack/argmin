@@ -95,12 +95,19 @@ impl PgTopology {
     /// Bucket rows and bucket subresources remain PG-sharded. They do not move
     /// back to a global service in the multihost transition.
     pub fn bucket_pg(&self, bucket: &str) -> u32 {
-        let hash = hash_parts(&[b"bucket/", bucket.as_bytes()]);
-        pick_pg(&self.pg_ids, hash)
+        self.pg_for_bucket_route_hash(Self::bucket_route_hash(bucket))
     }
 
     pub fn bucket_pg_for(&self, bucket: &BucketName) -> u32 {
         self.bucket_pg(bucket.as_str())
+    }
+
+    pub(crate) fn bucket_route_hash(bucket: &str) -> u64 {
+        hash_parts(&[b"bucket/", bucket.as_bytes()])
+    }
+
+    pub(crate) fn pg_for_bucket_route_hash(&self, hash: u64) -> u32 {
+        pick_pg(&self.pg_ids, hash)
     }
 
     #[cfg(test)]

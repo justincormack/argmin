@@ -2202,6 +2202,125 @@ fn stale_heartbeat_does_not_mutate_pg_observations() {
 }
 
 #[test]
+fn stale_historical_primary_heartbeat_reports_pending_after_acting_set_change() {
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+    for node_id in [1, 2] {
+        authority
+            .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+    }
+    let pg_id = PgId::new(116);
+    authority
+        .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+        .unwrap();
+    heartbeat_with_pg_observation(&mut authority, 1, pg_id.get(), PgState::Peering, 2_000);
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            2_001,
+        )
+        .unwrap();
+    heartbeat_with_pg_observation(&mut authority, 1, pg_id.get(), PgState::Active, 2_002);
+    let historical_epoch = authority.snapshot().cluster_epoch();
+
+    authority
+        .set_pg_acting_set_with_metadata_transfer(
+            pg_id,
+            vec![NodeId::new(2)],
+            PgMetadataTransferProof::new_with_imported_metadata_proof(
+                historical_epoch,
+                PgMetadataProof::empty(),
+                PgMetadataProof::empty(),
+            ),
+        )
+        .unwrap();
+    let expired = authority.expire_heartbeat_leases(2_103).unwrap();
+    assert!(expired.expired_nodes().contains(&NodeId::new(1)));
+    assert!(heartbeat_until_serving(&mut authority, 2, 3_103).serving());
+    heartbeat_with_pg_observation(&mut authority, 2, pg_id.get(), PgState::Peering, 3_105);
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(2),
+            node_incarnation(&authority, 2),
+            3_106,
+        )
+        .unwrap();
+    heartbeat_with_pg_observation(&mut authority, 2, pg_id.get(), PgState::Active, 3_107);
+    assert_eq!(
+        authority.snapshot().pg(pg_id).unwrap().state(),
+        PgState::Active,
+        "the replacement route must be serving before historical evidence arrives"
+    );
+    let pending =
+        PendingMetadataCommandObservation::new(historical_epoch, NonZeroU64::MIN, 0xfeed_cafe);
+    let mut stale = heartbeat_from_record(&authority, 1, historical_epoch, 3_108);
+    stale.node_incarnation += 1;
+    stale.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id,
+        state: PgState::Peering,
+        metadata_proof: PgMetadataProof::empty(),
+        pending_metadata_command: Some(pending),
+    }];
+    let retransmitted = stale.clone();
+
+    let refresh = authority.refresh_node_heartbeat(stale, 3_108).unwrap();
+
+    assert!(!refresh.lease().serving());
+    assert_eq!(
+        authority.snapshot().pg(pg_id).unwrap().state(),
+        PgState::Peering,
+        "trusted historical pending evidence must fence an Active replacement route"
+    );
+    assert_eq!(
+        authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(pg_id)
+            .and_then(NodePgObservationRecord::pending_metadata_command),
+        Some(pending)
+    );
+    assert_eq!(
+        authority
+            .snapshot()
+            .pending_metadata_command_recoveries()
+            .tasks(),
+        &[PendingMetadataCommandRecoveryTask::new(
+            pg_id,
+            PendingMetadataCommandRecovery::new(NodeId::new(1), pending),
+        )]
+    );
+
+    let fenced_epoch = authority.snapshot().cluster_epoch();
+    let replay = authority
+        .refresh_node_heartbeat(retransmitted, 3_108)
+        .unwrap();
+    assert!(!replay.lease().serving());
+    assert_eq!(
+        authority.snapshot().cluster_epoch(),
+        fenced_epoch,
+        "an exact stale-heartbeat retransmission must not advance the global epoch"
+    );
+    assert_eq!(
+        authority
+            .snapshot()
+            .pending_metadata_command_recoveries()
+            .tasks(),
+        &[PendingMetadataCommandRecoveryTask::new(
+            pg_id,
+            PendingMetadataCommandRecovery::new(NodeId::new(1), pending),
+        )],
+        "idempotent retransmission must retain historical recovery evidence"
+    );
+}
+
+#[test]
 fn heartbeat_rejects_invalid_pg_observations() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

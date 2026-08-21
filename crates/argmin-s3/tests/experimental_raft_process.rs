@@ -665,15 +665,15 @@ fn send_authenticated_storage_heartbeat(
     );
     client
         .refresh_node_heartbeat(
-            NodeHeartbeat {
-                node_id: NodeId::new(node_id),
-                node_incarnation: incarnation,
-                endpoint: endpoint.display().to_string(),
+            NodeHeartbeat::test_fixture(
+                NodeId::new(node_id),
+                incarnation,
+                endpoint.display().to_string(),
                 observed_epoch,
-                requested_lease_duration_ms: 10_000,
-                cluster_map_history_route_references: Default::default(),
-                pg_observations: Vec::new(),
-            },
+                10_000,
+                Default::default(),
+                Vec::new(),
+            ),
             storage::clock::current_time_millis(),
         )
         .expect("authenticated storage-node heartbeat should refresh")

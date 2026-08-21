@@ -1938,6 +1938,204 @@ fn local_cluster_reopen_rejects_corrupt_applied_command_log_hash() {
 }
 
 #[test]
+fn local_cluster_reopen_validates_old_epoch_chain_before_terminal_slot_cleanup() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let old_epoch = ClusterEpoch::INITIAL;
+    let current_epoch = ClusterEpoch::new(2).unwrap();
+    {
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let checkpoint_bucket = bucket_for_pg(topology, 1, "old-chain-base-");
+        let bucket = bucket_for_pg(topology, 1, "old-chain-cleanup-");
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+        let checkpoint_command = create_bucket_metadata_command(PgId::new(1), 1, checkpoint_bucket);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(
+                NodeId::new(0),
+                &checkpoint_command,
+            )
+            .unwrap();
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            pg.record_current_metadata_command_checkpoint(node_id.as_u32(), old_epoch)
+                .unwrap();
+            assert!(matches!(
+                pg.compact_metadata_command_log(old_epoch).unwrap(),
+                crate::pg_store::MetadataCommandLogCompactionStatus::Compacted {
+                    compacted_before: 2,
+                    ..
+                }
+            ));
+        }
+        let command = create_bucket_metadata_command(PgId::new(1), 2, bucket.clone());
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &command)
+            .unwrap();
+        force_insert_pending_metadata_command_for_test(&map, PgId::new(1), &bucket, &command);
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let old_state = pg.metadata_command_replica_state().unwrap();
+            pg.test_replace_metadata_command_replica_state(MetadataCommandReplicaState {
+                cluster_epoch: current_epoch,
+                applied_log_index: 0,
+                applied_log_hash: crate::control_plane::MetadataCommandLogHash::genesis(),
+                state_digest: old_state.state_digest,
+            })
+            .unwrap();
+        }
+        map.node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap()
+            .test_set_metadata_command_log_previous_hash(2, 123)
+            .unwrap();
+    }
+
+    let configs = node_ids.into_iter().map(|node_id| {
+        LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path().join(format!("node-{:04}", node_id.as_u32())),
+        )
+    });
+    let err = LocalClusterMap::open_with_configs_and_epoch(
+        NodeId::new(0),
+        configs,
+        &[0, 1],
+        ec_shape,
+        current_epoch,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err.open_local_node_store_error(),
+            Some((
+                1,
+                StoreError::MetadataCommandLogHashMismatch {
+                    pg_id: 1,
+                    cluster_epoch,
+                    log_index: 2,
+                    ..
+                }
+            )) if *cluster_epoch == old_epoch
+        ),
+        "unexpected old-epoch startup validation error: {err:?}"
+    );
+}
+
+#[test]
+fn local_cluster_reopen_validates_abandoned_old_epoch_chain_before_slot_cleanup() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let old_epoch = ClusterEpoch::INITIAL;
+    let current_epoch = ClusterEpoch::new(2).unwrap();
+    let command = {
+        let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let checkpoint_bucket = bucket_for_pg(topology, 1, "old-abandoned-chain-base-");
+        let bucket = bucket_for_pg(topology, 1, "old-abandoned-chain-cleanup-");
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+        let checkpoint_command = create_bucket_metadata_command(PgId::new(1), 1, checkpoint_bucket);
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(
+                NodeId::new(0),
+                &checkpoint_command,
+            )
+            .unwrap();
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            pg.record_current_metadata_command_checkpoint(node_id.as_u32(), old_epoch)
+                .unwrap();
+            assert!(matches!(
+                pg.compact_metadata_command_log(old_epoch).unwrap(),
+                crate::pg_store::MetadataCommandLogCompactionStatus::Compacted {
+                    compacted_before: 2,
+                    ..
+                }
+            ));
+        }
+        let command = create_bucket_metadata_command(PgId::new(1), 2, bucket.clone());
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            pg.record_metadata_command_abandoned(node_id.as_u32(), &command)
+                .unwrap();
+        }
+        force_insert_pending_metadata_command_for_test(&map, PgId::new(1), &bucket, &command);
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let old_state = pg.metadata_command_replica_state().unwrap();
+            pg.test_replace_metadata_command_replica_state(MetadataCommandReplicaState {
+                cluster_epoch: current_epoch,
+                applied_log_index: 0,
+                applied_log_hash: crate::control_plane::MetadataCommandLogHash::genesis(),
+                state_digest: old_state.state_digest,
+            })
+            .unwrap();
+        }
+        map.node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap()
+            .test_set_metadata_command_log_previous_hash(2, 123)
+            .unwrap();
+        command
+    };
+
+    let configs = node_ids.into_iter().map(|node_id| {
+        LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path().join(format!("node-{:04}", node_id.as_u32())),
+        )
+    });
+    let err = LocalClusterMap::open_with_configs_and_epoch(
+        NodeId::new(0),
+        configs,
+        &[0, 1],
+        ec_shape,
+        current_epoch,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err.open_local_node_store_error(),
+            Some((
+                1,
+                StoreError::MetadataCommandLogHashMismatch {
+                    pg_id: 1,
+                    cluster_epoch,
+                    log_index: 2,
+                    ..
+                }
+            )) if *cluster_epoch == old_epoch
+        ),
+        "unexpected abandoned old-epoch startup validation error: {err:?}"
+    );
+
+    let primary = crate::PgStore::open(&tmp.path().join("node-0000/pg-0001"), 1).unwrap();
+    assert_eq!(
+        primary
+            .pending_metadata_command_envelope(0, old_epoch)
+            .unwrap(),
+        Some(command),
+        "hash-chain validation must fail before destructive pending-slot cleanup"
+    );
+}
+
+#[test]
 fn local_cluster_reopen_rejects_materialized_state_digest_mismatch() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

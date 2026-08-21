@@ -323,6 +323,89 @@ fn single_authority_exact_heartbeat_retransmission_does_not_append_journal() {
 }
 
 #[test]
+fn production_generated_stable_route_scans_do_not_append_journal() {
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let mut control_plane = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+    control_plane
+        .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+        .unwrap();
+    let node = crate::node::SharedStorageNode::open(&tmp.path().join("node"), &[0]).unwrap();
+    let authority = LeaseHorizonAuthorityBinding::new(7, None);
+    let mut now_ms = 1_000;
+    loop {
+        let heartbeat = node
+            .control_plane_heartbeat(
+                NodeId::new(1),
+                11,
+                "node-1.sock",
+                control_plane.snapshot().cluster_epoch(),
+                1_000,
+                [],
+            )
+            .unwrap();
+        let response = control_plane
+            .refresh_node_heartbeat_with_lease_horizon_authority(heartbeat, now_ms, authority)
+            .unwrap();
+        now_ms += 1;
+        if response.lease().serving() {
+            break;
+        }
+    }
+    let settling = node
+        .control_plane_heartbeat(
+            NodeId::new(1),
+            11,
+            "node-1.sock",
+            control_plane.snapshot().cluster_epoch(),
+            1_000,
+            [],
+        )
+        .unwrap();
+    control_plane
+        .refresh_node_heartbeat_with_lease_horizon_authority(settling, now_ms, authority)
+        .unwrap();
+    now_ms += 1;
+    let journal_offset = store.journal.clean_len().unwrap();
+    let durable_generation = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .node(NodeId::new(1))
+        .unwrap()
+        .cluster_map_history_route_scan_generation;
+
+    let stable = node
+        .control_plane_heartbeat(
+            NodeId::new(1),
+            11,
+            "node-1.sock",
+            control_plane.snapshot().cluster_epoch(),
+            1_000,
+            [],
+        )
+        .unwrap();
+    let stable_generation = stable.cluster_map_history_route_scan_generation;
+    control_plane
+        .refresh_node_heartbeat_with_lease_horizon_authority(stable, now_ms, authority)
+        .unwrap();
+
+    assert!(stable_generation > durable_generation.unwrap());
+    assert_eq!(store.journal.clean_len().unwrap(), journal_offset);
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .unwrap()
+            .node(NodeId::new(1))
+            .unwrap()
+            .cluster_map_history_route_scan_generation,
+        durable_generation,
+        "a stable generation-only scan must remain volatile"
+    );
+}
+
+#[test]
 fn rejected_horizon_enabled_heartbeat_leaves_durable_state_unchanged() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

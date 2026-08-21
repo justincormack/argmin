@@ -1640,7 +1640,7 @@ mod tests {
                     PgId::new(8),
                 ),
                 PgClusterMapHistoryRouteReference::new(
-                    PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+                    PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
                     ClusterEpoch::new(3).unwrap(),
                     PgId::new(9),
                 ),

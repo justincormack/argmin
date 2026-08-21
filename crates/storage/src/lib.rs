@@ -3842,6 +3842,8 @@ pub mod test_support {
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
 pub(crate) use node::LocalStorageNode;
+#[cfg(feature = "test-hooks")]
+pub use node::StorageNodeHeartbeatTestSource;
 pub use node::{BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome, BucketMutationReceipt};
 pub(crate) use node::{BucketDeleteBeginRoot, ReclaimWorkItem};
 pub(crate) use node_runtime::role_facade::ObjectMetadataScanPgId;

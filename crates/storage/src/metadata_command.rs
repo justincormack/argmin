@@ -898,6 +898,36 @@ impl MetadataCommandPayload {
         )
     }
 
+    pub(crate) fn primary_bucket_write_reservation_proof(
+        &self,
+    ) -> Option<&BucketWriteReservationProof> {
+        match self {
+            Self::CommitDirectPutObject(commit) => Some(&commit.bucket_write_reservation),
+            Self::CommitMultipartObject(commit) => Some(&commit.bucket_write_reservation),
+            Self::CreateStreamUpload(create) => Some(&create.bucket_write_reservation),
+            Self::CommitStreamPart(commit) => Some(&commit.bucket_write_reservation),
+            Self::PutObjectMetadata(update) => Some(&update.bucket_write_reservation),
+            Self::DeleteObjectVersion(delete) => Some(&delete.bucket_write_reservation),
+            Self::InsertDeleteMarker(marker) => Some(&marker.bucket_write_reservation),
+            Self::CreateMultipartUpload(create) => Some(create.bucket_write_reservation()),
+            Self::AbortMultipartUpload(abort) => Some(&abort.bucket_write_reservation),
+            _ => None,
+        }
+    }
+
+    /// Durable cross-PG resources that may still need cleanup while this command is pending.
+    pub(crate) fn bucket_write_reservation_route_dependencies(
+        &self,
+    ) -> impl Iterator<Item = &BucketWriteReservationProof> {
+        let auxiliary = match self {
+            Self::AbortStreamUpload(abort) => abort.stream_create_bucket_write_reservation.as_ref(),
+            _ => None,
+        };
+        [self.primary_bucket_write_reservation_proof(), auxiliary]
+            .into_iter()
+            .flatten()
+    }
+
     pub(crate) fn is_ordinary_pending_slot_reissue_of(&self, source: &Self) -> bool {
         if self.kind_id() != source.kind_id() || self.bucket_name() != source.bucket_name() {
             return false;

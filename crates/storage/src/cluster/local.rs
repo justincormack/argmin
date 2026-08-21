@@ -50,6 +50,7 @@ use crate::node_client::{
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
+use crate::pg_store::MetadataCommandStartupDisposition;
 #[cfg(test)]
 use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
@@ -3092,21 +3093,138 @@ impl LocalClusterMap {
                 LocalNodeStore::new(node_id, canonical_data_dir, runtime),
             );
         }
-        // Recovery phase A: clean epoch-mismatched orphan pending command slots
-        // on every node BEFORE the cluster-wide validation below. That
-        // validation reads the pending slot through the epoch-checked path,
-        // which rejects an orphan with `StaleMetadataOperation`; without this
-        // phase a crash-leftover orphan would fail the whole open before full
-        // recovery could clean it. Same-epoch primary pending slots are left
-        // intact for convergence.
+        // Classify older pending commands with exact acting-set evidence before
+        // touching either their resources or slots. A local replica cannot tell
+        // whether an old command was unpublished or converged elsewhere.
         if validate_local_metadata_command_replay {
+            let mut orphan_slots = Vec::new();
+            let mut orphan_commands =
+                BTreeMap::<(u64, u32, u64), (MetadataCommandEnvelope, bool)>::new();
             for (node_id, store) in &nodes {
-                store
+                let orphans = store
                     .runtime()
-                    .prepare_metadata_command_recovery(*node_id)
+                    .epoch_mismatched_pending_metadata_commands(*node_id)
                     .map_err(|source| {
                         ClusterBuildError::open_local_node(node_id.as_u32(), source)
                     })?;
+                for (pg_id, pending) in orphans {
+                    let command = pending.command;
+                    let id = command.id();
+                    let key = (
+                        id.cluster_epoch().get(),
+                        id.pg_id().get(),
+                        id.log_index().get(),
+                    );
+                    if let Some((existing, publication_started)) = orphan_commands.get_mut(&key) {
+                        if existing.checksum_crc64() != command.checksum_crc64()
+                            || existing.command_bytes() != command.command_bytes()
+                        {
+                            return Err(ClusterBuildError::open_local_node(
+                                node_id.as_u32(),
+                                StoreError::MetadataCommandLogConflict {
+                                    node_id: node_id.as_u32(),
+                                    pg_id: pg_id.get(),
+                                    cluster_epoch: id.cluster_epoch(),
+                                    log_index: id.log_index().get(),
+                                },
+                            ));
+                        }
+                        *publication_started |= pending.publication_started;
+                    } else {
+                        orphan_commands.insert(key, (command.clone(), pending.publication_started));
+                    }
+                    orphan_slots.push((*node_id, pg_id, command));
+                }
+            }
+            for (command, publication_started) in orphan_commands.values() {
+                let route = pg_routes
+                    .get(&command.id().pg_id())
+                    .expect("validated command PG id should have a route");
+                let mut terminal_evidence = None;
+                let mut applied = 0usize;
+                for actor in route.acting_set() {
+                    let node = nodes
+                        .get(actor)
+                        .expect("validated acting-set node should be opened");
+                    let disposition = node
+                        .runtime()
+                        .metadata_command_startup_disposition(*actor, command)
+                        .map_err(|source| {
+                            ClusterBuildError::open_local_node(actor.as_u32(), source)
+                        })?;
+                    let evidence = match disposition {
+                        MetadataCommandStartupDisposition::Absent => None,
+                        MetadataCommandStartupDisposition::Abandoned {
+                            previous_log_hash,
+                            log_hash,
+                        } => Some((true, previous_log_hash, log_hash)),
+                        MetadataCommandStartupDisposition::Applied {
+                            previous_log_hash,
+                            log_hash,
+                        } => {
+                            applied += 1;
+                            Some((false, previous_log_hash, log_hash))
+                        }
+                    };
+                    if let Some(evidence) = evidence {
+                        if terminal_evidence.is_some_and(|expected| expected != evidence) {
+                            return Err(ClusterBuildError::open_local_node(
+                                actor.as_u32(),
+                                StoreError::MetadataCommandLogConflict {
+                                    node_id: actor.as_u32(),
+                                    pg_id: command.id().pg_id().get(),
+                                    cluster_epoch: command.id().cluster_epoch(),
+                                    log_index: command.id().log_index().get(),
+                                },
+                            ));
+                        }
+                        terminal_evidence = Some(evidence);
+                    }
+                }
+                if applied == route.acting_set().len() {
+                    release_open_applied_metadata_command_bucket_write_reservations(
+                        &nodes, &pg_routes, command,
+                    )?;
+                } else if applied == 0 && !publication_started {
+                    release_open_unpublished_metadata_command_bucket_write_reservation(
+                        &nodes, &pg_routes, command,
+                    )?;
+                } else {
+                    let primary = route.primary_node_id();
+                    return Err(ClusterBuildError::open_local_node(
+                        primary.as_u32(),
+                        StoreError::MetadataCommandLogConflict {
+                            node_id: primary.as_u32(),
+                            pg_id: command.id().pg_id().get(),
+                            cluster_epoch: command.id().cluster_epoch(),
+                            log_index: command.id().log_index().get(),
+                        },
+                    ));
+                }
+            }
+            for (node_id, pg_id, command) in orphan_slots {
+                let store = nodes
+                    .get(&node_id)
+                    .expect("orphan slot owner came from the opened local node map");
+                let removed = store
+                    .runtime()
+                    .remove_epoch_mismatched_orphan_pending_metadata_command(
+                        node_id, pg_id, &command,
+                    )
+                    .map_err(|source| {
+                        ClusterBuildError::open_local_node(node_id.as_u32(), source)
+                    })?;
+                if !removed {
+                    return Err(ClusterBuildError::open_local_node(
+                        node_id.as_u32(),
+                        StoreError::MetadataCommandLogConflict {
+                            node_id: node_id.as_u32(),
+                            pg_id: pg_id.get(),
+                            cluster_epoch: command.id().cluster_epoch(),
+                            log_index: command.id().log_index().get(),
+                        },
+                    ));
+                }
             }
         }
         if validate_local_metadata_command_replay {
@@ -6344,7 +6462,9 @@ fn validate_metadata_command_replay_state(
                 .find_map(|(node_id, state)| (*node_id == primary_node_id).then_some(state))
                 .expect("validated route primary must be in local node set");
             if command.id().log_index().get() <= primary_state.applied_log_index {
-                release_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
+                release_open_applied_metadata_command_bucket_write_reservations(
+                    nodes, pg_routes, command,
+                )?;
                 clean_converged_primary_terminal_pending_slot(
                     nodes,
                     pg_id,
@@ -6373,7 +6493,7 @@ fn clean_converged_primary_terminal_pending_slot(
     Ok(())
 }
 
-fn release_open_metadata_command_bucket_write_reservation(
+fn release_open_applied_metadata_command_bucket_write_reservations(
     nodes: &BTreeMap<NodeId, LocalNodeStore>,
     pg_routes: &BTreeMap<PgId, LocalPgRoute>,
     command: &MetadataCommandEnvelope,
@@ -6385,9 +6505,58 @@ fn release_open_metadata_command_bucket_write_reservation(
     ) {
         return Ok(());
     }
-    let Some(proof) = command_bucket_write_reservation_proof(command) else {
+    let topology = nodes
+        .values()
+        .next()
+        .expect("local cluster must contain at least one node")
+        .runtime()
+        .pg_topology();
+    for proof in command
+        .payload()
+        .bucket_write_reservation_route_dependencies()
+    {
+        let bucket_pg_id = PgId::new(topology.bucket_pg_for(&proof.bucket));
+        let primary_node_id = pg_routes
+            .get(&bucket_pg_id)
+            .expect("validated bucket PG id should have a route")
+            .primary_node_id();
+        let node = nodes
+            .get(&primary_node_id)
+            .expect("validated route primary must be in local node set");
+        let bucket_pg = node.runtime().bucket_metadata_pg_for(&proof.bucket);
+        node.retained_bucket_write_reservation_client()
+            .open_retained_bucket_write_reservation_route(bucket_pg, &proof.bucket)
+            .and_then(|route| route.release_metadata_command_bucket_write_reservation(proof))
+            .map_err(|source| {
+                ClusterBuildError::open_local_node(
+                    primary_node_id.as_u32(),
+                    StoreError::Io {
+                        context:
+                            "release metadata command bucket write reservations on local cluster open",
+                        source: std::io::Error::other(source),
+                    },
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn release_open_unpublished_metadata_command_bucket_write_reservation(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_routes: &BTreeMap<PgId, LocalPgRoute>,
+    command: &MetadataCommandEnvelope,
+) -> Result<(), ClusterBuildError> {
+    let Some(proof) = command.payload().primary_bucket_write_reservation_proof() else {
         return Ok(());
     };
+    release_open_bucket_write_reservation(nodes, pg_routes, proof)
+}
+
+fn release_open_bucket_write_reservation(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_routes: &BTreeMap<PgId, LocalPgRoute>,
+    proof: &crate::metadata_command::BucketWriteReservationProof,
+) -> Result<(), ClusterBuildError> {
     let topology = nodes
         .values()
         .next()
@@ -6415,8 +6584,7 @@ fn release_open_metadata_command_bucket_write_reservation(
                     source: std::io::Error::other(source),
                 },
             )
-        })?;
-    Ok(())
+        })
 }
 
 fn converge_in_flight_metadata_command_on_open(
@@ -6455,7 +6623,7 @@ fn converge_in_flight_metadata_command_on_open(
         maybe_run_open_metadata_command_after_apply_hook(nodes, pg_routes, *node_id, command);
     }
 
-    release_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
+    release_open_applied_metadata_command_bucket_write_reservations(nodes, pg_routes, command)?;
 
     let mut converged_states = Vec::new();
     for node in nodes.values() {
@@ -6533,36 +6701,7 @@ fn validate_open_metadata_command_bucket_write_reservation(
 fn command_bucket_write_reservation_proof(
     command: &MetadataCommandEnvelope,
 ) -> Option<&crate::metadata_command::BucketWriteReservationProof> {
-    match command.payload() {
-        crate::metadata_command::MetadataCommandPayload::CommitDirectPutObject(commit) => {
-            Some(&commit.bucket_write_reservation)
-        }
-        crate::metadata_command::MetadataCommandPayload::CommitMultipartObject(commit) => {
-            Some(&commit.bucket_write_reservation)
-        }
-        crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(create) => {
-            Some(&create.bucket_write_reservation)
-        }
-        crate::metadata_command::MetadataCommandPayload::CommitStreamPart(commit) => {
-            Some(&commit.bucket_write_reservation)
-        }
-        crate::metadata_command::MetadataCommandPayload::PutObjectMetadata(update) => {
-            Some(&update.bucket_write_reservation)
-        }
-        crate::metadata_command::MetadataCommandPayload::DeleteObjectVersion(delete) => {
-            Some(&delete.bucket_write_reservation)
-        }
-        crate::metadata_command::MetadataCommandPayload::InsertDeleteMarker(marker) => {
-            Some(&marker.bucket_write_reservation)
-        }
-        crate::metadata_command::MetadataCommandPayload::CreateMultipartUpload(create) => {
-            Some(create.bucket_write_reservation())
-        }
-        crate::metadata_command::MetadataCommandPayload::AbortMultipartUpload(abort) => {
-            Some(&abort.bucket_write_reservation)
-        }
-        _ => None,
-    }
+    command.payload().primary_bucket_write_reservation_proof()
 }
 
 fn bucket_snapshot_error_to_store_error(error: crate::BucketSnapshotLoadError) -> StoreError {

@@ -1304,6 +1304,7 @@ fn serving_pg_runtime_map_ignores_unrelated_unserved_pg() {
                 endpoint: "node-2.sock".to_owned(),
                 observed_epoch: authority.snapshot().cluster_epoch(),
                 requested_lease_duration_ms: 1_000,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: vec![NodePgHeartbeatObservation {
                     pg_id: PgId::new(26),

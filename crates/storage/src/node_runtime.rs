@@ -447,6 +447,10 @@ pub(super) mod node_facade {
     #[cfg(test)]
     pub(crate) use super::engine::LocalStorageNode;
     #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) use super::engine::SharedStorageNode;
+    #[cfg(feature = "test-hooks")]
+    pub use super::engine::StorageNodeHeartbeatTestSource;
+    #[cfg(any(test, feature = "test-hooks"))]
     pub use super::engine::{install_bucket_scoped_test_hooks, BucketScopedTestHooks};
     pub(crate) use super::engine::{
         maybe_run_after_begin_bucket_delete_drain_hook,
@@ -461,7 +465,6 @@ pub(super) mod node_facade {
     pub(crate) use super::engine::{
         maybe_run_after_direct_put_metadata_publish_hook, maybe_run_bucket_metadata_read_hook,
         BucketPgTestGuard, DirectPutMetadataPublishHook, DirectPutMetadataPublishTestHookGuard,
-        SharedStorageNode,
     };
     #[cfg(test)]
     pub(crate) use super::engine::{
@@ -510,10 +513,10 @@ pub(super) mod pg_store_facade {
         MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES, MAX_PG_DURABLE_IDENTITY_BYTES,
     };
     pub(crate) use super::pg_store::{
-        MetadataProofStorageIssuer, PendingMetadataCommandSlotInsertError,
-        PendingMetadataCommandSlotReplaceError, ScavengerShardFile, ScavengerShardFileScan,
-        ScavengerShardRow, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
-        METADATA_COMMAND_CHECKPOINT_MAGIC,
+        MetadataCommandStartupDisposition, MetadataProofStorageIssuer,
+        PendingMetadataCommandSlotInsertError, PendingMetadataCommandSlotReplaceError,
+        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,
+        METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, METADATA_COMMAND_CHECKPOINT_MAGIC,
     };
 }
 

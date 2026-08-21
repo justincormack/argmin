@@ -2831,7 +2831,7 @@ impl super::StorageCluster {
                         let applied_on_all = self
                             .metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
                                 pg_id, &command, route_mode,
-                            )?;
+                        )?;
                         if applied_on_all {
                             if !self
                                 .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(

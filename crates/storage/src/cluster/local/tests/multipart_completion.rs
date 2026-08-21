@@ -3201,6 +3201,7 @@ fn multipart_completion_races_classify_published_pending_command_by_manifest() {
     let command_release_response_lost = Arc::new(AtomicBool::new(false));
     let command_release_response_lost_for_hook = Arc::clone(&command_release_response_lost);
     let release_upload_id = request.upload_id.clone();
+    let reservations_before_command_release = reservation_ids();
     let command_release_hook = cluster
         .test_install_metadata_command_terminal_reservation_release_hook(Arc::new(
             move |command| {
@@ -3214,7 +3215,7 @@ fn multipart_completion_races_classify_published_pending_command_by_manifest() {
                         context: "injected multipart command reservation release response loss",
                         source: std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
-                            "injected response loss after command reservation release",
+                            "injected failure before command reservation release",
                         ),
                     }));
                 }
@@ -3228,8 +3229,9 @@ fn multipart_completion_races_classify_published_pending_command_by_manifest() {
     assert!(command_release_response_lost.load(Ordering::SeqCst));
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
-        "response loss after command reservation release must retain the pending slot"
+        "reservation release failure must retain the pending slot as a durable cleanup owner"
     );
+    assert_eq!(reservation_ids(), reservations_before_command_release);
     drop(command_release_hook);
 
     let converged = cluster
@@ -3237,6 +3239,7 @@ fn multipart_completion_races_classify_published_pending_command_by_manifest() {
         .unwrap();
     assert_eq!(converged.version_id, published.version_id);
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert!(reservation_ids().is_empty());
     assert_streamed_multipart_completion_on_acting_nodes(
         &map,
         &node_ids,

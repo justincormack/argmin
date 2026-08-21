@@ -1123,7 +1123,7 @@ pub struct ControlPlaneHistoryReferenceSample {
     pub observed_at_ms: u64,
     pub oldest_live_placement_epoch: Option<u64>,
     pub oldest_durable_backfill_epoch: Option<u64>,
-    pub oldest_pending_metadata_command_epoch: Option<u64>,
+    pub oldest_metadata_command_resource_epoch: Option<u64>,
     pub oldest_object_payload_reclaim_claim_epoch: Option<u64>,
 }
 

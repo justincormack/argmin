@@ -704,12 +704,19 @@ fn pending_metadata_command_for_test(
     pg_id: PgId,
     bucket: &BucketName,
 ) -> Option<MetadataCommandEnvelope> {
-    let primary = map
-        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
-        .unwrap();
+    pending_metadata_command_for_epoch_test(map, ClusterEpoch::INITIAL, pg_id, bucket)
+}
+
+fn pending_metadata_command_for_epoch_test(
+    map: &LocalClusterMap,
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    bucket: &BucketName,
+) -> Option<MetadataCommandEnvelope> {
+    let primary = map.metadata_pg_primary_node(cluster_epoch, pg_id).unwrap();
     let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
     let command = pg
-        .pending_metadata_command_envelope(primary.node_id().as_u32(), ClusterEpoch::INITIAL)
+        .pending_metadata_command_envelope(primary.node_id().as_u32(), cluster_epoch)
         .unwrap();
     if let Some(command) = &command {
         assert_eq!(command.bucket_name(), bucket);

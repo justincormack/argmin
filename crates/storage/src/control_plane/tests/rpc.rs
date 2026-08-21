@@ -14,7 +14,7 @@ const CONTROL_PLANE_RPC_CATALOGUE_HISTORY_KINDS: [PgClusterMapHistoryRouteRefere
     PgClusterMapHistoryRouteReferenceKind::LivePlacement,
     PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
     PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
-    PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+    PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
     PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
 ];
 const CONTROL_PLANE_RPC_CATALOGUE_METRIC_KINDS: [observability::ControlPlaneRpcMetricKind; 17] = {
@@ -245,6 +245,7 @@ fn control_plane_rpc_catalogue_heartbeat() -> NodeHeartbeat {
         endpoint: "unix:///catalogue-node-3".to_owned(),
         observed_epoch: ClusterEpoch::new(5).unwrap(),
         requested_lease_duration_ms: 6_000,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: PgClusterMapHistoryRouteReferences::try_from_iter(
             CONTROL_PLANE_RPC_CATALOGUE_HISTORY_KINDS
                 .into_iter()
@@ -507,7 +508,7 @@ fn control_plane_rpc_catalogue_diagnostics() -> ControlPlaneRuntimeMapDiagnostic
             observed_at_ms: 531,
             oldest_live_placement_epoch: Some(1),
             oldest_durable_backfill_epoch: None,
-            oldest_pending_metadata_command_epoch: Some(1),
+            oldest_metadata_command_resource_epoch: Some(1),
             oldest_object_payload_reclaim_claim_epoch: None,
         }],
         node_leases: vec![ControlPlaneRuntimeMapNodeLeaseDiagnostic::new(
@@ -527,7 +528,7 @@ fn control_plane_rpc_catalogue_diagnostics_alternate_options() -> ControlPlaneRu
         observed_at_ms: 551,
         oldest_live_placement_epoch: None,
         oldest_durable_backfill_epoch: Some(1),
-        oldest_pending_metadata_command_epoch: None,
+        oldest_metadata_command_resource_epoch: None,
         oldest_object_payload_reclaim_claim_epoch: Some(1),
     };
     diagnostics.node_leases[0] =
@@ -1103,7 +1104,39 @@ fn append_control_plane_rpc_catalogue_invalid_runtime_map(
 }
 
 #[test]
-fn control_plane_rpc_v14_operation_catalogue_is_exact() {
+fn control_plane_rpc_v14_operation_catalogue_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v14_operation.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            12_786,
+            "f100f7b2f763b0c40cc70ad8d52bf54e853bb4fb67fb20f98f86302f6cca07cc".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0usize;
+    while !remaining.is_empty() {
+        let (_section, tail) = remaining.split_first().unwrap();
+        let (raw_len, tail) = tail.split_at(4);
+        let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+        let (frame, tail) = tail.split_at(len);
+        let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)).unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { diagnostic }
+                if diagnostic.as_str() == "unsupported control-plane RPC version 14"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > ControlPlaneRpcKind::ALL.len());
+}
+
+#[test]
+fn control_plane_rpc_v15_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -1315,15 +1348,15 @@ fn control_plane_rpc_v14_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            12_786,
-            "f100f7b2f763b0c40cc70ad8d52bf54e853bb4fb67fb20f98f86302f6cca07cc".to_owned()
+            12_794,
+            "662eda24308716d84b41f5e1904103affccc76d2344d1a37ec715db256d22958".to_owned()
         )
     );
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v14_auth_v1_payload_binding_is_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 14);
+fn authenticated_control_plane_rpc_v14_and_v15_auth_v1_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 15);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -1340,7 +1373,19 @@ fn authenticated_control_plane_rpc_v14_auth_v1_payload_binding_is_exact() {
             .unwrap();
     assert_eq!(request_envelope.payload(), &[0x00, 0x0c]);
     let request_frame = encode_control_plane_rpc_frame(kind, &request.payload).unwrap();
-    assert!(request_frame.starts_with(b"argmin-control-plane-rpc\x00\x0e"));
+    assert!(request_frame.starts_with(b"argmin-control-plane-rpc\x00\x0f"));
+    let previous_request_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 14).unwrap();
+    assert_eq!(
+        (
+            previous_request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&previous_request_frame))
+        ),
+        (
+            182,
+            "8e6ced7925437cef8aae609508634cdcd86e76088d8e4b5816654f77652f4419".to_owned()
+        )
+    );
     let verified = verify_control_plane_unix_request(request, Some(&verifier), 1_000).unwrap();
     assert_eq!(verified.kind, kind);
     assert!(verified.payload.is_empty());
@@ -1368,6 +1413,18 @@ fn authenticated_control_plane_rpc_v14_auth_v1_payload_binding_is_exact() {
         encoded_response
     );
     let response_frame = encode_control_plane_rpc_frame(kind, &response).unwrap();
+    let previous_response_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &response, 14).unwrap();
+    assert_eq!(
+        (
+            previous_response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&previous_response_frame))
+        ),
+        (
+            190,
+            "72f5e379703b62bcd438281d63ac0dcc9c937400004d8c75e4014bb43b1128b7".to_owned()
+        )
+    );
 
     assert_eq!(
         (
@@ -1376,7 +1433,7 @@ fn authenticated_control_plane_rpc_v14_auth_v1_payload_binding_is_exact() {
         ),
         (
             182,
-            "8e6ced7925437cef8aae609508634cdcd86e76088d8e4b5816654f77652f4419".to_owned()
+            "37645109ed5bf0542da0101873aebdfffd5f2eae42bd51d2b4a7956cb31584da".to_owned()
         )
     );
     assert_eq!(
@@ -1386,7 +1443,7 @@ fn authenticated_control_plane_rpc_v14_auth_v1_payload_binding_is_exact() {
         ),
         (
             190,
-            "72f5e379703b62bcd438281d63ac0dcc9c937400004d8c75e4014bb43b1128b7".to_owned()
+            "ae755056e5f6f4308f6e28c788cdfcd204f74e8d383bf0188cbb08b7873bce9d".to_owned()
         )
     );
 }
@@ -2140,6 +2197,7 @@ fn unix_control_plane_client_refreshes_heartbeat_and_runtime_map_together() {
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: heartbeat_epoch,
                 requested_lease_duration_ms: 100,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -6416,6 +6474,7 @@ fn authenticated_unix_control_plane_client_refreshes_storage_node_heartbeat() {
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: heartbeat_epoch,
                 requested_lease_duration_ms: 100,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -6506,6 +6565,7 @@ fn authenticated_unix_control_plane_client_resigns_heartbeat_transport_retry() {
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: heartbeat_epoch,
                 requested_lease_duration_ms: 1_000,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -6553,6 +6613,7 @@ fn authenticated_unix_control_plane_client_does_not_recreate_heartbeat_deadline(
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: ClusterEpoch::new(1).unwrap(),
                 requested_lease_duration_ms: 10,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -6608,6 +6669,7 @@ fn authenticated_storage_node_heartbeat_accepts_overlapping_credentials() {
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: heartbeat_epoch,
                 requested_lease_duration_ms: 100,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -6664,6 +6726,7 @@ fn authenticated_unix_control_plane_client_verifies_heartbeat_response_at_receiv
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: heartbeat_epoch,
                 requested_lease_duration_ms: 100,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -6707,6 +6770,7 @@ fn authenticated_unix_control_plane_client_rejects_unsigned_heartbeat_response()
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: ClusterEpoch::new(1).unwrap(),
                 requested_lease_duration_ms: 100,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -6738,6 +6802,7 @@ fn authenticated_control_plane_rejects_missing_storage_node_heartbeat_auth() {
         endpoint: "/tmp/argmin-node-1.sock".to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: Default::default(),
         pg_observations: Vec::new(),
     };
@@ -6799,6 +6864,7 @@ fn frontend_auth_verifier_does_not_require_storage_node_heartbeat_auth() {
         endpoint: "/tmp/argmin-node-1.sock".to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: Default::default(),
         pg_observations: Vec::new(),
     };
@@ -6901,6 +6967,7 @@ fn authenticated_control_plane_rejects_storage_node_heartbeat_wrong_embedded_kin
         endpoint: "/tmp/argmin-node-1.sock".to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: Default::default(),
         pg_observations: Vec::new(),
     };
@@ -6962,6 +7029,7 @@ fn authenticated_control_plane_rejects_storage_node_incarnation_mismatch() {
         endpoint: "/tmp/argmin-node-1.sock".to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: Default::default(),
         pg_observations: Vec::new(),
     };
@@ -7018,6 +7086,7 @@ fn authenticated_control_plane_rejects_storage_node_heartbeat_without_freshness(
         endpoint: "/tmp/argmin-node-1.sock".to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: Default::default(),
         pg_observations: Vec::new(),
     };
@@ -7079,6 +7148,7 @@ fn authenticated_control_plane_accepts_storage_node_heartbeat_at_future_skew_bou
         endpoint: "/tmp/argmin-node-1.sock".to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: Default::default(),
         pg_observations: Vec::new(),
     };
@@ -7133,6 +7203,7 @@ fn authenticated_control_plane_rejects_storage_node_heartbeat_beyond_future_skew
         endpoint: "/tmp/argmin-node-1.sock".to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: Default::default(),
         pg_observations: Vec::new(),
     };
@@ -7233,6 +7304,7 @@ fn authenticated_control_plane_rejects_storage_node_heartbeat_long_replay_window
         endpoint: "/tmp/argmin-node-1.sock".to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: Default::default(),
         pg_observations: Vec::new(),
     };
@@ -7335,6 +7407,7 @@ fn unix_control_plane_client_retries_heartbeat_after_lost_response() {
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: heartbeat_epoch,
                 requested_lease_duration_ms: TEST_HEARTBEAT_LEASE_MS,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -7427,6 +7500,7 @@ fn unix_control_plane_client_waits_for_slow_heartbeat_response_within_lease() {
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: heartbeat_epoch,
                 requested_lease_duration_ms: 3_000,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -7553,6 +7627,7 @@ fn unix_control_plane_client_stops_heartbeat_retry_before_lease_window_expires()
                 endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                 observed_epoch: heartbeat_epoch,
                 requested_lease_duration_ms: 1,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -7617,6 +7692,7 @@ fn unix_control_plane_client_does_not_send_heartbeat_retry_at_lease_deadline() {
             endpoint: "/tmp/argmin-node-1.sock".to_owned(),
             observed_epoch: heartbeat_epoch,
             requested_lease_duration_ms: 50,
+            cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
             cluster_map_history_route_references: Default::default(),
             pg_observations: Vec::new(),
         },
@@ -8921,6 +8997,7 @@ fn unix_control_plane_client_receives_framed_authority_error() {
                 endpoint: "/tmp/argmin-node-99.sock".to_owned(),
                 observed_epoch: ClusterEpoch::INITIAL,
                 requested_lease_duration_ms: 100,
+                cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: Vec::new(),
             },
@@ -9375,7 +9452,7 @@ fn runtime_map_diagnostics_reports_rpc_and_snapshot_metrics() {
             PgId::new(1),
         ),
         PgClusterMapHistoryRouteReference::new(
-            PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+            PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
             history_epoch,
             PgId::new(1),
         ),
@@ -9407,7 +9484,7 @@ fn runtime_map_diagnostics_reports_rpc_and_snapshot_metrics() {
         observed_at_ms: 2_000,
         oldest_live_placement_epoch: Some(history_epoch.get()),
         oldest_durable_backfill_epoch: None,
-        oldest_pending_metadata_command_epoch: Some(history_epoch.get()),
+        oldest_metadata_command_resource_epoch: Some(history_epoch.get()),
         oldest_object_payload_reclaim_claim_epoch: Some(history_epoch.get()),
     };
     assert_eq!(
@@ -9479,7 +9556,7 @@ fn runtime_map_diagnostics_reports_rpc_and_snapshot_metrics() {
             PgId::new(1),
         ),
         PgClusterMapHistoryRouteReference::new(
-            PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+            PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
             history_epoch,
             PgId::new(1),
         ),
@@ -9703,7 +9780,11 @@ fn control_plane_rpc_rejects_corrupted_payload_checksum() {
 
 #[test]
 fn control_plane_rpc_rejects_previous_and_future_version_fixtures() {
-    for version in [CONTROL_PLANE_RPC_VERSION - 1, CONTROL_PLANE_RPC_VERSION + 1] {
+    for version in [
+        13,
+        CONTROL_PLANE_RPC_VERSION - 1,
+        CONTROL_PLANE_RPC_VERSION + 1,
+    ] {
         let frame = encode_control_plane_rpc_frame_with_version(
             ControlPlaneRpcKind::RuntimeMapStatus,
             &[],
@@ -9821,6 +9902,7 @@ fn control_plane_rpc_rejects_oversized_heartbeat_observation_count_before_alloca
     write_string(&mut payload, "/tmp/argmin-node-1.sock").unwrap();
     write_u64(&mut payload, ClusterEpoch::INITIAL.get());
     write_u64(&mut payload, 100);
+    write_u64(&mut payload, 1);
     write_u32(&mut payload, 0);
     write_u32(&mut payload, u32::MAX);
 
@@ -9860,6 +9942,7 @@ fn control_plane_rpc_heartbeat_round_trips_exact_history_route_references() {
         endpoint: "/tmp/argmin-node-1.sock".to_owned(),
         observed_epoch: ClusterEpoch::new(3).unwrap(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1).unwrap(),
         cluster_map_history_route_references: references,
         pg_observations: Vec::new(),
     };
@@ -9876,9 +9959,7 @@ fn control_plane_rpc_rejects_oversized_history_route_count_before_allocation() {
     write_string(&mut payload, "/tmp/argmin-node-1.sock").unwrap();
     write_u64(&mut payload, ClusterEpoch::INITIAL.get());
     write_u64(&mut payload, 100);
-    write_option_u64(&mut payload, None);
-    write_option_u64(&mut payload, None);
-    write_option_u64(&mut payload, None);
+    write_u64(&mut payload, 1);
     write_u32(&mut payload, u32::MAX);
 
     let mut reader = PayloadReader::new(&payload);
@@ -9898,6 +9979,7 @@ fn control_plane_rpc_rejects_malformed_heartbeat_pending_command_presence() {
     write_string(&mut payload, "/tmp/argmin-node-1.sock").unwrap();
     write_u64(&mut payload, ClusterEpoch::INITIAL.get());
     write_u64(&mut payload, 100);
+    write_u64(&mut payload, 1);
     write_u32(&mut payload, 0);
     write_u32(&mut payload, 1);
     write_u32(&mut payload, 7);

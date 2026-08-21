@@ -3,12 +3,12 @@
 
 /// LocalStorageNode and SharedStorageNode — manage multiple PgStores on a single node.
 use ec::{EcConfig, ErasureCodec};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -41,13 +41,13 @@ use crate::data_dir::prepare_private_data_dir;
 #[cfg(test)]
 use crate::error::BucketWriteDrainError;
 use crate::error::{BucketSnapshotLoadError, ObjectPgActionError, StoreError};
-use crate::metadata_command::ObjectPayloadReclaimClaimProof;
 #[cfg(test)]
 use crate::metadata_command::{
-    CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-    MetadataCommandPayload,
+    CreateBucketCommand, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
 };
+use crate::metadata_command::{MetadataCommandEnvelope, ObjectPayloadReclaimClaimProof};
 use crate::node_runtime::pg_store::{
+    EpochMismatchedPendingMetadataCommand, MetadataCommandStartupDisposition,
     PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReferences, PgStore,
     PgStoreRecoveryContext, ScavengerShardFileScan,
 };
@@ -463,6 +463,42 @@ pub struct SharedStorageNode {
     object_payload_leases: Mutex<ObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
     ec_write_states: Mutex<HashMap<EcShape, Arc<StorageEcWriteState>>>,
+    cluster_map_history_route_scan_generation: AtomicU64,
+}
+
+#[cfg(feature = "test-hooks")]
+pub struct StorageNodeHeartbeatTestSource {
+    node: SharedStorageNode,
+}
+
+#[cfg(feature = "test-hooks")]
+impl StorageNodeHeartbeatTestSource {
+    pub fn open(data_dir: &Path, pg_ids: &[u32]) -> Result<Self, String> {
+        SharedStorageNode::open(data_dir, pg_ids)
+            .map(|node| Self { node })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn heartbeat(
+        &self,
+        node_id: NodeId,
+        node_incarnation: u64,
+        endpoint: impl Into<String>,
+        observed_epoch: ClusterEpoch,
+        requested_lease_duration_ms: u64,
+        pg_states: impl IntoIterator<Item = (PgId, PgState)>,
+    ) -> Result<NodeHeartbeat, String> {
+        self.node
+            .control_plane_heartbeat(
+                node_id,
+                node_incarnation,
+                endpoint,
+                observed_epoch,
+                requested_lease_duration_ms,
+                pg_states,
+            )
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Opaque process-local node runtime used by the cluster facade.
@@ -575,11 +611,31 @@ impl LocalNodeRuntime {
         self.node.process_local_registry_key
     }
 
-    pub(crate) fn prepare_metadata_command_recovery(
+    pub(crate) fn epoch_mismatched_pending_metadata_commands(
         &self,
         node_id: NodeId,
-    ) -> Result<(), StoreError> {
-        self.node.prepare_pg_metadata_command_recovery(node_id)
+    ) -> Result<Vec<(PgId, EpochMismatchedPendingMetadataCommand)>, StoreError> {
+        self.node
+            .epoch_mismatched_pending_metadata_commands(node_id)
+    }
+
+    pub(crate) fn remove_epoch_mismatched_orphan_pending_metadata_command(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        self.node
+            .remove_epoch_mismatched_orphan_pending_metadata_command(node_id, pg_id, command)
+    }
+
+    pub(crate) fn metadata_command_startup_disposition(
+        &self,
+        node_id: NodeId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandStartupDisposition, StoreError> {
+        self.node
+            .metadata_command_startup_disposition(node_id, command)
     }
 
     pub(crate) fn recover_metadata_command_state(&self, node_id: NodeId) -> Result<(), StoreError> {
@@ -799,6 +855,7 @@ impl SharedStorageNode {
                 Condvar::new(),
             ),
             ec_write_states: Mutex::new(HashMap::new()),
+            cluster_map_history_route_scan_generation: AtomicU64::new(0),
         })
     }
 
@@ -887,6 +944,7 @@ impl SharedStorageNode {
                 Condvar::new(),
             ),
             ec_write_states: Mutex::new(HashMap::new()),
+            cluster_map_history_route_scan_generation: AtomicU64::new(0),
         })
     }
 
@@ -978,25 +1036,41 @@ impl SharedStorageNode {
         Ok(())
     }
 
-    /// Recovery phase A for clustered open paths: clean epoch-mismatched orphan
-    /// pending command slots on every opened PG. This must run before a
-    /// cluster-wide convergence pass, which would otherwise reject an orphan
-    /// through the epoch-checked pending-slot read before full recovery could
-    /// clean it. Same-epoch primary pending slots are preserved for convergence.
-    pub(crate) fn prepare_pg_metadata_command_recovery(
+    pub(crate) fn epoch_mismatched_pending_metadata_commands(
         &self,
         node_id: NodeId,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<(PgId, EpochMismatchedPendingMetadataCommand)>, StoreError> {
         let ctx = PgStoreRecoveryContext::for_node(node_id);
-        bounded_pg_startup_map(
-            &self.pg_id_list,
-            pg_startup_parallelism(self.pg_id_list.len()),
-            &|pg_id| {
-                self.get_pg(pg_id)?
-                    .recover_clean_orphan_pending_command_slots(ctx)
-            },
-        )?;
-        Ok(())
+        let mut commands = Vec::new();
+        for &pg_id in self.pg_id_list.iter() {
+            let pg = self.get_pg(pg_id)?;
+            if let Some(command) = pg.epoch_mismatched_pending_metadata_command(ctx)? {
+                commands.push((PgId::new(pg_id), command));
+            }
+        }
+        Ok(commands)
+    }
+
+    pub(crate) fn remove_epoch_mismatched_orphan_pending_metadata_command(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        self.get_pg(pg_id.get())?
+            .remove_epoch_mismatched_orphan_pending_metadata_command(
+                PgStoreRecoveryContext::for_node(node_id),
+                command,
+            )
+    }
+
+    pub(crate) fn metadata_command_startup_disposition(
+        &self,
+        node_id: NodeId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandStartupDisposition, StoreError> {
+        self.get_pg(command.id().pg_id().get())?
+            .metadata_command_startup_disposition(node_id.as_u32(), command)
     }
 
     pub fn bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
@@ -1633,7 +1707,8 @@ impl SharedStorageNode {
         let metadata_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
         let metadata_state =
             pg.metadata_command_replica_state_for_heartbeat(node_id.as_u32(), metadata_epoch)?;
-        let pending_slot = pg.pending_metadata_command_slot_any_epoch(node_id.as_u32())?;
+        let pending_route_references =
+            pg.pending_metadata_command_route_references(node_id.as_u32())?;
 
         // Heartbeat is a serving-time observation path. It reports proof and
         // pending-slot presence, but it must not reconcile or delete pending
@@ -1641,12 +1716,12 @@ impl SharedStorageNode {
         // before apply/record advances durable replica state, and terminal
         // same-epoch slots are also command/recovery cleanup work, not
         // heartbeat work.
-        let pending_metadata_command = pending_slot.map(|slot| {
+        let pending_metadata_command = pending_route_references.map(|pending| {
             PendingMetadataCommandObservation::new(
-                slot.id.cluster_epoch(),
-                NonZeroU64::new(slot.id.log_index().get())
+                pending.id.cluster_epoch(),
+                NonZeroU64::new(pending.id.log_index().get())
                     .expect("pending metadata command log index is nonzero"),
-                slot.command_checksum,
+                pending.command_checksum,
             )
         });
         Ok(NodePgHeartbeatObservation {
@@ -1670,17 +1745,49 @@ impl SharedStorageNode {
         requested_lease_duration_ms: u64,
         pg_states: impl IntoIterator<Item = (PgId, PgState)>,
     ) -> Result<NodeHeartbeat, StoreError> {
-        let pg_observations = pg_states
-            .into_iter()
-            .map(|(pg_id, state)| self.pg_heartbeat_observation(node_id, pg_id, state))
-            .collect::<Result<Vec<_>, _>>()?;
+        let requested_pg_states = pg_states.into_iter().collect::<BTreeMap<_, _>>();
+        let mut pg_observations = Vec::new();
+        for raw_pg_id in &self.pg_id_list {
+            let pg_id = PgId::new(*raw_pg_id);
+            let pg = self.get_pg(*raw_pg_id)?;
+            let requested_state = requested_pg_states.get(&pg_id).copied();
+            let has_historical_pending_command = if requested_state.is_none() {
+                pg.pending_metadata_command_route_references(node_id.as_u32())?
+                    .is_some()
+            } else {
+                false
+            };
+            if requested_state.is_none() && !has_historical_pending_command {
+                continue;
+            }
+            pg_observations.push(Self::pg_heartbeat_observation_from_pg(
+                &pg,
+                node_id,
+                pg_id,
+                requested_state.unwrap_or(PgState::Peering),
+            )?);
+        }
         let cluster_map_history_route_references = self.cluster_map_history_route_references()?;
+        let cluster_map_history_route_scan_generation = self
+            .cluster_map_history_route_scan_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| {
+                NonZeroU64::new(previous + 1)
+                    .expect("successful route scan generation increment is nonzero")
+            })
+            .map_err(|_| StoreError::Io {
+                context: "allocate cluster-map history route scan generation",
+                source: std::io::Error::other("route scan generation exhausted"),
+            })?;
         Ok(NodeHeartbeat {
             node_id,
             node_incarnation,
             endpoint: endpoint.into(),
             observed_epoch,
             requested_lease_duration_ms,
+            cluster_map_history_route_scan_generation,
             cluster_map_history_route_references,
             pg_observations,
         })
@@ -2276,6 +2383,7 @@ impl Drop for EncodeScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind};
 
     fn bucket_name(name: &str) -> BucketName {
         BucketName::try_from(name).unwrap()
@@ -2775,7 +2883,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_node_recover_cleans_older_epoch_orphan_pending_command() {
+    fn shared_node_recover_preserves_older_epoch_pending_command_for_topology_recovery() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         let newer_epoch = ClusterEpoch::new(2).unwrap();
@@ -2798,20 +2906,18 @@ mod tests {
             metadata_state
         };
 
-        // Recovery may clean epoch-mismatched orphans only when the slot is
-        // older than the store's replica-state epoch. A future-epoch slot can
-        // still be an in-flight first command for that epoch and must fail
-        // closed without acting-set evidence.
+        // A raw storage-node restart lacks acting-set evidence and must leave
+        // an older slot for topology-aware cluster recovery.
         node.recover_pg_metadata_command_state(NodeId::new(7))
-            .expect("recovery must reconcile an epoch-mismatched orphan slot");
+            .expect("storage-node recovery must preserve an older pending slot");
 
         let pg = node.get_pg(0).unwrap();
-        assert!(
-            pg.pending_metadata_command_slot_any_epoch(7)
-                .unwrap()
-                .is_none(),
-            "orphan pending slot must be removed by recovery"
-        );
+        let slot = pg
+            .pending_metadata_command_slot_any_epoch(7)
+            .unwrap()
+            .expect("older pending slot must remain available to cluster recovery");
+        assert_eq!(slot.id, old_command.id());
+        assert_eq!(slot.command_checksum, old_command.checksum_crc64());
         let state = pg.metadata_command_replica_state().unwrap();
         assert_eq!(state.applied_log_index, metadata_state.applied_log_index);
         assert_eq!(state.cluster_epoch, metadata_state.cluster_epoch);
@@ -2939,9 +3045,56 @@ mod tests {
     }
 
     #[test]
+    fn shared_node_pg_heartbeat_observation_does_not_read_pending_command_bytes() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let bucket = bucket_name("heartbeat-fixed-pending-identity");
+        let command = create_bucket_command_for(bucket.as_str(), ClusterEpoch::INITIAL);
+        {
+            let pg = node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+                .unwrap();
+            pg.test_set_pending_metadata_command_bytes(&vec![0xa5; 2 * 1024 * 1024])
+                .unwrap();
+        }
+
+        let observation = node
+            .pg_heartbeat_observation(NodeId::new(7), PgId::new(0), PgState::Peering)
+            .unwrap();
+        assert_eq!(
+            observation.pending_metadata_command,
+            Some(PendingMetadataCommandObservation::new(
+                command.id().cluster_epoch(),
+                NonZeroU64::new(command.id().log_index().get()).unwrap(),
+                command.checksum_crc64(),
+            ))
+        );
+    }
+
+    #[test]
     fn shared_node_control_plane_heartbeat_includes_pg_proofs() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let reservation_epoch = ClusterEpoch::new(2).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "heartbeat-reservation-route");
+        let bucket_pg_id = node.pg_topology().bucket_pg_for(&bucket);
+        let bucket_pg = node.get_pg(bucket_pg_id).unwrap();
+        crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*bucket_pg,
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "heartbeat-reservation",
+                owner_token: "heartbeat-reservation-owner",
+                cluster_epoch: reservation_epoch,
+                operation_kind: "delete-current-object",
+                created_at: 1,
+                lease_deadline: 10_000,
+                target_context: Some("object"),
+            },
+        )
+        .unwrap();
+        bucket_pg.refresh_metadata_command_state_digest().unwrap();
+        drop(bucket_pg);
 
         let heartbeat = node
             .control_plane_heartbeat(
@@ -2966,6 +3119,15 @@ mod tests {
             heartbeat.cluster_map_history_route_references,
             node.cluster_map_history_route_references().unwrap()
         );
+        assert!(heartbeat
+            .cluster_map_history_route_references
+            .iter()
+            .any(|reference| reference
+                == PgClusterMapHistoryRouteReference::new(
+                    PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
+                    reservation_epoch,
+                    PgId::new(bucket_pg_id),
+                )));
         assert_eq!(heartbeat.pg_observations.len(), 2);
         assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
         assert_eq!(heartbeat.pg_observations[0].state, PgState::Peering);
@@ -2990,6 +3152,65 @@ mod tests {
                 metadata_state.state_digest
             );
         }
+    }
+
+    #[test]
+    fn shared_node_control_plane_heartbeat_reports_pending_non_route_pg() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = bucket_name("historical-pending-heartbeat");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let config = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config_for_test(&config, 123, 1).unwrap(),
+            ),
+        );
+        node.get_pg(1)
+            .unwrap()
+            .try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+            .unwrap();
+
+        let heartbeat = node
+            .control_plane_heartbeat(
+                NodeId::new(7),
+                42,
+                "node-7.sock",
+                ClusterEpoch::new(2).unwrap(),
+                1_000,
+                [(PgId::new(0), PgState::Active)],
+            )
+            .unwrap();
+
+        assert_eq!(heartbeat.pg_observations.len(), 2);
+        assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
+        assert_eq!(heartbeat.pg_observations[1].pg_id, PgId::new(1));
+        assert_eq!(heartbeat.pg_observations[1].state, PgState::Peering);
+        assert_eq!(
+            heartbeat.pg_observations[1].pending_metadata_command,
+            Some(PendingMetadataCommandObservation::new(
+                ClusterEpoch::INITIAL,
+                NonZeroU64::MIN,
+                command.checksum_crc64(),
+            ))
+        );
     }
 
     fn create_bucket_for_snapshot_test(node: &SharedStorageNode, name: &str) -> BucketName {

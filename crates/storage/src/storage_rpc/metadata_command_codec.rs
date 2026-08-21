@@ -1637,7 +1637,7 @@ pub(crate) fn encode_cluster_map_history_reference_summary_response(
             PgClusterMapHistoryRouteReferenceKind::LivePlacement => 1,
             PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource => 2,
             PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => 3,
-            PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => 4,
+            PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource => 4,
             PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim => 5,
         });
         put_u64(&mut out, reference.cluster_epoch().get());
@@ -1665,7 +1665,7 @@ pub(crate) fn decode_cluster_map_history_reference_summary_response(
             1 => PgClusterMapHistoryRouteReferenceKind::LivePlacement,
             2 => PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
             3 => PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
-            4 => PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+            4 => PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
             5 => PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
             _ => {
                 return Err(

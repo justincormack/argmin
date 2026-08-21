@@ -1494,6 +1494,8 @@ mod tests {
                         endpoint: endpoint.clone(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                            .unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: pg_observations.clone(),
                     },
@@ -1811,6 +1813,8 @@ mod tests {
                         endpoint: tmp.path().join("node.sock").display().to_string(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 10_000,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                            .unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: vec![NodePgHeartbeatObservation {
                             pg_id,
@@ -1838,6 +1842,8 @@ mod tests {
                     endpoint: tmp.path().join("node.sock").display().to_string(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 10_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                        .unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id,
@@ -1919,6 +1925,8 @@ mod tests {
                         endpoint: tmp.path().join("node.sock").display().to_string(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 50,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                            .unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: vec![NodePgHeartbeatObservation {
                             pg_id,
@@ -1946,6 +1954,8 @@ mod tests {
                     endpoint: tmp.path().join("node.sock").display().to_string(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 50,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                        .unwrap(),
                     cluster_map_history_route_references: Default::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id,

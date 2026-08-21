@@ -240,6 +240,46 @@ the process-wide per-command recovery flight to deduplicate convergence. The
 pending slot and bucket-write reservation remain durable until that worker has
 converged every required replica and completed terminal cleanup.
 
+Cross-PG reservation routes are stored in a fixed-width sidecar in the same
+transaction as the pending slot. Its integrity checksum binds the complete
+command ID, command checksum, and every retained route dependency, so heartbeat
+construction does not read, allocate, hash, or decode the command envelope.
+The slot remains the durable cleanup owner: terminal cleanup releases every
+command-owned reservation before removing the exact pending slot.
+
+Heartbeat collection observes PGs independently, so a slot insertion and a
+reservation release cannot be captured atomically across PGs. The control plane
+therefore persists references omitted from one heartbeat as retiring references
+for one further heartbeat. Current and retiring references both protect route
+history and are included in node refresh. A later report either restores the
+reference or acknowledges its retirement by omitting it again; one interleaved
+scan cannot permanently prune a still-live cross-PG cleanup route.
+
+Each complete storage scan carries a process-incarnation-scoped, monotonically
+increasing generation. The control plane advances retirement only for a newer
+generation and ignores the route-reference portion of a retransmitted generation.
+Losing a heartbeat response and retrying the same authenticated report therefore
+cannot count one storage scan as two omissions. A new node incarnation resets the
+accepted generation before its first report; there is no cross-process monotonic
+clock assumption and no older control-plane RPC encoding is accepted. Once the
+reported reference set is unchanged and no reference is retiring, accepting a
+newer scan generation is a durable no-op; the volatile node view may advance the
+generation without appending another journal or Raft WAL entry.
+
+A storage node reports pending-command evidence for every opened PG, including
+a PG from whose current acting set it has been removed. Non-acting observations
+are accepted only when they contain a pending command and retained history proves
+the authenticated reporting node was that command epoch's active primary.
+Ordinary stale PG state remains discarded. Recovery discovery scans this
+independently authorized historical-primary evidence across all node records, so
+an offline old primary can make its durable slot discoverable after an acting-set
+change. Accepting that evidence fences an already Active replacement route into
+Peering and reinserts the evidence after the resulting epoch transition, so the
+route cannot continue serving or erase the recovery task. Replaying the same
+stale evidence while the PG is already Peering restores the observation without
+advancing the global epoch again. Clearing the slot removes the observation on
+the next complete heartbeat.
+
 Response construction must not introduce a new fallible storage or parsing
 boundary after publication. Bucket metadata mutations return a receipt derived
 from the exact applied command, including its bucket execution generation;

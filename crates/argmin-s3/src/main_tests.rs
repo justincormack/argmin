@@ -19,6 +19,38 @@ mod tests {
         ControlPlaneRaftLeaderId, ControlPlaneRaftPeerTestClient,
         ControlPlaneRaftPeerTransportLimits,
     };
+    use storage::StorageNodeHeartbeatTestSource;
+
+    macro_rules! heartbeat_field {
+        ($name:ident) => {
+            $name
+        };
+        ($name:ident: $value:expr) => {
+            $value
+        };
+    }
+
+    macro_rules! node_heartbeat {
+        {
+            $node_id_field:ident $(: $node_id:expr)?,
+            $node_incarnation_field:ident $(: $node_incarnation:expr)?,
+            $endpoint_field:ident $(: $endpoint:expr)?,
+            $observed_epoch_field:ident $(: $observed_epoch:expr)?,
+            $requested_lease_duration_ms_field:ident $(: $requested_lease_duration_ms:expr)?,
+            $cluster_map_history_route_references_field:ident $(: $cluster_map_history_route_references:expr)?,
+            $pg_observations_field:ident $(: $pg_observations:expr)? $(,)?
+        } => {
+            NodeHeartbeat::test_fixture(
+                heartbeat_field!($node_id_field $(: $node_id)?),
+                heartbeat_field!($node_incarnation_field $(: $node_incarnation)?),
+                heartbeat_field!($endpoint_field $(: $endpoint)?),
+                heartbeat_field!($observed_epoch_field $(: $observed_epoch)?),
+                heartbeat_field!($requested_lease_duration_ms_field $(: $requested_lease_duration_ms)?),
+                heartbeat_field!($cluster_map_history_route_references_field $(: $cluster_map_history_route_references)?),
+                heartbeat_field!($pg_observations_field $(: $pg_observations)?),
+            )
+        };
+    }
 
     #[test]
     fn unknown_positional_commands_are_rejected_before_server_startup() {
@@ -935,7 +967,7 @@ mod tests {
             node_incarnation,
         )
         .expect("storage-node auth client should build");
-        let heartbeat = storage::control_plane::NodeHeartbeat {
+        let heartbeat = node_heartbeat! {
             node_id,
             node_incarnation,
             endpoint: "/tmp/argmin-node-2.sock".to_string(),
@@ -1888,7 +1920,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -1909,7 +1941,7 @@ mod tests {
         let peering_refresh = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -1952,7 +1984,7 @@ mod tests {
         let active_refresh = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -1987,7 +2019,7 @@ mod tests {
         let steady_active_refresh = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -2078,7 +2110,7 @@ mod tests {
             observed_epoch: ClusterEpoch,
             pg_observations: Vec<NodePgHeartbeatObservation>,
         ) -> NodeHeartbeat {
-            NodeHeartbeat {
+            node_heartbeat! {
                 node_id: NodeId::new(node_id),
                 node_incarnation: 1,
                 endpoint: endpoint.to_owned(),
@@ -2431,40 +2463,62 @@ mod tests {
             "sustained Peering checkpoint must advance the WAL base"
         );
 
-        let metadata_proof = PgMetadataProof::for_test(
-            SUSTAINED_PEERING_INTERVALS
-                .saturating_mul(SUSTAINED_PEERING_ROUNDS)
-                .saturating_add(2),
-            0xfeed,
-            0xbeef,
-        );
+        let peering_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("production heartbeat store routes should read");
+        let heartbeat_nodes = (0..STORAGE_NODE_COUNT)
+            .map(|node_id| {
+                let pg_ids = peering_snapshot
+                    .pgs()
+                    .filter(|pg| pg.acting_set().contains(&NodeId::new(node_id)))
+                    .map(|pg| pg.pg_id().get())
+                    .collect::<Vec<_>>();
+                StorageNodeHeartbeatTestSource::open(
+                    &state_dir
+                        .0
+                        .path()
+                        .join(format!("heartbeat-storage-node-{node_id}")),
+                    &pg_ids,
+                )
+                .expect("production heartbeat storage node should open")
+            })
+            .collect::<Vec<_>>();
+        let metadata_proof = heartbeat_nodes[0]
+            .heartbeat(
+                NodeId::new(0),
+                1,
+                endpoints[0].clone(),
+                peering_epoch,
+                HEARTBEAT_LEASE_MS,
+                [(PgId::new(0), PgState::Peering)],
+            )
+            .expect("production heartbeat proof source should build")
+            .pg_observations[0]
+            .metadata_proof;
         for node_id in [0_u32, 2, 1] {
             let snapshot = harness
                 .control_plane
                 .current_snapshot()
                 .expect("peering observation snapshot should read");
             assert_eq!(snapshot.cluster_epoch(), peering_epoch);
-            let pg_observations = snapshot
+            let pg_states = snapshot
                 .pgs()
                 .filter(|pg| pg.acting_set().contains(&NodeId::new(node_id)))
-                .map(|pg| NodePgHeartbeatObservation {
-                    pg_id: pg.pg_id(),
-                    state: PgState::Peering,
-                    metadata_proof,
-                    pending_metadata_command: None,
-                })
-                .collect();
+                .map(|pg| (pg.pg_id(), PgState::Peering));
+            let generated_heartbeat = heartbeat_nodes[usize::try_from(node_id).unwrap()]
+                .heartbeat(
+                    NodeId::new(node_id),
+                    1,
+                    endpoints[usize::try_from(node_id).unwrap()].clone(),
+                    peering_epoch,
+                    HEARTBEAT_LEASE_MS,
+                    pg_states,
+                )
+                .expect("production peering heartbeat should build");
             harness
                 .control_plane
-                .refresh_node_heartbeat(
-                    heartbeat(
-                        node_id,
-                        &endpoints[usize::try_from(node_id).unwrap()],
-                        peering_epoch,
-                        pg_observations,
-                    ),
-                    now_ms,
-                )
+                .refresh_node_heartbeat(generated_heartbeat, now_ms)
                 .expect("production-shaped peering heartbeat should refresh");
             heartbeat_requests += 1;
             now_ms += 1;
@@ -2490,18 +2544,23 @@ mod tests {
                 .current_snapshot()
                 .expect("active observation routes should read");
             assert_eq!(snapshot.cluster_epoch(), active_epoch);
-            let pg_observations = active_primary_observations(&snapshot, node_id, metadata_proof);
+            let pg_states = snapshot
+                .pgs()
+                .filter(|pg| pg.active_primary() == Some(NodeId::new(node_id)))
+                .map(|pg| (pg.pg_id(), PgState::Active));
+            let generated_heartbeat = heartbeat_nodes[usize::try_from(node_id).unwrap()]
+                .heartbeat(
+                    NodeId::new(node_id),
+                    1,
+                    endpoints[usize::try_from(node_id).unwrap()].clone(),
+                    active_epoch,
+                    HEARTBEAT_LEASE_MS,
+                    pg_states,
+                )
+                .expect("production active heartbeat should build");
             harness
                 .control_plane
-                .refresh_node_heartbeat(
-                    heartbeat(
-                        node_id,
-                        &endpoints[usize::try_from(node_id).unwrap()],
-                        active_epoch,
-                        pg_observations,
-                    ),
-                    now_ms,
-                )
+                .refresh_node_heartbeat(generated_heartbeat, now_ms)
                 .expect("current primary Active observation should refresh");
             heartbeat_requests += 1;
             now_ms += 1;
@@ -2520,17 +2579,24 @@ mod tests {
                     .current_snapshot()
                     .expect("post-activation heartbeat state should read");
                 let observed_epoch = snapshot.cluster_epoch();
-                let pg_observations =
-                    active_primary_observations(&snapshot, node_id, metadata_proof);
+                let pg_states = snapshot
+                    .pgs()
+                    .filter(|pg| pg.active_primary() == Some(NodeId::new(node_id)))
+                    .map(|pg| (pg.pg_id(), PgState::Active));
+                let generated_heartbeat = heartbeat_nodes[usize::try_from(node_id).unwrap()]
+                    .heartbeat(
+                        NodeId::new(node_id),
+                        1,
+                        endpoints[usize::try_from(node_id).unwrap()].clone(),
+                        observed_epoch,
+                        HEARTBEAT_LEASE_MS,
+                        pg_states,
+                    )
+                    .expect("production post-activation heartbeat should build");
                 harness
                     .control_plane
                     .refresh_node_heartbeat(
-                        heartbeat(
-                            node_id,
-                            &endpoints[usize::try_from(node_id).unwrap()],
-                            observed_epoch,
-                            pg_observations,
-                        ),
+                        generated_heartbeat,
                         now_ms,
                     )
                     .expect("post-activation heartbeat should refresh");
@@ -2619,17 +2685,24 @@ mod tests {
                 .expect("steady heartbeat state should read");
             let observed_epoch = snapshot.cluster_epoch();
             for node_id in 0..STORAGE_NODE_COUNT {
-                let pg_observations =
-                    active_primary_observations(&snapshot, node_id, metadata_proof);
+                let pg_states = snapshot
+                    .pgs()
+                    .filter(|pg| pg.active_primary() == Some(NodeId::new(node_id)))
+                    .map(|pg| (pg.pg_id(), PgState::Active));
+                let generated_heartbeat = heartbeat_nodes[usize::try_from(node_id).unwrap()]
+                    .heartbeat(
+                        NodeId::new(node_id),
+                        1,
+                        endpoints[usize::try_from(node_id).unwrap()].clone(),
+                        observed_epoch,
+                        HEARTBEAT_LEASE_MS,
+                        pg_states,
+                    )
+                    .expect("production steady heartbeat should build");
                 harness
                     .control_plane
                     .refresh_node_heartbeat(
-                        heartbeat(
-                            node_id,
-                            &endpoints[usize::try_from(node_id).unwrap()],
-                            observed_epoch,
-                            pg_observations,
-                        ),
+                        generated_heartbeat,
                         now_ms,
                     )
                     .expect("covered steady heartbeat should refresh");
@@ -3041,7 +3114,7 @@ mod tests {
             harness
                 .control_plane
                 .refresh_node_heartbeat(
-                    NodeHeartbeat {
+                    node_heartbeat! {
                         node_id: NodeId::new(node_id),
                         node_incarnation: 1,
                         endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
@@ -3070,7 +3143,7 @@ mod tests {
         let first = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -3101,7 +3174,7 @@ mod tests {
         let second = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(2),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
@@ -3144,7 +3217,7 @@ mod tests {
         let refresh = storage::clock::with_time_override(30_000, || {
             enable_resampled_authority_time(&mut harness.control_plane, 30_000);
             harness.control_plane.refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -3208,7 +3281,7 @@ mod tests {
 
         let error = storage::clock::with_time_override(31_000, || {
             harness.control_plane.refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -3273,7 +3346,7 @@ mod tests {
         let first = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -3300,7 +3373,7 @@ mod tests {
         let shortened = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -3336,7 +3409,7 @@ mod tests {
         let renewed = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -3465,7 +3538,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -3499,7 +3572,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -3512,7 +3585,7 @@ mod tests {
             )
             .expect("experimental raft observed heartbeat should refresh");
 
-        let restart_heartbeat = NodeHeartbeat {
+        let restart_heartbeat = node_heartbeat! {
             node_id: NodeId::new(1),
             node_incarnation: 2,
             endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4006,7 +4079,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4028,7 +4101,7 @@ mod tests {
         let peering_refresh = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4058,7 +4131,7 @@ mod tests {
         let active_refresh = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4080,7 +4153,7 @@ mod tests {
         let steady_refresh = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4142,7 +4215,7 @@ mod tests {
         let refreshed = restarted
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4220,7 +4293,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: endpoint.display().to_string(),
@@ -4386,7 +4459,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4407,7 +4480,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4432,7 +4505,7 @@ mod tests {
         let active_refresh = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4462,7 +4535,7 @@ mod tests {
         let renewed = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4549,7 +4622,7 @@ mod tests {
         let first_successor = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 2,
                     endpoint: successor_endpoint.clone(),
@@ -4570,7 +4643,7 @@ mod tests {
         let fenced = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 2,
                     endpoint: successor_endpoint.clone(),
@@ -4595,7 +4668,7 @@ mod tests {
         let activated = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 2,
                     endpoint: successor_endpoint,
@@ -4647,7 +4720,7 @@ mod tests {
             harness
                 .control_plane
                 .refresh_node_heartbeat(
-                    NodeHeartbeat {
+                    node_heartbeat! {
                         node_id: NodeId::new(node_id),
                         node_incarnation: 1,
                         endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
@@ -4670,7 +4743,7 @@ mod tests {
             harness
                 .control_plane
                 .refresh_node_heartbeat(
-                    NodeHeartbeat {
+                    node_heartbeat! {
                         node_id: NodeId::new(node_id),
                         node_incarnation: 1,
                         endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
@@ -4692,7 +4765,7 @@ mod tests {
             harness
                 .control_plane
                 .refresh_node_heartbeat(
-                    NodeHeartbeat {
+                    node_heartbeat! {
                         node_id: NodeId::new(node_id),
                         node_incarnation: 1,
                         endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
@@ -4779,7 +4852,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4800,7 +4873,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4825,7 +4898,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4872,7 +4945,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4927,7 +5000,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4948,7 +5021,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -4973,7 +5046,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5037,7 +5110,7 @@ mod tests {
         let mut client = UnixControlPlaneClient::new(&socket_path);
         let startup_refresh = client
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5064,7 +5137,7 @@ mod tests {
         let mut client = UnixControlPlaneClient::new(&socket_path);
         let peering_refresh = client
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5117,7 +5190,7 @@ mod tests {
         let mut client = UnixControlPlaneClient::new(&socket_path);
         let error = client
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(99),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-99.sock".to_string(),
@@ -5552,7 +5625,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5573,7 +5646,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5598,7 +5671,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5628,7 +5701,7 @@ mod tests {
         let renewed = harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5801,7 +5874,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5822,7 +5895,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5854,7 +5927,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -5984,7 +6057,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -6005,7 +6078,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -6030,7 +6103,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
@@ -6357,7 +6430,7 @@ mod tests {
         .unwrap();
         authority
             .submit_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(2),
                     node_incarnation: 7,
                     endpoint: "node-2.sock".to_owned(),
@@ -6373,7 +6446,7 @@ mod tests {
         let metadata_proof = PgMetadataProof::for_test(1, 2, 3);
         authority
             .submit_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(2),
                     node_incarnation: 7,
                     endpoint: "node-2.sock".to_owned(),
@@ -6394,7 +6467,7 @@ mod tests {
         let active_epoch = authority.snapshot().cluster_epoch();
         authority
             .submit_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(2),
                     node_incarnation: 7,
                     endpoint: "node-2.sock".to_owned(),
@@ -6490,7 +6563,7 @@ mod tests {
                 observed_at_ms: 1_000,
                 oldest_live_placement_epoch: Some(floor_epoch.get()),
                 oldest_durable_backfill_epoch: Some(floor_epoch.get() + 1),
-                oldest_pending_metadata_command_epoch: None,
+                oldest_metadata_command_resource_epoch: None,
                 oldest_object_payload_reclaim_claim_epoch: Some(floor_epoch.get()),
             }],
         );
@@ -6540,7 +6613,7 @@ mod tests {
         );
         assert!(
             diagnostics.contains(&format!(
-                "history_report_observed_epoch={} history_report_validation_epoch={} history_report_accepted_at_ms=1000 history_live_payload_epoch={} history_durable_backfill_epoch={} history_pending_metadata_command_epoch=-",
+                "history_report_observed_epoch={} history_report_validation_epoch={} history_report_accepted_at_ms=1000 history_live_payload_epoch={} history_durable_backfill_epoch={} history_metadata_command_resource_epoch=-",
                 floor_epoch.get(),
                 floor_epoch.get(),
                 floor_epoch.get(),
@@ -7080,7 +7153,7 @@ mod tests {
             let observed_epoch = authority.snapshot().cluster_epoch();
             let lease = authority
                 .submit_node_heartbeat(
-                    NodeHeartbeat {
+                    node_heartbeat! {
                         node_id,
                         node_incarnation: 1,
                         endpoint: endpoint.clone(),
@@ -7111,7 +7184,7 @@ mod tests {
                 .unwrap();
             authority
                 .submit_node_heartbeat(
-                    NodeHeartbeat {
+                    node_heartbeat! {
                         node_id,
                         node_incarnation: 1,
                         endpoint: endpoint.clone(),
@@ -7162,7 +7235,7 @@ mod tests {
             let observed_epoch = authority.snapshot().cluster_epoch();
             let lease = authority
                 .submit_node_heartbeat(
-                    NodeHeartbeat {
+                    node_heartbeat! {
                         node_id,
                         node_incarnation: 1,
                         endpoint: endpoint.clone(),
@@ -7194,7 +7267,7 @@ mod tests {
             let observed_epoch = authority.snapshot().cluster_epoch();
             let lease = authority
                 .submit_node_heartbeat(
-                    NodeHeartbeat {
+                    node_heartbeat! {
                         node_id: unserved_node_id,
                         node_incarnation: 1,
                         endpoint: format!("{endpoint}.unserved"),
@@ -7224,7 +7297,7 @@ mod tests {
             .unwrap();
         authority
             .submit_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id,
                     node_incarnation: 1,
                     endpoint,
@@ -7380,7 +7453,7 @@ mod tests {
             let observed_epoch = authority.snapshot().cluster_epoch();
             let lease = authority
                 .submit_node_heartbeat(
-                    NodeHeartbeat {
+                    node_heartbeat! {
                         node_id,
                         node_incarnation: 1,
                         endpoint: endpoint.clone(),
@@ -7403,7 +7476,7 @@ mod tests {
             .unwrap();
         authority
             .submit_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id,
                     node_incarnation: 1,
                     endpoint,
@@ -7642,7 +7715,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: endpoint.display().to_string(),
@@ -7662,7 +7735,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: endpoint.display().to_string(),
@@ -7687,7 +7760,7 @@ mod tests {
         harness
             .control_plane
             .refresh_node_heartbeat(
-                NodeHeartbeat {
+                node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
                     endpoint: endpoint.display().to_string(),

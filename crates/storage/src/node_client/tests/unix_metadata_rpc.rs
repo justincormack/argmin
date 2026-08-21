@@ -8,6 +8,7 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_cleanup_response,
     StorageRpcMetadataCommandPendingSlotCleanupResponse,
 };
+use crate::{PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind};
 use std::sync::mpsc;
 
 fn append_stream_segment_command_for_rpc_test(
@@ -388,19 +389,120 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
         )
         .unwrap()
         .expect("durable reclaim root must be claimable");
+        let reservation_bucket = crate::tests::bucket_name("unix-history-reservation");
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &reservation_bucket,
+            "owner",
+            &s3_types::CanonicalUserId::from_principal("owner"),
+            &s3_types::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*pg,
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                name: &reservation_bucket,
+                reservation_id: "unix-history-reservation",
+                owner_token: "unix-history-reservation-owner",
+                cluster_epoch: ClusterEpoch::new(4).unwrap(),
+                operation_kind: "delete-current-object",
+                created_at: 1,
+                lease_deadline: 10_000,
+                target_context: Some("object"),
+            },
+        )
+        .unwrap();
+        let reservation_proof = BucketWriteReservationProof::from(&reservation);
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(
+                crate::metadata_command::InsertDeleteMarkerCommand {
+                    bucket_write_reservation: reservation_proof.clone(),
+                    bucket: reservation_bucket.clone(),
+                    key: crate::tests::object_key("unix-history-reservation-object"),
+                    version_id: VersionId::Null,
+                    owner: OwnerIdentity::from_principal("owner"),
+                    write_sequence: 1,
+                    last_modified_millis: 1,
+                    stale_payload: None,
+                },
+            ),
+        );
+        pg.try_insert_pending_metadata_command_slot(
+            config.node_id.as_u32(),
+            &command,
+            Some(&reservation_bucket),
+        )
+        .unwrap();
+        PgMetadataStore::release_metadata_command_bucket_write_reservation(
+            &*pg,
+            &reservation_proof,
+        )
+        .unwrap();
+        assert!(PgMetadataStore::durable_bucket_write_reservation(
+            &*pg,
+            &reservation_bucket,
+            &reservation.reservation_id,
+        )
+        .unwrap()
+        .is_none());
         pg.refresh_metadata_command_state_digest().unwrap();
     }
-    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    const TOPOLOGY_DIGEST: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let credential = crate::control_plane_auth::ControlPlaneScopedCredential::new(
+        crate::control_plane_auth::ControlPlaneScopedCredentialInput {
+            cluster_id: "unix-history-reference-test".to_owned(),
+            credential_id: "frontend-1".to_owned(),
+            credential_version: 1,
+            principal: crate::control_plane_auth::ControlPlaneAuthPrincipal::Frontend {
+                instance_id: "frontend-1".to_owned(),
+            },
+            secret: b"unix-history-reference-secret".to_vec(),
+        },
+    )
+    .unwrap();
+    let server_auth = crate::StorageRpcServerAuthConfig::new(
+        credential.cluster_id(),
+        crate::control_plane_auth::ControlPlaneScopedCredentialStore::new(vec![credential.clone()])
+            .unwrap(),
+        9,
+        TOPOLOGY_DIGEST,
+    )
+    .unwrap();
+    let client_auth = Arc::new(
+        crate::FrontendStorageRpcClientCapability::new(credential, 9, TOPOLOGY_DIGEST)
+            .unwrap()
+            .into(),
+    );
+    let server = crate::storage_node_server::PreparedStorageNodeServer::new(config.clone())
+        .with_rpc_auth(server_auth)
+        .bind()
+        .unwrap();
     let server_thread = thread::spawn(move || server.accept_one().unwrap());
-    let client = UnixStorageNodeClient::new(
+    let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
         config.node_id,
         config.cluster_epoch,
-        config.socket_path.clone(),
+        crate::storage_rpc_transport::StorageRpcClientEndpoint::unix(config.socket_path.clone()),
+        LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+        Some(client_auth),
     );
 
     let references = client.cluster_map_history_route_references().unwrap();
     let summary = references.summary();
-    assert_eq!(references.len(), 4);
+    assert_eq!(references.len(), 6);
+    assert!(references.iter().any(|reference| reference
+        == PgClusterMapHistoryRouteReference::new(
+            PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
+            ClusterEpoch::new(4).unwrap(),
+            PgId::new(0),
+        )));
     assert_eq!(
         summary.oldest_live_placement_epoch,
         Some(ClusterEpoch::new(6).unwrap())
@@ -410,13 +512,14 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
         Some(ClusterEpoch::new(3).unwrap())
     );
     assert_eq!(
+        summary.oldest_metadata_command_resource_epoch,
+        Some(ClusterEpoch::INITIAL)
+    );
+    assert_eq!(
         summary.oldest_object_payload_reclaim_claim_epoch,
         Some(ClusterEpoch::new(2).unwrap())
     );
-    assert_eq!(
-        summary.oldest_required_epoch(),
-        Some(ClusterEpoch::new(2).unwrap())
-    );
+    assert_eq!(summary.oldest_required_epoch(), Some(ClusterEpoch::INITIAL));
     server_thread.join().unwrap();
 }
 

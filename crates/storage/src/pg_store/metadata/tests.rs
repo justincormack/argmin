@@ -3960,7 +3960,7 @@ fn metadata_command_apply_rejects_stale_epoch_without_rewinding_replica_state() 
 }
 
 #[test]
-fn recovery_cleans_only_older_epoch_pending_slot() {
+fn local_recovery_preserves_older_epoch_pending_slot() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
     let first = create_bucket_probe_command(1, 1, trusted_bucket_name("old-slot-first"), 1);
@@ -3996,14 +3996,14 @@ fn recovery_cleans_only_older_epoch_pending_slot() {
         .is_some());
 
     store
-        .recover_clean_orphan_pending_command_slots(super::super::PgStoreRecoveryContext::for_node(
-            NodeId::new(0),
-        ))
+        .recover(super::super::PgStoreRecoveryContext::for_node(NodeId::new(
+            0,
+        )))
         .unwrap();
     assert!(store
         .pending_metadata_command_slot_any_epoch(0)
         .unwrap()
-        .is_none());
+        .is_some());
     assert_eq!(
         store.metadata_command_replica_state().unwrap(),
         epoch_two_state
@@ -4011,7 +4011,7 @@ fn recovery_cleans_only_older_epoch_pending_slot() {
 }
 
 #[test]
-fn recovery_rejects_future_epoch_pending_slot_without_cleanup() {
+fn local_recovery_rejects_future_epoch_pending_slot_without_cleanup() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
     let future_epoch = ClusterEpoch::new(2).unwrap();
@@ -4028,19 +4028,18 @@ fn recovery_rejects_future_epoch_pending_slot_without_cleanup() {
         .unwrap();
 
     let err = store
-        .recover_clean_orphan_pending_command_slots(super::super::PgStoreRecoveryContext::for_node(
-            NodeId::new(0),
-        ))
+        .recover(super::super::PgStoreRecoveryContext::for_node(NodeId::new(
+            0,
+        )))
         .unwrap_err();
     assert!(
         matches!(
             err,
-            StoreError::MetadataCommandLogConflict {
-                node_id: 0,
+            StoreError::StaleMetadataOperation {
                 pg_id: 1,
-                cluster_epoch,
-                log_index: 1,
-            } if cluster_epoch == future_epoch
+                operation_epoch,
+                current_epoch,
+            } if operation_epoch == ClusterEpoch::INITIAL && current_epoch == future_epoch
         ),
         "future-epoch pending slot must fail closed, got {err:?}"
     );
@@ -4651,7 +4650,7 @@ fn metadata_command_checkpoint_catalogue_prunes_old_epochs() {
 }
 
 #[test]
-fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_command_epochs() {
+fn cluster_map_history_reference_summary_reports_all_durable_route_epochs() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 7).unwrap();
     assert_eq!(
@@ -4779,7 +4778,7 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
         Some(ClusterEpoch::new(3).unwrap())
     );
     assert_eq!(
-        summary.oldest_pending_metadata_command_epoch,
+        summary.oldest_metadata_command_resource_epoch,
         Some(ClusterEpoch::new(2).unwrap())
     );
     assert_eq!(
@@ -4817,7 +4816,7 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
             PgId::new(7),
         ),
         PgClusterMapHistoryRouteReference::new(
-            PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+            PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
             ClusterEpoch::new(2).unwrap(),
             PgId::new(7),
         ),
@@ -4851,6 +4850,98 @@ fn cluster_map_history_route_references_fail_closed_at_collection_bound() {
             count,
             max: MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
         } if count == MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES + 1
+    ));
+}
+
+#[test]
+fn pending_command_route_dependencies_are_bounded_and_integrity_bound_without_envelope_decode() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let topology = PgTopology::new(&[1, 2]).unwrap();
+    let bucket = (0..10_000)
+        .find_map(|candidate| {
+            let bucket = BucketName::new(format!("route-sidecar-{candidate}")).ok()?;
+            (topology.bucket_pg_for(&bucket) == 2).then_some(bucket)
+        })
+        .unwrap();
+    let key = trusted_object_key("object");
+    let command = direct_put_terminal_cleanup_command(
+        &bucket,
+        &key,
+        &SessionId::try_from("cd".repeat(16)).unwrap(),
+    );
+    store
+        .try_insert_pending_metadata_command_slot(1, &command, Some(&bucket))
+        .unwrap();
+
+    let expected_dependency = PgClusterMapHistoryRouteReference::new(
+        PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
+        ClusterEpoch::INITIAL,
+        PgId::new(2),
+    );
+    assert!(store
+        .cluster_map_history_route_references(&topology)
+        .unwrap()
+        .iter()
+        .any(|reference| reference == expected_dependency));
+
+    store
+        .test_set_pending_metadata_command_bytes(&vec![0xa5; 2 * 1024 * 1024])
+        .unwrap();
+    assert!(store
+        .cluster_map_history_route_references(&topology)
+        .unwrap()
+        .iter()
+        .any(|reference| reference == expected_dependency));
+
+    store
+        .conn
+        .execute(
+            "UPDATE metadata_command_pending_slot SET log_index = log_index + 1 WHERE singleton = 0",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.cluster_map_history_route_references(&topology),
+        Err(StoreError::MetadataCommandLogConflict { .. })
+    ));
+    store
+        .conn
+        .execute(
+            "UPDATE metadata_command_pending_slot SET log_index = log_index - 1 WHERE singleton = 0",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE metadata_command_pending_slot SET cluster_epoch = cluster_epoch + 1 WHERE singleton = 0",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.cluster_map_history_route_references(&topology),
+        Err(StoreError::MetadataCommandLogConflict { .. })
+    ));
+    store
+        .conn
+        .execute(
+            "UPDATE metadata_command_pending_slot SET cluster_epoch = cluster_epoch - 1 WHERE singleton = 0",
+            [],
+        )
+        .unwrap();
+
+    store
+        .conn
+        .execute(
+            "UPDATE metadata_command_pending_route_dependencies \
+             SET dependency_checksum = dependency_checksum + 1 WHERE singleton = 0",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.cluster_map_history_route_references(&topology),
+        Err(StoreError::MetadataCommandLogConflict { .. })
     ));
 }
 
