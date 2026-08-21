@@ -1334,12 +1334,16 @@ pub(crate) enum ObjectEncryptionDecodeError {
     UnsupportedSseCustomerStateVersion { version: u8 },
     #[error("invalid SSE-C checksum metadata length {declared} (remaining {remaining})")]
     InvalidSseCustomerChecksumMetadataLength { declared: usize, remaining: usize },
+    #[error("SSE-C empty checksum metadata requires a zero nonce")]
+    NoncanonicalSseCustomerEmptyChecksumNonce,
     #[error("invalid SSE-S3 state length {actual} (minimum {minimum})")]
     InvalidSseS3StateLength { actual: usize, minimum: usize },
     #[error("unsupported SSE-S3 state version {version}")]
     UnsupportedSseS3StateVersion { version: u8 },
     #[error("invalid SSE-S3 checksum metadata length {declared} (remaining {remaining})")]
     InvalidSseS3ChecksumMetadataLength { declared: usize, remaining: usize },
+    #[error("SSE-S3 empty checksum metadata requires a zero nonce")]
+    NoncanonicalSseS3EmptyChecksumNonce,
 }
 
 /// Logical object-encryption state could not be represented by storage.
@@ -1347,6 +1351,8 @@ pub(crate) enum ObjectEncryptionDecodeError {
 pub enum ObjectEncryptionStateError {
     #[error("encrypted checksum metadata exceeds the storage limit")]
     EncryptedChecksumMetadataTooLong,
+    #[error("empty encrypted checksum metadata requires a zero nonce")]
+    NoncanonicalEmptyChecksumNonce,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1380,6 +1386,10 @@ impl EncryptedChecksumMetadata {
 
     fn len(&self) -> usize {
         usize::from(self.encoded_len)
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.encoded_len == 0
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -1501,6 +1511,10 @@ impl SseCustomerObjectState {
         checksum_nonce: [u8; SSE_C_CHECKSUM_NONCE_LEN],
         encrypted_checksum_metadata: Vec<u8>,
     ) -> Result<Self, ObjectEncryptionStateError> {
+        if encrypted_checksum_metadata.is_empty() && checksum_nonce != [0; SSE_C_CHECKSUM_NONCE_LEN]
+        {
+            return Err(ObjectEncryptionStateError::NoncanonicalEmptyChecksumNonce);
+        }
         Ok(Self {
             checksum_nonce,
             encrypted_checksum_metadata: EncryptedChecksumMetadata::try_new(
@@ -1640,6 +1654,10 @@ impl SseCustomerObjectState {
             checksum_len,
             take(&mut cursor, checksum_len_usize).to_vec(),
         );
+        if encrypted_checksum_metadata.is_empty() && checksum_nonce != [0; SSE_C_CHECKSUM_NONCE_LEN]
+        {
+            return Err(ObjectEncryptionDecodeError::NoncanonicalSseCustomerEmptyChecksumNonce);
+        }
 
         Ok(Self {
             validator_key_id,
@@ -1711,6 +1729,11 @@ impl SseS3ObjectState {
         checksum_nonce: [u8; SSE_S3_CHECKSUM_NONCE_LEN],
         encrypted_checksum_metadata: Vec<u8>,
     ) -> Result<Self, ObjectEncryptionStateError> {
+        if encrypted_checksum_metadata.is_empty()
+            && checksum_nonce != [0; SSE_S3_CHECKSUM_NONCE_LEN]
+        {
+            return Err(ObjectEncryptionStateError::NoncanonicalEmptyChecksumNonce);
+        }
         Ok(Self {
             checksum_nonce,
             encrypted_checksum_metadata: EncryptedChecksumMetadata::try_new(
@@ -1821,6 +1844,11 @@ impl SseS3ObjectState {
             checksum_len,
             take(&mut cursor, checksum_len_usize).to_vec(),
         );
+        if encrypted_checksum_metadata.is_empty()
+            && checksum_nonce != [0; SSE_S3_CHECKSUM_NONCE_LEN]
+        {
+            return Err(ObjectEncryptionDecodeError::NoncanonicalSseS3EmptyChecksumNonce);
+        }
 
         Ok(Self {
             wrapping_key_id,
@@ -7526,6 +7554,54 @@ mod tests {
                 .with_encrypted_checksum_metadata([13; SSE_S3_CHECKSUM_NONCE_LEN], overlong)
                 .unwrap_err(),
             ObjectEncryptionStateError::EncryptedChecksumMetadataTooLong
+        );
+    }
+
+    #[test]
+    fn object_encryption_empty_checksum_metadata_requires_zero_nonce() {
+        let customer = SseCustomerObjectState::new(
+            7,
+            [1; SSE_C_VALIDATOR_SALT_LEN],
+            [2; SSE_C_VALIDATOR_HMAC_LEN],
+            [3; SSE_C_WRAP_SALT_LEN],
+            [4; SSE_C_WRAP_NONCE_LEN],
+            [5; SSE_C_WRAPPED_DEK_LEN],
+            [6; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+        );
+        assert_eq!(
+            customer
+                .with_encrypted_checksum_metadata([1; SSE_C_CHECKSUM_NONCE_LEN], Vec::new())
+                .unwrap_err(),
+            ObjectEncryptionStateError::NoncanonicalEmptyChecksumNonce
+        );
+        let mut encoded_customer = customer.encode();
+        let customer_nonce_start =
+            SseCustomerObjectState::FIXED_ENCODED_LEN - 2 - SSE_C_CHECKSUM_NONCE_LEN;
+        encoded_customer[customer_nonce_start] = 1;
+        assert_eq!(
+            SseCustomerObjectState::decode(&encoded_customer).unwrap_err(),
+            ObjectEncryptionDecodeError::NoncanonicalSseCustomerEmptyChecksumNonce
+        );
+
+        let managed = SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        );
+        assert_eq!(
+            managed
+                .with_encrypted_checksum_metadata([1; SSE_S3_CHECKSUM_NONCE_LEN], Vec::new())
+                .unwrap_err(),
+            ObjectEncryptionStateError::NoncanonicalEmptyChecksumNonce
+        );
+        let mut encoded_managed = managed.encode();
+        let managed_nonce_start =
+            SseS3ObjectState::FIXED_ENCODED_LEN - 2 - SSE_S3_CHECKSUM_NONCE_LEN;
+        encoded_managed[managed_nonce_start] = 1;
+        assert_eq!(
+            SseS3ObjectState::decode(&encoded_managed).unwrap_err(),
+            ObjectEncryptionDecodeError::NoncanonicalSseS3EmptyChecksumNonce
         );
     }
 

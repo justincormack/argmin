@@ -1365,12 +1365,12 @@ impl<'a> StorageRpcDecoder<'a> {
         match self.read_u8()? {
             0 => Ok(None),
             1 => {
-                let algorithm = ChecksumAlgorithm::from_u8(self.read_u8()?).ok_or(
+                let algorithm = ChecksumAlgorithm::from_wire_tag(self.read_u8()?).ok_or(
                     StorageRpcPayloadError::InvalidObjectMetadataRequest(
                         "invalid multipart checksum algorithm",
                     ),
                 )?;
-                let checksum_type = ChecksumType::from_u8(self.read_u8()?).ok_or(
+                let checksum_type = ChecksumType::from_wire_tag(self.read_u8()?).ok_or(
                     StorageRpcPayloadError::InvalidObjectMetadataRequest(
                         "invalid multipart checksum type",
                     ),

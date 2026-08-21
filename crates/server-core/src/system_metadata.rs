@@ -465,8 +465,8 @@ impl SystemMetadata {
         }
 
         if let Some(checksum) = &self.checksum {
-            out.push(checksum.algorithm as u8);
-            out.push(checksum.checksum_type.map_or(u8::MAX, |v| v as u8));
+            out.push(checksum.algorithm.wire_tag());
+            out.push(ChecksumType::optional_wire_tag(checksum.checksum_type));
             let len = u16::try_from(checksum.value.len()).map_err(|_| {
                 ServerError::MetadataBlobError {
                     reason: "checksum metadata value too long".to_string(),
@@ -609,23 +609,18 @@ impl SystemMetadata {
                     reason: "truncated system metadata checksum".to_string(),
                 });
             }
-            let algorithm = ChecksumAlgorithm::from_u8(data[pos]).ok_or_else(|| {
+            let algorithm = ChecksumAlgorithm::from_wire_tag(data[pos]).ok_or_else(|| {
                 ServerError::MetadataBlobError {
                     reason: format!("invalid checksum algorithm {}", data[pos]),
                 }
             })?;
             pos += 1;
-            let checksum_type_raw = data[pos];
+            let checksum_type_wire_tag = data[pos];
             pos += 1;
-            let checksum_type = if checksum_type_raw == u8::MAX {
-                None
-            } else {
-                Some(ChecksumType::from_u8(checksum_type_raw).ok_or_else(|| {
-                    ServerError::MetadataBlobError {
-                        reason: format!("invalid checksum type {checksum_type_raw}"),
-                    }
-                })?)
-            };
+            let checksum_type = ChecksumType::from_optional_wire_tag(checksum_type_wire_tag)
+                .ok_or_else(|| ServerError::MetadataBlobError {
+                    reason: format!("invalid checksum type {checksum_type_wire_tag}"),
+                })?;
             let value = read_system_string(data, &mut pos, "checksum")?;
             Some(ObjectChecksumMetadata::new(algorithm, checksum_type, value))
         } else {

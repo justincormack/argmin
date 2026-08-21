@@ -1037,8 +1037,8 @@ fn put_optional_multipart_checksum_config(
         None => put_u8(out, 0),
         Some(checksum) => {
             put_u8(out, 1);
-            put_u8(out, checksum.algorithm() as u8);
-            put_u8(out, checksum.checksum_type() as u8);
+            put_u8(out, checksum.algorithm().wire_tag());
+            put_u8(out, checksum.checksum_type().wire_tag());
         }
     }
 }

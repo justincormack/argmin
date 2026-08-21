@@ -4146,7 +4146,7 @@ impl PgMetadataStore for PgStore {
                         20,
                     )?;
                     let checksum = if let Some(algo_val) = algo_raw {
-                        let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
+                        let algo = ChecksumAlgorithm::from_wire_tag(algo_val).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 12,
                                 rusqlite::types::Type::Integer,
@@ -4155,7 +4155,7 @@ impl PgMetadataStore for PgStore {
                         })?;
                         let ctype = ctype_raw
                             .map(|v| {
-                                ChecksumType::from_u8(v).ok_or_else(|| {
+                                ChecksumType::from_wire_tag(v).ok_or_else(|| {
                                     rusqlite::Error::FromSqlConversionFailure(
                                         13,
                                         rusqlite::types::Type::Integer,
@@ -4471,7 +4471,7 @@ impl PgMetadataStore for PgStore {
                     20,
                 )?;
                 let checksum = if let Some(algo_val) = algo_raw {
-                    let algo = ChecksumAlgorithm::from_u8(algo_val).ok_or_else(|| {
+                    let algo = ChecksumAlgorithm::from_wire_tag(algo_val).ok_or_else(|| {
                         rusqlite::Error::FromSqlConversionFailure(
                             12,
                             rusqlite::types::Type::Integer,
@@ -4480,7 +4480,7 @@ impl PgMetadataStore for PgStore {
                     })?;
                     let ctype = ctype_raw
                         .map(|v| {
-                            ChecksumType::from_u8(v).ok_or_else(|| {
+                            ChecksumType::from_wire_tag(v).ok_or_else(|| {
                                 rusqlite::Error::FromSqlConversionFailure(
                                     13,
                                     rusqlite::types::Type::Integer,

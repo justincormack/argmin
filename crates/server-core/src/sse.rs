@@ -23,18 +23,46 @@ use crate::system_metadata::ObjectChecksumMetadata;
 pub const SSE_CUSTOMER_ALGORITHM: &str = "AES256";
 pub const SSE_C_CUSTOMER_KEY_LEN: usize = 32;
 pub const SSE_C_DEK_LEN: usize = 32;
-pub const SSE_C_SEGMENT_TAG_LEN: usize = 16;
+const AES_256_GCM_TAG_LEN: usize = 16;
+pub const SSE_C_SEGMENT_TAG_LEN: usize = AES_256_GCM_TAG_LEN;
 const SSE_C_WRAP_AAD: &[u8] = b"argmin:sse-c:wrap:v1";
 const SSE_C_SEGMENT_AAD: &[u8] = b"argmin:sse-c:segment:v1";
 const SSE_C_CHECKSUM_AAD: &[u8] = b"argmin:sse-c:checksum:v1";
 const SSE_C_HKDF_INFO: &[u8] = b"argmin:sse-c:kek:v1";
-const SSE_C_CHECKSUM_METADATA_VERSION: u8 = 1;
+const CHECKSUM_METADATA_VERSION: u8 = 1;
+const CHECKSUM_METADATA_HEADER_LEN: usize = 5;
+const CHECKSUM_METADATA_MAX_VALUE_LEN: usize =
+    65_535 - CHECKSUM_METADATA_HEADER_LEN - AES_256_GCM_TAG_LEN;
 // Keep the persisted SSE-S3 wire format stable even though the internal
 // provider boundary is now modelled as generic managed encryption.
 const MANAGED_WRAP_AAD: &[u8] = b"argmin:sse-s3:wrap:v1";
 const MANAGED_SEGMENT_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
 const MANAGED_CHECKSUM_AAD: &[u8] = b"argmin:sse-s3:checksum:v1";
 const MANAGED_ENCRYPTION_LABEL: &str = "managed encryption";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum ChecksumMetadataCodecError {
+    #[error("checksum metadata value length {actual} exceeds maximum {maximum}")]
+    ValueTooLong { actual: usize, maximum: usize },
+    #[error("truncated checksum metadata: length {actual}, minimum {minimum}")]
+    Truncated { actual: usize, minimum: usize },
+    #[error("unsupported checksum metadata version {version}")]
+    UnsupportedVersion { version: u8 },
+    #[error("invalid checksum algorithm tag {wire_tag}")]
+    InvalidAlgorithmTag { wire_tag: u8 },
+    #[error("invalid checksum type tag {wire_tag}")]
+    InvalidChecksumTypeTag { wire_tag: u8 },
+    #[error("invalid checksum metadata length {actual}; declared value length {declared}")]
+    InvalidLength { declared: usize, actual: usize },
+    #[error("checksum metadata value is not valid UTF-8")]
+    InvalidUtf8,
+}
+
+fn checksum_metadata_codec_error(_error: ChecksumMetadataCodecError) -> ServerError {
+    ServerError::InternalError {
+        reason: "stored encrypted checksum metadata is invalid".to_string(),
+    }
+}
 
 struct AeadDescriptor<'a> {
     aad: &'a [u8],
@@ -48,6 +76,9 @@ fn object_encryption_state_error(error: ObjectEncryptionStateError) -> ServerErr
                 reason: "encrypted checksum metadata exceeds the durable storage limit".to_string(),
             }
         }
+        ObjectEncryptionStateError::NoncanonicalEmptyChecksumNonce => ServerError::InternalError {
+            reason: "encrypted checksum metadata state is invalid".to_string(),
+        },
     }
 }
 
@@ -888,54 +919,54 @@ fn segment_nonce(
     nonce
 }
 
-fn encode_checksum_metadata(checksum: &ObjectChecksumMetadata) -> Result<Vec<u8>, ServerError> {
+fn encode_checksum_metadata(
+    checksum: &ObjectChecksumMetadata,
+) -> Result<Vec<u8>, ChecksumMetadataCodecError> {
     let value = checksum.value().as_bytes();
-    let value_len = u16::try_from(value.len()).map_err(|_| ServerError::InternalError {
-        reason: "SSE-C checksum metadata value too long".to_string(),
-    })?;
-    let mut out = Vec::with_capacity(1 + 1 + 1 + 2 + value.len());
-    out.push(SSE_C_CHECKSUM_METADATA_VERSION);
-    out.push(checksum.algorithm() as u8);
-    out.push(checksum.checksum_type().map_or(u8::MAX, |v| v as u8));
+    if value.len() > CHECKSUM_METADATA_MAX_VALUE_LEN {
+        return Err(ChecksumMetadataCodecError::ValueTooLong {
+            actual: value.len(),
+            maximum: CHECKSUM_METADATA_MAX_VALUE_LEN,
+        });
+    }
+    let value_len = u16::try_from(value.len())
+        .expect("checksum metadata value length is bounded below u16::MAX");
+    let mut out = Vec::with_capacity(CHECKSUM_METADATA_HEADER_LEN + value.len());
+    out.push(CHECKSUM_METADATA_VERSION);
+    out.push(checksum.algorithm().wire_tag());
+    out.push(checksum::ChecksumType::optional_wire_tag(
+        checksum.checksum_type(),
+    ));
     out.extend_from_slice(&value_len.to_be_bytes());
     out.extend_from_slice(value);
     Ok(out)
 }
 
-fn decode_checksum_metadata(data: &[u8]) -> Result<ObjectChecksumMetadata, ServerError> {
-    if data.len() < 5 {
-        return Err(ServerError::InternalError {
-            reason: "SSE-C checksum metadata blob too short".to_string(),
+fn decode_checksum_metadata(
+    data: &[u8],
+) -> Result<ObjectChecksumMetadata, ChecksumMetadataCodecError> {
+    if data.len() < CHECKSUM_METADATA_HEADER_LEN {
+        return Err(ChecksumMetadataCodecError::Truncated {
+            actual: data.len(),
+            minimum: CHECKSUM_METADATA_HEADER_LEN,
         });
     }
-    if data[0] != SSE_C_CHECKSUM_METADATA_VERSION {
-        return Err(ServerError::InternalError {
-            reason: format!("unsupported SSE-C checksum metadata version {}", data[0]),
+    if data[0] != CHECKSUM_METADATA_VERSION {
+        return Err(ChecksumMetadataCodecError::UnsupportedVersion { version: data[0] });
+    }
+    let algorithm = checksum::ChecksumAlgorithm::from_wire_tag(data[1])
+        .ok_or(ChecksumMetadataCodecError::InvalidAlgorithmTag { wire_tag: data[1] })?;
+    let checksum_type = checksum::ChecksumType::from_optional_wire_tag(data[2])
+        .ok_or(ChecksumMetadataCodecError::InvalidChecksumTypeTag { wire_tag: data[2] })?;
+    let value_len = usize::from(u16::from_be_bytes([data[3], data[4]]));
+    if data.len() != CHECKSUM_METADATA_HEADER_LEN + value_len {
+        return Err(ChecksumMetadataCodecError::InvalidLength {
+            declared: value_len,
+            actual: data.len(),
         });
     }
-    let algorithm = checksum::ChecksumAlgorithm::from_u8(data[1]).ok_or_else(|| {
-        ServerError::InternalError {
-            reason: format!("invalid stored checksum algorithm {}", data[1]),
-        }
-    })?;
-    let checksum_type = if data[2] == u8::MAX {
-        None
-    } else {
-        Some(checksum::ChecksumType::from_u8(data[2]).ok_or_else(|| {
-            ServerError::InternalError {
-                reason: format!("invalid stored checksum type {}", data[2]),
-            }
-        })?)
-    };
-    let value_len = u16::from_be_bytes([data[3], data[4]]) as usize;
-    if data.len() != 5 + value_len {
-        return Err(ServerError::InternalError {
-            reason: "invalid stored checksum metadata length".to_string(),
-        });
-    }
-    let value = std::str::from_utf8(&data[5..]).map_err(|_| ServerError::InternalError {
-        reason: "stored checksum metadata is not valid UTF-8".to_string(),
-    })?;
+    let value = std::str::from_utf8(&data[CHECKSUM_METADATA_HEADER_LEN..])
+        .map_err(|_| ChecksumMetadataCodecError::InvalidUtf8)?;
     Ok(ObjectChecksumMetadata::new(
         algorithm,
         checksum_type,
@@ -959,7 +990,7 @@ fn encrypt_checksum_with_dek(
     argmin_crypto::random::fill(&mut nonce).map_err(|_| ServerError::InternalError {
         reason: format!("failed to generate {label} checksum nonce"),
     })?;
-    let mut buf = encode_checksum_metadata(checksum)?;
+    let mut buf = encode_checksum_metadata(checksum).map_err(checksum_metadata_codec_error)?;
     sealing_key
         .seal_in_place_append_tag(nonce, aad, &mut buf)
         .map_err(|_| ServerError::InternalError {
@@ -987,7 +1018,9 @@ fn decrypt_checksum_with_dek(
         .map_err(|_| ServerError::InternalError {
             reason: format!("failed to decrypt {label} checksum metadata"),
         })?;
-    Ok(Some(decode_checksum_metadata(plaintext)?))
+    Ok(Some(
+        decode_checksum_metadata(plaintext).map_err(checksum_metadata_codec_error)?,
+    ))
 }
 
 #[cfg(test)]
@@ -1220,23 +1253,121 @@ mod tests {
     }
 
     #[test]
-    fn checksum_metadata_rejects_unsupported_versions() {
-        let checksum = ObjectChecksumMetadata::new(
-            ChecksumAlgorithm::Sha256,
-            Some(ChecksumType::FullObject),
-            "deadbeef".to_string(),
+    fn checksum_metadata_plaintext_v1_corpus_is_exact() {
+        let algorithm_cases = [
+            (ChecksumAlgorithm::Crc32, 0),
+            (ChecksumAlgorithm::Crc32c, 1),
+            (ChecksumAlgorithm::Sha1, 2),
+            (ChecksumAlgorithm::Sha256, 3),
+            (ChecksumAlgorithm::Crc64nvme, 4),
+            (ChecksumAlgorithm::Md5, 5),
+            (ChecksumAlgorithm::XxHash64, 6),
+            (ChecksumAlgorithm::XxHash3, 7),
+            (ChecksumAlgorithm::XxHash128, 8),
+            (ChecksumAlgorithm::Sha512, 9),
+        ];
+        for (algorithm, wire_tag) in algorithm_cases {
+            let checksum = ObjectChecksumMetadata::new(algorithm, None, "v".to_string());
+            let expected = [1, wire_tag, 255, 0, 1, b'v'];
+            assert_eq!(encode_checksum_metadata(&checksum).unwrap(), expected);
+            assert_eq!(decode_checksum_metadata(&expected).unwrap(), checksum);
+        }
+
+        for (checksum_type, wire_tag) in
+            [(ChecksumType::Composite, 0), (ChecksumType::FullObject, 1)]
+        {
+            let checksum = ObjectChecksumMetadata::new(
+                ChecksumAlgorithm::Sha256,
+                Some(checksum_type),
+                String::new(),
+            );
+            let expected = [1, 3, wire_tag, 0, 0];
+            assert_eq!(encode_checksum_metadata(&checksum).unwrap(), expected);
+            assert_eq!(decode_checksum_metadata(&expected).unwrap(), checksum);
+        }
+
+        let multibyte =
+            ObjectChecksumMetadata::new(ChecksumAlgorithm::Sha256, None, "é".to_string());
+        let expected = [1, 3, 255, 0, 2, 0xc3, 0xa9];
+        assert_eq!(encode_checksum_metadata(&multibyte).unwrap(), expected);
+        assert_eq!(decode_checksum_metadata(&expected).unwrap(), multibyte);
+    }
+
+    #[test]
+    fn checksum_metadata_plaintext_v1_rejects_each_malformed_class() {
+        assert_eq!(
+            decode_checksum_metadata(&[]).unwrap_err(),
+            ChecksumMetadataCodecError::Truncated {
+                actual: 0,
+                minimum: CHECKSUM_METADATA_HEADER_LEN,
+            }
         );
-        for version in [0, SSE_C_CHECKSUM_METADATA_VERSION + 1] {
-            let mut encoded = encode_checksum_metadata(&checksum).unwrap();
-            encoded[0] = version;
+        assert_eq!(
+            decode_checksum_metadata(&[1, 0, 255, 0]).unwrap_err(),
+            ChecksumMetadataCodecError::Truncated {
+                actual: 4,
+                minimum: CHECKSUM_METADATA_HEADER_LEN,
+            }
+        );
+        for version in [0, CHECKSUM_METADATA_VERSION + 1] {
+            assert_eq!(
+                decode_checksum_metadata(&[version, 255, 2, 0, 0]).unwrap_err(),
+                ChecksumMetadataCodecError::UnsupportedVersion { version }
+            );
+        }
+        assert_eq!(
+            decode_checksum_metadata(&[1, 10, 255, 0, 0]).unwrap_err(),
+            ChecksumMetadataCodecError::InvalidAlgorithmTag { wire_tag: 10 }
+        );
+        assert_eq!(
+            decode_checksum_metadata(&[1, 0, 2, 0, 0]).unwrap_err(),
+            ChecksumMetadataCodecError::InvalidChecksumTypeTag { wire_tag: 2 }
+        );
+        for malformed in [&[1, 0, 255, 0, 1][..], &[1, 0, 255, 0, 0, b'x'][..]] {
             assert!(matches!(
-                decode_checksum_metadata(&encoded),
-                Err(ServerError::InternalError { reason })
-                    if reason == format!(
-                        "unsupported SSE-C checksum metadata version {version}"
-                    )
+                decode_checksum_metadata(malformed),
+                Err(ChecksumMetadataCodecError::InvalidLength { .. })
             ));
         }
+        assert_eq!(
+            decode_checksum_metadata(&[1, 0, 255, 0, 1, 0xff]).unwrap_err(),
+            ChecksumMetadataCodecError::InvalidUtf8
+        );
+
+        let public_error =
+            checksum_metadata_codec_error(ChecksumMetadataCodecError::InvalidAlgorithmTag {
+                wire_tag: 137,
+            });
+        assert_eq!(
+            public_error.to_string(),
+            "internal error: stored encrypted checksum metadata is invalid"
+        );
+        assert!(!public_error.to_string().contains("137"));
+    }
+
+    #[test]
+    fn checksum_metadata_plaintext_v1_enforces_outer_ciphertext_limit() {
+        let maximum = ObjectChecksumMetadata::new(
+            ChecksumAlgorithm::Sha256,
+            None,
+            "x".repeat(CHECKSUM_METADATA_MAX_VALUE_LEN),
+        );
+        let encoded = encode_checksum_metadata(&maximum).unwrap();
+        assert_eq!(encoded.len() + AES_256_GCM_TAG_LEN, usize::from(u16::MAX));
+        assert_eq!(decode_checksum_metadata(&encoded).unwrap(), maximum);
+
+        let overlong = ObjectChecksumMetadata::new(
+            ChecksumAlgorithm::Sha256,
+            None,
+            "x".repeat(CHECKSUM_METADATA_MAX_VALUE_LEN + 1),
+        );
+        assert_eq!(
+            encode_checksum_metadata(&overlong).unwrap_err(),
+            ChecksumMetadataCodecError::ValueTooLong {
+                actual: CHECKSUM_METADATA_MAX_VALUE_LEN + 1,
+                maximum: CHECKSUM_METADATA_MAX_VALUE_LEN,
+            }
+        );
     }
 
     #[test]

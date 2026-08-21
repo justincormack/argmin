@@ -1,53 +1,65 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-/// Checksum algorithm for multipart uploads.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChecksumAlgorithm {
-    Crc32 = 0,
-    Crc32c = 1,
-    Sha1 = 2,
-    Sha256 = 3,
-    Crc64nvme = 4,
-    Md5 = 5,
-    XxHash64 = 6,
-    XxHash3 = 7,
-    XxHash128 = 8,
-    Sha512 = 9,
+macro_rules! define_checksum_wire_enum {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident {
+            $($variant:ident = $wire_tag:literal),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            pub const ALL: [Self; define_checksum_wire_enum!(@count $($variant),+)] = [
+                $(Self::$variant),+
+            ];
+
+            /// Return the checksum-owned durable and wire tag.
+            #[must_use]
+            pub const fn wire_tag(self) -> u8 {
+                match self {
+                    $(Self::$variant => $wire_tag),+
+                }
+            }
+
+            /// Decode the checksum-owned durable and wire tag.
+            #[must_use]
+            pub const fn from_wire_tag(wire_tag: u8) -> Option<Self> {
+                match wire_tag {
+                    $($wire_tag => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
+    (@count $($variant:ident),+) => {
+        <[()]>::len(&[$(define_checksum_wire_enum!(@unit $variant)),+])
+    };
+    (@unit $variant:ident) => { () };
+}
+
+define_checksum_wire_enum! {
+    /// Checksum algorithm for multipart uploads.
+    pub enum ChecksumAlgorithm {
+        Crc32 = 0,
+        Crc32c = 1,
+        Sha1 = 2,
+        Sha256 = 3,
+        Crc64nvme = 4,
+        Md5 = 5,
+        XxHash64 = 6,
+        XxHash3 = 7,
+        XxHash128 = 8,
+        Sha512 = 9,
+    }
 }
 
 impl ChecksumAlgorithm {
-    pub const ALL: [Self; 10] = [
-        Self::Crc32,
-        Self::Crc32c,
-        Self::Sha1,
-        Self::Sha256,
-        Self::Crc64nvme,
-        Self::Md5,
-        Self::XxHash64,
-        Self::XxHash3,
-        Self::XxHash128,
-        Self::Sha512,
-    ];
-
-    #[must_use]
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::Crc32),
-            1 => Some(Self::Crc32c),
-            2 => Some(Self::Sha1),
-            3 => Some(Self::Sha256),
-            4 => Some(Self::Crc64nvme),
-            5 => Some(Self::Md5),
-            6 => Some(Self::XxHash64),
-            7 => Some(Self::XxHash3),
-            8 => Some(Self::XxHash128),
-            9 => Some(Self::Sha512),
-            _ => None,
-        }
-    }
-
     /// Parse from an S3 API header value. Only accepts the canonical
     /// uppercase form (`SHA256`, `CRC32`, `CRC32C`, etc.).
     #[must_use]
@@ -157,21 +169,34 @@ impl ChecksumAlgorithm {
     }
 }
 
-/// Checksum type for multipart uploads: COMPOSITE (SHA) or FULL_OBJECT (CRC).
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChecksumType {
-    Composite = 0,
-    FullObject = 1,
+define_checksum_wire_enum! {
+    /// Checksum type for multipart uploads: COMPOSITE (SHA) or FULL_OBJECT (CRC).
+    pub enum ChecksumType {
+        Composite = 0,
+        FullObject = 1,
+    }
 }
 
 impl ChecksumType {
+    const OPTIONAL_ABSENT_WIRE_TAG: u8 = u8::MAX;
+
     #[must_use]
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::Composite),
-            1 => Some(Self::FullObject),
-            _ => None,
+    pub const fn optional_wire_tag(value: Option<Self>) -> u8 {
+        match value {
+            Some(value) => value.wire_tag(),
+            None => Self::OPTIONAL_ABSENT_WIRE_TAG,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_optional_wire_tag(wire_tag: u8) -> Option<Option<Self>> {
+        if wire_tag == Self::OPTIONAL_ABSENT_WIRE_TAG {
+            Some(None)
+        } else {
+            match Self::from_wire_tag(wire_tag) {
+                Some(value) => Some(Some(value)),
+                None => None,
+            }
         }
     }
 
@@ -431,12 +456,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checksum_algorithm_from_u8_round_trip() {
+    fn checksum_wire_tag_table_is_exact() {
+        assert_eq!(
+            ChecksumAlgorithm::ALL.map(ChecksumAlgorithm::wire_tag),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        );
         for algorithm in ChecksumAlgorithm::ALL {
-            assert_eq!(ChecksumAlgorithm::from_u8(algorithm as u8), Some(algorithm));
+            assert_eq!(
+                ChecksumAlgorithm::from_wire_tag(algorithm.wire_tag()),
+                Some(algorithm)
+            );
         }
-        assert_eq!(ChecksumAlgorithm::from_u8(10), None);
-        assert_eq!(ChecksumAlgorithm::from_u8(255), None);
+        assert_eq!(ChecksumAlgorithm::from_wire_tag(10), None);
+        assert_eq!(ChecksumAlgorithm::from_wire_tag(255), None);
+
+        assert_eq!(ChecksumType::ALL.map(ChecksumType::wire_tag), [0, 1]);
+        assert_eq!(ChecksumType::optional_wire_tag(None), 255);
+        assert_eq!(ChecksumType::from_optional_wire_tag(255), Some(None));
+        for checksum_type in ChecksumType::ALL {
+            assert_eq!(
+                ChecksumType::from_wire_tag(checksum_type.wire_tag()),
+                Some(checksum_type)
+            );
+            assert_eq!(
+                ChecksumType::from_optional_wire_tag(checksum_type.wire_tag()),
+                Some(Some(checksum_type))
+            );
+        }
+        assert_eq!(ChecksumType::from_wire_tag(2), None);
+        assert_eq!(ChecksumType::from_optional_wire_tag(2), None);
     }
 
     #[test]
@@ -458,13 +506,6 @@ mod tests {
                 Some(algorithm)
             );
         }
-    }
-
-    #[test]
-    fn checksum_type_from_u8_round_trip() {
-        assert_eq!(ChecksumType::from_u8(0), Some(ChecksumType::Composite));
-        assert_eq!(ChecksumType::from_u8(1), Some(ChecksumType::FullObject));
-        assert_eq!(ChecksumType::from_u8(2), None);
     }
 
     #[test]

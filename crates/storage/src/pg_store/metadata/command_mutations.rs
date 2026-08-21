@@ -769,8 +769,8 @@ impl PgStore {
             upload.bucket.as_str(),
             upload.key.as_str()
         );
-        let algo = upload.checksum.map(|c| c.algorithm() as u8);
-        let ctype = upload.checksum.map(|c| c.checksum_type() as u8);
+        let algo = upload.checksum.map(|c| c.algorithm().wire_tag());
+        let ctype = upload.checksum.map(|c| c.checksum_type().wire_tag());
         let tags = upload.tags.as_ref().map(SerializedTagSet::as_str);
         let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
             Self::object_lock_sql_values(upload.object_lock).map_err(|e| MetadataError::Db {

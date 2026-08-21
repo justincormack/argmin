@@ -3916,19 +3916,16 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
     }
 
     fn skip_optional_multipart_checksum_config(&mut self) -> Result<(), String> {
-        self.skip_optional(|decoder| {
-            decoder.read_valid_u8("multipart checksum algorithm", 0..=9)?;
-            decoder.read_valid_u8("multipart checksum type", 0..=1)
-        })
+        self.read_optional_multipart_checksum_config().map(|_| ())
     }
 
     fn read_optional_multipart_checksum_config(
         &mut self,
     ) -> Result<Option<MultipartChecksumConfig>, String> {
         self.read_optional(|decoder| {
-            let algorithm = ChecksumAlgorithm::from_u8(decoder.read_u8()?)
+            let algorithm = ChecksumAlgorithm::from_wire_tag(decoder.read_u8()?)
                 .ok_or_else(|| "invalid multipart checksum algorithm".to_string())?;
-            let checksum_type = ChecksumType::from_u8(decoder.read_u8()?)
+            let checksum_type = ChecksumType::from_wire_tag(decoder.read_u8()?)
                 .ok_or_else(|| "invalid multipart checksum type".to_string())?;
             MultipartChecksumConfig::new(algorithm, Some(checksum_type))
                 .map_err(|error| format!("invalid multipart checksum config: {error}"))
@@ -4844,8 +4841,8 @@ fn encode_optional_multipart_checksum_config(
         None => put_u8(out, 0),
         Some(checksum) => {
             put_u8(out, 1);
-            put_u8(out, checksum.algorithm() as u8);
-            put_u8(out, checksum.checksum_type() as u8);
+            put_u8(out, checksum.algorithm().wire_tag());
+            put_u8(out, checksum.checksum_type().wire_tag());
         }
     }
 }
@@ -5985,6 +5982,48 @@ mod tests {
                     version,
                 })
             );
+        }
+    }
+
+    #[test]
+    fn metadata_command_header_checksum_validation_matches_full_decoder() {
+        for (encoded, expected_error) in [
+            (&[0][..], None),
+            (&[1, 0, 0][..], None),
+            (
+                &[1, 10, 0][..],
+                Some("invalid multipart checksum algorithm"),
+            ),
+            (&[1, 0, 2][..], Some("invalid multipart checksum type")),
+            (
+                &[1, 3, 1][..],
+                Some(
+                    "invalid multipart checksum config: FULL_OBJECT checksum type is not supported for SHA256",
+                ),
+            ),
+            (
+                &[1, 4, 0][..],
+                Some(
+                    "invalid multipart checksum config: COMPOSITE checksum type is not supported for CRC64NVME",
+                ),
+            ),
+        ] {
+            let mut header_decoder = MetadataCommandLogEntryDecoder::new(encoded);
+            let header_result = header_decoder.skip_optional_multipart_checksum_config();
+
+            let mut full_decoder = MetadataCommandLogEntryDecoder::new(encoded);
+            let full_result = full_decoder
+                .read_optional_multipart_checksum_config()
+                .map(|_| ());
+
+            assert_eq!(header_result, full_result, "encoded checksum {encoded:?}");
+            assert_eq!(header_decoder.remaining(), full_decoder.remaining());
+            match expected_error {
+                None => assert_eq!(header_result, Ok(())),
+                Some(expected_error) => {
+                    assert_eq!(header_result, Err(expected_error.to_string()));
+                }
+            }
         }
     }
 
