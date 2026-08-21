@@ -1031,7 +1031,7 @@ fn control_plane_raft_peer_rpc_frame_decode_fails_closed() {
             if message.contains("invalid control-plane OpenRaft peer RPC frame magic")
     ));
 
-    for version in [1_u16, 3] {
+    for version in [1_u16, 2, 4] {
         let mut unsupported_version = encoded.clone();
         unsupported_version[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len()
             ..CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2]
@@ -1181,8 +1181,68 @@ fn assert_raft_peer_rpc_wire_registries_are_complete() {
 }
 
 #[test]
-fn control_plane_raft_peer_rpc_v2_catalogue_is_exact() {
-    assert_eq!(CONTROL_PLANE_RAFT_PEER_RPC_VERSION, 2);
+fn control_plane_raft_peer_rpc_v2_catalogues_remain_exact_and_rejected() {
+    for (encoded, expected_len, expected_digest) in [
+        (
+            include_str!("peer_rpc_v2_state_v28_command_v15_aggregate.hex"),
+            2_452,
+            "621a9fb29dac5c5044ec398707c03f3578ec15fbb7e34d1e52fe2e0bd98dc304",
+        ),
+        (
+            include_str!("peer_rpc_v2_state_v29_command_v16_aggregate.hex"),
+            2_452,
+            "08ce6de520700664880c7d26f21ed20f73f93be3bbf0114ff6852e173730311f",
+        ),
+    ] {
+        assert_raft_peer_rpc_v2_catalogue_is_exact_and_rejected(
+            encoded,
+            expected_len,
+            expected_digest,
+        );
+    }
+}
+
+fn assert_raft_peer_rpc_v2_catalogue_is_exact_and_rejected(
+    encoded: &str,
+    expected_len: usize,
+    expected_digest: &str,
+) {
+    let aggregate = raft_test_decode_hex(encoded);
+    assert_eq!(
+        (
+            aggregate.len(),
+            raft_test_hex(&checksum::sha256::digest(&aggregate))
+        ),
+        (expected_len, expected_digest.to_owned())
+    );
+
+    let mut offset = 0;
+    let mut expected_sample = 1_u8;
+    while offset < aggregate.len() {
+        assert_eq!(aggregate[offset], expected_sample);
+        offset += 1;
+        let frame_len = u32::from_be_bytes(
+            aggregate[offset..offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset += std::mem::size_of::<u32>();
+        let frame = &aggregate[offset..offset + frame_len];
+        offset += frame_len;
+        assert!(matches!(
+            raft_peer_rpc_frame_reader_classified(frame),
+            Err(ControlPlaneRaftPeerRpcFrameDecodeError::Format(
+                ControlPlaneRaftPeerRpcFrameFormatError::UnsupportedVersion(2)
+            ))
+        ));
+        expected_sample = expected_sample.checked_add(1).unwrap();
+    }
+    assert_eq!(expected_sample, 21);
+}
+
+#[test]
+fn control_plane_raft_peer_rpc_v3_catalogue_is_exact() {
+    assert_eq!(CONTROL_PLANE_RAFT_PEER_RPC_VERSION, 3);
     assert_raft_peer_rpc_wire_registries_are_complete();
     let optional_capture = ControlPlaneRaftPeerRpcOptionCapture::begin();
     let identity_without_topology =
@@ -1632,8 +1692,8 @@ fn control_plane_raft_peer_rpc_v2_catalogue_is_exact() {
             raft_test_hex(&checksum::sha256::digest(&aggregate))
         ),
         (
-            2_452,
-            "08ce6de520700664880c7d26f21ed20f73f93be3bbf0114ff6852e173730311f".to_owned()
+            2_402,
+            "7dc75647cba28fcd8616e5a9a766ff1b60d64b0455e5b2050018a1bc71121f0e".to_owned()
         )
     );
 }
@@ -2426,7 +2486,7 @@ fn control_plane_raft_peer_server_rejects_authenticated_peer_rpc_versions_before
     .encode_frame_for_peer(&identity)
     .unwrap();
 
-    for (index, version) in [1_u16, 3].into_iter().enumerate() {
+    for (index, version) in [1_u16, 2, 4].into_iter().enumerate() {
         let mut unsupported = current.clone();
         unsupported[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len()
             ..CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2]

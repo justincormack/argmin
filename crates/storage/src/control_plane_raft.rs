@@ -6162,7 +6162,7 @@ fn read_control_plane_raft_restart_sentinel_bytes<'a>(
 }
 
 const CONTROL_PLANE_RAFT_RESTART_MAGIC: &[u8] = b"ARGMINCPRAFT";
-const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 4;
+const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 5;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC: &[u8] = b"ARGMINCPRAFTSEEN";
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION: u16 = 1;
@@ -6176,7 +6176,7 @@ const CONTROL_PLANE_RAFT_WAL_FILE_VERSION: u16 = 2;
 #[cfg(test)]
 const CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
-const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 2;
+const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 3;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
 const RAFT_ENTRY_MIN_LEN: usize = 8 + 8 + 8 + 1;
 const RAFT_MEMBERSHIP_CONFIG_MIN_LEN: usize = 4;
@@ -9251,23 +9251,7 @@ fn write_raft_snapshot_meta(
             )?;
         }
     }
-    // Keep the removed OpenRaft snapshot-id field in Argmin's durable and peer
-    // formats so alpha.30 artifacts and mixed-version peers remain compatible.
-    // The value has always been derived from the covered log position.
-    write_raft_string(out, &control_plane_raft_snapshot_id(meta.last_log_id))?;
     Ok(())
-}
-
-fn control_plane_raft_snapshot_id(log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>) -> String {
-    match log_id {
-        Some(log_id) => format!(
-            "control-plane-T{}-N{}-I{}",
-            log_id.committed_leader_id().term,
-            log_id.committed_leader_id().node_id,
-            log_id.index()
-        ),
-        None => "control-plane-empty".to_string(),
-    }
 }
 
 fn write_raft_append_entries_request(
@@ -9916,13 +9900,6 @@ impl<'a> RaftArtifactReader<'a> {
     ) -> Result<SnapshotMetaOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
         let last_log_id = self.read_option_log_id()?;
         let last_membership = self.read_stored_membership()?;
-        let snapshot_id = self.read_string()?;
-        let expected_snapshot_id = control_plane_raft_snapshot_id(last_log_id);
-        if snapshot_id != expected_snapshot_id {
-            return Err(raft_artifact_protocol_error(format!(
-                "control-plane OpenRaft snapshot id {snapshot_id} does not match expected {expected_snapshot_id} for last_log_id {last_log_id:?}"
-            )));
-        }
         Ok(SnapshotMeta {
             last_log_id,
             last_membership,

@@ -341,9 +341,69 @@ fn control_plane_raft_durable_restart_artifact_codec_round_trips() {
 }
 
 #[test]
-fn control_plane_raft_durable_restart_artifact_v4_aggregate_is_exact_and_complete() {
+fn control_plane_raft_durable_restart_artifact_v4_aggregates_remain_exact_and_rejected() {
+    for (encoded, expected_len, expected_digest) in [
+        (
+            include_str!("restart_artifact_v4_state_v28_command_v15_aggregate.hex"),
+            2_241,
+            "dd78c6257bcfbcd8d442c4bc3e80a4281993a6adeb009f5774cc98b84071ecf9",
+        ),
+        (
+            include_str!("restart_artifact_v4_state_v29_command_v16_aggregate.hex"),
+            2_245,
+            "fe9a18f104034100ba82445ec8c2c302b4506e1fa2ff6119f68821ac9f762792",
+        ),
+    ] {
+        assert_raft_restart_v4_aggregate_is_exact_and_rejected(
+            encoded,
+            expected_len,
+            expected_digest,
+        );
+    }
+}
+
+fn assert_raft_restart_v4_aggregate_is_exact_and_rejected(
+    encoded: &str,
+    expected_len: usize,
+    expected_digest: &str,
+) {
+    let aggregate = raft_test_decode_hex(encoded);
+    assert_eq!(
+        (
+            aggregate.len(),
+            raft_test_hex(&checksum::sha256::digest(&aggregate))
+        ),
+        (expected_len, expected_digest.to_owned())
+    );
+
+    let mut offset = 0;
+    let mut artifact_count = 0;
+    while offset < aggregate.len() {
+        let artifact_len = u32::from_be_bytes(
+            aggregate[offset..offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset += std::mem::size_of::<u32>();
+        let artifact = &aggregate[offset..offset + artifact_len];
+        offset += artifact_len;
+        assert!(matches!(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact_before_restore_validation_classified(
+                artifact
+            ),
+            Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+                ControlPlaneRaftRestartArtifactFormatError::UnsupportedVersion(4)
+            ))
+        ));
+        artifact_count += 1;
+    }
+    assert_eq!(artifact_count, 4);
+}
+
+#[test]
+fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complete() {
     let empty = ControlPlaneRaftRestartArtifact {
-        cluster_name: "restart-v4-empty".to_string(),
+        cluster_name: "restart-v5-empty".to_string(),
         local_node_id: 1,
         wal_replay_offset: 0,
         log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
@@ -353,7 +413,7 @@ fn control_plane_raft_durable_restart_artifact_v4_aggregate_is_exact_and_complet
     let mut empty_snapshot_state_machine = ControlPlaneRaftStateMachine::empty();
     empty_snapshot_state_machine.build_snapshot().unwrap();
     let empty_snapshot = ControlPlaneRaftRestartArtifact {
-        cluster_name: "restart-v4-empty-snapshot".to_string(),
+        cluster_name: "restart-v5-empty-snapshot".to_string(),
         local_node_id: 2,
         wal_replay_offset: 17,
         log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
@@ -366,7 +426,7 @@ fn control_plane_raft_durable_restart_artifact_v4_aggregate_is_exact_and_complet
         1,
         1,
         ControlPlaneCommand::BootstrapInitialClusterMap {
-            nodes: vec![(NodeId::new(1), "/tmp/restart-v4-node-1.sock".to_string())],
+            nodes: vec![(NodeId::new(1), "/tmp/restart-v5-node-1.sock".to_string())],
             pg_ids: vec![PgId::new(7)],
         },
     );
@@ -381,7 +441,7 @@ fn control_plane_raft_durable_restart_artifact_v4_aggregate_is_exact_and_complet
     }
     populated_state_machine.build_snapshot().unwrap();
     let populated = ControlPlaneRaftRestartArtifact {
-        cluster_name: "restart-v4-populated".to_string(),
+        cluster_name: "restart-v5-populated".to_string(),
         local_node_id: 1,
         wal_replay_offset: 0x0102_0304_0506_0708,
         log_store: ControlPlaneRaftLogStoreRestartArtifact {
@@ -399,7 +459,7 @@ fn control_plane_raft_durable_restart_artifact_v4_aggregate_is_exact_and_complet
         .apply_entry(bootstrap_membership.clone())
         .unwrap();
     let purged = ControlPlaneRaftRestartArtifact {
-        cluster_name: "restart-v4-purged".to_string(),
+        cluster_name: "restart-v5-purged".to_string(),
         local_node_id: 1,
         wal_replay_offset: 23,
         log_store: ControlPlaneRaftLogStoreRestartArtifact {
@@ -461,19 +521,13 @@ fn control_plane_raft_durable_restart_artifact_v4_aggregate_is_exact_and_complet
         assert_eq!(decoded.encode_durable_artifact().unwrap(), *bytes);
     }
     assert_eq!(
-        aggregate,
-        raft_test_decode_hex(include_str!(
-            "restart_artifact_v4_state_v29_command_v16_aggregate.hex"
-        ))
-    );
-    assert_eq!(
         (
             aggregate.len(),
             raft_test_hex(&checksum::sha256::digest(&aggregate))
         ),
         (
-            2245,
-            "fe9a18f104034100ba82445ec8c2c302b4506e1fa2ff6119f68821ac9f762792"
+            2196,
+            "016f7d32030efc5f9c0180c3b5a42977f0d94c78e3bc8012edab7ca252601c86"
                 .to_string()
         )
     );
@@ -1374,10 +1428,7 @@ fn control_plane_openraft_durable_startup_rejects_unsupported_wal_frame_without_
 fn control_plane_openraft_durable_startup_rejects_unsupported_restart_artifact_without_replay() {
     ControlPlaneRaftTypeConfig::run(async {
         let cluster_name = "control-plane-raft-unsupported-restart-artifact-startup-test";
-        for version in [
-            CONTROL_PLANE_RAFT_RESTART_VERSION - 1,
-            CONTROL_PLANE_RAFT_RESTART_VERSION + 1,
-        ] {
+        for version in [3, 4, CONTROL_PLANE_RAFT_RESTART_VERSION + 1] {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.state");
             let sentinel_path = durable_artifact_sentinel_path(&path);
@@ -1713,10 +1764,6 @@ fn control_plane_openraft_durable_single_node_restores_current_snapshot_cache() 
         assert_eq!(
             restored_snapshot.meta.last_log_id,
             Some(raft_log_id(3, 1, 1))
-        );
-        assert_eq!(
-            control_plane_raft_snapshot_id(restored_snapshot.meta.last_log_id),
-            "control-plane-T3-N1-I1"
         );
 
         authority.shutdown().await.unwrap();
@@ -2592,10 +2639,7 @@ fn control_plane_raft_durable_restart_artifact_codec_rejects_malformed_frames() 
         ))
     ));
 
-    for version in [
-        CONTROL_PLANE_RAFT_RESTART_VERSION - 1,
-        CONTROL_PLANE_RAFT_RESTART_VERSION + 1,
-    ] {
+    for version in [3, 4, CONTROL_PLANE_RAFT_RESTART_VERSION + 1] {
         let mut unsupported_version = encoded.clone();
         let version_offset = CONTROL_PLANE_RAFT_RESTART_MAGIC.len();
         unsupported_version[version_offset..version_offset + std::mem::size_of::<u16>()]
