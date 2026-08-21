@@ -2380,6 +2380,12 @@ fn refresh_raft_wal_frame_checksum(frame: &mut Vec<u8>) {
     append_raft_artifact_checksum(frame);
 }
 
+fn refresh_raft_restart_artifact_checksum(artifact: &mut Vec<u8>) {
+    let checksum_start = artifact.len() - CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN;
+    artifact.truncate(checksum_start);
+    append_raft_artifact_checksum(artifact);
+}
+
 fn raft_test_hex(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -2387,6 +2393,21 @@ fn raft_test_hex(bytes: &[u8]) -> String {
         write!(&mut encoded, "{byte:02x}").unwrap();
     }
     encoded
+}
+
+fn raft_test_decode_hex(encoded: &str) -> Vec<u8> {
+    let encoded = encoded
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    assert_eq!(encoded.len() % 2, 0, "hex fixture must have whole bytes");
+    encoded
+        .chunks_exact(2)
+        .map(|digits| {
+            let digits = std::str::from_utf8(digits).expect("hex fixture must be ASCII");
+            u8::from_str_radix(digits, 16).expect("hex fixture must contain hexadecimal digits")
+        })
+        .collect()
 }
 
 fn wal_file_frame_end(bytes: &[u8], start: usize) -> usize {

@@ -471,7 +471,7 @@ impl ControlPlaneRaftPeerSnapshotRequest {
         );
         write_raft_peer_frame_identity(&mut out, identity)?;
         write_raft_vote(&mut out, self.vote);
-        write_raft_snapshot(&mut out, &self.snapshot)?;
+        write_raft_snapshot(&mut out, &self.snapshot, RaftSnapshotEncodingContext::Peer)?;
         append_raft_artifact_checksum(&mut out);
         Ok(out)
     }

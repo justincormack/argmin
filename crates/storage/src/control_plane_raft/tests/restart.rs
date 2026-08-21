@@ -341,6 +341,145 @@ fn control_plane_raft_durable_restart_artifact_codec_round_trips() {
 }
 
 #[test]
+fn control_plane_raft_durable_restart_artifact_v4_aggregate_is_exact_and_complete() {
+    let empty = ControlPlaneRaftRestartArtifact {
+        cluster_name: "restart-v4-empty".to_string(),
+        local_node_id: 1,
+        wal_replay_offset: 0,
+        log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+        state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+    };
+
+    let mut empty_snapshot_state_machine = ControlPlaneRaftStateMachine::empty();
+    empty_snapshot_state_machine.build_snapshot().unwrap();
+    let empty_snapshot = ControlPlaneRaftRestartArtifact {
+        cluster_name: "restart-v4-empty-snapshot".to_string(),
+        local_node_id: 2,
+        wal_replay_offset: 17,
+        log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+        state_machine: empty_snapshot_state_machine.export_restart_artifact(),
+    };
+
+    let bootstrap_membership = single_node_bootstrap_membership_entry(1);
+    let bootstrap_command = normal_entry(
+        3,
+        1,
+        1,
+        ControlPlaneCommand::BootstrapInitialClusterMap {
+            nodes: vec![(NodeId::new(1), "/tmp/restart-v4-node-1.sock".to_string())],
+            pg_ids: vec![PgId::new(7)],
+        },
+    );
+    let blank = blank_entry(3, 1, 2);
+    let mut populated_state_machine = ControlPlaneRaftStateMachine::empty();
+    for entry in [
+        bootstrap_membership.clone(),
+        bootstrap_command.clone(),
+        blank.clone(),
+    ] {
+        populated_state_machine.apply_entry(entry).unwrap();
+    }
+    populated_state_machine.build_snapshot().unwrap();
+    let populated = ControlPlaneRaftRestartArtifact {
+        cluster_name: "restart-v4-populated".to_string(),
+        local_node_id: 1,
+        wal_replay_offset: 0x0102_0304_0506_0708,
+        log_store: ControlPlaneRaftLogStoreRestartArtifact {
+            vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+            committed: Some(raft_log_id(3, 1, 2)),
+            last_purged_log_id: None,
+            entries: vec![bootstrap_membership, bootstrap_command, blank],
+        },
+        state_machine: populated_state_machine.export_restart_artifact(),
+    };
+
+    let bootstrap_membership = single_node_bootstrap_membership_entry(1);
+    let mut purged_state_machine = ControlPlaneRaftStateMachine::empty();
+    purged_state_machine
+        .apply_entry(bootstrap_membership.clone())
+        .unwrap();
+    let purged = ControlPlaneRaftRestartArtifact {
+        cluster_name: "restart-v4-purged".to_string(),
+        local_node_id: 1,
+        wal_replay_offset: 23,
+        log_store: ControlPlaneRaftLogStoreRestartArtifact {
+            vote: Some(Vote::<ControlPlaneRaftLeaderId>::new(4, 1)),
+            committed: Some(bootstrap_membership.log_id),
+            last_purged_log_id: Some(bootstrap_membership.log_id),
+            entries: Vec::new(),
+        },
+        state_machine: purged_state_machine.export_restart_artifact(),
+    };
+
+    let artifacts = [empty, empty_snapshot, populated, purged];
+    let option_capture = ControlPlaneRaftRestartOptionCapture::begin();
+    let encoded = artifacts
+        .iter()
+        .map(|artifact| artifact.encode_durable_artifact().unwrap())
+        .collect::<Vec<_>>();
+    let observed_options = option_capture.finish().into_iter().collect::<BTreeSet<_>>();
+    let expected_options = ControlPlaneRaftRestartOptionalField::ALL
+        .iter()
+        .copied()
+        .flat_map(|field| {
+            RaftWireOptionTag::ALL
+                .into_iter()
+                .map(move |arm| (field, arm))
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(observed_options, expected_options);
+
+    let observed_entry_payloads = artifacts
+        .iter()
+        .flat_map(|artifact| artifact.log_store.entries.iter())
+        .map(control_plane_raft_entry_payload_tag)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        observed_entry_payloads,
+        ControlPlaneRaftEntryPayloadTag::ALL
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+    let observed_vote_booleans = artifacts
+        .iter()
+        .filter_map(|artifact| artifact.log_store.vote)
+        .map(|vote| RaftWireBoolean::from_bool(vote.committed))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        observed_vote_booleans,
+        RaftWireBoolean::ALL.into_iter().collect::<BTreeSet<_>>()
+    );
+
+    let mut aggregate = Vec::new();
+    for bytes in &encoded {
+        write_raft_u32(
+            &mut aggregate,
+            u32::try_from(bytes.len()).expect("restart fixture length should fit u32"),
+        );
+        aggregate.extend_from_slice(bytes);
+        let decoded = ControlPlaneRaftRestartArtifact::decode_durable_artifact(bytes).unwrap();
+        assert_eq!(decoded.encode_durable_artifact().unwrap(), *bytes);
+    }
+    assert_eq!(
+        aggregate,
+        raft_test_decode_hex(include_str!(
+            "restart_artifact_v4_state_v29_command_v16_aggregate.hex"
+        ))
+    );
+    assert_eq!(
+        (
+            aggregate.len(),
+            raft_test_hex(&checksum::sha256::digest(&aggregate))
+        ),
+        (
+            2245,
+            "fe9a18f104034100ba82445ec8c2c302b4506e1fa2ff6119f68821ac9f762792"
+                .to_string()
+        )
+    );
+}
+
+#[test]
 fn control_plane_raft_durable_restart_artifact_file_round_trips() {
     let tmp = test_util::tempdir();
     let path = tmp.path().join("control-plane").join("raft.state");
@@ -1223,6 +1362,74 @@ fn control_plane_openraft_durable_startup_rejects_unsupported_wal_frame_without_
             );
 
             assert_eq!(control_plane_raft_wal_replay_attempts(), 0);
+            assert_eq!(std::fs::read(&path).unwrap(), artifact_bytes);
+            assert_eq!(std::fs::read(&sentinel_path).unwrap(), sentinel_bytes);
+            assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
+            assert!(!durable_artifact_tmp_path(&path).exists());
+        }
+    });
+}
+
+#[test]
+fn control_plane_openraft_durable_startup_rejects_unsupported_restart_artifact_without_replay() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let cluster_name = "control-plane-raft-unsupported-restart-artifact-startup-test";
+        for version in [
+            CONTROL_PLANE_RAFT_RESTART_VERSION - 1,
+            CONTROL_PLANE_RAFT_RESTART_VERSION + 1,
+        ] {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let sentinel_path = durable_artifact_sentinel_path(&path);
+            let wal_path = durable_artifact_wal_path(&path);
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+                state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+
+            let wal = test_raft_wal_file(&wal_path, cluster_name, 1);
+            wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
+                ControlPlaneRaftLeaderId,
+            >::new_committed(
+                3, 1,
+            )))
+            .unwrap();
+            OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .unwrap()
+                .write_all(&[0, 0, 0])
+                .unwrap();
+
+            let mut artifact_bytes = std::fs::read(&path).unwrap();
+            let version_offset = CONTROL_PLANE_RAFT_RESTART_MAGIC.len();
+            artifact_bytes[version_offset..version_offset + std::mem::size_of::<u16>()]
+                .copy_from_slice(&version.to_be_bytes());
+            refresh_raft_restart_artifact_checksum(&mut artifact_bytes);
+            std::fs::write(&path, &artifact_bytes).unwrap();
+            let sentinel_bytes = std::fs::read(&sentinel_path).unwrap();
+            let wal_bytes = std::fs::read(&wal_path).unwrap();
+            reset_control_plane_raft_wal_replay_attempts();
+            reset_control_plane_raft_restore_attempts();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    cluster_name,
+                    1,
+                    &path,
+                )
+                .await,
+                &format!(
+                    "unsupported control-plane OpenRaft durable restart artifact version {version}"
+                ),
+            );
+
+            assert_eq!(control_plane_raft_wal_replay_attempts(), 0);
+            assert_eq!(control_plane_raft_restore_attempts(), 0);
             assert_eq!(std::fs::read(&path).unwrap(), artifact_bytes);
             assert_eq!(std::fs::read(&sentinel_path).unwrap(), sentinel_bytes);
             assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
@@ -2364,38 +2571,70 @@ fn control_plane_raft_durable_restart_artifact_codec_rejects_malformed_frames() 
         state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
     };
     assert!(matches!(
-        ControlPlaneRaftRestartArtifact::decode_durable_artifact(b"short"),
-        Err(ControlPlaneError::CommandDecode { .. })
+        ControlPlaneRaftRestartArtifact::decode_durable_artifact_before_restore_validation_classified(
+            b"short"
+        ),
+        Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+            ControlPlaneRaftRestartArtifactFormatError::Truncated
+        ))
     ));
 
     let encoded = artifact.encode_durable_artifact().unwrap();
     let mut bad_magic = encoded.clone();
     bad_magic[0] ^= 1;
-    bad_magic.truncate(bad_magic.len() - CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN);
-    append_raft_artifact_checksum(&mut bad_magic);
-    assert_error_contains(
-        ControlPlaneRaftRestartArtifact::decode_durable_artifact(&bad_magic),
-        "invalid control-plane OpenRaft durable restart artifact magic",
-    );
+    refresh_raft_restart_artifact_checksum(&mut bad_magic);
+    assert!(matches!(
+        ControlPlaneRaftRestartArtifact::decode_durable_artifact_before_restore_validation_classified(
+            &bad_magic
+        ),
+        Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+            ControlPlaneRaftRestartArtifactFormatError::UnknownMagic
+        ))
+    ));
 
-    let mut unsupported_version = Vec::new();
-    unsupported_version.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
-    write_raft_u16(
-        &mut unsupported_version,
+    for version in [
+        CONTROL_PLANE_RAFT_RESTART_VERSION - 1,
         CONTROL_PLANE_RAFT_RESTART_VERSION + 1,
-    );
-    append_raft_artifact_checksum(&mut unsupported_version);
-    assert_error_contains(
-        ControlPlaneRaftRestartArtifact::decode_durable_artifact(&unsupported_version),
-        "unsupported control-plane OpenRaft durable restart artifact version",
-    );
+    ] {
+        let mut unsupported_version = encoded.clone();
+        let version_offset = CONTROL_PLANE_RAFT_RESTART_MAGIC.len();
+        unsupported_version[version_offset..version_offset + std::mem::size_of::<u16>()]
+            .copy_from_slice(&version.to_be_bytes());
+        refresh_raft_restart_artifact_checksum(&mut unsupported_version);
+        assert!(matches!(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact_before_restore_validation_classified(
+                &unsupported_version
+            ),
+            Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+                ControlPlaneRaftRestartArtifactFormatError::UnsupportedVersion(candidate)
+            )) if candidate == version
+        ));
+    }
 
-    let mut truncated = encoded.clone();
-    truncated.pop();
-    assert_error_contains(
-        ControlPlaneRaftRestartArtifact::decode_durable_artifact(&truncated),
-        "checksum mismatch",
+    let mut bad_checksum = encoded.clone();
+    *bad_checksum.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        ControlPlaneRaftRestartArtifact::decode_durable_artifact_before_restore_validation_classified(
+            &bad_checksum
+        ),
+        Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+            ControlPlaneRaftRestartArtifactFormatError::ChecksumMismatch { .. }
+        ))
+    ));
+
+    let mut truncated_payload = encoded.clone();
+    truncated_payload.remove(
+        truncated_payload.len() - CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN - 1,
     );
+    refresh_raft_restart_artifact_checksum(&mut truncated_payload);
+    assert!(matches!(
+        ControlPlaneRaftRestartArtifact::decode_durable_artifact_before_restore_validation_classified(
+            &truncated_payload
+        ),
+        Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+            ControlPlaneRaftRestartArtifactFormatError::Truncated
+        ))
+    ));
 
     let mut unknown_entry_tag = Vec::new();
     unknown_entry_tag.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
@@ -2403,7 +2642,11 @@ fn control_plane_raft_durable_restart_artifact_codec_rejects_malformed_frames() 
     write_raft_string(&mut unknown_entry_tag, "test-cluster").unwrap();
     write_raft_u64(&mut unknown_entry_tag, 1);
     write_raft_u64(&mut unknown_entry_tag, 0);
-    write_raft_option_vote(&mut unknown_entry_tag, None);
+    write_raft_restart_option_vote(
+        &mut unknown_entry_tag,
+        ControlPlaneRaftRestartOptionalField::LogStoreVote,
+        None,
+    );
     write_raft_option_log_id(&mut unknown_entry_tag, None);
     write_raft_option_log_id(&mut unknown_entry_tag, None);
     write_raft_u32(&mut unknown_entry_tag, 1);

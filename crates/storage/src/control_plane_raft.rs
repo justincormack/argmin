@@ -5993,6 +5993,9 @@ std::thread_local! {
     static CONTROL_PLANE_RAFT_WAL_REPLAY_ATTEMPTS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    static CONTROL_PLANE_RAFT_RESTORE_ATTEMPTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 #[cfg(test)]
@@ -6003,6 +6006,16 @@ fn reset_control_plane_raft_wal_replay_attempts() {
 #[cfg(test)]
 fn control_plane_raft_wal_replay_attempts() -> usize {
     CONTROL_PLANE_RAFT_WAL_REPLAY_ATTEMPTS.get()
+}
+
+#[cfg(test)]
+fn reset_control_plane_raft_restore_attempts() {
+    CONTROL_PLANE_RAFT_RESTORE_ATTEMPTS.set(0);
+}
+
+#[cfg(test)]
+fn control_plane_raft_restore_attempts() -> usize {
+    CONTROL_PLANE_RAFT_RESTORE_ATTEMPTS.get()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6050,6 +6063,50 @@ type ControlPlaneRaftWalAppendError = DurableJournalAppendError;
 struct ControlPlaneRaftRestartSentinel {
     cluster_name: String,
     local_node_id: ControlPlaneRaftNodeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneRaftRestartArtifactFormatError {
+    Truncated,
+    ChecksumMismatch { expected: u64, actual: u64 },
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for ControlPlaneRaftRestartArtifactFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str(
+                "truncated control-plane OpenRaft durable restart artifact",
+            ),
+            Self::ChecksumMismatch { expected, actual } => write!(
+                formatter,
+                "control-plane OpenRaft durable restart artifact checksum mismatch: expected {expected:#x}, actual {actual:#x}"
+            ),
+            Self::UnknownMagic => formatter.write_str(
+                "invalid control-plane OpenRaft durable restart artifact magic",
+            ),
+            Self::UnsupportedVersion(version) => write!(
+                formatter,
+                "unsupported control-plane OpenRaft durable restart artifact version {version}"
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ControlPlaneRaftRestartArtifactDecodeError {
+    Format(ControlPlaneRaftRestartArtifactFormatError),
+    Invalid(ControlPlaneError),
+}
+
+impl ControlPlaneRaftRestartArtifactDecodeError {
+    fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::Format(error) => raft_artifact_protocol_error(error.to_string()),
+            Self::Invalid(error) => error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7529,11 +7586,18 @@ impl ControlPlaneRaftRestartArtifact {
     fn decode_durable_artifact_before_restore_validation(
         bytes: &[u8],
     ) -> Result<Self, ControlPlaneError> {
+        Self::decode_durable_artifact_before_restore_validation_classified(bytes)
+            .map_err(ControlPlaneRaftRestartArtifactDecodeError::into_control_plane_error)
+    }
+
+    fn decode_durable_artifact_before_restore_validation_classified(
+        bytes: &[u8],
+    ) -> Result<Self, ControlPlaneRaftRestartArtifactDecodeError> {
         let min_len =
             CONTROL_PLANE_RAFT_RESTART_MAGIC.len() + 2 + CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN;
         if bytes.len() < min_len {
-            return Err(raft_artifact_protocol_error(
-                "truncated control-plane OpenRaft durable restart artifact",
+            return Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+                ControlPlaneRaftRestartArtifactFormatError::Truncated,
             ));
         }
         let (body, checksum_bytes) =
@@ -7545,33 +7609,51 @@ impl ControlPlaneRaftRestartArtifact {
         );
         let actual_checksum = raft_artifact_checksum(body);
         if actual_checksum != expected_checksum {
-            return Err(raft_artifact_protocol_error(format!(
-                "control-plane OpenRaft durable restart artifact checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
-            )));
+            return Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+                ControlPlaneRaftRestartArtifactFormatError::ChecksumMismatch {
+                    expected: expected_checksum,
+                    actual: actual_checksum,
+                },
+            ));
         }
 
         let mut reader = RaftArtifactReader::new(body);
-        let magic = reader.read_exact(CONTROL_PLANE_RAFT_RESTART_MAGIC.len())?;
+        let magic = reader
+            .read_exact(CONTROL_PLANE_RAFT_RESTART_MAGIC.len())
+            .map_err(ControlPlaneRaftRestartArtifactDecodeError::Invalid)?;
         if magic != CONTROL_PLANE_RAFT_RESTART_MAGIC {
-            return Err(raft_artifact_protocol_error(
-                "invalid control-plane OpenRaft durable restart artifact magic",
+            return Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+                ControlPlaneRaftRestartArtifactFormatError::UnknownMagic,
             ));
         }
-        let version = reader.read_u16()?;
+        let version = reader
+            .read_u16()
+            .map_err(ControlPlaneRaftRestartArtifactDecodeError::Invalid)?;
         if version != CONTROL_PLANE_RAFT_RESTART_VERSION {
-            return Err(raft_artifact_protocol_error(format!(
-                "unsupported control-plane OpenRaft durable restart artifact version {version}"
-            )));
+            return Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+                ControlPlaneRaftRestartArtifactFormatError::UnsupportedVersion(version),
+            ));
         }
-        let artifact = Self {
-            cluster_name: reader.read_string()?,
-            local_node_id: reader.read_u64()?,
-            wal_replay_offset: reader.read_u64()?,
-            log_store: read_raft_log_store_artifact(&mut reader)?,
-            state_machine: read_raft_state_machine_artifact(&mut reader)?,
-        };
-        reader.finish()?;
-        Ok(artifact)
+        let decoded: Result<Self, ControlPlaneError> = (|| {
+            let artifact = Self {
+                cluster_name: reader.read_string()?,
+                local_node_id: reader.read_u64()?,
+                wal_replay_offset: reader.read_u64()?,
+                log_store: read_raft_log_store_artifact(&mut reader)?,
+                state_machine: read_raft_state_machine_artifact(&mut reader)?,
+            };
+            reader.finish()?;
+            Ok(artifact)
+        })();
+        match decoded {
+            Ok(artifact) => Ok(artifact),
+            Err(_) if reader.was_truncated() => {
+                Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+                    ControlPlaneRaftRestartArtifactFormatError::Truncated,
+                ))
+            }
+            Err(error) => Err(ControlPlaneRaftRestartArtifactDecodeError::Invalid(error)),
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -7765,6 +7847,9 @@ impl ControlPlaneRaftRestartArtifact {
     fn restore(
         self,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), io::Error> {
+        #[cfg(test)]
+        CONTROL_PLANE_RAFT_RESTORE_ATTEMPTS
+            .set(CONTROL_PLANE_RAFT_RESTORE_ATTEMPTS.get().saturating_add(1));
         let log_store =
             ControlPlaneRaftLogStore::from_restart_artifact_in_memory(self.log_store.clone())?;
         let state_machine =
@@ -7795,6 +7880,9 @@ impl ControlPlaneRaftRestartArtifact {
             &ControlPlaneRaftRestartArtifact,
         ) -> Result<(), ControlPlaneError>,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
+        #[cfg(test)]
+        CONTROL_PLANE_RAFT_RESTORE_ATTEMPTS
+            .set(CONTROL_PLANE_RAFT_RESTORE_ATTEMPTS.get().saturating_add(1));
         let log_store_artifact =
             wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
                 base: &self.log_store,
@@ -8655,9 +8743,21 @@ fn write_raft_log_store_artifact(
     out: &mut Vec<u8>,
     artifact: &ControlPlaneRaftLogStoreRestartArtifact,
 ) -> Result<(), ControlPlaneError> {
-    write_raft_option_vote(out, artifact.vote);
-    write_raft_option_log_id(out, artifact.committed);
-    write_raft_option_log_id(out, artifact.last_purged_log_id);
+    write_raft_restart_option_vote(
+        out,
+        ControlPlaneRaftRestartOptionalField::LogStoreVote,
+        artifact.vote,
+    );
+    write_raft_restart_option_log_id(
+        out,
+        ControlPlaneRaftRestartOptionalField::LogStoreCommitted,
+        artifact.committed,
+    );
+    write_raft_restart_option_log_id(
+        out,
+        ControlPlaneRaftRestartOptionalField::LogStoreLastPurged,
+        artifact.last_purged_log_id,
+    );
     write_raft_u32(
         out,
         raft_len_as_u32(artifact.entries.len(), "raft log entries")?,
@@ -8722,13 +8822,22 @@ fn write_raft_state_machine_artifact(
     out: &mut Vec<u8>,
     artifact: &ControlPlaneRaftStateMachineRestartArtifact,
 ) -> Result<(), ControlPlaneError> {
-    write_raft_option_log_id(out, artifact.last_applied);
-    write_raft_stored_membership(out, &artifact.last_membership, None)?;
+    write_raft_restart_option_log_id(
+        out,
+        ControlPlaneRaftRestartOptionalField::StateMachineLastApplied,
+        artifact.last_applied,
+    );
+    write_raft_restart_option_log_id(
+        out,
+        ControlPlaneRaftRestartOptionalField::StateMachineLastMembershipLogId,
+        *artifact.last_membership.log_id(),
+    );
+    write_raft_membership(out, artifact.last_membership.membership())?;
 
     let mut inner = artifact.inner.clone();
     let snapshot_artifact = inner.build_snapshot_artifact()?;
     write_raft_bytes(out, snapshot_artifact.payload())?;
-    write_raft_option_snapshot(out, artifact.current_snapshot.as_ref())?;
+    write_raft_restart_option_snapshot(out, artifact.current_snapshot.as_ref())?;
     Ok(())
 }
 
@@ -8864,6 +8973,30 @@ define_control_plane_raft_peer_rpc_optional_fields!(
     SnapshotMembershipLogId,
 );
 
+macro_rules! define_control_plane_raft_restart_optional_fields {
+    ($($field:ident),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum ControlPlaneRaftRestartOptionalField {
+            $($field),+
+        }
+
+        impl ControlPlaneRaftRestartOptionalField {
+            const ALL: &'static [Self] = &[$(Self::$field),+];
+        }
+    };
+}
+
+define_control_plane_raft_restart_optional_fields!(
+    LogStoreVote,
+    LogStoreCommitted,
+    LogStoreLastPurged,
+    StateMachineLastApplied,
+    StateMachineLastMembershipLogId,
+    CurrentSnapshot,
+    CurrentSnapshotLastLogId,
+    CurrentSnapshotMembershipLogId,
+);
+
 #[cfg(test)]
 thread_local! {
     static CONTROL_PLANE_RAFT_PEER_RPC_OPTION_CAPTURE: std::cell::RefCell<
@@ -8874,6 +9007,53 @@ thread_local! {
 #[cfg(test)]
 struct ControlPlaneRaftPeerRpcOptionCapture {
     active: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTROL_PLANE_RAFT_RESTART_OPTION_CAPTURE: std::cell::RefCell<
+        Option<Vec<(ControlPlaneRaftRestartOptionalField, RaftWireOptionTag)>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ControlPlaneRaftRestartOptionCapture {
+    active: bool,
+}
+
+#[cfg(test)]
+impl ControlPlaneRaftRestartOptionCapture {
+    fn begin() -> Self {
+        CONTROL_PLANE_RAFT_RESTART_OPTION_CAPTURE.with(|capture| {
+            let previous = capture.borrow_mut().replace(Vec::new());
+            assert!(
+                previous.is_none(),
+                "restart-artifact option capture is already active"
+            );
+        });
+        Self { active: true }
+    }
+
+    fn finish(mut self) -> Vec<(ControlPlaneRaftRestartOptionalField, RaftWireOptionTag)> {
+        self.active = false;
+        CONTROL_PLANE_RAFT_RESTART_OPTION_CAPTURE.with(|capture| {
+            capture
+                .borrow_mut()
+                .take()
+                .expect("restart-artifact option capture must remain active")
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for ControlPlaneRaftRestartOptionCapture {
+    fn drop(&mut self) {
+        if self.active {
+            CONTROL_PLANE_RAFT_RESTART_OPTION_CAPTURE.with(|capture| {
+                capture.borrow_mut().take();
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8927,6 +9107,44 @@ fn write_raft_peer_option_tag(
     write_raft_u8(out, arm.as_u8());
 }
 
+fn write_raft_restart_option_tag(
+    out: &mut Vec<u8>,
+    field: ControlPlaneRaftRestartOptionalField,
+    present: bool,
+) {
+    debug_assert!(ControlPlaneRaftRestartOptionalField::ALL.contains(&field));
+    let arm = RaftWireOptionTag::from_present(present);
+    #[cfg(test)]
+    CONTROL_PLANE_RAFT_RESTART_OPTION_CAPTURE.with(|capture| {
+        if let Some(observations) = capture.borrow_mut().as_mut() {
+            observations.push((field, arm));
+        }
+    });
+    write_raft_u8(out, arm.as_u8());
+}
+
+fn write_raft_restart_option_vote(
+    out: &mut Vec<u8>,
+    field: ControlPlaneRaftRestartOptionalField,
+    vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
+) {
+    write_raft_restart_option_tag(out, field, vote.is_some());
+    if let Some(vote) = vote {
+        write_raft_vote(out, vote);
+    }
+}
+
+fn write_raft_restart_option_log_id(
+    out: &mut Vec<u8>,
+    field: ControlPlaneRaftRestartOptionalField,
+    log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+) {
+    write_raft_restart_option_tag(out, field, log_id.is_some());
+    if let Some(log_id) = log_id {
+        write_raft_log_id(out, log_id);
+    }
+}
+
 fn write_raft_peer_option_log_id(
     out: &mut Vec<u8>,
     field: ControlPlaneRaftPeerRpcOptionalField,
@@ -8967,25 +9185,36 @@ impl ControlPlaneRaftEntryPayloadTag {
     }
 }
 
-fn write_raft_option_snapshot(
+fn write_raft_restart_option_snapshot(
     out: &mut Vec<u8>,
     snapshot: Option<&ControlPlaneRaftSnapshot>,
 ) -> Result<(), ControlPlaneError> {
+    write_raft_restart_option_tag(
+        out,
+        ControlPlaneRaftRestartOptionalField::CurrentSnapshot,
+        snapshot.is_some(),
+    );
     match snapshot {
-        None => write_raft_u8(out, RaftWireOptionTag::Absent.as_u8()),
+        None => {}
         Some(snapshot) => {
-            write_raft_u8(out, RaftWireOptionTag::Present.as_u8());
-            write_raft_snapshot(out, snapshot)?;
+            write_raft_snapshot(out, snapshot, RaftSnapshotEncodingContext::Restart)?;
         }
     }
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaftSnapshotEncodingContext {
+    Restart,
+    Peer,
+}
+
 fn write_raft_snapshot(
     out: &mut Vec<u8>,
     snapshot: &ControlPlaneRaftSnapshot,
+    context: RaftSnapshotEncodingContext,
 ) -> Result<(), ControlPlaneError> {
-    write_raft_snapshot_meta(out, &snapshot.meta)?;
+    write_raft_snapshot_meta(out, &snapshot.meta, context)?;
     write_raft_bytes(out, snapshot.snapshot.get_ref())?;
     Ok(())
 }
@@ -8993,17 +9222,35 @@ fn write_raft_snapshot(
 fn write_raft_snapshot_meta(
     out: &mut Vec<u8>,
     meta: &SnapshotMetaOf<ControlPlaneRaftTypeConfig>,
+    context: RaftSnapshotEncodingContext,
 ) -> Result<(), ControlPlaneError> {
-    write_raft_peer_option_log_id(
-        out,
-        ControlPlaneRaftPeerRpcOptionalField::SnapshotLastLogId,
-        meta.last_log_id,
-    );
-    write_raft_stored_membership(
-        out,
-        &meta.last_membership,
-        Some(ControlPlaneRaftPeerRpcOptionalField::SnapshotMembershipLogId),
-    )?;
+    match context {
+        RaftSnapshotEncodingContext::Restart => {
+            write_raft_restart_option_log_id(
+                out,
+                ControlPlaneRaftRestartOptionalField::CurrentSnapshotLastLogId,
+                meta.last_log_id,
+            );
+            write_raft_restart_option_log_id(
+                out,
+                ControlPlaneRaftRestartOptionalField::CurrentSnapshotMembershipLogId,
+                *meta.last_membership.log_id(),
+            );
+            write_raft_membership(out, meta.last_membership.membership())?;
+        }
+        RaftSnapshotEncodingContext::Peer => {
+            write_raft_peer_option_log_id(
+                out,
+                ControlPlaneRaftPeerRpcOptionalField::SnapshotLastLogId,
+                meta.last_log_id,
+            );
+            write_raft_stored_membership(
+                out,
+                &meta.last_membership,
+                Some(ControlPlaneRaftPeerRpcOptionalField::SnapshotMembershipLogId),
+            )?;
+        }
+    }
     // Keep the removed OpenRaft snapshot-id field in Argmin's durable and peer
     // formats so alpha.30 artifacts and mixed-version peers remain compatible.
     // The value has always been derived from the covered log position.
@@ -9237,16 +9484,6 @@ fn write_raft_membership(
         write_raft_string(out, &node.addr)?;
     }
     Ok(())
-}
-
-fn write_raft_option_vote(out: &mut Vec<u8>, vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>) {
-    match vote {
-        None => write_raft_u8(out, RaftWireOptionTag::Absent.as_u8()),
-        Some(vote) => {
-            write_raft_u8(out, RaftWireOptionTag::Present.as_u8());
-            write_raft_vote(out, vote);
-        }
-    }
 }
 
 fn write_raft_option_log_id(
