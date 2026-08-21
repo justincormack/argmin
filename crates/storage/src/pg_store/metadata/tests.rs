@@ -80,6 +80,68 @@ fn multipart_upload_schema_rejects_invalid_identity_values() {
     }
 }
 
+#[test]
+fn current_pg_schema_v5_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    assert_eq!(
+        store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+            .unwrap(),
+        5
+    );
+    let bucket = trusted_bucket_name("checksum-tag-schema-bucket");
+    let upload_id = crate::tests::multipart_upload_id("checksum-tag-schema-upload");
+    PgMetadataStore::create_bucket(
+        &store,
+        &bucket,
+        "owner",
+        &CanonicalUserId::from_principal("owner"),
+        &AclGrants::default(),
+        false,
+        false,
+    )
+    .unwrap();
+
+    let checksum =
+        MultipartChecksumConfig::new(ChecksumAlgorithm::Crc64nvme, Some(ChecksumType::FullObject))
+            .unwrap();
+    PgMetadataStore::create_multipart_upload(
+        &store,
+        &CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket,
+            key: trusted_object_key("object"),
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: test_owner(),
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: ObjectLockState::default(),
+            checksum: Some(checksum),
+            encryption: ObjectEncryption::None,
+        },
+    )
+    .unwrap();
+
+    let stored_tags = store
+        .conn
+        .query_row(
+            "SELECT checksum_algorithm, checksum_type FROM multipart_uploads WHERE upload_id = ?1",
+            params![upload_id.as_str()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_tags, (4, 1));
+    assert_eq!(
+        store.get_multipart_upload(&upload_id).unwrap().checksum,
+        Some(checksum)
+    );
+}
+
 fn create_bucket_probe_command(
     pg_id: u32,
     log_index: u64,

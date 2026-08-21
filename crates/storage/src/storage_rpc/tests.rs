@@ -260,6 +260,71 @@ mod tests {
     }
 
     #[test]
+    fn current_storage_rpc_v21_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
+    {
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 21);
+        const EXPECTED_V21_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65150008070605040302013a006801000070a672ed3efe83ca0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
+
+        let bucket = BucketName::try_from("rpc").unwrap();
+        let key = ObjectKey::try_from("k").unwrap();
+        let owner = OwnerIdentity::from_principal("o");
+        let request = StorageRpcMultipartUploadMatchRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(9).unwrap(),
+                pg_id: PgId::new(11),
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            request: CreateMultipartUploadReq {
+                upload_id: UploadId::try_from("u".repeat(UPLOAD_ID_LEN)).unwrap(),
+                bucket,
+                key,
+                tags: None,
+                metadata_blob: SerializedMetadataBlob::default(),
+                system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                initiator: owner.clone(),
+                owner,
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                object_lock: ObjectLockState::default(),
+                checksum: Some(
+                    MultipartChecksumConfig::new(
+                        ChecksumAlgorithm::Crc64nvme,
+                        Some(ChecksumType::FullObject),
+                    )
+                    .unwrap(),
+                ),
+                encryption: ObjectEncryption::None,
+            },
+            expected_command: None,
+        };
+
+        let payload = encode_multipart_upload_match_request(&request).unwrap();
+        let frame = encode_storage_rpc_frame(
+            0x0102_0304_0506_0708,
+            StorageRpcMessageKind::ObjectMultipartUploadMatch,
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(hex_bytes(&frame), EXPECTED_V21_FRAME_HEX);
+
+        let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
+        assert_eq!(
+            decoded_frame.kind,
+            StorageRpcMessageKind::ObjectMultipartUploadMatch
+        );
+        assert_eq!(
+            decode_multipart_upload_match_request(
+                &decoded_frame.payload,
+                &metadata_command_decode_authority_for_test(),
+            )
+            .unwrap(),
+            request
+        );
+    }
+
+    #[test]
     fn storage_rpc_v18_stream_upload_no_such_upload_payload_is_stable() {
         const V18_STREAM_UPLOAD_NO_SUCH_UPLOAD_PAYLOAD: &[u8] = b"\
             \x07\x20\x00\x00\x00\

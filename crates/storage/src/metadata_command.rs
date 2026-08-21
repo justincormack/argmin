@@ -5808,6 +5808,49 @@ mod tests {
     }
 
     #[test]
+    fn current_metadata_command_v8_checksum_tags_match_frozen_owner_encoding_and_require_version_bump(
+    ) {
+        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 8);
+
+        let cases = [
+            (None, &[0_u8][..]),
+            (
+                Some(
+                    MultipartChecksumConfig::new(
+                        ChecksumAlgorithm::Sha256,
+                        Some(ChecksumType::Composite),
+                    )
+                    .unwrap(),
+                ),
+                &[1, 3, 0][..],
+            ),
+            (
+                Some(
+                    MultipartChecksumConfig::new(
+                        ChecksumAlgorithm::Crc64nvme,
+                        Some(ChecksumType::FullObject),
+                    )
+                    .unwrap(),
+                ),
+                &[1, 4, 1][..],
+            ),
+        ];
+
+        for (checksum, expected) in cases {
+            let mut encoded = Vec::new();
+            encode_optional_multipart_checksum_config(&mut encoded, checksum);
+            assert_eq!(encoded, expected);
+
+            let mut decoder = MetadataCommandLogEntryDecoder::new(expected);
+            assert_eq!(
+                decoder.read_optional_multipart_checksum_config().unwrap(),
+                checksum
+            );
+            assert_eq!(decoder.remaining(), 0);
+        }
+    }
+
+    #[test]
     fn metadata_command_log_hash_v1_encoding_is_stable() {
         let hash = metadata_command_log_hash(
             ClusterEpoch::new(0x0102_0304_0506_0708).unwrap(),

@@ -7288,4 +7288,89 @@ mod canonical_format_baseline_tests {
             )
         );
     }
+
+    #[test]
+    fn current_checksum_tags_match_frozen_canonical_state_v5_and_checkpoint_v2_evidence_and_require_version_bumps(
+    ) {
+        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 5);
+        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 2);
+
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let upload_id = UploadId::new("c".repeat(UPLOAD_ID_LEN)).unwrap();
+        let owner = OwnerIdentity::from_principal("owner");
+        store
+            .conn
+            .execute(
+                "INSERT INTO multipart_uploads \
+                 (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
+                  system_metadata_blob, owner_principal, owner_canonical_id, \
+                  initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, \
+                  encryption_type, encryption_state, acl_grants, public_read, \
+                  object_generation_id, object_lock_retention_mode, object_lock_retain_until, \
+                  object_lock_legal_hold) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                         ?14, NULL, ?15, ?16, ?17, NULL, NULL, ?18)",
+                params![
+                    upload_id.as_str(),
+                    "checksum-bucket",
+                    "object",
+                    101_i64,
+                    UploadState::InProgress as u8,
+                    b"meta".as_slice(),
+                    b"system".as_slice(),
+                    owner.principal.as_str(),
+                    owner.canonical_id.as_str(),
+                    owner.principal.as_str(),
+                    owner.canonical_id.as_str(),
+                    ChecksumAlgorithm::Crc64nvme.wire_tag(),
+                    ChecksumType::FullObject.wire_tag(),
+                    ObjectEncryption::None.encryption_type() as u8,
+                    PgStore::serialize_acl_grants(&AclGrants::default()),
+                    0_i64,
+                    1_i64,
+                    StoredLegalHoldStatus::NotSet as u8,
+                ],
+            )
+            .unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+
+        let checkpoint = store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap();
+        checkpoint.verify().unwrap();
+        let multipart_uploads = checkpoint
+            .table_blocks
+            .iter()
+            .find(|block| block.table_name == "multipart_uploads")
+            .unwrap();
+        assert_eq!(multipart_uploads.rows.len(), 1);
+        assert_eq!(
+            &multipart_uploads.rows[0].values[12..14],
+            &[
+                MetadataCheckpointValue::Integer(4),
+                MetadataCheckpointValue::Integer(1),
+            ]
+        );
+
+        let encoded = encode_metadata_command_checkpoint_payload(&checkpoint).unwrap();
+        let encoded_sha256 = checksum::compute_checksum(ChecksumAlgorithm::Sha256, &encoded);
+        assert_eq!(
+            (
+                checkpoint.state_digest.value(),
+                checkpoint.checkpoint_crc64,
+                encoded.len(),
+                encoded_sha256.bytes(),
+            ),
+            (
+                0xaf12_e777_e798_6326,
+                0x628c_2605_8430_0187,
+                7_177,
+                &[
+                    43, 167, 154, 203, 225, 110, 170, 130, 120, 205, 134, 158, 119, 158, 134, 21,
+                    65, 23, 33, 14, 109, 147, 232, 228, 139, 29, 135, 45, 114, 191, 209, 191,
+                ][..],
+            )
+        );
+    }
 }
