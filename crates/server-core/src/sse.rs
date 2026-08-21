@@ -1033,20 +1033,31 @@ fn encrypt_checksum_with_dek(
     let Some(checksum) = checksum else {
         return Ok(([0u8; SSE_C_CHECKSUM_NONCE_LEN], Vec::new()));
     };
-    let sealing_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
-        reason: format!("failed to create {label} checksum sealing key"),
-    })?;
     let mut nonce = [0u8; SSE_C_CHECKSUM_NONCE_LEN];
     argmin_crypto::random::fill(&mut nonce).map_err(|_| ServerError::InternalError {
         reason: format!("failed to generate {label} checksum nonce"),
     })?;
-    let mut buf = encode_checksum_metadata(checksum).map_err(checksum_metadata_codec_error)?;
+    let plaintext = encode_checksum_metadata(checksum).map_err(checksum_metadata_codec_error)?;
+    let ciphertext = seal_checksum_plaintext_with_dek(dek, nonce, plaintext, aad, label)?;
+    Ok((nonce, ciphertext))
+}
+
+fn seal_checksum_plaintext_with_dek(
+    dek: &[u8; SSE_C_DEK_LEN],
+    nonce: [u8; SSE_C_CHECKSUM_NONCE_LEN],
+    mut plaintext: Vec<u8>,
+    aad: &[u8],
+    label: &str,
+) -> Result<Vec<u8>, ServerError> {
+    let sealing_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {label} checksum sealing key"),
+    })?;
     sealing_key
-        .seal_in_place_append_tag(nonce, aad, &mut buf)
+        .seal_in_place_append_tag(nonce, aad, &mut plaintext)
         .map_err(|_| ServerError::InternalError {
             reason: format!("failed to encrypt {label} checksum metadata"),
         })?;
-    Ok((nonce, buf))
+    Ok(plaintext)
 }
 
 #[cfg(test)]
@@ -1058,18 +1069,11 @@ fn test_encrypt_checksum_metadata_version(
     label: &str,
 ) -> Result<([u8; SSE_C_CHECKSUM_NONCE_LEN], Vec<u8>), ServerError> {
     assert_ne!(version, CHECKSUM_METADATA_VERSION);
-    let sealing_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
-        reason: format!("failed to create {label} test checksum sealing key"),
-    })?;
     let nonce = [version.wrapping_add(1); SSE_C_CHECKSUM_NONCE_LEN];
     let mut buf = encode_checksum_metadata(checksum).map_err(checksum_metadata_codec_error)?;
     buf[0] = version;
-    sealing_key
-        .seal_in_place_append_tag(nonce, aad, &mut buf)
-        .map_err(|_| ServerError::InternalError {
-            reason: format!("failed to encrypt {label} test checksum metadata"),
-        })?;
-    Ok((nonce, buf))
+    let ciphertext = seal_checksum_plaintext_with_dek(dek, nonce, buf, aad, label)?;
+    Ok((nonce, ciphertext))
 }
 
 fn decrypt_checksum_with_dek(
@@ -1323,6 +1327,153 @@ mod tests {
             .unwrap()
             .expect("expected checksum metadata");
         assert_eq!(decrypted, checksum);
+    }
+
+    #[test]
+    fn current_sse_c_checksum_profile_matches_frozen_vector_and_requires_outer_version_bump() {
+        fn assert_authentication_failure(
+            result: Result<Option<ObjectChecksumMetadata>, ServerError>,
+        ) {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: failed to decrypt SSE-C checksum metadata"
+            );
+        }
+
+        assert_eq!(SSE_C_HKDF_INFO, b"argmin:sse-c:kek:v1");
+        assert_eq!(SSE_C_WRAP_AAD, b"argmin:sse-c:wrap:v1");
+        assert_eq!(SSE_C_CHECKSUM_AAD, b"argmin:sse-c:checksum:v1");
+
+        let customer_key = [0x11; SSE_C_CUSTOMER_KEY_LEN];
+        let validator_key = [0x22; 32];
+        let validator_salt = [0x33; SSE_C_VALIDATOR_SALT_LEN];
+        let wrap_salt = [0x44; SSE_C_WRAP_SALT_LEN];
+        let wrap_nonce = [0x55; SSE_C_WRAP_NONCE_LEN];
+        let dek = [0x66; SSE_C_DEK_LEN];
+        let segment_nonce_prefix = [0x77; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
+        let checksum_nonce = [0x88; SSE_C_CHECKSUM_NONCE_LEN];
+        let validator = SseCustomerValidatorConfig {
+            key_id: 7,
+            validator_key,
+        };
+        let request = SseCustomerRequest::new(customer_key, "fixed-vector-md5".to_string());
+
+        let validator_hmac = compute_validator_hmac(&validator, &validator_salt, &customer_key);
+        assert_eq!(
+            validator_hmac,
+            [
+                0xea, 0x57, 0x82, 0x44, 0x46, 0x83, 0x57, 0xae, 0x9b, 0x38, 0x93, 0x4c, 0xa6, 0xb9,
+                0xf3, 0x7b, 0x57, 0xd2, 0xab, 0x78, 0x5f, 0x8a, 0xde, 0x3e, 0xb4, 0xa4, 0xe6, 0x79,
+                0x17, 0x88, 0xa2, 0x7a,
+            ]
+        );
+
+        let kek = derive_wrap_key(&customer_key, &wrap_salt).unwrap();
+        assert_eq!(
+            kek,
+            [
+                0xd6, 0x84, 0x1a, 0xad, 0x4f, 0x9d, 0x55, 0x9a, 0xf8, 0x73, 0xb8, 0x87, 0xf5, 0x55,
+                0x64, 0x9f, 0x7b, 0x61, 0x90, 0xa8, 0x4b, 0x42, 0xd9, 0xf5, 0x82, 0x7c, 0xf2, 0x30,
+                0x6b, 0x81, 0x86, 0xc6,
+            ]
+        );
+
+        let wrapped_dek =
+            wrap_managed_dek(&kek, &wrap_nonce, &dek, SSE_C_WRAP_AAD, "SSE-C").unwrap();
+        assert_eq!(
+            wrapped_dek,
+            [
+                0x11, 0x20, 0x6a, 0xf3, 0x3d, 0x69, 0xa9, 0x44, 0x20, 0x7d, 0xd6, 0xe2, 0x0c, 0xf4,
+                0x2d, 0x58, 0x1c, 0xe7, 0x25, 0x63, 0x04, 0xc4, 0x39, 0x68, 0x1d, 0xbb, 0x6d, 0x1f,
+                0xcd, 0x6a, 0xa9, 0x14, 0x72, 0x1b, 0xc8, 0xfb, 0x23, 0xc0, 0x29, 0x72, 0x36, 0x93,
+                0xe0, 0x62, 0x56, 0x70, 0xd0, 0x6b,
+            ]
+        );
+
+        let checksum = ObjectChecksumMetadata::new(
+            ChecksumAlgorithm::Sha256,
+            Some(ChecksumType::FullObject),
+            "0123456789abcdef".to_string(),
+        );
+        let checksum_plaintext = encode_checksum_metadata(&checksum).unwrap();
+        assert_eq!(
+            checksum_plaintext,
+            [
+                0x01, 0x03, 0x01, 0x00, 0x10, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+                0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66,
+            ]
+        );
+        let checksum_ciphertext = seal_checksum_plaintext_with_dek(
+            &dek,
+            checksum_nonce,
+            checksum_plaintext,
+            SSE_C_CHECKSUM_AAD,
+            "SSE-C",
+        )
+        .unwrap();
+        assert_eq!(
+            checksum_ciphertext,
+            [
+                0xc6, 0xc3, 0x32, 0x20, 0xb4, 0xad, 0x22, 0xb8, 0xae, 0xd3, 0x02, 0x28, 0x72, 0x6a,
+                0xb2, 0xd2, 0xde, 0xe6, 0x88, 0x5a, 0x87, 0x5f, 0xd0, 0x44, 0x47, 0x51, 0x69, 0xee,
+                0xb0, 0x46, 0x82, 0x6e, 0xf5, 0xba, 0xe8, 0x17, 0xc2,
+            ]
+        );
+
+        let make_state = |nonce, ciphertext| {
+            SseCustomerObjectState::new(
+                validator.key_id,
+                validator_salt,
+                validator_hmac,
+                wrap_salt,
+                wrap_nonce,
+                wrapped_dek,
+                segment_nonce_prefix,
+            )
+            .with_encrypted_checksum_metadata(nonce, ciphertext)
+            .unwrap()
+        };
+        let state = make_state(checksum_nonce, checksum_ciphertext.clone());
+        assert_eq!(
+            decrypt_sse_customer_checksum(&validator, &state, &request).unwrap(),
+            Some(checksum)
+        );
+
+        let mut wrong_nonce = checksum_nonce;
+        wrong_nonce[0] ^= 1;
+        let wrong_nonce_state = make_state(wrong_nonce, checksum_ciphertext.clone());
+        assert_authentication_failure(decrypt_sse_customer_checksum(
+            &validator,
+            &wrong_nonce_state,
+            &request,
+        ));
+        assert_authentication_failure(decrypt_checksum_with_dek(
+            &dek,
+            &checksum_nonce,
+            &checksum_ciphertext,
+            b"argmin:sse-c:checksum:v2",
+            "SSE-C",
+        ));
+
+        let mut corrupted_ciphertext = checksum_ciphertext.clone();
+        corrupted_ciphertext[0] ^= 1;
+        let corrupted_ciphertext_state = make_state(checksum_nonce, corrupted_ciphertext);
+        assert_authentication_failure(decrypt_sse_customer_checksum(
+            &validator,
+            &corrupted_ciphertext_state,
+            &request,
+        ));
+
+        let mut corrupted_tag = checksum_ciphertext;
+        let tag_byte = corrupted_tag.last_mut().unwrap();
+        *tag_byte ^= 1;
+        let corrupted_tag_state = make_state(checksum_nonce, corrupted_tag);
+        assert_authentication_failure(decrypt_sse_customer_checksum(
+            &validator,
+            &corrupted_tag_state,
+            &request,
+        ));
     }
 
     #[test]
