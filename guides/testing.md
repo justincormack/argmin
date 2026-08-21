@@ -209,6 +209,20 @@ but does not make the cluster tolerant of two simultaneous host failures. The
 test generates a private test PKI and scoped credentials for each run; it does
 not use operator credentials.
 
+The default EC profile is `1+1` on three hosts and `2+1` on four hosts. Both
+profiles leave one storage host outside each PG acting set, allowing the
+harness to verify degraded reads immediately after one host is lost and then
+verify writes after the control plane has replaced the missing shard on the
+spare host. Each outage records a probe PG containing the failed host, seeds a
+targeted object on that PG, verifies the object during degraded reads, requires
+the exact replacement acting set to use the recorded spare, and targets the
+outage write to the same data PG. Other PGs are placed away from the outage
+target before the fault so global readiness cannot hide the probe PG's state.
+`--ec-data-shards` and `--ec-parity-shards` override these defaults; the
+requested shard count must fit the supplied host count. A three-host `2+1`
+override can continue degraded reads after one loss but has no spare failure
+domain on which to restore an active, writable placement.
+
 By default the harness builds `argmin-s3` and `uat_pg_backfill_smoke` locally
 before contacting the remote hosts, and deploys the exact executable artifacts
 reported by Cargo. `--binary` and `--client-binary` remain available when an
@@ -313,13 +327,14 @@ preserves only failed runs, including process logs, flight traces, unit status,
 and durable state inventories. `--storage-profile volatile-test` is useful for
 functional or locking checks but is not durability evidence.
 
-The storage-node restart step currently verifies durable recovery after the
-node returns. Listener readiness alone is insufficient because the old lease
-and incarnation can still make the pre-restart map appear healthy. The harness
-therefore requires a strictly newer runtime-map epoch with every PG serving
-before issuing post-restart traffic. It does not assert uninterrupted reads
-while that node is offline; that is the separate degraded-read availability
-gate for PGs in `Peering`.
+The storage-node restart step verifies durable recovery after the node returns.
+Listener readiness alone is insufficient because the old lease and incarnation
+can still make the pre-restart map appear healthy. The harness therefore
+requires a strictly newer runtime-map epoch with every PG serving before
+issuing post-restart traffic. During the outage it first verifies degraded
+reads while affected PGs can be `Peering`; when a spare storage domain exists,
+it then waits for replacement placement and verifies a write before restoring
+the failed host.
 
 ## Standalone `argmin-s3` UAT `s3-tests`
 

@@ -28,6 +28,8 @@ Options:
   --storage-profile P    persistent or volatile-test (default: persistent)
   --port-base PORT       Raft port; other endpoints use the next four (default: 24000)
   --pg-count N           Bootstrap PG count (default: 116)
+  --ec-data-shards N     EC data shards (default: 1 on three hosts, 2 on four)
+  --ec-parity-shards N   EC parity shards (default: 1)
   --retained-epochs N    Committed route epoch advances before failover (default: 256)
   --data-objects N       Persistent S3 objects checked across failures (default: 8)
   --heartbeat-lease-ms N Storage-node heartbeat lease (default: 5000)
@@ -118,28 +120,61 @@ split_host_list() {
 route_acting_set_for_attempt() {
     local attempt="$1"
     local -n output_pg_id="$2"
-    local -n output_first_node="$3"
-    local -n output_second_node="$4"
+    local -n output_acting_set="$3"
     local zero_based_attempt=$((attempt - 1))
     local route_pass=$((zero_based_attempt / pg_count))
+    local first_node offset
     output_pg_id=$((zero_based_attempt % pg_count))
-    output_first_node=$((((output_pg_id + route_pass) % host_count) + 1))
-    # shellcheck disable=SC2034 # Assigned through a caller-provided nameref.
-    output_second_node=$(((output_first_node % host_count) + 1))
+    first_node=$((((output_pg_id + route_pass) % host_count) + 1))
+    output_acting_set=()
+    for ((offset = 0; offset < ec_total_shards; offset++)); do
+        output_acting_set+=($((((first_node - 1 + offset) % host_count) + 1)))
+    done
 }
 
 validate_route_rotation() {
     local attempts=$((pg_count * (host_count + 1)))
-    local attempt pg_id first_node second_node previous_pair pair
-    declare -A previous_pairs=()
+    local attempt pg_id previous_set set_key
+    local -a acting_set=()
+    declare -A previous_sets=()
     for ((attempt = 1; attempt <= attempts; attempt++)); do
-        route_acting_set_for_attempt "$attempt" pg_id first_node second_node
-        pair="$first_node,$second_node"
-        previous_pair="${previous_pairs[$pg_id]:-}"
-        [[ -z "$previous_pair" || "$previous_pair" != "$pair" ]] ||
-            die "internal route rotation repeats PG $pg_id acting pair $pair on consecutive passes"
-        previous_pairs["$pg_id"]="$pair"
+        route_acting_set_for_attempt "$attempt" pg_id acting_set
+        printf -v set_key '%s,' "${acting_set[@]}"
+        previous_set="${previous_sets[$pg_id]:-}"
+        [[ -z "$previous_set" || "$previous_set" != "$set_key" ]] ||
+            die "internal route rotation repeats PG $pg_id acting set $set_key on consecutive passes"
+        previous_sets["$pg_id"]="$set_key"
     done
+}
+
+acting_set_excluding_node() {
+    local excluded_node="$1"
+    local seed="$2"
+    local -n excluded_output="$3"
+    local offset candidate
+    excluded_output=()
+    for ((offset = 0; offset < host_count; offset++)); do
+        candidate=$((((seed + offset) % host_count) + 1))
+        ((candidate == excluded_node)) && continue
+        excluded_output+=("$candidate")
+        ((${#excluded_output[@]} == ec_total_shards)) && return 0
+    done
+    die "could not construct an EC acting set excluding node $excluded_node"
+}
+
+acting_set_including_node() {
+    local included_node="$1"
+    local seed="$2"
+    local -n included_output="$3"
+    local offset candidate
+    included_output=("$included_node")
+    for ((offset = 0; offset < host_count; offset++)); do
+        candidate=$((((seed + offset) % host_count) + 1))
+        ((candidate == included_node)) && continue
+        included_output+=("$candidate")
+        ((${#included_output[@]} == ec_total_shards)) && return 0
+    done
+    die "could not construct an EC acting set including node $included_node"
 }
 
 shell_join() {
@@ -183,6 +218,8 @@ ssh_config="${ARGMIN_MULTIHOST_RAFT_SSH_CONFIG:-}"
 storage_profile="${ARGMIN_MULTIHOST_RAFT_STORAGE_PROFILE:-persistent}"
 port_base="${ARGMIN_MULTIHOST_RAFT_PORT_BASE:-24000}"
 pg_count="${ARGMIN_MULTIHOST_RAFT_PG_COUNT:-116}"
+ec_data_shards="${ARGMIN_MULTIHOST_RAFT_EC_DATA_SHARDS:-}"
+ec_parity_shards="${ARGMIN_MULTIHOST_RAFT_EC_PARITY_SHARDS:-1}"
 retained_epochs="${ARGMIN_MULTIHOST_RAFT_RETAINED_EPOCHS:-256}"
 data_object_count="${ARGMIN_MULTIHOST_RAFT_DATA_OBJECTS:-8}"
 heartbeat_lease_ms="${ARGMIN_MULTIHOST_RAFT_HEARTBEAT_LEASE_MS:-5000}"
@@ -248,6 +285,16 @@ while (($# > 0)); do
         --pg-count)
             [[ $# -ge 2 ]] || die "--pg-count requires a value"
             pg_count="$2"
+            shift 2
+            ;;
+        --ec-data-shards)
+            [[ $# -ge 2 ]] || die "--ec-data-shards requires a value"
+            ec_data_shards="$2"
+            shift 2
+            ;;
+        --ec-parity-shards)
+            [[ $# -ge 2 ]] || die "--ec-parity-shards requires a value"
+            ec_parity_shards="$2"
             shift 2
             ;;
         --retained-epochs)
@@ -354,6 +401,16 @@ split_host_list "$addresses_value" "--addresses" addresses
 ((${#hosts[@]} == ${#addresses[@]})) ||
     die "--hosts and --addresses must contain the same number of values"
 host_count=${#hosts[@]}
+if [[ -z "$ec_data_shards" ]]; then
+    ec_data_shards=$((host_count - 2))
+fi
+for numeric in "$ec_data_shards" "$ec_parity_shards"; do
+    [[ "$numeric" =~ ^[1-9][0-9]*$ ]] ||
+        die "EC shard counts must be positive integers"
+done
+ec_total_shards=$((ec_data_shards + ec_parity_shards))
+((ec_total_shards <= host_count)) ||
+    die "EC $ec_data_shards+$ec_parity_shards requires $ec_total_shards hosts, but only $host_count were supplied"
 validate_route_rotation
 for address in "${addresses[@]}"; do
     [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
@@ -560,7 +617,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "== argmin-s3 multihost Raft and data-plane soak =="
-echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value host_count=$host_count storage_profile=$storage_profile pg_count=$pg_count retained_epochs=$retained_epochs data_objects=$data_object_count heartbeat_lease_ms=$heartbeat_lease_ms repeat=$repeat_count startup_crud_rounds=$startup_crud_rounds startup_only=$startup_only quantitative=$quantitative sustained_seconds=$sustained_seconds"
+echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value host_count=$host_count storage_profile=$storage_profile pg_count=$pg_count ec=$ec_data_shards+$ec_parity_shards retained_epochs=$retained_epochs data_objects=$data_object_count heartbeat_lease_ms=$heartbeat_lease_ms repeat=$repeat_count startup_crud_rounds=$startup_crud_rounds startup_only=$startup_only quantitative=$quantitative sustained_seconds=$sustained_seconds"
 echo "binary=$binary client_binary=$client_binary remote_run=$remote_run"
 if [[ -n "$host_fault_driver" ]]; then
     echo "host_fault_driver=$host_fault_driver"
@@ -663,8 +720,8 @@ failure_tolerance = 1
 
 [storage]
 pg_count = $pg_count
-ec_data_shards = 1
-ec_parity_shards = 1
+ec_data_shards = $ec_data_shards
+ec_parity_shards = $ec_parity_shards
 initial_cluster_epoch = 1
 
 [raft]
@@ -1291,6 +1348,80 @@ wait_runtime_map_ready() {
     die "control-plane runtime map did not become ready"
 }
 
+wait_pg_runtime_map_ready() {
+    local pg_id="$1"
+    local minimum_exclusive_epoch="$2"
+    shift 2
+    local -a expected_acting_set=("$@")
+    local deadline=$((SECONDS + 120))
+    local status="" runtime_epoch route_epoch
+    while ((SECONDS < deadline)); do
+        if status="$(frontend_read_command control-plane-pg-runtime-map-ready \
+            "$remote_run/unused.sock" "$pg_id" "${expected_acting_set[@]}" 2>&1)"; then
+            read -r runtime_epoch route_epoch <<<"$status"
+            if [[ "$runtime_epoch" =~ ^[0-9]+$ && "$route_epoch" =~ ^[0-9]+$ ]] &&
+                ((runtime_epoch > minimum_exclusive_epoch)); then
+                echo "pg_runtime_map_ready pg=$pg_id runtime_epoch=$runtime_epoch route_epoch=$route_epoch acting_set=${expected_acting_set[*]}"
+                return 0
+            fi
+            status="PG runtime-map epoch did not advance: $status"
+        fi
+        sleep 0.2
+    done
+    [[ -z "$status" ]] || echo "last_pg_runtime_map_error=$status" >&2
+    frontend_read_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" >&2 || true
+    die "PG $pg_id did not become active on acting set ${expected_acting_set[*]}"
+}
+
+prepare_host_outage_routes() {
+    local iteration="$1"
+    local target_number="$2"
+    local pg_id node actor found
+    local -a acting_set=()
+
+    outage_probe_pg=$(((iteration - 1) % pg_count))
+    outage_probe_pre_acting_set=()
+    outage_probe_replacement_acting_set=()
+    acting_set_including_node "$target_number" \
+        "$((outage_probe_pg + iteration))" outage_probe_pre_acting_set
+    outage_probe_spare=0
+    for ((node = 1; node <= host_count; node++)); do
+        found=0
+        for actor in "${outage_probe_pre_acting_set[@]}"; do
+            if ((actor == node)); then
+                found=1
+                break
+            fi
+        done
+        if ((found == 0)); then
+            outage_probe_spare="$node"
+            break
+        fi
+    done
+    ((outage_probe_spare != 0)) ||
+        die "outage probe PG $outage_probe_pg has no spare storage node"
+
+    for actor in "${outage_probe_pre_acting_set[@]}"; do
+        if ((actor == target_number)); then
+            outage_probe_replacement_acting_set+=("$outage_probe_spare")
+        else
+            outage_probe_replacement_acting_set+=("$actor")
+        fi
+    done
+
+    for ((pg_id = 0; pg_id < pg_count; pg_id++)); do
+        if ((pg_id == outage_probe_pg)); then
+            acting_set=("${outage_probe_pre_acting_set[@]}")
+        else
+            acting_set_excluding_node "$target_number" \
+                "$((pg_id + iteration))" acting_set
+        fi
+        admin_command control-plane-set-pg-acting-set-live \
+            "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}"
+    done
+    echo "host_outage_probe_configured pg=$outage_probe_pg failed_node=$target_number spare_node=$outage_probe_spare acting_set=${outage_probe_pre_acting_set[*]} replacement_acting_set=${outage_probe_replacement_acting_set[*]}"
+}
+
 data_plane_bucket_file="$local_run/data-plane-bucket"
 data_plane_body_file="$local_run/data-plane-body"
 data_plane_client_log="$metrics_dir/data-plane-client.log"
@@ -1392,6 +1523,20 @@ put_data_plane_object_on() {
     shift
     local key="$1"
     run_data_client_on "$number" put "$data_plane_bucket_file" "$key" "$data_plane_body_file"
+    data_plane_keys+=("$key")
+}
+
+put_data_plane_object_for_pg_on() {
+    local number="$1"
+    local data_pg="$2"
+    local key_prefix="$3"
+    local key_file="$local_run/data-plane-key-$key_prefix"
+    local key=""
+    run_data_client_on "$number" put-for-data-pg \
+        "$data_plane_bucket_file" "$key_file" "$key_prefix" \
+        "$data_plane_body_file" "$data_pg"
+    IFS= read -r key <"$key_file"
+    [[ -n "$key" ]] || die "targeted data-PG PUT did not report its object key"
     data_plane_keys+=("$key")
 }
 
@@ -1808,7 +1953,11 @@ if ((startup_only)); then
 fi
 
 echo "== build retained route history =="
-baseline_output="$(admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" 0 1 2 2>&1)"
+baseline_pg_id=""
+baseline_acting_set=()
+route_acting_set_for_attempt 1 baseline_pg_id baseline_acting_set
+baseline_output="$(admin_command control-plane-set-pg-acting-set-live \
+    "$remote_run/unused.sock" "$baseline_pg_id" "${baseline_acting_set[@]}" 2>&1)"
 printf '%s\n' "$baseline_output" >&2
 if [[ "$baseline_output" =~ control-plane\ set\ PG\ [0-9]+\ acting\ set\ at\ epoch\ ([0-9]+) ]]; then
     last_route_epoch="${BASH_REMATCH[1]}"
@@ -1823,8 +1972,7 @@ while ((route_advances < retained_epochs)); do
     route_attempts=$((route_attempts + 1))
     ((route_attempts <= max_route_attempts)) ||
         die "only observed $route_advances route epoch advances after $max_route_attempts attempts"
-    route_acting_set_for_attempt "$route_attempts" pg_id first_node second_node
-    acting_set=("$first_node" "$second_node")
+    route_acting_set_for_attempt "$route_attempts" pg_id acting_set
     print_command admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}"
     route_output="$(admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}" 2>&1)"
     printf '%s\n' "$route_output" >&2
@@ -1873,6 +2021,14 @@ for ((iteration = 1; iteration <= repeat_count; iteration++)); do
     target_raft_node=$((100 + target_number))
     survivor_number=$((target_number % host_count + 1))
     wait_runtime_map_ready
+    if ((host_count > ec_total_shards)); then
+        prepare_host_outage_routes "$iteration" "$target_number"
+        wait_pg_runtime_map_ready "$outage_probe_pg" -1 \
+            "${outage_probe_pre_acting_set[@]}"
+        wait_runtime_map_ready
+        put_data_plane_object_for_pg_on "$survivor_number" "$outage_probe_pg" \
+            "host-outage-read-$iteration"
+    fi
     pre_host_outage_epoch="$last_runtime_epoch"
     if [[ -n "$host_fault_driver" ]]; then
         echo "== host power outage iteration $iteration: power off ${hosts[$((target_number - 1))]} and Raft node $target_raft_node =="
@@ -1903,6 +2059,23 @@ for ((iteration = 1; iteration <= repeat_count; iteration++)); do
     verify_data_plane_objects_across_running_frontends
     echo "host_outage_reads_verified host=$target_number surviving_frontends=$((host_count - 1)) objects=${#data_plane_keys[@]}"
 
+    pre_host_rejoin_epoch="$last_runtime_epoch"
+    if ((host_count > ec_total_shards)); then
+        admin_command control-plane-set-pg-acting-set-live \
+            "$remote_run/unused.sock" "$outage_probe_pg" \
+            "${outage_probe_replacement_acting_set[@]}"
+        wait_pg_runtime_map_ready "$outage_probe_pg" "$pre_host_outage_epoch" \
+            "${outage_probe_replacement_acting_set[@]}"
+        wait_runtime_map_ready "$pre_host_outage_epoch"
+        pre_host_rejoin_epoch="$last_runtime_epoch"
+        put_data_plane_object_for_pg_on "$survivor_number" "$outage_probe_pg" \
+            "host-outage-write-$iteration"
+        verify_data_plane_objects_across_running_frontends
+        echo "host_outage_write_verified host=$target_number pg=$outage_probe_pg spare_node=$outage_probe_spare acting_set=${outage_probe_replacement_acting_set[*]} epoch=$last_runtime_epoch objects=${#data_plane_keys[@]}"
+    else
+        echo "host_outage_write_skipped host=$target_number reason=no-spare-storage-domain ec=$ec_data_shards+$ec_parity_shards"
+    fi
+
     if [[ -n "$host_fault_driver" ]]; then
         power_up_host "$target_number" || die "failed to power up host $target_number"
     fi
@@ -1912,7 +2085,7 @@ for ((iteration = 1; iteration <= repeat_count; iteration++)); do
     start_storage "$target_number"
     wait_storage_listener "$target_number"
     wait_for_storage_network
-    wait_runtime_map_ready "$pre_host_outage_epoch"
+    wait_runtime_map_ready "$pre_host_rejoin_epoch"
     start_frontend "$target_number"
     wait_frontend_listener "$target_number"
 
