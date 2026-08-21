@@ -298,6 +298,31 @@ impl PgStore {
         require_one_test_mutation(changed)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_replace_object_encryption(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        encryption: &ObjectEncryption,
+    ) -> Result<(), StoreError> {
+        let encryption_type = encryption.encryption_type() as u8;
+        let encryption_state = encryption.encode_state();
+        let changed = self.execute_cached(
+            "UPDATE objects SET encryption_type = ?1, encryption_state = ?2 \
+             WHERE bucket = ?3 AND key = ?4 AND version_id = ?5",
+            params![
+                encryption_type,
+                encryption_state,
+                bucket,
+                key,
+                version_id.to_u64() as i64,
+            ],
+            "replace object encryption for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_insert_object_segment(
         &self,

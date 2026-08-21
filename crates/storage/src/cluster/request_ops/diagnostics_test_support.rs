@@ -1205,6 +1205,18 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_replace_object_encryption(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        encryption: &ObjectEncryption,
+    ) -> Result<(), ObjectPgActionError> {
+        self.metadata_primary_bridge_node()?
+            .test_replace_object_encryption(bucket, key, version_id, encryption)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_observe_stored_sse_customer_checksum(
         &self,
         bucket: &BucketName,

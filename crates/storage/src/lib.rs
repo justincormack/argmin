@@ -1948,6 +1948,14 @@ pub mod test_support {
             version_id: VersionId,
             expected_owner: &OwnerIdentity,
         ) -> Result<bool, TestStorageFailure>;
+
+        fn test_replace_object_encryption(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            encryption: &ObjectEncryption,
+        ) -> Result<(), TestStorageFailure>;
     }
 
     impl StorageClusterObjectTestSupport for StorageCluster {
@@ -1981,6 +1989,19 @@ pub mod test_support {
                 key,
                 version_id,
                 expected_owner,
+            )
+            .map_err(TestStorageFailure::from_object_pg_action)
+        }
+
+        fn test_replace_object_encryption(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            encryption: &ObjectEncryption,
+        ) -> Result<(), TestStorageFailure> {
+            StorageCluster::test_replace_object_encryption(
+                self, bucket, key, version_id, encryption,
             )
             .map_err(TestStorageFailure::from_object_pg_action)
         }

@@ -6,6 +6,7 @@ use super::test_support::*;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
+use crate::system_metadata::ObjectChecksumMetadata;
 use std::sync::Arc;
 use storage::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterMultipartTestSupport as _,
@@ -6514,6 +6515,175 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn current_encrypted_checksum_plaintext_v1_read_gate_requires_version_bump() {
+    #[derive(Clone, Copy)]
+    enum Profile {
+        SseCustomer,
+        SseS3,
+    }
+
+    fn assert_invalid_checksum_metadata(error: ServerError) {
+        assert!(
+            matches!(
+                &error,
+                ServerError::InternalError { reason }
+                    if reason == "stored encrypted checksum metadata is invalid"
+            ),
+            "unexpected encrypted-checksum failure: {error:?}"
+        );
+    }
+
+    let checksum_value = "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=".to_string();
+    let checksum = ObjectChecksumMetadata::new(
+        ChecksumAlgorithm::Sha256,
+        Some(ChecksumType::FullObject),
+        checksum_value.clone(),
+    );
+    let mut system_metadata = SystemMetadata::new();
+    system_metadata.set_checksum(
+        ChecksumAlgorithm::Sha256,
+        Some(ChecksumType::FullObject),
+        checksum_value,
+    );
+
+    for (profile, profile_name) in [(Profile::SseCustomer, "sse-c"), (Profile::SseS3, "sse-s3")] {
+        for version in [0_u8, 2] {
+            let dir = test_util::tempdir();
+            let coord = setup_coordinator_with_sse_c(dir.path());
+            coord
+                .create_bucket_for_owner("default-owner", "bucket", false)
+                .unwrap();
+            enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
+            let sse_customer = test_sse_customer_request();
+            let write_encryption = match profile {
+                Profile::SseCustomer => WriteEncryptionRequest::sse_customer(&sse_customer),
+                Profile::SseS3 => WriteEncryptionRequest::none(),
+            };
+            let put = test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    encryption: write_encryption,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        "obj",
+                        test_requester(),
+                        None,
+                    ),
+                    data: b"checksum-body",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &system_metadata,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+            coord
+                .create_bucket_for_owner("default-owner", "destination", false)
+                .unwrap();
+            enable_bucket_sse_c_test(&coord, "destination", test_requester(), None).unwrap();
+
+            let invalid_encryption = match profile {
+                Profile::SseCustomer => coord
+                    .prepare_sse_customer_write_context(Some(&sse_customer))
+                    .unwrap()
+                    .unwrap()
+                    .test_seal_checksum_metadata_version(&checksum, version)
+                    .unwrap(),
+                Profile::SseS3 => coord
+                    .prepare_managed_write_context()
+                    .unwrap()
+                    .test_seal_checksum_metadata_version(&checksum, version)
+                    .unwrap(),
+            };
+            coord
+                .storage_node()
+                .test_replace_object_encryption(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("obj"),
+                    put.version_id,
+                    &invalid_encryption,
+                )
+                .unwrap();
+
+            let source_sse_customer = match profile {
+                Profile::SseCustomer => Some(&sse_customer),
+                Profile::SseS3 => None,
+            };
+            assert_invalid_checksum_metadata(
+                coord
+                    .head_object(&GetObjectRequest {
+                        sse_customer: source_sse_customer,
+                        object: object_version_request_with_expected_owner(
+                            "bucket",
+                            "obj",
+                            None,
+                            test_requester(),
+                            None,
+                        ),
+                        cond: NO_READ,
+                    })
+                    .unwrap_err(),
+            );
+            assert_invalid_checksum_metadata(
+                coord
+                    .get_object(&GetObjectRequest {
+                        sse_customer: source_sse_customer,
+                        object: object_version_request_with_expected_owner(
+                            "bucket",
+                            "obj",
+                            None,
+                            test_requester(),
+                            None,
+                        ),
+                        cond: NO_READ,
+                    })
+                    .unwrap_err(),
+            );
+            assert_invalid_checksum_metadata(
+                coord
+                    .copy_object(&CopyObjectRequest {
+                        source: copy_source("bucket", "obj", None),
+                        destination: object_request_with_expected_owner(
+                            "destination",
+                            "copy",
+                            test_requester(),
+                            None,
+                        ),
+                        dst_condition: &WriteCondition::default(),
+                        directive: MetadataDirective::Copy,
+                        website_redirect_location: None,
+                        tagging: TaggingDirective::Copy,
+                        acl: NO_PUT_OBJECT_ACL.into(),
+                        policy_context: PutObjectPolicyContext::default(),
+                        source_sse_customer,
+                        destination_encryption: WriteEncryptionRequest::none(),
+                        object_lock: ObjectLockState::default(),
+                    })
+                    .unwrap_err(),
+            );
+
+            assert!(matches!(
+                coord.head_object(&GetObjectRequest {
+                    sse_customer: None,
+                    object: object_version_request_with_expected_owner(
+                        "destination",
+                        "copy",
+                        None,
+                        test_requester(),
+                        None,
+                    ),
+                    cond: NO_READ,
+                }),
+                Err(ServerError::ObjectNotFound { .. })
+            ), "{profile_name} inner checksum version {version} unexpectedly created the copy destination");
+        }
+    }
 }
 
 #[test]

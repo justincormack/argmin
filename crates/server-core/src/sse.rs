@@ -349,6 +349,31 @@ impl SseCustomerWriteContext {
                 .map_err(object_encryption_state_error)?,
         ))
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_seal_checksum_metadata_version(
+        &self,
+        checksum: &ObjectChecksumMetadata,
+        version: u8,
+    ) -> Result<ObjectEncryption, ServerError> {
+        let ObjectEncryption::SseCustomer(state) = &self.encryption else {
+            return Err(ServerError::InternalError {
+                reason: "SSE-C test write context missing encryption state".to_string(),
+            });
+        };
+        let (checksum_nonce, encrypted_checksum_metadata) = test_encrypt_checksum_metadata_version(
+            &self.dek,
+            checksum,
+            version,
+            SSE_C_CHECKSUM_AAD,
+            "SSE-C",
+        )?;
+        Ok(ObjectEncryption::SseCustomer(
+            state
+                .with_encrypted_checksum_metadata(checksum_nonce, encrypted_checksum_metadata)
+                .map_err(object_encryption_state_error)?,
+        ))
+    }
 }
 
 impl fmt::Debug for SseCustomerWriteContext {
@@ -408,6 +433,31 @@ impl ManagedEncryptionWriteContext {
         let (checksum_nonce, encrypted_checksum_metadata) = encrypt_checksum_with_dek(
             &self.dek,
             checksum,
+            MANAGED_CHECKSUM_AAD,
+            MANAGED_ENCRYPTION_LABEL,
+        )?;
+        Ok(ObjectEncryption::SseS3(
+            state
+                .with_encrypted_checksum_metadata(checksum_nonce, encrypted_checksum_metadata)
+                .map_err(object_encryption_state_error)?,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_seal_checksum_metadata_version(
+        &self,
+        checksum: &ObjectChecksumMetadata,
+        version: u8,
+    ) -> Result<ObjectEncryption, ServerError> {
+        let ObjectEncryption::SseS3(state) = &self.encryption else {
+            return Err(ServerError::InternalError {
+                reason: "managed test write context missing encryption state".to_string(),
+            });
+        };
+        let (checksum_nonce, encrypted_checksum_metadata) = test_encrypt_checksum_metadata_version(
+            &self.dek,
+            checksum,
+            version,
             MANAGED_CHECKSUM_AAD,
             MANAGED_ENCRYPTION_LABEL,
         )?;
@@ -995,6 +1045,29 @@ fn encrypt_checksum_with_dek(
         .seal_in_place_append_tag(nonce, aad, &mut buf)
         .map_err(|_| ServerError::InternalError {
             reason: format!("failed to encrypt {label} checksum metadata"),
+        })?;
+    Ok((nonce, buf))
+}
+
+#[cfg(test)]
+fn test_encrypt_checksum_metadata_version(
+    dek: &[u8; SSE_C_DEK_LEN],
+    checksum: &ObjectChecksumMetadata,
+    version: u8,
+    aad: &[u8],
+    label: &str,
+) -> Result<([u8; SSE_C_CHECKSUM_NONCE_LEN], Vec<u8>), ServerError> {
+    assert_ne!(version, CHECKSUM_METADATA_VERSION);
+    let sealing_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {label} test checksum sealing key"),
+    })?;
+    let nonce = [version.wrapping_add(1); SSE_C_CHECKSUM_NONCE_LEN];
+    let mut buf = encode_checksum_metadata(checksum).map_err(checksum_metadata_codec_error)?;
+    buf[0] = version;
+    sealing_key
+        .seal_in_place_append_tag(nonce, aad, &mut buf)
+        .map_err(|_| ServerError::InternalError {
+            reason: format!("failed to encrypt {label} test checksum metadata"),
         })?;
     Ok((nonce, buf))
 }

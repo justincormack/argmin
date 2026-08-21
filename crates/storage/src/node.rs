@@ -72,8 +72,8 @@ use crate::types::{
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
     CreateStreamUploadReq, MultipartPartRecord, MultipartPartSegmentRecord, MultipartUploadRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, SessionId, StreamUploadRecord,
-    StreamUploadSegmentRecord, UploadId, UploadState,
+    ObjectEncryption, ObjectSegmentRecord, ObjectSegmentsReclaimRecord, SessionId,
+    StreamUploadRecord, StreamUploadSegmentRecord, UploadId, UploadState,
 };
 #[cfg(test)]
 use crate::types::{PutLiveObjectReq, StreamUploadState, StreamUploadTarget};
@@ -1371,6 +1371,20 @@ impl SharedStorageNode {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
         pg.test_remove_object_part(bucket, key, version_id, part_number)?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_replace_object_encryption(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        encryption: &ObjectEncryption,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        pg.test_replace_object_encryption(bucket, key, version_id, encryption)?;
         Ok(())
     }
 
