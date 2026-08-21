@@ -21,6 +21,13 @@ It also moves the former Phase 11 Slice 2 trigger-SQL-body work here: stale trig
 definitions are an upgrade correctness problem, not a current stabilisation task, because
 there should not be any supported legacy triggers yet.
 
+The stable engineering policy extracted from this plan lives in
+[`guides/versioning.md`](../guides/versioning.md). In particular, format versions and their
+evidence are established only at commit boundaries. The parent commit must already contain the
+evidence for the version being replaced, and the same format must not be advanced twice within one
+commit, because otherwise the claimed earlier version has no independently verifiable repository
+state. This plan remains the detailed format inventory and implementation tracker.
+
 Version markers are not sufficient by themselves. Every durable or cross-process
 representation must have one owning crate that can change, reject, negotiate, and eventually
 migrate that representation without requiring unrelated callers to understand its internals.
