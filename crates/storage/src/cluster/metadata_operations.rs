@@ -1717,7 +1717,7 @@ impl StorageCluster {
             deadline,
             recovery_guard,
         )
-        .map_err(ReissuePendingMetadataCommandFailure::into_source)
+        .map_err(ReissuePendingMetadataCommandFailure::into_recovery_handoff_error)
     }
 
     fn reissue_pending_metadata_command_outcome_with_route_mode_classified_until(
@@ -5460,6 +5460,17 @@ impl StorageCluster {
         self.local_map
             .runtime_state()
             .test_metadata_command_recovery_flight_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_metadata_command_recovery_awaiting_authorized(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> bool {
+        self.local_map
+            .runtime_state()
+            .test_metadata_command_recovery_awaiting_authorized(pg_id, command)
     }
 
     #[cfg(test)]

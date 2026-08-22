@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::cluster::request_ops;
+use crate::control_plane::{PendingMetadataCommandObservation, PendingMetadataCommandRecovery};
 use crate::control_plane_auth::{
     ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
     ControlPlaneScopedCredentialStore,
@@ -5764,7 +5766,7 @@ fn authenticated_unix_direct_put_does_not_allocate_version_after_action_crosses_
         NodeId::new(1),
         socket_path,
     )
-    .with_frontend_rpc_auth(client_auth)])
+    .with_frontend_rpc_auth(client_auth.clone())])
         .unwrap();
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
@@ -5827,6 +5829,298 @@ fn authenticated_unix_direct_put_does_not_allocate_version_after_action_crosses_
     ));
     assert_eq!(action_calls.load(Ordering::SeqCst), 1);
     assert_eq!(allocator_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn authenticated_unix_direct_put_recovers_across_delayed_route_transition_certificate() {
+    const TOPOLOGY_DIGEST: &str =
+        "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let source_epoch = ClusterEpoch::INITIAL;
+    let current_epoch = ClusterEpoch::new(source_epoch.get() + 3).unwrap();
+    let mut map =
+        LocalClusterMap::open(&tmp.path().join("frontend"), &node_ids, &pg_ids, ec_shape).unwrap();
+    for pg_id in pg_ids {
+        set_route_primary(&mut map, pg_id, NodeId::new(1));
+    }
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "authenticated-route-transition-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    let object_pg = topology.object_pg_for(&bucket, &key);
+
+    let credential = ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+        cluster_id: "direct-put-route-transition-test".to_owned(),
+        credential_id: "frontend-1".to_owned(),
+        credential_version: 1,
+        principal: ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        },
+        secret: b"direct-put-route-transition-secret".to_vec(),
+    })
+    .unwrap();
+    let server_auth = crate::StorageRpcServerAuthConfig::new(
+        credential.cluster_id(),
+        ControlPlaneScopedCredentialStore::new(vec![credential.clone()]).unwrap(),
+        9,
+        TOPOLOGY_DIGEST,
+    )
+    .unwrap();
+    let client_auth =
+        crate::FrontendStorageRpcClientCapability::new(credential, 9, TOPOLOGY_DIGEST).unwrap();
+    let socket_path = tmp
+        .path()
+        .join("sockets")
+        .join("route-transition-node-1.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let source_routes = pg_ids
+        .iter()
+        .map(|pg_id| StorageNodePgRoute {
+            pg_id: *pg_id,
+            cluster_epoch: source_epoch,
+            state: PgState::Active,
+            primary_node_id: NodeId::new(1),
+            metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
+            acting_set: node_ids.to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let server_config = StorageNodeProcessConfig {
+        node_id: NodeId::new(1),
+        cluster_epoch: source_epoch,
+        route_map_validity: RouteMapValidity::until_ms_saturating(
+            crate::clock::current_time_millis().saturating_add(60_000),
+        ),
+        data_dir: tmp.path().join("remote-route-transition-node-1"),
+        default_ec_shape: ec_shape,
+        pg_ids: pg_ids.to_vec(),
+        socket_path: socket_path.clone(),
+        pg_routes: source_routes.clone(),
+        pending_metadata_command_recoveries: Vec::new(),
+        historical_pg_routes: Vec::new(),
+    };
+    let server = Arc::new(
+        PreparedStorageNodeServer::new(server_config.clone())
+            .with_rpc_auth(server_auth)
+            .bind()
+            .unwrap(),
+    );
+    let _server_guard = spawn_shared_storage_node_server_pool(Arc::clone(&server), 4);
+    map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+        NodeId::new(1),
+        socket_path,
+    )
+    .with_frontend_rpc_auth(client_auth.clone())])
+        .unwrap();
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let current_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let state = if *pg_id == object_pg {
+                PgState::Peering
+            } else {
+                PgState::Active
+            };
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                current_epoch,
+                PgId::new(*pg_id),
+                if *pg_id == object_pg {
+                    NodeId::new(2)
+                } else {
+                    NodeId::new(1)
+                },
+                node_ids.to_vec(),
+                state,
+            )
+        })
+        .collect::<Vec<_>>();
+    let current_configs = node_ids.map(|node_id| {
+        LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path()
+                .join("current-frontend")
+                .join(format!("node-{}", node_id.as_u32())),
+        )
+    });
+    let mut current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        current_configs,
+        &pg_ids,
+        ec_shape,
+        current_epoch,
+        current_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    current_map
+        .install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+            NodeId::new(1),
+            server_config.socket_path.clone(),
+        )
+        .with_frontend_rpc_auth(client_auth)])
+        .unwrap();
+    let current_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::new(current_map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id =
+        crate::SessionId::try_from("79797979797979797979797979797970".to_string()).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"authenticated route transition direct put";
+    let segment_okh = [0xda; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+
+    let (installed_tx, installed_rx) = std::sync::mpsc::sync_channel(1);
+    let (transition_published_tx, transition_published_rx) = std::sync::mpsc::sync_channel(1);
+    let transition_published_rx = Arc::new(Mutex::new(transition_published_rx));
+    let transition_published_for_hook = Arc::clone(&transition_published_rx);
+    let _installed_hook =
+        cluster.test_install_direct_put_pending_installed_hook(Arc::new(move |command| {
+            installed_tx.send(command.clone()).unwrap();
+            transition_published_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            false
+        }));
+    let inject_uncertainty_once = Arc::new(AtomicBool::new(true));
+    let inject_uncertainty_once_for_hook = Arc::clone(&inject_uncertainty_once);
+    let _uncertainty_hook = cluster.test_install_direct_put_metadata_apply_uncertainty_hook(
+        Arc::new(move |_command| {
+            if inject_uncertainty_once_for_hook.swap(false, Ordering::SeqCst) {
+                request_ops::DirectPutMetadataApplyUncertaintyTestAction::Inject
+            } else {
+                request_ops::DirectPutMetadataApplyUncertaintyTestAction::None
+            }
+        }),
+    );
+    let server_for_transition = Arc::clone(&server);
+    let cluster_for_recovery = Arc::clone(&cluster);
+    let controller = thread::spawn(move || {
+        let command = installed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut transitioned = server_config.clone();
+        transitioned.cluster_epoch = current_epoch;
+        for route in &mut transitioned.pg_routes {
+            route.cluster_epoch = current_epoch;
+            if route.pg_id == object_pg {
+                route.state = PgState::Peering;
+                route.primary_node_id = NodeId::new(2);
+            }
+        }
+        transitioned.historical_pg_routes = source_routes;
+        server_for_transition
+            .install_control_plane_runtime_config(transitioned.clone())
+            .unwrap();
+        transition_published_tx.send(()).unwrap();
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while !cluster_for_recovery
+            .test_metadata_command_recovery_awaiting_authorized(PgId::new(object_pg), &command)
+        {
+            assert!(
+                Instant::now() < wait_deadline,
+                "direct PUT did not hand its flight to authorized recovery"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let delayed_certificate_error = cluster_for_recovery
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                PgId::new(object_pg),
+                &command,
+                &current_cluster,
+            )
+            .expect_err("storage node must reject recovery before receiving the certificate");
+        assert!(
+            request_ops::object_pg_action_error_is_retryable_command_observation(
+                &delayed_certificate_error
+            ),
+            "unexpected delayed-certificate error: {delayed_certificate_error:?}"
+        );
+        assert!(cluster_for_recovery
+            .test_metadata_command_recovery_awaiting_authorized(PgId::new(object_pg), &command,));
+        transitioned.pending_metadata_command_recoveries.push((
+            PgId::new(object_pg),
+            PendingMetadataCommandRecovery::new(
+                NodeId::new(1),
+                PendingMetadataCommandObservation::new(
+                    source_epoch,
+                    std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
+                    command.checksum_crc64(),
+                ),
+            ),
+        ));
+        server_for_transition
+            .install_control_plane_runtime_config(transitioned)
+            .unwrap();
+        let recovery_outcome = cluster_for_recovery
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                PgId::new(object_pg),
+                &command,
+                &current_cluster,
+            )
+            .unwrap();
+        assert!(recovery_outcome.is_logically_applied());
+        command
+    });
+
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_commit = Arc::clone(&action_calls);
+    let outcome = match cluster.commit_direct_put_object_from_payload_shards(
+        &commit_req,
+        &written.written_shards,
+        move |_| {
+            action_calls_for_commit.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), ()>(())
+        },
+    ) {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => panic!("direct PUT action unexpectedly rejected the request"),
+        Err(crate::ObjectPgActionError::Store(error)) => {
+            panic!("authenticated route-transition recovery failed: {error:?}")
+        }
+        Err(error) => panic!("authenticated route-transition recovery failed: {error:?}"),
+    };
+    let command = controller.join().unwrap();
+
+    assert!(!inject_uncertainty_once.load(Ordering::SeqCst));
+    assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.version_id, crate::VersionId::Null);
+    assert!(matches!(
+        command.payload(),
+        MetadataCommandPayload::CommitDirectPutObject(commit)
+            if commit.object.bucket == bucket && commit.object.key == key
+    ));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 }
 
 #[test]

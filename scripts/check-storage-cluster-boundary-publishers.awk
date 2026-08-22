@@ -230,7 +230,7 @@ function publisher_helper(line) {
     if (line ~ /drain_pending_metadata_command_with_local_recovery_route/) {
         return "metadata_command_local_recovery_drain"
     }
-    if (line ~ /drain_pending_metadata_command_with_authorized_recovery_route/) {
+    if (line ~ /drain_pending_metadata_command_with_authorized_recovery_(route|source)/) {
         return "metadata_command_historical_recovery_drain"
     }
     if (line ~ /MetadataCommandExecutionRoute::recovery/) {

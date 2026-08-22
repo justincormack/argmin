@@ -62,7 +62,9 @@ pub(super) struct RequestWorkBudget {
 
 mod metadata_command_drain_authority {
     use super::{
-        MetadataCommandEnvelope, MetadataCommandRecoveryGuard, PgId, RequestWorkBudget, StoreError,
+        MetadataCommandEnvelope, MetadataCommandRecoveryGuard, MetadataCommandRecoveryResolution,
+        MetadataCommandRecoveryRootDisposition, PendingMetadataCommandOutcome, PgId,
+        RequestWorkBudget, StoreError,
     };
 
     #[derive(Debug)]
@@ -134,13 +136,16 @@ mod metadata_command_drain_authority {
     /// This owns the process-local leader guard. Lower historical mutation
     /// boundaries accept only a proof borrowed from this value, so authority
     /// cannot outlive the joined recovery section or be constructed by a
-    /// sibling module. The proof starts bound to the guard's exact recovery
-    /// key and can advance only through a validated command-reissue chain.
+    /// sibling module. The proof retains the guard's immutable lineage root
+    /// while its mutation subject can advance only through a validated
+    /// command-reissue chain.
     pub(super) struct Leader<'a> {
         _guard: MetadataCommandRecoveryGuard,
         work_budget: &'a mut RequestWorkBudget,
         seal: LeaderSeal,
+        root_subject: RecoveryCommandSubject,
         subject: RecoveryCommandSubject,
+        root_disposition: MetadataCommandRecoveryRootDisposition,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -180,23 +185,71 @@ mod metadata_command_drain_authority {
                     operation: "metadata-command-recovery-leader",
                 });
             }
+            let lineage_root = guard.lineage_root();
+            let root_disposition = guard.root_disposition();
             Ok(Leader {
                 _guard: guard,
                 work_budget: &mut *self.work_budget,
                 seal: LeaderSeal,
+                root_subject: RecoveryCommandSubject::new(pg_id, &lineage_root),
                 subject: RecoveryCommandSubject::new(pg_id, command),
+                root_disposition,
             })
         }
     }
 
     impl Leader<'_> {
+        pub(super) fn lineage_tip(&self) -> MetadataCommandEnvelope {
+            self._guard.lineage_tip()
+        }
+
+        pub(super) fn lineage_advanced_from(&self, command: &MetadataCommandEnvelope) -> bool {
+            self._guard.lineage_advanced_from(command)
+        }
+
+        pub(super) fn mark_irreversible_handoff(
+            &self,
+            resolution: MetadataCommandRecoveryResolution,
+        ) {
+            self._guard.mark_irreversible_handoff(resolution);
+        }
+
+        pub(super) fn record_outcome(&self, outcome: PendingMetadataCommandOutcome) {
+            self._guard.record_outcome(outcome);
+        }
+
+        pub(super) fn abandoned_predecessor(&self) -> Option<MetadataCommandEnvelope> {
+            match &self.root_disposition {
+                MetadataCommandRecoveryRootDisposition::TipOutcome => None,
+                MetadataCommandRecoveryRootDisposition::Abandoned { predecessor } => {
+                    Some((**predecessor).clone())
+                }
+            }
+        }
+
+        pub(super) fn root_is_abandoned(&self) -> bool {
+            matches!(
+                self.root_disposition,
+                MetadataCommandRecoveryRootDisposition::Abandoned { .. }
+            )
+        }
+
+        pub(super) fn relinquish_for_authorized_recovery(self) {
+            self._guard.relinquish_for_authorized_recovery();
+        }
+
         #[cfg(test)]
         pub(super) fn proof(&self) -> LeaderProof<'_> {
             LeaderProof {
                 _seal: &self.seal,
-                root_subject: self.subject,
+                root_subject: self.root_subject,
                 subject: self.subject,
-                predecessor_subject: None,
+                predecessor_subject: match &self.root_disposition {
+                    MetadataCommandRecoveryRootDisposition::TipOutcome => None,
+                    MetadataCommandRecoveryRootDisposition::Abandoned { predecessor } => Some(
+                        RecoveryCommandSubject::new(predecessor.id().pg_id(), predecessor),
+                    ),
+                },
             }
         }
 
@@ -211,9 +264,17 @@ mod metadata_command_drain_authority {
                 &mut *self.work_budget,
                 LeaderProof {
                     _seal: &self.seal,
-                    root_subject: self.subject,
+                    root_subject: self.root_subject,
                     subject: self.subject,
-                    predecessor_subject: None,
+                    predecessor_subject: match &self.root_disposition {
+                        MetadataCommandRecoveryRootDisposition::TipOutcome => None,
+                        MetadataCommandRecoveryRootDisposition::Abandoned { predecessor } => {
+                            Some(RecoveryCommandSubject::new(
+                                predecessor.id().pg_id(),
+                                predecessor,
+                            ))
+                        }
+                    },
                 },
                 &self._guard,
             )

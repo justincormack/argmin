@@ -3059,7 +3059,7 @@ fn bucket_subresource_command_retry_reuses_pending_partial_replica_command() {
 }
 
 #[test]
-fn bucket_subresource_reports_contention_when_unrelated_pending_outcome_is_unconfirmed() {
+fn bucket_subresource_retains_handoff_when_unrelated_pending_command_is_irrevocable() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let mut map =
@@ -3115,7 +3115,7 @@ fn bucket_subresource_reports_contention_when_unrelated_pending_outcome_is_uncon
             if candidate == &hook_command {
                 hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
                 let id = candidate.id();
-                return Err(StoreError::MetadataCommandOutcomeUnconfirmed {
+                return Err(StoreError::MetadataCommandIrrevocableConvergencePending {
                     pg_id: id.pg_id().get(),
                     cluster_epoch: id.cluster_epoch(),
                     log_index: id.log_index().get(),
@@ -3130,7 +3130,7 @@ fn bucket_subresource_reports_contention_when_unrelated_pending_outcome_is_uncon
     );
     let error = cluster
         .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
-        .expect_err("an unrelated unconfirmed command must block with retryable contention");
+        .expect_err("an unrelated irrevocable command must block with retryable contention");
 
     assert_eq!(
         error.kind(),
@@ -3139,9 +3139,11 @@ fn bucket_subresource_reports_contention_when_unrelated_pending_outcome_is_uncon
     assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         pending_metadata_command_for_test(&map, pg_id, &deleting_bucket),
-        Some(command),
+        Some(command.clone()),
         "the unrelated uncertain command must remain available for recovery"
     );
+    assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 1);
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command,));
     for node_id in node_ids {
         let pg = map
             .node(node_id)
@@ -3246,9 +3248,11 @@ fn create_bucket_reports_contention_when_same_bucket_delete_mark_outcome_is_unco
     assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         pending_metadata_command_for_test(&map, pg_id, &bucket),
-        Some(command),
+        Some(command.clone()),
         "the uncertain delete mark must remain available for recovery"
     );
+    assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 1);
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command,));
     for node_id in node_ids {
         let pg = map
             .node(node_id)

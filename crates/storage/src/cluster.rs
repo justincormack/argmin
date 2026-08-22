@@ -22,6 +22,7 @@ pub use local::{
 use local::{
     LocalClusterRuntimeState, LocalPlacedSegmentShardReader, LocalRouteMapLeaseSnapshot,
     MetadataCommandRecoveryAdmission, MetadataCommandRecoveryGuard,
+    MetadataCommandRecoveryResolution, MetadataCommandRecoveryRootDisposition,
 };
 pub use request_ops::leased_object_snapshot::{
     LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome,

@@ -2820,6 +2820,18 @@ impl PgStore {
         &self,
         node_id: u32,
     ) -> Result<Option<PendingMetadataCommandSlot>, StoreError> {
+        #[cfg(test)]
+        if self
+            .fail_next_pending_slot_inspection
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(StoreError::Io {
+                context: "injected pending metadata command slot reconciliation failure",
+                source: std::io::Error::other(
+                    "injected failure while reconciling a lost replacement response",
+                ),
+            });
+        }
         let raw = self.query_row_cached_optional(
             "SELECT cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
                     publication_started, scope_bucket \
@@ -3986,6 +3998,39 @@ impl PgStore {
             .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
         let route_dependencies =
             Self::pending_metadata_command_route_dependency_sidecar(replacement);
+        #[cfg(test)]
+        if self
+            .fail_next_pending_slot_replace_definitively_with_fatal_error
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(PendingMetadataCommandSlotReplaceError::definitive(
+                StoreError::StorageRpc {
+                    node_id,
+                    operation: "replace pending metadata command slot",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::PayloadDecode,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "injected definitive authenticated replacement response validation failure",
+                    ),
+                },
+            ));
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_pending_slot_replace_before_commit
+            .swap(false, Ordering::Relaxed)
+        {
+            self.fail_next_pending_slot_inspection
+                .store(true, Ordering::Relaxed);
+            return Err(PendingMetadataCommandSlotReplaceError::may_have_applied(
+                StoreError::Io {
+                    context:
+                        "injected pending metadata command slot replacement pre-commit uncertainty",
+                    source: std::io::Error::other(
+                        "injected ambiguous failure before pending slot replacement commit",
+                    ),
+                },
+            ));
+        }
         let replaced = self
             .with_pending_slot_transaction(|| {
                 let updated = self.execute_cached(
@@ -4032,12 +4077,34 @@ impl PgStore {
                 .fail_next_pending_slot_replace_after_commit
                 .swap(false, Ordering::Relaxed)
         {
+            if self
+                .fail_pending_slot_inspection_after_replace
+                .swap(false, Ordering::Relaxed)
+            {
+                self.fail_next_pending_slot_inspection
+                    .store(true, Ordering::Relaxed);
+            }
+            let fatal_response = self
+                .fail_pending_slot_replace_after_commit_with_fatal_error
+                .swap(false, Ordering::Relaxed);
             return Err(PendingMetadataCommandSlotReplaceError::may_have_applied(
-                StoreError::Io {
-                    context: "injected pending metadata command slot replacement response failure",
-                    source: std::io::Error::other(
-                        "injected failure after pending slot replacement commit",
-                    ),
+                if fatal_response {
+                    StoreError::StorageRpc {
+                        node_id,
+                        operation: "replace pending metadata command slot",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::PayloadDecode,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected authenticated replacement response validation failure",
+                        ),
+                    }
+                } else {
+                    StoreError::Io {
+                        context:
+                            "injected pending metadata command slot replacement response failure",
+                        source: std::io::Error::other(
+                            "injected failure after pending slot replacement commit",
+                        ),
+                    }
                 },
             ));
         }
@@ -5547,6 +5614,29 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
+        #[cfg(test)]
+        if self
+            .fail_next_metadata_command_abandon_before_commit
+            .swap(false, Ordering::Relaxed)
+        {
+            let fatal = self
+                .fail_next_metadata_command_abandon_with_fatal_error
+                .swap(false, Ordering::Relaxed);
+            return Err(StoreError::StorageRpc {
+                node_id,
+                operation: "record abandoned metadata command",
+                failure: if fatal {
+                    crate::storage_rpc::StorageRpcErrorCode::MetadataCommandIntegrity
+                } else {
+                    crate::storage_rpc::StorageRpcErrorCode::TransportClosed
+                },
+                detail: crate::StorageNodeFailureDetail::new(if fatal {
+                    "injected fatal metadata command abandonment response"
+                } else {
+                    "injected pre-mutation metadata command abandonment failure"
+                }),
+            });
+        }
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| StoreError::Db {

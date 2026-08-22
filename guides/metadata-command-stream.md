@@ -329,6 +329,37 @@ caller-retryable contention. A definitive semantic, command-byte, checksum, or
 hash-chain failure is preserved verbatim for diagnosis and fail-closed
 recovery; it must not be overwritten as generic outcome uncertainty.
 
+Irreversible uncertainty is not historical-route authority. When a normal-route
+owner cannot finish either internal uncertainty outcome, it records that exact
+outcome in the process-local single flight and relinquishes execution without
+removing the flight. Normal waiters remain blocked behind that handoff and
+cannot fall back to old-route inspection. Only the current-map recovery worker
+may claim the detached flight, after matching the control-plane certificate to
+the flight's immutable lineage root. Reissue may advance the durable pending
+command to a later lineage tip, but does not replace that certified root. A
+replacement whose mutation response and bounded exact-slot reconciliation are
+both inconclusive is recorded as outcome uncertainty for the already-bound
+lineage tip; the transport error cannot discard the C1-to-C2 flight. Fatal
+authenticated-response, protocol, and integrity failures remain the foreground
+error, while the independently retained flight still protects an ambiguously
+committed C2 for authorized recovery. A cleanup derivative additionally retains
+its exact abandoned predecessor and the root command's abandoned disposition.
+If the ambiguous replacement did not commit and durable inspection still finds
+C1, rebinding that exact speculative C1-to-C2 derivative is idempotent; no
+different derivative is admitted. Authorized takeover supplies the predecessor
+to every storage mutation, and successful derivative convergence resolves
+waiters as C1 abandoned rather than C2 applied. A delayed storage-node
+certificate or other retryable recovery-route rejection
+returns the worker error while restoring the detached handoff; it does not wake
+foreground waiters or replace the retained internal uncertainty with
+`SlowDown`. Terminal recovery records its exact applied or abandoned outcome
+before releasing the flight.
+
+The handoff is local ownership bookkeeping, not a new storage mutation. It must
+therefore be recorded even when the request work deadline has just expired.
+Expiry still prohibits additional normal-route mutation; it does not authorize
+dropping an already irreversible flight or its C1-to-C2 lineage.
+
 Standalone one-replica mode has no second failure domain and therefore has no
 off-primary witness. Its configured lack of redundancy is explicit; the same
 exact-command retry and pending-slot rules still prevent replacement after an
@@ -696,9 +727,11 @@ opaque leader capability. Every lower historical apply, abandonment, reissue,
 and pending-slot removal boundary requires a proof borrowed from that live
 capability, so neither a direct lower call nor a recovery execution-route
 struct literal can escape the joined guard's lifetime. The proof is also bound
-to the joined guard's exact `(PG, log index, checksum)` recovery subject, and
-every lower boundary checks that subject before storage access. Reissue returns
-a newly derived proof bound to the replacement command only after validating a
+to an immutable certified root `(PG, log index, checksum)` and a current
+mutation subject. For an unreissued command they are identical; an authorized
+handoff retains C1 as the root while joining C2 as the subject. Every lower
+boundary checks the applicable subject before storage access. Reissue returns a
+newly derived proof bound to the replacement command only after validating a
 same-epoch, later-index chain with either identical payload or the one explicit
 abandoned-command cleanup derivative. Thus a leader for one command cannot be
 redirected to another command, while legitimate recovery follow-ups remain

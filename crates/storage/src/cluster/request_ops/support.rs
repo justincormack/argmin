@@ -750,6 +750,19 @@ type BeforeObjectMetadataCommandApplyTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectPutMetadataApplyUncertaintyTestAction {
+    None,
+    Inject,
+    InjectAfterBudgetExpiry,
+}
+
+#[cfg(test)]
+type DirectPutMetadataApplyUncertaintyTestHook = Arc<
+    dyn Fn(&MetadataCommandEnvelope) -> DirectPutMetadataApplyUncertaintyTestAction + Send + Sync,
+>;
+
+#[cfg(test)]
 type DirectPutPendingInstalledTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
 
@@ -774,10 +787,6 @@ type PostBudgetMetadataCommandInspectionTestHook = Arc<
 
 #[cfg(test)]
 type PendingCommandRecoveryTimeoutTestHook =
-    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
-
-#[cfg(test)]
-type PendingCommandRecoveryWaitedTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
 
 #[cfg(test)]
@@ -975,6 +984,11 @@ static BEFORE_OBJECT_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static DIRECT_PUT_METADATA_APPLY_UNCERTAINTY_HOOKS: OnceLock<
+    Mutex<HashMap<usize, DirectPutMetadataApplyUncertaintyTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static DIRECT_PUT_PENDING_INSTALLED_HOOKS: OnceLock<
     Mutex<HashMap<usize, DirectPutPendingInstalledTestHook>>,
 > = OnceLock::new();
@@ -1006,11 +1020,6 @@ static POST_BUDGET_METADATA_COMMAND_INSPECTION_HOOKS: OnceLock<
 #[cfg(test)]
 static PENDING_COMMAND_RECOVERY_TIMEOUT_HOOKS: OnceLock<
     Mutex<HashMap<usize, PendingCommandRecoveryTimeoutTestHook>>,
-> = OnceLock::new();
-
-#[cfg(test)]
-static PENDING_COMMAND_RECOVERY_WAITED_HOOKS: OnceLock<
-    Mutex<HashMap<usize, PendingCommandRecoveryWaitedTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -1189,6 +1198,11 @@ pub(crate) struct BeforeObjectMetadataCommandApplyTestHookGuard {
 }
 
 #[cfg(test)]
+pub(crate) struct DirectPutMetadataApplyUncertaintyTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
 pub(crate) struct DirectPutPendingInstalledTestHookGuard {
     scope_id: usize,
 }
@@ -1220,11 +1234,6 @@ pub(crate) struct PostBudgetMetadataCommandInspectionTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct PendingCommandRecoveryTimeoutTestHookGuard {
-    scope_id: usize,
-}
-
-#[cfg(test)]
-pub(crate) struct PendingCommandRecoveryWaitedTestHookGuard {
     scope_id: usize,
 }
 
@@ -1604,6 +1613,18 @@ impl Drop for BeforeObjectMetadataCommandApplyTestHookGuard {
 }
 
 #[cfg(test)]
+impl Drop for DirectPutMetadataApplyUncertaintyTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = DIRECT_PUT_METADATA_APPLY_UNCERTAINTY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
 impl Drop for DirectPutPendingInstalledTestHookGuard {
     fn drop(&mut self) {
         let hooks = DIRECT_PUT_PENDING_INSTALLED_HOOKS
@@ -1678,18 +1699,6 @@ impl Drop for PostBudgetMetadataCommandInspectionTestHookGuard {
 impl Drop for PendingCommandRecoveryTimeoutTestHookGuard {
     fn drop(&mut self) {
         let hooks = PENDING_COMMAND_RECOVERY_TIMEOUT_HOOKS
-            .get_or_init(|| Mutex::new(HashMap::new()));
-        hooks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.scope_id);
-    }
-}
-
-#[cfg(test)]
-impl Drop for PendingCommandRecoveryWaitedTestHookGuard {
-    fn drop(&mut self) {
-        let hooks = PENDING_COMMAND_RECOVERY_WAITED_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -2274,6 +2283,22 @@ fn maybe_run_before_object_metadata_command_apply_hook(
 }
 
 #[cfg(test)]
+pub(super) fn maybe_force_direct_put_metadata_apply_uncertainty(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+) -> DirectPutMetadataApplyUncertaintyTestAction {
+    DIRECT_PUT_METADATA_APPLY_UNCERTAINTY_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned()
+        .map_or(DirectPutMetadataApplyUncertaintyTestAction::None, |hook| {
+            hook(command)
+        })
+}
+
+#[cfg(test)]
 pub(super) fn maybe_run_direct_put_pending_installed_hook(
     scope_id: usize,
     command: &MetadataCommandEnvelope,
@@ -2373,23 +2398,6 @@ pub(super) fn maybe_run_pending_command_recovery_timeout_hook(
     work_budget: &mut super::RequestWorkBudget,
 ) {
     let hook = PENDING_COMMAND_RECOVERY_TIMEOUT_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&scope_id)
-        .cloned();
-    if hook.is_some_and(|hook| hook(command)) {
-        work_budget.expire_for_test();
-    }
-}
-
-#[cfg(test)]
-pub(super) fn maybe_run_pending_command_recovery_waited_hook(
-    scope_id: usize,
-    command: &MetadataCommandEnvelope,
-    work_budget: &mut super::RequestWorkBudget,
-) {
-    let hook = PENDING_COMMAND_RECOVERY_WAITED_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())

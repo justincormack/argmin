@@ -702,6 +702,20 @@ pub struct PgStore {
     #[cfg(test)]
     fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    fail_pending_slot_inspection_after_replace: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_pending_slot_replace_after_commit_with_fatal_error: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_pending_slot_replace_before_commit: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_pending_slot_replace_definitively_with_fatal_error: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_metadata_command_abandon_before_commit: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_metadata_command_abandon_with_fatal_error: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_pending_slot_inspection: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     before_object_payload_reclaim_claim_effect_check:
         std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
     #[cfg(test)]
@@ -911,6 +925,25 @@ pub(crate) fn inspect_pg_shard_inventory(
         fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
         fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        fail_pending_slot_inspection_after_replace: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        fail_pending_slot_replace_after_commit_with_fatal_error: std::sync::atomic::AtomicBool::new(
+            false,
+        ),
+        #[cfg(test)]
+        fail_next_pending_slot_replace_before_commit: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        fail_next_pending_slot_replace_definitively_with_fatal_error:
+            std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        fail_next_metadata_command_abandon_before_commit: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        fail_next_metadata_command_abandon_with_fatal_error: std::sync::atomic::AtomicBool::new(
+            false,
+        ),
+        #[cfg(test)]
+        fail_next_pending_slot_inspection: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
         before_object_payload_reclaim_claim_effect_check: std::sync::Mutex::new(None),
         #[cfg(test)]
@@ -1164,6 +1197,26 @@ impl PgStore {
             fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_pending_slot_inspection_after_replace: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_pending_slot_replace_after_commit_with_fatal_error:
+                std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_pending_slot_replace_before_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_pending_slot_replace_definitively_with_fatal_error:
+                std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_metadata_command_abandon_before_commit: std::sync::atomic::AtomicBool::new(
+                false,
+            ),
+            #[cfg(test)]
+            fail_next_metadata_command_abandon_with_fatal_error: std::sync::atomic::AtomicBool::new(
+                false,
+            ),
+            #[cfg(test)]
+            fail_next_pending_slot_inspection: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             before_object_payload_reclaim_claim_effect_check: std::sync::Mutex::new(None),
             #[cfg(test)]

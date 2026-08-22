@@ -51,6 +51,20 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_install_direct_put_metadata_apply_uncertainty_hook(
+        &self,
+        hook: DirectPutMetadataApplyUncertaintyTestHook,
+    ) -> DirectPutMetadataApplyUncertaintyTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = DIRECT_PUT_METADATA_APPLY_UNCERTAINTY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        DirectPutMetadataApplyUncertaintyTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_install_direct_put_pending_installed_hook(
         &self,
         hook: DirectPutPendingInstalledTestHook,
@@ -815,6 +829,47 @@ impl super::StorageCluster {
         Ok(())
     }
 
+    fn finish_definitively_not_reissued_object_metadata_command_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        source: ObjectPgActionError,
+        deadline: Instant,
+    ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
+        let can_reinspect = object_pg_action_error_is_retryable_command_observation(&source);
+        match self.abandon_definitively_unapplied_object_metadata_command_until(
+            pg_id, bucket, command, deadline,
+        ) {
+            Ok(()) if can_reinspect => {
+                Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(source))
+            }
+            Ok(()) => Ok(NewObjectMetadataCommandApplyOutcome::Abandoned(source)),
+            Err(error) if object_pg_action_error_is_retryable_command_observation(&error) => {
+                if can_reinspect {
+                    Err(Self::object_metadata_command_irrevocable_error(command))
+                } else {
+                    Err(source)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_finish_definitively_not_reissued_object_metadata_command_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        source: ObjectPgActionError,
+        deadline: Instant,
+    ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
+        self.finish_definitively_not_reissued_object_metadata_command_until(
+            pg_id, bucket, command, source, deadline,
+        )
+    }
+
     fn apply_new_object_metadata_command_for_bucket_inner(
         &self,
         pg_id: PgId,
@@ -1090,26 +1145,16 @@ impl super::StorageCluster {
                             Err(super::ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
                                 source,
                             )) if !command_is_irrevocable => {
-                                if Instant::now() >= work_budget.deadline() {
-                                    return Err(Self::object_metadata_command_irrevocable_error(
+                                let source =
+                                    super::bucket_snapshot_error_to_object_pg_action_error(source);
+                                return self
+                                    .finish_definitively_not_reissued_object_metadata_command_until(
+                                        pg_id,
+                                        bucket,
                                         &command,
-                                    ));
-                                }
-                                return match self
-                                    .abandon_definitively_unapplied_object_metadata_command(
-                                        pg_id, bucket, &command, None,
-                                    ) {
-                                    Ok(()) => {
-                                        Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
-                                            super::bucket_snapshot_error_to_object_pg_action_error(
-                                                source,
-                                            ),
-                                        ))
-                                    }
-                                    Err(_) => Err(Self::object_metadata_command_irrevocable_error(
-                                        &command,
-                                    )),
-                                };
+                                        source,
+                                        work_budget.deadline(),
+                                    );
                             }
                             Err(super::ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
                                 source,
@@ -1242,6 +1287,8 @@ impl super::StorageCluster {
         fallback_error: ObjectPgActionError,
         confirmation_deadline: Instant,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
+        let can_reinspect =
+            object_pg_action_error_is_retryable_command_observation(&fallback_error);
         match self
             .metadata_command_publication_state_on_acting_set_until(
                 pg_id,
@@ -1256,13 +1303,21 @@ impl super::StorageCluster {
                 crate::node::maybe_run_after_object_metadata_command_publish_hook(
                     self.metadata_primary_test_hook_node().test_hook_scope_id(),
                 )?;
-                Ok(NewObjectMetadataCommandApplyOutcome::Applied)
+                if can_reinspect {
+                    Ok(NewObjectMetadataCommandApplyOutcome::Applied)
+                } else {
+                    Err(fallback_error)
+                }
             }
             MetadataCommandPublicationState::PublicationStarted
             | MetadataCommandPublicationState::Witnessed
             | MetadataCommandPublicationState::PublicationUnconfirmed
             | MetadataCommandPublicationState::IrrevocableUnconfirmed => {
-                Err(Self::object_metadata_command_irrevocable_error(command))
+                if can_reinspect {
+                    Err(Self::object_metadata_command_irrevocable_error(command))
+                } else {
+                    Err(fallback_error)
+                }
             }
             MetadataCommandPublicationState::NotPublished => {
                 if let Err(error) = self
@@ -1274,13 +1329,25 @@ impl super::StorageCluster {
                     )
                 {
                     if object_pg_action_error_is_retryable_command_observation(&error) {
-                        return Err(Self::object_metadata_command_outcome_unconfirmed_error(
-                            command,
-                        ));
+                        return if can_reinspect {
+                            Err(Self::object_metadata_command_outcome_unconfirmed_error(
+                                command,
+                            ))
+                        } else {
+                            Err(fallback_error)
+                        };
                     }
                     return Err(error);
                 }
-                Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(fallback_error))
+                if can_reinspect {
+                    Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
+                        fallback_error,
+                    ))
+                } else {
+                    Ok(NewObjectMetadataCommandApplyOutcome::Abandoned(
+                        fallback_error,
+                    ))
+                }
             }
         }
     }

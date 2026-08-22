@@ -30,7 +30,59 @@ impl PgStore {
 
     #[cfg(test)]
     pub(crate) fn fail_next_pending_slot_replace_after_commit(&self) {
+        self.fail_pending_slot_inspection_after_replace
+            .store(false, Ordering::Relaxed);
+        self.fail_pending_slot_replace_after_commit_with_fatal_error
+            .store(false, Ordering::Relaxed);
         self.fail_next_pending_slot_replace_after_commit
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_pending_slot_replace_after_commit_with_inconclusive_inspection(&self) {
+        self.fail_pending_slot_inspection_after_replace
+            .store(true, Ordering::Relaxed);
+        self.fail_pending_slot_replace_after_commit_with_fatal_error
+            .store(false, Ordering::Relaxed);
+        self.fail_next_pending_slot_replace_after_commit
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_pending_slot_replace_before_commit_with_inconclusive_inspection(&self) {
+        self.fail_next_pending_slot_replace_before_commit
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_pending_slot_replace_definitively_with_fatal_response(&self) {
+        self.fail_next_pending_slot_replace_definitively_with_fatal_error
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_pending_slot_replace_after_commit_with_fatal_response(&self) {
+        self.fail_pending_slot_inspection_after_replace
+            .store(true, Ordering::Relaxed);
+        self.fail_pending_slot_replace_after_commit_with_fatal_error
+            .store(true, Ordering::Relaxed);
+        self.fail_next_pending_slot_replace_after_commit
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_metadata_command_abandon_before_commit(&self) {
+        self.fail_next_metadata_command_abandon_with_fatal_error
+            .store(false, Ordering::Relaxed);
+        self.fail_next_metadata_command_abandon_before_commit
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_metadata_command_abandon_before_commit_with_fatal_response(&self) {
+        self.fail_next_metadata_command_abandon_with_fatal_error
+            .store(true, Ordering::Relaxed);
+        self.fail_next_metadata_command_abandon_before_commit
             .store(true, Ordering::Relaxed);
     }
 

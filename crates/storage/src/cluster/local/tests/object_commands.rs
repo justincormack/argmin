@@ -4379,6 +4379,8 @@ fn recovery_drain_classifies_publication_started_when_abandonment_scan_exhausts_
         Some(&command),
         "publication uncertainty must retain the pending command"
     );
+    assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 1);
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command,));
 }
 
 #[test]
@@ -4820,7 +4822,7 @@ fn insert_delete_marker_reissue_pg_lock_timeout_is_not_retryable_while_source_is
     assert!(matches!(
         error,
         crate::ObjectPgActionError::Store(
-            StoreError::MetadataCommandIrrevocableConvergencePending {
+            StoreError::MetadataCommandOutcomeUnconfirmed {
                 pg_id: error_pg_id,
                 log_index,
                 ..
@@ -4846,6 +4848,384 @@ fn insert_delete_marker_reissue_pg_lock_timeout_is_not_retryable_while_source_is
             Err(crate::MetadataError::ObjectNotFound)
         ));
     }
+}
+
+#[test]
+fn reissued_object_command_deadline_expiry_retains_authorized_handoff_lineage() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+        .unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(object_pg);
+    let source_index = map.test_next_metadata_command_log_index(pg_id);
+    let occupant_bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        object_pg,
+        "handoff-deadline-occupant-",
+    );
+    let occupant = create_bucket_metadata_command(pg_id, source_index.get(), occupant_bucket);
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &occupant)
+        .unwrap();
+
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let write_sequence = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .next_object_write_sequence(bucket.as_str(), key.as_str())
+        .unwrap();
+    let source = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(ClusterEpoch::INITIAL, pg_id, source_index),
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket_write_reservation: proof,
+            bucket: bucket.clone(),
+            key,
+            version_id: crate::VersionId::Null,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            write_sequence,
+            last_modified_millis: crate::clock::current_time_millis(),
+            stale_payload: None,
+        }),
+    );
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &source);
+
+    let holder_map = Arc::clone(&map);
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let (fanout_blocked_tx, fanout_blocked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let holder = std::thread::spawn(move || {
+        start_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("C2 apply hook must start the actor-PG lock holder");
+        let _pg_guards: Vec<_> = node_ids
+            .iter()
+            .map(|node_id| {
+                holder_map
+                    .node(*node_id)
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(object_pg)
+                    .unwrap()
+            })
+            .collect();
+        locked_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test must release the actor PG locks");
+    });
+    let source_log_index = source.id().log_index().get();
+    let hook_once = Arc::new(AtomicBool::new(true));
+    let hook_once_for_apply = Arc::clone(&hook_once);
+    let locked_rx = Arc::new(Mutex::new(locked_rx));
+    let locked_rx_for_apply = Arc::clone(&locked_rx);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if command.id().log_index().get() > source_log_index
+                && hook_once_for_apply.swap(false, Ordering::SeqCst)
+            {
+                start_tx.send(()).unwrap();
+                locked_rx_for_apply
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("all actor PGs must be locked before C2 fanout");
+                fanout_blocked_tx.send(()).unwrap();
+            }
+            Ok(())
+        }));
+    let drain_cluster = cluster.clone();
+    let drain_source = source.clone();
+    let drain = std::thread::spawn(move || {
+        let mut work_budget = RequestWorkBudget::new(Duration::from_millis(25), None)
+            .for_operation("test_reissued_object_handoff_deadline")
+            .for_pg(pg_id);
+        drain_cluster.drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+            pg_id,
+            &drain_source,
+            &mut work_budget,
+        )
+    });
+    fanout_blocked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("C2 fanout must block behind the held actor PGs");
+    std::thread::sleep(Duration::from_millis(50));
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let error = drain
+        .join()
+        .expect("C2 drainer must not panic")
+        .expect_err("C2 fanout must expire behind the held actor PGs");
+
+    assert!(!hook_once.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandOutcomeUnconfirmed { .. }
+                | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+        )
+    ));
+    let replacement = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("C2 must remain durably pending for authorized recovery");
+    assert!(replacement.id().log_index().get() > source.id().log_index().get());
+    assert_eq!(replacement.payload(), source.payload());
+    assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 2);
+    assert!(map
+        .runtime_state()
+        .test_metadata_command_recovery_commands_share_flight(pg_id, &source, &replacement));
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &replacement,));
+    assert_eq!(
+        map.runtime_state()
+            .metadata_command_recovery_handoff_source(pg_id, &replacement),
+        Some(source),
+        "deadline expiry must retain C1 as the authority root for durable C2"
+    );
+}
+
+#[test]
+fn ambiguous_object_reissue_retains_c1_c2_flight_for_authorized_recovery() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(object_pg);
+    let source_index = map.test_next_metadata_command_log_index(pg_id);
+    let occupant_bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        object_pg,
+        "ambiguous-object-reissue-occupant-",
+    );
+    let occupant = create_bucket_metadata_command(pg_id, source_index.get(), occupant_bucket);
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &occupant)
+        .unwrap();
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let write_sequence = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .next_object_write_sequence(bucket.as_str(), key.as_str())
+        .unwrap();
+    let source = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(ClusterEpoch::INITIAL, pg_id, source_index),
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket_write_reservation: proof,
+            bucket: bucket.clone(),
+            key,
+            version_id: crate::VersionId::Null,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            write_sequence,
+            last_modified_millis: crate::clock::current_time_millis(),
+            stale_payload: None,
+        }),
+    );
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &source);
+    map.node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .fail_next_pending_slot_replace_after_commit_with_inconclusive_inspection();
+
+    let mut work_budget = RequestWorkBudget::new(Duration::from_secs(1), None)
+        .for_operation("test_ambiguous_object_reissue_handoff")
+        .for_pg(pg_id);
+    let error = cluster
+        .drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+            pg_id,
+            &source,
+            &mut work_budget,
+        )
+        .expect_err("lost object replacement response must require authorized recovery");
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandOutcomeUnconfirmed {
+            log_index,
+            ..
+        }) if log_index == source_index.get() + 1
+    ));
+    let replacement = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("committed object C2 must remain pending");
+    assert_eq!(replacement.id().log_index().get(), source_index.get() + 1);
+    assert_eq!(replacement.payload(), source.payload());
+    assert!(map
+        .runtime_state()
+        .test_metadata_command_recovery_commands_share_flight(pg_id, &source, &replacement));
+    assert!(map
+        .runtime_state()
+        .test_metadata_command_recovery_awaiting_authorized(pg_id, &replacement));
+
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_source(
+                pg_id,
+                &replacement,
+                &source,
+                &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
+fn fatal_object_reissue_response_preserves_error_and_c1_c2_recovery_flight() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(object_pg);
+    let source_index = map.test_next_metadata_command_log_index(pg_id);
+    let occupant_bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        object_pg,
+        "fatal-object-reissue-occupant-",
+    );
+    let occupant = create_bucket_metadata_command(pg_id, source_index.get(), occupant_bucket);
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &occupant)
+        .unwrap();
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let write_sequence = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .next_object_write_sequence(bucket.as_str(), key.as_str())
+        .unwrap();
+    let source = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(ClusterEpoch::INITIAL, pg_id, source_index),
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket_write_reservation: proof,
+            bucket: bucket.clone(),
+            key,
+            version_id: crate::VersionId::Null,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            write_sequence,
+            last_modified_millis: crate::clock::current_time_millis(),
+            stale_payload: None,
+        }),
+    );
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &source);
+    map.node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .fail_next_pending_slot_replace_after_commit_with_fatal_response();
+
+    let mut work_budget = RequestWorkBudget::new(Duration::from_secs(1), None)
+        .for_operation("test_fatal_object_reissue_handoff")
+        .for_pg(pg_id);
+    let error = cluster
+        .drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+            pg_id,
+            &source,
+            &mut work_budget,
+        )
+        .expect_err("fatal object replacement response validation must remain fail closed");
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::StorageRpc {
+            failure: crate::storage_rpc::StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    let replacement = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("committed object C2 must remain pending after fatal response validation");
+    assert_eq!(replacement.id().log_index().get(), source_index.get() + 1);
+    assert_eq!(replacement.payload(), source.payload());
+    assert!(map
+        .runtime_state()
+        .test_metadata_command_recovery_commands_share_flight(pg_id, &source, &replacement));
+    assert!(map
+        .runtime_state()
+        .test_metadata_command_recovery_awaiting_authorized(pg_id, &replacement));
+
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_source(
+                pg_id,
+                &replacement,
+                &source,
+                &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
 }
 
 #[test]

@@ -4407,9 +4407,14 @@ fn begin_bucket_delete_marker_only_convergence_expiry_preserves_drain_and_exact_
     drop(primary_pg);
     drop(observation_hook);
 
-    cluster
-        .test_begin_bucket_delete_if_current(&bucket)
-        .expect("retry should converge the marker-only pending mark command");
+    let recovery_outcome = cluster
+        .drain_pending_metadata_command_with_authorized_recovery_route(
+            PgId::new(1),
+            &installed_command,
+            &cluster,
+        )
+        .expect("authorized recovery should converge the marker-only pending mark command");
+    assert!(recovery_outcome.is_logically_applied());
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
         "converged retry must clear the exact pending mark command"

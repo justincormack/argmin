@@ -4362,6 +4362,96 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
 }
 
 #[test]
+fn direct_put_retains_irreversible_handoff_until_authorized_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id = crate::tests::stream_session_id("route-shift");
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"direct PUT route transition";
+    let segment_okh = [0x9d; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+
+    let inject_once = Arc::new(AtomicBool::new(true));
+    let inject_once_for_hook = Arc::clone(&inject_once);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let _apply_hook =
+        cluster.test_install_direct_put_metadata_apply_uncertainty_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.object.bucket == hook_bucket && commit.object.key == hook_key
+            ) && inject_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                crate::cluster::request_ops::DirectPutMetadataApplyUncertaintyTestAction::InjectAfterBudgetExpiry
+            } else {
+                crate::cluster::request_ops::DirectPutMetadataApplyUncertaintyTestAction::None
+            }
+        }));
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_commit = Arc::clone(&action_calls);
+    let error = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &commit_req,
+            &written.written_shards,
+            move |_| {
+                action_calls_for_commit.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap_err();
+
+    assert!(!inject_once.load(Ordering::SeqCst));
+    assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandOutcomeUnconfirmed { .. })
+    ));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some());
+    assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 1);
+}
+
+#[test]
 fn direct_put_log_conflict_pending_visibility_error_cleans_new_payload() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

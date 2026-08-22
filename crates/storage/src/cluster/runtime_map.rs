@@ -814,10 +814,30 @@ impl StorageClusterRouteHandle {
             return Ok(0);
         };
         let command_id = command.id();
-        if command_id.cluster_epoch() != pending.cluster_epoch()
-            || command_id.log_index().get() != pending.log_index()
-            || command.checksum_crc64() != pending.command_checksum()
+        let observation_matches = |candidate: &MetadataCommandEnvelope| {
+            let candidate_id = candidate.id();
+            candidate_id.cluster_epoch() == pending.cluster_epoch()
+                && candidate_id.pg_id() == pg_id
+                && candidate_id.log_index().get() == pending.log_index()
+                && candidate.checksum_crc64() == pending.command_checksum()
+        };
+        let authorized_source = if observation_matches(&command) {
+            command.clone()
+        } else if let Some(source) = current
+            .local_map
+            .runtime_state()
+            .metadata_command_recovery_handoff_source(pg_id, &command)
+            .filter(|source| {
+                observation_matches(source)
+                    && command.id().cluster_epoch() == source.id().cluster_epoch()
+                    && command.id().log_index().get() > source.id().log_index().get()
+                    && command
+                        .payload()
+                        .is_authorized_recovery_derivative_of(source.payload())
+            })
         {
+            source
+        } else {
             return Err(
                 PendingMetadataCommandRefreshRecoveryError::IdentityChanged {
                     pg_id: pg_id.get(),
@@ -829,10 +849,14 @@ impl StorageClusterRouteHandle {
                     actual_checksum: command.checksum_crc64(),
                 },
             );
-        }
-        let outcome = recovery_cluster.drain_pending_metadata_command_with_authorized_recovery_route(
-            pg_id, &command, &current,
-        )?;
+        };
+        let outcome = recovery_cluster
+            .drain_pending_metadata_command_with_authorized_recovery_source(
+                pg_id,
+                &command,
+                &authorized_source,
+                &current,
+            )?;
         Ok(usize::from(outcome.is_terminal()))
     }
 

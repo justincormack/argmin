@@ -1,6 +1,78 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+fn metadata_command_finish_result_from_recovery_resolution(
+    command: &MetadataCommandEnvelope,
+    resolution: MetadataCommandRecoveryResolution,
+) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
+    let outcome = match resolution {
+        MetadataCommandRecoveryResolution::Outcome(outcome) => outcome,
+        MetadataCommandRecoveryResolution::OutcomeUnconfirmed => {
+            let id = command.id();
+            return Err(StoreError::MetadataCommandOutcomeUnconfirmed {
+                pg_id: id.pg_id().get(),
+                cluster_epoch: id.cluster_epoch(),
+                log_index: id.log_index().get(),
+            }
+            .into());
+        }
+        MetadataCommandRecoveryResolution::IrrevocableConvergencePending => {
+            let id = command.id();
+            return Err(StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: id.pg_id().get(),
+                cluster_epoch: id.cluster_epoch(),
+                log_index: id.log_index().get(),
+            }
+            .into());
+        }
+    };
+    Ok(match outcome {
+        PendingMetadataCommandOutcome::Applied => FinishPendingMetadataCommandResult::Applied,
+        PendingMetadataCommandOutcome::PublishedPendingRecovery => {
+            FinishPendingMetadataCommandResult::PublishedPendingRecovery
+        }
+        PendingMetadataCommandOutcome::Abandoned => FinishPendingMetadataCommandResult::Abandoned,
+        PendingMetadataCommandOutcome::TerminalCleanupPending { applied } => {
+            FinishPendingMetadataCommandResult::TerminalCleanupPending { applied }
+        }
+        PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+            FinishPendingMetadataCommandResult::RetryPartialExactConflict
+        }
+    })
+}
+
+fn metadata_command_recovery_outcome_from_finish_result(
+    outcome: FinishPendingMetadataCommandResult,
+) -> PendingMetadataCommandOutcome {
+    match outcome {
+        FinishPendingMetadataCommandResult::Applied => PendingMetadataCommandOutcome::Applied,
+        FinishPendingMetadataCommandResult::PublishedPendingRecovery => {
+            PendingMetadataCommandOutcome::PublishedPendingRecovery
+        }
+        FinishPendingMetadataCommandResult::Abandoned => PendingMetadataCommandOutcome::Abandoned,
+        FinishPendingMetadataCommandResult::TerminalCleanupPending { applied } => {
+            PendingMetadataCommandOutcome::TerminalCleanupPending { applied }
+        }
+        FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
+            PendingMetadataCommandOutcome::RetryPartialExactConflict
+        }
+    }
+}
+
+fn bucket_metadata_command_irreversible_resolution(
+    error: &BucketSnapshotLoadError,
+) -> Option<MetadataCommandRecoveryResolution> {
+    match error {
+        BucketSnapshotLoadError::Store(StoreError::MetadataCommandOutcomeUnconfirmed { .. }) => {
+            Some(MetadataCommandRecoveryResolution::OutcomeUnconfirmed)
+        }
+        BucketSnapshotLoadError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending { .. },
+        ) => Some(MetadataCommandRecoveryResolution::IrrevocableConvergencePending),
+        BucketSnapshotLoadError::Store(_) | BucketSnapshotLoadError::Metadata(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
@@ -405,20 +477,6 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         PendingCommandRecoveryTimeoutTestHookGuard { scope_id }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_install_pending_command_recovery_waited_hook(
-        &self,
-        hook: PendingCommandRecoveryWaitedTestHook,
-    ) -> PendingCommandRecoveryWaitedTestHookGuard {
-        let scope_id = self.metadata_command_apply_test_hook_scope_id();
-        let slot = PENDING_COMMAND_RECOVERY_WAITED_HOOKS
-            .get_or_init(|| Mutex::new(HashMap::new()));
-        slot.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(scope_id, hook);
-        PendingCommandRecoveryWaitedTestHookGuard { scope_id }
     }
 
     #[cfg(test)]
@@ -2390,7 +2448,30 @@ impl super::StorageCluster {
                         execution_route,
                         work_budget,
                         Some(&guard),
-                    )?;
+                    );
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(error)
+                            if bucket_metadata_command_irreversible_resolution(&error)
+                                .is_some() =>
+                        {
+                            command = guard.lineage_tip();
+                            guard.mark_irreversible_handoff(
+                                bucket_metadata_command_irreversible_resolution(&error)
+                                    .expect("guard requires typed irreversible uncertainty"),
+                            );
+                            guard.relinquish_for_authorized_recovery();
+                            continue;
+                        }
+                        Err(error) if guard.lineage_advanced_from(&command) => {
+                            guard.relinquish_for_authorized_recovery();
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    guard.record_outcome(metadata_command_recovery_outcome_from_finish_result(
+                        outcome,
+                    ));
                     self.emit_metadata_command_recovery_outcome_for_command(
                         pg_id,
                         &command,
@@ -2416,6 +2497,7 @@ impl super::StorageCluster {
                 MetadataCommandRecoveryAdmission::Waited {
                     wait_us,
                     lineage_tip,
+                    resolution,
                 } => {
                     command = lineage_tip;
                     policy.progress_provenance =
@@ -2426,6 +2508,12 @@ impl super::StorageCluster {
                         observability::MetadataCommandRecoveryAdmissionKind::Waited,
                         wait_us,
                     );
+                    if let Some(resolution) = resolution {
+                        return metadata_command_finish_result_from_recovery_resolution(
+                            &command,
+                            resolution,
+                        );
+                    }
                     if let Err(error) =
                         work_budget.check("metadata command recovery waiter budget exhausted")
                     {
@@ -2472,6 +2560,7 @@ impl super::StorageCluster {
                 MetadataCommandRecoveryAdmission::TimedOut {
                     wait_us,
                     lineage_tip,
+                    resolution,
                 } => {
                     command = lineage_tip;
                     policy.progress_provenance =
@@ -2487,6 +2576,27 @@ impl super::StorageCluster {
                         &command,
                         "timed_out",
                     );
+                    if let Some(resolution) = resolution {
+                        if matches!(resolution, MetadataCommandRecoveryResolution::Outcome(_)) {
+                            return metadata_command_finish_result_from_recovery_resolution(
+                                &command,
+                                resolution,
+                            );
+                        }
+                        let result = metadata_command_finish_result_from_recovery_resolution(
+                            &command,
+                            resolution,
+                        );
+                        if work_budget
+                            .sleep_after_contention(
+                                "metadata command authorized recovery handoff budget exhausted",
+                            )
+                            .is_ok()
+                        {
+                            continue;
+                        }
+                        return result;
+                    }
                     if let Err(error) = work_budget.sleep_after_contention(
                         "metadata command recovery gate retry budget exhausted",
                     ) {

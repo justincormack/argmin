@@ -2710,13 +2710,6 @@ fn identical_multipart_completions_help_partial_barrier_without_contention() {
         &pending_command,
         Arc::clone(&owner_release_selected),
     );
-    let waited_command = pending_command.clone();
-    let waited_observed = Arc::new(AtomicBool::new(false));
-    let waited_observed_for_hook = Arc::clone(&waited_observed);
-    let waited_hook =
-        cluster.test_install_pending_command_recovery_waited_hook(Arc::new(move |command| {
-            command == &waited_command && !waited_observed_for_hook.swap(true, Ordering::SeqCst)
-        }));
     let waited_cluster = Arc::clone(&cluster);
     let waited_command = pending_command.clone();
     let (waited_result_tx, waited_result_rx) = std::sync::mpsc::channel();
@@ -2741,16 +2734,14 @@ fn identical_multipart_completions_help_partial_barrier_without_contention() {
     let waited_result = waited_result_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("waited recovery did not classify its expired budget");
-    drop(waited_hook);
-    assert!(waited_observed.load(Ordering::SeqCst));
     assert_eq!(
         waited_result.unwrap(),
-        crate::cluster::PendingMetadataCommandOutcome::PublishedPendingRecovery
+        crate::cluster::PendingMetadataCommandOutcome::Applied
     );
     assert_eq!(
         cluster.test_take_metadata_command_recovery_wait_hook_observation(),
         (1, 0),
-        "owner completion after budget expiry must retain published recovery state"
+        "owner completion must return its recorded terminal outcome without fresh slot inspection"
     );
     first.join().unwrap();
     second.join().unwrap();

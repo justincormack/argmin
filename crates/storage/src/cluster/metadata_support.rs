@@ -67,9 +67,29 @@ enum ReissuePendingMetadataCommandFailure {
 }
 
 impl ReissuePendingMetadataCommandFailure {
+    #[cfg(test)]
     fn into_source(self) -> BucketSnapshotLoadError {
         match self {
             Self::DefinitelyNotReissued(source) | Self::MayHaveReissued { source, .. } => source,
+        }
+    }
+
+    fn into_recovery_handoff_error(self) -> BucketSnapshotLoadError {
+        match self {
+            Self::DefinitelyNotReissued(source) => source,
+            Self::MayHaveReissued {
+                source,
+                lineage_tip,
+            } if request_ops::metadata_command_apply_error_can_handoff_to_recovery(&source) => {
+                let id = lineage_tip.id();
+                StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                }
+                .into()
+            }
+            Self::MayHaveReissued { source, .. } => source,
         }
     }
 }
