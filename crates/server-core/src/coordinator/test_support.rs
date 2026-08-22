@@ -375,6 +375,21 @@ pub(crate) fn setup_coordinator_with_sse_c_validator(
     .unwrap()
 }
 
+pub(crate) fn setup_coordinator_with_managed_key_provider(
+    dir: &Path,
+    provider: StaticManagedKeyProvider,
+) -> Coordinator {
+    let pg_ids: Vec<u32> = (0..DEFAULT_TEST_PG_COUNT).collect();
+    let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+    Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        storage_cluster,
+        "us-east-1".to_string(),
+        None,
+        provider,
+    )
+    .unwrap()
+}
+
 pub(crate) fn open_test_storage_cluster(dir: &Path, pg_ids: &[u32]) -> Arc<StorageCluster> {
     let ec_config = EcConfig::default();
     open_test_storage_cluster_with_ec_shape(

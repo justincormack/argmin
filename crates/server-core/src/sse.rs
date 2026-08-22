@@ -6,8 +6,6 @@ use std::fmt;
 use argmin_crypto::aead::Aes256GcmKey;
 use argmin_crypto::hmac::Sha256Key;
 #[cfg(test)]
-use ring::aead;
-#[cfg(test)]
 use storage::SSE_S3_CHECKSUM_NONCE_LEN;
 use storage::{
     ObjectEncryption, ObjectEncryptionStateError, SseCustomerObjectState, SseS3ObjectState,
@@ -1200,6 +1198,105 @@ pub(crate) fn test_sse_customer_checksum_profile_fixture() -> (
 }
 
 #[cfg(test)]
+struct SseS3ChecksumProfileFixture {
+    wrapping_key_id: u32,
+    provider: StaticManagedKeyProvider,
+    dek: [u8; SSE_C_DEK_LEN],
+    wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
+    wrapped_dek: [u8; storage::SSE_S3_WRAPPED_DEK_LEN],
+    segment_nonce_prefix: [u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    segment_plaintext: &'static [u8],
+    segment_ciphertext: Vec<u8>,
+    checksum_nonce: [u8; SSE_S3_CHECKSUM_NONCE_LEN],
+    checksum: ObjectChecksumMetadata,
+    checksum_plaintext: Vec<u8>,
+    checksum_ciphertext: Vec<u8>,
+    encryption: ObjectEncryption,
+}
+
+#[cfg(test)]
+fn sse_s3_checksum_profile_fixture() -> SseS3ChecksumProfileFixture {
+    let wrapping_key_id = 7;
+    let wrapping_key = [0x11u8; 32];
+    let provider = StaticManagedKeyProvider::single(ManagedWrappingKeyConfig {
+        key_id: wrapping_key_id,
+        wrapping_key,
+    });
+    let dek = [0x22u8; SSE_C_DEK_LEN];
+    let wrap_nonce = [0x33u8; SSE_S3_WRAP_NONCE_LEN];
+    let wrapped_dek = wrap_managed_dek(
+        &wrapping_key,
+        &wrap_nonce,
+        &dek,
+        MANAGED_WRAP_AAD,
+        MANAGED_ENCRYPTION_LABEL,
+    )
+    .unwrap();
+    let segment_nonce_prefix = [0x44u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN];
+    let segment_plaintext = b"compat-sse-s3";
+    let segment_ciphertext = encrypt_segment_with_dek_and_prefix(
+        &dek,
+        &segment_nonce_prefix,
+        SseCustomerSegmentScope::object(),
+        7,
+        segment_plaintext,
+        AeadDescriptor {
+            aad: MANAGED_SEGMENT_AAD,
+            label: MANAGED_ENCRYPTION_LABEL,
+        },
+    )
+    .unwrap();
+    let checksum_nonce = [0x55u8; SSE_S3_CHECKSUM_NONCE_LEN];
+    let checksum = ObjectChecksumMetadata::new(
+        checksum::ChecksumAlgorithm::Sha256,
+        Some(checksum::ChecksumType::FullObject),
+        "0123456789abcdef".to_string(),
+    );
+    let checksum_plaintext = encode_checksum_metadata(&checksum).unwrap();
+    let checksum_ciphertext = seal_checksum_plaintext_with_dek(
+        &dek,
+        checksum_nonce,
+        checksum_plaintext.clone(),
+        MANAGED_CHECKSUM_AAD,
+        MANAGED_ENCRYPTION_LABEL,
+    )
+    .unwrap();
+    let encryption = ObjectEncryption::SseS3(
+        SseS3ObjectState::new(
+            wrapping_key_id,
+            wrap_nonce,
+            wrapped_dek,
+            segment_nonce_prefix,
+        )
+        .with_encrypted_checksum_metadata(checksum_nonce, checksum_ciphertext.clone())
+        .unwrap(),
+    );
+
+    SseS3ChecksumProfileFixture {
+        wrapping_key_id,
+        provider,
+        dek,
+        wrap_nonce,
+        wrapped_dek,
+        segment_nonce_prefix,
+        segment_plaintext,
+        segment_ciphertext,
+        checksum_nonce,
+        checksum,
+        checksum_plaintext,
+        checksum_ciphertext,
+        encryption,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_sse_s3_checksum_profile_inputs(
+) -> (StaticManagedKeyProvider, ObjectChecksumMetadata) {
+    let fixture = sse_s3_checksum_profile_fixture();
+    (fixture.provider, fixture.checksum)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::system_metadata::ObjectChecksumMetadata;
@@ -1731,29 +1828,24 @@ mod tests {
     }
 
     #[test]
-    fn sse_s3_wire_format_vectors_stay_stable() {
-        let wrapping_key = [0x11u8; 32];
-        let dek = [0x22u8; SSE_C_DEK_LEN];
-        let wrap_nonce = [0x33u8; SSE_S3_WRAP_NONCE_LEN];
-        let segment_prefix = [0x44u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN];
-        let checksum_nonce = [0x55u8; SSE_S3_CHECKSUM_NONCE_LEN];
-        let plaintext = b"compat-sse-s3";
-        let checksum = ObjectChecksumMetadata::new(
-            ChecksumAlgorithm::Sha256,
-            Some(ChecksumType::FullObject),
-            "0123456789abcdef".to_string(),
-        );
+    fn current_sse_s3_checksum_profile_matches_frozen_vector_and_requires_outer_version_bump() {
+        fn assert_authentication_failure(
+            result: Result<Option<ObjectChecksumMetadata>, ServerError>,
+        ) {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: failed to decrypt managed encryption checksum metadata"
+            );
+        }
 
-        let wrapped_dek = wrap_managed_dek(
-            &wrapping_key,
-            &wrap_nonce,
-            &dek,
-            MANAGED_WRAP_AAD,
-            MANAGED_ENCRYPTION_LABEL,
-        )
-        .unwrap();
+        assert_eq!(MANAGED_WRAP_AAD, b"argmin:sse-s3:wrap:v1");
+        assert_eq!(MANAGED_SEGMENT_AAD, b"argmin:sse-s3:segment:v1");
+        assert_eq!(MANAGED_CHECKSUM_AAD, b"argmin:sse-s3:checksum:v1");
+
+        let fixture = sse_s3_checksum_profile_fixture();
         assert_eq!(
-            wrapped_dek,
+            fixture.wrapped_dek,
             [
                 0xa6, 0xa1, 0x70, 0x64, 0xe8, 0xb0, 0x57, 0x0e, 0x90, 0x9a, 0xc9, 0x4f, 0x85, 0x09,
                 0xc1, 0x0a, 0x24, 0xea, 0x2d, 0x16, 0xa8, 0xfb, 0xa7, 0x8e, 0xda, 0x68, 0x2b, 0xa7,
@@ -1761,20 +1853,8 @@ mod tests {
                 0x91, 0xa6, 0x05, 0x0c, 0x86, 0x37,
             ]
         );
-        let segment_ciphertext = encrypt_segment_with_dek_and_prefix(
-            &dek,
-            &segment_prefix,
-            SseCustomerSegmentScope::object(),
-            7,
-            plaintext,
-            AeadDescriptor {
-                aad: MANAGED_SEGMENT_AAD,
-                label: MANAGED_ENCRYPTION_LABEL,
-            },
-        )
-        .unwrap();
         assert_eq!(
-            segment_ciphertext,
+            fixture.segment_ciphertext,
             vec![
                 0xf0, 0x05, 0xef, 0x0d, 0x52, 0xfe, 0x04, 0x8e, 0xae, 0x22, 0x79, 0xa0, 0x1a, 0x23,
                 0x8c, 0x13, 0xfe, 0x8f, 0x3a, 0x1d, 0xe6, 0xef, 0x57, 0xff, 0xf6, 0x5e, 0x4d, 0xd8,
@@ -1782,48 +1862,80 @@ mod tests {
             ]
         );
         let decrypted_segment = decrypt_segment_with_dek_and_prefix(
-            &dek,
-            &segment_prefix,
+            &fixture.dek,
+            &fixture.segment_nonce_prefix,
             SseCustomerSegmentScope::object(),
             7,
-            &segment_ciphertext,
-            plaintext.len(),
+            &fixture.segment_ciphertext,
+            fixture.segment_plaintext.len(),
             AeadDescriptor {
                 aad: MANAGED_SEGMENT_AAD,
                 label: MANAGED_ENCRYPTION_LABEL,
             },
         )
         .unwrap();
-        assert_eq!(decrypted_segment, plaintext);
+        assert_eq!(decrypted_segment, fixture.segment_plaintext);
 
-        let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &dek).unwrap();
-        let sealing_key = aead::LessSafeKey::new(unbound);
-        let mut checksum_ciphertext = encode_checksum_metadata(&checksum).unwrap();
-        sealing_key
-            .seal_in_place_append_tag(
-                aead::Nonce::assume_unique_for_key(checksum_nonce),
-                aead::Aad::from(MANAGED_CHECKSUM_AAD),
-                &mut checksum_ciphertext,
-            )
-            .unwrap();
         assert_eq!(
-            checksum_ciphertext,
+            fixture.checksum_plaintext,
+            [
+                0x01, 0x03, 0x01, 0x00, 0x10, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+                0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66,
+            ]
+        );
+        assert_eq!(
+            fixture.checksum_ciphertext,
             vec![
                 0x58, 0x11, 0xd6, 0xb2, 0xc9, 0xd6, 0xd4, 0xca, 0xd8, 0xf1, 0x56, 0xcf, 0xc3, 0xa8,
                 0x61, 0x77, 0x29, 0x03, 0xef, 0x16, 0x9a, 0xfe, 0x87, 0xaa, 0x1d, 0x39, 0x2d, 0xda,
                 0x7e, 0xf5, 0xc7, 0x5a, 0x63, 0x50, 0x28, 0x67, 0x41,
             ]
         );
-        let decrypted_checksum = decrypt_checksum_with_dek(
-            &dek,
-            &checksum_nonce,
-            &checksum_ciphertext,
-            MANAGED_CHECKSUM_AAD,
+        let ObjectEncryption::SseS3(state) = &fixture.encryption else {
+            panic!("expected SSE-S3 fixture state");
+        };
+        assert_eq!(
+            decrypt_managed_encryption_checksum(&fixture.provider, state).unwrap(),
+            Some(fixture.checksum.clone())
+        );
+
+        let make_state = |nonce, ciphertext| {
+            SseS3ObjectState::new(
+                fixture.wrapping_key_id,
+                fixture.wrap_nonce,
+                fixture.wrapped_dek,
+                fixture.segment_nonce_prefix,
+            )
+            .with_encrypted_checksum_metadata(nonce, ciphertext)
+            .unwrap()
+        };
+        let mut wrong_nonce = fixture.checksum_nonce;
+        wrong_nonce[0] ^= 1;
+        assert_authentication_failure(decrypt_managed_encryption_checksum(
+            &fixture.provider,
+            &make_state(wrong_nonce, fixture.checksum_ciphertext.clone()),
+        ));
+        assert_authentication_failure(decrypt_checksum_with_dek(
+            &fixture.dek,
+            &fixture.checksum_nonce,
+            &fixture.checksum_ciphertext,
+            b"argmin:sse-s3:checksum:v2",
             MANAGED_ENCRYPTION_LABEL,
-        )
-        .unwrap()
-        .expect("expected checksum metadata");
-        assert_eq!(decrypted_checksum, checksum);
+        ));
+
+        let mut corrupted_ciphertext = fixture.checksum_ciphertext.clone();
+        corrupted_ciphertext[0] ^= 1;
+        assert_authentication_failure(decrypt_managed_encryption_checksum(
+            &fixture.provider,
+            &make_state(fixture.checksum_nonce, corrupted_ciphertext),
+        ));
+
+        let mut corrupted_tag = fixture.checksum_ciphertext.clone();
+        *corrupted_tag.last_mut().unwrap() ^= 1;
+        assert_authentication_failure(decrypt_managed_encryption_checksum(
+            &fixture.provider,
+            &make_state(fixture.checksum_nonce, corrupted_tag),
+        ));
     }
 
     #[test]

@@ -5,7 +5,10 @@ use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
-use crate::sse::{test_sse_customer_checksum_profile_fixture, SSE_C_CUSTOMER_KEY_LEN};
+use crate::sse::{
+    test_sse_customer_checksum_profile_fixture, test_sse_s3_checksum_profile_inputs,
+    SSE_C_CUSTOMER_KEY_LEN,
+};
 use crate::system_metadata::ObjectChecksumMetadata;
 use std::sync::Arc;
 use storage::test_support::{
@@ -6468,7 +6471,7 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
 
     let stored = coord
         .storage_node()
-        .test_observe_stored_sse_customer_checksum(
+        .test_observe_stored_encrypted_checksum(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("obj"),
             put.version_id,
@@ -6592,6 +6595,153 @@ fn current_sse_c_checksum_profile_persists_through_storage_and_logical_reads() {
     ] {
         assert_eq!(visible_metadata.checksum(), Some(&expected_checksum));
     }
+}
+
+#[test]
+fn sse_s3_checksum_metadata_persists_through_put_head_get_and_copy() {
+    let (provider, expected_checksum) = test_sse_s3_checksum_profile_inputs();
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator_with_managed_key_provider(dir.path(), provider);
+    coord
+        .create_bucket_for_owner("default-owner", "source", false)
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "destination", false)
+        .unwrap();
+
+    let mut system_metadata = SystemMetadata::new();
+    system_metadata.set_checksum(
+        expected_checksum.algorithm(),
+        expected_checksum.checksum_type(),
+        expected_checksum.value().to_string(),
+    );
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::managed(ManagedEncryptionAlgorithm::Aes256),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("source", "obj", test_requester(), None),
+            data: b"fixed-profile-body",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let stored = coord
+        .storage_node()
+        .test_observe_stored_encrypted_checksum(
+            &trusted_bucket_name("source"),
+            &trusted_object_key("obj"),
+            put.version_id,
+            expected_checksum.value(),
+        )
+        .unwrap();
+    assert!(stored.has_encrypted_checksum);
+    assert!(!stored.contains_supplied_cleartext);
+
+    let head = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "source",
+                "obj",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(head.system_metadata.checksum(), Some(&expected_checksum));
+
+    let get = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "source",
+                "obj",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(get.system_metadata.checksum(), Some(&expected_checksum));
+    assert_eq!(get.body.read_all().unwrap(), b"fixed-profile-body");
+
+    let copy = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("source", "obj", None),
+            destination: object_request_with_expected_owner(
+                "destination",
+                "copy",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::managed(
+                ManagedEncryptionAlgorithm::Aes256,
+            ),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+    assert_eq!(
+        copy.managed_encryption,
+        Some(ManagedEncryptionAlgorithm::Aes256)
+    );
+
+    let copied_storage = coord
+        .storage_node()
+        .test_observe_stored_encrypted_checksum(
+            &trusted_bucket_name("destination"),
+            &trusted_object_key("copy"),
+            copy.version_id,
+            expected_checksum.value(),
+        )
+        .unwrap();
+    assert!(copied_storage.has_encrypted_checksum);
+    assert!(!copied_storage.contains_supplied_cleartext);
+    assert!(
+        coord
+            .storage_node()
+            .test_encrypted_object_states_are_distinct(
+                &trusted_bucket_name("source"),
+                &trusted_object_key("obj"),
+                put.version_id,
+                &trusted_bucket_name("destination"),
+                &trusted_object_key("copy"),
+                copy.version_id,
+            )
+            .unwrap(),
+        "CopyObject reused the source object's managed encryption state"
+    );
+
+    let copied = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "destination",
+                "copy",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(copied.system_metadata.checksum(), Some(&expected_checksum));
+    assert_eq!(copied.body.read_all().unwrap(), b"fixed-profile-body");
 }
 
 #[test]

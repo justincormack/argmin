@@ -1217,16 +1217,16 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn test_observe_stored_sse_customer_checksum(
+    pub(crate) fn test_observe_stored_encrypted_checksum(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
         cleartext_checksum: &str,
-    ) -> Result<crate::TestStoredSseCustomerChecksumObservation, ObjectPgActionError> {
+    ) -> Result<crate::TestStoredEncryptedChecksumObservation, ObjectPgActionError> {
         if cleartext_checksum.is_empty() {
             return Err(ObjectPgActionError::InvalidRequest {
-                reason: "SSE-C checksum observation requires a nonempty cleartext value"
+                reason: "encrypted checksum observation requires a nonempty cleartext value"
                     .to_string(),
             });
         }
@@ -1234,12 +1234,18 @@ impl super::StorageCluster {
         let live = stored
             .as_live()
             .ok_or_else(|| ObjectPgActionError::InvalidRequest {
-                reason: "selected SSE-C checksum observation is not a live object".to_string(),
+                reason: "selected encrypted checksum observation is not a live object".to_string(),
             })?;
-        let ObjectEncryption::SseCustomer(encryption) = &live.encryption else {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "selected checksum observation is not SSE-C encrypted".to_string(),
-            });
+        let encrypted_checksum_metadata = match &live.encryption {
+            ObjectEncryption::SseCustomer(encryption) => {
+                encryption.encrypted_checksum_metadata()
+            }
+            ObjectEncryption::SseS3(encryption) => encryption.encrypted_checksum_metadata(),
+            ObjectEncryption::None => {
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "selected checksum observation is not encrypted".to_string(),
+                });
+            }
         };
         let cleartext_checksum = cleartext_checksum.as_bytes();
         let contains_supplied_cleartext =
@@ -1249,10 +1255,42 @@ impl super::StorageCluster {
                     .windows(cleartext_checksum.len())
                     .any(|window| window == cleartext_checksum)
             });
-        Ok(crate::TestStoredSseCustomerChecksumObservation {
-            has_encrypted_checksum: !encryption.encrypted_checksum_metadata().is_empty(),
+        Ok(crate::TestStoredEncryptedChecksumObservation {
+            has_encrypted_checksum: !encrypted_checksum_metadata.is_empty(),
             contains_supplied_cleartext,
         })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_encrypted_object_states_are_distinct(
+        &self,
+        left_bucket: &BucketName,
+        left_key: &ObjectKey,
+        left_version_id: VersionId,
+        right_bucket: &BucketName,
+        right_key: &ObjectKey,
+        right_version_id: VersionId,
+    ) -> Result<bool, ObjectPgActionError> {
+        let left = self.test_get_object_version(left_bucket, left_key, left_version_id)?;
+        let right = self.test_get_object_version(right_bucket, right_key, right_version_id)?;
+        let left = left
+            .as_live()
+            .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+                reason: "left encryption-state observation is not a live object".to_string(),
+            })?;
+        let right = right
+            .as_live()
+            .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+                reason: "right encryption-state observation is not a live object".to_string(),
+            })?;
+        if matches!(left.encryption, ObjectEncryption::None)
+            || matches!(right.encryption, ObjectEncryption::None)
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "encryption-state comparison requires two encrypted objects".to_string(),
+            });
+        }
+        Ok(left.encryption != right.encryption)
     }
 
     /// Observes only whether the durable segmented-payload reclaim root exists.

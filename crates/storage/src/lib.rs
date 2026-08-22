@@ -1933,13 +1933,23 @@ pub mod test_support {
 
     /// Narrow logical and at-rest observations for committed objects.
     pub trait StorageClusterObjectTestSupport {
-        fn test_observe_stored_sse_customer_checksum(
+        fn test_observe_stored_encrypted_checksum(
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
             version_id: VersionId,
             cleartext_checksum: &str,
-        ) -> Result<TestStoredSseCustomerChecksumObservation, TestStorageFailure>;
+        ) -> Result<TestStoredEncryptedChecksumObservation, TestStorageFailure>;
+
+        fn test_encrypted_object_states_are_distinct(
+            &self,
+            left_bucket: &BucketName,
+            left_key: &ObjectKey,
+            left_version_id: VersionId,
+            right_bucket: &BucketName,
+            right_key: &ObjectKey,
+            right_version_id: VersionId,
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_delete_marker_version_has_owner(
             &self,
@@ -1959,19 +1969,40 @@ pub mod test_support {
     }
 
     impl StorageClusterObjectTestSupport for StorageCluster {
-        fn test_observe_stored_sse_customer_checksum(
+        fn test_observe_stored_encrypted_checksum(
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
             version_id: VersionId,
             cleartext_checksum: &str,
-        ) -> Result<TestStoredSseCustomerChecksumObservation, TestStorageFailure> {
-            StorageCluster::test_observe_stored_sse_customer_checksum(
+        ) -> Result<TestStoredEncryptedChecksumObservation, TestStorageFailure> {
+            StorageCluster::test_observe_stored_encrypted_checksum(
                 self,
                 bucket,
                 key,
                 version_id,
                 cleartext_checksum,
+            )
+            .map_err(TestStorageFailure::from_object_pg_action)
+        }
+
+        fn test_encrypted_object_states_are_distinct(
+            &self,
+            left_bucket: &BucketName,
+            left_key: &ObjectKey,
+            left_version_id: VersionId,
+            right_bucket: &BucketName,
+            right_key: &ObjectKey,
+            right_version_id: VersionId,
+        ) -> Result<bool, TestStorageFailure> {
+            StorageCluster::test_encrypted_object_states_are_distinct(
+                self,
+                left_bucket,
+                left_key,
+                left_version_id,
+                right_bucket,
+                right_key,
+                right_version_id,
             )
             .map_err(TestStorageFailure::from_object_pg_action)
         }
@@ -3489,11 +3520,11 @@ pub mod test_support {
         pub size: u64,
     }
 
-    /// Narrow observation of SSE-C checksum persistence for one committed
+    /// Narrow observation of encrypted checksum persistence for one committed
     /// object version.
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct TestStoredSseCustomerChecksumObservation {
+    pub struct TestStoredEncryptedChecksumObservation {
         pub has_encrypted_checksum: bool,
         pub contains_supplied_cleartext: bool,
     }
@@ -3907,7 +3938,7 @@ pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
     TestObjectPayloadRepairObservation, TestObjectPayloadSnapshot,
-    TestStoredSseCustomerChecksumObservation, TestStreamUploadPayloadSnapshot,
+    TestStoredEncryptedChecksumObservation, TestStreamUploadPayloadSnapshot,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;
