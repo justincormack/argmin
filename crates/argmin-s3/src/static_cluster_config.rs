@@ -76,6 +76,7 @@ const CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const TOPOLOGY_IDENTITY_DOMAIN: &str = "argmin-static-cluster-topology-v1";
 const PROCESS_IDENTITY_DOMAIN: &str = "argmin-static-cluster-process-identity-v1";
 const FULL_CONFIG_FINGERPRINT_DOMAIN: &str = "argmin-static-cluster-full-config-v1";
+const FULL_CONFIG_FINGERPRINT_VERSION: u32 = 1;
 const TEST_ENV_SHAPED_CONFIG: &str = "ARGMIN_TEST_ENV_SHAPED_CONFIG";
 const STATIC_CLUSTER_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
@@ -712,6 +713,26 @@ impl ValidatedStaticClusterManifest {
 
     pub(crate) fn full_config_fingerprint(&self) -> &str {
         &self.full_config_fingerprint
+    }
+
+    pub(crate) fn validation_success_output(
+        &self,
+        material: &ResolvedStaticClusterMaterial,
+    ) -> String {
+        format!(
+            "valid cluster configuration cluster_id={} topology_generation={} process_id={} deployment_mode={} topology_digest={} process_identity_digest={} full_config_fingerprint_version={} full_config_fingerprint={} auth_credentials={} tls_identities={} tls_trust_bundles={}",
+            self.cluster_id(),
+            self.topology_generation(),
+            self.selected_process_id(),
+            self.deployment_mode(),
+            self.topology_digest(),
+            self.process_identity_digest(),
+            FULL_CONFIG_FINGERPRINT_VERSION,
+            self.full_config_fingerprint(),
+            material.auth_credential_count(),
+            material.tls_identity_count(),
+            material.tls_trust_bundle_count()
+        )
     }
 
     pub(crate) fn resolve_selected_process_material(
@@ -8954,12 +8975,10 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
             (
                 standalone.topology_digest(),
                 standalone.process_identity_digest(),
-                standalone.full_config_fingerprint(),
             ),
             (
                 "ce30e19d641d6c43b6b2ee4da53c2a98e6a9e1966b6d157bf4542e7ea21e5a54",
                 "603ad39045e499b35843ed647010738665bf478d2d204af57df1337f38f4bf07",
-                "eba1830e2f4d9e50ce05dbba6a439e9384381545cbd91de817fd7b7d654e59dc",
             )
         );
 
@@ -8969,12 +8988,51 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
             (
                 replicated.topology_digest(),
                 replicated.process_identity_digest(),
-                replicated.full_config_fingerprint(),
             ),
             (
                 "0d32b6801cdf4a4a37e9b8f294ed5d1f0e118edfccb6a6f5825e6f45962825ae",
                 "720ce6f51baf0752837a5250b5921c1dca2e4baff69b6c7ef4b1d7c4d5c62193",
-                "8c5289c878434b3a0688e4e6fcce6d207f50cb06ee91a4c5194aa6afa492ba32",
+            )
+        );
+    }
+
+    #[test]
+    fn current_static_full_config_fingerprint_matches_frozen_versioned_manifest_and_requires_version_bump(
+    ) {
+        assert_eq!(FULL_CONFIG_FINGERPRINT_VERSION, 1);
+        assert_eq!(
+            FULL_CONFIG_FINGERPRINT_DOMAIN,
+            "argmin-static-cluster-full-config-v1"
+        );
+
+        let standalone = parse_static_cluster_manifest(&standalone_manifest(), "all-1").unwrap();
+        let replicated =
+            parse_static_cluster_manifest(&replicated_manifest(), "control-2").unwrap();
+        assert_eq!(
+            standalone.full_config_fingerprint(),
+            "eba1830e2f4d9e50ce05dbba6a439e9384381545cbd91de817fd7b7d654e59dc"
+        );
+        assert_eq!(
+            replicated.full_config_fingerprint(),
+            "8c5289c878434b3a0688e4e6fcce6d207f50cb06ee91a4c5194aa6afa492ba32"
+        );
+
+        let material = ResolvedStaticClusterMaterial {
+            auth_credentials: Vec::new(),
+            tls_identities: BTreeMap::new(),
+            tls_trust_bundles: BTreeMap::new(),
+            s3: None,
+        };
+        assert_eq!(
+            standalone.validation_success_output(&material),
+            concat!(
+                "valid cluster configuration cluster_id=test-cluster ",
+                "topology_generation=1 process_id=all-1 deployment_mode=standalone ",
+                "topology_digest=ce30e19d641d6c43b6b2ee4da53c2a98e6a9e1966b6d157bf4542e7ea21e5a54 ",
+                "process_identity_digest=603ad39045e499b35843ed647010738665bf478d2d204af57df1337f38f4bf07 ",
+                "full_config_fingerprint_version=1 ",
+                "full_config_fingerprint=eba1830e2f4d9e50ce05dbba6a439e9384381545cbd91de817fd7b7d654e59dc ",
+                "auth_credentials=0 tls_identities=0 tls_trust_bundles=0"
             )
         );
     }

@@ -440,19 +440,7 @@ fn run_control_plane_admin_command(mut args: impl Iterator<Item = OsString>) -> 
             static_cluster_config::validate_static_cluster_configuration_from_environment();
         return match validation {
             Ok((manifest, material)) => {
-                println!(
-                    "valid cluster configuration cluster_id={} topology_generation={} process_id={} deployment_mode={} topology_digest={} process_identity_digest={} full_config_fingerprint={} auth_credentials={} tls_identities={} tls_trust_bundles={}",
-                    manifest.cluster_id(),
-                    manifest.topology_generation(),
-                    manifest.selected_process_id(),
-                    manifest.deployment_mode(),
-                    manifest.topology_digest(),
-                    manifest.process_identity_digest(),
-                    manifest.full_config_fingerprint(),
-                    material.auth_credential_count(),
-                    material.tls_identity_count(),
-                    material.tls_trust_bundle_count()
-                );
+                println!("{}", manifest.validation_success_output(&material));
                 Some(0)
             }
             Err(error) => {
