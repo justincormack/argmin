@@ -86,6 +86,7 @@ use crate::durable_journal::{
     DurableJournalAppendError, DurableJournalFile, DurableJournalFormat, DurableJournalIoContexts,
     DurableJournalObserver,
 };
+use crate::internal_tls_protocol::InternalTlsProtocol;
 use crate::static_topology::{
     StaticInitialControlPlaneTopology, UncertifiedInitialControlPlaneTopology,
 };

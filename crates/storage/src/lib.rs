@@ -48,6 +48,7 @@ pub(crate) mod data_dir;
 pub mod deadline_io;
 pub(crate) mod durable_journal;
 mod error;
+mod internal_tls_protocol;
 mod live_pg_transfer;
 mod maintenance;
 pub(crate) mod metadata_command;

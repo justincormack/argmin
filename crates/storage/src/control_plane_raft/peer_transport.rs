@@ -591,7 +591,7 @@ impl ControlPlaneRaftPeerTransportLimits {
     pub const REPLICATION_REQUIRED_APPEND_ENTRIES: usize = 64;
 }
 
-pub(crate) const CONTROL_PLANE_RAFT_TLS_ALPN: &[u8] = b"argmin-raft/1";
+pub(crate) const CONTROL_PLANE_RAFT_TLS_ALPN: &[u8] = InternalTlsProtocol::RaftPeer.alpn();
 
 impl Default for ControlPlaneRaftPeerTransportLimits {
     fn default() -> Self {
@@ -1774,6 +1774,18 @@ impl ControlPlaneRaftPeerClientEndpoint {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn tls_client_config_for_test(&self) -> Arc<rustls::ClientConfig> {
+        match &self.kind {
+            ControlPlaneRaftPeerClientEndpointKind::TlsTcp {
+                tls_client_config, ..
+            } => Arc::clone(tls_client_config),
+            ControlPlaneRaftPeerClientEndpointKind::Unix { .. } => {
+                panic!("test endpoint is not TLS/TCP")
+            }
+        }
+    }
+
     #[must_use]
     pub fn advertised_endpoint(&self) -> &str {
         &self.advertised_endpoint
@@ -2130,7 +2142,7 @@ fn exchange_tls_raft_peer_frame_after_connect(
                 )
             })?;
     }
-    if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RAFT_TLS_ALPN) {
+    if !InternalTlsProtocol::RaftPeer.is_negotiated(stream.conn.alpn_protocol()) {
         return Err(ControlPlaneRaftPeerFrameExchangeError::new(
             configured_raft_peer_exchange_context(exchange.context_prefix, "tls"),
             raft_artifact_protocol_error(

@@ -889,6 +889,25 @@ fail_with_matches \
     "Dynamic route publication and standalone durable binding must remain storage-owned and explicit; request consumers receive only StorageClusterRouteHandle, standalone representations stay opaque, and the obsolete legacy-local role cannot return" \
     "$route_authority_capability_leaks"
 
+internal_tls_protocol_leaks=$(
+    {
+        rg -n --color=never \
+            'argmin-(storage-rpc|control-plane|raft)/[0-9]+' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/src/internal_tls_protocol.rs' \
+            || true
+        rg -n --color=never \
+            'pub[[:space:]]+mod[[:space:]]+internal_tls_protocol|pub[[:space:]]+enum[[:space:]]+InternalTlsProtocol' \
+            crates/storage/src \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Internal storage, control-plane, and Raft TLS protocol identifiers and their version selection must remain private to storage's authoritative registry" \
+    "$internal_tls_protocol_leaks"
+
 test_support_api_scanner=scripts/check-storage-test-support-api.awk
 
 scan_storage_test_support_api() {

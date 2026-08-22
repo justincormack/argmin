@@ -1320,7 +1320,7 @@ fn connect_control_plane_tls_tcp(
                 ControlPlaneError::io("complete control-plane TLS client handshake", source)
             })?;
     }
-    if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RPC_TLS_ALPN) {
+    if !InternalTlsProtocol::ControlPlaneRpc.is_negotiated(stream.conn.alpn_protocol()) {
         return Err(ControlPlaneError::rpc_protocol(
             "control-plane TLS peer did not negotiate the required protocol profile".to_owned(),
         ));
@@ -6617,7 +6617,9 @@ impl ControlPlaneRpcServerListener {
                                         )
                                     })?;
                             }
-                            if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RPC_TLS_ALPN) {
+                            if !InternalTlsProtocol::ControlPlaneRpc
+                                .is_negotiated(stream.conn.alpn_protocol())
+                            {
                                 return Err(ControlPlaneError::rpc_protocol("control-plane TLS peer did not negotiate the required protocol profile".to_owned()));
                             }
                             Ok(Box::new(stream) as Box<dyn ControlPlaneRpcServerStream>)

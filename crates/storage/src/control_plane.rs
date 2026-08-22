@@ -42,6 +42,7 @@ use crate::durable_journal::{
     DurableJournalAppendError, DurableJournalFile, DurableJournalFormat, DurableJournalIoContexts,
     DurableJournalObserver,
 };
+use crate::internal_tls_protocol::InternalTlsProtocol;
 use crate::static_topology::UncertifiedInitialControlPlaneTopology;
 use crate::{
     ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
@@ -61,7 +62,7 @@ const CONTROL_PLANE_RPC_VERSION: u16 = 16;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
-const CONTROL_PLANE_RPC_TLS_ALPN: &[u8] = b"argmin-control-plane/1";
+const CONTROL_PLANE_RPC_TLS_ALPN: &[u8] = InternalTlsProtocol::ControlPlaneRpc.alpn();
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 pub const CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);

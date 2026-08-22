@@ -26,7 +26,7 @@ const METHOD: &str = "GET";
 const PATH: &str = "/benchmark/object";
 const QUERY: &str = "partNumber=1&uploadId=crypto-benchmark";
 const HOST: &str = "benchmark.s3.us-east-1.amazonaws.com";
-const STORAGE_RPC_ALPN: &[u8] = b"argmin-storage-rpc/1";
+const BENCHMARK_TLS_ALPN: &[u8] = b"argmin-crypto-bench/1";
 const SSE_SEGMENT_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
 const SSE_SEGMENT_NONCE_PREFIX: [u8; 6] = [0x42; 6];
 const SSE_SEGMENT_NONCE_SCOPE: [u8; 2] = [0; 2];
@@ -359,14 +359,14 @@ fn connected_tls_pair(
         .map_err(|error| error.to_string())?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    client_config.alpn_protocols = vec![STORAGE_RPC_ALPN.to_vec()];
+    client_config.alpn_protocols = vec![BENCHMARK_TLS_ALPN.to_vec()];
     let mut server_config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| error.to_string())?
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)
         .map_err(|error| error.to_string())?;
-    server_config.alpn_protocols = vec![STORAGE_RPC_ALPN.to_vec()];
+    server_config.alpn_protocols = vec![BENCHMARK_TLS_ALPN.to_vec()];
 
     let server_name = ServerName::try_from("localhost")
         .map_err(|error| error.to_string())?
@@ -384,8 +384,8 @@ fn connected_tls_pair(
             transfer_server_to_client(&mut server, &mut client).map_err(io_error)?;
         }
     }
-    if client.alpn_protocol() != Some(STORAGE_RPC_ALPN)
-        || server.alpn_protocol() != Some(STORAGE_RPC_ALPN)
+    if client.alpn_protocol() != Some(BENCHMARK_TLS_ALPN)
+        || server.alpn_protocol() != Some(BENCHMARK_TLS_ALPN)
     {
         return Err("benchmark TLS connection did not negotiate storage RPC ALPN".to_string());
     }
@@ -484,7 +484,7 @@ fn print_tls_connection(
     }
     println!("tls_protocol={protocol:?}");
     println!("tls_cipher_suite={:?}", cipher.suite());
-    println!("tls_alpn={}", String::from_utf8_lossy(STORAGE_RPC_ALPN));
+    println!("tls_alpn={}", String::from_utf8_lossy(BENCHMARK_TLS_ALPN));
     Ok(())
 }
 

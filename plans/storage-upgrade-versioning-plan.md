@@ -1896,7 +1896,7 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Static storage identity and initialization marker | `argmin-s3` | magic `ARGSSID\0`; identity encoding 1; the same bytes are retained in each initialized PG | Recorded: exact v1 bytes, private typed framing/field/version failures, bounded regular-file admission, and versions 0/2 rejected from both initialization markers and completed identities before PG or identity mutation |
 | Static control-plane outer identity | `argmin-s3` | magic `ARGSCPID`; identity encoding 2 with a trailing lowercase-hex SHA-256 digest | Recorded: exact established and unestablished v2 bytes, private typed integrity/framing/field/version failures, bounded regular-file admission, and correctly resealed versions 1/3 rejected through initialization, establishment, and the production Raft startup gate before authority opening or durable mutation |
 | Temporary-credential session token | `auth` | `ARGST1` envelope / version 1 | Recorded |
-| Internal TLS protocol identifiers | `storage` | storage RPC, control-plane RPC, and Raft peer ALPN `/1` identifiers | Evidence required; all three identifiers and protocol-profile constructors are owner-private and boundary-checked |
+| Internal TLS protocol identifiers | `storage` | storage RPC `argmin-storage-rpc/1`, control-plane RPC `argmin-control-plane/1`, and Raft peer `argmin-raft/1` | Recorded: one private exhaustive registry and conspicuously named exact fixture own all three identifiers; each production TLS 1.3 client/server profile negotiates its exact current value, while adjacent `/0` and `/2` peers are rejected in both directions before application framing |
 
 #### Versioned-format bump regressions
 
@@ -1913,6 +1913,24 @@ Maintain every historical entry permanently. They provide old/new rejection inpu
 and become golden upgrade inputs for durable formats if migration support is later introduced.
 Transport formats may remain current-version-only at runtime while still preserving old fixtures
 that prove unsupported versions fail before authentication-sensitive dispatch or mutation.
+
+#### Internal TLS protocol identifier evidence (2026-08-22)
+
+These three ALPN values are independently versioned transport markers. They are not configuration,
+and the protocol number does not inherit from the nested RPC frame version. Unix transports have
+no equivalent negotiation marker and remain an identical-binary protocol until one is designed.
+
+| Format | Current identifier and writer | First rejecting reader | Permanent evidence | Advancement rule |
+| --- | --- | --- | --- | --- |
+| Storage-node RPC TLS protocol | Private `InternalTlsProtocol::StorageRpc` emits exact bytes `argmin-storage-rpc/1`. The storage-owned client endpoint and server-listener profile constructors install it as their sole ALPN under TLS 1.3. | Both the client connect path and accepted server stream require the exact negotiated registry value after the handshake and before returning a stream to storage-RPC framing. Configured profiles are also rejected unless their sole offered value is the current registry value. | Recorded. The exhaustive registry fixture pins the exact identifier and complete three-protocol set. A production client/server profile handshake negotiates the current bytes. Cloned peer profiles offering adjacent `/0` and `/2` values are rejected in both client and server directions without application bytes. Existing TLS 1.2-only, profile-shape, transport, deadline, and complete RPC exchange tests remain. | Any incompatible identifier or TLS-profile semantic change advances this `/1` protocol to a new value, retains the exact current and adjacent rejection fixture append-only, and does not add fallback negotiation. The independently versioned storage-RPC frame advances only when its own grammar changes. |
+| Control-plane RPC TLS protocol | Private `InternalTlsProtocol::ControlPlaneRpc` emits exact bytes `argmin-control-plane/1`. The storage-owned logical client endpoint and role-aware server-listener constructors install it as their sole ALPN under TLS 1.3. | Client connection and server worker admission both require the exact negotiated registry value before frame read, authentication, authority confirmation, dispatch, or response publication. | Recorded. The exhaustive registry fixture pins the exact identifier. Production endpoint/listener profiles negotiate it in a real current/current handshake; adjacent `/0` and `/2` peers are rejected in both directions without application bytes. Existing missing-ALPN server admission proves the worker exits before frame authentication or authority confirmation, while complete TLS exchange and deadline/failover tests remain. | Any incompatible identifier or TLS-profile semantic change advances this `/1` protocol independently, retains current and adjacent rejection evidence, and adds no fallback negotiation. Control-plane RPC frame v16 and authentication-envelope v1 advance only for their own representation changes. |
+| Raft peer TLS protocol | Private `InternalTlsProtocol::RaftPeer` emits exact bytes `argmin-raft/1`. Storage-owned Raft peer endpoint and listener constructors install it as their sole ALPN under TLS 1.3. | The peer client rejects a noncurrent negotiation before writing the transport record; the peer server rejects it before authentication-envelope reading, OpenRaft dispatch, checkpointing, or response publication. | Recorded. The exhaustive registry fixture pins the exact identifier. Production peer client/server profiles negotiate it in a real current/current handshake; adjacent `/0` and `/2` peers are rejected in both directions without application bytes. Existing missing-ALPN client/server tests retain no-frame/no-authentication behavior and complete authenticated peer exchange coverage. | Any incompatible identifier or TLS-profile semantic change advances this `/1` protocol independently and retains current plus adjacent rejection evidence. The untagged transport record, peer RPC v3, and shared authentication envelope v1 follow their separate dependency rules unless their bytes or semantics also change. |
+
+The registry module is private and every production negotiated-ALPN comparison uses its typed
+protocol selection. The boundary gate rejects any duplicate internal identifier in another crate,
+including benchmarks, and rejects making the registry module or type public. The cryptographic
+benchmark uses its own `argmin-crypto-bench/1` identifier and therefore cannot accidentally become
+an alternate storage-RPC implementation.
 
 #### PG SQLite schema-version manifest and bump regression
 

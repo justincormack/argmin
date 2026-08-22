@@ -3156,6 +3156,31 @@ fn control_plane_raft_tls_peer_server_authenticates_dispatches_and_requires_alpn
 }
 
 #[test]
+fn raft_peer_current_and_adjacent_alpn_profiles_are_negotiated_exactly() {
+    let client_config = raft_peer_test_tls_endpoint(1).tls_client_config_for_test();
+    let listener = ControlPlaneRaftPeerServerListener::tls_tcp(
+        "peer-alpn-profile",
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        raft_peer_test_tls_certified_key(),
+        1,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let ControlPlaneRaftPeerServerListenerKind::TlsTcp {
+        tls_server_config, ..
+    } = listener.kind
+    else {
+        panic!("TLS/TCP constructor returned a Unix listener")
+    };
+
+    crate::internal_tls_protocol::assert_current_and_adjacent_profile_negotiation(
+        InternalTlsProtocol::RaftPeer,
+        client_config,
+        tls_server_config,
+    );
+}
+
+#[test]
 fn control_plane_raft_peer_policy_rejects_fresh_topology_mismatch() {
     let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
         "cluster-a",

@@ -901,7 +901,8 @@ impl ControlPlaneRaftPeerServerListener {
                                     .complete_io(&mut stream.sock)
                                     .map_err(|source| ControlPlaneError::io("complete control-plane OpenRaft TLS server handshake", source))?;
                                 }
-                                if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RAFT_TLS_ALPN)
+                                if !InternalTlsProtocol::RaftPeer
+                                    .is_negotiated(stream.conn.alpn_protocol())
                                 {
                                     return Err(ControlPlaneError::rpc_protocol("control-plane OpenRaft TLS peer did not negotiate the required protocol profile".to_owned()));
                                 }

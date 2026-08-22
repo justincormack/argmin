@@ -14,8 +14,9 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
 use crate::deadline_io::{connect_unix_stream_until, DeadlineStream};
+use crate::internal_tls_protocol::InternalTlsProtocol;
 
-pub(crate) const STORAGE_RPC_TLS_ALPN: &[u8] = b"argmin-storage-rpc/1";
+pub(crate) const STORAGE_RPC_TLS_ALPN: &[u8] = InternalTlsProtocol::StorageRpc.alpn();
 const STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT: usize = 8;
 
 pub trait StorageRpcStream: Read + Write + Send {
@@ -184,7 +185,7 @@ impl StorageRpcClientEndpoint {
         if tls_client_config.alpn_protocols != [STORAGE_RPC_TLS_ALPN] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "storage RPC TLS client must offer only argmin-storage-rpc/1 ALPN",
+                "storage RPC TLS client must offer only the current storage RPC ALPN",
             ));
         }
         Ok(Self {
@@ -419,7 +420,7 @@ pub(crate) fn validate_storage_rpc_tls_server_config(
     if config.alpn_protocols != [STORAGE_RPC_TLS_ALPN] {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "storage RPC TLS server must offer only argmin-storage-rpc/1 ALPN",
+            "storage RPC TLS server must offer only the current storage RPC ALPN",
         ));
     }
     Ok(())
@@ -724,10 +725,10 @@ fn connect_tls_tcp(
             .complete_io(&mut stream.stream.sock)
             .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
     }
-    if stream.stream.conn.alpn_protocol() != Some(STORAGE_RPC_TLS_ALPN) {
+    if !InternalTlsProtocol::StorageRpc.is_negotiated(stream.stream.conn.alpn_protocol()) {
         return Err(StorageRpcEndpointConnectFailure::internal(io::Error::new(
             io::ErrorKind::InvalidData,
-            "storage RPC TLS peer did not negotiate required argmin-storage-rpc/1 ALPN",
+            "storage RPC TLS peer did not negotiate the required protocol profile",
         )));
     }
     Ok(Box::new(stream))
@@ -765,10 +766,10 @@ pub(crate) fn accepted_tls_tcp_stream(
     while stream.stream.conn.is_handshaking() {
         stream.stream.conn.complete_io(&mut stream.stream.sock)?;
     }
-    if stream.stream.conn.alpn_protocol() != Some(STORAGE_RPC_TLS_ALPN) {
+    if !InternalTlsProtocol::StorageRpc.is_negotiated(stream.stream.conn.alpn_protocol()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "storage RPC TLS client did not negotiate required argmin-storage-rpc/1 ALPN",
+            "storage RPC TLS client did not negotiate the required protocol profile",
         ));
     }
     Ok(Box::new(stream))
@@ -843,7 +844,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("argmin-storage-rpc/1 ALPN"));
+        assert!(error.to_string().contains("current storage RPC ALPN"));
     }
 
     #[test]
@@ -864,6 +865,18 @@ mod tests {
         };
         assert_eq!(tls_client_config.alpn_protocols, [STORAGE_RPC_TLS_ALPN]);
         assert!(endpoint.is_tls_tcp());
+    }
+
+    #[test]
+    fn storage_rpc_current_and_adjacent_alpn_profiles_are_negotiated_exactly() {
+        let client = storage_rpc_tls_client_config(test_trust_roots()).unwrap();
+        let server = storage_rpc_tls_server_config(test_certified_key()).unwrap();
+
+        crate::internal_tls_protocol::assert_current_and_adjacent_profile_negotiation(
+            InternalTlsProtocol::StorageRpc,
+            client,
+            server,
+        );
     }
 
     #[test]

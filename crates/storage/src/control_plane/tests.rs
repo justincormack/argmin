@@ -1034,6 +1034,37 @@ fn control_plane_tls_tcp_endpoint_owns_protocol_profile() {
 }
 
 #[test]
+fn control_plane_rpc_current_and_adjacent_alpn_profiles_are_negotiated_exactly() {
+    let endpoint = control_plane_test_tls_endpoint("127.0.0.1:1".parse().unwrap());
+    let ControlPlaneRpcClientEndpointKind::TlsTcp {
+        tls_client_config, ..
+    } = endpoint.0
+    else {
+        panic!("TLS/TCP constructor returned a Unix endpoint")
+    };
+    let listener = ControlPlaneRpcServerListener::tls_tcp(
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+        control_plane_test_tls_certified_key(),
+        1,
+        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let ControlPlaneRpcServerListenerKind::TlsTcp {
+        tls_server_config, ..
+    } = listener.kind
+    else {
+        panic!("TLS/TCP constructor returned a Unix listener")
+    };
+
+    crate::internal_tls_protocol::assert_current_and_adjacent_profile_negotiation(
+        InternalTlsProtocol::ControlPlaneRpc,
+        tls_client_config,
+        tls_server_config,
+    );
+}
+
+#[test]
 fn control_plane_tls_tcp_endpoint_exchanges_typed_frame() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
