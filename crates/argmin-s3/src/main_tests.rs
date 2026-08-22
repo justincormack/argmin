@@ -1537,6 +1537,83 @@ mod tests {
         experimental_raft_durable_test_harness_inner(name, state_path, 1)
     }
 
+    #[test]
+    fn static_raft_startup_rejects_outer_identity_versions_before_opening_valid_durable_state() {
+        fn directory_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+            let mut paths = fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+                .into_iter()
+                .map(|path| {
+                    let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                    let bytes = fs::read(path).unwrap();
+                    (relative, bytes)
+                })
+                .collect()
+        }
+
+        for version in [1, 3] {
+            let temp = test_util::tempdir();
+            let state_path = temp.path().join("control-plane.state");
+            let static_identity = ConfiguredStaticClusterIdentity {
+                cluster_id: format!("static-identity-version-{version}"),
+                topology_generation: 1,
+                topology_digest: "a".repeat(64),
+                process_id: "control-1".to_string(),
+                process_identity_digest: "b".repeat(64),
+            };
+            static_cluster_state::initialize_static_control_plane_identity(
+                &static_identity,
+                1,
+                &state_path,
+            )
+            .unwrap();
+            let harness = experimental_raft_durable_test_harness(
+                &format!("static-outer-identity-version-{version}"),
+                &state_path,
+            );
+            harness.shutdown();
+            static_cluster_state::mark_static_control_plane_identity_established(
+                &static_identity,
+                1,
+                &state_path,
+            )
+            .unwrap();
+            static_cluster_state::test_rewrite_static_control_plane_identity_version(
+                &state_path,
+                version,
+            );
+            let before = directory_snapshot(temp.path());
+
+            let mut config = test_server_config();
+            config.static_cluster_identity = Some(static_identity);
+            let authority_opened = std::cell::Cell::new(false);
+            let listeners_bound = std::cell::Cell::new(false);
+            let error = prepare_static_raft_authority_before_listener_publication(
+                &config,
+                1,
+                &state_path,
+                |_| {
+                    authority_opened.set(true);
+                    Ok(())
+                },
+                || {
+                    listeners_bound.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+            assert!(error.contains(&format!("unsupported version {version}")));
+            assert!(!authority_opened.get());
+            assert!(!listeners_bound.get());
+            assert_eq!(directory_snapshot(temp.path()), before);
+        }
+    }
+
     fn experimental_raft_durable_test_harness_inner(
         name: &str,
         state_path: &Path,

@@ -1875,20 +1875,6 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             std::process::exit(1);
         });
     let node_id: ControlPlaneRaftNodeId = config.control_plane_raft_node_id.unwrap_or(1);
-    let static_cluster_identity_established =
-        if let Some(identity) = &config.static_cluster_identity {
-            static_cluster_state::bind_static_control_plane_identity(
-                identity,
-                node_id,
-                Path::new(state_path),
-            )
-            .unwrap_or_else(|error| {
-                eprintln!("failed to bind static control-plane identity: {error}");
-                std::process::exit(1);
-            })
-        } else {
-            false
-        };
     let recovery_socket_path = config
         .control_plane_clock_recovery_socket_path
         .as_deref()
@@ -1914,28 +1900,33 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .static_cluster_identity
         .as_ref()
         .map(|identity| StaticRaftOuterIdentityPublisher { identity, node_id });
-    let outer_identity = match outer_identity_publisher.as_ref() {
-        None => ControlPlaneRaftOuterIdentityStartup::NotConfigured,
-        Some(_) if static_cluster_identity_established => {
-            ControlPlaneRaftOuterIdentityStartup::Established
-        }
-        Some(publisher) => ControlPlaneRaftOuterIdentityStartup::Publish(publisher),
-    };
-    let prepared_authority = block_on_control_plane_raft(
-        &runtime,
-        raft_peer_bootstrap.prepare_durable_authority(
-            runtime.clone(),
+    let (prepared_authority, raft_peer_listener_inputs) =
+        prepare_static_raft_authority_before_listener_publication(
+            config,
+            node_id,
             Path::new(state_path),
-            outer_identity,
-        ),
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("failed to prepare experimental OpenRaft control-plane: {error}");
-        std::process::exit(1);
-    });
-    // Durable replay and authority validation must finish before the process
-    // publishes any inbound peer endpoint.
-    let raft_peer_listener_inputs = bind_experimental_raft_peer_listener_inputs(config)
+            |static_cluster_identity_established| {
+                let outer_identity = match outer_identity_publisher.as_ref() {
+                    None => ControlPlaneRaftOuterIdentityStartup::NotConfigured,
+                    Some(_) if static_cluster_identity_established => {
+                        ControlPlaneRaftOuterIdentityStartup::Established
+                    }
+                    Some(publisher) => ControlPlaneRaftOuterIdentityStartup::Publish(publisher),
+                };
+                block_on_control_plane_raft(
+                    &runtime,
+                    raft_peer_bootstrap.prepare_durable_authority(
+                        runtime.clone(),
+                        Path::new(state_path),
+                        outer_identity,
+                    ),
+                )
+                .map_err(|error| {
+                    format!("failed to prepare experimental OpenRaft control-plane: {error}")
+                })
+            },
+            || bind_experimental_raft_peer_listener_inputs(config),
+        )
         .unwrap_or_else(|error| {
             eprintln!("{error}");
             std::process::exit(1);
@@ -2126,6 +2117,27 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         }
         thread::sleep(config.control_plane_lease_scan_interval);
     }
+}
+
+fn prepare_static_raft_authority_before_listener_publication<Authority, Listeners>(
+    config: &ServerConfig,
+    node_id: ControlPlaneRaftNodeId,
+    state_path: &Path,
+    prepare_authority: impl FnOnce(bool) -> Result<Authority, String>,
+    bind_listeners: impl FnOnce() -> Result<Listeners, String>,
+) -> Result<(Authority, Listeners), String> {
+    let established = config
+        .static_cluster_identity
+        .as_ref()
+        .map_or(Ok(false), |identity| {
+            static_cluster_state::bind_static_control_plane_identity(identity, node_id, state_path)
+        })
+        .map_err(|error| format!("failed to bind static control-plane identity: {error}"))?;
+    // Durable replay and authority validation must finish before the process
+    // publishes any inbound peer endpoint.
+    let authority = prepare_authority(established)?;
+    let listeners = bind_listeners()?;
+    Ok((authority, listeners))
 }
 
 fn successor_heartbeat_renewal_not_before_ms(

@@ -79,13 +79,56 @@ impl From<IdentityFieldDecodeError> for StaticStorageIdentityDecodeError {
     }
 }
 
-fn control_plane_identity_field_error(error: IdentityFieldDecodeError) -> String {
-    match error {
-        IdentityFieldDecodeError::Truncated { field } => {
-            format!("static control-plane identity has truncated {field}")
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StaticControlPlaneIdentityDecodeError {
+    Truncated { field: &'static str },
+    InvalidDigest,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+    InvalidEstablishedFlag(u8),
+    InvalidField { field: &'static str },
+    TrailingData,
+}
+
+impl std::fmt::Display for StaticControlPlaneIdentityDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated { field } => {
+                write!(
+                    formatter,
+                    "static control-plane identity has truncated {field}"
+                )
+            }
+            Self::InvalidDigest => {
+                formatter.write_str("static control-plane identity has an invalid digest")
+            }
+            Self::UnknownMagic => {
+                formatter.write_str("static control-plane identity has unknown magic")
+            }
+            Self::UnsupportedVersion(version) => write!(
+                formatter,
+                "static control-plane identity has unsupported version {version}"
+            ),
+            Self::InvalidEstablishedFlag(value) => write!(
+                formatter,
+                "static control-plane identity has invalid established flag {value}"
+            ),
+            Self::InvalidField { field } => write!(
+                formatter,
+                "static control-plane identity has invalid UTF-8 in {field}"
+            ),
+            Self::TrailingData => {
+                formatter.write_str("static control-plane identity has trailing bytes")
+            }
         }
-        IdentityFieldDecodeError::InvalidUtf8 { field } => {
-            format!("static control-plane identity has invalid UTF-8 in {field}")
+    }
+}
+
+impl From<IdentityFieldDecodeError> for StaticControlPlaneIdentityDecodeError {
+    fn from(error: IdentityFieldDecodeError) -> Self {
+        match error {
+            IdentityFieldDecodeError::Truncated { field } => Self::Truncated { field },
+            IdentityFieldDecodeError::InvalidUtf8 { field } => Self::InvalidField { field },
         }
     }
 }
@@ -160,13 +203,29 @@ impl StaticControlPlaneIdentity {
         bytes.extend_from_slice(&self.topology_generation.to_be_bytes());
         bytes.extend_from_slice(&self.raft_node_id.to_be_bytes());
         bytes.push(u8::from(self.established));
-        encode_string(&mut bytes, &self.cluster_id, "cluster id")?;
-        encode_string(&mut bytes, &self.topology_digest, "topology digest")?;
-        encode_string(&mut bytes, &self.process_id, "process id")?;
+        encode_string(
+            &mut bytes,
+            &self.cluster_id,
+            "cluster id",
+            "static control-plane identity",
+        )?;
+        encode_string(
+            &mut bytes,
+            &self.topology_digest,
+            "topology digest",
+            "static control-plane identity",
+        )?;
+        encode_string(
+            &mut bytes,
+            &self.process_id,
+            "process id",
+            "static control-plane identity",
+        )?;
         encode_string(
             &mut bytes,
             &self.process_identity_digest,
             "process identity digest",
+            "static control-plane identity",
         )?;
         let digest = auth::canonical::sha256_hex(&bytes);
         bytes.extend_from_slice(digest.as_bytes());
@@ -176,61 +235,43 @@ impl StaticControlPlaneIdentity {
         Ok(bytes)
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, String> {
+    fn decode(bytes: &[u8]) -> Result<Self, StaticControlPlaneIdentityDecodeError> {
         let body_len = bytes
             .len()
             .checked_sub(CONTROL_PLANE_IDENTITY_DIGEST_BYTES)
-            .ok_or_else(|| "static control-plane identity has a truncated digest".to_string())?;
+            .ok_or(StaticControlPlaneIdentityDecodeError::Truncated { field: "digest" })?;
         let (body, actual_digest) = bytes.split_at(body_len);
         let expected_digest = auth::canonical::sha256_hex(body);
         if actual_digest != expected_digest.as_bytes() {
-            return Err("static control-plane identity has an invalid digest".to_string());
+            return Err(StaticControlPlaneIdentityDecodeError::InvalidDigest);
         }
         let mut decoder = IdentityDecoder::new(body);
-        let magic = decoder
-            .take(CONTROL_PLANE_IDENTITY_MAGIC.len(), "magic")
-            .map_err(control_plane_identity_field_error)?;
+        let magic = decoder.take(CONTROL_PLANE_IDENTITY_MAGIC.len(), "magic")?;
         if magic != CONTROL_PLANE_IDENTITY_MAGIC {
-            return Err("static control-plane identity has invalid magic".to_string());
+            return Err(StaticControlPlaneIdentityDecodeError::UnknownMagic);
         }
-        let version = decoder
-            .read_u16("version")
-            .map_err(control_plane_identity_field_error)?;
+        let version = decoder.read_u16("version")?;
         if version != CONTROL_PLANE_IDENTITY_VERSION {
-            return Err("static control-plane identity has an unsupported version".to_string());
+            return Err(StaticControlPlaneIdentityDecodeError::UnsupportedVersion(
+                version,
+            ));
         }
-        let topology_generation = decoder
-            .read_u64("topology generation")
-            .map_err(control_plane_identity_field_error)?;
-        let raft_node_id = decoder
-            .read_u64("Raft node id")
-            .map_err(control_plane_identity_field_error)?;
-        let established = match decoder
-            .take(1, "established flag")
-            .map_err(control_plane_identity_field_error)?[0]
-        {
+        let topology_generation = decoder.read_u64("topology generation")?;
+        let raft_node_id = decoder.read_u64("Raft node id")?;
+        let established_value = decoder.take(1, "established flag")?[0];
+        let established = match established_value {
             0 => false,
             1 => true,
-            _ => {
-                return Err(
-                    "static control-plane identity has an invalid established flag".to_string(),
-                );
+            value => {
+                return Err(StaticControlPlaneIdentityDecodeError::InvalidEstablishedFlag(value));
             }
         };
-        let cluster_id = decoder
-            .read_string("cluster id")
-            .map_err(control_plane_identity_field_error)?;
-        let topology_digest = decoder
-            .read_string("topology digest")
-            .map_err(control_plane_identity_field_error)?;
-        let process_id = decoder
-            .read_string("process id")
-            .map_err(control_plane_identity_field_error)?;
-        let process_identity_digest = decoder
-            .read_string("process identity digest")
-            .map_err(control_plane_identity_field_error)?;
+        let cluster_id = decoder.read_string("cluster id")?;
+        let topology_digest = decoder.read_string("topology digest")?;
+        let process_id = decoder.read_string("process id")?;
+        let process_identity_digest = decoder.read_string("process identity digest")?;
         if !decoder.is_empty() {
-            return Err("static control-plane identity has trailing bytes".to_string());
+            return Err(StaticControlPlaneIdentityDecodeError::TrailingData);
         }
         Ok(Self {
             cluster_id,
@@ -435,6 +476,18 @@ fn static_control_plane_identity_path(state_path: &Path) -> std::path::PathBuf {
     state_path.with_file_name(format!("{file_name}.static-identity"))
 }
 
+#[cfg(test)]
+pub(crate) fn test_rewrite_static_control_plane_identity_version(state_path: &Path, version: u16) {
+    let identity_path = static_control_plane_identity_path(state_path);
+    let mut bytes = fs::read(&identity_path).expect("test static identity should be readable");
+    let version_offset = CONTROL_PLANE_IDENTITY_MAGIC.len();
+    bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+    bytes.truncate(bytes.len() - CONTROL_PLANE_IDENTITY_DIGEST_BYTES);
+    let digest = auth::canonical::sha256_hex(&bytes);
+    bytes.extend_from_slice(digest.as_bytes());
+    fs::write(identity_path, bytes).expect("test static identity version should be rewritten");
+}
+
 fn publish_new_static_control_plane_identity(
     identity_path: &Path,
     identity: &StaticControlPlaneIdentity,
@@ -591,7 +644,7 @@ fn read_static_control_plane_identity(path: &Path) -> Result<StaticControlPlaneI
         CONTROL_PLANE_IDENTITY_MAX_BYTES,
         "static control-plane identity",
     )?;
-    StaticControlPlaneIdentity::decode(&bytes)
+    StaticControlPlaneIdentity::decode(&bytes).map_err(|error| error.to_string())
 }
 
 fn read_static_control_plane_identity_for_establishment(
@@ -603,8 +656,9 @@ fn read_static_control_plane_identity_for_establishment(
         "static control-plane identity",
     )
     .map_err(StaticControlPlaneIdentityEstablishmentError::from)?;
-    StaticControlPlaneIdentity::decode(&bytes)
-        .map_err(StaticControlPlaneIdentityEstablishmentError::validation)
+    StaticControlPlaneIdentity::decode(&bytes).map_err(|error| {
+        StaticControlPlaneIdentityEstablishmentError::validation(error.to_string())
+    })
 }
 
 impl StaticStorageIdentity {
@@ -625,13 +679,29 @@ impl StaticStorageIdentity {
         bytes.extend_from_slice(&STORAGE_IDENTITY_VERSION.to_be_bytes());
         bytes.extend_from_slice(&self.topology_generation.to_be_bytes());
         bytes.extend_from_slice(&self.storage_node_id.to_be_bytes());
-        encode_string(&mut bytes, &self.cluster_id, "cluster id")?;
-        encode_string(&mut bytes, &self.topology_digest, "topology digest")?;
-        encode_string(&mut bytes, &self.process_id, "process id")?;
+        encode_string(
+            &mut bytes,
+            &self.cluster_id,
+            "cluster id",
+            "static storage identity",
+        )?;
+        encode_string(
+            &mut bytes,
+            &self.topology_digest,
+            "topology digest",
+            "static storage identity",
+        )?;
+        encode_string(
+            &mut bytes,
+            &self.process_id,
+            "process id",
+            "static storage identity",
+        )?;
         encode_string(
             &mut bytes,
             &self.process_identity_digest,
             "process identity digest",
+            "static storage identity",
         )?;
         if bytes.len() > STORAGE_IDENTITY_MAX_BYTES as usize {
             return Err("static storage identity exceeds its size bound".to_string());
@@ -1299,9 +1369,14 @@ fn open_bounded_identity_file_typed(
     Ok((bytes, file))
 }
 
-fn encode_string(bytes: &mut Vec<u8>, value: &str, field: &str) -> Result<(), String> {
-    let len = u16::try_from(value.len())
-        .map_err(|_| format!("static storage identity {field} is too long"))?;
+fn encode_string(
+    bytes: &mut Vec<u8>,
+    value: &str,
+    field: &str,
+    identity_label: &str,
+) -> Result<(), String> {
+    let len =
+        u16::try_from(value.len()).map_err(|_| format!("{identity_label} {field} is too long"))?;
     bytes.extend_from_slice(&len.to_be_bytes());
     bytes.extend_from_slice(value.as_bytes());
     Ok(())
@@ -1443,9 +1518,20 @@ mod tests {
     fn replace_control_plane_identity_version(bytes: &mut Vec<u8>, version: u16) {
         let version_offset = CONTROL_PLANE_IDENTITY_MAGIC.len();
         bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+        reseal_control_plane_identity(bytes);
+    }
+
+    fn reseal_control_plane_identity(bytes: &mut Vec<u8>) {
         bytes.truncate(bytes.len() - CONTROL_PLANE_IDENTITY_DIGEST_BYTES);
         let digest = auth::canonical::sha256_hex(bytes);
         bytes.extend_from_slice(digest.as_bytes());
+    }
+
+    fn sealed_control_plane_identity_body(body: &[u8]) -> Vec<u8> {
+        let mut bytes = body.to_vec();
+        let digest = auth::canonical::sha256_hex(body);
+        bytes.extend_from_slice(digest.as_bytes());
+        bytes
     }
 
     fn replace_storage_identity_version(bytes: &mut [u8], version: u16) {
@@ -1642,7 +1728,7 @@ mod tests {
     }
 
     #[test]
-    fn static_identities_reject_unsupported_versions() {
+    fn static_storage_identity_rejects_unsupported_versions() {
         let expected = identity("storage-1", "b");
         for version in [0, STORAGE_IDENTITY_VERSION + 1] {
             let mut bytes = StaticStorageIdentity::new(&expected, 17).encode().unwrap();
@@ -1653,19 +1739,253 @@ mod tests {
                 StaticStorageIdentityDecodeError::UnsupportedVersion(version)
             );
         }
+    }
 
+    #[test]
+    fn current_static_control_plane_identity_matches_frozen_versioned_manifest_and_requires_version_bump(
+    ) {
+        assert_eq!(CONTROL_PLANE_IDENTITY_VERSION, 2);
+        let configured = ConfiguredStaticClusterIdentity {
+            cluster_id: "c".to_string(),
+            topology_generation: 2,
+            topology_digest: "990380dfc3ea9351149d81bf1886d2921fe140ef4a56b9083ca1ee9e63e63a8b"
+                .to_string(),
+            process_id: "p".to_string(),
+            process_identity_digest:
+                "a91507daf79156b816e0bc0be3f762aa44ca8a69dc06be24e4c9fc5cf0052538".to_string(),
+        };
+        const VERSION_2_UNESTABLISHED_HEX: &str = concat!(
+            "415247534350494400020000000000000002000000000000000b0000016300403939303338306466",
+            "63336561393335313134396438316266313838366432393231666531343065663461353662393038",
+            "33636131656539653633653633613862000170004061393135303764616637393135366238313665",
+            "30626330626533663736326161343463613861363964633036626532346534633966633563663030",
+            "35323533386632396566306337626362663037306231346665353261646639643536316263353631",
+            "6365343563323234656337383365613963613566616237343734303065",
+        );
+        const VERSION_2_ESTABLISHED_HEX: &str = concat!(
+            "415247534350494400020000000000000002000000000000000b0100016300403939303338306466",
+            "63336561393335313134396438316266313838366432393231666531343065663461353662393038",
+            "33636131656539653633653633613862000170004061393135303764616637393135366238313665",
+            "30626330626533663736326161343463613861363964633036626532346534633966633563663030",
+            "35323533383637353630623139303166623662313764363965613532383763663363323733323130",
+            "3364373361666234306634386539326337646666653333373161336337",
+        );
+
+        let unestablished = StaticControlPlaneIdentity::new(&configured, 11);
+        let mut established = unestablished.clone();
+        established.established = true;
+        for (identity, fixture) in [
+            (unestablished, VERSION_2_UNESTABLISHED_HEX),
+            (established, VERSION_2_ESTABLISHED_HEX),
+        ] {
+            let bytes = identity.encode().unwrap();
+            assert_eq!(hex(&bytes), fixture);
+            assert_eq!(
+                StaticControlPlaneIdentity::decode(&bytes_from_hex(fixture)),
+                Ok(identity)
+            );
+        }
+    }
+
+    #[test]
+    fn static_control_plane_identity_classifies_integrity_framing_and_field_failures() {
+        let stored_identity = StaticControlPlaneIdentity::new(&identity("control-1", "b"), 19);
+        let bytes = stored_identity.encode().unwrap();
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&[]),
+            Err(StaticControlPlaneIdentityDecodeError::Truncated { field: "digest" })
+        );
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&bytes[..CONTROL_PLANE_IDENTITY_DIGEST_BYTES - 1]),
+            Err(StaticControlPlaneIdentityDecodeError::Truncated { field: "digest" })
+        );
+
+        let mut invalid_digest = bytes.clone();
+        *invalid_digest.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&invalid_digest),
+            Err(StaticControlPlaneIdentityDecodeError::InvalidDigest)
+        );
+
+        let body_len = bytes.len() - CONTROL_PLANE_IDENTITY_DIGEST_BYTES;
+        let body = &bytes[..body_len];
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&sealed_control_plane_identity_body(
+                &body[..CONTROL_PLANE_IDENTITY_MAGIC.len() - 1]
+            )),
+            Err(StaticControlPlaneIdentityDecodeError::Truncated { field: "magic" })
+        );
+        let mut unknown_magic = bytes.clone();
+        unknown_magic[0] ^= 1;
+        reseal_control_plane_identity(&mut unknown_magic);
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&unknown_magic),
+            Err(StaticControlPlaneIdentityDecodeError::UnknownMagic)
+        );
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&sealed_control_plane_identity_body(
+                &body[..CONTROL_PLANE_IDENTITY_MAGIC.len() + 1]
+            )),
+            Err(StaticControlPlaneIdentityDecodeError::Truncated { field: "version" })
+        );
+
+        for version in [0, CONTROL_PLANE_IDENTITY_VERSION + 1] {
+            let mut unsupported = bytes.clone();
+            replace_control_plane_identity_version(&mut unsupported, version);
+            unsupported.truncate(CONTROL_PLANE_IDENTITY_MAGIC.len() + 2);
+            let unsupported = sealed_control_plane_identity_body(&unsupported);
+            assert_eq!(
+                StaticControlPlaneIdentity::decode(&unsupported),
+                Err(StaticControlPlaneIdentityDecodeError::UnsupportedVersion(
+                    version
+                ))
+            );
+        }
+
+        let established_offset = CONTROL_PLANE_IDENTITY_MAGIC.len() + 2 + 8 + 8;
+        let mut invalid_flag = bytes.clone();
+        invalid_flag[established_offset] = 2;
+        reseal_control_plane_identity(&mut invalid_flag);
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&invalid_flag),
+            Err(StaticControlPlaneIdentityDecodeError::InvalidEstablishedFlag(2))
+        );
+
+        let cluster_length_offset = established_offset + 1;
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&sealed_control_plane_identity_body(
+                &body[..cluster_length_offset + 1]
+            )),
+            Err(StaticControlPlaneIdentityDecodeError::Truncated {
+                field: "cluster id"
+            })
+        );
+        let cluster_offset = cluster_length_offset + 2;
+        let truncated_cluster_body =
+            body[..cluster_offset + stored_identity.cluster_id.len() - 1].to_vec();
+        let truncated_cluster = sealed_control_plane_identity_body(&truncated_cluster_body);
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&truncated_cluster),
+            Err(StaticControlPlaneIdentityDecodeError::Truncated {
+                field: "cluster id"
+            })
+        );
+        let mut invalid_utf8 = bytes.clone();
+        invalid_utf8[cluster_offset] = 0xff;
+        reseal_control_plane_identity(&mut invalid_utf8);
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&invalid_utf8),
+            Err(StaticControlPlaneIdentityDecodeError::InvalidField {
+                field: "cluster id"
+            })
+        );
+
+        let mut trailing_body = body.to_vec();
+        trailing_body.push(0);
+        assert_eq!(
+            StaticControlPlaneIdentity::decode(&sealed_control_plane_identity_body(&trailing_body)),
+            Err(StaticControlPlaneIdentityDecodeError::TrailingData)
+        );
+    }
+
+    #[test]
+    fn static_control_plane_identity_reader_enforces_exact_file_bound_and_regular_file_type() {
+        let configured = ConfiguredStaticClusterIdentity {
+            cluster_id: "c".repeat(796),
+            topology_generation: 7,
+            topology_digest: "a".repeat(64),
+            process_id: "p".to_string(),
+            process_identity_digest: "b".repeat(64),
+        };
+        let identity = StaticControlPlaneIdentity::new(&configured, 17);
+        let bytes = identity.encode().unwrap();
+        assert_eq!(bytes.len(), CONTROL_PLANE_IDENTITY_MAX_BYTES as usize);
+
+        let temp = test_util::tempdir();
+        let identity_path = temp.path().join("identity");
+        fs::write(&identity_path, &bytes).unwrap();
+        assert_eq!(
+            read_static_control_plane_identity(&identity_path),
+            Ok(identity)
+        );
+
+        let mut oversized = bytes;
+        oversized.push(0);
+        fs::write(&identity_path, oversized).unwrap();
+        assert_eq!(
+            read_static_control_plane_identity(&identity_path).unwrap_err(),
+            "static control-plane identity exceeds its size bound"
+        );
+
+        fs::remove_file(&identity_path).unwrap();
+        let path_bytes = CString::new(identity_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path_bytes` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+        assert!(read_static_control_plane_identity(&identity_path)
+            .unwrap_err()
+            .contains("is not a regular file"));
+    }
+
+    #[test]
+    fn static_control_plane_identity_versions_are_rejected_before_lifecycle_mutation() {
+        let expected = identity("control-1", "b");
         for version in [
             CONTROL_PLANE_IDENTITY_VERSION - 1,
             CONTROL_PLANE_IDENTITY_VERSION + 1,
         ] {
+            let initialization = test_util::tempdir();
+            let initialization_state = initialization.path().join("control.state");
+            drop(crate::acquire_control_plane_state_lock(&initialization_state).unwrap());
+            let initialization_identity = static_control_plane_identity_path(&initialization_state);
             let mut bytes = StaticControlPlaneIdentity::new(&expected, 19)
                 .encode()
                 .unwrap();
             replace_control_plane_identity_version(&mut bytes, version);
-            assert_eq!(
-                StaticControlPlaneIdentity::decode(&bytes).unwrap_err(),
-                "static control-plane identity has an unsupported version"
-            );
+            fs::write(&initialization_identity, bytes).unwrap();
+            let before = storage_tree_snapshot(initialization.path());
+
+            let error =
+                initialize_static_control_plane_identity(&expected, 19, &initialization_state)
+                    .unwrap_err();
+            assert!(error.contains(&format!("unsupported version {version}")));
+            assert_eq!(storage_tree_snapshot(initialization.path()), before);
+
+            let establishment = test_util::tempdir();
+            let establishment_state = establishment.path().join("control.state");
+            write_control_plane_restart_set(&establishment_state);
+            let establishment_identity = static_control_plane_identity_path(&establishment_state);
+            let mut bytes = StaticControlPlaneIdentity::new(&expected, 19)
+                .encode()
+                .unwrap();
+            replace_control_plane_identity_version(&mut bytes, version);
+            fs::write(&establishment_identity, bytes).unwrap();
+            let before = storage_tree_snapshot(establishment.path());
+
+            let error =
+                mark_static_control_plane_identity_established(&expected, 19, &establishment_state)
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                StaticControlPlaneIdentityEstablishmentError::Validation(message)
+                    if message.contains(&format!("unsupported version {version}"))
+            ));
+            assert_eq!(storage_tree_snapshot(establishment.path()), before);
+
+            let startup = test_util::tempdir();
+            let startup_state = startup.path().join("control.state");
+            write_control_plane_restart_set(&startup_state);
+            let startup_identity = static_control_plane_identity_path(&startup_state);
+            let mut established = StaticControlPlaneIdentity::new(&expected, 19);
+            established.established = true;
+            let mut bytes = established.encode().unwrap();
+            replace_control_plane_identity_version(&mut bytes, version);
+            fs::write(&startup_identity, bytes).unwrap();
+            let before = storage_tree_snapshot(startup.path());
+
+            let error =
+                bind_static_control_plane_identity(&expected, 19, &startup_state).unwrap_err();
+            assert!(error.contains(&format!("unsupported version {version}")));
+            assert_eq!(storage_tree_snapshot(startup.path()), before);
         }
     }
 
