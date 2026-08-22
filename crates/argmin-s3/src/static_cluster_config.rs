@@ -77,6 +77,39 @@ const TOPOLOGY_IDENTITY_DOMAIN: &str = "argmin-static-cluster-topology-v1";
 const PROCESS_IDENTITY_DOMAIN: &str = "argmin-static-cluster-process-identity-v1";
 const FULL_CONFIG_FINGERPRINT_DOMAIN: &str = "argmin-static-cluster-full-config-v1";
 const TEST_ENV_SHAPED_CONFIG: &str = "ARGMIN_TEST_ENV_SHAPED_CONFIG";
+const STATIC_CLUSTER_MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StaticClusterManifestPreflightError {
+    InvalidToml {
+        category: &'static str,
+        span: Option<std::ops::Range<usize>>,
+    },
+    MissingSchemaVersion,
+    MalformedSchemaVersion,
+    UnsupportedSchemaVersion(u32),
+}
+
+impl fmt::Display for StaticClusterManifestPreflightError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidToml { category, span } => {
+                write!(f, "invalid cluster manifest {category}")?;
+                if let Some(span) = span {
+                    write!(f, " at bytes {}..{}", span.start, span.end)?;
+                }
+                Ok(())
+            }
+            Self::MissingSchemaVersion => f.write_str("cluster manifest schema version is missing"),
+            Self::MalformedSchemaVersion => {
+                f.write_str("cluster manifest schema version is malformed")
+            }
+            Self::UnsupportedSchemaVersion(version) => {
+                write!(f, "unsupported cluster manifest schema version {version}")
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -3886,6 +3919,7 @@ pub(crate) fn parse_static_cluster_manifest(
             CLUSTER_MANIFEST_MAX_BYTES
         ));
     }
+    preflight_static_cluster_manifest_schema(text).map_err(|error| error.to_string())?;
     let input: StaticClusterManifestInput = toml::from_str(text).map_err(|error| {
         let location = error
             .span()
@@ -3897,11 +3931,48 @@ pub(crate) fn parse_static_cluster_manifest(
     validate_static_cluster_manifest(input, process_id)
 }
 
+fn preflight_static_cluster_manifest_schema(
+    text: &str,
+) -> Result<(), StaticClusterManifestPreflightError> {
+    let document: toml::Table = toml::from_str(text).map_err(|error| {
+        if error.message().contains("duplicate key")
+            && error
+                .span()
+                .and_then(|span| text.get(span))
+                .is_some_and(is_schema_version_key)
+        {
+            StaticClusterManifestPreflightError::MalformedSchemaVersion
+        } else {
+            StaticClusterManifestPreflightError::InvalidToml {
+                category: toml_error_category(error.message()),
+                span: error.span(),
+            }
+        }
+    })?;
+    let value = document
+        .get("schema_version")
+        .ok_or(StaticClusterManifestPreflightError::MissingSchemaVersion)?;
+    let version = value
+        .as_integer()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(StaticClusterManifestPreflightError::MalformedSchemaVersion)?;
+    if version != STATIC_CLUSTER_MANIFEST_SCHEMA_VERSION {
+        return Err(StaticClusterManifestPreflightError::UnsupportedSchemaVersion(version));
+    }
+    Ok(())
+}
+
+fn is_schema_version_key(source: &str) -> bool {
+    let candidate = format!("{source} = 0");
+    toml::from_str::<toml::Table>(&candidate)
+        .is_ok_and(|table| table.len() == 1 && table.contains_key("schema_version"))
+}
+
 fn validate_static_cluster_manifest(
     mut manifest: StaticClusterManifestInput,
     process_id: &str,
 ) -> Result<ValidatedStaticClusterManifest, String> {
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != STATIC_CLUSTER_MANIFEST_SCHEMA_VERSION {
         return Err(format!(
             "unsupported cluster manifest schema version {}",
             manifest.schema_version
@@ -6342,6 +6413,43 @@ mod tests {
     }
 
     #[test]
+    fn committed_manifest_examples_and_generators_emit_the_current_schema() {
+        let dir = test_util::tempdir();
+        let manifests = [
+            (
+                "configuration guide",
+                configuration_guide_toml_example("### Replicated manifest example").to_string(),
+            ),
+            ("standalone", standalone_manifest()),
+            ("replicated", replicated_manifest()),
+            ("replicated Unix", replicated_unix_manifest()),
+            ("replicated Unix data", replicated_unix_data_manifest()),
+            ("replicated TCP data", replicated_tcp_data_manifest()),
+            (
+                "standalone mounted",
+                standalone_manifest_on_mount(dir.path()),
+            ),
+            (
+                "replicated mounted",
+                replicated_manifest_with_host_one_mounts(dir.path(), dir.path()),
+            ),
+        ];
+
+        for (name, manifest) in manifests {
+            preflight_static_cluster_manifest_schema(&manifest)
+                .unwrap_or_else(|error| panic!("{name} manifest schema: {error}"));
+            let document: toml::Table = toml::from_str(&manifest).unwrap();
+            assert_eq!(
+                document
+                    .get("schema_version")
+                    .and_then(toml::Value::as_integer),
+                Some(i64::from(STATIC_CLUSTER_MANIFEST_SCHEMA_VERSION)),
+                "{name} manifest schema"
+            );
+        }
+    }
+
+    #[test]
     fn static_cluster_manifest_rejects_unsupported_schema_versions() {
         for version in [0, 2] {
             let manifest = standalone_manifest().replacen(
@@ -6353,6 +6461,137 @@ mod tests {
                 parse_static_cluster_manifest(&manifest, "all-1").unwrap_err(),
                 format!("unsupported cluster manifest schema version {version}")
             );
+        }
+    }
+
+    #[test]
+    fn static_cluster_manifest_schema_preflight_classifies_marker_failures() {
+        for manifest in ["", "cluster = {}\n"] {
+            assert_eq!(
+                preflight_static_cluster_manifest_schema(manifest).unwrap_err(),
+                StaticClusterManifestPreflightError::MissingSchemaVersion
+            );
+        }
+
+        for marker in [
+            "schema_version = -1",
+            "schema_version = 1.0",
+            "schema_version = \"1\"",
+            "schema_version = true",
+            "schema_version = 4294967296",
+        ] {
+            assert_eq!(
+                preflight_static_cluster_manifest_schema(marker).unwrap_err(),
+                StaticClusterManifestPreflightError::MalformedSchemaVersion,
+                "unexpected classification for {marker}"
+            );
+        }
+
+        for manifest in [
+            "schema_version = 1\nschema_version = 2\n",
+            "schema_version = 1\n\"schema_version\" = 2\n",
+            "schema_version = 1\n'schema_version' = 2\n",
+            "schema_version = 1\n\"schema\\u005fversion\" = 2\n",
+        ] {
+            assert_eq!(
+                preflight_static_cluster_manifest_schema(manifest).unwrap_err(),
+                StaticClusterManifestPreflightError::MalformedSchemaVersion
+            );
+        }
+
+        for version in [0, 2] {
+            assert_eq!(
+                preflight_static_cluster_manifest_schema(&format!(
+                    "schema_version = {version}\n[deployment]\nmode = \"future-v1-mode\"\n"
+                ))
+                .unwrap_err(),
+                StaticClusterManifestPreflightError::UnsupportedSchemaVersion(version)
+            );
+        }
+    }
+
+    #[test]
+    fn static_cluster_manifest_schema_preflight_precedes_current_body_validation() {
+        for version in [0, 2] {
+            for body in [
+                "",
+                "[deployment]\nmode = \"future-v1-mode\"\n",
+                "unknown_v1_field = true\n",
+            ] {
+                let manifest = format!("schema_version = {version}\n{body}");
+                assert_eq!(
+                    parse_static_cluster_manifest(&manifest, "missing-process").unwrap_err(),
+                    format!("unsupported cluster manifest schema version {version}"),
+                    "current-body validation ran for schema version {version}: {body:?}"
+                );
+            }
+        }
+
+        assert!(
+            parse_static_cluster_manifest("schema_version = 1\n", "missing-process")
+                .unwrap_err()
+                .contains("invalid cluster manifest")
+        );
+
+        for (manifest, expected) in [
+            (
+                "cluster = {}\n",
+                "cluster manifest schema version is missing",
+            ),
+            (
+                "schema_version = \"1\"\n",
+                "cluster manifest schema version is malformed",
+            ),
+            (
+                "schema_version = 1\nschema_version = 1\n",
+                "cluster manifest schema version is malformed",
+            ),
+            (
+                "schema_version = 1\n\"schema\\u005fversion\" = 1\n",
+                "cluster manifest schema version is malformed",
+            ),
+        ] {
+            assert_eq!(
+                parse_static_cluster_manifest(manifest, "missing-process").unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_manifest_schema_stops_before_filesystem_and_material_resolution() {
+        use std::cell::Cell;
+
+        for version in [0, 2] {
+            let manifest = standalone_manifest().replacen(
+                "schema_version = 1",
+                &format!("schema_version = {version}"),
+                1,
+            );
+            let (_dir, manifest_path) = write_manifest(&manifest);
+            let environment_read = Cell::new(false);
+            let filesystem_validated = Cell::new(false);
+
+            let error = load_server_config_from_inputs_with_filesystem_validator(
+                Some(&manifest_path),
+                Some("all-1"),
+                |_| {
+                    environment_read.set(true);
+                    None
+                },
+                |_| {
+                    filesystem_validated.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                error,
+                format!("unsupported cluster manifest schema version {version}")
+            );
+            assert!(!filesystem_validated.get());
+            assert!(!environment_read.get());
         }
     }
 
