@@ -1,6 +1,6 @@
 # Internal Format Ownership, Upgrade And Versioning Plan
 
-Status: Phase 0 complete; Phase 1 containment complete; Phase 2 evidence audit in progress
+Status: Phase 0 complete; Phase 1 containment complete; Phase 2 evidence audit complete; Phase 3 deferred
 
 ## Context
 
@@ -2349,8 +2349,9 @@ Implemented evidence for the coordinated slice:
 - Read-after-write tests for objects, multipart uploads, buckets, and bucket tagging, plus unchanged
   AWS-facing tag XML and ACL response tests proving the durable split does not alter S3 behavior.
 - Exact current fixtures pin every newly advanced outer format and immediately older/newer versions
-  at each authoritative reader. Broader pre-existing evidence gaps for an outer format remain on
-  that format's own matrix row; they do not reopen an old coordinated representation.
+  at each authoritative reader. Broader pre-existing outer-format evidence gaps were tracked on
+  their owner rows and are now recorded; closing them did not reopen an old coordinated
+  representation.
 
 After the initial coordinated advancement, the inner frame is authoritative for tag/ACL payload
 syntax. A later inner-only payload change need not advance PG, command, or RPC versions when their
@@ -2393,13 +2394,13 @@ The evidence audit proceeds in this bounded order after Phase 1 containment is c
 
 1. **Complete:** storage-node TLS, topology, physical payload, maintenance workflow, control-plane
    admin, and implementation-error containment are complete and boundary-checked.
-2. **In progress:** expand each `storage` family above to one line per independently changeable
+2. **Complete:** each `storage` family above has one line per independently changeable
    format, recording its defining constant, writer, first rejecting reader, exact-current fixture,
    and unsupported-version fixtures. The metadata-command and metadata-checkpoint/canonical-state
    families, storage-node RPC/authentication, control-plane logical state/command/snapshot,
    single-authority journal hash-chain binding and durable artifacts, control-plane RPC/shared
    authentication, Raft peer transport/RPC/shared logical values, and Raft restart/sentinel/WAL
-   artifacts are recorded above.
+   artifacts, route identities, and internal TLS protocols are recorded above.
 3. **Complete:** do the same for the remaining `server-core`, `argmin-s3`, and `auth` rows, without
    exposing private constants or codecs to cross-crate tests. The shared checksum-tag and encrypted
    checksum-metadata families and the static-manifest/digest/identity family are recorded above;
@@ -2407,10 +2408,40 @@ The evidence audit proceeds in this bounded order after Phase 1 containment is c
 4. **Complete:** the two `s3-types`-owned tag/ACL text frames and the independent
    checkpoint/log-hash/state-digest carriers are implemented with their one-time coordinated
    downstream advances and repository boundary enforcement.
-5. **Complete:** the atomic checkpoint/proof/tag/ACL baseline was reviewed and verified. Continue
-   only with the remaining owner-specific gaps in the matrix. Subsequent evidence work remains
-   owner-bounded and must not add a fallback reader. The PG SQLite v3 manifest and automatic bump
-   regression are now recorded as the first such owner-specific closure.
+5. **Complete:** the atomic checkpoint/proof/tag/ACL baseline and every subsequent owner-specific
+   row were reviewed and verified. Future format work remains owner-bounded, retains the frozen
+   evidence append-only, and must not add a fallback reader before Phase 3 defines compatibility.
+
+### Phase 2 Closeout Audit (2026-08-22)
+
+The completed matrix was re-audited against every production format/version constant and its
+first rejecting reader. Every self-describing format requires its exact current marker and
+version before payload interpretation, allocation owned by the nested format, replay, dispatch,
+mutation, repair, replacement, listener publication, or serving, according to the boundary's
+recorded evidence. Untagged nested representations are named in the dependency ledger and are
+sealed by exact fixtures for every containing version rather than being accepted through an
+implicit reader version. The three internal TLS protocol identifiers are likewise exact,
+owner-private negotiated versions rather than fallback ALPN alternatives.
+
+The source audit found no production parser for an older durable, wire, identity, credential, or
+configuration representation and no missing-version default. The remaining code and terminology
+that can resemble compatibility is outside that category:
+
+- SQLite `user_version = 0` is accepted only for a database with no user schema objects and is the
+  fresh-database creation state; any nonempty unversioned database is rejected unchanged.
+- Current journal recovery accepts only a missing/empty initial file or a bounded torn final frame
+  after current headers and complete preceding records have been validated.
+- Metadata checkpoint reconstruction, endpoint fallback, and retry/failover paths select among
+  current representations and authorities; they do not decode an older format.
+- AWS lifecycle, region, policy, and signature behavior described as `legacy` remains current S3
+  compatibility behavior and is unrelated to internal upgrade compatibility.
+- Session-token key rotation accepts multiple current-format tokens sealed by configured keys; it
+  does not accept another token-envelope version.
+
+Phase 2 is therefore complete. Until Phase 3 is deliberately started, an incompatible format
+change must advance its owner version and affected containing-version vector at a commit boundary,
+preserve the prior exact evidence append-only, and continue rejecting the prior version. It must
+not introduce a compatibility decoder, migration, or default-version path.
 
 Phase 2 is complete only when every row is `Recorded`, no representation relies on an implicit
 version assumption, and the audit finds no older-version parser, default-version fallback, or
