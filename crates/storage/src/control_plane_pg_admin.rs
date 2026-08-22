@@ -351,6 +351,7 @@ pub struct ControlPlanePgAdminError {
 
 enum ControlPlanePgAdminFailure {
     Source(Box<ControlPlaneError>),
+    UnconfirmedSource(Box<ControlPlaneError>),
     Semantic(ControlPlanePgAdminFailureReason),
 }
 
@@ -361,10 +362,12 @@ enum ControlPlanePgAdminFailureReason {
 
 impl ControlPlanePgAdminError {
     fn operation(operation: &'static str, source: ControlPlaneError) -> Self {
-        Self {
-            operation,
-            failure: ControlPlanePgAdminFailure::Source(Box::new(source)),
-        }
+        let failure = if matches!(source, ControlPlaneError::RpcUnconfirmed { .. }) {
+            ControlPlanePgAdminFailure::UnconfirmedSource(Box::new(source))
+        } else {
+            ControlPlanePgAdminFailure::Source(Box::new(source))
+        };
+        Self { operation, failure }
     }
 
     fn semantic(operation: &'static str, reason: ControlPlanePgAdminFailureReason) -> Self {
@@ -394,6 +397,9 @@ impl fmt::Display for ControlPlanePgAdminError {
         write!(formatter, "control-plane PG {} failed", self.operation)?;
         match &self.failure {
             ControlPlanePgAdminFailure::Source(_source) => Ok(()),
+            ControlPlanePgAdminFailure::UnconfirmedSource(_source) => {
+                formatter.write_str(": operation outcome could not be confirmed")
+            }
             ControlPlanePgAdminFailure::Semantic(
                 ControlPlanePgAdminFailureReason::RequestedPgOmitted,
             ) => formatter.write_str(": requested PG was omitted from the scoped response"),
@@ -581,7 +587,7 @@ mod tests {
             },
         );
 
-        let ControlPlanePgAdminFailure::Source(source) = &error.failure else {
+        let ControlPlanePgAdminFailure::UnconfirmedSource(source) = &error.failure else {
             panic!("operation failure should retain its source inside storage");
         };
         assert!(matches!(
@@ -591,7 +597,10 @@ mod tests {
         ));
 
         let display = error.to_string();
-        assert_eq!(display, "control-plane PG set acting set failed");
+        assert_eq!(
+            display,
+            "control-plane PG set acting set failed: operation outcome could not be confirmed"
+        );
         assert!(!display.contains(SENSITIVE_DIAGNOSTIC));
 
         let debug = format!("{error:?}");
@@ -601,6 +610,23 @@ mod tests {
         );
         assert!(!debug.contains(SENSITIVE_DIAGNOSTIC));
         assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn admin_error_does_not_misclassify_other_private_sources_as_unconfirmed() {
+        let error = ControlPlanePgAdminError::operation(
+            "set acting set",
+            ControlPlaneError::UnknownPg { pg_id: 41 },
+        );
+
+        let ControlPlanePgAdminFailure::Source(source) = &error.failure else {
+            panic!("operation failure should retain its source inside storage");
+        };
+        assert!(matches!(
+            source.as_ref(),
+            ControlPlaneError::UnknownPg { pg_id: 41 }
+        ));
+        assert_eq!(error.to_string(), "control-plane PG set acting set failed");
     }
 
     #[test]

@@ -1956,8 +1956,11 @@ echo "== build retained route history =="
 baseline_pg_id=""
 baseline_acting_set=()
 route_acting_set_for_attempt 1 baseline_pg_id baseline_acting_set
-baseline_output="$(admin_command control-plane-set-pg-acting-set-live \
-    "$remote_run/unused.sock" "$baseline_pg_id" "${baseline_acting_set[@]}" 2>&1)"
+if ! baseline_output="$(admin_command control-plane-set-pg-acting-set-live \
+    "$remote_run/unused.sock" "$baseline_pg_id" "${baseline_acting_set[@]}" 2>&1)"; then
+    printf '%s\n' "$baseline_output" >&2
+    die "baseline route acting-set update failed for PG $baseline_pg_id"
+fi
 printf '%s\n' "$baseline_output" >&2
 if [[ "$baseline_output" =~ control-plane\ set\ PG\ [0-9]+\ acting\ set\ at\ epoch\ ([0-9]+) ]]; then
     last_route_epoch="${BASH_REMATCH[1]}"
@@ -1974,7 +1977,11 @@ while ((route_advances < retained_epochs)); do
         die "only observed $route_advances route epoch advances after $max_route_attempts attempts"
     route_acting_set_for_attempt "$route_attempts" pg_id acting_set
     print_command admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}"
-    route_output="$(admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}" 2>&1)"
+    if ! route_output="$(admin_command control-plane-set-pg-acting-set-live \
+        "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}" 2>&1)"; then
+        printf '%s\n' "$route_output" >&2
+        die "route acting-set update failed for PG $pg_id"
+    fi
     printf '%s\n' "$route_output" >&2
     if [[ "$route_output" =~ control-plane\ set\ PG\ [0-9]+\ acting\ set\ at\ epoch\ ([0-9]+) ]]; then
         route_epoch="${BASH_REMATCH[1]}"
@@ -1987,6 +1994,10 @@ while ((route_advances < retained_epochs)); do
     elif ((route_epoch < last_route_epoch)); then
         die "route epoch regressed from $last_route_epoch to $route_epoch"
     fi
+    # Keep this history generator to one in-flight peering transition. Letting
+    # the loop outrun storage heartbeats can leave dozens of unrelated PGs in
+    # Peering and turn a history-retention gate into a convergence stress test.
+    wait_pg_runtime_map_ready "$pg_id" -1 "${acting_set[@]}"
 done
 echo "retained_route_history advances=$route_advances attempts=$route_attempts final_epoch=$last_route_epoch"
 admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
