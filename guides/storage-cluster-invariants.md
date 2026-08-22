@@ -53,6 +53,13 @@ Every public `StorageCluster` operation must fit one of these classes:
   in `Degraded`, `Backfilling`, or `Inconsistent`, fail closed with typed route
   errors. Payload reads may separately use their retained-route EC
   reconstruction capability when at least `k` valid shards are reachable.
+- An exact current-epoch pending-command observation from the current Active
+  primary is recoverable without changing the PG state or global epoch. The
+  Active runtime route carries that exact recovery certificate, and later
+  mutations remain blocked by the PG pending slot until recovery converges or
+  a clean primary scan withdraws the certificate. Older-epoch pending evidence
+  still requires a retained Active historical-primary route and a current
+  Peering fence.
 - Phase 6 writes are strict. A successful write must apply to every required
   metadata acting-set replica and write every required payload shard. The local
   implementation must not acknowledge quorum writes, degraded writes, or

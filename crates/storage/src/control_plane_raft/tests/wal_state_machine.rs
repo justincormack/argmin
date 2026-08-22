@@ -138,9 +138,46 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
         ),
         (
             714,
-            "496e771c7dc786a55182d3afc7f4e351b33c51d71f7e808e706199e859fbd6af".to_owned()
+            "e8b1af25ceb9f6f9278445e8237c43ad6ec7afc24b759a051166eae0f094a547".to_owned()
         )
     );
+}
+
+#[test]
+fn control_plane_raft_wal_v2_rejects_nested_command_v16() {
+    let command = ControlPlaneCommand::SetNodeMembership {
+        node_id: NodeId::new(7),
+        membership: NodeMembershipState::Active,
+    };
+    let current = encode_control_plane_command(&command).unwrap();
+    let previous =
+        crate::control_plane_command::encode_control_plane_command_with_version_for_test(
+            &command, 16,
+        )
+        .unwrap();
+    let mut frame = ControlPlaneRaftWalFrame::new(
+        "nested-command-version-wal",
+        1,
+        ControlPlaneRaftWalRecord::Append(vec![normal_entry(3, 1, 1, command)]),
+    )
+    .encode_frame()
+    .unwrap();
+    let offsets = frame
+        .windows(current.len())
+        .enumerate()
+        .filter_map(|(offset, candidate)| (candidate == current.as_slice()).then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(offsets.len(), 1);
+    let offset = offsets[0];
+    frame[offset..offset + previous.len()].copy_from_slice(&previous);
+    refresh_raft_wal_frame_checksum(&mut frame);
+
+    let error = ControlPlaneRaftWalFrame::decode_frame(&frame).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::CommandDecode { message }
+            if message == "unsupported control-plane command version 16"
+    ));
 }
 
 #[test]
@@ -528,7 +565,7 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         (
             75,
             236,
-            "ac9bdfd9efe42cc30e03507db2cf444e5f156ebb23559385d7f5025f283a59e8".to_owned(),
+            "8aa679691b60f6aecb4d6e93fe44ef346745c117e76ad16e96c03343fca4c16b".to_owned(),
             112,
             "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62".to_owned()
         )

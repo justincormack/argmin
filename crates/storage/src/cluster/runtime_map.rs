@@ -749,7 +749,14 @@ impl StorageClusterRouteHandle {
             .find(|route| route.pg_id() == pg_id)
             .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
         let actual_recovery = current_route.pending_metadata_command_recovery();
-        if current_route.state() != PgState::Peering || actual_recovery != Some(expected_recovery) {
+        let current_active_recovery = current_route.state() == PgState::Active
+            && pending.cluster_epoch() == pg_runtime_map.cluster_epoch()
+            && current_route.primary_node_id() == reporting_node;
+        let historical_peering_recovery = current_route.state() == PgState::Peering
+            && pending.cluster_epoch() < pg_runtime_map.cluster_epoch();
+        if actual_recovery != Some(expected_recovery)
+            || (!current_active_recovery && !historical_peering_recovery)
+        {
             return Err(
                 PendingMetadataCommandRefreshRecoveryError::AuthorizationChanged {
                     pg_id: pg_id.get(),
@@ -759,45 +766,48 @@ impl StorageClusterRouteHandle {
                 },
             );
         }
-        let historical_route =
-            pg_runtime_map.reconstructed_pg_route_at_epoch(pg_id, pending.cluster_epoch())?;
-        if historical_route.state() != PgState::Active {
-            return Err(
-                PendingMetadataCommandRefreshRecoveryError::HistoricalRouteNotActive {
-                    pg_id: pg_id.get(),
-                    pending_epoch: pending.cluster_epoch(),
-                    state: historical_route.state(),
-                },
-            );
-        }
-        if historical_route.primary_node_id() != reporting_node {
-            return Err(
-                PendingMetadataCommandRefreshRecoveryError::ReportingNodeNotHistoricalPrimary {
-                    pg_id: pg_id.get(),
-                    pending_epoch: pending.cluster_epoch(),
-                    reporting_node: reporting_node.as_u32(),
-                    actual_primary: historical_route.primary_node_id().as_u32(),
-                },
-            );
-        }
-
-        let historical_runtime_map =
-            pg_runtime_map.runtime_map_at_epoch(pending.cluster_epoch())?;
+        let historical_runtime_map = if historical_peering_recovery {
+            let historical_route =
+                pg_runtime_map.reconstructed_pg_route_at_epoch(pg_id, pending.cluster_epoch())?;
+            if historical_route.state() != PgState::Active {
+                return Err(
+                    PendingMetadataCommandRefreshRecoveryError::HistoricalRouteNotActive {
+                        pg_id: pg_id.get(),
+                        pending_epoch: pending.cluster_epoch(),
+                        state: historical_route.state(),
+                    },
+                );
+            }
+            if historical_route.primary_node_id() != reporting_node {
+                return Err(
+                    PendingMetadataCommandRefreshRecoveryError::ReportingNodeNotHistoricalPrimary {
+                        pg_id: pg_id.get(),
+                        pending_epoch: pending.cluster_epoch(),
+                        reporting_node: reporting_node.as_u32(),
+                        actual_primary: historical_route.primary_node_id().as_u32(),
+                    },
+                );
+            }
+            Some(pg_runtime_map.runtime_map_at_epoch(pending.cluster_epoch())?)
+        } else {
+            None
+        };
+        let recovery_runtime_map = historical_runtime_map.as_ref().unwrap_or(&pg_runtime_map);
         let current = self.current();
         let recovery_cluster = match admission_settings {
             Some(admission_settings) => current
                 .historical_recovery_cluster_with_storage_rpc_clients(
-                    &historical_runtime_map,
+                    recovery_runtime_map,
                     admission_settings,
                 )?,
             None => {
                 let local_map = LocalClusterMap::open_runtime_map_with_existing_local_nodes(
                     &current.local_map,
-                    &historical_runtime_map,
+                    recovery_runtime_map,
                 )?;
                 StorageCluster::from_runtime_local_map(
                     Arc::new(local_map),
-                    &historical_runtime_map,
+                    recovery_runtime_map,
                 )?
             }
         };

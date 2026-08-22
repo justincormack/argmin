@@ -527,10 +527,75 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
         ),
         (
             2196,
-            "016f7d32030efc5f9c0180c3b5a42977f0d94c78e3bc8012edab7ca252601c86"
+            "9baeca4ade9c28d2fb81ccd8cca54656d6bb0d5777f22d55757be1c11313e5c9"
                 .to_string()
         )
     );
+}
+
+#[test]
+fn control_plane_raft_restart_v5_rejects_v16_commands_and_v29_state() {
+    let command = ControlPlaneCommand::SetNodeMembership {
+        node_id: NodeId::new(7),
+        membership: NodeMembershipState::Active,
+    };
+    let current_command = encode_control_plane_command(&command).unwrap();
+    let previous_command =
+        crate::control_plane_command::encode_control_plane_command_with_version_for_test(
+            &command, 16,
+        )
+        .unwrap();
+    let mut state_machine = ControlPlaneRaftStateMachine::empty();
+    let current_snapshot = state_machine.build_snapshot().unwrap().snapshot.into_inner();
+    let previous_snapshot =
+        crate::control_plane_command::reseal_control_plane_snapshot_state_version_for_test(
+            &current_snapshot,
+            29,
+        )
+        .unwrap();
+    let artifact = ControlPlaneRaftRestartArtifact {
+        cluster_name: "restart-v5-nested-version-evidence".to_owned(),
+        local_node_id: 1,
+        wal_replay_offset: 0,
+        log_store: ControlPlaneRaftLogStoreRestartArtifact {
+            entries: vec![bootstrap_membership_entry(1), normal_entry(3, 1, 1, command)],
+            ..Default::default()
+        },
+        state_machine: state_machine.export_restart_artifact(),
+    };
+    let encoded = artifact.encode_durable_artifact().unwrap();
+
+    for (current, previous, expected_message) in [
+        (
+            current_command.as_slice(),
+            previous_command.as_slice(),
+            "unsupported control-plane command version 16",
+        ),
+        (
+            current_snapshot.as_slice(),
+            previous_snapshot.as_slice(),
+            "unsupported control-plane state version 29",
+        ),
+    ] {
+        assert_eq!(current.len(), previous.len());
+        let offsets = encoded
+            .windows(current.len())
+            .enumerate()
+            .filter_map(|(offset, candidate)| (candidate == current).then_some(offset))
+            .collect::<Vec<_>>();
+        assert!(!offsets.is_empty(), "nested fixture must occur in restart v5");
+        for offset in offsets {
+            let mut unsupported = encoded.clone();
+            unsupported[offset..offset + previous.len()].copy_from_slice(previous);
+            refresh_raft_restart_artifact_checksum(&mut unsupported);
+            let error =
+                ControlPlaneRaftRestartArtifact::decode_durable_artifact(&unsupported).unwrap_err();
+            assert!(
+                error.to_string().contains(expected_message),
+                "unexpected nested restart error: {error:?}"
+            );
+        }
+    }
 }
 
 #[test]

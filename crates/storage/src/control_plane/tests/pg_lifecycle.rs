@@ -1260,14 +1260,9 @@ fn complete_pg_peering_rejects_pending_metadata_command_observation() {
     heartbeat_with_pg_proof(&mut authority, 1, 29, PgState::Peering, proof, false, 2_000);
     authority.complete_ready_pg_peerings(2_010).unwrap();
     let active_epoch = authority.snapshot().cluster_epoch();
-    let mut heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_020);
-    heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
-        pg_id: PgId::new(29),
-        state: PgState::Active,
-        metadata_proof: proof,
-        pending_metadata_command: Some(test_pending_metadata_command(active_epoch)),
-    }];
-    authority.heartbeat(heartbeat, 2_020).unwrap();
+    authority
+        .set_pg_state(PgId::new(29), PgState::Peering)
+        .unwrap();
     let mut heartbeat =
         heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_030);
     heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
@@ -1826,7 +1821,7 @@ fn complete_ready_pg_peerings_command_rejects_duplicate_pg_completion() {
 }
 
 #[test]
-fn active_primary_heartbeat_pending_command_fences_pg_for_recovery() {
+fn active_primary_pending_command_is_recoverable_without_epoch_bump() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
     let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
@@ -1881,48 +1876,19 @@ fn active_primary_heartbeat_pending_command_fences_pg_for_recovery() {
     let refresh = authority
         .refresh_node_heartbeat(pending_active, 2_020)
         .unwrap();
-    let peering_epoch = authority.snapshot().cluster_epoch();
-    assert!(peering_epoch > active_epoch);
-    assert!(!refresh.lease().serving());
+    assert_eq!(authority.snapshot().cluster_epoch(), active_epoch);
+    assert!(refresh.lease().serving());
     let route = refresh
         .runtime_map()
         .pg_routes()
         .iter()
         .find(|route| route.pg_id() == PgId::new(32))
         .unwrap();
-    assert_eq!(route.state(), PgState::Peering);
+    assert_eq!(route.state(), PgState::Active);
     assert_eq!(
         route.pending_metadata_command_recovery(),
         Some(PendingMetadataCommandRecovery::new(NodeId::new(1), pending))
     );
-    authority = reopen_file_authority(&store);
-    let pg = authority.snapshot().pg(PgId::new(32)).unwrap();
-    assert_eq!(pg.state(), PgState::Peering);
-    assert_eq!(pg.previous_primary_node_id(), Some(NodeId::new(1)));
-    assert!(authority
-        .snapshot()
-        .node(NodeId::new(1))
-        .unwrap()
-        .pg_observation(PgId::new(32))
-        .is_none());
-    assert!(authority
-        .snapshot()
-        .pending_metadata_command_recoveries()
-        .tasks()
-        .is_empty());
-
-    let restart_epoch = authority.snapshot().cluster_epoch();
-    let mut reconstructed = heartbeat_from_record(&authority, 1, restart_epoch, 2_030);
-    reconstructed.pg_observations = vec![NodePgHeartbeatObservation {
-        pg_id: PgId::new(32),
-        state: PgState::Peering,
-        metadata_proof: active_proof,
-        pending_metadata_command: Some(pending),
-    }];
-    let reconstructed = authority
-        .refresh_node_heartbeat(reconstructed, 2_030)
-        .unwrap();
-    assert_eq!(reconstructed.runtime_map().cluster_epoch(), restart_epoch);
     assert_eq!(
         authority
             .snapshot()
@@ -1933,28 +1899,35 @@ fn active_primary_heartbeat_pending_command_fences_pg_for_recovery() {
             PendingMetadataCommandRecovery::new(NodeId::new(1), pending),
         )]
     );
-    let observation = authority
+
+    // The previous scan can arrive after the pending slot was already removed.
+    // A later clean scan clears only the recovery authorization; neither scan
+    // changes the serving route or the global epoch.
+    let mut clean = heartbeat_from_record(&authority, 1, active_epoch, 2_021);
+    clean.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id: PgId::new(32),
+        state: PgState::Active,
+        metadata_proof: active_proof,
+        pending_metadata_command: None,
+    }];
+    let clean = authority.refresh_node_heartbeat(clean, 2_021).unwrap();
+    assert_eq!(authority.snapshot().cluster_epoch(), active_epoch);
+    assert!(clean.lease().serving());
+    assert_eq!(clean.runtime_map().pg_routes()[0].state(), PgState::Active);
+    assert!(clean.runtime_map().pg_routes()[0]
+        .pending_metadata_command_recovery()
+        .is_none());
+    assert!(authority
         .snapshot()
-        .node(NodeId::new(1))
-        .unwrap()
-        .pg_observation(PgId::new(32))
-        .unwrap();
-    assert_eq!(observation.state(), PgState::Peering);
-    assert_eq!(observation.observed_epoch(), restart_epoch);
-    assert_eq!(observation.pending_metadata_command(), Some(pending));
-    assert_eq!(
-        authority
-            .snapshot()
-            .reconstructed_pg_route_at_epoch(PgId::new(32), active_epoch)
-            .unwrap()
-            .state(),
-        PgState::Active
-    );
+        .pending_metadata_command_recoveries()
+        .tasks()
+        .is_empty());
+
     assert_eq!(store.load().unwrap().unwrap(), *authority.snapshot());
 }
 
 #[test]
-fn active_primary_pending_reset_fences_only_affected_pg_and_renews_node() {
+fn active_primary_pending_retains_proof_floor_and_serving_lease() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
     let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -2043,7 +2016,7 @@ fn active_primary_pending_reset_fences_only_affected_pg_and_renews_node() {
         .lease_deadline_ms()
         .unwrap();
 
-    let reset_proof = PgMetadataProof::current(2, 0x789, affected_floor.state_digest);
+    let pending_proof = affected_floor;
     let pending = test_pending_metadata_command(active_epoch);
     let mut pending_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_030);
     pending_heartbeat.requested_lease_duration_ms = 1_000;
@@ -2051,7 +2024,7 @@ fn active_primary_pending_reset_fences_only_affected_pg_and_renews_node() {
         NodePgHeartbeatObservation {
             pg_id: affected_pg,
             state: PgState::Active,
-            metadata_proof: reset_proof,
+            metadata_proof: pending_proof,
             pending_metadata_command: Some(pending),
         },
         NodePgHeartbeatObservation {
@@ -2064,10 +2037,11 @@ fn active_primary_pending_reset_fences_only_affected_pg_and_renews_node() {
     let refresh = authority
         .refresh_node_heartbeat(pending_heartbeat, 2_030)
         .unwrap();
-    assert!(!refresh.lease().serving());
+    assert!(refresh.lease().serving());
+    assert_eq!(authority.snapshot().cluster_epoch(), active_epoch);
     assert_eq!(
         authority.snapshot().pg(affected_pg).unwrap().state(),
-        PgState::Peering
+        PgState::Active
     );
     assert_eq!(
         authority.snapshot().pg(unaffected_pg).unwrap().state(),
@@ -2078,7 +2052,7 @@ fn active_primary_pending_reset_fences_only_affected_pg_and_renews_node() {
             .snapshot()
             .pg(affected_pg)
             .unwrap()
-            .peering_metadata_proof_floor(),
+            .active_metadata_proof(),
         Some(affected_floor)
     );
     assert_eq!(
@@ -2092,14 +2066,13 @@ fn active_primary_pending_reset_fences_only_affected_pg_and_renews_node() {
         )]
     );
 
-    let peering_epoch = authority.snapshot().cluster_epoch();
-    let mut acknowledged = heartbeat_from_record(&authority, 1, peering_epoch, 2_040);
+    let mut acknowledged = heartbeat_from_record(&authority, 1, active_epoch, 2_040);
     acknowledged.requested_lease_duration_ms = 1_000;
     acknowledged.pg_observations = vec![
         NodePgHeartbeatObservation {
             pg_id: affected_pg,
-            state: PgState::Peering,
-            metadata_proof: reset_proof,
+            state: PgState::Active,
+            metadata_proof: pending_proof,
             pending_metadata_command: Some(pending),
         },
         NodePgHeartbeatObservation {

@@ -8828,6 +8828,25 @@ fn validate_runtime_map_snapshot(
         let Some(recovery) = route.pending_metadata_command_recovery() else {
             continue;
         };
+        if route.state() == PgState::Active {
+            if recovery.pending().cluster_epoch() != snapshot.cluster_epoch() {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "runtime map Active route for PG {} pending command epoch {} does not match current epoch {}",
+                    route.pg_id().get(),
+                    recovery.pending().cluster_epoch().get(),
+                    snapshot.cluster_epoch().get()
+                )));
+            }
+            if recovery.reporting_node_id() != route.primary_node_id() {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "runtime map Active route for PG {} pending command recovery reporter {} is not the current primary {}",
+                    route.pg_id().get(),
+                    recovery.reporting_node_id().as_u32(),
+                    route.primary_node_id().as_u32()
+                )));
+            }
+            continue;
+        }
         if route.state() != PgState::Peering {
             return Err(ControlPlaneError::rpc_protocol(format!(
                 "runtime map route for PG {} authorizes pending command recovery while {:?}",
@@ -8837,11 +8856,11 @@ fn validate_runtime_map_snapshot(
         }
         if recovery.pending().cluster_epoch() >= snapshot.cluster_epoch() {
             return Err(ControlPlaneError::rpc_protocol(format!(
-                    "runtime map route for PG {} pending command epoch {} is not older than current epoch {}",
-                    route.pg_id().get(),
-                    recovery.pending().cluster_epoch().get(),
-                    snapshot.cluster_epoch().get()
-                )));
+                "runtime map Peering route for PG {} pending command epoch {} is not older than current epoch {}",
+                route.pg_id().get(),
+                recovery.pending().cluster_epoch().get(),
+                snapshot.cluster_epoch().get()
+            )));
         }
         let historical = snapshot
             .reconstructed_pg_route_at_epoch(route.pg_id(), recovery.pending().cluster_epoch())?;
@@ -9063,13 +9082,20 @@ fn validate_runtime_map_routes(
                 route.pg_id().get()
             )));
         }
-        if route.pending_metadata_command_recovery().is_some()
-            && (!is_current_route_set || route.state() != PgState::Peering)
-        {
-            return Err(ControlPlaneError::rpc_protocol(format!(
-                    "{label} route for PG {} has pending metadata command recovery outside a current Peering route",
+        if route.pending_metadata_command_recovery().is_some() {
+            if !is_current_route_set {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "{label} route for PG {} has pending metadata command recovery outside the current route set",
                     route.pg_id().get()
                 )));
+            }
+            if !matches!(route.state(), PgState::Active | PgState::Peering) {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "{label} route for PG {} has pending metadata command recovery while {:?}",
+                    route.pg_id().get(),
+                    route.state()
+                )));
+            }
         }
     }
     Ok(())

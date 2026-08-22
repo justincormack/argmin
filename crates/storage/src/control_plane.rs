@@ -57,7 +57,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 15;
+const CONTROL_PLANE_RPC_VERSION: u16 = 16;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -69,7 +69,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 29;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 30;
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
 const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
@@ -810,6 +810,8 @@ impl ClusterControlSnapshot {
             .lease_deadline_ms
             .expect("serving primary must have a lease deadline");
         validate_pg_primary_active_observation(self, pg_id, primary)?;
+        let pending_metadata_command_recovery =
+            self.pending_metadata_command_recovery_for_pg(record)?;
         Ok(PgRouteSnapshot {
             cluster_epoch: self.cluster_epoch,
             pg_id,
@@ -823,7 +825,7 @@ impl ClusterControlSnapshot {
             peering_metadata_transfer_destination_epoch: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
-            pending_metadata_command_recovery: None,
+            pending_metadata_command_recovery,
         })
     }
 
@@ -862,6 +864,8 @@ impl ClusterControlSnapshot {
                 cluster_epoch: self.cluster_epoch,
             });
         }
+        let pending_metadata_command_recovery =
+            self.pending_metadata_command_recovery_for_pg(record)?;
         let non_serving_route = || PgRouteSnapshot {
             cluster_epoch: self.cluster_epoch,
             pg_id,
@@ -875,7 +879,7 @@ impl ClusterControlSnapshot {
             peering_metadata_transfer_destination_epoch: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
-            pending_metadata_command_recovery: None,
+            pending_metadata_command_recovery,
         };
         let Some(primary_lease_deadline_ms) = primary_record.lease_deadline_ms else {
             return Ok(non_serving_route());
@@ -915,7 +919,7 @@ impl ClusterControlSnapshot {
             peering_metadata_transfer_destination_epoch: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
-            pending_metadata_command_recovery: None,
+            pending_metadata_command_recovery,
         })
     }
 
@@ -1011,7 +1015,7 @@ impl ClusterControlSnapshot {
         for record in self
             .pgs
             .values()
-            .filter(|record| record.state == PgState::Peering)
+            .filter(|record| matches!(record.state, PgState::Active | PgState::Peering))
         {
             match self.pending_metadata_command_recovery_for_pg(record) {
                 Ok(Some(recovery)) => tasks.push(PendingMetadataCommandRecoveryTask::new(
@@ -1103,10 +1107,8 @@ impl ClusterControlSnapshot {
             reconstruct_pg_route_from_record(self.cluster_epoch, pg_id, record, |node_id| {
                 self.nodes.contains_key(&node_id)
             })?;
-        if record.state == PgState::Peering {
-            route.pending_metadata_command_recovery =
-                self.pending_metadata_command_recovery_for_pg(record)?;
-        }
+        route.pending_metadata_command_recovery =
+            self.pending_metadata_command_recovery_for_pg(record)?;
         self.runtime_map_from_pg_routes_with_history(
             vec![route],
             self.historical_pg_routes_for_runtime_map_pg(pg_id)?,
@@ -1410,12 +1412,14 @@ impl ClusterControlSnapshot {
                 );
             }
             if let Some(recovery) = route.pending_metadata_command_recovery() {
-                add_required_historical_route_key(
-                    &mut required_keys,
-                    &mut pending_keys,
-                    recovery.pending().cluster_epoch(),
-                    route.pg_id(),
-                );
+                if recovery.pending().cluster_epoch() < route.cluster_epoch() {
+                    add_required_historical_route_key(
+                        &mut required_keys,
+                        &mut pending_keys,
+                        recovery.pending().cluster_epoch(),
+                        route.pg_id(),
+                    );
+                }
             }
         }
 
@@ -2209,9 +2213,12 @@ impl ClusterControlSnapshot {
                     && pg.active_primary == Some(node.node_id)
                     && observation.state == PgState::Active
                 {
-                    if observation.has_pending_metadata_command() {
+                    if observation
+                        .pending_metadata_command()
+                        .is_some_and(|pending| pending.cluster_epoch() != self.cluster_epoch)
+                    {
                         return Err(format!(
-                            "active primary node {} observation for PG {} has pending metadata command",
+                            "active primary node {} observation for PG {} has a non-current pending metadata command",
                             node.node_id.as_u32(),
                             observation.pg_id.get()
                         ));
@@ -2904,7 +2911,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     ));
                 }
                 validate_storage_cluster_map_history_floor(self, &heartbeat)?;
-                let pending_active_pg_observations = validate_pg_heartbeat_observations(
+                let historical_pending_active_pg_observations = validate_pg_heartbeat_observations(
                     self,
                     heartbeat.node_id,
                     &heartbeat.pg_observations,
@@ -3003,11 +3010,11 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         pg.active_metadata_transfer_imported = false;
                     }
                 }
-                if !pending_active_pg_observations.is_empty() {
+                if !historical_pending_active_pg_observations.is_empty() {
                     mark_pgs_peering_for_pg_ids(
                         &mut next_snapshot,
                         self,
-                        pending_active_pg_observations
+                        historical_pending_active_pg_observations
                             .iter()
                             .map(|observation| observation.pg_id),
                     );
@@ -3018,17 +3025,13 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         mark_pgs_peering_for_nodes(&mut next_snapshot, self, [node_id]);
                     }
                     next_snapshot.bump_epoch()?;
-                    if !pending_active_pg_observations.is_empty() {
-                        // Preserve the validated pending-command evidence across the
-                        // epoch bump that fences the old Active route. Treating it as
-                        // a Peering observation makes recovery discoverable while
-                        // preventing peering completion until the node clears it.
+                    if !historical_pending_active_pg_observations.is_empty() {
                         let current_epoch = next_snapshot.cluster_epoch;
                         let record = next_snapshot
                             .nodes
                             .get_mut(&heartbeat.node_id)
                             .expect("node record validated before heartbeat mutation");
-                        for observation in pending_active_pg_observations {
+                        for observation in historical_pending_active_pg_observations {
                             record.pg_observations.insert(
                                 observation.pg_id,
                                 NodePgObservationRecord {
@@ -8061,10 +8064,13 @@ fn validate_current_pg_observations(
                 && pg.active_primary == Some(node.node_id)
                 && observation.state == PgState::Active
             {
-                if observation.has_pending_metadata_command() {
+                if observation
+                    .pending_metadata_command()
+                    .is_some_and(|pending| pending.cluster_epoch() != current_epoch)
+                {
                     return Err(parse_error(
                         line,
-                        "active node PG observation must not have pending metadata command",
+                        "active node PG observation has a non-current pending metadata command",
                     ));
                 }
                 let Some(expected) = pg.active_metadata_proof else {
@@ -9104,7 +9110,7 @@ fn validate_pg_heartbeat_observations(
     observations: &[NodePgHeartbeatObservation],
 ) -> Result<Vec<NodePgHeartbeatObservation>, ControlPlaneError> {
     let mut observed_pgs = BTreeSet::new();
-    let mut pending_active_pg_observations = Vec::new();
+    let mut historical_pending_active_pg_observations = Vec::new();
     for observation in observations {
         if !observed_pgs.insert(observation.pg_id) {
             return Err(ControlPlaneError::DuplicatePgObservation {
@@ -9132,13 +9138,13 @@ fn validate_pg_heartbeat_observations(
                 node_id,
                 pending,
             )?;
+            if pg.state == PgState::Active && pending.cluster_epoch() < snapshot.cluster_epoch {
+                historical_pending_active_pg_observations.push(*observation);
+            }
         }
-        if pg.state == PgState::Active && observation.pending_metadata_command.is_some() {
-            pending_active_pg_observations.push(*observation);
-        }
-        // A validated pending command already requires this PG to enter
-        // Peering. Its proof may reflect partial or reissued work; retain the
-        // committed floor and require replica convergence there.
+        // Pending current-epoch work remains recoverable under the Active route.
+        // Its proof may reflect partial or reissued work, so retain the committed
+        // floor until a later heartbeat reports the terminal state without a slot.
         if pg.state == PgState::Active
             && pg.active_primary == Some(node_id)
             && observation.state == PgState::Active
@@ -9168,7 +9174,7 @@ fn validate_pg_heartbeat_observations(
             }
         }
     }
-    Ok(pending_active_pg_observations)
+    Ok(historical_pending_active_pg_observations)
 }
 
 fn validate_historical_pending_pg_heartbeat_observations(
@@ -9974,14 +9980,6 @@ fn validate_pg_primary_active_observation(
             node_id: primary.as_u32(),
             cluster_epoch: snapshot.cluster_epoch,
             state: observation.state,
-        });
-    }
-    if let Some(pending) = observation.pending_metadata_command() {
-        return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
-            pg_id: pg_id.get(),
-            node_id: primary.as_u32(),
-            cluster_epoch: snapshot.cluster_epoch,
-            pending,
         });
     }
     if !metadata_proof_satisfies_active_primary_observation_floor(

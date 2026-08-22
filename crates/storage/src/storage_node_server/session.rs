@@ -1224,17 +1224,23 @@ fn validate_process_config_route_table(
         let historical_route = config.historical_pg_routes.iter().find(|route| {
             route.pg_id == pg_id.get() && route.cluster_epoch == recovery.pending().cluster_epoch()
         });
-        if current_route.is_none_or(|route| route.state != PgState::Peering)
-            || recovery.pending().cluster_epoch() >= config.cluster_epoch
-            || historical_route.is_none_or(|route| {
-                route.state != PgState::Active
-                    || route.primary_node_id != recovery.reporting_node_id()
-            })
-        {
+        let current_active = current_route.is_some_and(|route| {
+            route.state == PgState::Active
+                && recovery.pending().cluster_epoch() == config.cluster_epoch
+                && route.primary_node_id == recovery.reporting_node_id()
+        });
+        let historical_peering = current_route.is_some_and(|route| {
+            route.state == PgState::Peering
+                && recovery.pending().cluster_epoch() < config.cluster_epoch
+        }) && historical_route.is_some_and(|route| {
+            route.state == PgState::Active
+                && route.primary_node_id == recovery.reporting_node_id()
+        });
+        if !current_active && !historical_peering {
             return Err(
                 StorageNodeServerError::InvalidPendingMetadataCommandRecovery {
                     pg_id: pg_id.get(),
-                    reason: "authorization does not reference a current Peering route and its Active historical primary".to_owned(),
+                    reason: "authorization does not reference either the current Active primary or a current Peering route and its Active historical primary".to_owned(),
                 },
             );
         }

@@ -2721,7 +2721,17 @@ fn fencing_pending_recovery_peering_preserves_imported_source_provenance() {
 
     let local_progress = PgMetadataProof::current(2, 30, 31);
     let pending = test_pending_metadata_command(active_epoch);
-    let mut pending_heartbeat = heartbeat_from_record(&authority, 2, active_epoch, 3_220);
+    authority
+        .set_pg_acting_set(PgId::new(54), vec![NodeId::new(1)])
+        .unwrap();
+    let report_epoch = authority.snapshot().cluster_epoch();
+    let mut pending_heartbeat = heartbeat_from_record(&authority, 2, report_epoch, 3_220);
+    pending_heartbeat.cluster_map_history_route_references =
+        history_route_references([PgClusterMapHistoryRouteReference::new(
+            PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
+            active_epoch,
+            pg_id,
+        )]);
     pending_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id,
         state: PgState::Active,

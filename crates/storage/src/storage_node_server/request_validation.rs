@@ -589,11 +589,17 @@ impl StorageNodeConnectionHandler {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::StaleShardLocation,
                 message: format!(
-                    "historical metadata command recovery for PG {} at epoch {} is not authorized by the current runtime map",
+                    "metadata command recovery for PG {} at epoch {} is not authorized by the current runtime map",
                     pg_id.get(),
                     cluster_epoch.get()
                 ),
             });
+        }
+        if cluster_epoch == self.config.cluster_epoch {
+            return Ok(StorageNodeRouteFence::current(
+                &self.config,
+                self.current_route_map_lease(),
+            ));
         }
         self.bounded_historical_metadata_command_fence(cluster_epoch, pg_id)
     }

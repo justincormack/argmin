@@ -236,7 +236,22 @@ fn control_plane_rpc_v14_frame_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v15_frame_encoding_is_exact() {
+fn control_plane_rpc_v15_frame_remains_rejected_evidence() {
+    const FRAME: &[u8] = &[
+        97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97, 110,
+        101, 45, 114, 112, 99, 0, 15, 0, 12, 0, 0, 0, 3, 25, 251, 193, 234, 127, 14, 74, 195, 1, 2,
+        3,
+    ];
+    let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(FRAME)).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str() == "unsupported control-plane RPC version 15"
+    ));
+}
+
+#[test]
+fn control_plane_rpc_v16_frame_encoding_is_exact() {
     let frame =
         encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
             .unwrap();
@@ -245,8 +260,8 @@ fn control_plane_rpc_v15_frame_encoding_is_exact() {
         frame,
         [
             97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
-            110, 101, 45, 114, 112, 99, 0, 15, 0, 12, 0, 0, 0, 3, 25, 251, 193, 234, 127, 14, 74,
-            195, 1, 2, 3,
+            110, 101, 45, 114, 112, 99, 0, 16, 0, 12, 0, 0, 0, 3, 168, 219, 98, 75, 82, 215, 243,
+            245, 1, 2, 3,
         ]
     );
 }
@@ -274,6 +289,7 @@ fn control_plane_rpc_frame_marker_failures_are_typed() {
 
     for version in [
         13,
+        14,
         CONTROL_PLANE_RPC_VERSION - 1,
         CONTROL_PLANE_RPC_VERSION + 1,
     ] {
@@ -1517,15 +1533,15 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         require_current_control_plane_state_version(None),
         Err(ControlPlaneStateVersionError::Missing)
     );
-    for version in [28, 30] {
+    for version in [28, 29, 31] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
             Err(ControlPlaneStateVersionError::Unsupported(version))
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(29)),
-        Ok(29)
+        require_current_control_plane_state_version(Some(30)),
+        Ok(30)
     );
 
     assert!(matches!(
@@ -1602,11 +1618,77 @@ fn canonical_control_plane_state_v28_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v29_text_is_exact() {
+fn canonical_control_plane_state_v29_text_remains_rejected_evidence() {
+    const STATE_V29: &str = concat!(
+        "version=29\n",
+        "authority_incarnation=1\n",
+        "cluster_epoch=1\n",
+        "initial_topology=-\n",
+        "max_committed_timestamp_ms=123\n",
+        "lease_grant_horizon=-\n",
+        "node=1,active,1,healthy,11,1,100,200,-,6e6f64652d312e736f636b\n",
+    );
+    assert_eq!(
+        (
+            STATE_V29.len(),
+            hex_encode(&checksum::sha256::digest(STATE_V29.as_bytes()))
+        ),
+        (
+            185,
+            "14ce3a9b2971dbf7935fcbb77c281ee140d3bb2515be01a4d63feac39bba5b46".to_owned()
+        )
+    );
+    assert!(matches!(
+        parse_snapshot(STATE_V29),
+        Err(ControlPlaneError::Parse { line: 1, message })
+            if message == "unsupported control-plane state version 29"
+    ));
+}
+
+#[test]
+fn canonical_control_plane_state_v29_representative_aggregate_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("testdata/state_v29_representative.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            4_685,
+            "eb50cb06a9ddec679a03e67fdf4a079395fc886b2ae5a328488f2b90c52efeac".to_owned()
+        )
+    );
+
+    let before = canonical_snapshot_with_node();
+    let mut remaining = AGGREGATE;
+    let mut count = 0usize;
+    while !remaining.is_empty() {
+        let (raw_len, tail) = remaining.split_at(8);
+        let len = usize::try_from(u64::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+        let (snapshot, tail) = tail.split_at(len);
+        let snapshot = std::str::from_utf8(snapshot).unwrap();
+        assert!(snapshot.starts_with("version=29\n"));
+        assert!(matches!(
+            parse_snapshot(snapshot),
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 29"
+        ));
+        assert_eq!(before, canonical_snapshot_with_node());
+        remaining = tail;
+        count += 1;
+    }
+    assert!(
+        count > 1,
+        "representative v29 aggregate must contain a corpus"
+    );
+}
+
+#[test]
+fn canonical_control_plane_state_v30_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=29\n",
+            "version=30\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -1618,7 +1700,7 @@ fn canonical_control_plane_state_v29_text_is_exact() {
 }
 
 #[test]
-fn canonical_control_plane_state_v29_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v30_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -1829,6 +1911,57 @@ fn canonical_control_plane_state_v29_representative_aggregate_is_stable() {
     authority.heartbeat(pending_heartbeat, 4_030).unwrap();
     snapshots.push(authority.snapshot().clone());
 
+    let store = FileControlPlaneStore::new(tmp.path().join("active-pending.state"));
+    let mut active_pending_authority = SingleAuthorityControlPlane::open(store).unwrap();
+    active_pending_authority
+        .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+        .unwrap();
+    assert!(heartbeat_until_serving(&mut active_pending_authority, 1, 5_000).serving());
+    let active_pending_pg_id = PgId::new(26);
+    let active_pending_proof = PgMetadataProof::current(23, 24, 25);
+    active_pending_authority
+        .set_pg_acting_set(active_pending_pg_id, vec![NodeId::new(1)])
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut active_pending_authority,
+        1,
+        active_pending_pg_id.get(),
+        PgState::Peering,
+        active_pending_proof,
+        false,
+        5_010,
+    );
+    active_pending_authority
+        .complete_pg_peering(
+            active_pending_pg_id,
+            NodeId::new(1),
+            node_incarnation(&active_pending_authority, 1),
+            5_020,
+        )
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut active_pending_authority,
+        1,
+        active_pending_pg_id.get(),
+        PgState::Active,
+        active_pending_proof,
+        false,
+        5_030,
+    );
+    let active_pending_epoch = active_pending_authority.snapshot().cluster_epoch();
+    let mut current_pending_heartbeat =
+        heartbeat_from_record(&active_pending_authority, 1, active_pending_epoch, 5_040);
+    current_pending_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id: active_pending_pg_id,
+        state: PgState::Active,
+        metadata_proof: active_pending_proof,
+        pending_metadata_command: Some(test_pending_metadata_command(active_pending_epoch)),
+    }];
+    active_pending_authority
+        .heartbeat(current_pending_heartbeat, 5_040)
+        .unwrap();
+    snapshots.push(active_pending_authority.snapshot().clone());
+
     assert!(snapshots
         .iter()
         .any(|snapshot| snapshot.initial_topology.is_some()));
@@ -1879,6 +2012,16 @@ fn canonical_control_plane_state_v29_representative_aggregate_is_stable() {
         .flat_map(|snapshot| snapshot.nodes.values())
         .flat_map(|node| node.pg_observations.values())
         .any(|observation| observation.pending_metadata_command.is_none()));
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot
+            .pg(active_pending_pg_id)
+            .is_some_and(|pg| pg.state() == PgState::Active)
+            && snapshot
+                .node(NodeId::new(1))
+                .and_then(|node| node.pg_observations.get(&active_pending_pg_id))
+                .and_then(|observation| observation.pending_metadata_command.as_ref())
+                .is_some_and(|pending| pending.cluster_epoch() == snapshot.cluster_epoch())
+    }));
     for kind in [
         PgClusterMapHistoryRouteReferenceKind::LivePlacement,
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
@@ -1904,7 +2047,7 @@ fn canonical_control_plane_state_v29_representative_aggregate_is_stable() {
         aggregate_text.push_str(&formatted);
     }
     for required_record in [
-        "version=29\n",
+        "version=30\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -1928,8 +2071,8 @@ fn canonical_control_plane_state_v29_representative_aggregate_is_stable() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            4_685,
-            "eb50cb06a9ddec679a03e67fdf4a079395fc886b2ae5a328488f2b90c52efeac".to_owned()
+            5_199,
+            "4e6e430bb64dad8a2048a09be56988943442f0f7d50d9eec6b286ab76d22938d".to_owned()
         )
     );
 }
@@ -2823,6 +2966,7 @@ enum CrossPgActingSetClientPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingCommandLifecycleModel {
     slot: PendingCommandSlotState,
+    pending_epoch_current: bool,
     pg_state: PgState,
     observed_pending: bool,
     peering_ready: bool,
@@ -2833,6 +2977,7 @@ impl PendingCommandLifecycleModel {
     fn active() -> Self {
         Self {
             slot: PendingCommandSlotState::NotInstalled,
+            pending_epoch_current: true,
             pg_state: PgState::Active,
             observed_pending: false,
             peering_ready: false,
@@ -2856,10 +3001,10 @@ impl PendingCommandLifecycleModel {
                 self.route_protected = self.slot == PendingCommandSlotState::Pending;
                 match self.pg_state {
                     PgState::Active => {
-                        if self.slot == PendingCommandSlotState::Pending {
+                        self.observed_pending = self.slot == PendingCommandSlotState::Pending;
+                        self.peering_ready = false;
+                        if self.observed_pending && !self.pending_epoch_current {
                             self.pg_state = PgState::Peering;
-                            self.observed_pending = true;
-                            self.peering_ready = false;
                         }
                     }
                     PgState::Peering => {
@@ -2878,6 +3023,7 @@ impl PendingCommandLifecycleModel {
                 }
             }
             PendingCommandLifecycleOp::Restart => {
+                self.pending_epoch_current = false;
                 self.pg_state = PgState::Peering;
                 self.observed_pending = false;
                 self.peering_ready = false;
@@ -3327,11 +3473,6 @@ fn assert_control_plane_heartbeat_model_invariants(
                 observation.pg_id().get()
             );
             if let Some(pending) = observation.pending_metadata_command() {
-                prop_assert_eq!(
-                    pg.state(),
-                    PgState::Peering,
-                    "accepted pending-command evidence must fence the PG in Peering"
-                );
                 let expected = PendingMetadataCommandRecoveryTask::new(
                     observation.pg_id(),
                     PendingMetadataCommandRecovery::new(node.node_id(), pending),
@@ -3340,11 +3481,28 @@ fn assert_control_plane_heartbeat_model_invariants(
                     recovery_listing.tasks().contains(&expected),
                     "accepted pending-command evidence must remain discoverable"
                 );
-                let historical = snapshot
-                    .reconstructed_pg_route_at_epoch(observation.pg_id(), pending.cluster_epoch())
-                    .expect("accepted recovery evidence retains its historical route");
-                prop_assert_eq!(historical.state(), PgState::Active);
-                prop_assert_eq!(historical.primary_node_id(), node.node_id());
+                match pg.state() {
+                    PgState::Active => {
+                        prop_assert_eq!(pending.cluster_epoch(), snapshot.cluster_epoch());
+                        prop_assert_eq!(pg.active_primary(), Some(node.node_id()));
+                    }
+                    PgState::Peering => {
+                        prop_assert!(pending.cluster_epoch() < snapshot.cluster_epoch());
+                        let historical = snapshot
+                            .reconstructed_pg_route_at_epoch(
+                                observation.pg_id(),
+                                pending.cluster_epoch(),
+                            )
+                            .expect("accepted recovery evidence retains its historical route");
+                        prop_assert_eq!(historical.state(), PgState::Active);
+                        prop_assert_eq!(historical.primary_node_id(), node.node_id());
+                    }
+                    state => {
+                        return Err(TestCaseError::fail(format!(
+                            "accepted pending-command evidence has invalid PG state {state:?}"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -3353,7 +3511,7 @@ fn assert_control_plane_heartbeat_model_invariants(
         let pg = snapshot
             .pg(task.pg_id())
             .expect("recovery task references known PG");
-        prop_assert_eq!(pg.state(), PgState::Peering);
+        prop_assert!(matches!(pg.state(), PgState::Active | PgState::Peering));
     }
 
     for pg in snapshot.pgs() {

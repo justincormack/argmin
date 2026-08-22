@@ -120,6 +120,23 @@ fn control_plane_rpc_catalogue_recovery_snapshot() -> ClusterRuntimeMapSnapshot 
     snapshot
 }
 
+fn control_plane_rpc_catalogue_current_recovery_snapshot() -> ClusterRuntimeMapSnapshot {
+    let mut snapshot = runtime_map_test_snapshot_with_active_route();
+    snapshot.freshness_proof = RuntimeMapFreshnessProof::Reconstructed {
+        authority_incarnation: AuthorityIncarnation::new(10).unwrap(),
+    };
+    snapshot.pg_routes[0].pending_metadata_command_recovery =
+        Some(PendingMetadataCommandRecovery::new(
+            NodeId::new(1),
+            PendingMetadataCommandObservation::new(
+                snapshot.cluster_epoch(),
+                NonZeroU64::new(12).unwrap(),
+                13,
+            ),
+        ));
+    snapshot
+}
+
 fn control_plane_rpc_catalogue_empty_snapshot() -> ClusterRuntimeMapSnapshot {
     runtime_map_test_snapshot(RuntimeMapFreshnessProof::Reconstructed {
         authority_incarnation: AuthorityIncarnation::new(12).unwrap(),
@@ -205,6 +222,14 @@ fn assert_control_plane_rpc_catalogue_runtime_map_branches(
     assert!(routes
         .iter()
         .any(|route| route.pending_metadata_command_recovery().is_some()));
+    let recovery_states = routes
+        .iter()
+        .filter(|route| route.pending_metadata_command_recovery().is_some())
+        .map(|route| route.state())
+        .collect::<Vec<_>>();
+    assert_eq!(recovery_states.len(), 2);
+    assert!(recovery_states.contains(&PgState::Active));
+    assert!(recovery_states.contains(&PgState::Peering));
 
     assert!(snapshots.iter().any(|snapshot| snapshot.nodes().is_empty()));
     assert!(snapshots
@@ -1136,7 +1161,39 @@ fn control_plane_rpc_v14_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v15_operation_catalogue_is_exact() {
+fn control_plane_rpc_v15_operation_catalogue_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v15_operation.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            12_794,
+            "662eda24308716d84b41f5e1904103affccc76d2344d1a37ec715db256d22958".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0usize;
+    while !remaining.is_empty() {
+        let (_section, tail) = remaining.split_first().unwrap();
+        let (raw_len, tail) = tail.split_at(4);
+        let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+        let (frame, tail) = tail.split_at(len);
+        let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)).unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { diagnostic }
+                if diagnostic.as_str() == "unsupported control-plane RPC version 15"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > ControlPlaneRpcKind::ALL.len());
+}
+
+#[test]
+fn control_plane_rpc_v16_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -1146,6 +1203,7 @@ fn control_plane_rpc_v15_operation_catalogue_is_exact() {
         control_plane_rpc_catalogue_snapshot(),
         control_plane_rpc_catalogue_transfer_snapshot(),
         control_plane_rpc_catalogue_recovery_snapshot(),
+        control_plane_rpc_catalogue_current_recovery_snapshot(),
         control_plane_rpc_catalogue_empty_snapshot(),
     ];
     assert_control_plane_rpc_catalogue_runtime_map_branches(&runtime_map_snapshots);
@@ -1348,15 +1406,15 @@ fn control_plane_rpc_v15_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            12_794,
-            "662eda24308716d84b41f5e1904103affccc76d2344d1a37ec715db256d22958".to_owned()
+            13_018,
+            "177077e60ee3220c91129d4b51c3fec0f2438c92ff90fcb13093b54b59dc49d5".to_owned()
         )
     );
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v14_and_v15_auth_v1_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 15);
+fn authenticated_control_plane_rpc_v14_v15_and_v16_auth_v1_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 16);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -1373,17 +1431,29 @@ fn authenticated_control_plane_rpc_v14_and_v15_auth_v1_payload_bindings_are_exac
             .unwrap();
     assert_eq!(request_envelope.payload(), &[0x00, 0x0c]);
     let request_frame = encode_control_plane_rpc_frame(kind, &request.payload).unwrap();
-    assert!(request_frame.starts_with(b"argmin-control-plane-rpc\x00\x0f"));
-    let previous_request_frame =
+    assert!(request_frame.starts_with(b"argmin-control-plane-rpc\x00\x10"));
+    let v14_request_frame =
         encode_control_plane_rpc_frame_with_version(kind, &request.payload, 14).unwrap();
     assert_eq!(
         (
-            previous_request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&previous_request_frame))
+            v14_request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v14_request_frame))
         ),
         (
             182,
             "8e6ced7925437cef8aae609508634cdcd86e76088d8e4b5816654f77652f4419".to_owned()
+        )
+    );
+    let v15_request_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 15).unwrap();
+    assert_eq!(
+        (
+            v15_request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v15_request_frame))
+        ),
+        (
+            182,
+            "37645109ed5bf0542da0101873aebdfffd5f2eae42bd51d2b4a7956cb31584da".to_owned()
         )
     );
     let verified = verify_control_plane_unix_request(request, Some(&verifier), 1_000).unwrap();
@@ -1413,16 +1483,28 @@ fn authenticated_control_plane_rpc_v14_and_v15_auth_v1_payload_bindings_are_exac
         encoded_response
     );
     let response_frame = encode_control_plane_rpc_frame(kind, &response).unwrap();
-    let previous_response_frame =
+    let v14_response_frame =
         encode_control_plane_rpc_frame_with_version(kind, &response, 14).unwrap();
     assert_eq!(
         (
-            previous_response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&previous_response_frame))
+            v14_response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v14_response_frame))
         ),
         (
             190,
             "72f5e379703b62bcd438281d63ac0dcc9c937400004d8c75e4014bb43b1128b7".to_owned()
+        )
+    );
+    let v15_response_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &response, 15).unwrap();
+    assert_eq!(
+        (
+            v15_response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v15_response_frame))
+        ),
+        (
+            190,
+            "ae755056e5f6f4308f6e28c788cdfcd204f74e8d383bf0188cbb08b7873bce9d".to_owned()
         )
     );
 
@@ -1433,7 +1515,7 @@ fn authenticated_control_plane_rpc_v14_and_v15_auth_v1_payload_bindings_are_exac
         ),
         (
             182,
-            "37645109ed5bf0542da0101873aebdfffd5f2eae42bd51d2b4a7956cb31584da".to_owned()
+            "7e3502c39d454c15a2fd8040e056422482506bb5dfb8c5c916fd5413e5e9b737".to_owned()
         )
     );
     assert_eq!(
@@ -1443,7 +1525,7 @@ fn authenticated_control_plane_rpc_v14_and_v15_auth_v1_payload_bindings_are_exac
         ),
         (
             190,
-            "ae755056e5f6f4308f6e28c788cdfcd204f74e8d383bf0188cbb08b7873bce9d".to_owned()
+            "91cb6a680b0305c3c6e87404f0b2a77e1f94ee6634ff9c1207532d6e30292059".to_owned()
         )
     );
 }
@@ -6505,6 +6587,108 @@ fn authenticated_unix_control_plane_client_refreshes_storage_node_heartbeat() {
 }
 
 #[test]
+fn authenticated_heartbeat_response_carries_current_active_recovery_authorization() {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("control-plane.sock");
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+    authority
+        .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+        .unwrap();
+    assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+    let pg_id = PgId::new(7);
+    let proof = PgMetadataProof::current(2, 3, 4);
+    authority
+        .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut authority,
+        1,
+        pg_id.get(),
+        PgState::Peering,
+        proof,
+        false,
+        2_000,
+    );
+    authority.complete_ready_pg_peerings(2_010).unwrap();
+    let active_epoch = authority.snapshot().cluster_epoch();
+    heartbeat_with_pg_proof(
+        &mut authority,
+        1,
+        pg_id.get(),
+        PgState::Active,
+        proof,
+        false,
+        2_020,
+    );
+    let pending = PendingMetadataCommandObservation::new(active_epoch, NonZeroU64::MIN, 0x1234);
+    let node_incarnation = node_incarnation(&authority, 1);
+    let mut heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_030);
+    heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id,
+        state: PgState::Active,
+        metadata_proof: proof,
+        pending_metadata_command: Some(pending),
+    }];
+
+    let credential = storage_node_auth_credential("auth-cluster", 1, node_incarnation);
+    let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let server = std::thread::spawn(move || {
+        for authority_now_ms in [2_030, 2_032] {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                authority_now_ms,
+                &verifier,
+            )
+            .unwrap();
+        }
+    });
+    let mut client = AuthenticatedUnixControlPlaneClient::new(
+        UnixControlPlaneClient::new(&socket_path),
+        credential,
+    );
+    let mut clock = [2_030, 2_031].into_iter();
+    let refresh = client
+        .refresh_node_heartbeat_with_clock(heartbeat, || {
+            clock.next().ok_or_else(|| {
+                ControlPlaneError::rpc_protocol("test heartbeat auth clock exhausted".to_owned())
+            })
+        })
+        .unwrap();
+    let scoped_client = AuthenticatedUnixControlPlaneClient::new(
+        UnixControlPlaneClient::new(&socket_path),
+        frontend_auth_credential("auth-cluster", "frontend-1"),
+    );
+    let scoped = scoped_client.pg_runtime_map_snapshot(pg_id, 2_032).unwrap();
+
+    server.join().unwrap();
+    assert_eq!(refresh.runtime_map().cluster_epoch(), active_epoch);
+    let route = refresh
+        .runtime_map()
+        .pg_routes()
+        .iter()
+        .find(|route| route.pg_id() == pg_id)
+        .unwrap();
+    assert_eq!(route.state(), PgState::Active);
+    assert_eq!(
+        route.pending_metadata_command_recovery(),
+        Some(PendingMetadataCommandRecovery::new(NodeId::new(1), pending))
+    );
+    assert_eq!(scoped.cluster_epoch(), active_epoch);
+    assert_eq!(scoped.pg_routes().len(), 1);
+    let scoped_route = &scoped.pg_routes()[0];
+    assert_eq!(scoped_route.pg_id(), pg_id);
+    assert_eq!(scoped_route.state(), PgState::Active);
+    assert_eq!(
+        scoped_route.pending_metadata_command_recovery(),
+        Some(PendingMetadataCommandRecovery::new(NodeId::new(1), pending))
+    );
+}
+
+#[test]
 fn authenticated_unix_control_plane_client_resigns_heartbeat_transport_retry() {
     let tmp = test_util::tempdir();
     let socket_path = tmp.path().join("control-plane.sock");
@@ -10181,7 +10365,7 @@ fn control_plane_rpc_rejects_duplicate_runtime_map_pg_routes() {
 }
 
 #[test]
-fn control_plane_rpc_round_trips_pending_command_recovery_authorization() {
+fn control_plane_rpc_round_trips_historical_pending_command_recovery_authorization() {
     let mut snapshot = runtime_map_test_snapshot_with_active_route();
     let historical = snapshot.pg_routes[0].without_serving_authority();
     snapshot.cluster_epoch = ClusterEpoch::new(2).unwrap();
@@ -10201,6 +10385,115 @@ fn control_plane_rpc_round_trips_pending_command_recovery_authorization() {
 
     let decoded = decode_runtime_map_test_snapshot(snapshot.clone()).unwrap();
     assert_eq!(decoded, snapshot);
+}
+
+#[test]
+fn control_plane_rpc_round_trips_current_active_pending_command_recovery_authorization() {
+    let mut snapshot = runtime_map_test_snapshot_with_active_route();
+    snapshot.pg_routes[0].pending_metadata_command_recovery =
+        Some(PendingMetadataCommandRecovery::new(
+            NodeId::new(1),
+            PendingMetadataCommandObservation::new(
+                snapshot.cluster_epoch(),
+                NonZeroU64::MIN,
+                0x1234,
+            ),
+        ));
+
+    let decoded = decode_runtime_map_test_snapshot(snapshot.clone()).unwrap();
+    assert_eq!(decoded, snapshot);
+}
+
+#[test]
+fn control_plane_rpc_rejects_active_pending_recovery_from_non_current_epoch() {
+    let mut snapshot = runtime_map_test_snapshot_with_active_route();
+    snapshot.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    snapshot.pg_routes[0].cluster_epoch = snapshot.cluster_epoch;
+    snapshot.pg_routes[0].pending_metadata_command_recovery =
+        Some(PendingMetadataCommandRecovery::new(
+            NodeId::new(1),
+            PendingMetadataCommandObservation::new(ClusterEpoch::INITIAL, NonZeroU64::MIN, 0x1234),
+        ));
+
+    let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str().contains("Active route for PG 7 pending command epoch 1 does not match current epoch 2")
+    ));
+}
+
+#[test]
+fn control_plane_rpc_rejects_active_pending_recovery_from_non_primary_reporter() {
+    let mut snapshot = runtime_map_test_snapshot_with_active_route();
+    snapshot.nodes.push(NodeRouteSnapshot {
+        node_id: NodeId::new(2),
+        node_incarnation: 12,
+        endpoint: "/tmp/argmin-node-2.sock".to_owned(),
+        cluster_map_history_floor_epoch: None,
+    });
+    snapshot.pg_routes[0].acting_set.push(NodeId::new(2));
+    snapshot.pg_routes[0].pending_metadata_command_recovery =
+        Some(PendingMetadataCommandRecovery::new(
+            NodeId::new(2),
+            PendingMetadataCommandObservation::new(
+                snapshot.cluster_epoch(),
+                NonZeroU64::MIN,
+                0x1234,
+            ),
+        ));
+
+    let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str().contains("recovery reporter 2 is not the current primary 1")
+    ));
+}
+
+#[test]
+fn control_plane_rpc_rejects_peering_pending_recovery_from_current_epoch() {
+    let mut snapshot = runtime_map_test_snapshot_with_active_route();
+    snapshot.pg_routes[0].state = PgState::Peering;
+    snapshot.pg_routes[0].active_metadata_proof = None;
+    snapshot.pg_routes[0].primary_lease_deadline_ms = None;
+    snapshot.pg_routes[0].pending_metadata_command_recovery =
+        Some(PendingMetadataCommandRecovery::new(
+            NodeId::new(1),
+            PendingMetadataCommandObservation::new(
+                snapshot.cluster_epoch(),
+                NonZeroU64::MIN,
+                0x1234,
+            ),
+        ));
+
+    let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str().contains("Peering route for PG 7 pending command epoch 1 is not older than current epoch 1")
+    ));
+}
+
+#[test]
+fn control_plane_rpc_rejects_pending_recovery_on_historical_route() {
+    let mut snapshot = runtime_map_test_snapshot_with_active_route();
+    let mut historical = snapshot.pg_routes[0].without_serving_authority();
+    historical.pending_metadata_command_recovery = Some(PendingMetadataCommandRecovery::new(
+        NodeId::new(1),
+        PendingMetadataCommandObservation::new(ClusterEpoch::INITIAL, NonZeroU64::MIN, 0x1234),
+    ));
+    snapshot.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    snapshot.pg_routes[0].cluster_epoch = snapshot.cluster_epoch;
+    snapshot.historical_cluster_epochs = vec![ClusterEpoch::INITIAL];
+    snapshot.historical_pg_routes = vec![historical];
+
+    let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str().contains("outside the current route set")
+    ));
 }
 
 #[test]

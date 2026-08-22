@@ -62,7 +62,7 @@ fn control_plane_raft_peer_rpc_rejects_noncurrent_nested_command_versions() {
     ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded).unwrap();
 
     let mut unsupported_frames = Vec::new();
-    for version in [14, 15, 17] {
+    for version in [14, 15, 16, 18] {
         let unsupported_command =
             crate::control_plane_command::encode_control_plane_command_with_version_for_test(
                 &command, version,
@@ -858,6 +858,31 @@ fn control_plane_raft_peer_server_rejects_noncurrent_nested_snapshot_versions_be
                     ControlPlaneError::SnapshotDecode { message }
                         if message == &format!(
                             "unsupported control-plane snapshot version {version}"
+                        )
+                ));
+            },
+        );
+    }
+}
+
+#[test]
+fn control_plane_raft_peer_server_rejects_noncurrent_nested_state_versions_before_publication() {
+    let current = current_peer_snapshot_payload();
+    for version in [28, 29, 31] {
+        let unsupported =
+            crate::control_plane_command::reseal_control_plane_snapshot_state_version_for_test(
+                &current, version,
+            )
+            .unwrap();
+        assert_peer_server_rejects_snapshot_before_publication(
+            &format!("nested-state-version-{version}"),
+            unsupported,
+            |error| {
+                assert!(matches!(
+                    error,
+                    ControlPlaneError::Parse { message, .. }
+                        if message == &format!(
+                            "unsupported control-plane state version {version}"
                         )
                 ));
             },
@@ -1693,7 +1718,7 @@ fn control_plane_raft_peer_rpc_v3_catalogue_is_exact() {
         ),
         (
             2_402,
-            "7dc75647cba28fcd8616e5a9a766ff1b60d64b0455e5b2050018a1bc71121f0e".to_owned()
+            "a4b6da2c437752c7ff6a2ffd3221b12df746d7d3516bffa460b920bf08802b95".to_owned()
         )
     );
 }

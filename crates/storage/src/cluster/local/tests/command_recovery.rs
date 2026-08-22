@@ -567,6 +567,30 @@ impl HistoricalRouteRecoveryFixture {
         pending
     }
 
+    fn authorize_current_pending_recovery(
+        &mut self,
+        command: &MetadataCommandEnvelope,
+    ) -> PendingMetadataCommandObservation {
+        let pending = PendingMetadataCommandObservation::new(
+            self.active_epoch,
+            std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
+            command.checksum_crc64(),
+        );
+        for node_id in self.node_ids {
+            self.now_ms += 1;
+            heartbeat_authority_with_pending(
+                &mut self.authority,
+                &self.active_map,
+                node_id,
+                self.pg_id,
+                (node_id == NodeId::new(0)).then_some(pending),
+                self.now_ms,
+            );
+        }
+        assert_eq!(self.authority.snapshot().cluster_epoch(), self.active_epoch);
+        pending
+    }
+
     fn recover(&self, pending: PendingMetadataCommandObservation) -> usize {
         self.handle
             .recover_reported_pending_metadata_command(
@@ -655,6 +679,65 @@ impl HistoricalRouteRecoveryFixture {
         assert_eq!(outcome, PendingMetadataCommandOutcome::Applied);
         1
     }
+}
+
+#[test]
+fn refresh_recovery_converges_current_active_pending_command_without_epoch_bump() {
+    let tmp = test_util::tempdir();
+    let mut fixture =
+        HistoricalRouteRecoveryFixture::open(tmp.path(), "current-active-pending-command");
+    let bucket = BucketName::new("current-active-pending-command").unwrap();
+    let command = create_bucket_metadata_command_at_epoch(
+        fixture.active_epoch,
+        fixture.pg_id,
+        fixture
+            .active_map
+            .test_next_metadata_command_log_index(fixture.pg_id)
+            .get(),
+        bucket.clone(),
+    );
+    force_insert_pending_metadata_command_for_node_for_test(
+        &fixture.active_map,
+        NodeId::new(0),
+        fixture.pg_id,
+        &bucket,
+        &command,
+    );
+    let pending = fixture.authorize_current_pending_recovery(&command);
+    let route = fixture
+        .authority
+        .pg_runtime_map_snapshot(fixture.pg_id, fixture.now_ms + 1)
+        .unwrap()
+        .pg_routes()[0]
+        .clone();
+    assert_eq!(route.state(), PgState::Active);
+    assert_eq!(
+        route.pending_metadata_command_recovery(),
+        Some(PendingMetadataCommandRecovery::new(NodeId::new(0), pending))
+    );
+
+    assert_eq!(fixture.recover(pending), 1);
+    assert_eq!(
+        fixture.authority.snapshot().cluster_epoch(),
+        fixture.active_epoch
+    );
+    for node_id in fixture.node_ids {
+        let pg = fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            command.id().log_index().get()
+        );
+    }
+    assert_fixture_pending_command(&fixture, None);
 }
 
 #[test]

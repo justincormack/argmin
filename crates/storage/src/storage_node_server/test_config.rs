@@ -7226,6 +7226,113 @@
         );
     }
 
+    #[test]
+    fn authenticated_unix_current_active_recovery_applies_exact_command() {
+        authenticated_current_active_recovery_applies_exact_command(false);
+    }
+
+    #[test]
+    fn authenticated_tls_current_active_recovery_applies_exact_command() {
+        authenticated_current_active_recovery_applies_exact_command(true);
+    }
+
+    fn authenticated_current_active_recovery_applies_exact_command(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let mut config = bounded_runtime_refresh_config(test_config(&tmp));
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let replacement = test_metadata_command(0, 2);
+        config.pending_metadata_command_recoveries.push((
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                config.node_id,
+                PendingMetadataCommandObservation::new(
+                    config.cluster_epoch,
+                    std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
+                    command.checksum_crc64(),
+                ),
+            ),
+        ));
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        create_probe_bucket_direct(
+            &server._node.get_pg(0).unwrap(),
+            command.bucket_name(),
+        );
+        server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .try_insert_pending_metadata_command_slot(
+                config.node_id.as_u32(),
+                &command,
+                Some(command.bucket_name()),
+            )
+            .unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let section =
+            MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
+                &client,
+                PgId::new(0),
+                config.cluster_epoch,
+            )
+            .unwrap();
+        assert_eq!(
+            section.pending_metadata_command_envelope().unwrap(),
+            Some(command.clone())
+        );
+        assert!(section
+            .replace_pending_metadata_command_slot_for_recovery(
+                &command,
+                None,
+                &command,
+                &replacement,
+                Some(command.bucket_name()),
+            )
+            .unwrap());
+        assert_eq!(
+            section.pending_metadata_command_envelope().unwrap(),
+            Some(replacement)
+        );
+        drop(section);
+
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
     fn assert_authenticated_pending_slot_replacement_scope_error(
         error: MetadataCommandPendingSlotReplaceError,
         expected_detail: &str,

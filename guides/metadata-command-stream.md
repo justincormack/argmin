@@ -355,6 +355,18 @@ foreground waiters or replace the retained internal uncertainty with
 `SlowDown`. Terminal recovery records its exact applied or abandoned outcome
 before releasing the flight.
 
+A current primary reporting an exact pending command from the current epoch
+does not by itself invalidate an otherwise healthy Active route. The authority
+keeps the PG Active, does not advance the global epoch, and publishes the exact
+pending identity and reporting primary as recovery authorization in the
+current runtime map. The current-map recovery worker may use that certificate
+with the current route fence to converge the command; ordinary request paths
+remain serialized behind the PG pending slot. A later primary scan that no
+longer observes the slot removes the certificate without changing the epoch.
+Pending evidence from an older route is different: it requires the retained
+Active historical-primary route and keeps the current PG in Peering until
+historical recovery resolves it.
+
 The handoff is local ownership bookkeeping, not a new storage mutation. It must
 therefore be recorded even when the request work deadline has just expired.
 Expiry still prohibits additional normal-route mutation; it does not authorize
