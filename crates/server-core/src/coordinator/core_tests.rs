@@ -6618,10 +6618,20 @@ fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
         setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
             Arc::clone(&initial),
         );
-    let buckets = [
-        trusted_bucket_name("shared-deferred-finalize-first"),
-        trusted_bucket_name("shared-deferred-finalize-second"),
-    ];
+    let first_bucket = trusted_bucket_name("shared-deferred-finalize-first");
+    let first_bucket_pg = replacement.bucket_pg_id_for(&first_bucket);
+    let second_bucket = (0..10_000)
+        .map(|index| trusted_bucket_name(format!("shared-deferred-finalize-second-{index}")))
+        .find(|bucket| replacement.bucket_pg_id_for(bucket) != first_bucket_pg)
+        .expect("test topology must provide a second bucket metadata PG");
+    let buckets = [first_bucket, second_bucket];
+    for cluster in [&initial, &independent, &replacement] {
+        assert_ne!(
+            cluster.bucket_pg_id_for(&buckets[0]),
+            cluster.bucket_pg_id_for(&buckets[1]),
+            "shared deferred roots must avoid unrelated same-PG database contention"
+        );
+    }
     initial
         .test_seed_missing_bucket_finalize_work(&trusted_bucket_name(
             "shared-deferred-worker-blocker",
