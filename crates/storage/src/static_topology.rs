@@ -153,6 +153,11 @@ impl StaticInitialControlPlaneTopology {
         self.pg_acting_sets.len()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_topology_digest(&self) -> Vec<u8> {
+        self.certificate.topology_digest().to_vec()
+    }
+
     /// Validate whether a control-plane snapshot is either wholly
     /// uninitialized or established with this exact certified topology.
     ///

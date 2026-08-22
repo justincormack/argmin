@@ -614,6 +614,26 @@ impl StaticStorageIdentity {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_static_outer_identity_bytes(
+    identity: &ConfiguredStaticClusterIdentity,
+    storage_node_id: u32,
+    raft_node_id: u64,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let storage = StaticStorageIdentity::new(identity, storage_node_id)
+        .encode()
+        .expect("test static storage identity must encode");
+    let control_unestablished = StaticControlPlaneIdentity::new(identity, raft_node_id)
+        .encode()
+        .expect("test static control-plane identity must encode");
+    let mut established = StaticControlPlaneIdentity::new(identity, raft_node_id);
+    established.established = true;
+    let control_established = established
+        .encode()
+        .expect("test established static control-plane identity must encode");
+    (storage, control_unestablished, control_established)
+}
+
 pub(crate) fn initialize_static_storage(
     identity: &ConfiguredStaticClusterIdentity,
     storage_node_id: u32,

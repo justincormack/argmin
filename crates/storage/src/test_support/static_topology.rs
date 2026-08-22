@@ -10,6 +10,8 @@ use crate::StaticInitialControlPlaneTopology;
 pub trait StaticInitialControlPlaneTopologyTestSupport {
     fn test_topology_generation(&self) -> u64;
 
+    fn test_topology_digest(&self) -> Vec<u8>;
+
     fn test_raft_voters(&self) -> &[u64];
 
     fn test_logical_acting_sets(&self) -> Vec<Vec<u32>>;
@@ -18,6 +20,10 @@ pub trait StaticInitialControlPlaneTopologyTestSupport {
 impl StaticInitialControlPlaneTopologyTestSupport for StaticInitialControlPlaneTopology {
     fn test_topology_generation(&self) -> u64 {
         StaticInitialControlPlaneTopology::test_topology_generation(self)
+    }
+
+    fn test_topology_digest(&self) -> Vec<u8> {
+        StaticInitialControlPlaneTopology::test_topology_digest(self)
     }
 
     fn test_raft_voters(&self) -> &[u64] {

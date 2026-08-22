@@ -3070,6 +3070,18 @@ fn topology_digest(
     initial_pg_acting_sets: &[Vec<u32>],
     canonical_raft_peer_endpoints: &BTreeMap<u64, CanonicalRaftPeerEndpoint>,
 ) -> String {
+    auth::canonical::sha256_hex(&topology_identity_canonical_bytes(
+        manifest,
+        initial_pg_acting_sets,
+        canonical_raft_peer_endpoints,
+    ))
+}
+
+fn topology_identity_canonical_bytes(
+    manifest: &StaticClusterManifestInput,
+    initial_pg_acting_sets: &[Vec<u32>],
+    canonical_raft_peer_endpoints: &BTreeMap<u64, CanonicalRaftPeerEndpoint>,
+) -> Vec<u8> {
     let mut encoder = CanonicalEncoder::default();
     encoder.string(1, TOPOLOGY_IDENTITY_DOMAIN);
     encoder.u32(2, manifest.schema_version);
@@ -3120,7 +3132,7 @@ fn topology_digest(
             .iter()
             .map(|(node_id, endpoint)| encode_raft_peer_endpoint(*node_id, endpoint)),
     );
-    auth::canonical::sha256_hex(&encoder.finish())
+    encoder.finish()
 }
 
 fn process_identity_digest(
@@ -3128,6 +3140,18 @@ fn process_identity_digest(
     selected_process_index: usize,
     topology_digest: &str,
 ) -> String {
+    auth::canonical::sha256_hex(&process_identity_canonical_bytes(
+        manifest,
+        selected_process_index,
+        topology_digest,
+    ))
+}
+
+fn process_identity_canonical_bytes(
+    manifest: &StaticClusterManifestInput,
+    selected_process_index: usize,
+    topology_digest: &str,
+) -> Vec<u8> {
     let selected = &manifest.processes[selected_process_index];
     let mut encoder = CanonicalEncoder::default();
     encoder.string(1, PROCESS_IDENTITY_DOMAIN);
@@ -3151,7 +3175,7 @@ fn process_identity_digest(
             .filter(|storage_node| storage_node.process_id == selected.id)
             .map(encode_storage_node_process_identity),
     );
-    auth::canonical::sha256_hex(&encoder.finish())
+    encoder.finish()
 }
 
 fn full_config_fingerprint(manifest: &StaticClusterManifestInput) -> String {
@@ -7417,6 +7441,189 @@ secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
             changed.full_config_fingerprint(),
             baseline.full_config_fingerprint()
         );
+    }
+
+    fn test_hex(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(encoded, "{byte:02x}").unwrap();
+        }
+        encoded
+    }
+
+    fn compact_identity_manifest_input() -> StaticClusterManifestInput {
+        toml::from_str(
+            r#"
+schema_version = 1
+transport_profiles = []
+hosts = [{ id = "h" }]
+disks = [{ id = "d", host_id = "h", mount_path = "/m" }]
+processes = [{ id = "p", host_id = "h", kind = "all-in-one" }]
+authorities = [{ id = "a", kind = "single", process_id = "p", disk_id = "d", state_path = "/s" }]
+storage_nodes = [{ node_id = 7, process_id = "p", disk_id = "d", data_dir = "/n" }]
+endpoints = []
+tls_identities = []
+tls_trust_bundles = []
+auth_credentials = []
+
+[s3]
+account_id = "1"
+access_key_id = "k"
+secret_access_key_ref = "file:/a"
+sse_s3_wrapping_key_ref = "file:/w"
+
+[cluster]
+id = "c"
+topology_generation = 2
+region = "r"
+
+[deployment]
+mode = "standalone"
+failure_domain = "none"
+failure_tolerance = 0
+
+[storage]
+pg_count = 1
+ec_data_shards = 1
+ec_parity_shards = 0
+initial_cluster_epoch = 3
+
+[raft]
+max_append_entries = 64
+max_append_bytes = 8388608
+max_snapshot_bytes = 15728640
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn current_static_topology_and_process_identity_digests_match_frozen_versioned_manifest_and_requires_version_bump(
+    ) {
+        let manifest = compact_identity_manifest_input();
+        let placement = storage::derive_static_initial_pg_placement(
+            1,
+            1,
+            0,
+            StaticStorageFailureDomain::None,
+            &["h".to_string()],
+            &["d".to_string()],
+            &[StaticStoragePlacementNode::new(7, "h", "d")],
+        )
+        .unwrap();
+        let raft_endpoints = BTreeMap::from([(
+            9,
+            CanonicalRaftPeerEndpoint {
+                endpoint_id: "e".to_string(),
+                owner_process_id: "p".to_string(),
+                advertise: "unix:///e".to_string(),
+            },
+        )]);
+        let topology_bytes = topology_identity_canonical_bytes(
+            &manifest,
+            placement.logical_acting_sets(),
+            &raft_endpoints,
+        );
+        let topology_digest =
+            topology_digest(&manifest, placement.logical_acting_sets(), &raft_endpoints);
+        let process_bytes = process_identity_canonical_bytes(&manifest, 0, &topology_digest);
+        let process_digest = process_identity_digest(&manifest, 0, &topology_digest);
+
+        let certified = storage::derive_static_initial_control_plane_topology(
+            manifest.cluster.topology_generation,
+            &topology_digest,
+            &[9],
+            &[StaticStorageNodeEndpoint::new(7, "unix:///n")],
+            placement,
+        )
+        .unwrap();
+        assert_eq!(test_hex(&certified.test_topology_digest()), topology_digest);
+
+        let identity = ConfiguredStaticClusterIdentity {
+            cluster_id: manifest.cluster.id,
+            topology_generation: manifest.cluster.topology_generation,
+            topology_digest: topology_digest.clone(),
+            process_id: manifest.processes[0].id.clone(),
+            process_identity_digest: process_digest.clone(),
+        };
+        let (storage_identity, control_unestablished, control_established) =
+            crate::static_cluster_state::test_static_outer_identity_bytes(&identity, 7, 9);
+
+        const TOPOLOGY_BYTES_HEX: &str = concat!(
+            "000100000000000000216172676d696e2d7374617469632d636c75737465722d746f706f",
+            "6c6f67792d76310002000000000000000400000001000300000000000000016300040000",
+            "000000000008000000000000000200050000000000000021000100000000000000010100",
+            "020000000000000001010003000000000000000100000600000000000000360001000000",
+            "000000000400000001000200000000000000010100030000000000000001000004000000",
+            "000000000800000000000000030007000000000000003600010000000000000008000000",
+            "000000004000020000000000000008000000000080000000030000000000000008000000",
+            "0000f0000000080000000000000004000000000009000000000000001900000001000100",
+            "0000000000000b0001000000000000000168000a00000000000000240000000100010000",
+            "00000000001600010000000000000001640002000000000000000168000b000000000000",
+            "005000000001000100000000000000420001000000000000000170000200000000000000",
+            "016800030000000000000001010004000000000000000100000500000000000000010000",
+            "06000000000000000100000c000000000000004500000001000100000000000000370001",
+            "000000000000000161000200000000000000010100030000000000000001000004000000",
+            "0000000001700005000000000000000164000d0000000000000032000000010001000000",
+            "000000002400010000000000000004000000070002000000000000000170000300000000",
+            "0000000164000e000000000000000400000000000f000000000000003600000001000100",
+            "000000000000280001000000000000000102000200000000000000010100030000000000",
+            "00000800000000000000070010000000000000003c000000010001000000000000002e00",
+            "010000000000000008000000000000000000020000000000000012000000010001000000",
+            "00000000040000000700110000000000000049000000010001000000000000003b000100",
+            "000000000000080000000000000009000200000000000000016500030000000000000001",
+            "7000040000000000000009756e69783a2f2f2f65",
+        );
+        const PROCESS_BYTES_HEX: &str = concat!(
+            "000100000000000000296172676d696e2d7374617469632d636c75737465722d70726f63",
+            "6573732d6964656e746974792d7631000200000000000000403939303338306466633365",
+            "61393335313134396438316266313838366432393231666531343065663461353662393038",
+            "336361316565396536336536336138620003000000000000000170000400000000000000",
+            "016800050000000000000001010006000000000000004500000001000100000000000000",
+            "370001000000000000000161000200000000000000010100030000000000000001000004",
+            "000000000000000170000500000000000000016400070000000000000032000000010001",
+            "000000000000002400010000000000000004000000070002000000000000000170000300",
+            "0000000000000164",
+        );
+        const STORAGE_IDENTITY_HEX: &str = concat!(
+            "41524753534944000001000000000000000200000007000163004039393033383064666333",
+            "65613933353131343964383162663138383664323932316665313430656634613536623930",
+            "38336361316565396536336536336138620001700040613931353037646166373931353662",
+            "38313665306263306265336637363261613434636138613639646330366265323465346339",
+            "666335636630303532353338",
+        );
+        const CONTROL_UNESTABLISHED_HEX: &str = concat!(
+            "415247534350494400020000000000000002000000000000000900000163004039393033",
+            "38306466633365613933353131343964383162663138383664323932316665313430656634",
+            "61353662393038336361316565396536336536336138620001700040613931353037646166",
+            "37393135366238313665306263306265336637363261613434636138613639646330366265",
+            "32346534633966633563663030353235333838333065316533313536333332383036303864",
+            "30666638376661636564366134336632656133323966383364393963396466386237626534",
+            "3536343130346266",
+        );
+        const CONTROL_ESTABLISHED_HEX: &str = concat!(
+            "415247534350494400020000000000000002000000000000000901000163004039393033",
+            "38306466633365613933353131343964383162663138383664323932316665313430656634",
+            "61353662393038336361316565396536336536336138620001700040613931353037646166",
+            "37393135366238313665306263306265336637363261613434636138613639646330366265",
+            "32346534633966633563663030353235333831303037653465306434363366396261336661",
+            "61373532313631303366373639396338386130613639656162613336356563343136666132",
+            "6538653732643061",
+        );
+
+        assert_eq!(test_hex(&topology_bytes), TOPOLOGY_BYTES_HEX);
+        assert_eq!(
+            topology_digest,
+            "990380dfc3ea9351149d81bf1886d2921fe140ef4a56b9083ca1ee9e63e63a8b"
+        );
+        assert_eq!(test_hex(&process_bytes), PROCESS_BYTES_HEX);
+        assert_eq!(
+            process_digest,
+            "a91507daf79156b816e0bc0be3f762aa44ca8a69dc06be24e4c9fc5cf0052538"
+        );
+        assert_eq!(test_hex(&storage_identity), STORAGE_IDENTITY_HEX);
+        assert_eq!(test_hex(&control_unestablished), CONTROL_UNESTABLISHED_HEX);
+        assert_eq!(test_hex(&control_established), CONTROL_ESTABLISHED_HEX);
     }
 
     #[test]
