@@ -3,9 +3,9 @@
 
 use crate::config::ConfiguredStaticClusterIdentity;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use storage::control_plane::ensure_control_plane_state_parent_directory;
 use storage::{ClusterEpoch, EcShape, NodeId};
@@ -33,6 +33,61 @@ struct StaticStorageIdentity {
     process_id: String,
     process_identity_digest: String,
     storage_node_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StaticStorageIdentityDecodeError {
+    Truncated { field: &'static str },
+    UnknownMagic,
+    UnsupportedVersion(u16),
+    InvalidField { field: &'static str },
+    TrailingData,
+}
+
+impl std::fmt::Display for StaticStorageIdentityDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated { field } => {
+                write!(formatter, "static storage identity has truncated {field}")
+            }
+            Self::UnknownMagic => formatter.write_str("static storage identity has unknown magic"),
+            Self::UnsupportedVersion(version) => write!(
+                formatter,
+                "static storage identity has unsupported version {version}"
+            ),
+            Self::InvalidField { field } => write!(
+                formatter,
+                "static storage identity has invalid UTF-8 in {field}"
+            ),
+            Self::TrailingData => formatter.write_str("static storage identity has trailing bytes"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityFieldDecodeError {
+    Truncated { field: &'static str },
+    InvalidUtf8 { field: &'static str },
+}
+
+impl From<IdentityFieldDecodeError> for StaticStorageIdentityDecodeError {
+    fn from(error: IdentityFieldDecodeError) -> Self {
+        match error {
+            IdentityFieldDecodeError::Truncated { field } => Self::Truncated { field },
+            IdentityFieldDecodeError::InvalidUtf8 { field } => Self::InvalidField { field },
+        }
+    }
+}
+
+fn control_plane_identity_field_error(error: IdentityFieldDecodeError) -> String {
+    match error {
+        IdentityFieldDecodeError::Truncated { field } => {
+            format!("static control-plane identity has truncated {field}")
+        }
+        IdentityFieldDecodeError::InvalidUtf8 { field } => {
+            format!("static control-plane identity has invalid UTF-8 in {field}")
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,17 +187,28 @@ impl StaticControlPlaneIdentity {
             return Err("static control-plane identity has an invalid digest".to_string());
         }
         let mut decoder = IdentityDecoder::new(body);
-        let magic = decoder.take(CONTROL_PLANE_IDENTITY_MAGIC.len(), "magic")?;
+        let magic = decoder
+            .take(CONTROL_PLANE_IDENTITY_MAGIC.len(), "magic")
+            .map_err(control_plane_identity_field_error)?;
         if magic != CONTROL_PLANE_IDENTITY_MAGIC {
             return Err("static control-plane identity has invalid magic".to_string());
         }
-        let version = decoder.read_u16("version")?;
+        let version = decoder
+            .read_u16("version")
+            .map_err(control_plane_identity_field_error)?;
         if version != CONTROL_PLANE_IDENTITY_VERSION {
             return Err("static control-plane identity has an unsupported version".to_string());
         }
-        let topology_generation = decoder.read_u64("topology generation")?;
-        let raft_node_id = decoder.read_u64("Raft node id")?;
-        let established = match decoder.take(1, "established flag")?[0] {
+        let topology_generation = decoder
+            .read_u64("topology generation")
+            .map_err(control_plane_identity_field_error)?;
+        let raft_node_id = decoder
+            .read_u64("Raft node id")
+            .map_err(control_plane_identity_field_error)?;
+        let established = match decoder
+            .take(1, "established flag")
+            .map_err(control_plane_identity_field_error)?[0]
+        {
             0 => false,
             1 => true,
             _ => {
@@ -151,10 +217,18 @@ impl StaticControlPlaneIdentity {
                 );
             }
         };
-        let cluster_id = decoder.read_string("cluster id")?;
-        let topology_digest = decoder.read_string("topology digest")?;
-        let process_id = decoder.read_string("process id")?;
-        let process_identity_digest = decoder.read_string("process identity digest")?;
+        let cluster_id = decoder
+            .read_string("cluster id")
+            .map_err(control_plane_identity_field_error)?;
+        let topology_digest = decoder
+            .read_string("topology digest")
+            .map_err(control_plane_identity_field_error)?;
+        let process_id = decoder
+            .read_string("process id")
+            .map_err(control_plane_identity_field_error)?;
+        let process_identity_digest = decoder
+            .read_string("process identity digest")
+            .map_err(control_plane_identity_field_error)?;
         if !decoder.is_empty() {
             return Err("static control-plane identity has trailing bytes".to_string());
         }
@@ -565,12 +639,17 @@ impl StaticStorageIdentity {
         Ok(bytes)
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, String> {
+    fn decode(bytes: &[u8]) -> Result<Self, StaticStorageIdentityDecodeError> {
         let mut decoder = IdentityDecoder::new(bytes);
-        decoder.expect_magic()?;
+        let magic = decoder.take(STORAGE_IDENTITY_MAGIC.len(), "magic")?;
+        if magic != STORAGE_IDENTITY_MAGIC {
+            return Err(StaticStorageIdentityDecodeError::UnknownMagic);
+        }
         let version = decoder.read_u16("version")?;
         if version != STORAGE_IDENTITY_VERSION {
-            return Err("static storage identity has an unsupported version".to_string());
+            return Err(StaticStorageIdentityDecodeError::UnsupportedVersion(
+                version,
+            ));
         }
         let topology_generation = decoder.read_u64("topology generation")?;
         let storage_node_id = decoder.read_u32("storage node id")?;
@@ -579,7 +658,7 @@ impl StaticStorageIdentity {
         let process_id = decoder.read_string("process id")?;
         let process_identity_digest = decoder.read_string("process identity digest")?;
         if !decoder.is_empty() {
-            return Err("static storage identity has trailing bytes".to_string());
+            return Err(StaticStorageIdentityDecodeError::TrailingData);
         }
         Ok(Self {
             cluster_id,
@@ -642,6 +721,29 @@ pub(crate) fn initialize_static_storage(
     ec_shape: EcShape,
     initial_cluster_epoch: ClusterEpoch,
 ) -> Result<(), String> {
+    initialize_static_storage_after_marker_verification(
+        identity,
+        storage_node_id,
+        data_dir,
+        pg_ids,
+        ec_shape,
+        initial_cluster_epoch,
+        || {},
+    )
+}
+
+fn initialize_static_storage_after_marker_verification<F>(
+    identity: &ConfiguredStaticClusterIdentity,
+    storage_node_id: u32,
+    data_dir: &Path,
+    pg_ids: &[u32],
+    ec_shape: EcShape,
+    initial_cluster_epoch: ClusterEpoch,
+    after_marker_verification: F,
+) -> Result<(), String>
+where
+    F: FnOnce(),
+{
     let expected = StaticStorageIdentity::new(identity, storage_node_id);
     let expected_bytes = expected.encode()?;
     ensure_private_data_directory_durable(data_dir)?;
@@ -670,8 +772,11 @@ pub(crate) fn initialize_static_storage(
             marker_path.display()
         )
     })? {
-        verify_static_storage_identity(&marker_path, &expected)?;
-        sync_identity_file(&marker_path, "sync static storage initialization marker")?;
+        verify_and_sync_static_storage_identity_after_verification(
+            &marker_path,
+            &expected,
+            after_marker_verification,
+        )?;
         sync_directory(data_dir, "sync static storage initialization marker")?;
     } else {
         publish_initialization_marker(data_dir, &expected, &storage_node_initialization_guard)?;
@@ -1045,25 +1150,89 @@ fn verify_static_storage_identity(
     path: &Path,
     expected: &StaticStorageIdentity,
 ) -> Result<(), String> {
-    let actual = read_static_storage_identity(path)?;
+    let (actual, _file, _bytes) = open_static_storage_identity(path)?;
     actual.verify(expected)
 }
 
-fn sync_identity_file(path: &Path, context: &'static str) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    options
-        .open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| format!("{context} {}: {error}", path.display()))
+fn verify_and_sync_static_storage_identity_after_verification<F>(
+    path: &Path,
+    expected: &StaticStorageIdentity,
+    after_verification: F,
+) -> Result<(), String>
+where
+    F: FnOnce(),
+{
+    let (actual, mut file, validated_bytes) = open_static_storage_identity(path)?;
+    actual.verify(expected)?;
+    let validated_metadata = file.metadata().map_err(|error| {
+        format!(
+            "inspect validated static storage initialization marker {}: {error}",
+            path.display()
+        )
+    })?;
+    after_verification();
+    file.sync_all().map_err(|error| {
+        format!(
+            "sync validated static storage initialization marker {}: {error}",
+            path.display()
+        )
+    })?;
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        format!(
+            "rewind validated static storage initialization marker {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut current_bytes = Vec::with_capacity(validated_bytes.len());
+    Read::by_ref(&mut file)
+        .take(STORAGE_IDENTITY_MAX_BYTES + 1)
+        .read_to_end(&mut current_bytes)
+        .map_err(|error| {
+            format!(
+                "reread validated static storage initialization marker {}: {error}",
+                path.display()
+            )
+        })?;
+    if current_bytes != validated_bytes {
+        return Err(format!(
+            "static storage initialization marker {} changed after validation",
+            path.display()
+        ));
+    }
+    let current_metadata = fs::symlink_metadata(path).map_err(|_| {
+        format!(
+            "static storage initialization marker {} changed after validation",
+            path.display()
+        )
+    })?;
+    if !current_metadata.file_type().is_file()
+        || current_metadata.dev() != validated_metadata.dev()
+        || current_metadata.ino() != validated_metadata.ino()
+    {
+        return Err(format!(
+            "static storage initialization marker {} changed after validation",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
+#[cfg(test)]
 fn read_static_storage_identity(path: &Path) -> Result<StaticStorageIdentity, String> {
-    let bytes =
-        read_bounded_identity_file(path, STORAGE_IDENTITY_MAX_BYTES, "static storage identity")?;
-    StaticStorageIdentity::decode(&bytes)
+    open_static_storage_identity(path).map(|(identity, _file, _bytes)| identity)
+}
+
+fn open_static_storage_identity(
+    path: &Path,
+) -> Result<(StaticStorageIdentity, File, Vec<u8>), String> {
+    let (bytes, file) = open_bounded_identity_file_typed(
+        path,
+        STORAGE_IDENTITY_MAX_BYTES,
+        "static storage identity",
+    )
+    .map_err(StaticStateReadError::into_message)?;
+    let identity = StaticStorageIdentity::decode(&bytes).map_err(|error| error.to_string())?;
+    Ok((identity, file, bytes))
 }
 
 fn read_bounded_identity_file(
@@ -1080,11 +1249,19 @@ fn read_bounded_identity_file_typed(
     max_bytes: u64,
     label: &'static str,
 ) -> Result<Vec<u8>, StaticStateReadError> {
+    open_bounded_identity_file_typed(path, max_bytes, label).map(|(bytes, _file)| bytes)
+}
+
+fn open_bounded_identity_file_typed(
+    path: &Path,
+    max_bytes: u64,
+    label: &'static str,
+) -> Result<(Vec<u8>, File), StaticStateReadError> {
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = options.open(path).map_err(|error| {
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut file = options.open(path).map_err(|error| {
         let message = format!("open {label} {}: {error}", path.display());
         if error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ELOOP)
         {
@@ -1108,7 +1285,8 @@ fn read_bounded_identity_file_typed(
         )));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_bytes + 1)
+    Read::by_ref(&mut file)
+        .take(max_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| {
             StaticStateReadError::Persistence(format!("read {label} {}: {error}", path.display()))
@@ -1118,7 +1296,7 @@ fn read_bounded_identity_file_typed(
             "{label} exceeds its size bound"
         )));
     }
-    Ok(bytes)
+    Ok((bytes, file))
 }
 
 fn encode_string(bytes: &mut Vec<u8>, value: &str, field: &str) -> Result<(), String> {
@@ -1144,49 +1322,45 @@ impl<'a> IdentityDecoder<'a> {
         Self { remaining: bytes }
     }
 
-    fn expect_magic(&mut self) -> Result<(), String> {
-        let magic = self.take(STORAGE_IDENTITY_MAGIC.len(), "magic")?;
-        if magic != STORAGE_IDENTITY_MAGIC {
-            return Err("static storage identity has invalid magic".to_string());
-        }
-        Ok(())
-    }
-
-    fn read_u16(&mut self, field: &str) -> Result<u16, String> {
+    fn read_u16(&mut self, field: &'static str) -> Result<u16, IdentityFieldDecodeError> {
         let bytes: [u8; 2] = self
             .take(2, field)?
             .try_into()
-            .map_err(|_| format!("static storage identity has truncated {field}"))?;
+            .map_err(|_| IdentityFieldDecodeError::Truncated { field })?;
         Ok(u16::from_be_bytes(bytes))
     }
 
-    fn read_u32(&mut self, field: &str) -> Result<u32, String> {
+    fn read_u32(&mut self, field: &'static str) -> Result<u32, IdentityFieldDecodeError> {
         let bytes: [u8; 4] = self
             .take(4, field)?
             .try_into()
-            .map_err(|_| format!("static storage identity has truncated {field}"))?;
+            .map_err(|_| IdentityFieldDecodeError::Truncated { field })?;
         Ok(u32::from_be_bytes(bytes))
     }
 
-    fn read_u64(&mut self, field: &str) -> Result<u64, String> {
+    fn read_u64(&mut self, field: &'static str) -> Result<u64, IdentityFieldDecodeError> {
         let bytes: [u8; 8] = self
             .take(8, field)?
             .try_into()
-            .map_err(|_| format!("static storage identity has truncated {field}"))?;
+            .map_err(|_| IdentityFieldDecodeError::Truncated { field })?;
         Ok(u64::from_be_bytes(bytes))
     }
 
-    fn read_string(&mut self, field: &str) -> Result<String, String> {
+    fn read_string(&mut self, field: &'static str) -> Result<String, IdentityFieldDecodeError> {
         let len = usize::from(self.read_u16(field)?);
         let bytes = self.take(len, field)?;
         std::str::from_utf8(bytes)
             .map(str::to_owned)
-            .map_err(|_| format!("static storage identity has invalid UTF-8 in {field}"))
+            .map_err(|_| IdentityFieldDecodeError::InvalidUtf8 { field })
     }
 
-    fn take(&mut self, len: usize, field: &str) -> Result<&'a [u8], String> {
+    fn take(
+        &mut self,
+        len: usize,
+        field: &'static str,
+    ) -> Result<&'a [u8], IdentityFieldDecodeError> {
         if self.remaining.len() < len {
-            return Err(format!("static storage identity has truncated {field}"));
+            return Err(IdentityFieldDecodeError::Truncated { field });
         }
         let (value, remaining) = self.remaining.split_at(len);
         self.remaining = remaining;
@@ -1202,7 +1376,9 @@ impl<'a> IdentityDecoder<'a> {
 mod tests {
     use super::*;
     use std::ffi::CString;
+    use std::fmt::Write as _;
     use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
     use storage::{LocalClusterMap, LocalNodeStoreConfig};
 
     fn identity(process_id: &str, process_digest: &str) -> ConfiguredStaticClusterIdentity {
@@ -1232,6 +1408,28 @@ mod tests {
         )
     }
 
+    fn initialize_storage_after_marker_verification<F>(
+        identity: &ConfiguredStaticClusterIdentity,
+        storage_node_id: u32,
+        data_dir: &Path,
+        pg_ids: &[u32],
+        ec_shape: EcShape,
+        after_marker_verification: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(),
+    {
+        initialize_static_storage_after_marker_verification(
+            identity,
+            storage_node_id,
+            data_dir,
+            pg_ids,
+            ec_shape,
+            ClusterEpoch::INITIAL,
+            after_marker_verification,
+        )
+    }
+
     fn write_control_plane_restart_set(state_path: &Path) {
         let file_name = state_path.file_name().unwrap().to_str().unwrap();
         fs::write(state_path, b"durable artifact").unwrap();
@@ -1250,6 +1448,199 @@ mod tests {
         bytes.extend_from_slice(digest.as_bytes());
     }
 
+    fn replace_storage_identity_version(bytes: &mut [u8], version: u16) {
+        let version_offset = STORAGE_IDENTITY_MAGIC.len();
+        bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(encoded, "{byte:02x}").unwrap();
+        }
+        encoded
+    }
+
+    fn bytes_from_hex(encoded: &str) -> Vec<u8> {
+        assert_eq!(encoded.len() % 2, 0);
+        encoded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                    .expect("fixture must contain hexadecimal bytes")
+            })
+            .collect()
+    }
+
+    fn storage_tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn visit(root: &Path, directory: &Path, snapshot: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    snapshot.push((relative, None));
+                    visit(root, &path, snapshot);
+                } else if file_type.is_file() {
+                    snapshot.push((relative, Some(fs::read(path).unwrap())));
+                } else {
+                    panic!("unexpected storage test artifact {}", path.display());
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    fn prepare_storage_lock_files(data_dir: &Path) {
+        drop(
+            storage::storage_node_server::StorageNodeStateInitializationGuard::acquire(data_dir)
+                .unwrap(),
+        );
+        drop(acquire_storage_directory_lock(data_dir).unwrap());
+    }
+
+    #[test]
+    fn current_static_storage_identity_matches_frozen_versioned_manifest_and_requires_version_bump()
+    {
+        assert_eq!(STORAGE_IDENTITY_VERSION, 1);
+        let configured = ConfiguredStaticClusterIdentity {
+            cluster_id: "c".to_string(),
+            topology_generation: 2,
+            topology_digest: "990380dfc3ea9351149d81bf1886d2921fe140ef4a56b9083ca1ee9e63e63a8b"
+                .to_string(),
+            process_id: "p".to_string(),
+            process_identity_digest:
+                "a91507daf79156b816e0bc0be3f762aa44ca8a69dc06be24e4c9fc5cf0052538".to_string(),
+        };
+        let identity = StaticStorageIdentity::new(&configured, 7);
+        const VERSION_1_HEX: &str = concat!(
+            "41524753534944000001000000000000000200000007000163004039393033383064666333",
+            "65613933353131343964383162663138383664323932316665313430656634613536623930",
+            "38336361316565396536336536336138620001700040613931353037646166373931353662",
+            "38313665306263306265336637363261613434636138613639646330366265323465346339",
+            "666335636630303532353338",
+        );
+
+        let bytes = identity.encode().unwrap();
+        assert_eq!(hex(&bytes), VERSION_1_HEX);
+        assert_eq!(
+            StaticStorageIdentity::decode(&bytes_from_hex(VERSION_1_HEX)),
+            Ok(identity)
+        );
+    }
+
+    #[test]
+    fn static_storage_identity_classifies_framing_and_field_failures() {
+        let stored_identity = StaticStorageIdentity::new(&identity("storage-1", "b"), 17);
+        let bytes = stored_identity.encode().unwrap();
+        assert_eq!(
+            StaticStorageIdentity::decode(&[]),
+            Err(StaticStorageIdentityDecodeError::Truncated { field: "magic" })
+        );
+        assert_eq!(
+            StaticStorageIdentity::decode(&bytes[..STORAGE_IDENTITY_MAGIC.len() - 1]),
+            Err(StaticStorageIdentityDecodeError::Truncated { field: "magic" })
+        );
+
+        let mut unknown_magic = bytes.clone();
+        unknown_magic[0] ^= 1;
+        assert_eq!(
+            StaticStorageIdentity::decode(&unknown_magic),
+            Err(StaticStorageIdentityDecodeError::UnknownMagic)
+        );
+        assert_eq!(
+            StaticStorageIdentity::decode(&bytes[..STORAGE_IDENTITY_MAGIC.len() + 1]),
+            Err(StaticStorageIdentityDecodeError::Truncated { field: "version" })
+        );
+
+        for version in [0, STORAGE_IDENTITY_VERSION + 1] {
+            let mut unsupported = bytes.clone();
+            replace_storage_identity_version(&mut unsupported, version);
+            unsupported.truncate(STORAGE_IDENTITY_MAGIC.len() + 2);
+            assert_eq!(
+                StaticStorageIdentity::decode(&unsupported),
+                Err(StaticStorageIdentityDecodeError::UnsupportedVersion(
+                    version
+                ))
+            );
+        }
+
+        let cluster_length_offset = STORAGE_IDENTITY_MAGIC.len() + 2 + 8 + 4;
+        assert_eq!(
+            StaticStorageIdentity::decode(&bytes[..cluster_length_offset + 1]),
+            Err(StaticStorageIdentityDecodeError::Truncated {
+                field: "cluster id"
+            })
+        );
+        let cluster_offset = cluster_length_offset + 2;
+        let mut truncated_cluster = bytes.clone();
+        truncated_cluster.truncate(cluster_offset + stored_identity.cluster_id.len() - 1);
+        assert_eq!(
+            StaticStorageIdentity::decode(&truncated_cluster),
+            Err(StaticStorageIdentityDecodeError::Truncated {
+                field: "cluster id"
+            })
+        );
+        let mut invalid_utf8 = bytes.clone();
+        invalid_utf8[cluster_offset] = 0xff;
+        assert_eq!(
+            StaticStorageIdentity::decode(&invalid_utf8),
+            Err(StaticStorageIdentityDecodeError::InvalidField {
+                field: "cluster id"
+            })
+        );
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_eq!(
+            StaticStorageIdentity::decode(&trailing),
+            Err(StaticStorageIdentityDecodeError::TrailingData)
+        );
+    }
+
+    #[test]
+    fn static_storage_identity_reader_enforces_exact_file_bound_and_regular_file_type() {
+        let configured = ConfiguredStaticClusterIdentity {
+            cluster_id: "c".repeat(865),
+            topology_generation: 7,
+            topology_digest: "a".repeat(64),
+            process_id: "p".to_string(),
+            process_identity_digest: "b".repeat(64),
+        };
+        let identity = StaticStorageIdentity::new(&configured, 17);
+        let bytes = identity.encode().unwrap();
+        assert_eq!(bytes.len(), STORAGE_IDENTITY_MAX_BYTES as usize);
+
+        let temp = test_util::tempdir();
+        let identity_path = temp.path().join("identity");
+        fs::write(&identity_path, &bytes).unwrap();
+        assert_eq!(read_static_storage_identity(&identity_path), Ok(identity));
+
+        let mut oversized = bytes;
+        oversized.push(0);
+        fs::write(&identity_path, oversized).unwrap();
+        assert_eq!(
+            read_static_storage_identity(&identity_path).unwrap_err(),
+            "static storage identity exceeds its size bound"
+        );
+
+        fs::remove_file(&identity_path).unwrap();
+        let path_bytes = CString::new(identity_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path_bytes` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+        assert!(read_static_storage_identity(&identity_path)
+            .unwrap_err()
+            .contains("is not a regular file"));
+    }
+
     #[test]
     fn static_identities_reject_unsupported_versions() {
         let expected = identity("storage-1", "b");
@@ -1259,7 +1650,7 @@ mod tests {
             bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
             assert_eq!(
                 StaticStorageIdentity::decode(&bytes).unwrap_err(),
-                "static storage identity has an unsupported version"
+                StaticStorageIdentityDecodeError::UnsupportedVersion(version)
             );
         }
 
@@ -1521,6 +1912,46 @@ mod tests {
     }
 
     #[test]
+    fn static_storage_unsupported_versions_precede_initialization_and_startup_mutation() {
+        let expected = identity("all-1", "b");
+        for version in [0, STORAGE_IDENTITY_VERSION + 1] {
+            let marker_temp = test_util::tempdir();
+            let marker_dir = marker_temp.path().join("storage");
+            ensure_private_data_directory_durable(&marker_dir).unwrap();
+            prepare_storage_lock_files(&marker_dir);
+            let marker_path = marker_dir.join(STORAGE_INITIALIZING_FILE_NAME);
+            let mut marker_bytes = StaticStorageIdentity::new(&expected, 1).encode().unwrap();
+            replace_storage_identity_version(&mut marker_bytes, version);
+            fs::write(&marker_path, marker_bytes).unwrap();
+            let marker_before = storage_tree_snapshot(&marker_dir);
+
+            assert_eq!(
+                initialize_storage(&expected, 1, &marker_dir, &[0], EcShape { k: 1, m: 0 },)
+                    .unwrap_err(),
+                format!("static storage identity has unsupported version {version}")
+            );
+            assert_eq!(storage_tree_snapshot(&marker_dir), marker_before);
+            assert!(!marker_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
+
+            let identity_temp = test_util::tempdir();
+            let identity_dir = identity_temp.path().join("storage");
+            initialize_storage(&expected, 1, &identity_dir, &[0], EcShape { k: 1, m: 0 }).unwrap();
+            let identity_path = identity_dir.join(STORAGE_IDENTITY_FILE_NAME);
+            let mut identity_bytes = fs::read(&identity_path).unwrap();
+            replace_storage_identity_version(&mut identity_bytes, version);
+            fs::write(&identity_path, identity_bytes).unwrap();
+            let identity_before = storage_tree_snapshot(&identity_dir);
+
+            assert_eq!(
+                lock_and_verify_standalone_storage_startup(&expected, 1, &identity_dir, &[0])
+                    .unwrap_err(),
+                format!("static storage identity has unsupported version {version}")
+            );
+            assert_eq!(storage_tree_snapshot(&identity_dir), identity_before);
+        }
+    }
+
+    #[test]
     fn static_storage_rejects_wrong_process_identity() {
         let temp = test_util::tempdir();
         let data_dir = temp.path().join("storage");
@@ -1659,6 +2090,101 @@ mod tests {
         initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap();
 
         lock_and_verify_standalone_storage_startup(&expected, 1, &data_dir, &[0]).unwrap();
+    }
+
+    #[test]
+    fn static_storage_initialization_rejects_marker_path_replacement_after_descriptor_validation() {
+        for replace_with_fifo in [false, true] {
+            let temp = test_util::tempdir();
+            let data_dir = temp.path().join("storage");
+            let expected = identity("all-1", "b");
+            ensure_private_data_directory_durable(&data_dir).unwrap();
+            prepare_storage_lock_files(&data_dir);
+            let marker_path = data_dir.join(STORAGE_INITIALIZING_FILE_NAME);
+            create_identity_file(&marker_path, &StaticStorageIdentity::new(&expected, 1)).unwrap();
+            let marker_path_for_hook = marker_path.clone();
+
+            let error = initialize_storage_after_marker_verification(
+                &expected,
+                1,
+                &data_dir,
+                &[0],
+                EcShape { k: 1, m: 0 },
+                move || {
+                    fs::remove_file(&marker_path_for_hook).unwrap();
+                    if replace_with_fifo {
+                        let path_bytes =
+                            CString::new(marker_path_for_hook.as_os_str().as_bytes()).unwrap();
+                        // SAFETY: `path_bytes` is a valid NUL-terminated path.
+                        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+                    } else {
+                        fs::write(&marker_path_for_hook, b"replacement marker").unwrap();
+                    }
+                },
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains("changed after validation"),
+                "unexpected replacement error: {error}"
+            );
+            assert!(!data_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
+            assert!(marker_path.exists());
+            assert!(
+                fs::read_dir(&data_dir).unwrap().all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pg-")),
+                "marker replacement must fail before PG initialization"
+            );
+        }
+    }
+
+    #[test]
+    fn static_storage_initialization_rejects_same_inode_marker_mutation_after_validation() {
+        let temp = test_util::tempdir();
+        let data_dir = temp.path().join("storage");
+        let expected = identity("all-1", "b");
+        ensure_private_data_directory_durable(&data_dir).unwrap();
+        prepare_storage_lock_files(&data_dir);
+        let marker_path = data_dir.join(STORAGE_INITIALIZING_FILE_NAME);
+        create_identity_file(&marker_path, &StaticStorageIdentity::new(&expected, 1)).unwrap();
+        let original_metadata = fs::metadata(&marker_path).unwrap();
+        let mut unsupported_bytes = fs::read(&marker_path).unwrap();
+        replace_storage_identity_version(&mut unsupported_bytes, 0);
+        let unsupported_bytes_for_hook = unsupported_bytes.clone();
+        let marker_path_for_hook = marker_path.clone();
+
+        let error = initialize_storage_after_marker_verification(
+            &expected,
+            1,
+            &data_dir,
+            &[0],
+            EcShape { k: 1, m: 0 },
+            move || {
+                fs::write(&marker_path_for_hook, unsupported_bytes_for_hook).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("changed after validation"),
+            "unexpected in-place mutation error: {error}"
+        );
+        let mutated_metadata = fs::metadata(&marker_path).unwrap();
+        assert_eq!(mutated_metadata.dev(), original_metadata.dev());
+        assert_eq!(mutated_metadata.ino(), original_metadata.ino());
+        assert_eq!(fs::read(&marker_path).unwrap(), unsupported_bytes);
+        assert!(!data_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
+        assert!(
+            fs::read_dir(&data_dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pg-")),
+            "in-place marker mutation must fail before PG initialization"
+        );
     }
 
     #[test]
