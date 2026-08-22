@@ -38,4 +38,7 @@ cargo nextest run --release -p argmin-s3 --bin argmin-s3 \
 
 echo
 echo "== release control-plane process suite =="
-cargo nextest run --release -p argmin-s3 --test experimental_raft_process
+# Release binaries accept the environment-shaped split-process fixture only
+# through its explicit test compatibility feature.
+cargo nextest run --release -p argmin-s3 --test experimental_raft_process \
+    --features test-unauthenticated-internal-rpc
