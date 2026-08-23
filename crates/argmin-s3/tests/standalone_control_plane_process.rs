@@ -7,9 +7,8 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use storage::test_support::{
     observe_single_authority_durable_state, prepare_unsupported_authority_clock_checkpoint_restart,
@@ -25,6 +24,7 @@ use storage::test_support::{
 
 struct TestDir {
     path: PathBuf,
+    _temp: test_util::TempDir,
 }
 
 struct ChildGuard {
@@ -33,26 +33,13 @@ struct ChildGuard {
 
 impl TestDir {
     fn new() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos();
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "a3-single-authority-{}-{id}-{now:x}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("test directory should be created");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        let temp = test_util::tempdir();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
             .expect("test directory should be private");
-        Self { path }
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        Self {
+            path: temp.path().to_path_buf(),
+            _temp: temp,
+        }
     }
 }
 

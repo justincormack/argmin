@@ -40,11 +40,18 @@ const DEFAULT_ADMIN_INSTANCE_ID: &str = "server-admin";
 
 struct TestDir {
     path: PathBuf,
+    _temp: Option<test_util::TempDir>,
 }
 
 impl TestDir {
     fn new(_name: &str) -> Self {
-        Self::new_under(&std::env::temp_dir())
+        let temp = test_util::tempdir();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .expect("test directory should be private");
+        Self {
+            path: temp.path().to_path_buf(),
+            _temp: Some(temp),
+        }
     }
 
     fn new_under(parent: &Path) -> Self {
@@ -58,7 +65,7 @@ impl TestDir {
         fs::create_dir_all(&path).expect("test directory should be created");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
             .expect("test directory should be private");
-        Self { path }
+        Self { path, _temp: None }
     }
 
     fn path(&self) -> &Path {
@@ -68,7 +75,9 @@ impl TestDir {
 
 impl Drop for TestDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if self._temp.is_none() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
