@@ -5587,8 +5587,8 @@ Eleventh Phase 4 correction (2026-08-03):
 ### Phase 5 — isolate test support
 
 Audit update (2026-08-03): this phase is materially smaller in architectural
-scope than when the plan was written. The containment work tracked by
-`storage-upgrade-versioning-plan.md` moved storage-node protocols, physical
+scope than when the plan was written. The containment work now archived in
+`storage-format-baseline-and-containment-plan.md` moved storage-node protocols, physical
 payload representations, maintenance workers, claims, reclaim/finalization
 state, and most impossible-state fixtures into `storage`. The ordinary
 normal/build dependency graphs for `argmin-s3`, `server-core`, and
@@ -5654,7 +5654,7 @@ The audit found and closed four classes of work:
    cross-crate test, expose an opaque scenario-level fault or logical
    observation rather than physical PG, shard, row, claim, or command records.
    This completed the test-fixture portion formerly shared with pending item
-   14 in `storage-upgrade-versioning-plan.md`; that plan retains ownership of
+   14 in `storage-format-baseline-and-containment-plan.md`; that plan retains ownership of
    its separate production error-wrapper and debug-PG containment work.
 
 3. **Completed — consolidated dev-only support.** Retained cross-crate test
@@ -6367,7 +6367,7 @@ Final Phase 5 completion audit (2026-08-07):
   reuse regressions also pass; and
 - Phase 5 is complete. The broader production `StoreError`/operation-wrapper
   boundary and debug-PG containment remain owned by item 14 of
-  `storage-upgrade-versioning-plan.md`; they are not test-support work.
+  `storage-format-baseline-and-containment-plan.md`; they are not test-support work.
 
 Completion:
 
@@ -6799,14 +6799,11 @@ Phase 6 error-representation follow-up slice (2026-08-09):
   string-flattening conversion; and
 - retained the object-encryption, user/system metadata, tag, and ACL codec
   checks. The completed containment inventory in
-  `storage-upgrade-versioning-plan.md` records their current owners, opaque
-  carrier boundaries, exact-current evidence, and containing formats. Phase 2
-  of that plan remains active: in particular, the selected framed tag/ACL
-  carriers and coordinated containing-format version advances have not
-  landed. These checks are permanent cross-crate ownership guards, and also
-  keep the current unframed representations frozen while that format work is
-  open. Behavior tests pin the bytes; the checks prevent another crate from
-  becoming an unrecorded interpreter or producer before or after the advance.
+  `storage-format-baseline-and-containment-plan.md` records their current owners, opaque
+  carrier boundaries, exact-current evidence, and containing formats. The framed tag/ACL
+  carriers and coordinated containing-format advances are complete. These checks remain
+  permanent cross-crate ownership guards: behavior tests pin the bytes, while the checks prevent
+  another crate from becoming an unrecorded interpreter or producer.
 
 The checker baseline after this slice is 34 actual `fail_with_matches`
 invocations (27 top-level and seven nested).
@@ -6825,7 +6822,7 @@ every historical symbol ban merely because it already existed.
 | HTTP storage boundary (2) | HTTP uses opaque diagnostics and semantic EC support rather than physical PG/checkpoint/snapshot/placement or erasure-code representations. | Some logical storage and EC types are public for legitimate owner/server-core use, so visibility cannot express the dependency-layer rule. | HTTP behavior can remain correct while an internal diagnostic or test acquires forbidden physical authority. | `server-http` source and its Cargo dependency declaration. |
 | Live-transfer opacity (2) | Public transfer capabilities remain opaque, non-`Clone`, non-`Debug`, and cannot act as the unrestricted runtime-map source. | Rust permits a future public field, trait implementation, or derive on an intentionally public type. | Runtime transfer tests do not prove negative trait/API properties for downstream callers. | The four public live-transfer facade declarations and trait implementations, with compile-fail doctests for linear/debug properties. |
 | Manual/operator/control-plane facades (7) | Process administration uses logical opaque PG, Raft, clock, and control-plane facades and typed retry/error classifications rather than reconstructing proofs, transport state, or remote diagnostic policy. | Several lower logical control-plane values are public for other legitimate storage/control-plane integrations; Rust has no per-caller policy for `argmin-s3`. | Happy-path administration tests cannot prove that a parallel raw dispatch or diagnostic-string policy was not introduced. | Production `argmin-s3` dispatch call sites plus the bounded public facade declarations and typed error classifiers. |
-| Nested metadata codecs (4) | Encryption bytes, metadata blobs, canonical tag XML, and ACL durable strings remain confined to their recorded format owners and approved opaque carrier boundary. The current tag/ACL representations remain frozen until their planned framed replacements and coordinated container advances land. | The ownership design intentionally crosses selected crate boundaries, so visibility cannot express which crate owns interpretation and which may only transport the opaque value. | Exact-current goldens and rejection matrices prove bytes and behavior but do not prevent an additional crate from becoming an unrecorded interpreter or producer. | The codec declarations and cross-crate uses, paired with the current owner-local goldens, containing-format inventory, and still-active Phase 2 format gates in `storage-upgrade-versioning-plan.md`. |
+| Nested metadata codecs (4) | Encryption bytes, metadata blobs, canonical framed tag sets, and canonical framed ACL grants remain confined to their recorded format owners and approved opaque carrier boundary. The current framed tag/ACL representations and coordinated containing formats are the frozen baseline. | The ownership design intentionally crosses selected crate boundaries, so visibility cannot express which crate owns interpretation and which may only transport the opaque value. | Exact-current goldens and rejection matrices prove bytes and behavior but do not prevent an additional crate from becoming an unrecorded interpreter or producer. | The codec declarations and cross-crate uses, paired with the current owner-local goldens, containing-format inventory, and completed Phase 2 format gates archived in `storage-format-baseline-and-containment-plan.md`. |
 | Dynamic/static route authority (1) | Only the process bootstrap owns dynamic runtime-map publication; request consumers cannot upgrade a route handle; standalone identity files and mutation protocol remain storage-owned; `legacy-local` cannot return. | Both static request handles and dynamic publication handles are public capabilities needed by the process layer, while file names and role spellings are not type-level properties. | Route transition and restart tests do not reject an additional consumer, duplicated file protocol, or parser role. | Production runtime-handle consumers, standalone type consumers/file spellings and mutation sites, and process-role parsing. Deleted constructor spellings and the crate-private authorized constructor are no longer scanned. |
 | Curated cross-crate test support (2) | Feature-gated public test support cannot expose physical PG/node/shard/route/proof/claim/durable-row/generation/EC-shape authority, including through aliases or reexports. | Several forbidden types are public production types, so ordinary privacy and private-interface lints cannot stop the curated test namespace from reexporting them. | Tests consuming the intended facade do not enumerate all public declarations or transitive aliases. | Recursive declaration-semantic scan of `storage::test_support` plus outcome-based adversarial fixtures. |
 

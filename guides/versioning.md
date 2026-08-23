@@ -4,10 +4,12 @@
 # Versioned Formats And Compatibility
 
 This guide defines how Argmin owns and changes durable and cross-process
-formats. The current format inventory, evidence status, and implementation
-work are tracked in
+formats. The completed current-format inventory and evidence record is archived
+in
+[`storage-format-baseline-and-containment-plan.md`](../plans/completed/storage-format-baseline-and-containment-plan.md).
+Future migration and mixed-version implementation work is tracked in
 [`storage-upgrade-versioning-plan.md`](../plans/storage-upgrade-versioning-plan.md).
-The plan is allowed to change as work progresses; this guide states the
+Plans are allowed to change as work progresses; this guide states the
 engineering rules that should remain true.
 
 This is internal format versioning. It is separate from Rust API stability,
@@ -204,7 +206,10 @@ types still compile.
 ## Future Upgrade And Compatibility Work
 
 Upgrade support will be designed deliberately rather than emerging as a set of
-fallback parsers. At minimum, it will require:
+fallback parsers. The format-specific implementation models and ordering are in
+the active
+[`storage upgrade and mixed-version compatibility plan`](../plans/storage-upgrade-versioning-plan.md).
+At minimum, support will require:
 
 - an explicit supported-version and compatibility matrix;
 - ordered, crash-safe upgrade steps with preconditions, postconditions, and

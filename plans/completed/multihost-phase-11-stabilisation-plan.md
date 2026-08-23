@@ -161,7 +161,7 @@ Progress update:
   materialised rows on reopen and make caller semantics unclear.
 
 1. **Define recovery semantics explicitly.** **Completed.** Document, in
-   [`guides/storage-cluster-invariants.md`](../guides/storage-cluster-invariants.md), that
+   [`guides/storage-cluster-invariants.md`](../../guides/storage-cluster-invariants.md), that
    opening a PG store plus explicit recovery is a validation boundary and state which
    anomaly classes fail closed (possible corruption: hash-chain break, digest mismatch,
    forked log, or future-epoch pending-slot ambiguity) versus which are locally recoverable
@@ -388,7 +388,7 @@ Progress update:
 ### Out of scope for Slice 1
 
 - SQLite trigger SQL body verification (moved to
-  [`storage-upgrade-versioning-plan.md`](storage-upgrade-versioning-plan.md)). The
+  [`storage-upgrade-versioning-plan.md`](../storage-upgrade-versioning-plan.md)). The
   materialised digest scan in work item 2b catches the *symptom* of a stale trigger
   definition at open. Trigger-body verification is part of future versioned upgrade
   support, not current Phase 11 stabilisation, because the project deliberately does not
@@ -404,7 +404,7 @@ These are recorded here so the backlog is visible; each will be expanded into a 
 when prioritised. They correspond to the remaining findings from the Phase 11 review.
 
 - **Moved out:** Trigger SQL body verification now lives in
-  [`storage-upgrade-versioning-plan.md`](storage-upgrade-versioning-plan.md). It should be
+  [`storage-upgrade-versioning-plan.md`](../storage-upgrade-versioning-plan.md). It should be
   implemented only as part of a deliberate upgrade-support phase, after legacy format
   cleanup and baseline versioning are in place.
 
