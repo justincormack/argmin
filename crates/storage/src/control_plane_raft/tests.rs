@@ -688,12 +688,12 @@ fn state_machine_retirement_progress_watchdog(
     timer_completed: Arc<AtomicBool>,
 ) -> thread::JoinHandle<bool> {
     thread::spawn(move || {
-        hook.wait_until_entered(Duration::from_secs(1));
+        let retirement_started = hook.entered_within(IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT);
         retirement_entered.store(true, Ordering::SeqCst);
         thread::sleep(Duration::from_millis(100));
         let progressed_before_release = timer_completed.load(Ordering::SeqCst);
         hook.release();
-        progressed_before_release
+        retirement_started && progressed_before_release
     })
 }
 

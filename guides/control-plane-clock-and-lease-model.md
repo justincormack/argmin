@@ -79,6 +79,24 @@ command is not time recovery. A proposal that cannot satisfy the invariant is
 non-serving and must not preserve an older deadline whose time basis has been
 declared invalid.
 
+In a Raft authority, covered heartbeat renewals may advance a leader-local
+volatile overlay without appending every renewal to the WAL. Runtime-map reads
+must therefore be served by the current linearized leader. A follower can have
+an up-to-date replicated log while still lacking the leader's latest volatile
+lease renewal; it returns a typed leader-routing result so a
+multi-endpoint client retries the leader. Full snapshots, compact status,
+diagnostics, scoped PG maps, and pending-command recovery listings all follow
+this rule. On the leader, a runtime-map read also selects the replicated
+ReadIndex lower bound, then captures the current applied state-machine snapshot
+and its matching volatile overlay under the heartbeat-update gate. The capture
+copies only retirement-aware `Arc`-backed immutable generation handles.
+Runtime-map/status derivation and the reader's final generation release occur
+on the blocking lane after the gate is released; cancellation and early errors
+also defer a retained generation's release there. An applied tip that advances
+after ReadIndex is therefore included without repeating the quorum read or
+falling back to an older durable snapshot. Quorum I/O likewise occurs outside
+the gate so reads cannot starve heartbeat renewal.
+
 The authority process establishes a wall/monotonic reference before issuing
 timestamp-bearing work. Healthy wall progress may advance committed time by
 the corresponding monotonic elapsed time, even when the authority has been

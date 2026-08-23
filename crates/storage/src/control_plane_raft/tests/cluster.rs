@@ -2150,6 +2150,527 @@ fn control_plane_openraft_leader_transfer_fences_old_leader() {
 }
 
 #[test]
+fn control_plane_openraft_runtime_map_reads_route_followers_and_capture_rebased_volatile_lease() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (authority1, authority2) = initialized_two_node_authorities(
+            "control-plane-raft-runtime-map-leader-read-test",
+            711,
+            712,
+        )
+        .await;
+        let authority1 = Arc::new(authority1);
+
+        let bootstrap = authority1
+            .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(NodeId::new(711), "node-711".to_string())],
+                pg_ids: vec![PgId::new(0)],
+            })
+            .await
+            .unwrap();
+        authority2
+            .wait_for_applied_log_id(
+                bootstrap.log_id(),
+                Duration::from_secs(1),
+                "runtime-map follower applied bootstrap before read",
+            )
+            .await
+            .unwrap();
+
+        let durable_generation = authority1
+            .raft()
+            .with_state_machine(|state_machine| {
+                let generation = state_machine.inner().snapshot_generation();
+                Box::pin(async move { generation })
+            })
+            .await
+            .unwrap();
+        let durable_retirement_hook =
+            Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+        authority1.set_linearized_snapshot_retirement_hook_for_test(Arc::clone(
+            &durable_retirement_hook,
+        ));
+        let durable_selection = authority1
+            .linearized_control_plane_snapshot_selection()
+            .await
+            .unwrap();
+        let durable_retirement_entered = Arc::new(AtomicBool::new(false));
+        let durable_timer_completed = Arc::new(AtomicBool::new(false));
+        let durable_retirement_watchdog = state_machine_retirement_progress_watchdog(
+            Arc::clone(&durable_retirement_hook),
+            Arc::clone(&durable_retirement_entered),
+            Arc::clone(&durable_timer_completed),
+        );
+        let durable_timer = tokio::spawn(mark_executor_timer_progress_after_phase_entry(
+            durable_retirement_entered,
+            durable_timer_completed,
+        ));
+        assert!(
+            Arc::ptr_eq(durable_selection.snapshot.arc(), &durable_generation),
+            "durable runtime-map selection must retain the immutable state-machine generation"
+        );
+        drop(durable_generation);
+        authority1
+            .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(711),
+                availability: NodeAvailabilityState::Healthy,
+            })
+            .await
+            .unwrap();
+        drop(durable_selection);
+        durable_timer.await.unwrap();
+        assert!(
+            durable_retirement_watchdog.join().unwrap(),
+            "single-worker executor must progress while durable generation destruction is blocked"
+        );
+
+        let leader_map = authority1
+            .linearized_runtime_map_snapshot(79_000)
+            .await
+            .unwrap();
+        assert_eq!(leader_map.pg_routes().len(), 1);
+        assert_eq!(leader_map.pg_routes()[0].pg_id(), PgId::new(0));
+
+        let follower_error = authority2
+            .linearized_runtime_map_snapshot(79_001)
+            .await
+            .unwrap_err();
+        assert!(
+            follower_error.is_control_plane_leader_routing_rejection(),
+            "unexpected follower runtime-map error: {follower_error:?}"
+        );
+        let follower_status_error = authority2
+            .linearized_runtime_map_status(79_002)
+            .await
+            .unwrap_err();
+        assert!(
+            follower_status_error.is_control_plane_leader_routing_rejection(),
+            "unexpected follower runtime-map status error: {follower_status_error:?}"
+        );
+
+        let authority_term = authority1
+            .status()
+            .await
+            .unwrap()
+            .current_term()
+            .expect("serving runtime-map authority should have a term");
+        let lease_horizon_authority =
+            LeaseHorizonAuthorityBinding::new(1, Some(authority_term));
+        let mut observed_epoch = leader_map.cluster_epoch();
+        for heartbeat_at_ms in [79_010, 79_011] {
+            let heartbeat = authority1
+                .submit_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat: NodeHeartbeat {
+                        node_id: NodeId::new(711),
+                        node_incarnation: 1,
+                        endpoint: "node-711".to_string(),
+                        observed_epoch,
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                            .unwrap(),
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: vec![NodePgHeartbeatObservation {
+                            pg_id: PgId::new(0),
+                            state: PgState::Peering,
+                            metadata_proof: PgMetadataProof::empty(),
+                            pending_metadata_command: None,
+                        }],
+                    },
+                    heartbeat_at_ms,
+                    lease_deadline_ms: heartbeat_at_ms + 1_000,
+                    lease_horizon_authority: Some(lease_horizon_authority),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                heartbeat.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::RecordNodeHeartbeat
+                )
+            ));
+            observed_epoch = authority1
+                .current_control_plane_snapshot()
+                .await
+                .unwrap()
+                .cluster_epoch();
+        }
+        let completion = authority1
+            .submit_control_plane_command(ControlPlaneCommand::CompletePgPeering {
+                pg_id: PgId::new(0),
+                primary: NodeId::new(711),
+                node_incarnation: 1,
+                complete_at_ms: 79_012,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            completion.outcome(),
+            ControlPlaneRaftCommandOutcome::Applied(
+                ControlPlaneCommandResponse::CompletePgPeering
+            )
+        ));
+        observed_epoch = authority1
+            .current_control_plane_snapshot()
+            .await
+            .unwrap()
+            .cluster_epoch();
+        authority1
+            .submit_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat: NodeHeartbeat {
+                    node_id: NodeId::new(711),
+                    node_incarnation: 1,
+                    endpoint: "node-711".to_string(),
+                    observed_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                        .unwrap(),
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(0),
+                        state: PgState::Active,
+                        metadata_proof: PgMetadataProof::empty(),
+                        pending_metadata_command: None,
+                    }],
+                },
+                heartbeat_at_ms: 79_013,
+                lease_deadline_ms: 80_013,
+                lease_horizon_authority: Some(lease_horizon_authority),
+            })
+            .await
+            .unwrap();
+        observed_epoch = authority1
+            .current_control_plane_snapshot()
+            .await
+            .unwrap()
+            .cluster_epoch();
+        let volatile_lease_deadline_ms = 80_500;
+        let volatile_snapshot = authority1
+            .try_apply_volatile_heartbeat(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat: NodeHeartbeat {
+                    node_id: NodeId::new(711),
+                    node_incarnation: 1,
+                    endpoint: "node-711".to_string(),
+                    observed_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                        .unwrap(),
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(0),
+                        state: PgState::Active,
+                        metadata_proof: PgMetadataProof::empty(),
+                        pending_metadata_command: None,
+                    }],
+                },
+                heartbeat_at_ms: 79_500,
+                lease_deadline_ms: volatile_lease_deadline_ms,
+                lease_horizon_authority: Some(lease_horizon_authority),
+            })
+            .await
+            .unwrap()
+            .expect("covered heartbeat should publish a volatile lease overlay");
+        assert_eq!(
+            volatile_snapshot
+                .node(NodeId::new(711))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(volatile_lease_deadline_ms)
+        );
+        let overlay_generation = authority1
+            .volatile_heartbeat_overlay_generation(authority_term, authority1.status().await.unwrap().applied().unwrap())
+            .unwrap()
+            .expect("covered heartbeat should retain an overlay generation");
+        let overlay_retirement_hook =
+            Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+        authority1.set_linearized_snapshot_retirement_hook_for_test(Arc::clone(
+            &overlay_retirement_hook,
+        ));
+        let overlay_selection = authority1
+            .linearized_control_plane_snapshot_selection()
+            .await
+            .unwrap();
+        let overlay_retirement_entered = Arc::new(AtomicBool::new(false));
+        let overlay_timer_completed = Arc::new(AtomicBool::new(false));
+        let overlay_retirement_watchdog = state_machine_retirement_progress_watchdog(
+            Arc::clone(&overlay_retirement_hook),
+            Arc::clone(&overlay_retirement_entered),
+            Arc::clone(&overlay_timer_completed),
+        );
+        let overlay_timer = tokio::spawn(mark_executor_timer_progress_after_phase_entry(
+            overlay_retirement_entered,
+            overlay_timer_completed,
+        ));
+        assert!(
+            Arc::ptr_eq(
+                overlay_selection.snapshot.arc(),
+                overlay_generation.arc()
+            ),
+            "overlay runtime-map selection must retain the immutable overlay generation"
+        );
+        drop(overlay_generation);
+        authority1
+            .publish_rebased_volatile_heartbeat_overlay(
+                authority_term,
+                authority1.status().await.unwrap().applied().unwrap(),
+                volatile_snapshot.clone(),
+            )
+            .await
+            .unwrap();
+        ControlPlaneRaftTypeConfig::timeout(
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            async {
+                while Arc::strong_count(overlay_selection.snapshot.arc()) != 1 {
+                    ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(1)).await;
+                }
+            },
+        )
+        .await
+        .expect("replaced overlay owner should retire on the blocking lane");
+        drop(overlay_selection);
+        overlay_timer.await.unwrap();
+        assert!(
+            overlay_retirement_watchdog.join().unwrap(),
+            "single-worker executor must progress while overlay generation destruction is blocked"
+        );
+
+        let reads_before_advance = authority1.linearized_runtime_map_read_index_count_for_test();
+        let update_guard = authority1.volatile_heartbeat_update_gate.lock().await;
+        let read_gate = Arc::new(tokio::sync::Barrier::new(2));
+        authority1.set_linearized_read_after_snapshot_gate_for_test(Arc::clone(&read_gate));
+        let reader_authority = Arc::clone(&authority1);
+        let reader = tokio::spawn(async move {
+            reader_authority
+                .linearized_runtime_map_snapshot(79_003)
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            read_gate.wait(),
+        )
+        .await
+        .expect("runtime-map reader should reach the post-ReadIndex gate");
+
+        let advanced = authority1
+            .raft()
+            .client_write(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(711),
+                availability: NodeAvailabilityState::Healthy,
+            })
+            .await
+            .unwrap();
+        authority1
+            .publish_rebased_volatile_heartbeat_overlay(
+                authority_term,
+                advanced.log_id,
+                volatile_snapshot,
+            )
+            .await
+            .unwrap();
+        drop(update_guard);
+
+        let advanced_map = ControlPlaneRaftTypeConfig::timeout(
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            reader,
+        )
+        .await
+        .expect("runtime-map reader should complete after publication is released")
+        .expect("runtime-map reader task should join")
+        .expect("runtime-map reader should capture the rebased volatile lease");
+        assert_eq!(
+            authority1.linearized_runtime_map_read_index_count_for_test(),
+            reads_before_advance + 1,
+            "one ReadIndex followed by a current state-machine capture must make progress"
+        );
+        assert_eq!(
+            advanced_map.freshness_proof().read_index(),
+            Some(
+                control_plane_log_id_from_raft(advanced.log_id)
+                    .expect("advanced runtime-map read tip should be non-bootstrap")
+            ),
+            "runtime-map read must capture the applied tip reached after ReadIndex"
+        );
+        assert_eq!(
+            advanced_map.valid_until_ms(),
+            Some(volatile_lease_deadline_ms),
+            "full runtime-map read must select the volatile lease rebased to the captured tip"
+        );
+        let reads_before_status = authority1.linearized_runtime_map_read_index_count_for_test();
+        let advanced_status = authority1
+            .linearized_runtime_map_status(79_504)
+            .await
+            .unwrap();
+        assert_eq!(
+            authority1.linearized_runtime_map_read_index_count_for_test(),
+            reads_before_status + 1,
+            "compact status must also complete with one ReadIndex"
+        );
+        assert_eq!(advanced_status.pg_routes(), 1);
+        assert_eq!(advanced_status.active_serving_pg_routes(), 1);
+        assert_eq!(
+            advanced_status
+                .lease_renewal()
+                .expect("volatile active route should renew the compact runtime-map lease")
+                .validity()
+                .valid_until_ms(),
+            Some(volatile_lease_deadline_ms),
+            "compact status must derive its serving lease from the rebased volatile overlay"
+        );
+        assert_eq!(
+            advanced_status
+                .lease_renewal()
+                .expect("volatile active route should carry a content renewal")
+                .content_digest(),
+            advanced_map.content_digest(),
+            "full and compact reads must describe the same rebased volatile map"
+        );
+
+        let raft_state_capture_gate = Arc::new(tokio::sync::Barrier::new(2));
+        let generation_capture_gate = Arc::new(tokio::sync::Barrier::new(2));
+        let rejected_retirement_hook =
+            Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+        authority1.set_linearized_read_after_raft_state_capture_gate_for_test(Arc::clone(
+            &raft_state_capture_gate,
+        ));
+        authority1.set_linearized_read_after_generation_capture_gate_for_test(Arc::clone(
+            &generation_capture_gate,
+        ));
+        authority1.set_linearized_snapshot_retirement_hook_for_test(Arc::clone(
+            &rejected_retirement_hook,
+        ));
+        let rejected_retirement_entered = Arc::new(AtomicBool::new(false));
+        let rejected_timer_completed = Arc::new(AtomicBool::new(false));
+        let rejected_retirement_watchdog = state_machine_retirement_progress_watchdog(
+            Arc::clone(&rejected_retirement_hook),
+            Arc::clone(&rejected_retirement_entered),
+            Arc::clone(&rejected_timer_completed),
+        );
+        let rejected_timer = tokio::spawn(mark_executor_timer_progress_after_phase_entry(
+            rejected_retirement_entered,
+            rejected_timer_completed,
+        ));
+        let rejected_reader_authority = Arc::clone(&authority1);
+        let rejected_reader = tokio::spawn(async move {
+            rejected_reader_authority
+                .linearized_control_plane_snapshot_selection()
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            raft_state_capture_gate.wait(),
+        )
+        .await
+        .expect("reader should pause after capturing Raft readiness state");
+        authority1
+            .raft()
+            .client_write(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(711),
+                availability: NodeAvailabilityState::Unavailable,
+            })
+            .await
+            .unwrap();
+        ControlPlaneRaftTypeConfig::timeout(
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            raft_state_capture_gate.wait(),
+        )
+        .await
+        .expect("reader should resume to capture the advanced generation");
+        ControlPlaneRaftTypeConfig::timeout(
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            generation_capture_gate.wait(),
+        )
+        .await
+        .expect("reader should retain the advanced generation before readiness checks");
+        authority1
+            .raft()
+            .client_write(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(711),
+                availability: NodeAvailabilityState::Healthy,
+            })
+            .await
+            .unwrap();
+        ControlPlaneRaftTypeConfig::timeout(
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            generation_capture_gate.wait(),
+        )
+        .await
+        .expect("reader should resume after its generation is replaced");
+        let rejected_result = ControlPlaneRaftTypeConfig::timeout(
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            rejected_reader,
+        )
+        .await
+        .expect("readiness-rejected reader should finish boundedly")
+        .expect("readiness-rejected reader task should join");
+        let rejected_error = match rejected_result {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched Raft-state and applied captures must fail readiness"),
+        };
+        assert!(matches!(
+            rejected_error,
+            ControlPlaneError::AuthorityNotServing
+        ));
+        rejected_timer.await.unwrap();
+        assert!(
+            rejected_retirement_watchdog.join().unwrap(),
+            "single-worker executor must progress while an early-error generation is destroyed"
+        );
+
+        let channel_retirement_hook =
+            Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+        let response_ready_notify = Arc::new(tokio::sync::Notify::new());
+        authority1.set_linearized_snapshot_retirement_hook_for_test(Arc::clone(
+            &channel_retirement_hook,
+        ));
+        authority1.set_linearized_state_machine_response_ready_notify_for_test(Arc::clone(
+            &response_ready_notify,
+        ));
+        let channel_retirement_entered = Arc::new(AtomicBool::new(false));
+        let channel_timer_completed = Arc::new(AtomicBool::new(false));
+        let channel_retirement_watchdog = state_machine_retirement_progress_watchdog(
+            Arc::clone(&channel_retirement_hook),
+            Arc::clone(&channel_retirement_entered),
+            Arc::clone(&channel_timer_completed),
+        );
+        let channel_timer = tokio::spawn(mark_executor_timer_progress_after_phase_entry(
+            channel_retirement_entered,
+            channel_timer_completed,
+        ));
+        let mut unpolled_receiver =
+            Box::pin(authority1.retained_state_machine_snapshot_generation());
+        assert!(
+            futures_util::poll!(unpolled_receiver.as_mut()).is_pending(),
+            "state-machine generation request must suspend before its response is delivered"
+        );
+        ControlPlaneRaftTypeConfig::timeout(
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            response_ready_notify.notified(),
+        )
+        .await
+        .expect("state-machine worker should send the retained generation response");
+        authority1
+            .raft()
+            .client_write(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(711),
+                availability: NodeAvailabilityState::Unavailable,
+            })
+            .await
+            .unwrap();
+        drop(unpolled_receiver);
+        channel_timer.await.unwrap();
+        assert!(
+            channel_retirement_watchdog.join().unwrap(),
+            "single-worker executor must progress when a sent generation response is cancelled"
+        );
+
+        authority1.shutdown().await.unwrap();
+        authority2.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn control_plane_openraft_two_node_membership_change_updates_state_machine() {
     ControlPlaneRaftTypeConfig::run(async {
         let operation_timeout = Duration::from_secs(2);

@@ -37,6 +37,13 @@ impl ControlPlaneRaftStateMachineBlockingHook {
     }
 
     pub(super) fn wait_until_entered(&self, timeout: Duration) {
+        assert!(
+            self.entered_within(timeout),
+            "state-machine operation did not enter hook before timeout"
+        );
+    }
+
+    pub(super) fn entered_within(&self, timeout: Duration) -> bool {
         let state = self
             .state
             .lock()
@@ -45,8 +52,7 @@ impl ControlPlaneRaftStateMachineBlockingHook {
             .condition
             .wait_timeout_while(state, timeout, |state| !state.entered)
             .expect("state-machine blocking hook should not be poisoned");
-        assert!(state.entered, "state-machine operation did not enter hook");
-        assert!(!wait.timed_out(), "state-machine hook wait timed out");
+        state.entered && !wait.timed_out()
     }
 
     pub(super) fn entered(&self) -> bool {

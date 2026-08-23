@@ -1654,6 +1654,16 @@ fn write_frontend_runtime_map_refresh_status(
     );
     let _ = writeln!(
         body,
+        "frontend_pending_command_fallback_recovery_attempt_total {}",
+        status.fallback_recovery_attempts
+    );
+    let _ = writeln!(
+        body,
+        "frontend_pending_command_fallback_recovery_failure_total {}",
+        status.fallback_recovery_failures
+    );
+    let _ = writeln!(
+        body,
         "frontend_runtime_map_refresh_last_success_epoch {}",
         status
             .last_success

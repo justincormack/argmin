@@ -1326,6 +1326,11 @@ impl ReplicatedControlPlaneStateMachine {
     }
 
     #[must_use]
+    pub(crate) fn snapshot_generation(&self) -> Arc<ClusterControlSnapshot> {
+        Arc::clone(&self.snapshot)
+    }
+
+    #[must_use]
     pub fn last_applied(&self) -> Option<ControlPlaneLogId> {
         self.last_applied
     }

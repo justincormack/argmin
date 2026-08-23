@@ -5,7 +5,8 @@ use super::*;
 use crate::cluster::{PendingMetadataCommandRefreshRecoveryError, RequestWorkBudget};
 use crate::control_plane::{
     ControlPlaneError, ControlPlaneRuntimeMapSource, PendingMetadataCommandObservation,
-    PendingMetadataCommandRecovery, PendingMetadataCommandRecoveryListing,
+    PendingMetadataCommandRecovery, PendingMetadataCommandRecoveryDiscoveryFailure,
+    PendingMetadataCommandRecoveryDiscoveryFailureKind, PendingMetadataCommandRecoveryListing,
     PendingMetadataCommandRecoveryTask,
 };
 use crate::StorageClusterRouteHandle;
@@ -14,6 +15,103 @@ use crate::{BucketSnapshotLoadError, ObjectPgActionError};
 struct UnrelatedFullMapFailureSource<S> {
     authority: crate::control_plane::SingleAuthorityControlPlane<S>,
     tasks: Vec<PendingMetadataCommandRecoveryTask>,
+}
+
+struct RepeatedFullMapFailureSource {
+    refresh_attempts: Arc<std::sync::atomic::AtomicU64>,
+    include_discovery_failure: bool,
+}
+
+impl ControlPlaneRuntimeMapSource for RepeatedFullMapFailureSource {
+    fn runtime_map_snapshot(
+        &self,
+        _authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.refresh_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(ControlPlaneError::PgHasNoServingPrimary {
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::INITIAL,
+        })
+    }
+
+    fn pending_metadata_command_recoveries(
+        &self,
+        _authority_now_ms: u64,
+    ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+        let failures = self.include_discovery_failure.then(|| {
+            PendingMetadataCommandRecoveryDiscoveryFailure::new(
+                PgId::new(999),
+                PendingMetadataCommandRecoveryDiscoveryFailureKind::HistoricalRouteInvalid,
+                "injected discovery failure".to_string(),
+            )
+        });
+        Ok(PendingMetadataCommandRecoveryListing::new(
+            Vec::new(),
+            failures.into_iter().collect(),
+        ))
+    }
+
+    fn serving_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        _authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        Err(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
+    }
+}
+
+#[test]
+fn repeated_runtime_map_failure_triggers_one_fallback_scan_per_outage() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &[NodeId::new(0)], &[1], EcShape { k: 1, m: 0 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(cluster);
+    let cluster_epoch = handle.current().cluster_epoch();
+    let refresh_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let source = RepeatedFullMapFailureSource {
+        refresh_attempts: Arc::clone(&refresh_attempts),
+        include_discovery_failure: true,
+    };
+    let bucket = BucketName::new("fallback-with-nonempty-listing").unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command_at_epoch(cluster_epoch, pg_id, 1, bucket.clone());
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .try_insert_pending_metadata_command_slot(NodeId::new(0).as_u32(), &command, Some(&bucket))
+        .unwrap();
+    let mut refresh_loop = handle
+        .spawn_control_plane_refresh_loop(source, Duration::from_millis(1), || 1_000)
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while refresh_attempts.load(std::sync::atomic::Ordering::SeqCst) < 25
+        || refresh_loop.status().fallback_recovery_attempts == 0
+        || map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .pending_metadata_command_envelope(NodeId::new(0).as_u32(), cluster_epoch)
+            .unwrap()
+            .is_some()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "runtime-map outage did not exercise refresh and fallback workers: {:?}",
+            refresh_loop.status()
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(refresh_loop.status().fallback_recovery_attempts, 1);
+    assert_eq!(refresh_loop.status().fallback_recovery_failures, 0);
+    refresh_loop.stop();
 }
 
 impl<S: crate::control_plane::ControlPlaneStore> ControlPlaneRuntimeMapSource

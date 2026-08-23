@@ -157,6 +157,8 @@ pub struct StorageNodeServer {
     #[cfg(test)]
     runtime_route_before_publish_lock_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
     #[cfg(test)]
+    runtime_route_after_publish_lock_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
+    #[cfg(test)]
     response_envelope_test_hook: Arc<Mutex<Option<StorageRpcResponseEnvelopeTestHook>>>,
     #[cfg(test)]
     response_frame_test_hook: Arc<Mutex<Option<StorageRpcResponseFrameTestHook>>>,
@@ -166,6 +168,8 @@ pub struct StorageNodeServer {
     #[cfg(test)]
     metadata_checkpoint_rows_captured_test_hook:
         Arc<Mutex<Option<MetadataCheckpointRowsCapturedTestHook>>>,
+    #[cfg(test)]
+    control_plane_heartbeat_scan_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
 }
 
 #[cfg(test)]
@@ -539,17 +543,28 @@ impl PreparedStorageNodeServer {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageNodeControlPlaneRefreshLoopStatus {
-    pub attempts: u64,
-    pub successes: u64,
-    pub failures: u64,
-    pub last_lease: Option<HeartbeatLease>,
-    pub last_error: Option<String>,
+    pub scan_publication_attempts: u64,
+    pub scan_publication_successes: u64,
+    pub scan_publication_failures: u64,
+    pub last_scan_publication_lease: Option<HeartbeatLease>,
+    pub last_scan_publication_error: Option<String>,
+    pub authority_renewal_attempts: u64,
+    pub authority_renewal_successes: u64,
+    pub authority_renewal_failures: u64,
+    pub last_authority_renewal_lease: Option<HeartbeatLease>,
+    pub last_authority_renewal_error: Option<String>,
 }
 
 pub struct StorageNodeControlPlaneRefreshLoop {
     stop: Arc<(Mutex<bool>, Condvar)>,
     status: Arc<Mutex<StorageNodeControlPlaneRefreshLoopStatus>>,
-    handle: Option<JoinHandle<()>>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+struct StorageNodeHeartbeatSubmissionState<S> {
+    control_plane: S,
+    latest_submitted: Option<NodeHeartbeat>,
+    last_submission_started_at: Option<Instant>,
 }
 
 pub const STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_USABLE_LEASE_MS: u64 = 1_000;
@@ -589,6 +604,79 @@ pub fn storage_node_control_plane_heartbeat_interval(
     Ok(Duration::from_millis(interval_ms))
 }
 
+fn wait_for_storage_node_control_plane_worker(
+    stop: &Arc<(Mutex<bool>, Condvar)>,
+    interval: Duration,
+) -> bool {
+    let (lock, cvar) = &**stop;
+    let stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *stopped {
+        return true;
+    }
+    let (stopped, _) = cvar
+        .wait_timeout(stopped, interval)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *stopped
+}
+
+fn record_storage_node_control_plane_scan_publication_result(
+    status: &Mutex<StorageNodeControlPlaneRefreshLoopStatus>,
+    node_id: NodeId,
+    result: &Result<HeartbeatLease, StorageNodeServerError>,
+) {
+    let mut status = status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.scan_publication_attempts += 1;
+    match result {
+        Ok(lease) => {
+            status.scan_publication_successes += 1;
+            status.last_scan_publication_lease = Some(lease.clone());
+            status.last_scan_publication_error = None;
+        }
+        Err(error) => {
+            let error = error.to_string();
+            if status.last_scan_publication_error.as_deref() != Some(error.as_str()) {
+                eprintln!(
+                    "storage-node {} control-plane heartbeat scan/publication failed: {error}",
+                    node_id.as_u32()
+                );
+            }
+            status.scan_publication_failures += 1;
+            status.last_scan_publication_error = Some(error);
+        }
+    }
+}
+
+fn record_storage_node_control_plane_authority_renewal_result(
+    status: &Mutex<StorageNodeControlPlaneRefreshLoopStatus>,
+    node_id: NodeId,
+    result: &Result<HeartbeatLease, StorageNodeServerError>,
+) {
+    let mut status = status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    status.authority_renewal_attempts += 1;
+    match result {
+        Ok(lease) => {
+            status.authority_renewal_successes += 1;
+            status.last_authority_renewal_lease = Some(lease.clone());
+            status.last_authority_renewal_error = None;
+        }
+        Err(error) => {
+            let error = error.to_string();
+            if status.last_authority_renewal_error.as_deref() != Some(error.as_str()) {
+                eprintln!(
+                    "storage-node {} control-plane authority renewal failed: {error}",
+                    node_id.as_u32()
+                );
+            }
+            status.authority_renewal_failures += 1;
+            status.last_authority_renewal_error = Some(error);
+        }
+    }
+}
+
 impl StorageNodeControlPlaneRefreshLoop {
     pub fn status(&self) -> StorageNodeControlPlaneRefreshLoopStatus {
         self.status
@@ -604,7 +692,7 @@ impl StorageNodeControlPlaneRefreshLoop {
             *stopped = true;
             cvar.notify_all();
         }
-        if let Some(handle) = self.handle.take() {
+        for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
     }
@@ -800,6 +888,8 @@ impl StorageNodeServer {
             #[cfg(test)]
             runtime_route_before_publish_lock_test_hook: Mutex::new(None),
             #[cfg(test)]
+            runtime_route_after_publish_lock_test_hook: Mutex::new(None),
+            #[cfg(test)]
             response_envelope_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             response_frame_test_hook: Arc::new(Mutex::new(None)),
@@ -807,6 +897,8 @@ impl StorageNodeServer {
             metadata_command_before_commit_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             metadata_checkpoint_rows_captured_test_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            control_plane_heartbeat_scan_test_hook: Mutex::new(None),
         })
     }
 
@@ -903,6 +995,19 @@ impl StorageNodeServer {
     ) -> Result<StorageNodeControlPlaneRefresh, StorageNodeServerError> {
         let heartbeat =
             self.control_plane_heartbeat(node_incarnation, requested_lease_duration_ms)?;
+        self.refresh_control_plane_runtime_map_with_heartbeat(
+            control_plane,
+            heartbeat,
+            authority_now_ms,
+        )
+    }
+
+    fn refresh_control_plane_runtime_map_with_heartbeat(
+        &self,
+        control_plane: &mut impl ControlPlaneHeartbeatRuntimeMapSource,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<StorageNodeControlPlaneRefresh, StorageNodeServerError> {
         let history_reference_summary = heartbeat.cluster_map_history_route_references.summary();
         let refresh = control_plane
             .refresh_node_heartbeat(heartbeat, authority_now_ms)
@@ -920,6 +1025,95 @@ impl StorageNodeServer {
             runtime_map,
             next_config,
         })
+    }
+
+    fn submit_serialized_control_plane_heartbeat<S, F>(
+        &self,
+        submission: &Mutex<StorageNodeHeartbeatSubmissionState<S>>,
+        authority_now_ms: &Mutex<F>,
+        heartbeat: NodeHeartbeat,
+    ) -> Result<HeartbeatLease, StorageNodeServerError>
+    where
+        S: ControlPlaneHeartbeatRuntimeMapSource,
+        F: Fn() -> u64,
+    {
+        let history_reference_summary = heartbeat.cluster_map_history_route_references.summary();
+        let (lease, runtime_map) = {
+            let mut submission = submission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Publish sender order before dispatch. If the response is lost
+            // after the authority accepts this report, no concurrent renewal
+            // may submit the older report and regress its PG observations.
+            submission.latest_submitted = Some(heartbeat.clone());
+            submission.last_submission_started_at = Some(Instant::now());
+            let authority_now_ms = {
+                let authority_now_ms = authority_now_ms
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                authority_now_ms()
+            };
+            submission
+                .control_plane
+                .refresh_node_heartbeat(heartbeat, authority_now_ms)
+                .map_err(StorageNodeServerError::from)?
+                .into_parts()
+        };
+        // Every local topology operation may wait behind route publication.
+        // Keep it outside heartbeat submission so the renewal worker can
+        // preserve the authority lease from the accepted complete report.
+        let current_config = self.config_snapshot();
+        let next_config = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current_config,
+            &runtime_map,
+            history_reference_summary,
+        )?;
+        next_config.validate_runtime_refresh_from(&current_config)?;
+        let refresh = StorageNodeControlPlaneRefresh {
+            lease,
+            runtime_map,
+            next_config,
+        };
+        self.install_control_plane_refresh(refresh)
+    }
+
+    fn renew_latest_serialized_control_plane_heartbeat<S, F>(
+        submission: &Mutex<StorageNodeHeartbeatSubmissionState<S>>,
+        authority_now_ms: &Mutex<F>,
+        minimum_interval: Duration,
+    ) -> Option<Result<HeartbeatLease, StorageNodeServerError>>
+    where
+        S: ControlPlaneHeartbeatRuntimeMapSource,
+        F: Fn() -> u64,
+    {
+        let result = {
+            let mut submission = submission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if submission
+                .last_submission_started_at
+                .is_some_and(|started| started.elapsed() < minimum_interval)
+            {
+                return None;
+            }
+            let heartbeat = submission.latest_submitted.clone()?;
+            submission.last_submission_started_at = Some(Instant::now());
+            let authority_now_ms = {
+                let authority_now_ms = authority_now_ms
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                authority_now_ms()
+            };
+            submission
+                .control_plane
+                .refresh_node_heartbeat(heartbeat, authority_now_ms)
+                .map(|refresh| refresh.into_parts().0)
+                .map_err(StorageNodeServerError::from)
+        };
+        // The complete-scan worker is the sole runtime-map publisher. A
+        // cached report carries no new PG evidence and renews only the
+        // authority's node lease, so it cannot be delayed by route draining.
+        Some(result)
     }
 
     pub fn refresh_and_install_control_plane_runtime_map(
@@ -940,7 +1134,7 @@ impl StorageNodeServer {
 
     pub fn spawn_control_plane_refresh_loop<S, F>(
         self: Arc<Self>,
-        mut control_plane: S,
+        control_plane: S,
         node_incarnation: u64,
         requested_lease_duration_ms: u64,
         authority_now_ms: F,
@@ -956,46 +1150,84 @@ impl StorageNodeServer {
         let status = Arc::new(Mutex::new(
             StorageNodeControlPlaneRefreshLoopStatus::default(),
         ));
-        let worker_stop = Arc::clone(&stop);
-        let worker_status = Arc::clone(&status);
-        let handle = thread::Builder::new()
+        let submission = Arc::new(Mutex::new(StorageNodeHeartbeatSubmissionState {
+            control_plane,
+            latest_submitted: None,
+            last_submission_started_at: None,
+        }));
+        let authority_now_ms = Arc::new(Mutex::new(authority_now_ms));
+
+        let renewal_stop = Arc::clone(&stop);
+        let renewal_status = Arc::clone(&status);
+        let renewal_submission = Arc::clone(&submission);
+        let renewal_authority_now_ms = Arc::clone(&authority_now_ms);
+        let renewal_handle = thread::Builder::new()
             .name(format!(
-                "argmin-storage-node-{}-control-plane-refresh",
+                "argmin-storage-node-{}-control-plane-lease-renewal",
                 node_id.as_u32()
             ))
             .spawn(move || {
                 let mut completed_attempts = 0_u64;
                 loop {
-                    let result = self.refresh_and_install_control_plane_runtime_map(
-                        &mut control_plane,
-                        node_incarnation,
+                    let refresh_interval = storage_node_control_plane_heartbeat_interval(
+                        node_id,
                         requested_lease_duration_ms,
-                        authority_now_ms(),
-                    );
-                    {
-                        let mut status = worker_status
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        status.attempts += 1;
-                        match result {
-                            Ok(lease) => {
-                                status.successes += 1;
-                                status.last_lease = Some(lease);
-                                status.last_error = None;
-                            }
-                            Err(error) => {
-                                let error = error.to_string();
-                                if status.last_error.as_deref() != Some(error.as_str()) {
-                                    eprintln!(
-                                        "storage-node {} control-plane refresh failed: {error}",
-                                        self.config_snapshot().node_id.as_u32()
-                                    );
-                                }
-                                status.failures += 1;
-                                status.last_error = Some(error);
-                            }
-                        }
+                        completed_attempts,
+                    )
+                    .expect("validated heartbeat schedule remains valid");
+                    if wait_for_storage_node_control_plane_worker(&renewal_stop, refresh_interval) {
+                        break;
                     }
+                    if let Some(result) =
+                        Self::renew_latest_serialized_control_plane_heartbeat(
+                            &renewal_submission,
+                            &renewal_authority_now_ms,
+                            refresh_interval,
+                        )
+                    {
+                        record_storage_node_control_plane_authority_renewal_result(
+                            &renewal_status,
+                            node_id,
+                            &result,
+                        );
+                        completed_attempts = completed_attempts.saturating_add(1);
+                    }
+                }
+            })
+            .map_err(|source| StorageNodeServerError::ControlPlaneRefreshLoopSpawn { source })?;
+
+        let scan_stop = Arc::clone(&stop);
+        let scan_status = Arc::clone(&status);
+        let scan_submission = Arc::clone(&submission);
+        let scan_authority_now_ms = Arc::clone(&authority_now_ms);
+        let scan_server = self;
+        let scan_handle = thread::Builder::new()
+            .name(format!(
+                "argmin-storage-node-{}-control-plane-heartbeat-scan",
+                node_id.as_u32()
+            ))
+            .spawn(move || {
+                let mut completed_attempts = 0_u64;
+                loop {
+                    #[cfg(test)]
+                    scan_server.run_control_plane_heartbeat_scan_test_hook();
+                    let result = scan_server
+                        .control_plane_heartbeat(
+                            node_incarnation,
+                            requested_lease_duration_ms,
+                        )
+                        .and_then(|heartbeat| {
+                            scan_server.submit_serialized_control_plane_heartbeat(
+                                &scan_submission,
+                                &scan_authority_now_ms,
+                                heartbeat,
+                            )
+                        });
+                    record_storage_node_control_plane_scan_publication_result(
+                        &scan_status,
+                        node_id,
+                        &result,
+                    );
                     completed_attempts = completed_attempts.saturating_add(1);
                     let refresh_interval = storage_node_control_plane_heartbeat_interval(
                         node_id,
@@ -1003,26 +1235,29 @@ impl StorageNodeServer {
                         completed_attempts,
                     )
                     .expect("validated heartbeat schedule remains valid");
-
-                    let (lock, cvar) = &*worker_stop;
-                    let stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if *stopped {
-                        break;
-                    }
-                    let (stopped, _) = cvar
-                        .wait_timeout(stopped, refresh_interval)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if *stopped {
+                    if wait_for_storage_node_control_plane_worker(&scan_stop, refresh_interval) {
                         break;
                     }
                 }
-            })
-            .map_err(|source| StorageNodeServerError::ControlPlaneRefreshLoopSpawn { source })?;
+            });
+        let scan_handle = match scan_handle {
+            Ok(handle) => handle,
+            Err(source) => {
+                {
+                    let (lock, cvar) = &*stop;
+                    let mut stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *stopped = true;
+                    cvar.notify_all();
+                }
+                let _ = renewal_handle.join();
+                return Err(StorageNodeServerError::ControlPlaneRefreshLoopSpawn { source });
+            }
+        };
 
         Ok(StorageNodeControlPlaneRefreshLoop {
             stop,
             status,
-            handle: Some(handle),
+            handles: vec![renewal_handle, scan_handle],
         })
     }
 
@@ -1065,6 +1300,15 @@ impl StorageNodeServer {
                 .runtime_route_state
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            #[cfg(test)]
+            if let Some(hook) = self
+                .runtime_route_after_publish_lock_test_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                hook();
+            }
             validate_runtime_config_install(&current_state.config, &next_config)?;
             if next_config.only_extends_route_map_validity_from(&current_state.config) {
                 *current_state = StorageNodeRuntimeRouteState {
@@ -1105,6 +1349,15 @@ impl StorageNodeServer {
             .runtime_route_state
             .write()
             .unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        if let Some(hook) = self
+            .runtime_route_after_publish_lock_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook();
+        }
         validate_runtime_config_install(&current_state.config, &next_config)?;
         staged_config.publish()?;
         *current_state = StorageNodeRuntimeRouteState {
@@ -1292,6 +1545,29 @@ impl StorageNodeServer {
             .metadata_checkpoint_rows_captured_test_hook
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_control_plane_heartbeat_scan_test_hook(
+        &self,
+        hook: RuntimeConfigStageTestHook,
+    ) {
+        *self
+            .control_plane_heartbeat_scan_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_control_plane_heartbeat_scan_test_hook(&self) {
+        let hook = self
+            .control_plane_heartbeat_scan_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     fn config_snapshot(&self) -> StorageNodeProcessConfig {

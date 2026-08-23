@@ -18,6 +18,8 @@ pub struct StorageClusterRuntimeMapRefreshLoopStatus {
     pub attempts: u64,
     pub successes: u64,
     pub failures: u64,
+    pub fallback_recovery_attempts: u64,
+    pub fallback_recovery_failures: u64,
     pub last_success: Option<StorageClusterRuntimeMapRefreshLoopSuccess>,
     pub last_failure: Option<StorageClusterRuntimeMapRefreshLoopFailure>,
     pub last_error: Option<String>,
@@ -67,6 +69,59 @@ impl StorageClusterRuntimeMapRefreshLoop {
 impl Drop for StorageClusterRuntimeMapRefreshLoop {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+const PENDING_METADATA_COMMAND_FALLBACK_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct PendingMetadataCommandFallbackSchedule {
+    attempted_request_generation: u64,
+    retry_not_before: Option<Instant>,
+}
+
+impl PendingMetadataCommandFallbackSchedule {
+    fn should_attempt(&self, request_generation: u64, now: Instant) -> bool {
+        request_generation > self.attempted_request_generation
+            || self
+                .retry_not_before
+                .is_some_and(|deadline| now >= deadline)
+    }
+
+    fn record_attempt(&mut self, request_generation: u64, now: Instant, succeeded: bool) {
+        self.attempted_request_generation = request_generation;
+        self.retry_not_before = (!succeeded)
+            .then_some(now + PENDING_METADATA_COMMAND_FALLBACK_RETRY_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod fallback_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn failed_fallback_retries_only_after_cooldown_and_new_outages_run_immediately() {
+        let started = Instant::now();
+        let mut schedule = PendingMetadataCommandFallbackSchedule::default();
+
+        assert!(schedule.should_attempt(1, started));
+        schedule.record_attempt(1, started, false);
+        assert!(!schedule.should_attempt(
+            1,
+            started + PENDING_METADATA_COMMAND_FALLBACK_RETRY_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(schedule.should_attempt(
+            1,
+            started + PENDING_METADATA_COMMAND_FALLBACK_RETRY_INTERVAL
+        ));
+
+        let retry = started + PENDING_METADATA_COMMAND_FALLBACK_RETRY_INTERVAL;
+        schedule.record_attempt(1, retry, true);
+        assert!(!schedule.should_attempt(1, retry + Duration::from_secs(30)));
+        assert!(
+            schedule.should_attempt(2, retry),
+            "a new outage must not inherit the previous outage's cooldown"
+        );
     }
 }
 
@@ -573,12 +628,14 @@ impl StorageClusterRouteHandle {
         ));
         let control_plane = Arc::new(control_plane);
         let authority_now_ms = Arc::new(authority_now_ms);
-        let recovery_requested = Arc::new(AtomicBool::new(false));
+        let recovery_request_generation = Arc::new(AtomicU64::new(0));
+        let refresh_outage_active = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_status = Arc::clone(&status);
         let worker_control_plane = Arc::clone(&control_plane);
         let worker_authority_now_ms = Arc::clone(&authority_now_ms);
-        let worker_recovery_requested = Arc::clone(&recovery_requested);
+        let worker_recovery_request_generation = Arc::clone(&recovery_request_generation);
+        let worker_refresh_outage_active = Arc::clone(&refresh_outage_active);
         let refresh_route_handle = self.clone();
         // Lease renewal must never share a worker with metadata recovery. A
         // recovery RPC may consume its full retry budget, which can be longer
@@ -600,8 +657,14 @@ impl StorageClusterRouteHandle {
                     ),
                 };
                 if let Err(error) = &result {
-                    if recover_pending_commands {
-                        worker_recovery_requested.store(true, Ordering::Release);
+                    if recover_pending_commands
+                        && !worker_refresh_outage_active.swap(true, Ordering::AcqRel)
+                    {
+                        let _ = worker_recovery_request_generation.fetch_update(
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            |generation| generation.checked_add(1),
+                        );
                     }
                     if runtime_map_refresh_error_requires_current_map_invalidation(error) {
                         refresh_route_handle.expire_same_epoch_generations(refresh_now_ms);
@@ -617,8 +680,13 @@ impl StorageClusterRouteHandle {
                     let _ = observability::event(
                         "storage",
                         "runtime_map_refresh_error",
-                        Some(format_args!("kind={}", error.diagnostic_kind())),
+                        Some(format_args!(
+                            "kind={} error={error}",
+                            error.diagnostic_kind()
+                        )),
                     );
+                } else {
+                    worker_refresh_outage_active.store(false, Ordering::Release);
                 }
                 {
                     let mut status = worker_status
@@ -658,6 +726,7 @@ impl StorageClusterRouteHandle {
         let mut handles = vec![refresh_handle];
         if recover_pending_commands {
             let worker_stop = Arc::clone(&stop);
+            let recovery_status = Arc::clone(&status);
             let worker_control_plane = Arc::clone(&control_plane);
             let worker_authority_now_ms = Arc::clone(&authority_now_ms);
             let recovery_route_handle = self;
@@ -666,48 +735,76 @@ impl StorageClusterRouteHandle {
             // cannot prevent the refresh worker from renewing request routes.
             let recovery_handle = thread::Builder::new()
                 .name("argmin-storage-cluster-pending-command-recovery".to_string())
-                .spawn(move || loop {
-                    let discovery_now_ms = worker_authority_now_ms();
-                    let fallback_requested = recovery_requested.swap(false, Ordering::AcqRel);
-                    let recovery_result = match worker_control_plane
-                        .pending_metadata_command_recoveries(discovery_now_ms)
-                    {
-                        Ok(listing)
-                            if !listing.tasks().is_empty() || !listing.failures().is_empty() => {
-                            recovery_route_handle.recover_authorized_pending_metadata_commands(
-                                worker_control_plane.as_ref(),
-                                worker_authority_now_ms.as_ref(),
-                                admission_settings,
-                                listing,
-                            )
+                .spawn(move || {
+                    let mut fallback_schedule =
+                        PendingMetadataCommandFallbackSchedule::default();
+                    loop {
+                        let discovery_now_ms = worker_authority_now_ms();
+                        let request_generation =
+                            recovery_request_generation.load(Ordering::Acquire);
+                        let fallback_requested =
+                            fallback_schedule.should_attempt(request_generation, Instant::now());
+                        let targeted_recovery_result = match worker_control_plane
+                            .pending_metadata_command_recoveries(discovery_now_ms)
+                        {
+                            Ok(listing)
+                                if !listing.tasks().is_empty()
+                                    || !listing.failures().is_empty() =>
+                            {
+                                recovery_route_handle
+                                    .recover_authorized_pending_metadata_commands(
+                                        worker_control_plane.as_ref(),
+                                        worker_authority_now_ms.as_ref(),
+                                        admission_settings,
+                                        listing,
+                                    )
+                            }
+                            Ok(_) => Ok(0),
+                            Err(error) => Err(
+                                PendingMetadataCommandRefreshRecoveryError::ControlPlane(error),
+                            ),
+                        };
+                        let fallback_recovery_result = fallback_requested.then(|| {
+                            let result = recovery_route_handle
+                                .current()
+                                .drain_pending_metadata_commands_for_current_map()
+                                .map_err(PendingMetadataCommandRefreshRecoveryError::Recover);
+                            fallback_schedule.record_attempt(
+                                request_generation,
+                                Instant::now(),
+                                result.is_ok(),
+                            );
+                            let mut status = recovery_status
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            status.fallback_recovery_attempts += 1;
+                            status.fallback_recovery_failures += u64::from(result.is_err());
+                            result
+                        });
+                        let recovery_result = match (
+                            targeted_recovery_result,
+                            fallback_recovery_result,
+                        ) {
+                            (Err(error), _) | (Ok(_), Some(Err(error))) => Err(error),
+                            (Ok(targeted), Some(Ok(fallback))) => Ok(targeted + fallback),
+                            (Ok(targeted), None) => Ok(targeted),
+                        };
+                        if let Err(error) = &recovery_result {
+                            let _ = observability::emit_flight_event(
+                                "storage",
+                                "pending_metadata_command_recovery_error",
+                                format!("kind={}", error.diagnostic_kind()),
+                            );
+                            let _ = observability::event(
+                                "storage",
+                                "pending_metadata_command_recovery_error",
+                                Some(format_args!("kind={}", error.diagnostic_kind())),
+                            );
                         }
-                        Ok(_) if fallback_requested => recovery_route_handle
-                            .current()
-                            .drain_pending_metadata_commands_for_current_map()
-                            .map_err(PendingMetadataCommandRefreshRecoveryError::Recover),
-                        Ok(_) => Ok(0),
-                        Err(error) => Err(
-                            PendingMetadataCommandRefreshRecoveryError::ControlPlane(error),
-                        ),
-                    };
-                    if let Err(error) = &recovery_result {
-                        if fallback_requested {
-                            recovery_requested.store(true, Ordering::Release);
-                        }
-                        let _ = observability::emit_flight_event(
-                            "storage",
-                            "pending_metadata_command_recovery_error",
-                            format!("kind={}", error.diagnostic_kind()),
-                        );
-                        let _ = observability::event(
-                            "storage",
-                            "pending_metadata_command_recovery_error",
-                            Some(format_args!("kind={}", error.diagnostic_kind())),
-                        );
-                    }
 
-                    if wait_for_runtime_map_worker(&worker_stop, refresh_interval) {
-                        break;
+                        if wait_for_runtime_map_worker(&worker_stop, refresh_interval) {
+                            break;
+                        }
                     }
                 });
             match recovery_handle {

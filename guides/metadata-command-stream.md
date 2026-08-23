@@ -240,6 +240,16 @@ the process-wide per-command recovery flight to deduplicate convergence. The
 pending slot and bucket-write reservation remain durable until that worker has
 converged every required replica and completed terminal cleanup.
 
+Failure of the frontend runtime-map refresh requests one fallback current-map
+scan at the start of that failure episode. Repeated refresh failures do not
+request another full-PG scan; a failed fallback retries on a bounded cooldown,
+while exact control-plane recovery listings continue to be polled normally.
+Targeted work, discovery failures, and listing transport failures do not consume
+the fallback request: only an attempted full current-map scan advances its
+outage generation and starts or clears its retry cooldown.
+This prevents route unavailability from amplifying into continuous all-PG
+storage RPC traffic.
+
 Cross-PG reservation routes are stored in a fixed-width sidecar in the same
 transaction as the pending slot. Its integrity checksum binds the complete
 command ID, command checksum, and every retained route dependency, so heartbeat
@@ -265,6 +275,24 @@ clock assumption and no older control-plane RPC encoding is accepted. Once the
 reported reference set is unchanged and no reference is retiring, accepting a
 newer scan generation is a durable no-op; the volatile node view may advance the
 generation without appending another journal or Raft WAL entry.
+
+Storage-node lease renewal is independent of complete heartbeat collection. The
+sender retains the latest complete report and may retransmit that exact report
+while the next PG scan waits for a busy PG. Complete reports and retransmissions
+share one submission order, and a newly built report becomes the retained report
+before dispatch, so response loss cannot allow an older report to follow a newer
+one. A complete-scan response is removed from that submission section before
+any local topology read, construction, validation, or publication, each of
+which may wait for admitted storage frames or a topology lock.
+Cached retransmission renews only the control-plane node lease and does not
+read, construct, validate, or publish local topology. It calls the authority
+directly and extracts only the returned lease, so a blocked local topology read
+or publication cannot block subsequent lease renewal. Scan/publication and
+authority-renewal health are recorded independently; successful renewal cannot
+hide a permanently failing topology publisher. The complete-scan worker remains
+the sole runtime-map publisher.
+Retransmission cannot advance route-reference retirement; only the next complete
+scan generation can do that.
 
 A storage node reports pending-command evidence for every opened PG, including
 a PG from whose current acting set it has been removed. Non-acting observations

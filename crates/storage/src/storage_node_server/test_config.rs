@@ -3753,6 +3753,31 @@
         }));
     }
 
+    struct RecordingHeartbeatAuthority<S> {
+        authority: SingleAuthorityControlPlane<S>,
+        accepted_reports: Arc<Mutex<Vec<(std::num::NonZeroU64, HeartbeatLease)>>>,
+    }
+
+    impl<S: crate::control_plane::ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
+        for RecordingHeartbeatAuthority<S>
+    {
+        fn refresh_node_heartbeat(
+            &mut self,
+            heartbeat: NodeHeartbeat,
+            authority_now_ms: u64,
+        ) -> Result<crate::control_plane::ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+            let generation = heartbeat.cluster_map_history_route_scan_generation;
+            let refresh = self
+                .authority
+                .refresh_node_heartbeat(heartbeat, authority_now_ms)?;
+            self.accepted_reports
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((generation, refresh.lease().clone()));
+            Ok(refresh)
+        }
+    }
+
     #[test]
     fn storage_node_control_plane_refresh_loop_installs_runtime_maps() {
         let tmp = test_util::tempdir();
@@ -3825,7 +3850,7 @@
 
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if refresh_loop.status().successes > 0 {
+            if refresh_loop.status().scan_publication_successes > 0 {
                 break;
             }
             assert!(
@@ -3841,12 +3866,190 @@
         assert!(installed_config.route_map_valid_until_ms().is_some());
         assert_eq!(installed_config.pg_routes.len(), 1);
         assert_eq!(installed_config.pg_routes[0].state, PgState::Active);
-        assert_eq!(refresh_loop.status().failures, 0);
+        assert_eq!(refresh_loop.status().scan_publication_failures, 0);
 
         refresh_loop.stop();
-        let attempts_after_stop = refresh_loop.status().attempts;
+        let attempts_after_stop = refresh_loop.status().scan_publication_attempts;
         thread::sleep(Duration::from_millis(15));
-        assert_eq!(refresh_loop.status().attempts, attempts_after_stop);
+        assert_eq!(
+            refresh_loop.status().scan_publication_attempts,
+            attempts_after_stop
+        );
+    }
+
+    #[test]
+    fn storage_node_lease_renews_while_heartbeat_scan_or_runtime_install_is_blocked() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat::test_fixture(
+                    node_id,
+                    12,
+                    socket_path.to_str().unwrap().to_owned(),
+                    authority.snapshot().cluster_epoch(),
+                    STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+                    Default::default(),
+                    Vec::new(),
+                ),
+                1_000,
+            )
+            .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat::test_fixture(
+                    node_id,
+                    12,
+                    socket_path.to_str().unwrap().to_owned(),
+                    first.cluster_epoch(),
+                    STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+                    Default::default(),
+                    Vec::new(),
+                ),
+                1_001,
+            )
+            .unwrap();
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        let server = Arc::new(StorageNodeServer::bind(config).unwrap());
+        let scan_gate = DeterministicTestGate::new();
+        let scan_calls = Arc::new(AtomicUsize::new(0));
+        let hook_gate = Arc::clone(&scan_gate);
+        let hook_calls = Arc::clone(&scan_calls);
+        server.set_control_plane_heartbeat_scan_test_hook(Arc::new(move || {
+            if hook_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                hook_gate.block_until_released();
+            }
+        }));
+        let accepted_reports = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingHeartbeatAuthority {
+            authority,
+            accepted_reports: Arc::clone(&accepted_reports),
+        };
+        let now = Arc::new(AtomicU64::new(1_003));
+        let loop_now = Arc::clone(&now);
+        let mut refresh_loop = Arc::clone(&server)
+            .spawn_control_plane_refresh_loop(
+                source,
+                12,
+                STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+                move || loop_now.fetch_add(100, Ordering::SeqCst),
+            )
+            .unwrap();
+        let _scan_gate_release = scan_gate.release_on_drop();
+
+        scan_gate.wait_until_arrived(Duration::from_secs(2));
+        let initial_report = accepted_reports.lock().unwrap()[0].clone();
+        let initial_generation = initial_report.0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let reports = accepted_reports.lock().unwrap().clone();
+            if reports.len() >= 3 {
+                assert!(
+                    reports
+                        .iter()
+                        .all(|(generation, _)| *generation == initial_generation),
+                    "blocked scan must renew only from the latest complete report: {reports:?}"
+                );
+                assert!(
+                    reports.last().unwrap().1.lease_deadline_ms()
+                        > initial_report.1.lease_deadline_ms(),
+                    "accepted cached heartbeats must advance the authority lease: {reports:?}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cached heartbeat did not renew while the complete scan was blocked: {:?}",
+                refresh_loop.status()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        scan_gate.release();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let reports = accepted_reports.lock().unwrap().clone();
+            if reports
+                .iter()
+                .any(|(generation, _)| *generation > initial_generation)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "released complete heartbeat scan did not publish fresh evidence: {reports:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let install_gate = DeterministicTestGate::new();
+        let _install_gate_release = install_gate.release_on_drop();
+        let hook_gate = Arc::clone(&install_gate);
+        *server
+            .runtime_route_after_publish_lock_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Arc::new(move || hook_gate.block_until_released()));
+        install_gate.wait_until_arrived(Duration::from_secs(2));
+        let reports_at_block = accepted_reports.lock().unwrap().clone();
+        let blocked_generation = reports_at_block.last().unwrap().0;
+        let blocked_lease_deadline = reports_at_block.last().unwrap().1.lease_deadline_ms();
+        let report_count_at_block = reports_at_block.len();
+        let scan_successes_at_block = refresh_loop.status().scan_publication_successes;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let reports = accepted_reports.lock().unwrap().clone();
+            if reports.len() >= report_count_at_block + 2 {
+                assert!(
+                    reports[report_count_at_block..]
+                        .iter()
+                        .all(|(generation, _)| *generation == blocked_generation),
+                    "blocked runtime-map installation must not prevent cached lease renewal: {reports:?}"
+                );
+                assert!(
+                    reports.last().unwrap().1.lease_deadline_ms() > blocked_lease_deadline,
+                    "accepted cached heartbeats must advance the authority lease while publication is blocked: {reports:?}"
+                );
+                assert_eq!(
+                    refresh_loop.status().scan_publication_successes,
+                    scan_successes_at_block,
+                    "renewal-only success must not advance scan/publication health"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cached heartbeat did not renew while runtime-map installation was blocked: {:?}",
+                refresh_loop.status()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        install_gate.release();
+        *server
+            .runtime_route_after_publish_lock_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        refresh_loop.stop();
+        assert!(scan_calls.load(Ordering::SeqCst) >= 2);
     }
 
     #[test]

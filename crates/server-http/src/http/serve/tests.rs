@@ -1567,6 +1567,8 @@ Connection: close\r\n\r\n",
             attempts: 9,
             successes: 4,
             failures: 5,
+            fallback_recovery_attempts: 2,
+            fallback_recovery_failures: 1,
             last_success: Some(storage::StorageClusterRuntimeMapRefreshLoopSuccess {
                 cluster_epoch: storage::ClusterEpoch::new(17).unwrap(),
                 route_map_validity: storage::RouteMapValidity::until_ms(42_000).unwrap(),
@@ -1584,6 +1586,8 @@ Connection: close\r\n\r\n",
         assert!(body.contains("frontend_runtime_map_refresh_attempt_total 9\n"));
         assert!(body.contains("frontend_runtime_map_refresh_success_total 4\n"));
         assert!(body.contains("frontend_runtime_map_refresh_failure_total 5\n"));
+        assert!(body.contains("frontend_pending_command_fallback_recovery_attempt_total 2\n"));
+        assert!(body.contains("frontend_pending_command_fallback_recovery_failure_total 1\n"));
         assert!(body.contains("frontend_runtime_map_refresh_last_success_epoch 17\n"));
         assert!(body.contains("frontend_runtime_map_refresh_last_success_valid_until_ms 42000\n"));
         assert!(body.contains("frontend_runtime_map_refresh_last_failure_present 1\n"));

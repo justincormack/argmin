@@ -452,6 +452,19 @@ pub struct ControlPlaneRaftAuthority {
     proposal_changed_tip_rejection_count: AtomicUsize,
     #[cfg(test)]
     membership_initialization_after_check_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    linearized_read_after_snapshot_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    linearized_read_after_raft_state_capture_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    linearized_read_after_generation_capture_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)]
+    linearized_runtime_map_read_index_count: AtomicUsize,
+    #[cfg(test)]
+    linearized_snapshot_retirement_hook:
+        Mutex<Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>>,
+    #[cfg(test)]
+    linearized_state_machine_response_ready_notify: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -718,11 +731,100 @@ impl ControlPlaneRaftCommandMetrics {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+struct ControlPlaneRaftSnapshotGeneration {
+    snapshot: Option<Arc<ClusterControlSnapshot>>,
+    #[cfg(test)]
+    retirement_hook: Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>,
+}
+
+impl ControlPlaneRaftSnapshotGeneration {
+    fn new(
+        snapshot: Arc<ClusterControlSnapshot>,
+        #[cfg(test)] retirement_hook: Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>,
+    ) -> Self {
+        Self {
+            snapshot: Some(snapshot),
+            #[cfg(test)]
+            retirement_hook,
+        }
+    }
+
+    fn arc(&self) -> &Arc<ClusterControlSnapshot> {
+        self.snapshot
+            .as_ref()
+            .expect("control-plane snapshot generation must exist until consumed")
+    }
+
+    fn replace_snapshot(mut self, snapshot: Arc<ClusterControlSnapshot>) -> Self {
+        let retired = self
+            .snapshot
+            .replace(snapshot)
+            .expect("control-plane snapshot generation must exist until replaced");
+        Self::retire(
+            retired,
+            #[cfg(test)]
+            None,
+        );
+        self
+    }
+
+    fn into_blocking_lane_arc(mut self) -> Arc<ClusterControlSnapshot> {
+        self.snapshot
+            .take()
+            .expect("control-plane snapshot generation must exist until consumed")
+    }
+
+    fn retire(
+        snapshot: Arc<ClusterControlSnapshot>,
+        #[cfg(test)] retirement_hook: Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>,
+    ) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(hook) = retirement_hook {
+                    assert_eq!(
+                        Arc::strong_count(&snapshot),
+                        1,
+                        "retirement hook must observe the final snapshot generation owner"
+                    );
+                    hook.block();
+                }
+                drop(snapshot);
+            });
+        } else {
+            drop(snapshot);
+        }
+    }
+}
+
+impl Drop for ControlPlaneRaftSnapshotGeneration {
+    fn drop(&mut self) {
+        let Some(snapshot) = self.snapshot.take() else {
+            return;
+        };
+        #[cfg(test)]
+        let retirement_hook = self.retirement_hook.take();
+        Self::retire(
+            snapshot,
+            #[cfg(test)]
+            retirement_hook,
+        );
+    }
+}
+
+#[derive(Debug)]
 struct ControlPlaneRaftVolatileHeartbeatOverlay {
     authority_term: ControlPlaneRaftTerm,
     base_applied: LogIdOf<ControlPlaneRaftTypeConfig>,
-    snapshot: ClusterControlSnapshot,
+    snapshot: ControlPlaneRaftSnapshotGeneration,
+}
+
+struct ControlPlaneRaftLinearizedSnapshot {
+    snapshot: ControlPlaneRaftSnapshotGeneration,
+    applied: LogIdOf<ControlPlaneRaftTypeConfig>,
+    read_index: ControlPlaneLogId,
+    volatile_authority_term: Option<ControlPlaneRaftTerm>,
 }
 
 pub type ControlPlaneRaftFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -2804,6 +2906,18 @@ impl ControlPlaneRaftAuthority {
             proposal_changed_tip_rejection_count: AtomicUsize::new(0),
             #[cfg(test)]
             membership_initialization_after_check_gate: Mutex::new(None),
+            #[cfg(test)]
+            linearized_read_after_snapshot_gate: Mutex::new(None),
+            #[cfg(test)]
+            linearized_read_after_raft_state_capture_gate: Mutex::new(None),
+            #[cfg(test)]
+            linearized_read_after_generation_capture_gate: Mutex::new(None),
+            #[cfg(test)]
+            linearized_runtime_map_read_index_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            linearized_snapshot_retirement_hook: Mutex::new(None),
+            #[cfg(test)]
+            linearized_state_machine_response_ready_notify: Mutex::new(None),
         }
     }
 
@@ -2842,6 +2956,18 @@ impl ControlPlaneRaftAuthority {
             proposal_changed_tip_rejection_count: AtomicUsize::new(0),
             #[cfg(test)]
             membership_initialization_after_check_gate: Mutex::new(None),
+            #[cfg(test)]
+            linearized_read_after_snapshot_gate: Mutex::new(None),
+            #[cfg(test)]
+            linearized_read_after_raft_state_capture_gate: Mutex::new(None),
+            #[cfg(test)]
+            linearized_read_after_generation_capture_gate: Mutex::new(None),
+            #[cfg(test)]
+            linearized_runtime_map_read_index_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            linearized_snapshot_retirement_hook: Mutex::new(None),
+            #[cfg(test)]
+            linearized_state_machine_response_ready_notify: Mutex::new(None),
         }
     }
 
@@ -3115,6 +3241,191 @@ impl ControlPlaneRaftAuthority {
             previous.is_none(),
             "membership initialization test gate already set"
         );
+    }
+
+    #[cfg(test)]
+    fn set_linearized_read_after_snapshot_gate_for_test(&self, gate: Arc<tokio::sync::Barrier>) {
+        let previous = self
+            .linearized_read_after_snapshot_gate
+            .lock()
+            .expect("linearized read test gate should not be poisoned")
+            .replace(gate);
+        assert!(previous.is_none(), "linearized read test gate already set");
+    }
+
+    #[cfg(test)]
+    async fn run_linearized_read_after_snapshot_gate_for_test(&self) {
+        let gate = self
+            .linearized_read_after_snapshot_gate
+            .lock()
+            .expect("linearized read test gate should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_linearized_read_after_raft_state_capture_gate_for_test(
+        &self,
+        gate: Arc<tokio::sync::Barrier>,
+    ) {
+        let previous = self
+            .linearized_read_after_raft_state_capture_gate
+            .lock()
+            .expect("linearized Raft-state capture test gate should not be poisoned")
+            .replace(gate);
+        assert!(
+            previous.is_none(),
+            "linearized Raft-state capture test gate already set"
+        );
+    }
+
+    #[cfg(test)]
+    async fn run_linearized_read_after_raft_state_capture_gate_for_test(&self) {
+        let gate = self
+            .linearized_read_after_raft_state_capture_gate
+            .lock()
+            .expect("linearized Raft-state capture test gate should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+            gate.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_linearized_read_after_generation_capture_gate_for_test(
+        &self,
+        gate: Arc<tokio::sync::Barrier>,
+    ) {
+        let previous = self
+            .linearized_read_after_generation_capture_gate
+            .lock()
+            .expect("linearized generation capture test gate should not be poisoned")
+            .replace(gate);
+        assert!(
+            previous.is_none(),
+            "linearized generation capture test gate already set"
+        );
+    }
+
+    #[cfg(test)]
+    async fn run_linearized_read_after_generation_capture_gate_for_test(&self) {
+        let gate = self
+            .linearized_read_after_generation_capture_gate
+            .lock()
+            .expect("linearized generation capture test gate should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.wait().await;
+            gate.wait().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn linearized_runtime_map_read_index_count_for_test(&self) -> usize {
+        self.linearized_runtime_map_read_index_count
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn set_linearized_snapshot_retirement_hook_for_test(
+        &self,
+        hook: Arc<ControlPlaneRaftStateMachineBlockingHook>,
+    ) {
+        let previous = self
+            .linearized_snapshot_retirement_hook
+            .lock()
+            .expect("linearized snapshot retirement hook should not be poisoned")
+            .replace(hook);
+        assert!(
+            previous.is_none(),
+            "linearized snapshot retirement hook already set"
+        );
+    }
+
+    #[cfg(test)]
+    fn take_linearized_snapshot_retirement_hook_for_test(
+        &self,
+    ) -> Option<Arc<ControlPlaneRaftStateMachineBlockingHook>> {
+        self.linearized_snapshot_retirement_hook
+            .lock()
+            .expect("linearized snapshot retirement hook should not be poisoned")
+            .take()
+    }
+
+    #[cfg(test)]
+    fn set_linearized_state_machine_response_ready_notify_for_test(
+        &self,
+        notify: Arc<tokio::sync::Notify>,
+    ) {
+        let previous = self
+            .linearized_state_machine_response_ready_notify
+            .lock()
+            .expect("linearized state-machine response notification should not be poisoned")
+            .replace(notify);
+        assert!(
+            previous.is_none(),
+            "linearized state-machine response notification already set"
+        );
+    }
+
+    #[cfg(test)]
+    fn take_linearized_state_machine_response_ready_notify_for_test(
+        &self,
+    ) -> Option<Arc<tokio::sync::Notify>> {
+        self.linearized_state_machine_response_ready_notify
+            .lock()
+            .expect("linearized state-machine response notification should not be poisoned")
+            .take()
+    }
+
+    fn retained_snapshot_generation(
+        &self,
+        snapshot: Arc<ClusterControlSnapshot>,
+    ) -> ControlPlaneRaftSnapshotGeneration {
+        ControlPlaneRaftSnapshotGeneration::new(
+            snapshot,
+            #[cfg(test)]
+            self.take_linearized_snapshot_retirement_hook_for_test(),
+        )
+    }
+
+    async fn retained_state_machine_snapshot_generation(
+        &self,
+    ) -> Result<
+        (
+            ControlPlaneRaftSnapshotGeneration,
+            Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+            Option<ControlPlaneLogId>,
+        ),
+        ControlPlaneError,
+    > {
+        #[cfg(test)]
+        let retirement_hook = self.take_linearized_snapshot_retirement_hook_for_test();
+        #[cfg(test)]
+        let response_ready_notify =
+            self.take_linearized_state_machine_response_ready_notify_for_test();
+        self.raft
+            .with_state_machine(move |state_machine| {
+                let snapshot = ControlPlaneRaftSnapshotGeneration::new(
+                    state_machine.inner().snapshot_generation(),
+                    #[cfg(test)]
+                    retirement_hook,
+                );
+                let applied = state_machine.last_applied();
+                let control_plane_applied = state_machine.inner().last_applied();
+                Box::pin(async move {
+                    #[cfg(test)]
+                    if let Some(notify) = response_ready_notify {
+                        notify.notify_one();
+                    }
+                    (snapshot, applied, control_plane_applied)
+                })
+            })
+            .await
+            .map_err(|error| openraft_remote_error("runtime-map state-machine read", error))
     }
 
     pub async fn is_initialized(&self) -> Result<bool, ControlPlaneError> {
@@ -4248,54 +4559,171 @@ impl ControlPlaneRaftAuthority {
                 "OpenRaft authority changed while publishing volatile heartbeat".to_string(),
             ));
         }
+        let generation = self.retained_snapshot_generation(Arc::new(next_snapshot.clone()));
         *self.lock_volatile_heartbeat_overlay()? = Some(ControlPlaneRaftVolatileHeartbeatOverlay {
             authority_term,
             base_applied,
-            snapshot: next_snapshot.clone(),
+            snapshot: generation,
         });
         Ok(Some(next_snapshot))
     }
 
-    async fn linearized_control_plane_snapshot(
+    async fn linearized_control_plane_snapshot_selection(
         &self,
-    ) -> Result<(ClusterControlSnapshot, ControlPlaneLogId), ControlPlaneError> {
-        let (durable_snapshot, base_applied) =
-            control_plane_snapshot_via_openraft_read_index(&self.raft).await?;
-        let read_index = control_plane_log_id_from_raft(base_applied).ok_or_else(|| {
+    ) -> Result<ControlPlaneRaftLinearizedSnapshot, ControlPlaneError> {
+        #[cfg(test)]
+        self.linearized_runtime_map_read_index_count
+            .fetch_add(1, Ordering::SeqCst);
+        let required_applied = control_plane_read_index_via_openraft(&self.raft).await?;
+        let required_read_index =
+            control_plane_log_id_from_raft(required_applied).ok_or_else(|| {
+                ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "invalid OpenRaft read-index log id for runtime map: {required_applied}"
+                    ),
+                }
+            })?;
+        #[cfg(test)]
+        self.run_linearized_read_after_snapshot_gate_for_test()
+            .await;
+
+        // A ReadIndex establishes the lower bound. Command submission and
+        // volatile heartbeat publication serialize through this gate, so one
+        // later state-machine capture is both linearizable and paired with the
+        // overlay for its exact applied tip. Do not repeat ReadIndex under a
+        // sustained write stream, and do not hold this gate during quorum I/O.
+        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let node_id = *self.raft.node_id();
+        let current_leader = self.raft.current_leader().await;
+        let current_term = self
+            .log_store
+            .as_ref()
+            .map(ControlPlaneRaftLogStore::status_snapshot)
+            .transpose()
+            .map_err(|error| openraft_remote_error("runtime-map vote read", error))?
+            .and_then(|status| status.durable_vote)
+            .map(|vote| vote.leader_id.term);
+        let (server_state, committed, effective_voter) = self
+            .raft
+            .with_raft_state(move |state| {
+                (
+                    state.server_state,
+                    state.local_committed().cloned(),
+                    state
+                        .membership_state
+                        .effective()
+                        .membership()
+                        .voter_ids()
+                        .any(|voter| voter == node_id),
+                )
+            })
+            .await
+            .map_err(|error| openraft_remote_error("runtime-map raft-state read", error))?;
+        #[cfg(test)]
+        self.run_linearized_read_after_raft_state_capture_gate_for_test()
+            .await;
+        let (durable_snapshot, applied, control_plane_applied) =
+            self.retained_state_machine_snapshot_generation().await?;
+        #[cfg(test)]
+        self.run_linearized_read_after_generation_capture_gate_for_test()
+            .await;
+        let Some(applied) = applied else {
+            return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index: required_read_index,
+                last_applied: control_plane_applied,
+            });
+        };
+        if applied < required_applied {
+            return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index: required_read_index,
+                last_applied: control_plane_applied,
+            });
+        }
+        let local_leader = server_state == ServerState::Leader && current_leader == Some(node_id);
+        let applied_caught_up_to_committed = committed == Some(applied);
+        let committed_in_current_term = matches!(
+            (current_term, committed),
+            (Some(current_term), Some(committed))
+                if committed.committed_leader_id().term == current_term
+        );
+        if !linearized_authority_readiness_from_flags(
+            local_leader,
+            effective_voter,
+            applied_caught_up_to_committed,
+            committed_in_current_term,
+        )
+        .serving()
+        {
+            return Err(ControlPlaneError::AuthorityNotServing);
+        }
+        let authority_term = current_term.ok_or_else(|| {
+            ControlPlaneError::invariant_failure("serving OpenRaft authority has no current term")
+        })?;
+        let read_index = control_plane_log_id_from_raft(applied).ok_or_else(|| {
             ControlPlaneError::CommandDecode {
-                message: format!("invalid OpenRaft applied log id for runtime map: {base_applied}"),
+                message: format!("invalid OpenRaft applied log id for runtime map: {applied}"),
             }
         })?;
-        let status = self.status().await?;
-        let Some(authority_term) = status
-            .linearized_authority_serving()
-            .then_some(status.current_term())
-            .flatten()
-        else {
-            return Ok((durable_snapshot, read_index));
+        let volatile_snapshot = self.volatile_heartbeat_overlay_arc(authority_term, applied)?;
+        let (snapshot, volatile_authority_term) = match volatile_snapshot {
+            Some(snapshot) => (
+                durable_snapshot.replace_snapshot(snapshot),
+                Some(authority_term),
+            ),
+            None => (durable_snapshot, None),
         };
-        let snapshot = if status.applied() == Some(base_applied) {
-            self.volatile_heartbeat_overlay_snapshot(authority_term, base_applied)?
-                .unwrap_or(durable_snapshot)
-        } else {
-            durable_snapshot
-        };
-        Ok((snapshot, read_index))
+        Ok(ControlPlaneRaftLinearizedSnapshot {
+            snapshot,
+            applied,
+            read_index,
+            volatile_authority_term,
+        })
+    }
+
+    async fn derive_linearized_snapshot<T, F>(
+        selected: ControlPlaneRaftLinearizedSnapshot,
+        context: &'static str,
+        derive: F,
+    ) -> Result<T, ControlPlaneError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&ClusterControlSnapshot, ControlPlaneLogId) -> Result<T, ControlPlaneError>
+            + Send
+            + 'static,
+    {
+        let ControlPlaneRaftLinearizedSnapshot {
+            snapshot,
+            read_index,
+            ..
+        } = selected;
+        tokio::task::spawn_blocking(move || {
+            let snapshot = snapshot.into_blocking_lane_arc();
+            derive(&snapshot, read_index)
+        })
+        .await
+        .map_err(|error| {
+            ControlPlaneError::rpc_remote(format!(
+                "control-plane {context} derivation worker failed: {error}"
+            ))
+        })?
     }
 
     pub async fn linearized_runtime_map_snapshot(
         &self,
         issued_at_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let (snapshot, read_index) = self.linearized_control_plane_snapshot().await?;
-        snapshot.runtime_map_with_freshness_proof(
-            issued_at_ms,
-            RuntimeMapFreshnessProof::ReadIndex {
-                authority_incarnation: snapshot.authority_incarnation(),
-                read_index,
+        let selected = self.linearized_control_plane_snapshot_selection().await?;
+        Self::derive_linearized_snapshot(selected, "runtime-map", move |snapshot, read_index| {
+            snapshot.runtime_map_with_freshness_proof(
                 issued_at_ms,
-            },
-        )
+                RuntimeMapFreshnessProof::ReadIndex {
+                    authority_incarnation: snapshot.authority_incarnation(),
+                    read_index,
+                    issued_at_ms,
+                },
+            )
+        })
+        .await
     }
 
     pub async fn linearized_serving_pg_runtime_map_snapshot(
@@ -4303,133 +4731,144 @@ impl ControlPlaneRaftAuthority {
         pg_id: PgId,
         issued_at_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let (snapshot, read_index) = self.linearized_control_plane_snapshot().await?;
-        snapshot.serving_runtime_map_for_pg_with_freshness_proof(
-            pg_id,
-            issued_at_ms,
-            RuntimeMapFreshnessProof::ReadIndex {
-                authority_incarnation: snapshot.authority_incarnation(),
-                read_index,
-                issued_at_ms,
+        let selected = self.linearized_control_plane_snapshot_selection().await?;
+        Self::derive_linearized_snapshot(
+            selected,
+            "scoped runtime-map",
+            move |snapshot, read_index| {
+                snapshot.serving_runtime_map_for_pg_with_freshness_proof(
+                    pg_id,
+                    issued_at_ms,
+                    RuntimeMapFreshnessProof::ReadIndex {
+                        authority_incarnation: snapshot.authority_incarnation(),
+                        read_index,
+                        issued_at_ms,
+                    },
+                )
             },
         )
+        .await
     }
 
     pub async fn linearized_runtime_map_diagnostics_snapshot(
         &self,
         issued_at_ms: u64,
     ) -> Result<ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneError> {
-        let (snapshot, read_index) = self.linearized_control_plane_snapshot().await?;
-        let node_leases = snapshot
-            .nodes()
-            .map(|node| {
-                ControlPlaneRuntimeMapNodeLeaseDiagnostic::new(
-                    node.node_id(),
-                    node.lease_deadline_ms(),
-                )
-            })
-            .collect();
-        let runtime_map = snapshot.runtime_map_with_freshness_proof(
-            issued_at_ms,
-            RuntimeMapFreshnessProof::ReadIndex {
-                authority_incarnation: snapshot.authority_incarnation(),
-                read_index,
-                issued_at_ms,
+        let selected = self.linearized_control_plane_snapshot_selection().await?;
+        Self::derive_linearized_snapshot(
+            selected,
+            "runtime-map diagnostics",
+            move |snapshot, read_index| {
+                let node_leases = snapshot
+                    .nodes()
+                    .map(|node| {
+                        ControlPlaneRuntimeMapNodeLeaseDiagnostic::new(
+                            node.node_id(),
+                            node.lease_deadline_ms(),
+                        )
+                    })
+                    .collect();
+                let runtime_map = snapshot.runtime_map_with_freshness_proof(
+                    issued_at_ms,
+                    RuntimeMapFreshnessProof::ReadIndex {
+                        authority_incarnation: snapshot.authority_incarnation(),
+                        read_index,
+                        issued_at_ms,
+                    },
+                )?;
+                ControlPlaneRuntimeMapDiagnosticSnapshot::new(runtime_map, node_leases)
             },
-        )?;
-        ControlPlaneRuntimeMapDiagnosticSnapshot::new(runtime_map, node_leases)
+        )
+        .await
     }
 
     pub async fn linearized_runtime_map_status(
         &self,
         issued_at_ms: u64,
     ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        let cached_certificate = *self.runtime_map_content_certificate.lock().map_err(|_| {
-            ControlPlaneError::rpc_protocol(
-                "control-plane OpenRaft runtime-map content certificate lock poisoned".to_owned(),
-            )
-        })?;
-        let (durable_status, base_applied, certificate) =
-            control_plane_runtime_map_status_via_openraft_read_index(
-                &self.raft,
-                issued_at_ms,
-                cached_certificate,
-            )
-            .await?;
-        if cached_certificate != Some((base_applied, certificate)) {
+        let selected = self.linearized_control_plane_snapshot_selection().await?;
+        let selected_applied = selected.applied;
+        let selected_authority_term = selected.volatile_authority_term;
+        let cached_certificate = if let Some(authority_term) = selected.volatile_authority_term {
+            self.runtime_map_overlay_content_certificate
+                .lock()
+                .map_err(|_| {
+                    ControlPlaneError::rpc_protocol(
+                        "control-plane OpenRaft overlay runtime-map content certificate lock poisoned"
+                            .to_owned(),
+                    )
+                })?
+                .as_ref()
+                .filter(|(term, applied, _)| {
+                    *term == authority_term && *applied == selected.applied
+                })
+                .map(|(_, _, certificate)| *certificate)
+        } else {
+            self.runtime_map_content_certificate
+                .lock()
+                .map_err(|_| {
+                    ControlPlaneError::rpc_protocol(
+                        "control-plane OpenRaft runtime-map content certificate lock poisoned"
+                            .to_owned(),
+                    )
+                })?
+                .as_ref()
+                .filter(|(applied, _)| *applied == selected.applied)
+                .map(|(_, certificate)| *certificate)
+        };
+        let (status, new_certificate) = Self::derive_linearized_snapshot(
+            selected,
+            "runtime-map status",
+            move |snapshot, read_index| {
+                let freshness_proof = RuntimeMapFreshnessProof::ReadIndex {
+                    authority_incarnation: snapshot.authority_incarnation(),
+                    read_index,
+                    issued_at_ms,
+                };
+                if let Some(certificate) = cached_certificate {
+                    if let Some(status) =
+                        ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
+                            snapshot,
+                            issued_at_ms,
+                            freshness_proof,
+                            certificate,
+                        )?
+                    {
+                        return Ok((status, None));
+                    }
+                }
+                let runtime_map =
+                    snapshot.runtime_map_with_freshness_proof(issued_at_ms, freshness_proof)?;
+                let status = ControlPlaneRuntimeMapStatus::from_runtime_map(&runtime_map);
+                let certificate = RuntimeMapContentCertificate::from_snapshot_and_runtime_map(
+                    snapshot,
+                    &runtime_map,
+                );
+                Ok((status, Some(certificate)))
+            },
+        )
+        .await?;
+        let Some(certificate) = new_certificate else {
+            return Ok(status);
+        };
+        if let Some(authority_term) = selected_authority_term {
+            *self
+                .runtime_map_overlay_content_certificate
+                .lock()
+                .map_err(|_| {
+                    ControlPlaneError::rpc_protocol(
+                        "control-plane OpenRaft overlay runtime-map content certificate lock poisoned"
+                            .to_owned(),
+                    )
+                })? = Some((authority_term, selected_applied, certificate));
+        } else {
             *self.runtime_map_content_certificate.lock().map_err(|_| {
                 ControlPlaneError::rpc_protocol(
                     "control-plane OpenRaft runtime-map content certificate lock poisoned"
                         .to_owned(),
                 )
-            })? = Some((base_applied, certificate));
+            })? = Some((selected_applied, certificate));
         }
-
-        let authority_status = self.status().await?;
-        let Some(authority_term) = authority_status
-            .linearized_authority_serving()
-            .then_some(authority_status.current_term())
-            .flatten()
-            .filter(|_| authority_status.applied() == Some(base_applied))
-        else {
-            return Ok(durable_status);
-        };
-        let read_index = control_plane_log_id_from_raft(base_applied).ok_or_else(|| {
-            ControlPlaneError::CommandDecode {
-                message: format!(
-                    "invalid OpenRaft applied log id for runtime-map status: {base_applied}"
-                ),
-            }
-        })?;
-        let overlay_certificate = self
-            .runtime_map_overlay_content_certificate
-            .lock()
-            .map_err(|_| {
-                ControlPlaneError::rpc_protocol(
-                    "control-plane OpenRaft overlay runtime-map content certificate lock poisoned"
-                        .to_owned(),
-                )
-            })?
-            .as_ref()
-            .filter(|(term, applied, _)| *term == authority_term && *applied == base_applied)
-            .map(|(_, _, certificate)| *certificate)
-            .unwrap_or(certificate);
-        let mut overlay = self.lock_volatile_heartbeat_overlay()?;
-        let Some(overlay) = overlay.as_mut().filter(|overlay| {
-            overlay.authority_term == authority_term && overlay.base_applied == base_applied
-        }) else {
-            return Ok(durable_status);
-        };
-        let freshness_proof = RuntimeMapFreshnessProof::ReadIndex {
-            authority_incarnation: overlay.snapshot.authority_incarnation(),
-            read_index,
-            issued_at_ms,
-        };
-        if let Some(status) = ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
-            &overlay.snapshot,
-            issued_at_ms,
-            freshness_proof,
-            overlay_certificate,
-        )? {
-            return Ok(status);
-        }
-        let runtime_map = overlay
-            .snapshot
-            .runtime_map_with_freshness_proof(issued_at_ms, freshness_proof)?;
-        let status = ControlPlaneRuntimeMapStatus::from_runtime_map(&runtime_map);
-        let overlay_certificate = RuntimeMapContentCertificate::from_snapshot_and_runtime_map(
-            &overlay.snapshot,
-            &runtime_map,
-        );
-        *self
-            .runtime_map_overlay_content_certificate
-            .lock()
-            .map_err(|_| {
-                ControlPlaneError::rpc_protocol(
-                    "control-plane OpenRaft overlay runtime-map content certificate lock poisoned"
-                        .to_owned(),
-                )
-            })? = Some((authority_term, base_applied, overlay_certificate));
         Ok(status)
     }
 
@@ -4502,11 +4941,12 @@ impl ControlPlaneRaftAuthority {
             && current_status.current_term() == Some(authority_term)
             && current_status.applied() == Some(base_applied)
         {
+            let generation = self.retained_snapshot_generation(Arc::new(snapshot));
             *self.lock_volatile_heartbeat_overlay()? =
                 Some(ControlPlaneRaftVolatileHeartbeatOverlay {
                     authority_term,
                     base_applied,
-                    snapshot,
+                    snapshot: generation,
                 });
         }
         Ok(())
@@ -4518,12 +4958,32 @@ impl ControlPlaneRaftAuthority {
         base_applied: LogIdOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
         Ok(self
+            .volatile_heartbeat_overlay_generation(authority_term, base_applied)?
+            .map(|generation| Arc::unwrap_or_clone(generation.into_blocking_lane_arc())))
+    }
+
+    fn volatile_heartbeat_overlay_generation(
+        &self,
+        authority_term: ControlPlaneRaftTerm,
+        base_applied: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<Option<ControlPlaneRaftSnapshotGeneration>, ControlPlaneError> {
+        Ok(self
+            .volatile_heartbeat_overlay_arc(authority_term, base_applied)?
+            .map(|snapshot| self.retained_snapshot_generation(snapshot)))
+    }
+
+    fn volatile_heartbeat_overlay_arc(
+        &self,
+        authority_term: ControlPlaneRaftTerm,
+        base_applied: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<Option<Arc<ClusterControlSnapshot>>, ControlPlaneError> {
+        Ok(self
             .lock_volatile_heartbeat_overlay()?
             .as_ref()
             .filter(|overlay| {
                 overlay.authority_term == authority_term && overlay.base_applied == base_applied
             })
-            .map(|overlay| overlay.snapshot.clone()))
+            .map(|overlay| Arc::clone(overlay.snapshot.arc())))
     }
 
     fn lock_volatile_heartbeat_overlay(
@@ -5436,101 +5896,10 @@ pub async fn runtime_map_via_openraft_read_index(
     )
 }
 
-async fn control_plane_runtime_map_status_via_openraft_read_index(
-    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
-    issued_at_ms: u64,
-    cached_certificate: Option<(
-        LogIdOf<ControlPlaneRaftTypeConfig>,
-        RuntimeMapContentCertificate,
-    )>,
-) -> Result<
-    (
-        ControlPlaneRuntimeMapStatus,
-        LogIdOf<ControlPlaneRaftTypeConfig>,
-        RuntimeMapContentCertificate,
-    ),
-    ControlPlaneError,
-> {
-    let read_log_id = raft
-        .ensure_linearizable(ReadPolicy::ReadIndex)
-        .await
-        .map_err(|error| {
-            openraft_linearizable_read_error("runtime-map status read-index", error)
-        })?;
-    let read_log_id = *read_log_id.log_id();
-    let read_index = control_plane_log_id_from_raft(read_log_id).ok_or_else(|| {
-        ControlPlaneError::CommandDecode {
-            message: format!(
-                "invalid OpenRaft read-index log id for runtime-map status: {read_log_id}"
-            ),
-        }
-    })?;
-
-    raft.with_state_machine(move |state_machine| {
-        Box::pin(async move {
-            let Some(last_applied) = state_machine.last_applied() else {
-                return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
-                    read_index,
-                    last_applied: state_machine.inner().last_applied(),
-                });
-            };
-            if last_applied < read_log_id {
-                return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
-                    read_index,
-                    last_applied: state_machine.inner().last_applied(),
-                });
-            }
-            let applied_read_index =
-                control_plane_log_id_from_raft(last_applied).ok_or_else(|| {
-                    ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "invalid OpenRaft applied log id for runtime-map status: {last_applied}"
-                        ),
-                    }
-                })?;
-            let snapshot = state_machine.inner().snapshot();
-            let freshness_proof = RuntimeMapFreshnessProof::ReadIndex {
-                authority_incarnation: snapshot.authority_incarnation(),
-                read_index: applied_read_index,
-                issued_at_ms,
-            };
-            if let Some((cached_applied, certificate)) = cached_certificate {
-                if cached_applied == last_applied {
-                    if let Some(status) =
-                        ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
-                            snapshot,
-                            issued_at_ms,
-                            freshness_proof,
-                            certificate,
-                        )?
-                    {
-                        return Ok((status, last_applied, certificate));
-                    }
-                }
-            }
-            let runtime_map =
-                snapshot.runtime_map_with_freshness_proof(issued_at_ms, freshness_proof)?;
-            let certificate =
-                RuntimeMapContentCertificate::from_snapshot_and_runtime_map(snapshot, &runtime_map);
-            Ok((
-                ControlPlaneRuntimeMapStatus::from_runtime_map(&runtime_map),
-                last_applied,
-                certificate,
-            ))
-        })
-    })
-    .await
-    .map_err(|error| openraft_remote_error("runtime-map status state-machine read", error))?
-}
-
 async fn control_plane_snapshot_via_openraft_read_index(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
 ) -> Result<(ClusterControlSnapshot, LogIdOf<ControlPlaneRaftTypeConfig>), ControlPlaneError> {
-    let read_log_id = raft
-        .ensure_linearizable(ReadPolicy::ReadIndex)
-        .await
-        .map_err(|error| openraft_linearizable_read_error("read-index", error))?;
-    let read_log_id = *read_log_id.log_id();
+    let read_log_id = control_plane_read_index_via_openraft(raft).await?;
     let read_index = control_plane_log_id_from_raft(read_log_id).ok_or_else(|| {
         ControlPlaneError::CommandDecode {
             message: format!("invalid OpenRaft read-index log id for runtime map: {read_log_id}"),
@@ -5556,6 +5925,15 @@ async fn control_plane_snapshot_via_openraft_read_index(
     })
     .await
     .map_err(|error| openraft_remote_error("state-machine read", error))?
+}
+
+async fn control_plane_read_index_via_openraft(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+    raft.ensure_linearizable(ReadPolicy::ReadIndex)
+        .await
+        .map(|read_index| *read_index.log_id())
+        .map_err(|error| openraft_linearizable_read_error("read-index", error))
 }
 
 fn control_plane_error_to_io_error(context: &'static str, error: ControlPlaneError) -> io::Error {
