@@ -18,12 +18,13 @@ Unless explicit binary paths are supplied, the required server and UAT client
 binaries are built locally before any remote setup.
 
 Options:
-  --hosts HOSTS          Three or four SSH aliases (or ARGMIN_MULTIHOST_RAFT_HOSTS)
+  --hosts HOSTS          Three or four SSH aliases; required except for shutdown
   --addresses ADDRS      Matching advertised IPv4 addresses (or ARGMIN_MULTIHOST_RAFT_ADDRS)
   --binary PATH          Deploy a prebuilt argmin-s3 binary; standard target paths build it
   --client-binary PATH   Use a prebuilt UAT client; standard target paths build it
   --release              Build and deploy target/release/argmin-s3
   --remote-root PATH     Common absolute remote root (default: /home/argmin-test/argmin-soak)
+  --lifecycle-root PATH  Private lifecycle registry (default: XDG state directory)
   --ssh-config PATH      Explicit SSH client config (or ARGMIN_MULTIHOST_RAFT_SSH_CONFIG)
   --storage-profile P    persistent or volatile-test (default: persistent)
   --port-base PORT       Raft port; other endpoints use the next four (default: 24000)
@@ -37,6 +38,8 @@ Options:
   --startup-crud-rounds N
                          CRUD rounds through every frontend before fault testing (default: 1)
   --startup-only         Stop after startup CRUD and cluster diagnostics
+  --start-cluster        Start a cluster for ad hoc use; run no tests and leave it running
+  --shutdown-cluster ID  Stop and remove a cluster previously started with --start-cluster
   --host-fault-driver P  Local executable invoked as P down|up HOST ADDRESS
   --quantitative         Enforce the sustained persistent-storage release gate
   --sustained-seconds N  Quantitative steady interval (default: 300)
@@ -49,6 +52,14 @@ Example:
     --hosts grey0,grey1,grey2,grey3 \
     --addresses 192.168.1.124,192.168.1.155,192.168.1.116,192.168.1.154 \
     --startup-only --startup-crud-rounds 10 --no-cleanup-fail
+
+Ad hoc cluster lifecycle:
+  ./scripts/uat-multihost-raft \
+    --hosts grey0,grey1,grey2,grey3 \
+    --addresses 192.0.2.10,192.0.2.11,192.0.2.12,192.0.2.13 \
+    --release --start-cluster
+  ./scripts/uat-multihost-raft \
+    --shutdown-cluster RUN_ID
 EOF
 }
 
@@ -217,13 +228,137 @@ remote_exec_quiet() {
     ssh "${ssh_options[@]}" "$host" "$command"
 }
 
+shutdown_started_cluster() {
+    local requested_run_id="$1"
+    local shutdown_run_name="argmin-multihost-raft-$requested_run_id"
+    local shutdown_remote_run="$remote_root/$shutdown_run_name"
+    local index host
+    local failed=0
+    local -a shutdown_hosts=()
+
+    split_host_list "$hosts_value" "--hosts" shutdown_hosts
+    echo "== shut down argmin-s3 multihost cluster $requested_run_id =="
+    for ((index = 0; index < ${#shutdown_hosts[@]}; index++)); do
+        host="${shutdown_hosts[$index]}"
+        echo "== stop cluster services on $host =="
+        # The single-quoted script expands positional parameters on the remote host.
+        # shellcheck disable=SC2016
+        if ! remote_exec "$host" bash -c '
+            remote_run="$1"
+            unit_prefix="$2"
+            unit_rows="$(systemctl --user list-units --all --plain --no-legend "${unit_prefix}-*")" || exit 1
+            units=()
+            while read -r unit _; do
+                [[ -n "$unit" ]] && units+=("$unit")
+            done <<<"$unit_rows"
+            if ((${#units[@]} > 0)); then
+                systemctl --user stop "${units[@]}" >/dev/null 2>&1 || true
+            fi
+            for unit in "${units[@]}"; do
+                if systemctl --user is-active --quiet "$unit"; then
+                    printf "service remains active after shutdown: %s\n" "$unit" >&2
+                    exit 1
+                fi
+            done
+            rm -rf -- "$remote_run"
+        ' _ "$shutdown_remote_run" "$shutdown_run_name"; then
+            echo "error: failed to shut down cluster state on $host" >&2
+            failed=1
+        fi
+    done
+    ((failed == 0)) || die "cluster shutdown was incomplete; retained local lifecycle state"
+
+    rm -rf -- "$shutdown_local_run"
+    rm -f -- "$lifecycle_record"
+    echo "cluster_shutdown_complete run_id=$requested_run_id remote_run=$shutdown_remote_run"
+}
+
+load_cluster_lifecycle_record() {
+    local requested_run_id="$1"
+    local expected_run_name="argmin-multihost-raft-$requested_run_id"
+    local line key value
+    local record_version="" record_run_id="" record_hosts=""
+    local record_remote_root="" record_local_run="" record_ssh_config=""
+    local -A seen=()
+
+    lifecycle_record="$lifecycle_root/$requested_run_id.record"
+    [[ -d "$lifecycle_root" && ! -L "$lifecycle_root" && -O "$lifecycle_root" ]] ||
+        die "lifecycle root is not a private current-user directory: $lifecycle_root"
+    [[ "$(stat -c %a "$lifecycle_root")" == "700" ]] ||
+        die "lifecycle root must have mode 0700"
+    [[ -f "$lifecycle_record" && ! -L "$lifecycle_record" ]] ||
+        die "lifecycle record does not exist or is not a regular file: $lifecycle_record"
+    [[ -O "$lifecycle_record" ]] || die "lifecycle record is not owned by the current user"
+    [[ "$(stat -c %a "$lifecycle_record")" == "600" ]] ||
+        die "lifecycle record must have mode 0600"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *=* ]] || die "malformed lifecycle record: $lifecycle_record"
+        key="${line%%=*}"
+        value="${line#*=}"
+        [[ -z "${seen[$key]:-}" ]] ||
+            die "duplicate lifecycle record field $key"
+        seen["$key"]=1
+        case "$key" in
+            version) record_version="$value" ;;
+            run_id) record_run_id="$value" ;;
+            hosts) record_hosts="$value" ;;
+            remote_root) record_remote_root="$value" ;;
+            local_run) record_local_run="$value" ;;
+            ssh_config) record_ssh_config="$value" ;;
+            *) die "unknown lifecycle record field $key" ;;
+        esac
+    done <"$lifecycle_record"
+
+    for key in version run_id hosts remote_root local_run ssh_config; do
+        [[ "${seen[$key]:-}" == "1" ]] ||
+            die "lifecycle record is missing field $key"
+    done
+    [[ "$record_version" == "1" ]] || die "unsupported lifecycle record version"
+    [[ "$record_run_id" == "$requested_run_id" ]] ||
+        die "lifecycle record run ID does not match $requested_run_id"
+    [[ -n "$record_hosts" ]] || die "lifecycle record has no hosts"
+    [[ "$record_remote_root" == /* && "$record_remote_root" != "/" ]] ||
+        die "lifecycle record has an unsafe remote root"
+    [[ "$record_remote_root" != *[[:space:]]* ]] ||
+        die "lifecycle record remote root contains whitespace"
+    [[ "$record_local_run" == /* && "$record_local_run" != "/" ]] ||
+        die "lifecycle record has an unsafe local path"
+    [[ "${record_local_run##*/}" == "$expected_run_name" ]] ||
+        die "lifecycle record local path is not bound to run $requested_run_id"
+    if [[ -n "$record_ssh_config" ]]; then
+        [[ -f "$record_ssh_config" ]] ||
+            die "recorded SSH config does not exist: $record_ssh_config"
+    fi
+
+    if ((hosts_explicit)) && [[ "$hosts_value" != "$record_hosts" ]]; then
+        die "--hosts does not match the lifecycle record"
+    fi
+    if ((remote_root_explicit)) && [[ "$remote_root" != "$record_remote_root" ]]; then
+        die "--remote-root does not match the lifecycle record"
+    fi
+    if ((ssh_config_explicit)) && [[ "$ssh_config" != "$record_ssh_config" ]]; then
+        die "--ssh-config does not match the lifecycle record"
+    fi
+    hosts_value="$record_hosts"
+    remote_root="$record_remote_root"
+    shutdown_local_run="$record_local_run"
+    ssh_config="$record_ssh_config"
+}
+
 hosts_value="${ARGMIN_MULTIHOST_RAFT_HOSTS:-}"
 addresses_value="${ARGMIN_MULTIHOST_RAFT_ADDRS:-}"
+hosts_explicit=0
+[[ -z "${ARGMIN_MULTIHOST_RAFT_HOSTS+x}" ]] || hosts_explicit=1
 binary=""
 client_binary=""
 release=0
 remote_root="${ARGMIN_MULTIHOST_RAFT_REMOTE_ROOT:-/home/argmin-test/argmin-soak}"
+remote_root_explicit=0
+[[ -z "${ARGMIN_MULTIHOST_RAFT_REMOTE_ROOT+x}" ]] || remote_root_explicit=1
+lifecycle_root="${ARGMIN_MULTIHOST_RAFT_LIFECYCLE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/argmin/multihost-raft}"
 ssh_config="${ARGMIN_MULTIHOST_RAFT_SSH_CONFIG:-}"
+ssh_config_explicit=0
+[[ -z "${ARGMIN_MULTIHOST_RAFT_SSH_CONFIG+x}" ]] || ssh_config_explicit=1
 storage_profile="${ARGMIN_MULTIHOST_RAFT_STORAGE_PROFILE:-persistent}"
 port_base="${ARGMIN_MULTIHOST_RAFT_PORT_BASE:-24000}"
 pg_count="${ARGMIN_MULTIHOST_RAFT_PG_COUNT:-116}"
@@ -235,6 +370,8 @@ heartbeat_lease_ms="${ARGMIN_MULTIHOST_RAFT_HEARTBEAT_LEASE_MS:-5000}"
 repeat_count="${ARGMIN_MULTIHOST_RAFT_REPEAT:-3}"
 startup_crud_rounds="${ARGMIN_MULTIHOST_RAFT_STARTUP_CRUD_ROUNDS:-1}"
 startup_only=0
+start_cluster=0
+shutdown_run_id=""
 host_fault_driver="${ARGMIN_MULTIHOST_RAFT_HOST_FAULT_DRIVER:-}"
 quantitative=0
 sustained_seconds="${ARGMIN_MULTIHOST_RAFT_SUSTAINED_SECONDS:-300}"
@@ -250,6 +387,7 @@ while (($# > 0)); do
         --hosts)
             [[ $# -ge 2 ]] || die "--hosts requires a value"
             hosts_value="$2"
+            hosts_explicit=1
             shift 2
             ;;
         --addresses)
@@ -274,11 +412,18 @@ while (($# > 0)); do
         --remote-root)
             [[ $# -ge 2 ]] || die "--remote-root requires a value"
             remote_root="$2"
+            remote_root_explicit=1
+            shift 2
+            ;;
+        --lifecycle-root)
+            [[ $# -ge 2 ]] || die "--lifecycle-root requires a value"
+            lifecycle_root="$2"
             shift 2
             ;;
         --ssh-config)
             [[ $# -ge 2 ]] || die "--ssh-config requires a value"
             ssh_config="$2"
+            ssh_config_explicit=1
             shift 2
             ;;
         --storage-profile)
@@ -335,6 +480,15 @@ while (($# > 0)); do
             startup_only=1
             shift
             ;;
+        --start-cluster)
+            start_cluster=1
+            shift
+            ;;
+        --shutdown-cluster)
+            [[ $# -ge 2 ]] || die "--shutdown-cluster requires a run ID"
+            shutdown_run_id="$2"
+            shift 2
+            ;;
         --host-fault-driver)
             [[ $# -ge 2 ]] || die "--host-fault-driver requires a value"
             host_fault_driver="$2"
@@ -367,9 +521,18 @@ while (($# > 0)); do
     esac
 done
 
-[[ -n "$hosts_value" ]] || die "--hosts is required"
-[[ -n "$addresses_value" ]] || die "--addresses is required"
 ((release == 0 || ${#binary} == 0)) || die "--binary cannot be combined with --release"
+[[ "$lifecycle_root" == /* && "$lifecycle_root" != "/" ]] ||
+    die "--lifecycle-root must be a non-root absolute path"
+[[ "$lifecycle_root" != *$'\n'* ]] || die "--lifecycle-root cannot contain a newline"
+if [[ -n "$shutdown_run_id" ]]; then
+    ((start_cluster == 0)) || die "--shutdown-cluster cannot be combined with --start-cluster"
+    [[ "$shutdown_run_id" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+-[0-9]+$ ]] ||
+        die "--shutdown-cluster requires a run ID printed by --start-cluster"
+    load_cluster_lifecycle_record "$shutdown_run_id"
+fi
+
+[[ -n "$hosts_value" ]] || die "--hosts is required"
 [[ "$remote_root" == /* && "$remote_root" != "/" ]] || die "--remote-root must be a non-root absolute path"
 [[ "$remote_root" != *[[:space:]]* ]] || die "--remote-root cannot contain whitespace"
 declare -a ssh_options=(-o BatchMode=yes -o ConnectTimeout=3)
@@ -378,6 +541,22 @@ if [[ -n "$ssh_config" ]]; then
     [[ -f "$ssh_config" ]] || die "--ssh-config does not name a regular file: $ssh_config"
     ssh_options+=(-F "$ssh_config")
     scp_options+=(-F "$ssh_config")
+fi
+if [[ -n "$shutdown_run_id" ]]; then
+    shutdown_started_cluster "$shutdown_run_id"
+    exit 0
+fi
+
+[[ -n "$addresses_value" ]] || die "--addresses is required"
+if ((start_cluster)); then
+    ((startup_only == 0)) || die "--start-cluster cannot be combined with --startup-only"
+    ((quantitative == 0)) || die "--start-cluster cannot be combined with --quantitative"
+    ((keep_always == 0 && keep_failure == 0)) ||
+        die "--start-cluster manages preservation automatically; omit cleanup options"
+    [[ -z "$host_fault_driver" ]] ||
+        die "--start-cluster cannot be combined with --host-fault-driver"
+    [[ -z "$client_binary" ]] ||
+        die "--start-cluster does not use --client-binary"
 fi
 case "$storage_profile" in
     persistent|volatile-test) ;;
@@ -454,7 +633,7 @@ case "$binary" in
         ;;
 esac
 
-if [[ -z "$client_binary" ]]; then
+if ((start_cluster == 0)) && [[ -z "$client_binary" ]]; then
     client_build=(cargo build -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
     if ((release)); then
         client_build=(cargo build --release -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
@@ -486,7 +665,9 @@ fi
 if ((${#client_build[@]} != 0)); then
     build_cargo_binary client_binary uat_pg_backfill_smoke "${client_build[@]}"
 fi
-[[ -x "$client_binary" ]] || die "S3 UAT client binary is not executable: $client_binary"
+if ((start_cluster == 0)); then
+    [[ -x "$client_binary" ]] || die "S3 UAT client binary is not executable: $client_binary"
+fi
 
 for host in "${hosts[@]}"; do
     if ! machine_id="$(remote_exec_quiet "$host" cat /etc/machine-id)"; then
@@ -505,14 +686,25 @@ done
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
 run_name="argmin-multihost-raft-$run_id"
 remote_run="$remote_root/$run_name"
-local_run="$(mktemp -d "${TMPDIR:-/tmp}/$run_name.XXXXXX")"
+if ((start_cluster)); then
+    local_run="${TMPDIR:-/tmp}/$run_name"
+    mkdir "$local_run" || die "local lifecycle path already exists: $local_run"
+else
+    local_run="$(mktemp -d "${TMPDIR:-/tmp}/$run_name.XXXXXX")"
+fi
 material_dir="$local_run/material"
 manifest_path="$local_run/cluster.toml"
 mkdir -p "$material_dir"
 chmod 700 "$local_run" "$material_dir"
-printf '%s' 'argmin-multihost-primary-secret' >"$material_dir/s3-secret-access-key"
-printf '%s' 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' >"$material_dir/sse-s3-wrapping-key"
+s3_secret_access_key="$(openssl rand -hex 20)"
+sse_s3_wrapping_key="$(openssl rand -base64 32)"
+[[ ${#s3_secret_access_key} -eq 40 && ${#sse_s3_wrapping_key} -eq 44 ]] ||
+    die "openssl returned malformed per-run secret material"
+printf '%s' "$s3_secret_access_key" >"$material_dir/s3-secret-access-key"
+printf '%s' "$sse_s3_wrapping_key" >"$material_dir/sse-s3-wrapping-key"
 chmod 600 "$material_dir/s3-secret-access-key" "$material_dir/sse-s3-wrapping-key"
+lifecycle_record=""
+lifecycle_record_next=""
 
 declare -a current_units=() unit_generations=()
 declare -a storage_units=() storage_unit_generations=()
@@ -520,6 +712,7 @@ declare -a frontend_units=() frontend_unit_generations=()
 declare -A diagnostic_unit_hosts=()
 command_process_number=1
 cleanup_started=0
+leave_cluster_running=0
 powered_off_number=0
 metrics_dir="$local_run/metrics"
 mkdir -p "$metrics_dir"
@@ -601,6 +794,9 @@ cleanup() {
     ((cleanup_started == 0)) || exit "$status"
     cleanup_started=1
     set +e
+    if ((status == 0 && leave_cluster_running)); then
+        exit 0
+    fi
     if ((status != 0)) && declare -F capture_cluster_diagnostics >/dev/null; then
         capture_cluster_diagnostics failure
     fi
@@ -618,6 +814,12 @@ cleanup() {
             remote_exec_quiet "$host" rm -rf -- "$remote_run" >/dev/null 2>&1 || true
         done
         rm -rf -- "$local_run"
+        if [[ -n "$lifecycle_record" ]]; then
+            rm -f -- "$lifecycle_record"
+        fi
+        if [[ -n "$lifecycle_record_next" ]]; then
+            rm -f -- "$lifecycle_record_next"
+        fi
     else
         echo "preserved local artifacts: $local_run" >&2
         echo "preserved remote state: $remote_run on ${hosts_value}" >&2
@@ -627,7 +829,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "== argmin-s3 multihost Raft and data-plane soak =="
-echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value host_count=$host_count storage_profile=$storage_profile pg_count=$pg_count ec=$ec_data_shards+$ec_parity_shards retained_epochs=$retained_epochs data_objects=$data_object_count heartbeat_lease_ms=$heartbeat_lease_ms repeat=$repeat_count startup_crud_rounds=$startup_crud_rounds startup_only=$startup_only quantitative=$quantitative sustained_seconds=$sustained_seconds"
+echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value host_count=$host_count storage_profile=$storage_profile pg_count=$pg_count ec=$ec_data_shards+$ec_parity_shards retained_epochs=$retained_epochs data_objects=$data_object_count heartbeat_lease_ms=$heartbeat_lease_ms repeat=$repeat_count startup_crud_rounds=$startup_crud_rounds startup_only=$startup_only start_cluster=$start_cluster quantitative=$quantitative sustained_seconds=$sustained_seconds"
 echo "binary=$binary client_binary=$client_binary remote_run=$remote_run"
 if [[ -n "$host_fault_driver" ]]; then
     echo "host_fault_driver=$host_fault_driver"
@@ -1518,7 +1720,7 @@ run_data_client_on() {
         "S3_TEST_TIMEOUT_SECS=60" \
         "ARGMIN_PG_COUNT=$pg_count" \
         "AWS_TEST_ACCESS_KEY=argmin-multihost-primary" \
-        "AWS_TEST_SECRET_KEY=argmin-multihost-primary-secret" \
+        "AWS_TEST_SECRET_KEY=$s3_secret_access_key" \
         "AWS_TEST_REGION=us-east-1" \
         "$client_binary" "$@"
     env \
@@ -1527,7 +1729,7 @@ run_data_client_on() {
         "S3_TEST_TIMEOUT_SECS=60" \
         "ARGMIN_PG_COUNT=$pg_count" \
         "AWS_TEST_ACCESS_KEY=argmin-multihost-primary" \
-        "AWS_TEST_SECRET_KEY=argmin-multihost-primary-secret" \
+        "AWS_TEST_SECRET_KEY=$s3_secret_access_key" \
         "AWS_TEST_REGION=us-east-1" \
         "$client_binary" "$@" 2>&1 | tee -a "$data_plane_client_log"
 }
@@ -2069,13 +2271,83 @@ done
 wait_for_storage_network
 wait_runtime_map_ready
 
-echo "== start split-role frontends and run startup CRUD diagnostics =="
+echo "== start split-role frontends =="
 for ((number = 1; number <= host_count; number++)); do
     start_frontend "$number"
 done
 for ((number = 1; number <= host_count; number++)); do
     wait_frontend_listener "$number"
 done
+if ((start_cluster)); then
+    assert_all_service_units_active
+    for lifecycle_value in \
+        "$run_id" "$hosts_value" "$remote_root" "$local_run" "$ssh_config"; do
+        [[ "$lifecycle_value" != *$'\n'* && "$lifecycle_value" != *$'\r'* ]] ||
+            die "cluster lifecycle values cannot contain line breaks"
+    done
+    mkdir -p -- "$lifecycle_root"
+    [[ -d "$lifecycle_root" && ! -L "$lifecycle_root" && -O "$lifecycle_root" ]] ||
+        die "lifecycle root is not a private current-user directory: $lifecycle_root"
+    chmod 700 "$lifecycle_root"
+    lifecycle_record="$lifecycle_root/$run_id.record"
+    lifecycle_record_next="$lifecycle_record.next-$$"
+    (
+        umask 077
+        {
+            printf 'version=1\n'
+            printf 'run_id=%s\n' "$run_id"
+            printf 'hosts=%s\n' "$hosts_value"
+            printf 'remote_root=%s\n' "$remote_root"
+            printf 'local_run=%s\n' "$local_run"
+            printf 'ssh_config=%s\n' "$ssh_config"
+        } >"$lifecycle_record_next"
+    )
+    mv "$lifecycle_record_next" "$lifecycle_record"
+    lifecycle_record_next=""
+
+    lifecycle_file="$local_run/cluster-lifecycle.env"
+    {
+        printf 'run_id=%q\n' "$run_id"
+        printf 'cluster_id=%q\n' "$cluster_id"
+        printf 'hosts=%q\n' "$hosts_value"
+        printf 'addresses=%q\n' "$addresses_value"
+        printf 'remote_root=%q\n' "$remote_root"
+        printf 'remote_run=%q\n' "$remote_run"
+        printf 'local_run=%q\n' "$local_run"
+        printf 'frontend_port=%q\n' "$frontend_port"
+        printf 's3_access_key_id=%q\n' 'argmin-multihost-primary'
+        printf 's3_secret_access_key=%q\n' "$s3_secret_access_key"
+        printf 's3_region=%q\n' 'us-east-1'
+        for ((number = 1; number <= host_count; number++)); do
+            printf 'frontend_%d_id=%q\n' "$number" "frontend-$number"
+            printf 'frontend_%d_endpoint=%q\n' "$number" \
+                "http://${addresses[$((number - 1))]}:$frontend_port"
+        done
+    } >"$lifecycle_file"
+    chmod 600 "$lifecycle_file"
+
+    echo "cluster_started run_id=$run_id cluster_id=$cluster_id"
+    echo "remote_run=$remote_run"
+    echo "local_run=$local_run"
+    for ((number = 1; number <= host_count; number++)); do
+        echo "frontend id=frontend-$number address=${addresses[$((number - 1))]}:$frontend_port endpoint=http://${addresses[$((number - 1))]}:$frontend_port"
+    done
+    echo "s3_credentials access_key_id=argmin-multihost-primary secret_access_key=$s3_secret_access_key region=us-east-1"
+    shutdown_command=(
+        ./scripts/uat-multihost-raft
+        --lifecycle-root "$lifecycle_root"
+        --shutdown-cluster "$run_id"
+    )
+    printf 'shutdown_command='
+    printf ' %q' "${shutdown_command[@]}"
+    printf '\n'
+    echo "cluster_lifecycle_file=$lifecycle_file"
+    echo "cluster_lifecycle_record=$lifecycle_record"
+    leave_cluster_running=1
+    exit 0
+fi
+
+echo "== run startup CRUD diagnostics =="
 openssl rand -out "$data_plane_body_file" 1048576
 capture_cluster_diagnostics startup-before-crud
 if ((startup_only == 0)); then

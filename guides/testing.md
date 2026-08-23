@@ -266,6 +266,44 @@ journals, clock tracking, durable file inventories, and the timestamped
 them. This mode distinguishes listener health from a cluster that cannot admit
 S3 mutations.
 
+For ad hoc testing, `--start-cluster` stops after every authority, storage node,
+and frontend is ready. It runs no S3 probes and deliberately leaves the
+run-scoped systemd units and remote state active:
+
+```bash
+./scripts/uat-multihost-raft \
+  --hosts grey0,grey1,grey2,grey3 \
+  --addresses 192.0.2.10,192.0.2.11,192.0.2.12,192.0.2.13 \
+  --release \
+  --start-cluster
+```
+
+The command generates independent per-run S3 and SSE wrapping secrets, then
+prints the run ID, cluster ID, every `frontend-N` HTTP endpoint, the generated
+test S3 credential, the retained local and remote paths, and an exact shutdown
+command. The client values are stored with mode `0600` in the reported
+`cluster-lifecycle.env`. A separate mode-`0600` record under
+`~/.local/state/argmin/multihost-raft` binds the run ID to its original host
+set, SSH configuration, remote root, and exact local path. Use
+`--lifecycle-root` or `ARGMIN_MULTIHOST_RAFT_LIFECYCLE_ROOT` to select another
+private registry directory.
+
+Stop the cluster and remove its run-scoped remote and local state by passing
+only that run ID; host aliases and advertised addresses are loaded from the
+record:
+
+```bash
+./scripts/uat-multihost-raft \
+  --shutdown-cluster 20260823T120000Z-12345-6789
+```
+
+`--shutdown-cluster` rejects conflicting host, remote-root, or SSH-config
+arguments, discovers every run-scoped unit generation, and verifies those
+units are inactive on every recorded host before deleting that host's state.
+If a host cannot be reached or a unit remains active, shutdown fails and
+retains the lifecycle record and exact local state so the operation can be
+retried.
+
 For real machine loss, `--host-fault-driver PATH` replaces the normal
 three-service stop with a local operator-provided executable. The harness calls
 it as `PATH down HOST ADDRESS`, requires three consecutive failed SSH probes and
