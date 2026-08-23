@@ -27,7 +27,7 @@ Options:
   --ssh-config PATH      Explicit SSH client config (or ARGMIN_MULTIHOST_RAFT_SSH_CONFIG)
   --storage-profile P    persistent or volatile-test (default: persistent)
   --port-base PORT       Raft port; other endpoints use the next four (default: 24000)
-  --pg-count N           Bootstrap PG count (default: 116)
+  --pg-count N           Bootstrap PG count, at least 2 (default: 116)
   --ec-data-shards N     EC data shards (default: 1 on three hosts, 2 on four)
   --ec-parity-shards N   EC parity shards (default: 1)
   --retained-epochs N    Committed route epoch advances before failover (default: 256)
@@ -47,7 +47,7 @@ Options:
 Example:
   ./scripts/uat-multihost-raft \
     --hosts grey0,grey1,grey2,grey3 \
-    --addresses 192.168.1.124,192.168.1.155,192.168.1.116,192.168.1.117 \
+    --addresses 192.168.1.124,192.168.1.155,192.168.1.116,192.168.1.154 \
     --startup-only --startup-crud-rounds 10 --no-cleanup-fail
 EOF
 }
@@ -147,34 +147,43 @@ validate_route_rotation() {
     done
 }
 
-acting_set_excluding_node() {
-    local excluded_node="$1"
-    local seed="$2"
-    local -n excluded_output="$3"
+acting_set_with_primary_and_node() {
+    local primary_node="$1"
+    local included_node="$2"
+    local seed="$3"
+    local -n included_output="$4"
     local offset candidate
-    excluded_output=()
+    ((primary_node != included_node)) ||
+        die "acting-set primary and included node must differ"
+    included_output=("$primary_node" "$included_node")
+    ((${#included_output[@]} == ec_total_shards)) && return 0
     for ((offset = 0; offset < host_count; offset++)); do
         candidate=$((((seed + offset) % host_count) + 1))
-        ((candidate == excluded_node)) && continue
-        excluded_output+=("$candidate")
-        ((${#excluded_output[@]} == ec_total_shards)) && return 0
-    done
-    die "could not construct an EC acting set excluding node $excluded_node"
-}
-
-acting_set_including_node() {
-    local included_node="$1"
-    local seed="$2"
-    local -n included_output="$3"
-    local offset candidate
-    included_output=("$included_node")
-    for ((offset = 0; offset < host_count; offset++)); do
-        candidate=$((((seed + offset) % host_count) + 1))
-        ((candidate == included_node)) && continue
+        ((candidate == primary_node || candidate == included_node)) && continue
         included_output+=("$candidate")
         ((${#included_output[@]} == ec_total_shards)) && return 0
     done
-    die "could not construct an EC acting set including node $included_node"
+    ((${#included_output[@]} == ec_total_shards)) ||
+        die "could not construct an EC acting set with primary $primary_node including node $included_node"
+}
+
+acting_set_with_primary_excluding_node() {
+    local primary_node="$1"
+    local excluded_node="$2"
+    local seed="$3"
+    local -n excluded_output="$4"
+    local offset candidate
+    ((primary_node != excluded_node)) ||
+        die "acting-set primary must differ from excluded node"
+    excluded_output=("$primary_node")
+    for ((offset = 0; offset < host_count; offset++)); do
+        candidate=$((((seed + offset) % host_count) + 1))
+        ((candidate == primary_node || candidate == excluded_node)) && continue
+        excluded_output+=("$candidate")
+        ((${#excluded_output[@]} == ec_total_shards)) && return 0
+    done
+    ((${#excluded_output[@]} == ec_total_shards)) ||
+        die "could not construct an EC acting set with primary $primary_node excluding node $excluded_node"
 }
 
 shell_join() {
@@ -378,6 +387,7 @@ for numeric in "$port_base" "$pg_count" "$retained_epochs" "$data_object_count" 
     [[ "$numeric" =~ ^[1-9][0-9]*$ ]] || die "numeric options must be positive integers"
 done
 ((port_base >= 1024 && port_base <= 65531)) || die "--port-base must be between 1024 and 65531"
+((pg_count >= 2)) || die "--pg-count must be at least 2 for distinct metadata and payload outage probes"
 ((pg_count <= 4096)) || die "--pg-count exceeds the manifest limit of 4096"
 ((data_object_count <= 64)) || die "--data-objects must not exceed 64"
 ((heartbeat_lease_ms >= 2000 && heartbeat_lease_ms <= 10000)) ||
@@ -1313,7 +1323,7 @@ admin_command() {
         "$remote_run/argmin-s3" "$@"
 }
 
-frontend_read_command() {
+frontend_command() {
     local number="$command_process_number"
     local index=$((number - 1))
     remote_exec_quiet "${hosts[$index]}" env \
@@ -1329,7 +1339,7 @@ wait_runtime_map_ready() {
     local status=""
     local runtime_epoch runtime_pg_routes active_serving_pg_routes trailing
     while ((SECONDS < deadline)); do
-        if status="$(frontend_read_command control-plane-runtime-map-ready "$remote_run/unused.sock" 2>&1)"; then
+        if status="$(frontend_command control-plane-runtime-map-ready "$remote_run/unused.sock" 2>&1)"; then
             read -r runtime_epoch runtime_pg_routes active_serving_pg_routes trailing <<<"$status"
             if [[ "$runtime_epoch" =~ ^[0-9]+$ && "$runtime_pg_routes" == "$pg_count" &&
                 "$minimum_exclusive_epoch" =~ ^-?[0-9]+$ &&
@@ -1344,7 +1354,7 @@ wait_runtime_map_ready() {
         sleep 0.2
     done
     [[ -z "$status" ]] || echo "last_runtime_map_error=$status" >&2
-    frontend_read_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" >&2 || true
+    frontend_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" >&2 || true
     die "control-plane runtime map did not become ready"
 }
 
@@ -1356,11 +1366,12 @@ wait_pg_runtime_map_ready() {
     local deadline=$((SECONDS + 120))
     local status="" runtime_epoch route_epoch
     while ((SECONDS < deadline)); do
-        if status="$(frontend_read_command control-plane-pg-runtime-map-ready \
+        if status="$(frontend_command control-plane-pg-runtime-map-ready \
             "$remote_run/unused.sock" "$pg_id" "${expected_acting_set[@]}" 2>&1)"; then
             read -r runtime_epoch route_epoch <<<"$status"
             if [[ "$runtime_epoch" =~ ^[0-9]+$ && "$route_epoch" =~ ^[0-9]+$ ]] &&
                 ((runtime_epoch > minimum_exclusive_epoch)); then
+                last_runtime_epoch="$runtime_epoch"
                 echo "pg_runtime_map_ready pg=$pg_id runtime_epoch=$runtime_epoch route_epoch=$route_epoch acting_set=${expected_acting_set[*]}"
                 return 0
             fi
@@ -1369,21 +1380,86 @@ wait_pg_runtime_map_ready() {
         sleep 0.2
     done
     [[ -z "$status" ]] || echo "last_pg_runtime_map_error=$status" >&2
-    frontend_read_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" >&2 || true
+    frontend_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" >&2 || true
     die "PG $pg_id did not become active on acting set ${expected_acting_set[*]}"
+}
+
+build_empty_cluster_retained_route_history() {
+    local baseline_pg_id baseline_output last_route_epoch
+    local route_advances=0 route_attempts=0 route_epoch route_output pg_id
+    local max_route_attempts=$((retained_epochs + (host_count * pg_count)))
+    local -a baseline_acting_set=() acting_set=()
+
+    echo "== build retained route history on empty cluster =="
+    route_acting_set_for_attempt 1 baseline_pg_id baseline_acting_set
+    if ! baseline_output="$(admin_command control-plane-set-pg-acting-set-live \
+        "$remote_run/unused.sock" "$baseline_pg_id" "${baseline_acting_set[@]}" 2>&1)"; then
+        printf '%s\n' "$baseline_output" >&2
+        die "baseline route acting-set update failed for PG $baseline_pg_id"
+    fi
+    printf '%s\n' "$baseline_output" >&2
+    if [[ "$baseline_output" =~ control-plane\ set\ PG\ [0-9]+\ acting\ set\ at\ epoch\ ([0-9]+) ]]; then
+        last_route_epoch="${BASH_REMATCH[1]}"
+    else
+        die "could not parse baseline route epoch from admin response"
+    fi
+
+    while ((route_advances < retained_epochs)); do
+        route_attempts=$((route_attempts + 1))
+        ((route_attempts <= max_route_attempts)) ||
+            die "only observed $route_advances route epoch advances after $max_route_attempts attempts"
+        route_acting_set_for_attempt "$route_attempts" pg_id acting_set
+        print_command admin_command control-plane-set-pg-acting-set-live \
+            "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}"
+        if ! route_output="$(admin_command control-plane-set-pg-acting-set-live \
+            "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}" 2>&1)"; then
+            printf '%s\n' "$route_output" >&2
+            die "route acting-set update failed for PG $pg_id"
+        fi
+        printf '%s\n' "$route_output" >&2
+        if [[ "$route_output" =~ control-plane\ set\ PG\ [0-9]+\ acting\ set\ at\ epoch\ ([0-9]+) ]]; then
+            route_epoch="${BASH_REMATCH[1]}"
+        else
+            die "could not parse route epoch from admin response"
+        fi
+        if ((route_epoch > last_route_epoch)); then
+            route_advances=$((route_advances + 1))
+            last_route_epoch="$route_epoch"
+        elif ((route_epoch < last_route_epoch)); then
+            die "route epoch regressed from $last_route_epoch to $route_epoch"
+        fi
+        # Direct acting-set changes require identical metadata proofs. Keep the
+        # cluster empty here and serialize transitions so this history fixture
+        # cannot accidentally become an unsafe metadata migration workload.
+        wait_pg_runtime_map_ready "$pg_id" -1 "${acting_set[@]}"
+    done
+    echo "retained_route_history advances=$route_advances attempts=$route_attempts final_epoch=$last_route_epoch"
+    admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
+    wait_runtime_map_ready
 }
 
 prepare_host_outage_routes() {
     local iteration="$1"
     local target_number="$2"
-    local pg_id node actor found
-    local -a acting_set=()
+    local source_number="$3"
+    local node actor found
 
-    outage_probe_pg=$(((iteration - 1) % pg_count))
+    IFS= read -r outage_probe_pg <"$data_plane_metadata_pg_file"
+    [[ "$outage_probe_pg" =~ ^[0-9]+$ ]] ||
+        die "persistent workload did not report a valid metadata PG"
     outage_probe_pre_acting_set=()
     outage_probe_replacement_acting_set=()
-    acting_set_including_node "$target_number" \
+    outage_probe_data_acting_set=()
+    outage_probe_data_pg=$(((outage_probe_pg + iteration) % pg_count))
+    if ((outage_probe_data_pg == outage_probe_pg)); then
+        outage_probe_data_pg=$(((outage_probe_data_pg + 1) % pg_count))
+    fi
+    ((outage_probe_data_pg != outage_probe_pg)) ||
+        die "host outage probe requires distinct metadata and payload PGs"
+    acting_set_with_primary_and_node "$source_number" "$target_number" \
         "$((outage_probe_pg + iteration))" outage_probe_pre_acting_set
+    acting_set_with_primary_excluding_node "$source_number" "$target_number" \
+        "$((outage_probe_data_pg + iteration))" outage_probe_data_acting_set
     outage_probe_spare=0
     for ((node = 1; node <= host_count; node++)); do
         found=0
@@ -1409,20 +1485,18 @@ prepare_host_outage_routes() {
         fi
     done
 
-    for ((pg_id = 0; pg_id < pg_count; pg_id++)); do
-        if ((pg_id == outage_probe_pg)); then
-            acting_set=("${outage_probe_pre_acting_set[@]}")
-        else
-            acting_set_excluding_node "$target_number" \
-                "$((pg_id + iteration))" acting_set
-        fi
-        admin_command control-plane-set-pg-acting-set-live \
-            "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}"
-    done
-    echo "host_outage_probe_configured pg=$outage_probe_pg failed_node=$target_number spare_node=$outage_probe_spare acting_set=${outage_probe_pre_acting_set[*]} replacement_acting_set=${outage_probe_replacement_acting_set[*]}"
+    frontend_command control-plane-transfer-pg-metadata-live \
+        "$remote_run/unused.sock" "$outage_probe_pg" \
+        "${outage_probe_pre_acting_set[@]}"
+    frontend_command control-plane-transfer-pg-metadata-live \
+        "$remote_run/unused.sock" "$outage_probe_data_pg" \
+        "${outage_probe_data_acting_set[@]}"
+    echo "host_outage_probe_configured metadata_pg=$outage_probe_pg data_pg=$outage_probe_data_pg failed_node=$target_number spare_node=$outage_probe_spare metadata_acting_set=${outage_probe_pre_acting_set[*]} metadata_replacement_acting_set=${outage_probe_replacement_acting_set[*]} data_acting_set=${outage_probe_data_acting_set[*]}"
 }
 
 data_plane_bucket_file="$local_run/data-plane-bucket"
+data_plane_initial_key_file="$local_run/data-plane-initial-key"
+data_plane_metadata_pg_file="$local_run/data-plane-metadata-pg"
 data_plane_body_file="$local_run/data-plane-body"
 data_plane_client_log="$metrics_dir/data-plane-client.log"
 data_plane_keys=()
@@ -1442,6 +1516,7 @@ run_data_client_on() {
         "S3_TEST_ENDPOINT=$data_plane_endpoint" \
         "S3_TEST_BUCKET_PREFIX=argmin-multihost-" \
         "S3_TEST_TIMEOUT_SECS=60" \
+        "ARGMIN_PG_COUNT=$pg_count" \
         "AWS_TEST_ACCESS_KEY=argmin-multihost-primary" \
         "AWS_TEST_SECRET_KEY=argmin-multihost-primary-secret" \
         "AWS_TEST_REGION=us-east-1" \
@@ -1450,6 +1525,7 @@ run_data_client_on() {
         "S3_TEST_ENDPOINT=$data_plane_endpoint" \
         "S3_TEST_BUCKET_PREFIX=argmin-multihost-" \
         "S3_TEST_TIMEOUT_SECS=60" \
+        "ARGMIN_PG_COUNT=$pg_count" \
         "AWS_TEST_ACCESS_KEY=argmin-multihost-primary" \
         "AWS_TEST_SECRET_KEY=argmin-multihost-primary-secret" \
         "AWS_TEST_REGION=us-east-1" \
@@ -1538,6 +1614,69 @@ put_data_plane_object_for_pg_on() {
     IFS= read -r key <"$key_file"
     [[ -n "$key" ]] || die "targeted data-PG PUT did not report its object key"
     data_plane_keys+=("$key")
+}
+
+inspect_data_plane_object_placement_on() {
+    local number="$1"
+    local metadata_pg="$2"
+    local data_pg="$3"
+    local key="$4"
+    local deadline=$((SECONDS + 30))
+    local inspection_output="" status=0
+    local bucket=""
+    IFS= read -r bucket <"$data_plane_bucket_file"
+    [[ -n "$bucket" ]] || die "data-plane bucket file is empty"
+
+    command_process_number="$number"
+    while ((SECONDS < deadline)); do
+        status=0
+        inspection_output="$(frontend_command control-plane-inspect-object-payload-placement \
+            "$remote_run/unused.sock" "$metadata_pg" "$data_pg" \
+            "$bucket" "$key" 2>&1)" || status=$?
+        if ((status == 0)); then
+            printf '%s\n' "$inspection_output"
+            return 0
+        fi
+        if ((status == 3)); then
+            printf '%s\n' "$inspection_output" >&2
+            return 3
+        fi
+        sleep 0.2
+    done
+    [[ -z "$inspection_output" ]] || printf '%s\n' "$inspection_output" >&2
+    return 1
+}
+
+put_data_plane_object_for_metadata_and_data_pg_on() {
+    local number="$1"
+    local metadata_pg="$2"
+    local data_pg="$3"
+    local key_prefix="$4"
+    local key_file="$local_run/data-plane-key-$key_prefix"
+    local key="" candidate_prefix="" inspection_status=0 attempt
+    for ((attempt = 0; attempt < 32; attempt++)); do
+        candidate_prefix="$key_prefix-placement-attempt-$attempt"
+        run_data_client_on "$number" put-for-metadata-pg \
+            "$data_plane_bucket_file" "$key_file" "$candidate_prefix" \
+            "$data_plane_body_file" "$metadata_pg" "$data_pg"
+        IFS= read -r key <"$key_file"
+        [[ -n "$key" ]] || die "targeted metadata/data-PG PUT did not report its object key"
+
+        inspection_status=0
+        inspect_data_plane_object_placement_on \
+            "$number" "$metadata_pg" "$data_pg" "$key" || inspection_status=$?
+        if ((inspection_status == 0)); then
+            data_plane_keys+=("$key")
+            return 0
+        fi
+        if ((inspection_status != 3)); then
+            die "could not inspect committed placement for $key"
+        fi
+
+        echo "discarding committed object with unexpected placement key=$key expected_metadata_pg=$metadata_pg expected_data_pg=$data_pg" >&2
+        run_data_client_on "$number" delete "$data_plane_bucket_file" "$key"
+    done
+    die "could not commit object on metadata PG $metadata_pg and data PG $data_pg after 32 attempts"
 }
 
 verify_data_plane_objects_on() {
@@ -1745,7 +1884,7 @@ capture_quantitative_baseline() {
     local number="$1"
     local index=$((number - 1))
     local diagnostics checkpoint_line wal_line
-    diagnostics="$(frontend_read_command control-plane-runtime-map-diagnostics \
+    diagnostics="$(frontend_command control-plane-runtime-map-diagnostics \
         "$remote_run/unused.sock")"
     printf '%s\n' "$diagnostics" \
         >"$metrics_dir/control-$number-baseline.txt"
@@ -1776,7 +1915,7 @@ accumulate_quantitative_generation() {
     local checkpoint_delta wal_delta
     local checkpoint_store_us_max wal_file_sync_us_max rpc_operation_us_max
 
-    diagnostics="$(frontend_read_command control-plane-runtime-map-diagnostics \
+    diagnostics="$(frontend_command control-plane-runtime-map-diagnostics \
         "$remote_run/unused.sock")"
     printf '%s\n' "$diagnostics" \
         >"$metrics_dir/control-$number-generation-${unit_generations[$index]}-$label.txt"
@@ -1939,6 +2078,9 @@ for ((number = 1; number <= host_count; number++)); do
 done
 openssl rand -out "$data_plane_body_file" 1048576
 capture_cluster_diagnostics startup-before-crud
+if ((startup_only == 0)); then
+    build_empty_cluster_retained_route_history
+fi
 for ((startup_round = 1; startup_round <= startup_crud_rounds; startup_round++)); do
     echo "== startup CRUD round $startup_round/$startup_crud_rounds =="
     run_startup_crud_round "$startup_round"
@@ -1952,60 +2094,13 @@ if ((startup_only)); then
     exit 0
 fi
 
-echo "== build retained route history =="
-baseline_pg_id=""
-baseline_acting_set=()
-route_acting_set_for_attempt 1 baseline_pg_id baseline_acting_set
-if ! baseline_output="$(admin_command control-plane-set-pg-acting-set-live \
-    "$remote_run/unused.sock" "$baseline_pg_id" "${baseline_acting_set[@]}" 2>&1)"; then
-    printf '%s\n' "$baseline_output" >&2
-    die "baseline route acting-set update failed for PG $baseline_pg_id"
-fi
-printf '%s\n' "$baseline_output" >&2
-if [[ "$baseline_output" =~ control-plane\ set\ PG\ [0-9]+\ acting\ set\ at\ epoch\ ([0-9]+) ]]; then
-    last_route_epoch="${BASH_REMATCH[1]}"
-else
-    die "could not parse baseline route epoch from admin response"
-fi
-
-route_advances=0
-route_attempts=0
-max_route_attempts=$((retained_epochs + (host_count * pg_count)))
-while ((route_advances < retained_epochs)); do
-    route_attempts=$((route_attempts + 1))
-    ((route_attempts <= max_route_attempts)) ||
-        die "only observed $route_advances route epoch advances after $max_route_attempts attempts"
-    route_acting_set_for_attempt "$route_attempts" pg_id acting_set
-    print_command admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}"
-    if ! route_output="$(admin_command control-plane-set-pg-acting-set-live \
-        "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}" 2>&1)"; then
-        printf '%s\n' "$route_output" >&2
-        die "route acting-set update failed for PG $pg_id"
-    fi
-    printf '%s\n' "$route_output" >&2
-    if [[ "$route_output" =~ control-plane\ set\ PG\ [0-9]+\ acting\ set\ at\ epoch\ ([0-9]+) ]]; then
-        route_epoch="${BASH_REMATCH[1]}"
-    else
-        die "could not parse route epoch from admin response"
-    fi
-    if ((route_epoch > last_route_epoch)); then
-        route_advances=$((route_advances + 1))
-        last_route_epoch="$route_epoch"
-    elif ((route_epoch < last_route_epoch)); then
-        die "route epoch regressed from $last_route_epoch to $route_epoch"
-    fi
-    # Keep this history generator to one in-flight peering transition. Letting
-    # the loop outrun storage heartbeats can leave dozens of unrelated PGs in
-    # Peering and turn a history-retention gate into a convergence stress test.
-    wait_pg_runtime_map_ready "$pg_id" -1 "${acting_set[@]}"
-done
-echo "retained_route_history advances=$route_advances attempts=$route_attempts final_epoch=$last_route_epoch"
-admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
-wait_runtime_map_ready
-
 echo "== seed persistent cross-frontend S3 workload =="
-run_data_client_on 1 create-put "$data_plane_bucket_file" object-000 "$data_plane_body_file"
-data_plane_keys+=(object-000)
+run_data_client_on 1 create-put-metadata-pg \
+    "$data_plane_bucket_file" "$data_plane_initial_key_file" \
+    "$data_plane_metadata_pg_file" object-000 "$data_plane_body_file" 0
+IFS= read -r object_key <"$data_plane_initial_key_file"
+[[ -n "$object_key" ]] || die "persistent workload did not report its initial object key"
+data_plane_keys+=("$object_key")
 for ((object_index = 1; object_index < data_object_count; object_index++)); do
     printf -v object_key 'object-%03d' "$object_index"
     frontend_number=$(((object_index % host_count) + 1))
@@ -2033,12 +2128,14 @@ for ((iteration = 1; iteration <= repeat_count; iteration++)); do
     survivor_number=$((target_number % host_count + 1))
     wait_runtime_map_ready
     if ((host_count > ec_total_shards)); then
-        prepare_host_outage_routes "$iteration" "$target_number"
+        prepare_host_outage_routes "$iteration" "$target_number" "$survivor_number"
         wait_pg_runtime_map_ready "$outage_probe_pg" -1 \
             "${outage_probe_pre_acting_set[@]}"
+        wait_pg_runtime_map_ready "$outage_probe_data_pg" -1 \
+            "${outage_probe_data_acting_set[@]}"
         wait_runtime_map_ready
-        put_data_plane_object_for_pg_on "$survivor_number" "$outage_probe_pg" \
-            "host-outage-read-$iteration"
+        put_data_plane_object_for_metadata_and_data_pg_on "$survivor_number" \
+            "$outage_probe_pg" "$outage_probe_data_pg" "host-outage-read-$iteration"
     fi
     pre_host_outage_epoch="$last_runtime_epoch"
     if [[ -n "$host_fault_driver" ]]; then
@@ -2072,17 +2169,16 @@ for ((iteration = 1; iteration <= repeat_count; iteration++)); do
 
     pre_host_rejoin_epoch="$last_runtime_epoch"
     if ((host_count > ec_total_shards)); then
-        admin_command control-plane-set-pg-acting-set-live \
+        frontend_command control-plane-transfer-pg-metadata-live \
             "$remote_run/unused.sock" "$outage_probe_pg" \
             "${outage_probe_replacement_acting_set[@]}"
         wait_pg_runtime_map_ready "$outage_probe_pg" "$pre_host_outage_epoch" \
             "${outage_probe_replacement_acting_set[@]}"
-        wait_runtime_map_ready "$pre_host_outage_epoch"
         pre_host_rejoin_epoch="$last_runtime_epoch"
-        put_data_plane_object_for_pg_on "$survivor_number" "$outage_probe_pg" \
-            "host-outage-write-$iteration"
+        put_data_plane_object_for_metadata_and_data_pg_on "$survivor_number" \
+            "$outage_probe_pg" "$outage_probe_data_pg" "host-outage-write-$iteration"
         verify_data_plane_objects_across_running_frontends
-        echo "host_outage_write_verified host=$target_number pg=$outage_probe_pg spare_node=$outage_probe_spare acting_set=${outage_probe_replacement_acting_set[*]} epoch=$last_runtime_epoch objects=${#data_plane_keys[@]}"
+        echo "host_outage_write_verified host=$target_number metadata_pg=$outage_probe_pg data_pg=$outage_probe_data_pg spare_node=$outage_probe_spare metadata_acting_set=${outage_probe_replacement_acting_set[*]} data_acting_set=${outage_probe_data_acting_set[*]} epoch=$last_runtime_epoch objects=${#data_plane_keys[@]}"
     else
         echo "host_outage_write_skipped host=$target_number reason=no-spare-storage-domain ec=$ec_data_shards+$ec_parity_shards"
     fi
@@ -2146,7 +2242,7 @@ for ((index = 0; index < host_count; index++)); do
     remote_exec "${hosts[$index]}" du -s -B1 "$remote_run/storage-$number"
 done
 
-if diagnostics="$(frontend_read_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" 2>/dev/null)"; then
+if diagnostics="$(frontend_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" 2>/dev/null)"; then
     echo "$diagnostics"
 fi
 

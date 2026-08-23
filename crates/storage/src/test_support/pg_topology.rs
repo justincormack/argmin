@@ -42,6 +42,7 @@ pub trait PgTopologyPlacementTestSupport {
         bucket: &BucketName,
         key_prefix: &str,
         target_metadata_pg: u32,
+        target_data_pg: Option<u32>,
     ) -> Option<TestObjectDataPgSelection>;
 }
 
@@ -95,10 +96,28 @@ impl PgTopologyPlacementTestSupport for PgTopology {
         bucket: &BucketName,
         key_prefix: &str,
         target_metadata_pg: u32,
+        target_data_pg: Option<u32>,
     ) -> Option<TestObjectDataPgSelection> {
-        find_object_key(self, bucket, key_prefix, 10_000, |object_pg, data_pg| {
-            object_pg == target_metadata_pg && data_pg != target_metadata_pg
-        })
+        if !topology_contains_pg(self, target_metadata_pg)
+            || target_data_pg.is_some_and(|target| {
+                target == target_metadata_pg || !topology_contains_pg(self, target)
+            })
+        {
+            return None;
+        }
+        let search_limit =
+            distinct_data_pg_key_search_limit(self.pg_count(), 1, target_data_pg.is_some());
+        find_object_key(
+            self,
+            bucket,
+            key_prefix,
+            search_limit,
+            |object_pg, data_pg| {
+                object_pg == target_metadata_pg
+                    && data_pg != target_metadata_pg
+                    && target_data_pg.is_none_or(|target| data_pg == target)
+            },
+        )
     }
 }
 
@@ -198,12 +217,39 @@ mod tests {
                 &bucket,
                 "placement-test-object",
                 7,
+                None,
             )
             .expect("test topology should contain the requested relation");
         let (key, data_pg) = selection.into_key_and_data_pg();
 
         assert_eq!(topology.object_pg_for(&bucket, &key), 7);
         assert_ne!(data_pg, 7);
+    }
+
+    #[test]
+    fn metadata_and_data_pg_relation_selection_targets_both_pgs() {
+        let topology = PgTopology::new(&(0..32).collect::<Vec<_>>()).unwrap();
+        let bucket = BucketName::try_from("exact-placement-test-bucket".to_string()).unwrap();
+        let selection = topology
+            .test_find_object_key_on_metadata_pg_with_distinct_data_pg(
+                &bucket,
+                "exact-placement-test-object",
+                7,
+                Some(11),
+            )
+            .expect("test topology should contain the requested exact relation");
+        let (key, data_pg) = selection.into_key_and_data_pg();
+
+        assert_eq!(topology.object_pg_for(&bucket, &key), 7);
+        assert_eq!(data_pg, 11);
+        assert!(topology
+            .test_find_object_key_on_metadata_pg_with_distinct_data_pg(
+                &bucket,
+                "invalid-exact-placement-test-object",
+                7,
+                Some(7),
+            )
+            .is_none());
     }
 
     #[test]

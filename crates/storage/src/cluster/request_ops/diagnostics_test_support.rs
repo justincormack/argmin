@@ -59,6 +59,23 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> ObjectPayloadPlacementDiagnostic {
+        self.object_payload_placement_diagnostic_for_expected_pgs(bucket, key, None)
+    }
+
+    pub(crate) fn object_payload_placement_diagnostic_for_expected_pgs(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_pgs: Option<(u32, u32)>,
+    ) -> ObjectPayloadPlacementDiagnostic {
+        if let Some((expected_metadata_pg, _)) = expected_pgs {
+            let actual_metadata_pg = self.object_metadata_pg_id(bucket, key);
+            if actual_metadata_pg != expected_metadata_pg {
+                return ObjectPayloadPlacementDiagnostic::mismatch(format!(
+                    "object payload placement mismatch: expected_metadata_pg={expected_metadata_pg} actual_metadata_pg={actual_metadata_pg}\n"
+                ));
+            }
+        }
         match self.load_object_read_snapshot_if(
             bucket,
             key,
@@ -67,7 +84,18 @@ impl super::StorageCluster {
             |_| Ok::<(), std::convert::Infallible>(()),
         ) {
             Ok(Ok(outcome)) => match outcome.snapshot.payload_placement_diagnostic() {
-                Ok(text) => ObjectPayloadPlacementDiagnostic::success(text),
+                Ok(text) => {
+                    if let Some((_, expected_data_pg)) = expected_pgs {
+                        if outcome.snapshot.object_segments.iter().any(|segment| {
+                            segment.stored_bytes_request().data_pg_id != expected_data_pg
+                        }) {
+                            return ObjectPayloadPlacementDiagnostic::mismatch(format!(
+                                "object payload placement mismatch: expected_data_pg={expected_data_pg}\n{text}"
+                            ));
+                        }
+                    }
+                    ObjectPayloadPlacementDiagnostic::success(text)
+                }
                 Err(ObjectPayloadPlacementDiagnosticError::DeleteMarker) => {
                     ObjectPayloadPlacementDiagnostic::conflict(
                         "object payload placement unavailable: delete_marker\n".to_string(),

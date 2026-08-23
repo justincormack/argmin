@@ -166,8 +166,9 @@ pub(crate) use error::{
     StorageNodeFailureClass, StorageNodeFailureDetail, StoreError,
 };
 pub use live_pg_transfer::{
-    LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
-    LivePgMetadataTransferError, LivePgMetadataTransferFailpoint, LivePgMetadataTransferSummary,
+    LiveObjectPayloadPlacementInspectionError, LivePgMetadataTransferAdmin,
+    LivePgMetadataTransferControlPlaneClient, LivePgMetadataTransferError,
+    LivePgMetadataTransferFailpoint, LivePgMetadataTransferSummary,
 };
 pub use maintenance::{
     StorageMaintenanceAdmission, StorageMaintenancePermit, StorageMaintenanceStartError,

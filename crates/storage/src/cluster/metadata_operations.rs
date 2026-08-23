@@ -2622,7 +2622,10 @@ impl StorageCluster {
         checkpoints: impl IntoIterator<Item = MetadataCommandCheckpoint>,
     ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
         match self.export_pg_metadata_transfer_from_retained_log(pg_id, source_node_id) {
-            Ok(artifact) => return Ok(artifact),
+            Ok(artifact) if metadata_transfer_retained_base_is_self_contained(&artifact) => {
+                return Ok(artifact);
+            }
+            Ok(_) => {}
             Err(error) if retained_log_export_failure_allows_checkpoint_fallback(&error) => {}
             Err(error) => return Err(error.into()),
         }
@@ -2750,9 +2753,7 @@ impl StorageCluster {
         source_node_id: NodeId,
     ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
         match self.export_pg_metadata_transfer_from_retained_log(pg_id, source_node_id) {
-            Ok(artifact)
-                if artifact.source_base_kind() != PgMetadataTransferBaseKind::RetainedLogPrefix =>
-            {
+            Ok(artifact) if metadata_transfer_retained_base_is_self_contained(&artifact) => {
                 return Ok(artifact);
             }
             Ok(_) => {}
@@ -2782,9 +2783,12 @@ impl StorageCluster {
             metadata_transfer_destination_proof(artifact, &commands, self.operation_epoch());
         let base_import_proof = artifact.source_base_metadata_proof();
         let checkpoint_base = artifact.checkpoint_base();
-        let nodes = self
-            .local_map
-            .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?;
+        let nodes = metadata_transfer_import_nodes_source_last(
+            self.local_map
+                .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?,
+            artifact.source_node_id,
+            |node| node.node_id(),
+        );
 
         let mut reference: Option<(NodeId, PgMetadataProof)> = None;
         for node in nodes {
@@ -6680,5 +6684,39 @@ impl StorageCluster {
         self.metadata_primary_test_hook_node()
             .test_install_after_object_metadata_command_publish_hook(hook)
     }
+}
 
+fn metadata_transfer_retained_base_is_self_contained(
+    artifact: &PgMetadataTransferArtifact,
+) -> bool {
+    artifact.base_kind == PgMetadataTransferBaseKind::Empty
+        && artifact.base_proof.applied_log_index == 0
+        && artifact.base_proof.applied_log_hash == MetadataCommandLogHash::genesis()
+        && artifact.base_proof.state_digest == canonical_empty_metadata_state_digest()
+}
+
+fn metadata_transfer_import_nodes_source_last<T>(
+    mut nodes: Vec<T>,
+    source_node_id: NodeId,
+    node_id: impl Fn(&T) -> NodeId,
+) -> Vec<T> {
+    nodes.sort_by_key(|node| node_id(node) == source_node_id);
+    nodes
+}
+
+#[cfg(test)]
+mod metadata_transfer_import_order_tests {
+    use super::*;
+
+    #[test]
+    fn retained_source_is_imported_after_every_other_destination() {
+        let source = NodeId::new(1);
+        let ordered = metadata_transfer_import_nodes_source_last(
+            vec![NodeId::new(2), source, NodeId::new(3)],
+            source,
+            |node_id| *node_id,
+        );
+
+        assert_eq!(ordered, vec![NodeId::new(2), NodeId::new(3), source]);
+    }
 }

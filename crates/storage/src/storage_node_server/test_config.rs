@@ -11,7 +11,8 @@
         BuildStreamPartCommitCommandReq, DirectPutMetadataNodeClient,
         LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandApplyErrorKind,
         MetadataCommandInspectionNodeClient, MetadataCommandPendingSlotReplaceError,
-        MetadataCommandRecoveryNodeClient, ObjectMutationMetadataNodeClient, PlacedShardNodeClient,
+        MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient,
+        ObjectMutationMetadataNodeClient, PlacedShardNodeClient,
         RetainedBucketWriteReservationNodeClient, UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
@@ -5473,6 +5474,175 @@
         }
         drop(client);
         assert!(join.join().unwrap().is_ok());
+    }
+
+    fn authenticated_skipped_transfer_destination_epoch_uses_current_marker(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let mut config = bounded_runtime_refresh_config(test_config(&tmp));
+        let destination_epoch = ClusterEpoch::new(2).unwrap();
+        let current_epoch = ClusterEpoch::new(3).unwrap();
+        let mut skipped_destination_route = config.pg_routes[0].clone();
+        skipped_destination_route.cluster_epoch = destination_epoch;
+        skipped_destination_route.state = PgState::Active;
+        config.cluster_epoch = current_epoch;
+        config.pg_routes[0].cluster_epoch = current_epoch;
+        config.pg_routes[0].state = PgState::Peering;
+        config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
+        config.historical_pg_routes.push(skipped_destination_route);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let mut prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        if tcp {
+            prepared = prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        }
+        let server = prepared.bind().unwrap();
+        let expected_state_digest = server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap()
+            .state_digest;
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            destination_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let state = MetadataCommandInspectionNodeClient::metadata_command_replica_state(
+            &client,
+            PgId::new(0),
+        )
+        .unwrap();
+        assert_eq!(state.applied_log_index, 0);
+        assert!(
+            MetadataCommandInspectionNodeClient::metadata_command_replica_state_can_initialize(
+                &client,
+                PgId::new(0),
+                destination_epoch,
+            )
+            .unwrap()
+        );
+        let route = client
+            .open_metadata_command_peering_route(PgId::new(0), destination_epoch)
+            .unwrap();
+        let initialized = route
+            .initialize_metadata_transfer_empty_state(expected_state_digest)
+            .unwrap();
+        assert_eq!(initialized.cluster_epoch, destination_epoch);
+        assert_eq!(initialized.state_digest, expected_state_digest);
+
+        drop(route);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_skipped_transfer_destination_epoch_uses_current_marker() {
+        authenticated_skipped_transfer_destination_epoch_uses_current_marker(false);
+    }
+
+    #[test]
+    fn authenticated_tls_skipped_transfer_destination_epoch_uses_current_marker() {
+        authenticated_skipped_transfer_destination_epoch_uses_current_marker(true);
+    }
+
+    fn authenticated_checkpoint_export_uses_current_peering_source_fence(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let mut config = bounded_runtime_refresh_config(test_config(&tmp));
+        let source_epoch = config.cluster_epoch;
+        let current_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+        let mut source_route = config.pg_routes[0].clone();
+        source_route.state = PgState::Peering;
+        config.cluster_epoch = current_epoch;
+        config.pg_routes[0].cluster_epoch = current_epoch;
+        config.pg_routes[0].state = PgState::Peering;
+        config.historical_pg_routes.push(source_route);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let mut prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        if tcp {
+            prepared = prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        }
+        let server = prepared.bind().unwrap();
+        let expected_checkpoint = server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_checkpoint(config.node_id.as_u32(), source_epoch)
+            .unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            current_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let checkpoint = MetadataCommandInspectionNodeClient::metadata_command_checkpoint(
+            &client,
+            PgId::new(0),
+            source_epoch,
+        );
+
+        drop(client);
+        let server_result = join.join().unwrap();
+        assert!(server_result.is_ok(), "{server_result:?}");
+        assert_eq!(checkpoint.unwrap(), expected_checkpoint);
+    }
+
+    #[test]
+    fn authenticated_unix_checkpoint_export_uses_current_peering_source_fence() {
+        authenticated_checkpoint_export_uses_current_peering_source_fence(false);
+    }
+
+    #[test]
+    fn authenticated_tls_checkpoint_export_uses_current_peering_source_fence() {
+        authenticated_checkpoint_export_uses_current_peering_source_fence(true);
     }
 
     fn authenticated_bucket_subresource_get_preserves_bucket_not_found(tcp: bool) {

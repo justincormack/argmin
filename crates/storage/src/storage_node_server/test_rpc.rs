@@ -1491,20 +1491,21 @@
     }
 
     #[test]
-    fn storage_node_server_allows_retained_transfer_destination_after_unrelated_epoch_advance() {
+    fn storage_node_server_allows_skipped_transfer_destination_epoch_from_current_marker() {
         let (bucket, checkpoint) =
-            test_metadata_checkpoint_with_bucket("metadata-rpc-retained-destination");
+            test_metadata_checkpoint_with_bucket("metadata-rpc-skipped-destination");
         let tmp = test_util::tempdir();
         let mut config = bounded_runtime_refresh_config(test_config(&tmp));
         let destination_epoch = ClusterEpoch::new(2).unwrap();
         let current_epoch = ClusterEpoch::new(3).unwrap();
         let mut destination_route = config.pg_routes[0].clone();
         destination_route.cluster_epoch = destination_epoch;
-        destination_route.state = PgState::Peering;
-        destination_route.metadata_transfer_destination_epoch = Some(destination_epoch);
+        destination_route.state = PgState::Active;
         config.cluster_epoch = current_epoch;
         config.pg_routes[0] = destination_route.clone();
         config.pg_routes[0].cluster_epoch = current_epoch;
+        config.pg_routes[0].state = PgState::Peering;
+        config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
         config.historical_pg_routes.push(destination_route);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -1512,9 +1513,29 @@
         let join = thread::spawn(move || server.accept_one().unwrap());
 
         let mut client = UnixStream::connect(socket_path).unwrap();
-        let response = send_frame(
+        let state_response = send_frame(
             &mut client,
             1,
+            StorageRpcMessageKind::MetadataCommandReplicaState,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: destination_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        let can_initialize_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: destination_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        let response = send_frame(
+            &mut client,
+            3,
             StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall,
             encode_metadata_command_transfer_checkpoint_base_request(
                 &StorageRpcMetadataCommandTransferCheckpointBaseRequest {
@@ -1528,6 +1549,20 @@
         );
         drop(client);
         join.join().unwrap();
+
+        let state_payload = decode_storage_rpc_response_payload(&state_response.payload)
+            .unwrap()
+            .unwrap();
+        let state = decode_metadata_command_state_response(&state_payload).unwrap();
+        assert_eq!(state.state.applied_log_index, 0);
+        let can_initialize_payload =
+            decode_storage_rpc_response_payload(&can_initialize_response.payload)
+                .unwrap()
+                .unwrap();
+        let can_initialize =
+            crate::storage_rpc::decode_metadata_command_bool_response(&can_initialize_payload)
+                .unwrap();
+        assert!(can_initialize.value);
 
         let payload = decode_storage_rpc_response_payload(&response.payload)
             .unwrap()

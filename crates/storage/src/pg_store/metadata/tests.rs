@@ -4353,6 +4353,10 @@ fn initialize_metadata_transfer_empty_state_moves_canonical_empty_replica() {
     let source_state = store.metadata_command_replica_state().unwrap();
     assert_eq!(source_state.applied_log_index, 0);
     assert_eq!(source_state.applied_log_hash, 0);
+    assert_eq!(
+        source_state.state_digest,
+        PgStore::canonical_empty_metadata_state_digest()
+    );
 
     let destination_epoch = ClusterEpoch::new(11).unwrap();
     let initialized = store

@@ -503,6 +503,13 @@ pub(super) mod server_facade {
 pub(super) mod pg_store_facade {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) use super::pg_store::PgStore;
+    pub(crate) use super::pg_store::{
+        canonical_empty_metadata_state_digest, MetadataCommandStartupDisposition,
+        MetadataProofStorageIssuer, PendingMetadataCommandSlotInsertError,
+        PendingMetadataCommandSlotReplaceError, ScavengerShardFile, ScavengerShardFileScan,
+        ScavengerShardRow, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
+        METADATA_COMMAND_CHECKPOINT_MAGIC,
+    };
     pub use super::pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
         MetadataCheckpointValue, MetadataCommandCheckpoint,
@@ -511,12 +518,6 @@ pub(super) mod pg_store_facade {
         PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
         PgClusterMapHistoryRouteReferenceLimitError, PgClusterMapHistoryRouteReferences,
         MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES, MAX_PG_DURABLE_IDENTITY_BYTES,
-    };
-    pub(crate) use super::pg_store::{
-        MetadataCommandStartupDisposition, MetadataProofStorageIssuer,
-        PendingMetadataCommandSlotInsertError, PendingMetadataCommandSlotReplaceError,
-        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,
-        METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, METADATA_COMMAND_CHECKPOINT_MAGIC,
     };
 }
 

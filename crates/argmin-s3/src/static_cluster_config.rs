@@ -2453,6 +2453,7 @@ impl ValidatedStaticClusterManifest {
 
         let mut storage_control_plane_credentials = Vec::new();
         let mut frontend_control_plane_credentials = Vec::new();
+        let mut admin_control_plane_credentials = Vec::new();
         let mut storage_control_plane_signer = None;
         let mut frontend_control_plane_signer = None;
         for credential in &material.auth_credentials {
@@ -2493,6 +2494,16 @@ impl ValidatedStaticClusterManifest {
                     {
                         frontend_control_plane_signer = Some(signer);
                     }
+                }
+                (AuthPrincipal::Admin, CredentialPrincipalId::Instance(instance_id)) => {
+                    admin_control_plane_credentials.push(
+                        ConfiguredControlPlaneAdminAuthCredential {
+                            instance_id: instance_id.clone(),
+                            credential_id: credential.credential_id.clone(),
+                            credential_version: credential.credential_version,
+                            secret: BinarySecretConfigValue::from_bytes(credential.secret.clone()),
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -2564,6 +2575,10 @@ impl ValidatedStaticClusterManifest {
         config.control_plane_frontend_auth_instance_id = selected.frontend_instance_id.clone();
         config.control_plane_frontend_auth_credentials = frontend_control_plane_credentials;
         config.control_plane_frontend_auth_signing_credential = frontend_control_plane_signer;
+        if let Some(admin_instance_id) = &selected.admin_instance_id {
+            config.control_plane_admin_auth_instance_id = Some(admin_instance_id.clone());
+            config.control_plane_admin_auth_credentials = admin_control_plane_credentials;
+        }
         config.storage_rpc_frontend_client_auth = storage_rpc_frontend_client_auth;
         config.storage_rpc_maintenance_client_auth = storage_rpc_maintenance_client_auth;
         config.storage_rpc_storage_node_client_auth = storage_rpc_storage_node_client_auth;
@@ -9965,6 +9980,16 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
             Duration::from_secs(15)
         );
         assert!(frontend_config.storage_rpc_server_auth.is_none());
+        assert_eq!(
+            frontend_config
+                .control_plane_admin_auth_instance_id
+                .as_deref(),
+            Some("frontend-1-admin")
+        );
+        assert!(frontend_config
+            .control_plane_admin_auth_credentials
+            .iter()
+            .any(|credential| credential.instance_id == "frontend-1-admin"));
         assert!(frontend_config
             .control_plane_rpc_client_endpoints
             .iter()

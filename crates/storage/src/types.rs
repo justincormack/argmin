@@ -4678,6 +4678,7 @@ pub(crate) enum ObjectPayloadPlacementDiagnosticError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectPayloadPlacementDiagnosticOutcome {
     Success,
+    Mismatch,
     Conflict,
 }
 
@@ -4707,6 +4708,13 @@ impl ObjectPayloadPlacementDiagnostic {
     pub(crate) fn conflict(text: String) -> Self {
         Self {
             outcome: ObjectPayloadPlacementDiagnosticOutcome::Conflict,
+            text,
+        }
+    }
+
+    pub(crate) fn mismatch(text: String) -> Self {
+        Self {
+            outcome: ObjectPayloadPlacementDiagnosticOutcome::Mismatch,
             text,
         }
     }

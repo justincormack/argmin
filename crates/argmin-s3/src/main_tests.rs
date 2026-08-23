@@ -4,6 +4,28 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_payload_placement_inspection_deletes_only_confirmed_mismatches() {
+        assert_eq!(
+            object_payload_placement_inspection_exit_code(
+                storage::ObjectPayloadPlacementDiagnosticOutcome::Success
+            ),
+            0
+        );
+        assert_eq!(
+            object_payload_placement_inspection_exit_code(
+                storage::ObjectPayloadPlacementDiagnosticOutcome::Mismatch
+            ),
+            3
+        );
+        assert_eq!(
+            object_payload_placement_inspection_exit_code(
+                storage::ObjectPayloadPlacementDiagnosticOutcome::Conflict
+            ),
+            1
+        );
+    }
     use auth::SecretKey;
     use config::{
         BinarySecretConfigValue, ConfiguredControlPlaneRaftAuthCredential,

@@ -5,6 +5,70 @@ use super::*;
 use crate::test_support::StorageClusterTopologyTestSupport as _;
 
 #[test]
+fn object_payload_placement_diagnostic_distinguishes_mismatch_from_unavailability() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let cluster = crate::StorageCluster::open_static_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0, 1],
+        EcShape { k: 2, m: 1 },
+    )
+    .unwrap();
+    let bucket = crate::tests::bucket_name("placement-diagnostic-bucket");
+    let key = crate::tests::object_key("placement-diagnostic-key");
+    let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, b"payload");
+    let metadata_pg = cluster.test_object_pg_id_for(&bucket, &key);
+    let data_pg = committed.written.data_pg_id;
+
+    assert_eq!(
+        cluster
+            .object_payload_placement_diagnostic_for_expected_pgs(
+                &bucket,
+                &key,
+                Some((metadata_pg, data_pg)),
+            )
+            .outcome(),
+        crate::ObjectPayloadPlacementDiagnosticOutcome::Success
+    );
+    assert_eq!(
+        cluster
+            .object_payload_placement_diagnostic_for_expected_pgs(
+                &bucket,
+                &key,
+                Some(((metadata_pg + 1) % 2, data_pg)),
+            )
+            .outcome(),
+        crate::ObjectPayloadPlacementDiagnosticOutcome::Mismatch
+    );
+    assert_eq!(
+        cluster
+            .object_payload_placement_diagnostic_for_expected_pgs(
+                &bucket,
+                &key,
+                Some((metadata_pg, (data_pg + 1) % 2)),
+            )
+            .outcome(),
+        crate::ObjectPayloadPlacementDiagnosticOutcome::Mismatch
+    );
+
+    let missing_key = crate::tests::object_key("missing-placement-diagnostic-key");
+    assert_eq!(
+        cluster
+            .object_payload_placement_diagnostic_for_expected_pgs(
+                &bucket,
+                &missing_key,
+                Some((
+                    cluster.test_object_pg_id_for(&bucket, &missing_key),
+                    data_pg
+                )),
+            )
+            .outcome(),
+        crate::ObjectPayloadPlacementDiagnosticOutcome::Conflict
+    );
+}
+
+#[test]
 fn topology_test_support_selects_only_the_requested_opaque_placement_relations() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

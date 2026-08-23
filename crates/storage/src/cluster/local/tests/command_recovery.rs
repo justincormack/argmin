@@ -6550,6 +6550,163 @@ fn metadata_transfer_checkpoint_import_replaces_stale_older_epoch_destination() 
 }
 
 #[test]
+fn metadata_transfer_live_export_replays_self_contained_retained_log() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "metadata-transfer-retained-replay-");
+    let pg_id = PgId::new(1);
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    source_pg
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    drop(source_pg);
+
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+    let artifact = cluster
+        .export_pg_metadata_transfer_artifact_for_live_transfer(pg_id, NodeId::new(0))
+        .unwrap();
+
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Empty
+    );
+    assert_eq!(
+        artifact.source_base_metadata_proof().state_digest,
+        crate::PgStore::canonical_empty_metadata_state_digest()
+    );
+    assert!(artifact.checkpoint_base().is_none());
+    assert_eq!(artifact.retained_log_entries.len(), 1);
+}
+
+#[test]
+fn metadata_transfer_live_export_checkpoints_nonempty_genesis_base() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "metadata-transfer-genesis-base-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "metadata-transfer-genesis-base-second-");
+    let pg_id = PgId::new(1);
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket.clone());
+    source_pg
+        .apply_metadata_command_and_record(0, &first)
+        .unwrap();
+    let first_state = source_pg.metadata_command_replica_state().unwrap();
+    let source_epoch = ClusterEpoch::new(2).unwrap();
+    source_pg
+        .initialize_metadata_transfer_matching_state(
+            0,
+            source_epoch,
+            0,
+            crate::control_plane::MetadataCommandLogHash::genesis(),
+            first_state.state_digest,
+        )
+        .unwrap();
+    let second =
+        create_bucket_metadata_command_at_epoch(source_epoch, pg_id, 1, second_bucket.clone());
+    source_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    drop(source_pg);
+
+    map.epoch = source_epoch;
+    let route = map.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = source_epoch;
+    route.primary_node_id = NodeId::new(0);
+    route.acting_set = Arc::from([NodeId::new(0)]);
+    let mut map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+
+    let retained = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(
+        retained.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Empty
+    );
+    assert_eq!(
+        retained.source_base_metadata_proof().state_digest,
+        first_state.state_digest
+    );
+    let destination_before = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
+    assert_ne!(destination_before.state_digest, first_state.state_digest);
+
+    let artifact = cluster
+        .export_pg_metadata_transfer_artifact_for_live_transfer(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Checkpoint
+    );
+    drop(cluster);
+
+    let destination_epoch = ClusterEpoch::new(3).unwrap();
+    let map_mut = Arc::get_mut(&mut map).unwrap();
+    map_mut.epoch = destination_epoch;
+    let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = destination_epoch;
+    route.primary_node_id = NodeId::new(1);
+    route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+
+    let imported = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap();
+    let expected = crate::StorageCluster::metadata_transfer_imported_proof_at_epoch(
+        &artifact,
+        destination_epoch,
+    )
+    .unwrap();
+    assert_eq!(imported, expected);
+    for node_id in [NodeId::new(1), NodeId::new(2)] {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+        assert_eq!(
+            pg.metadata_command_replica_state().unwrap().state_digest,
+            imported.state_digest
+        );
+    }
+}
+
+#[test]
 fn metadata_transfer_live_export_falls_back_to_checkpoint_without_retained_state_proof() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

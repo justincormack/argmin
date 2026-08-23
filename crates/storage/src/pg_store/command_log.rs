@@ -6602,6 +6602,43 @@ impl PgStore {
         .transpose()
     }
 
+    pub(crate) fn canonical_empty_metadata_state_digest() -> CanonicalStateDigest {
+        let mut state_hasher = checksum::crc64::Hasher::new();
+        Self::digest_canonical_pg_state_header(&mut state_hasher);
+        for table in METADATA_DIGEST_TABLES {
+            let stats = if table.name == "pg_counters" {
+                debug_assert_eq!(
+                    table.columns,
+                    ["singleton", "next_bucket_execution_generation"]
+                );
+                let row_digest = Self::metadata_checkpoint_row_digest(
+                    table,
+                    &[
+                        MetadataCheckpointValue::Integer(0),
+                        MetadataCheckpointValue::Integer(0),
+                    ],
+                );
+                MetadataTableDigestStats {
+                    row_count: 1,
+                    row_hash_xor: row_digest,
+                    row_hash_sum: row_digest,
+                }
+            } else {
+                MetadataTableDigestStats {
+                    row_count: 0,
+                    row_hash_xor: 0,
+                    row_hash_sum: 0,
+                }
+            };
+            let table_digest = metadata_table_digest_from_stats(table, stats);
+            Self::digest_metadata_table_digest_entry(&mut state_hasher, table, table_digest);
+        }
+        CanonicalStateDigest::from_storage(
+            state_hasher.finalize(),
+            super::MetadataProofStorageIssuer::new(),
+        )
+    }
+
     pub(super) fn metadata_state_digest(&self) -> Result<u64, StoreError> {
         let mut hasher = checksum::crc64::Hasher::new();
         Self::digest_canonical_pg_state_header(&mut hasher);

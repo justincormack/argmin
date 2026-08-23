@@ -658,6 +658,20 @@ impl StorageNodeConnectionHandler {
         pg_id: PgId,
     ) -> Result<(), StorageRpcErrorResponse> {
         if cluster_epoch < self.config.cluster_epoch {
+            let current_route_retains_destination = self.config.pg_routes.iter().any(|route| {
+                route.pg_id == pg_id.get()
+                    && route.metadata_transfer_destination_epoch == Some(cluster_epoch)
+            });
+            if current_route_retains_destination {
+                return self
+                    .validate_pg_route_for_metadata_transfer_mutation(
+                        node_id,
+                        cluster_epoch,
+                        pg_id,
+                        false,
+                    )
+                    .map(drop);
+            }
             return self.validate_historical_pg_route_for_peering_inspection(
                 node_id,
                 cluster_epoch,
@@ -752,24 +766,6 @@ impl StorageNodeConnectionHandler {
                 &self.config,
                 self.current_route_map_lease(),
             ));
-        }
-        let retained_route = self
-            .config
-            .historical_pg_routes
-            .iter()
-            .find(|route| route.pg_id == raw_pg_id && route.cluster_epoch == destination_epoch);
-        if retained_route.is_none_or(|route| {
-            route.state != PgState::Peering
-                || !route.acting_set.contains(&self.config.node_id)
-                || route.metadata_transfer_destination_epoch != Some(destination_epoch)
-        }) {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::StaleShardLocation,
-                message: format!(
-                    "PG {raw_pg_id} metadata-transfer destination route at epoch {} is not retained",
-                    destination_epoch.get()
-                ),
-            });
         }
         let valid_until_ms = self.config.route_map_valid_until_ms().ok_or_else(|| {
             StorageRpcErrorResponse {

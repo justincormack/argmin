@@ -23,7 +23,7 @@ use storage::{BucketName, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | put-expect-failure <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | get-expect-failure <bucket-file> <key> | head <bucket-file> <key> <body-file> | head-expect-failure <bucket-file> <key> | list-contains <bucket-file> <key>... | list-expect-failure <bucket-file> | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file> | cleanup-versioned-stress <bucket-count> <keys-per-bucket> <versions-per-key> <key-prefix> <body-file> [bucket-log-file]"
+        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> [target-data-pg] | put <bucket-file> <key> <body-file> | delete <bucket-file> <key> | put-expect-failure <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | get-expect-failure <bucket-file> <key> | head <bucket-file> <key> <body-file> | head-expect-failure <bucket-file> <key> | list-contains <bucket-file> <key>... | list-expect-failure <bucket-file> | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file> | cleanup-versioned-stress <bucket-count> <keys-per-bucket> <versions-per-key> <key-prefix> <body-file> [bucket-log-file]"
     );
     std::process::exit(2);
 }
@@ -391,6 +391,7 @@ fn key_with_metadata_pg_and_distinct_data_pg(
     bucket: &str,
     key_prefix: &str,
     target_metadata_pg: u32,
+    target_data_pg: Option<u32>,
 ) -> Option<(String, u32)> {
     let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
     topology
@@ -398,6 +399,7 @@ fn key_with_metadata_pg_and_distinct_data_pg(
             &bucket_name,
             key_prefix,
             target_metadata_pg,
+            target_data_pg,
         )
         .map(|selection| {
             let (key, data_pg) = selection.into_key_and_data_pg();
@@ -421,6 +423,7 @@ fn choose_bucket_key_with_metadata_pg_and_distinct_data_pg(
             &bucket,
             key_prefix,
             target_metadata_pg,
+            None,
         ) {
             return (bucket, key, data_pg);
         }
@@ -444,6 +447,7 @@ fn choose_existing_bucket_key_with_metadata_pg_and_distinct_data_pg(
     bucket: &str,
     key_prefix: &str,
     target_metadata_pg: u32,
+    target_data_pg: Option<u32>,
 ) -> (String, u32) {
     let topology = pg_topology_from_env();
     let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
@@ -452,10 +456,16 @@ fn choose_existing_bucket_key_with_metadata_pg_and_distinct_data_pg(
         bucket_pg, target_metadata_pg,
         "bucket metadata PG must match requested metadata PG"
     );
-    key_with_metadata_pg_and_distinct_data_pg(&topology, bucket, key_prefix, target_metadata_pg)
-        .unwrap_or_else(|| {
+    key_with_metadata_pg_and_distinct_data_pg(
+        &topology,
+        bucket,
+        key_prefix,
+        target_metadata_pg,
+        target_data_pg,
+    )
+    .unwrap_or_else(|| {
             panic!(
-                "could not find UAT key with object metadata PG {target_metadata_pg} in bucket {bucket}"
+                "could not find UAT key with object metadata PG {target_metadata_pg} and payload data PG {target_data_pg:?} in bucket {bucket}"
             )
         })
 }
@@ -466,9 +476,13 @@ fn stress_key_for_pg(
     key_prefix: &str,
     target_metadata_pg: u32,
 ) -> (String, Option<u32>) {
-    if let Some((key, data_pg)) =
-        key_with_metadata_pg_and_distinct_data_pg(topology, bucket, key_prefix, target_metadata_pg)
-    {
+    if let Some((key, data_pg)) = key_with_metadata_pg_and_distinct_data_pg(
+        topology,
+        bucket,
+        key_prefix,
+        target_metadata_pg,
+        None,
+    ) {
         return (key, Some(data_pg));
     }
     (key_prefix.to_string(), None)
@@ -782,6 +796,12 @@ fn main() {
             else {
                 usage();
             };
+            let target_data_pg = args.next().map(|arg| {
+                arg.into_string()
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or_else(|| usage())
+            });
             if args.next().is_some() {
                 usage();
             }
@@ -793,6 +813,7 @@ fn main() {
                         &bucket,
                         &key_prefix,
                         target_metadata_pg,
+                        target_data_pg,
                     );
                 let body = read_body(Path::new(&body_file));
                 put_object(&client, &bucket, &key, body).await;
@@ -822,6 +843,24 @@ fn main() {
                 let bucket = read_bucket(Path::new(&bucket_file));
                 let body = read_body(Path::new(&body_file));
                 put_object(&client, &bucket, &key, body).await;
+            });
+        }
+        "delete" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            let Some(key) = args.next().and_then(|arg| arg.into_string().ok()) else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                delete_object_retrying_operation_aborted(&client, &bucket, &key)
+                    .await
+                    .unwrap_or_else(|error| panic!("delete UAT object {bucket}/{key}: {error:?}"));
             });
         }
         "put-expect-failure" => {

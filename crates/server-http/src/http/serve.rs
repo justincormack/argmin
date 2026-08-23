@@ -1368,7 +1368,8 @@ fn local_debug_response(
                 .object_payload_placement_diagnostic(&bucket, &key);
             let status_code = match diagnostic.outcome() {
                 ObjectPayloadPlacementDiagnosticOutcome::Success => 200,
-                ObjectPayloadPlacementDiagnosticOutcome::Conflict => 409,
+                ObjectPayloadPlacementDiagnosticOutcome::Mismatch
+                | ObjectPayloadPlacementDiagnosticOutcome::Conflict => 409,
             };
             Some(local_debug_text_response(
                 status_code,

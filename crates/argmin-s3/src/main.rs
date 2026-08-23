@@ -794,6 +794,58 @@ fn run_control_plane_admin_command(mut args: impl Iterator<Item = OsString>) -> 
         ));
     }
 
+    if command == "control-plane-inspect-object-payload-placement" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <metadata-pg-id> <data-pg-id> <bucket> <key>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some(metadata_pg_id) = args.next().and_then(parse_pg_id_arg) else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <metadata-pg-id> <data-pg-id> <bucket> <key>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some(data_pg_id) = args.next().and_then(parse_pg_id_arg) else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <metadata-pg-id> <data-pg-id> <bucket> <key>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some(bucket) = args.next().and_then(|value| value.into_string().ok()) else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <metadata-pg-id> <data-pg-id> <bucket> <key>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some(key) = args.next().and_then(|value| value.into_string().ok()) else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <metadata-pg-id> <data-pg-id> <bucket> <key>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <metadata-pg-id> <data-pg-id> <bucket> <key>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return Some(run_object_payload_placement_inspection_command(
+            Path::new(&path),
+            metadata_pg_id,
+            data_pg_id,
+            &bucket,
+            &key,
+        ));
+    }
+
     #[cfg(feature = "test-live-metadata-transfer-failpoints")]
     if command == "test-control-plane-transfer-pg-metadata-live-with-failpoint" {
         let Some(failpoint) = args
@@ -918,6 +970,47 @@ fn run_control_plane_pg_metadata_transfer_command(
             eprintln!("{error}");
             1
         }
+    }
+}
+
+fn run_object_payload_placement_inspection_command(
+    socket_path: &Path,
+    metadata_pg_id: u32,
+    data_pg_id: u32,
+    bucket: &str,
+    key: &str,
+) -> i32 {
+    let admin = match build_live_pg_metadata_transfer_admin(socket_path, None) {
+        Ok(admin) => admin,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    match admin.inspect_object_payload_placement(metadata_pg_id, data_pg_id, bucket, key) {
+        Ok(diagnostic) => {
+            let outcome = diagnostic.outcome();
+            if outcome == storage::ObjectPayloadPlacementDiagnosticOutcome::Success {
+                print!("{}", diagnostic.into_text());
+            } else {
+                eprint!("{}", diagnostic.into_text());
+            }
+            object_payload_placement_inspection_exit_code(outcome)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+fn object_payload_placement_inspection_exit_code(
+    outcome: storage::ObjectPayloadPlacementDiagnosticOutcome,
+) -> i32 {
+    match outcome {
+        storage::ObjectPayloadPlacementDiagnosticOutcome::Success => 0,
+        storage::ObjectPayloadPlacementDiagnosticOutcome::Mismatch => 3,
+        storage::ObjectPayloadPlacementDiagnosticOutcome::Conflict => 1,
     }
 }
 
@@ -1099,6 +1192,15 @@ fn transfer_control_plane_pg_metadata_live(
     acting_set: Vec<u32>,
     failpoint: Option<storage::LivePgMetadataTransferFailpoint>,
 ) -> Result<storage::LivePgMetadataTransferSummary, String> {
+    build_live_pg_metadata_transfer_admin(socket_path, failpoint)?
+        .transfer(pg_id, acting_set)
+        .map_err(|error| error.to_string())
+}
+
+fn build_live_pg_metadata_transfer_admin(
+    socket_path: &Path,
+    failpoint: Option<storage::LivePgMetadataTransferFailpoint>,
+) -> Result<storage::LivePgMetadataTransferAdmin, String> {
     let config = static_cluster_config::load_server_config_from_environment()
         .map_err(|error| format!("configuration error: {error}"))?;
     let ec_config = EcConfig::new(config.ec_k, config.ec_m)
@@ -1119,7 +1221,7 @@ fn transfer_control_plane_pg_metadata_live(
         m: ec_config.parity_shards(),
     };
     let admission_settings = unix_storage_node_client_admission_settings(&config);
-    let transfer = if config.storage_rpc_client_endpoints.is_empty() {
+    let admin = if config.storage_rpc_client_endpoints.is_empty() {
         if config.storage_rpc_frontend_client_auth.is_none()
             && !config.allow_unauthenticated_internal_rpc_for_tests
         {
@@ -1147,9 +1249,7 @@ fn transfer_control_plane_pg_metadata_live(
         )
     }
     .with_failpoint(failpoint);
-    transfer
-        .transfer(pg_id, acting_set)
-        .map_err(|error| error.to_string())
+    Ok(admin)
 }
 
 fn control_plane_runtime_map_ready(

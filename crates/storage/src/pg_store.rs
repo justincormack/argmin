@@ -690,6 +690,12 @@ fn compact_sql_for_log(sql: &str) -> String {
     compact.trim().to_owned()
 }
 
+/// Returns the canonical digest of a newly initialized PG's materialized metadata.
+pub(crate) fn canonical_empty_metadata_state_digest() -> crate::control_plane::CanonicalStateDigest
+{
+    PgStore::canonical_empty_metadata_state_digest()
+}
+
 /// Per-PG store combining shard file I/O with SQLite metadata.
 pub struct PgStore {
     pg_id: u32,

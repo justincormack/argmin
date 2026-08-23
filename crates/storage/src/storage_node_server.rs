@@ -7848,7 +7848,7 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+        if let Err(error) = self.validate_pg_route_for_metadata_log_read(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,

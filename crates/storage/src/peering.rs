@@ -85,6 +85,7 @@ impl PgMetadataTransferArtifact {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn source_base_kind(&self) -> PgMetadataTransferBaseKind {
         self.base_kind
     }
