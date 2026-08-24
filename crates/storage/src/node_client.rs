@@ -83,7 +83,7 @@ use crate::storage_rpc::{
     decode_object_payload_reclaim_claim_optional_record_response,
     decode_object_payload_reclaim_response, decode_object_read_auth_subject_response,
     decode_object_read_snapshot_response, decode_object_version_response,
-    decode_payload_reclaim_root_response, decode_placed_segment_backfill_reference_page_response,
+    decode_payload_reclaim_root_response,
     decode_placed_segment_shard_backfill_claim_optional_record_response,
     decode_placed_segment_shard_backfill_count_response,
     decode_placed_segment_shard_backfills_response,
@@ -92,8 +92,10 @@ use crate::storage_rpc::{
     decode_read_handle_acquire_response, decode_read_handle_release_response,
     decode_scavenger_list_files_response, decode_scavenger_observations_response,
     decode_scavenger_payload_references_response, decode_scavenger_shard_rows_response,
-    decode_shard_ack_item_response, decode_shard_read_range_response, decode_shard_read_response,
-    decode_shard_write_ack, decode_storage_rpc_response_payload,
+    decode_shard_ack_item_response, decode_shard_read_range_response,
+    decode_shard_scavenger_reference_match_response,
+    decode_shard_scavenger_reference_page_response, decode_shard_write_ack,
+    decode_storage_rpc_response_payload,
     decode_storage_rpc_response_payload_with_connection_disposition,
     decode_stream_part_finalize_snapshot_response, decode_stream_put_finalize_snapshot_response,
     decode_stream_segment_append_prepare_response, decode_stream_upload_match_response,
@@ -146,7 +148,6 @@ use crate::storage_rpc::{
     encode_object_payload_reclaim_command_build_request,
     encode_object_payload_reclaim_exists_request, encode_object_read_auth_subject_request,
     encode_object_read_snapshot_request, encode_object_request,
-    encode_placed_segment_backfill_reference_page_request,
     encode_placed_segment_shard_backfill_claim_acquire_request,
     encode_placed_segment_shard_backfill_claim_error_request,
     encode_placed_segment_shard_backfill_claim_record_request,
@@ -162,10 +163,10 @@ use crate::storage_rpc::{
     encode_scavenger_list_files_request, encode_scavenger_observation_key_request,
     encode_scavenger_observation_record_request, encode_shard_ack_batch_request,
     encode_shard_ack_item_request, encode_shard_delete_request, encode_shard_read_range_request,
-    encode_shard_read_request, encode_shard_write_request,
-    encode_stream_part_commit_command_build_request, encode_stream_part_finalize_snapshot_request,
-    encode_stream_put_commit_command_build_request, encode_stream_put_finalize_snapshot_request,
-    encode_stream_segment_append_prepare_request,
+    encode_shard_scavenger_reference_match_request, encode_shard_scavenger_reference_page_request,
+    encode_shard_write_request, encode_stream_part_commit_command_build_request,
+    encode_stream_part_finalize_snapshot_request, encode_stream_put_commit_command_build_request,
+    encode_stream_put_finalize_snapshot_request, encode_stream_segment_append_prepare_request,
     encode_stream_upload_bucket_write_reservation_update_request,
     encode_stream_upload_match_request, encode_stream_upload_session_request,
     encode_stream_uploads_list_request, encode_stream_uploads_pg_list_request,
@@ -231,7 +232,6 @@ use crate::storage_rpc::{
     StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
     StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
     StorageRpcObjectRequest, StorageRpcOperationDeadline,
-    StorageRpcPlacedSegmentBackfillReferencePageRequest,
     StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest,
     StorageRpcPlacedSegmentShardBackfillClaimErrorRequest,
     StorageRpcPlacedSegmentShardBackfillClaimRecordRequest,
@@ -247,7 +247,8 @@ use crate::storage_rpc::{
     StorageRpcScavengerListFilesRequest, StorageRpcScavengerObservationKeyRequest,
     StorageRpcScavengerObservationRecordRequest, StorageRpcShardAckBatchRequest,
     StorageRpcShardAckItem, StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest,
-    StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+    StorageRpcShardReadRangeRequest, StorageRpcShardScavengerReferenceMatchRequest,
+    StorageRpcShardScavengerReferencePageRequest, StorageRpcShardWriteRequest,
     StorageRpcStreamError, StorageRpcStreamPartCommitCommandBuildRequest,
     StorageRpcStreamPartFinalizeSnapshotOutcome, StorageRpcStreamPartFinalizeSnapshotRequest,
     StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
@@ -263,6 +264,10 @@ use crate::storage_rpc::{
     encode_cluster_map_history_reference_summary_request,
     StorageRpcClusterMapHistoryReferenceSummaryRequest,
 };
+#[cfg(test)]
+use crate::storage_rpc::{
+    decode_shard_read_response, encode_shard_read_request, StorageRpcShardReadRequest,
+};
 use crate::storage_rpc_auth::{
     read_storage_rpc_auth_transport_frame_with_limit,
     write_storage_rpc_auth_transport_frame_with_limit, StorageRpcClientAuthConfig,
@@ -270,6 +275,7 @@ use crate::storage_rpc_auth::{
 };
 use crate::storage_rpc_transport::{
     BoxStorageRpcStream, StorageRpcClientEndpoint, StorageRpcEndpointConnectFailure,
+    StorageRpcRequestConnection,
 };
 #[cfg(test)]
 use crate::types::BucketSnapshotTagsRequest;
@@ -291,14 +297,14 @@ use crate::types::{
     ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
     ObjectReadSnapshotMode, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
-    PlacedSegmentBackfillReferenceCursor, PlacedSegmentBackfillReferencePage,
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
     PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
     PrepareStreamUploadSegmentAppendReq, PutLiveObjectReq, SessionId, ShardKey,
     ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, StoredObject, StreamPutCommitInput,
+    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
+    ShardScavengerReferenceCursor, ShardScavengerReferencePage, StoredObject, StreamPutCommitInput,
     StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord, StreamUploadPartStorageSnapshot,
     StreamUploadRecord, StreamUploadRecordPage, StreamUploadSegmentRecord, StreamUploadState,
     StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
@@ -1666,8 +1672,6 @@ fn storage_rpc_auth_store_error(
         )),
     }
 }
-
-struct LocalStorageNodeReadHandleLease;
 
 #[allow(dead_code)]
 impl UnixStorageNodeClient {

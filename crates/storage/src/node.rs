@@ -464,6 +464,8 @@ pub struct SharedStorageNode {
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
     ec_write_states: Mutex<HashMap<EcShape, Arc<StorageEcWriteState>>>,
     cluster_map_history_route_scan_generation: AtomicU64,
+    #[cfg(test)]
+    fail_next_shard_scavenger_file_scan: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -856,6 +858,8 @@ impl SharedStorageNode {
             ),
             ec_write_states: Mutex::new(HashMap::new()),
             cluster_map_history_route_scan_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_shard_scavenger_file_scan: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -945,6 +949,8 @@ impl SharedStorageNode {
             ),
             ec_write_states: Mutex::new(HashMap::new()),
             cluster_map_history_route_scan_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_shard_scavenger_file_scan: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1969,11 +1975,30 @@ impl SharedStorageNode {
             "pg_id={}",
             pg_id
         );
+        #[cfg(test)]
+        if self
+            .fail_next_shard_scavenger_file_scan
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StoreError::Io {
+                context: "list shard files for scavenger audit",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected transient shard scavenger file-list failure",
+                ),
+            });
+        }
         let paths = self
             .pg_paths
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
         PgStore::list_scavenger_shard_files_in_dir(&paths.shards_dir)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_next_shard_scavenger_file_scan(&self) {
+        self.fail_next_shard_scavenger_file_scan
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Acquire an in-memory lease on an object payload generation.

@@ -197,7 +197,7 @@ fn unix_storage_node_client_times_out_waiting_for_response() {
     assert!(matches!(
         err,
         StoreError::StorageRpc {
-            operation: "read storage RPC response",
+            operation: "read read-handle RPC response",
             failure: StorageRpcErrorCode::TransportTimeout,
             ..
         }
@@ -1512,6 +1512,78 @@ fn unix_shard_scavenger_observation_route_rejects_foreign_subject_before_rpc() {
             }
         ));
     }
+}
+
+#[test]
+fn authenticated_unix_shard_scavenger_exact_reference_match_reaches_storage() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    const TOPOLOGY_DIGEST: &str =
+        "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0";
+    let credential = crate::control_plane_auth::ControlPlaneScopedCredential::new(
+        crate::control_plane_auth::ControlPlaneScopedCredentialInput {
+            cluster_id: "unix-scavenger-reference-match".to_owned(),
+            credential_id: "maintenance-1".to_owned(),
+            credential_version: 1,
+            principal: crate::control_plane_auth::ControlPlaneAuthPrincipal::LocalMaintenance {
+                process_id: "maintenance-1".to_owned(),
+            },
+            secret: b"unix-scavenger-reference-match-secret".to_vec(),
+        },
+    )
+    .unwrap();
+    let server_auth = crate::StorageRpcServerAuthConfig::new(
+        credential.cluster_id(),
+        crate::control_plane_auth::ControlPlaneScopedCredentialStore::new(vec![credential.clone()])
+            .unwrap(),
+        9,
+        TOPOLOGY_DIGEST,
+    )
+    .unwrap();
+    let client_auth = Arc::new(
+        crate::MaintenanceStorageRpcClientCapability::new(credential, 9, TOPOLOGY_DIGEST)
+            .unwrap()
+            .into(),
+    );
+    let server = crate::storage_node_server::PreparedStorageNodeServer::new(config.clone())
+        .with_rpc_auth(server_auth)
+        .bind()
+        .unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+        config.node_id,
+        config.cluster_epoch,
+        crate::storage_rpc_transport::StorageRpcClientEndpoint::unix(config.socket_path.clone()),
+        LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+        Some(client_auth),
+    );
+    let route = client
+        .open_shard_scavenger_object_scan_route(
+            config.cluster_epoch,
+            ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        )
+        .unwrap();
+    let cursor = ShardScavengerReferenceCursor::ObjectSegment {
+        bucket: crate::tests::bucket_name("missing-reference"),
+        key: crate::tests::object_key("key"),
+        version_id: 1,
+        segment_index: 0,
+    };
+    let expected = ShardScavengerPlacedShardSetReference {
+        data_pg_id: 0,
+        okh: [0x52; 16],
+        generation_id: GenerationId::MIN,
+        placement_cluster_epoch: config.cluster_epoch,
+        stored_size: 1,
+        crc64: 2,
+        ec: config.default_ec_shape,
+    };
+
+    assert!(!route
+        .shard_scavenger_reference_matches(&cursor, &expected)
+        .unwrap());
+    server_thread.join().unwrap();
 }
 
 #[test]

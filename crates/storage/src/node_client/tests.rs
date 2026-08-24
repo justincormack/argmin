@@ -396,7 +396,31 @@ fn local_shard_read_handle_route_is_bound_to_exact_batch() {
         .open_shard_read_handle_route(epoch, "bound-read", vec![(location, key.clone())])
         .and_then(|route| route.acquire())
         .unwrap();
+    let payload = b"local read-handle payload";
+    let expected_ack = storage_node.write_shard_file(0, &key, payload).unwrap();
+    let mut read = vec![0; payload.len()];
+    lease
+        .read_placed_shard_into(location, &key, expected_ack, &mut read)
+        .unwrap();
+    assert_eq!(read, payload);
+    let foreign_key = ShardKey::new(&[0x35; 16], 15, 0);
+    assert!(matches!(
+        lease
+            .read_placed_shard_into(location, &foreign_key, expected_ack, &mut read)
+            .unwrap_err(),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "read placed shard through read-handle lease",
+        }
+    ));
     lease.release().unwrap();
+    assert!(matches!(
+        lease
+            .read_placed_shard_into(location, &key, expected_ack, &mut read)
+            .unwrap_err(),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "read placed shard through released read-handle lease",
+        }
+    ));
 
     let wrong_epoch = ClusterEpoch::new(epoch.get() + 1).unwrap();
     assert!(matches!(

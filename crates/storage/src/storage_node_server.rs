@@ -76,7 +76,7 @@ use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, PgMetadataStore, ShardStore,
 };
 #[cfg(test)]
-use crate::storage_rpc::encode_placed_segment_backfill_reference_page_request;
+use crate::storage_rpc::encode_shard_scavenger_reference_page_request;
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_request, decode_abort_multipart_command_build_request,
     decode_authorized_abort_multipart_command_build_request, decode_bucket_batch_request,
@@ -127,7 +127,6 @@ use crate::storage_rpc::{
     decode_object_payload_reclaim_command_build_request,
     decode_object_payload_reclaim_exists_request, decode_object_read_auth_subject_request,
     decode_object_read_snapshot_request, decode_object_request,
-    decode_placed_segment_backfill_reference_page_request,
     decode_placed_segment_shard_backfill_claim_acquire_request,
     decode_placed_segment_shard_backfill_claim_error_request,
     decode_placed_segment_shard_backfill_claim_record_request,
@@ -143,7 +142,8 @@ use crate::storage_rpc::{
     decode_scavenger_list_files_request, decode_scavenger_observation_key_request,
     decode_scavenger_observation_record_request, decode_shard_ack_batch_request,
     decode_shard_ack_item_request, decode_shard_delete_request, decode_shard_read_range_request,
-    decode_shard_read_request, decode_shard_write_request,
+    decode_shard_read_request, decode_shard_scavenger_reference_match_request,
+    decode_shard_scavenger_reference_page_request, decode_shard_write_request,
     decode_stream_part_commit_command_build_request, decode_stream_part_finalize_snapshot_request,
     decode_stream_put_commit_command_build_request, decode_stream_put_finalize_snapshot_request,
     decode_stream_segment_append_prepare_request,
@@ -192,7 +192,7 @@ use crate::storage_rpc::{
     encode_object_payload_reclaim_claim_optional_record_response,
     encode_object_payload_reclaim_response, encode_object_read_auth_subject_response,
     encode_object_read_snapshot_response, encode_object_version_response,
-    encode_payload_reclaim_root_response, encode_placed_segment_backfill_reference_page_response,
+    encode_payload_reclaim_root_response,
     encode_placed_segment_shard_backfill_claim_optional_record_response,
     encode_placed_segment_shard_backfill_count_response,
     encode_placed_segment_shard_backfills_response,
@@ -202,7 +202,9 @@ use crate::storage_rpc::{
     encode_scavenger_list_files_response, encode_scavenger_observations_response,
     encode_scavenger_payload_references_response, encode_scavenger_shard_rows_response,
     encode_shard_ack_item_response, encode_shard_read_range_response, encode_shard_read_response,
-    encode_shard_write_ack, encode_storage_rpc_error_response, encode_storage_rpc_success_response,
+    encode_shard_scavenger_reference_match_response,
+    encode_shard_scavenger_reference_page_response, encode_shard_write_ack,
+    encode_storage_rpc_error_response, encode_storage_rpc_success_response,
     encode_stream_part_finalize_snapshot_response, encode_stream_put_finalize_snapshot_response,
     encode_stream_segment_append_prepare_response, encode_stream_upload_match_response,
     encode_stream_upload_segments_response, encode_stream_upload_session_response,
@@ -307,7 +309,6 @@ use crate::storage_rpc::{
     StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
     StorageRpcObjectReadSnapshotResponse, StorageRpcObjectRequest, StorageRpcObjectVersionResponse,
     StorageRpcOperationDeadline, StorageRpcPayloadReclaimRootResponse,
-    StorageRpcPlacedSegmentBackfillReferencePageRequest,
     StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest,
     StorageRpcPlacedSegmentShardBackfillClaimErrorRequest,
     StorageRpcPlacedSegmentShardBackfillClaimOptionalRecordResponse,
@@ -327,12 +328,14 @@ use crate::storage_rpc::{
     StorageRpcScavengerObservationKeyRequest, StorageRpcScavengerObservationRecordRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardAckItemRequest,
     StorageRpcShardDeleteRequest, StorageRpcShardLocation, StorageRpcShardReadRangeRequest,
-    StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
-    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotOutcome,
-    StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcStreamPartFinalizeSnapshotResponse,
-    StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
-    StorageRpcStreamPutFinalizeSnapshotResponse, StorageRpcStreamSegmentAppendPrepareOutcome,
-    StorageRpcStreamSegmentAppendPrepareRequest, StorageRpcStreamSegmentAppendPrepareResponse,
+    StorageRpcShardReadRequest, StorageRpcShardScavengerReferenceMatchRequest,
+    StorageRpcShardScavengerReferencePageRequest, StorageRpcShardWriteRequest,
+    StorageRpcStreamError, StorageRpcStreamPartCommitCommandBuildRequest,
+    StorageRpcStreamPartFinalizeSnapshotOutcome, StorageRpcStreamPartFinalizeSnapshotRequest,
+    StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
+    StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
+    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
+    StorageRpcStreamSegmentAppendPrepareResponse,
     StorageRpcStreamUploadBucketWriteReservationUpdateRequest, StorageRpcStreamUploadMatchRequest,
     StorageRpcStreamUploadMatchResponse, StorageRpcStreamUploadSegmentsOutcome,
     StorageRpcStreamUploadSegmentsResponse, StorageRpcStreamUploadSessionOutcome,
@@ -900,16 +903,19 @@ impl StorageNodeConnectionHandler {
                 &self.metadata_command_locks,
                 session.current_rpc_context(),
             );
-            let mut response = match self.dispatch_frame(&mut session, &route_permit, &frame) {
+            let mut response = match self.dispatch_frame(
+                &mut session,
+                &mut session_guard,
+                &route_permit,
+                &frame,
+            ) {
                 Ok(response) => response,
                 Err(error) => {
                     session.clear_metadata_command_lock_context(&self.metadata_command_locks);
                     return Err(error);
                 }
             };
-            let connection_reusable = session_guard.classify_connection(
-                session.has_active_read_state() || session.has_metadata_command_pg_locks(),
-            );
+            let connection_reusable = session_guard.classify_connection(session.retention());
             set_storage_rpc_response_connection_reusable(
                 &mut response.payload,
                 connection_reusable,
@@ -968,6 +974,7 @@ impl StorageNodeConnectionHandler {
     fn dispatch_frame(
         &self,
         session: &mut StorageNodeSession,
+        session_guard: &mut StorageNodeActiveSessionGuard,
         route_permit: &StorageNodeRouteAdmissionPermit,
         frame: &StorageRpcFrame,
     ) -> Result<StorageRpcFrame, StorageNodeServerError> {
@@ -1022,9 +1029,12 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectPayloadLeaseControl => {
                 match decode_object_payload_lease_control_request(&frame.payload) {
-                    Ok(request) => {
-                        self.object_payload_lease_control_response(session, route_permit, request)
-                    }
+                    Ok(request) => self.object_payload_lease_control_response(
+                        session,
+                        session_guard,
+                        route_permit,
+                        request,
+                    ),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1843,7 +1853,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::ShardRead => match decode_shard_read_request(&frame.payload) {
-                Ok(request) => self.shard_read_response(route_permit, request),
+                Ok(request) => self.shard_read_response(session, route_permit, request),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::PayloadDecode,
                     message: error.to_string(),
@@ -1860,7 +1870,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ShardReadRange => {
                 match decode_shard_read_range_request(&frame.payload) {
-                    Ok(request) => self.shard_read_range_response(route_permit, request),
+                    Ok(request) => self.shard_read_range_response(session, route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -1950,10 +1960,32 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
-            StorageRpcMessageKind::PlacedSegmentBackfillReferencePage => {
-                match decode_placed_segment_backfill_reference_page_request(&frame.payload) {
+            StorageRpcMessageKind::ShardScavengerReferencePage => {
+                match decode_shard_scavenger_reference_page_request(&frame.payload) {
                     Ok(request) => {
-                        self.placed_segment_backfill_reference_page_response(route_permit, request)
+                        self.shard_scavenger_reference_page_response(route_permit, request)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::PlacedSegmentBackfillReferencePage => {
+                match decode_shard_scavenger_reference_page_request(&frame.payload) {
+                    Ok(request) => {
+                        self.placed_shard_scavenger_reference_page_response(route_permit, request)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ShardScavengerReferenceMatch => {
+                match decode_shard_scavenger_reference_match_request(&frame.payload) {
+                    Ok(request) => {
+                        self.shard_scavenger_reference_match_response(route_permit, request)
                     }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -2706,6 +2738,7 @@ impl StorageNodeConnectionHandler {
     fn object_payload_lease_control_response(
         &self,
         session: &mut StorageNodeSession,
+        session_guard: &mut StorageNodeActiveSessionGuard,
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectPayloadLeaseControlRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
@@ -2734,6 +2767,12 @@ impl StorageNodeConnectionHandler {
         }
         let value = match request.operation {
             StorageRpcObjectPayloadLeaseControlOperation::Acquire => {
+                if !session_guard.reserve_object_payload_lease() {
+                    return encode_storage_rpc_error_response(&resource_exhausted_response(
+                        "storage-node object-payload lease capacity is reserved for read handoff"
+                            .to_string(),
+                    ));
+                }
                 if let Err(error) = active_control
                     .as_ref()
                     .expect("active operation has active capability")
@@ -6296,6 +6335,7 @@ impl StorageNodeConnectionHandler {
 
     fn shard_read_response(
         &self,
+        session: &StorageNodeSession,
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcShardReadRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
@@ -6308,6 +6348,9 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
+        if let Err(error) = session.require_active_read_handle(route.location, &request.shard_key) {
+            return encode_storage_rpc_error_response(&error);
+        }
         self.shard_read_file_response(route.read(), request)
     }
 
@@ -6376,6 +6419,7 @@ impl StorageNodeConnectionHandler {
 
     fn shard_read_range_response(
         &self,
+        session: &StorageNodeSession,
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcShardReadRangeRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
@@ -6388,6 +6432,9 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
+        if let Err(error) = session.require_active_read_handle(route.location, &request.shard_key) {
+            return encode_storage_rpc_error_response(&error);
+        }
         let response = match route.read() {
             Ok(payload) => {
                 let actual_size = payload.len() as u64;
@@ -6604,7 +6651,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcScavengerListFilesRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_data_scan_route(
+        let route = match self.shard_scavenger_file_scan_route(
             route_permit,
             request.node_id,
             request.cluster_epoch,
@@ -6685,26 +6732,82 @@ impl StorageNodeConnectionHandler {
         }
     }
 
-    fn placed_segment_backfill_reference_page_response(
+    fn shard_scavenger_reference_page_response(
         &self,
         route_permit: &StorageNodeRouteAdmissionPermit,
-        request: StorageRpcPlacedSegmentBackfillReferencePageRequest,
+        request: StorageRpcShardScavengerReferencePageRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         let route = match self.active_primary_object_scan_route(
             route_permit,
             request.route.node_id,
             request.route.cluster_epoch,
             request.route.pg_id,
-            "placed segment backfill reference page",
+            "shard scavenger reference page",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.list_shard_scavenger_reference_page(request.after.as_ref(), request.limit) {
+            Ok(page) => Ok(encode_storage_rpc_success_response(
+                &encode_shard_scavenger_reference_page_response(&page)?,
+            )),
+            Err(StorageNodeObjectScanStoreError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectScanStoreError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))
+            }
+        }
+    }
+
+    fn placed_shard_scavenger_reference_page_response(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        request: StorageRpcShardScavengerReferencePageRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let route = match self.active_primary_object_scan_route(
+            route_permit,
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+            "placed shard scavenger reference page",
         ) {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         match route
-            .list_placed_segment_backfill_reference_page(request.after.as_ref(), request.limit)
+            .list_placed_shard_scavenger_reference_page(request.after.as_ref(), request.limit)
         {
             Ok(page) => Ok(encode_storage_rpc_success_response(
-                &encode_placed_segment_backfill_reference_page_response(&page)?,
+                &encode_shard_scavenger_reference_page_response(&page)?,
+            )),
+            Err(StorageNodeObjectScanStoreError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectScanStoreError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))
+            }
+        }
+    }
+
+    fn shard_scavenger_reference_match_response(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        request: StorageRpcShardScavengerReferenceMatchRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let route = match self.active_primary_object_scan_route(
+            route_permit,
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+            "shard scavenger reference match",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.shard_scavenger_reference_matches(&request.cursor, &request.expected) {
+            Ok(matches) => Ok(encode_storage_rpc_success_response(
+                &encode_shard_scavenger_reference_match_response(matches),
             )),
             Err(StorageNodeObjectScanStoreError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)

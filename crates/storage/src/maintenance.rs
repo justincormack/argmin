@@ -1,6 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -10,8 +11,8 @@ use std::time::{Duration, Instant};
 use crate::cluster::{
     DurablePlacedSegmentShardRepairEnqueueSummary, MetadataCommandCheckpointScanCursor,
     PlacedSegmentShardBackfillCandidateEnqueueSummary,
-    PlacedSegmentShardBackfillCandidateScanCursor, StorageClusterRouteAdmissionDomain,
-    StorageClusterRouteHandle, StreamSessionSweepSummary,
+    PlacedSegmentShardBackfillCandidateScanCursor, ShardScavengerAuditPass,
+    StorageClusterRouteAdmissionDomain, StorageClusterRouteHandle, StreamSessionSweepSummary,
 };
 use crate::types::{
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
@@ -33,7 +34,12 @@ const TRACE_TARGET: &str = "storage";
 #[cfg(test)]
 const SHARD_SCAVENGER_SWEEP_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
-const SHARD_SCAVENGER_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+const SHARD_SCAVENGER_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
+#[cfg(test)]
+const SHARD_SCAVENGER_STEP_INTERVAL: Duration = Duration::from_millis(1);
+#[cfg(not(test))]
+const SHARD_SCAVENGER_STEP_INTERVAL: Duration = Duration::from_millis(250);
+const SHARD_SCAVENGER_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 const STREAM_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 const STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS: u64 = 60_000;
 const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
@@ -1162,12 +1168,18 @@ impl StorageShardScavengerSweeper {
                     StorageBackfillCandidateScanner::new(storage_handle.clone());
                 let checkpoint_scanner =
                     StorageMetadataCheckpointScanner::new(storage_handle.clone());
+                let mut audit_scanner = StorageShardScavengerAuditScanner::default();
                 while !stop.load(Ordering::SeqCst) {
                     admission.observe_pressure();
                     let now = Instant::now();
                     if now >= next_audit {
-                        run_shard_scavenger_audit(&storage_handle, &admission);
-                        next_audit = Instant::now() + audit_interval;
+                        let outcome = run_shard_scavenger_audit(
+                            &storage_handle,
+                            &admission,
+                            &mut audit_scanner,
+                        );
+                        next_audit =
+                            Instant::now() + shard_scavenger_next_interval(outcome, audit_interval);
                     }
                     if now >= next_candidate_scan {
                         run_backfill_candidate_scan(&admission, &candidate_scanner);
@@ -1282,20 +1294,98 @@ fn maintenance_interval_from_env(name: &str, default: Duration) -> Duration {
     }
 }
 
+#[derive(Default)]
+struct StorageShardScavengerAuditScanner {
+    pass: Option<(Arc<crate::StorageCluster>, ShardScavengerAuditPass)>,
+    prior_unreferenced: HashSet<crate::types::ShardScavengerObservationKey>,
+}
+
+impl StorageShardScavengerAuditScanner {
+    fn scan_next(
+        &mut self,
+        storage_handle: &StorageClusterRouteHandle,
+    ) -> Result<bool, StoreError> {
+        if self.pass.is_none() {
+            let storage_cluster = storage_handle.current();
+            let pass = storage_cluster.begin_shard_scavenger_audit_pass_with_prior(std::mem::take(
+                &mut self.prior_unreferenced,
+            ));
+            self.pass = Some((Arc::clone(&storage_cluster), pass));
+        }
+
+        let storage_cluster = Arc::clone(
+            &self
+                .pass
+                .as_ref()
+                .expect("shard scavenger pass was initialized")
+                .0,
+        );
+        let result = storage_cluster.audit_next_shard_scavenger_pg(
+            &mut self
+                .pass
+                .as_mut()
+                .expect("shard scavenger pass was initialized")
+                .1,
+        );
+        let complete = match result {
+            Ok(step) => step.is_none(),
+            Err(error) => {
+                if !Arc::ptr_eq(&storage_cluster, &storage_handle.current()) {
+                    self.pass = None;
+                    self.prior_unreferenced.clear();
+                }
+                return Err(error);
+            }
+        };
+        if complete {
+            let (_, mut pass) = self.pass.take().expect("completed audit pass exists");
+            if Arc::ptr_eq(&storage_cluster, &storage_handle.current()) {
+                self.prior_unreferenced = std::mem::take(&mut pass.current_unreferenced);
+            } else {
+                self.prior_unreferenced.clear();
+            }
+        }
+        Ok(complete)
+    }
+}
+
+enum ShardScavengerAuditRunOutcome {
+    Complete,
+    Progress,
+    Deferred,
+}
+
+fn shard_scavenger_next_interval(
+    outcome: ShardScavengerAuditRunOutcome,
+    audit_interval: Duration,
+) -> Duration {
+    match outcome {
+        ShardScavengerAuditRunOutcome::Complete => audit_interval,
+        ShardScavengerAuditRunOutcome::Progress => SHARD_SCAVENGER_STEP_INTERVAL,
+        ShardScavengerAuditRunOutcome::Deferred => SHARD_SCAVENGER_ERROR_BACKOFF,
+    }
+}
+
 fn run_shard_scavenger_audit(
     storage_handle: &StorageClusterRouteHandle,
     admission: &Arc<StorageMaintenanceAdmission>,
-) {
-    let storage_cluster = storage_handle.current();
+    scanner: &mut StorageShardScavengerAuditScanner,
+) -> ShardScavengerAuditRunOutcome {
     if let Some(_permit) = admission.try_opportunistic_scan() {
-        if let Err(error) = storage_cluster.audit_shard_storage_for_scavenger() {
-            let _ = observability::event(
-                TRACE_TARGET,
-                "shard_scavenger_audit_error",
-                Some(format_args!("error={error}")),
-            );
+        match scanner.scan_next(storage_handle) {
+            Ok(true) => return ShardScavengerAuditRunOutcome::Complete,
+            Ok(false) => return ShardScavengerAuditRunOutcome::Progress,
+            Err(error) => {
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "shard_scavenger_audit_error",
+                    Some(format_args!("error={error}")),
+                );
+                return ShardScavengerAuditRunOutcome::Deferred;
+            }
         }
     }
+    ShardScavengerAuditRunOutcome::Progress
 }
 
 fn run_backfill_candidate_scan(
@@ -1914,6 +2004,69 @@ fn sweep_abandoned_stream_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shard_scavenger_failed_step_uses_error_backoff() {
+        let full_interval = Duration::from_secs(30 * 60);
+        assert_eq!(
+            shard_scavenger_next_interval(ShardScavengerAuditRunOutcome::Deferred, full_interval,),
+            SHARD_SCAVENGER_ERROR_BACKOFF
+        );
+        assert_eq!(
+            shard_scavenger_next_interval(ShardScavengerAuditRunOutcome::Progress, full_interval,),
+            SHARD_SCAVENGER_STEP_INTERVAL
+        );
+        assert_eq!(
+            shard_scavenger_next_interval(ShardScavengerAuditRunOutcome::Complete, full_interval,),
+            full_interval
+        );
+    }
+
+    #[test]
+    fn shard_scavenger_runtime_map_replacement_does_not_restart_healthy_pass() {
+        crate::clock::with_time_override(1_000, || {
+            let tmp = test_util::tempdir();
+            let static_cluster = crate::StorageCluster::open_static_local_nodes(
+                tmp.path(),
+                &[crate::NodeId::new(0)],
+                &[0, 1],
+                crate::EcShape { k: 1, m: 0 },
+            )
+            .unwrap();
+            let initial = static_cluster
+                .test_clone_with_dynamic_route_map_validity(
+                    crate::RouteMapValidity::until_ms(10_000).unwrap(),
+                )
+                .unwrap();
+            let replacement = static_cluster
+                .test_clone_with_dynamic_route_map_validity(
+                    crate::RouteMapValidity::until_ms(10_000).unwrap(),
+                )
+                .unwrap();
+            let runtime_handle =
+                crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial)).unwrap();
+            let route_handle = runtime_handle.route_handle();
+            let mut scanner = StorageShardScavengerAuditScanner::default();
+
+            assert!(!scanner.scan_next(&route_handle).unwrap());
+            assert!(Arc::ptr_eq(&scanner.pass.as_ref().unwrap().0, &initial));
+
+            runtime_handle.install(Arc::clone(&replacement)).unwrap();
+            assert!(Arc::ptr_eq(&route_handle.current(), &replacement));
+            assert!(Arc::ptr_eq(&scanner.pass.as_ref().unwrap().0, &initial));
+
+            for _ in 0..8 {
+                if scanner.scan_next(&route_handle).unwrap() {
+                    break;
+                }
+            }
+            assert!(scanner.pass.is_none(), "the pinned pass must complete");
+            assert!(scanner.prior_unreferenced.is_empty());
+
+            assert!(!scanner.scan_next(&route_handle).unwrap());
+            assert!(Arc::ptr_eq(&scanner.pass.as_ref().unwrap().0, &replacement));
+        });
+    }
 
     #[test]
     fn maintenance_admission_limits_and_releases_each_class() {

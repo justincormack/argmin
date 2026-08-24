@@ -692,13 +692,43 @@ pub(crate) struct MetadataCommandRecoveryTestGuard {
 
 const TRACE_TARGET: &str = "storage";
 
-type ShardScavengerLocationIdentity = (u32, u32, ShardKey);
-type ShardScavengerRepairIdentity = (u32, ShardKey);
+type ShardScavengerLocationIdentity = (u32, ShardKey);
+type ShardScavengerRepairIdentity = ShardKey;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+struct ShardScavengerRepairCandidate {
+    work_item: PlacedSegmentShardRepairWorkItem,
+    authorities: Vec<ShardScavengerRepairAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShardScavengerRepairAuthority {
+    source_pg_id: PgId,
+    cursor: ShardScavengerReferenceCursor,
+    reference: ShardScavengerPlacedShardSetReference,
+}
+
+#[derive(Debug, Default, Clone)]
 struct ShardScavengerReferenceScan {
     locations: HashSet<ShardScavengerLocationIdentity>,
-    repair_work_by_shard: HashMap<ShardScavengerRepairIdentity, PlacedSegmentShardRepairWorkItem>,
+    repair_work_by_shard: HashMap<ShardScavengerRepairIdentity, ShardScavengerRepairCandidate>,
+}
+
+enum PlacedSegmentDirectReadOutcome {
+    Complete,
+    Recover {
+        temporarily_unavailable: Option<StoreError>,
+    },
+}
+
+pub(crate) struct ShardScavengerAuditPass {
+    referenced_scans: HashMap<u32, ShardScavengerReferenceScan>,
+    pg_ids: Vec<PgId>,
+    next_reference_pg_index: usize,
+    reference_after: Option<ShardScavengerReferenceCursor>,
+    next_pg_index: usize,
+    prior_unreferenced: HashSet<ShardScavengerObservationKey>,
+    pub(super) current_unreferenced: HashSet<ShardScavengerObservationKey>,
 }
 
 fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectPgActionError {
@@ -1700,7 +1730,7 @@ impl PlacedSegmentShardBackfillCandidateKey {
 pub(crate) struct PlacedSegmentShardBackfillCandidateScanCursor {
     after_pg_id: Option<PgId>,
     active_pg_id: Option<PgId>,
-    reference_after: Option<PlacedSegmentBackfillReferenceCursor>,
+    reference_after: Option<ShardScavengerReferenceCursor>,
 }
 
 impl PlacedSegmentShardBackfillPlan {
@@ -1736,12 +1766,16 @@ enum PlacedSegmentShardHealthReadMode {
 pub(crate) struct AcquiredObjectPayloadNodeLeases {
     pub(crate) node_leases: Vec<Box<dyn ObjectPayloadLeaseNodeLease>>,
     pub(crate) leased_node_ids: BTreeSet<NodeId>,
+    pub(crate) unavailable_error: Option<StoreError>,
+    pub(crate) reclaim_fenced: bool,
 }
 
 pub struct ObjectPayloadLease {
     cluster: Weak<StorageCluster>,
     node_leases: Vec<Box<dyn ObjectPayloadLeaseNodeLease>>,
     leased_node_ids: BTreeSet<NodeId>,
+    unavailable_error: Option<StoreError>,
+    reclaim_fenced: bool,
     runtime_state: Arc<LocalClusterRuntimeState>,
     bucket: BucketName,
     key: ObjectKey,
@@ -1943,11 +1977,15 @@ impl ObjectPayloadLease {
         let AcquiredObjectPayloadNodeLeases {
             node_leases,
             leased_node_ids,
+            unavailable_error,
+            reclaim_fenced,
         } = acquired;
         Self {
             cluster,
             node_leases,
             leased_node_ids,
+            unavailable_error,
+            reclaim_fenced,
             runtime_state,
             bucket,
             key,
@@ -1983,6 +2021,36 @@ impl ObjectPayloadLease {
 
     fn leased_node_ids(&self) -> &BTreeSet<NodeId> {
         &self.leased_node_ids
+    }
+
+    fn retain_node_ids(&mut self, retained_node_ids: &BTreeSet<NodeId>) -> Result<(), StoreError> {
+        let mut retained_leases = Vec::with_capacity(self.node_leases.len());
+        let mut release_error = None;
+        for mut lease in self.node_leases.drain(..) {
+            if retained_node_ids.contains(&lease.node_id()) {
+                retained_leases.push(lease);
+            } else if let Err(error) = lease.release() {
+                release_error.get_or_insert(error);
+                retained_leases.push(lease);
+            }
+        }
+        self.leased_node_ids = retained_leases
+            .iter()
+            .map(|lease| lease.node_id())
+            .collect();
+        self.node_leases = retained_leases;
+        if let Some(error) = release_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn reclaim_fenced(&self) -> bool {
+        self.reclaim_fenced
+    }
+
+    fn take_unavailable_error(&mut self) -> Option<StoreError> {
+        self.unavailable_error.take()
     }
 }
 

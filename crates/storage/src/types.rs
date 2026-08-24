@@ -3094,7 +3094,7 @@ pub(crate) struct ShardScavengerPlacedShardSetReference {
     pub ec: EcShape,
 }
 
-pub(crate) const PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT: u16 = 64;
+pub(crate) const SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT: u16 = 64;
 
 /// Stable, storage-owned resume position for placed-segment backfill discovery.
 ///
@@ -3103,7 +3103,7 @@ pub(crate) const PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT: u16 = 64;
 /// outside storage and is safe to discard; a later pass will rediscover any
 /// rows inserted before it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PlacedSegmentBackfillReferenceCursor {
+pub(crate) enum ShardScavengerReferenceCursor {
     ObjectSegment {
         bucket: BucketName,
         key: ObjectKey,
@@ -3121,7 +3121,27 @@ pub(crate) enum PlacedSegmentBackfillReferenceCursor {
         part_number: u32,
         segment_index: u32,
     },
-    PendingCommand {
+    ObjectReclaimSegment {
+        bucket: BucketName,
+        key: ObjectKey,
+        generation_id: GenerationId,
+        segment_index: u32,
+    },
+    MultipartReclaimSegment {
+        bucket: BucketName,
+        key: ObjectKey,
+        generation_id: GenerationId,
+        part_number: u32,
+        segment_index: u32,
+    },
+    PendingPlacedCommand {
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: u64,
+        command_checksum: u64,
+        reference_index: u32,
+    },
+    PendingReclaimCommand {
         cluster_epoch: ClusterEpoch,
         pg_id: PgId,
         log_index: u64,
@@ -3131,14 +3151,14 @@ pub(crate) enum PlacedSegmentBackfillReferenceCursor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlacedSegmentBackfillReferencePageItem {
-    pub cursor: PlacedSegmentBackfillReferenceCursor,
-    pub reference: ShardScavengerPlacedShardSetReference,
+pub(crate) struct ShardScavengerReferencePageItem {
+    pub cursor: ShardScavengerReferenceCursor,
+    pub reference: ShardScavengerPayloadReference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlacedSegmentBackfillReferencePage {
-    pub items: Vec<PlacedSegmentBackfillReferencePageItem>,
+pub(crate) struct ShardScavengerReferencePage {
+    pub items: Vec<ShardScavengerReferencePageItem>,
     pub complete: bool,
 }
 

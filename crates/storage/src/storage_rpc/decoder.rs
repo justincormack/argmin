@@ -2737,28 +2737,48 @@ impl<'a> StorageRpcDecoder<'a> {
         })
     }
 
-    fn read_placed_segment_backfill_reference_cursor(
+    fn read_shard_scavenger_reference_cursor(
         &mut self,
-    ) -> Result<PlacedSegmentBackfillReferenceCursor, StorageRpcPayloadError> {
+    ) -> Result<ShardScavengerReferenceCursor, StorageRpcPayloadError> {
         match self.read_u8()? {
-            0 => Ok(PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+            0 => Ok(ShardScavengerReferenceCursor::ObjectSegment {
                 bucket: self.read_bucket_name()?,
                 key: self.read_object_key()?,
                 version_id: self.read_u64()?,
                 segment_index: self.read_u32()?,
             }),
-            1 => Ok(PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+            1 => Ok(ShardScavengerReferenceCursor::StreamUploadSegment {
                 session_id: self.read_session_id()?,
                 segment_index: self.read_u32()?,
             }),
-            2 => Ok(PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+            2 => Ok(ShardScavengerReferenceCursor::MultipartPartSegment {
                 bucket: self.read_bucket_name()?,
                 key: self.read_object_key()?,
                 upload_id: self.read_upload_id()?,
                 part_number: self.read_u32()?,
                 segment_index: self.read_u32()?,
             }),
-            3 => Ok(PlacedSegmentBackfillReferenceCursor::PendingCommand {
+            3 => Ok(ShardScavengerReferenceCursor::ObjectReclaimSegment {
+                bucket: self.read_bucket_name()?,
+                key: self.read_object_key()?,
+                generation_id: self.read_generation_id()?,
+                segment_index: self.read_u32()?,
+            }),
+            4 => Ok(ShardScavengerReferenceCursor::MultipartReclaimSegment {
+                bucket: self.read_bucket_name()?,
+                key: self.read_object_key()?,
+                generation_id: self.read_generation_id()?,
+                part_number: self.read_u32()?,
+                segment_index: self.read_u32()?,
+            }),
+            5 => Ok(ShardScavengerReferenceCursor::PendingPlacedCommand {
+                cluster_epoch: self.read_cluster_epoch()?,
+                pg_id: PgId::new(self.read_u32()?),
+                log_index: self.read_u64()?,
+                command_checksum: self.read_u64()?,
+                reference_index: self.read_u32()?,
+            }),
+            6 => Ok(ShardScavengerReferenceCursor::PendingReclaimCommand {
                 cluster_epoch: self.read_cluster_epoch()?,
                 pg_id: PgId::new(self.read_u32()?),
                 log_index: self.read_u64()?,
@@ -2766,7 +2786,7 @@ impl<'a> StorageRpcDecoder<'a> {
                 reference_index: self.read_u32()?,
             }),
             _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
-                "invalid backfill reference cursor tag",
+                "invalid shard scavenger reference cursor tag",
             )),
         }
     }

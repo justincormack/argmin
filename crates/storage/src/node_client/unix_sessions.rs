@@ -6,9 +6,11 @@ use super::*;
 pub(crate) struct UnixStorageNodeReadHandleSession {
     node_id: NodeId,
     route_cluster_epoch: ClusterEpoch,
-    stream: BoxStorageRpcStream,
+    connection: StorageRpcRequestConnection,
     next_request_id: u64,
     io_timeout: Duration,
+    last_connection_reusable: bool,
+    active_read_operation_ids: BTreeSet<String>,
     rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
     _rpc_permit: Option<UnixStorageNodeRpcAdmissionPermit>,
     _object_payload_lease_permit: Option<UnixStorageNodeObjectPayloadLeaseAdmissionPermit>,
@@ -33,6 +35,7 @@ struct UnixStorageNodeMetadataCommandSessionInner {
 struct UnixStorageNodeReadHandleLease {
     session: UnixStorageNodeReadHandleSession,
     read_operation_id: String,
+    entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
     released: bool,
 }
 
@@ -66,10 +69,10 @@ struct UnixRetainedObjectPayloadReclaimRoute<'a> {
 }
 
 impl UnixStorageNodeClient {
-    fn connect_session_stream(
+    fn connect_session_connection(
         &self,
         context: &'static str,
-    ) -> Result<(BoxStorageRpcStream, Duration), StoreError> {
+    ) -> Result<(StorageRpcRequestConnection, Duration), StoreError> {
         let io_timeout = storage_rpc_io_timeout(self.rpc_auth.as_deref());
         let deadline = Instant::now()
             .checked_add(io_timeout)
@@ -80,8 +83,16 @@ impl UnixStorageNodeClient {
                     "storage-node RPC session deadline overflowed",
                 ),
             })?;
-        self.connect_session_stream_until(context, deadline)
-            .map(|stream| (stream, io_timeout))
+        let max_connections = self
+            .rpc_auth
+            .as_deref()
+            .map_or(self.rpc_admission.limit, |auth| {
+                auth.transport_limits().max_connections()
+            });
+        self.endpoint
+            .connect_session(deadline, io_timeout, max_connections)
+            .map(|connection| (connection, io_timeout))
+            .map_err(|failure| storage_rpc_endpoint_connect_error(self.node_id, context, failure))
     }
 
     fn connect_session_stream_until(
@@ -102,20 +113,41 @@ impl UnixStorageNodeClient {
         self.rpc_admission.active_session_count_for_test()
     }
 
+    #[cfg(test)]
+    pub(crate) fn idle_session_connection_count_for_test(&self) -> usize {
+        self.endpoint.idle_session_connection_count_for_test()
+    }
+
     fn open_read_handle_session(&self) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
         let rpc_permit = self.acquire_rpc_admission(StorageRpcMessageKind::ReadHandlesAcquire)?;
-        let (stream, io_timeout) =
-            self.connect_session_stream("connect storage-node read-handle RPC endpoint")?;
+        let (connection, io_timeout) =
+            self.connect_session_connection("connect storage-node read-handle RPC endpoint")?;
         Ok(UnixStorageNodeReadHandleSession {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
-            stream,
+            connection,
             next_request_id: 1,
             io_timeout,
+            last_connection_reusable: false,
+            active_read_operation_ids: BTreeSet::new(),
             rpc_auth: self.rpc_auth.clone(),
             _rpc_permit: Some(rpc_permit),
             _object_payload_lease_permit: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_full_placed_shard_with_handle_for_test(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut session = self.open_read_handle_session()?;
+        session.acquire_read_handles("test-full-shard-read", vec![(location, key.clone())])?;
+        let payload = session.read_full_placed_shard_for_test(location, key, expected_ack)?;
+        session.release_read_handles("test-full-shard-read")?;
+        Ok(payload)
     }
 
     #[cfg(test)]
@@ -130,14 +162,16 @@ impl UnixStorageNodeClient {
         kind: ObjectPayloadLeaseKind,
     ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
         let lease_permit = self.acquire_object_payload_lease_session_admission(kind)?;
-        let (stream, io_timeout) =
-            self.connect_session_stream("connect storage-node object-payload lease RPC endpoint")?;
+        let (connection, io_timeout) = self
+            .connect_session_connection("connect storage-node object-payload lease RPC endpoint")?;
         Ok(UnixStorageNodeReadHandleSession {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
-            stream,
+            connection,
             next_request_id: 1,
             io_timeout,
+            last_connection_reusable: false,
+            active_read_operation_ids: BTreeSet::new(),
             rpc_auth: self.rpc_auth.clone(),
             _rpc_permit: None,
             _object_payload_lease_permit: Some(lease_permit),
@@ -267,8 +301,9 @@ impl UnixStorageNodeReadHandleSession {
         entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
     ) -> Result<Vec<crate::cluster::ShardLocation>, StoreError> {
         let (locations, shard_keys): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        let read_operation_id = read_operation_id.into();
         let request = StorageRpcReadHandleAcquireRequest {
-            read_operation_id: read_operation_id.into(),
+            read_operation_id: read_operation_id.clone(),
             locations: locations.iter().copied().map(Into::into).collect(),
             shard_keys,
         };
@@ -288,6 +323,7 @@ impl UnixStorageNodeReadHandleSession {
                 ),
             ));
         }
+        self.active_read_operation_ids.insert(read_operation_id);
         Ok(locations)
     }
 
@@ -295,8 +331,9 @@ impl UnixStorageNodeReadHandleSession {
         &mut self,
         read_operation_id: impl Into<String>,
     ) -> Result<(), StoreError> {
+        let read_operation_id = read_operation_id.into();
         let request = StorageRpcReadHandleReleaseRequest {
-            read_operation_id: read_operation_id.into(),
+            read_operation_id: read_operation_id.clone(),
         };
         let payload = encode_read_handle_release_request(&request).map_err(|error| {
             self.rpc_payload_error("encode read handle release request", error.to_string())
@@ -305,7 +342,84 @@ impl UnixStorageNodeReadHandleSession {
         decode_read_handle_release_response(&response).map_err(|error| {
             self.rpc_payload_error("decode read handle release response", error.to_string())
         })?;
+        self.active_read_operation_ids.remove(&read_operation_id);
+        if self.active_read_operation_ids.is_empty() {
+            self.mark_connection_reusable_if_server_allows();
+        }
         Ok(())
+    }
+
+    fn read_placed_shard_into(
+        &mut self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        if dst.len() as u64 != expected_ack.stored_size {
+            return Err(self.rpc_payload_error(
+                "read shard through read-handle session",
+                format!(
+                    "remote shard read buffer is {} bytes for expected {} byte shard",
+                    dst.len(),
+                    expected_ack.stored_size
+                ),
+            ));
+        }
+        let request = StorageRpcShardReadRangeRequest {
+            location: location.into(),
+            shard_key: key.clone(),
+            expected_ack,
+            offset: 0,
+            length: dst.len() as u64,
+        };
+        let payload = encode_shard_read_range_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode read-handle shard read request", error.to_string())
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ShardReadRange, payload)?;
+        let data = decode_shard_read_range_response(&response, dst.len()).map_err(|error| {
+            self.rpc_payload_error("decode read-handle shard read response", error.to_string())
+        })?;
+        dst.copy_from_slice(&data);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_placed_shard_into_for_test(
+        &mut self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        self.read_placed_shard_into(location, key, expected_ack, dst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_full_placed_shard_for_test(
+        &mut self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError> {
+        let request = StorageRpcShardReadRequest {
+            location: location.into(),
+            shard_key: key.clone(),
+            expected_ack,
+        };
+        let payload = encode_shard_read_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode full read-handle shard read request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(StorageRpcMessageKind::ShardRead, payload)?;
+        decode_shard_read_response(&response, expected_ack).map_err(|error| {
+            self.rpc_payload_error(
+                "decode full read-handle shard read response",
+                error.to_string(),
+            )
+        })
     }
 
     fn object_payload_lease_control(
@@ -349,7 +463,8 @@ impl UnixStorageNodeReadHandleSession {
                 "storage-node read-handle RPC deadline overflowed".to_string(),
             )
         })?;
-        self.stream
+        self.connection
+            .stream_mut()
             .set_operation_deadline(deadline)
             .map_err(|source| StoreError::Io {
                 context: "set storage-node read-handle RPC deadline",
@@ -368,14 +483,14 @@ impl UnixStorageNodeReadHandleSession {
             payload,
         };
         let request_proof = write_unix_storage_rpc_request(
-            &mut self.stream,
+            self.connection.stream_mut(),
             self.node_id,
             self.rpc_auth.as_deref(),
             &request,
             "write read-handle RPC request",
         )?;
         let response = read_unix_storage_rpc_response(
-            &mut self.stream,
+            self.connection.stream_mut(),
             self.node_id,
             self.rpc_auth.as_deref(),
             request_proof.as_ref(),
@@ -390,11 +505,21 @@ impl UnixStorageNodeReadHandleSession {
                 ),
             ));
         }
-        match decode_storage_rpc_response_payload(&response.payload).map_err(|error| {
-            self.rpc_payload_error("decode read-handle RPC response", error.to_string())
-        })? {
+        let response =
+            decode_storage_rpc_response_payload_with_connection_disposition(&response.payload)
+                .map_err(|error| {
+                    self.rpc_payload_error("decode read-handle RPC response", error.to_string())
+                })?;
+        self.last_connection_reusable = response.connection_reusable;
+        match response.response {
             Ok(payload) => Ok(payload),
             Err(error) => Err(self.rpc_response_error(kind, error)),
+        }
+    }
+
+    fn mark_connection_reusable_if_server_allows(&mut self) {
+        if self.last_connection_reusable {
+            self.connection.mark_reusable();
         }
     }
 
@@ -2534,10 +2659,11 @@ impl ShardReadHandleNodeClient for UnixStorageNodeClient {
 impl ShardReadHandleRoute for UnixShardReadHandleRoute<'_> {
     fn acquire(self: Box<Self>) -> Result<Box<dyn ShardReadHandleLease>, StoreError> {
         let mut session = self.client.open_read_handle_session()?;
-        session.acquire_read_handles(&self.read_operation_id, self.entries)?;
+        session.acquire_read_handles(&self.read_operation_id, self.entries.clone())?;
         Ok(Box::new(UnixStorageNodeReadHandleLease {
             session,
             read_operation_id: self.read_operation_id,
+            entries: self.entries,
             released: false,
         }))
     }
@@ -2580,7 +2706,10 @@ impl ObjectPayloadLeaseRoute for UnixObjectPayloadLeaseRoute<'_> {
             None,
         )?;
         match acquired {
-            0 => Ok(None),
+            0 => {
+                session.mark_connection_reusable_if_server_allows();
+                Ok(None)
+            }
             1 => Ok(Some(Box::new(UnixObjectPayloadLease {
                 session,
                 bucket: self.bucket.clone(),
@@ -2715,6 +2844,10 @@ impl RetainedObjectPayloadReclaimRoute for UnixRetainedObjectPayloadReclaimRoute
 }
 
 impl ObjectPayloadLeaseNodeLease for UnixObjectPayloadLease {
+    fn node_id(&self) -> NodeId {
+        self.session.node_id
+    }
+
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
             return Ok(0);
@@ -2727,6 +2860,7 @@ impl ObjectPayloadLeaseNodeLease for UnixObjectPayloadLease {
             None,
         )?;
         self.released = true;
+        self.session.mark_connection_reusable_if_server_allows();
         usize::try_from(remaining).map_err(|_| StoreError::Io {
             context: "validate storage-node object-payload lease release response",
             source: io::Error::new(io::ErrorKind::InvalidData, "lease count exceeds usize"),
@@ -2741,6 +2875,31 @@ impl Drop for UnixObjectPayloadLease {
 }
 
 impl ShardReadHandleLease for UnixStorageNodeReadHandleLease {
+    fn read_placed_shard_into(
+        &mut self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        if self.released {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "read placed shard through released read-handle lease",
+            });
+        }
+        if !self
+            .entries
+            .iter()
+            .any(|entry| entry.0 == location && entry.1 == *key)
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "read placed shard through read-handle lease",
+            });
+        }
+        self.session
+            .read_placed_shard_into(location, key, expected_ack, dst)
+    }
+
     fn release(&mut self) -> Result<(), StoreError> {
         if self.released {
             return Ok(());
@@ -2788,9 +2947,13 @@ mod tests {
         let read_session = UnixStorageNodeReadHandleSession {
             node_id: NodeId::new(8),
             route_cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            stream: accepted_unix_stream(read_stream, Instant::now() + io_timeout).unwrap(),
+            connection: StorageRpcRequestConnection::unpooled_for_test(
+                accepted_unix_stream(read_stream, Instant::now() + io_timeout).unwrap(),
+            ),
             next_request_id: 1,
             io_timeout,
+            last_connection_reusable: false,
+            active_read_operation_ids: BTreeSet::new(),
             rpc_auth: None,
             _rpc_permit: Some(test_rpc_admission_permit()),
             _object_payload_lease_permit: None,

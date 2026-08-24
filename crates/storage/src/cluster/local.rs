@@ -132,6 +132,9 @@ fn maybe_run_open_metadata_command_after_apply_hook(
 }
 
 fn object_payload_lease_node_is_unavailable(error: &StoreError) -> bool {
+    if matches!(error, StoreError::StorageRpcResourceExhausted { .. }) {
+        return true;
+    }
     if error.storage_node_failure_class()
         == Some(crate::error::StorageNodeFailureClass::TransportInterrupted)
     {
@@ -945,15 +948,21 @@ impl LocalShardNodeClient<'_> {
 
     fn read_shard(&self, expected: WriteAck) -> Result<Vec<u8>, ShardIoError> {
         let mut read_handle = self.acquire_read_handle()?;
-        let data_result = self
-            .route
-            .read_placed_shard(expected)
+        let mut data = vec![
+            0;
+            usize::try_from(expected.stored_size).map_err(|_| {
+                self.store_error(StoreError::PayloadShardSetMismatch {
+                    reason: "payload shard size exceeds addressable memory".to_string(),
+                })
+            })?
+        ];
+        let data_result = read_handle
+            .read_placed_shard_into(self.location, &self.key, expected, &mut data)
             .map_err(|source| self.store_error(source));
         if let Err(error) = read_handle.release() {
             return Err(self.store_error(error));
         }
-        let data = data_result?;
-        self.verify_read_ack(expected, &data)?;
+        data_result?;
         Ok(data)
     }
 
@@ -966,32 +975,13 @@ impl LocalShardNodeClient<'_> {
             }));
         }
         let mut read_handle = self.acquire_read_handle()?;
-        let read_result = self
-            .route
-            .read_placed_shard_into(expected, dst)
+        let read_result = read_handle
+            .read_placed_shard_into(self.location, &self.key, expected, dst)
             .map_err(|source| self.store_error(source));
         if let Err(error) = read_handle.release() {
             return Err(self.store_error(error));
         }
-        read_result?;
-        self.verify_read_ack(expected, dst)
-    }
-
-    fn read_shard_into_without_handle(
-        &self,
-        expected: WriteAck,
-        dst: &mut [u8],
-    ) -> Result<(), ShardIoError> {
-        if dst.len() as u64 != expected.stored_size {
-            return Err(self.store_error(StoreError::Io {
-                context: "read payload shard buffer size mismatch",
-                source: std::io::Error::from(std::io::ErrorKind::InvalidData),
-            }));
-        }
-        self.route
-            .read_placed_shard_into(expected, dst)
-            .map_err(|source| self.store_error(source))?;
-        self.verify_read_ack(expected, dst)
+        read_result
     }
 
     fn delete_shard(&self) -> Result<(), ShardIoError> {
@@ -1049,23 +1039,6 @@ impl LocalShardNodeClient<'_> {
             source,
         }
     }
-
-    fn verify_read_ack(&self, expected: WriteAck, data: &[u8]) -> Result<(), ShardIoError> {
-        if data.len() as u64 != expected.stored_size {
-            return Err(self.store_error(StoreError::Io {
-                context: "read payload shard size mismatch",
-                source: std::io::Error::from(std::io::ErrorKind::InvalidData),
-            }));
-        }
-        let actual = checksum::crc64::checksum(data);
-        if actual != expected.crc64 {
-            return Err(self.store_error(StoreError::IntegrityError {
-                expected: expected.crc64,
-                actual,
-            }));
-        }
-        Ok(())
-    }
 }
 
 pub(crate) struct LocalShardReadHandleSet {
@@ -1112,6 +1085,36 @@ impl LocalShardReadHandleSet {
         }
         self.released = true;
         Ok(())
+    }
+
+    fn read_placed_shard_into(
+        &mut self,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        let lease = self
+            .leases
+            .iter_mut()
+            .find(|(leased_location, _)| leased_location.node_id() == location.node_id())
+            .map(|(_, lease)| lease)
+            .ok_or_else(|| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source: StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "read shard without a retained node read-handle session",
+                },
+            })?;
+        lease
+            .read_placed_shard_into(location, key, expected, dst)
+            .map_err(|source| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source,
+            })
     }
 }
 
@@ -1298,7 +1301,7 @@ impl LocalPlacedSegmentShardReadHandles<'_> {
     }
 
     pub(super) fn read_into(
-        &self,
+        &mut self,
         shard_index: usize,
         expected: WriteAck,
         dst: &mut [u8],
@@ -1309,15 +1312,8 @@ impl LocalPlacedSegmentShardReadHandles<'_> {
             )));
         }
         let (location, key) = self.reader.subject.location_and_key(shard_index)?;
-        self.reader
-            .cluster_map
-            .read_payload_shard_into_without_handle(
-                self.reader.subject.operation_epoch,
-                location,
-                &key,
-                expected,
-                dst,
-            )
+        self.read_handles
+            .read_placed_shard_into(location, &key, expected, dst)
     }
 
     pub(super) fn release(&mut self) -> Result<(), ShardIoError> {
@@ -4868,6 +4864,7 @@ impl LocalClusterMap {
         let mut acquired: Vec<Box<dyn ObjectPayloadLeaseNodeLease>> =
             Vec::with_capacity(self.nodes.len());
         let mut acquired_node_ids = BTreeSet::new();
+        let mut unavailable_error = None;
         for (node_id, node) in &self.nodes {
             let result = node
                 .object_payload_lease_client()
@@ -4886,16 +4883,23 @@ impl LocalClusterMap {
                     return Ok(AcquiredObjectPayloadNodeLeases {
                         node_leases: Vec::new(),
                         leased_node_ids: BTreeSet::new(),
+                        unavailable_error: None,
+                        reclaim_fenced: true,
                     });
                 }
                 Err(error)
-                    if retain_available && object_payload_lease_node_is_unavailable(&error) => {}
+                    if retain_available && object_payload_lease_node_is_unavailable(&error) =>
+                {
+                    unavailable_error.get_or_insert(error);
+                }
                 Err(error) => return Err(error),
             }
         }
         Ok(AcquiredObjectPayloadNodeLeases {
             node_leases: acquired,
             leased_node_ids: acquired_node_ids,
+            unavailable_error,
+            reclaim_fenced: false,
         })
     }
 
@@ -4906,40 +4910,6 @@ impl LocalClusterMap {
         generation_id: GenerationId,
         locations: &[ShardLocation],
     ) -> Result<Vec<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
-        self.try_acquire_object_payload_lease_on_locations_inner(
-            bucket,
-            key,
-            generation_id,
-            locations,
-            false,
-        )
-        .map(|acquired| acquired.node_leases)
-    }
-
-    pub(crate) fn try_acquire_available_object_payload_lease_on_locations(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        locations: &[ShardLocation],
-    ) -> Result<AcquiredObjectPayloadNodeLeases, StoreError> {
-        self.try_acquire_object_payload_lease_on_locations_inner(
-            bucket,
-            key,
-            generation_id,
-            locations,
-            true,
-        )
-    }
-
-    fn try_acquire_object_payload_lease_on_locations_inner(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        locations: &[ShardLocation],
-        retain_available: bool,
-    ) -> Result<AcquiredObjectPayloadNodeLeases, StoreError> {
         let mut node_ids = BTreeMap::new();
         for location in locations {
             let route = self
@@ -4981,8 +4951,7 @@ impl LocalClusterMap {
         }
 
         let mut acquired = Vec::with_capacity(lease_clients.len());
-        let mut acquired_node_ids = BTreeSet::new();
-        for (node_id, lease_client) in lease_clients {
+        for (_, lease_client) in lease_clients {
             let result = lease_client
                 .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)
                 .and_then(|route| {
@@ -4993,24 +4962,14 @@ impl LocalClusterMap {
             match result {
                 Ok(Some(lease)) => {
                     acquired.push(lease);
-                    acquired_node_ids.insert(node_id);
                 }
-                Ok(None) if retain_available => {}
                 Ok(None) => {
-                    return Ok(AcquiredObjectPayloadNodeLeases {
-                        node_leases: Vec::new(),
-                        leased_node_ids: BTreeSet::new(),
-                    });
+                    return Ok(Vec::new());
                 }
-                Err(error)
-                    if retain_available && object_payload_lease_node_is_unavailable(&error) => {}
                 Err(error) => return Err(error),
             }
         }
-        Ok(AcquiredObjectPayloadNodeLeases {
-            node_leases: acquired,
-            leased_node_ids: acquired_node_ids,
-        })
+        Ok(acquired)
     }
 
     pub(crate) fn try_begin_object_payload_reclaim(
@@ -6231,18 +6190,6 @@ impl LocalClusterMap {
             }
         }
         Ok(handle_set)
-    }
-
-    fn read_payload_shard_into_without_handle(
-        &self,
-        operation_epoch: ClusterEpoch,
-        location: ShardLocation,
-        key: &ShardKey,
-        expected: WriteAck,
-        dst: &mut [u8],
-    ) -> Result<(), ShardIoError> {
-        self.shard_node_client(operation_epoch, location, key)?
-            .read_shard_into_without_handle(expected, dst)
     }
 
     fn delete_payload_shard_for_current_route(

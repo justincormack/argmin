@@ -3775,9 +3775,18 @@
         let join = thread::spawn(move || server.accept_one().unwrap());
 
         let mut client = UnixStream::connect(socket_path).unwrap();
-        let response = send_frame(
+        let acquire = send_frame(
             &mut client,
             1,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("full-read", location),
+        );
+        decode_storage_rpc_response_payload(&acquire.payload)
+            .unwrap()
+            .unwrap();
+        let response = send_frame(
+            &mut client,
+            2,
             StorageRpcMessageKind::ShardRead,
             encode_shard_read_request(&request).unwrap(),
         );
@@ -3790,7 +3799,7 @@
         };
         let mismatch = send_frame(
             &mut client,
-            2,
+            3,
             StorageRpcMessageKind::ShardRead,
             encode_shard_read_request(&mismatched_request).unwrap(),
         );
@@ -3873,9 +3882,18 @@
         let join = thread::spawn(move || server.accept_one().unwrap());
 
         let mut client = UnixStream::connect(socket_path).unwrap();
-        let response = send_frame(
+        let acquire = send_frame(
             &mut client,
             1,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("range-read", location),
+        );
+        decode_storage_rpc_response_payload(&acquire.payload)
+            .unwrap()
+            .unwrap();
+        let response = send_frame(
+            &mut client,
+            2,
             StorageRpcMessageKind::ShardReadRange,
             encode_shard_read_range_request(&request).unwrap(),
         );
@@ -3893,7 +3911,9 @@
     #[test]
     fn storage_node_server_lists_scavenger_shard_files_over_rpc() {
         let tmp = test_util::tempdir();
-        let config = test_config(&tmp);
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
+        config.pg_routes[0].acting_set = vec![NodeId::new(8)];
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let socket_path = config.socket_path.clone();
@@ -4589,7 +4609,7 @@
         });
         let data_scan_route = crate::clock::with_time_override(1_000, || {
             handler
-                .active_data_scan_route(
+                .shard_scavenger_file_scan_route(
                     &active_permit,
                     config.node_id,
                     config.cluster_epoch,
@@ -4643,7 +4663,7 @@
                 }
             }
             for permit in [&retained_permit, &foreign_permit] {
-                match handler.active_data_scan_route(
+                match handler.shard_scavenger_file_scan_route(
                     permit,
                     config.node_id,
                     config.cluster_epoch,
@@ -4729,6 +4749,39 @@
         assert!(matches!(
             server._node.get_pg(0).unwrap().stat_shard(&other_shard_key),
             Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn shard_scavenger_file_scan_allows_the_current_non_acting_node() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
+        config.pg_routes[0].acting_set = vec![NodeId::new(8)];
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+
+        let route = handler
+            .shard_scavenger_file_scan_route(
+                &active_permit,
+                config.node_id,
+                config.cluster_epoch,
+                PgId::new(0),
+                "test non-acting shard scavenger scan",
+            )
+            .unwrap();
+
+        assert!(route.list_shard_files().unwrap().files.is_empty());
+        assert!(matches!(
+            handler.validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0)),
+            Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                ..
+            })
         ));
     }
 

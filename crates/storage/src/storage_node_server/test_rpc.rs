@@ -550,9 +550,9 @@
                 encode_bucket_pg_request(&unknown_route).unwrap(),
             ),
             (
-                StorageRpcMessageKind::PlacedSegmentBackfillReferencePage,
-                encode_placed_segment_backfill_reference_page_request(
-                    &StorageRpcPlacedSegmentBackfillReferencePageRequest {
+                StorageRpcMessageKind::ShardScavengerReferencePage,
+                encode_shard_scavenger_reference_page_request(
+                    &StorageRpcShardScavengerReferencePageRequest {
                         route: unknown_route.clone(),
                         after: None,
                         limit: std::num::NonZeroU16::new(1).unwrap(),
@@ -644,9 +644,9 @@
                 encode_bucket_pg_request(&route).unwrap(),
             ),
             (
-                StorageRpcMessageKind::PlacedSegmentBackfillReferencePage,
-                encode_placed_segment_backfill_reference_page_request(
-                    &StorageRpcPlacedSegmentBackfillReferencePageRequest {
+                StorageRpcMessageKind::ShardScavengerReferencePage,
+                encode_shard_scavenger_reference_page_request(
+                    &StorageRpcShardScavengerReferencePageRequest {
                         route: route.clone(),
                         after: None,
                         limit: std::num::NonZeroU16::new(1).unwrap(),
@@ -4504,6 +4504,7 @@
         assert!(session
             .acquire_object_payload_lease(epoch, &bucket, &key, generation_id)
             .unwrap());
+        assert!(node.try_acquire_object_payload_lease(&bucket, &key, generation_id));
         for (release_epoch, release_bucket) in [
             (ClusterEpoch::new(2).unwrap(), &bucket),
             (epoch, &other_bucket),
@@ -4514,7 +4515,7 @@
             assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
             assert_eq!(
                 node.object_payload_lease_count(&bucket, &key, generation_id),
-                1
+                2
             );
         }
 
@@ -4522,14 +4523,18 @@
             session
                 .release_object_payload_lease(epoch, &bucket, &key, generation_id)
                 .unwrap(),
-            0
+            1
         );
         assert_eq!(
             session
                 .release_object_payload_lease(epoch, &bucket, &key, generation_id)
                 .unwrap(),
-            0,
-            "lost release responses must be retryable without releasing another lease"
+            1,
+            "lost release responses must replay the original remaining count"
+        );
+        assert_eq!(
+            node.release_object_payload_lease(&bucket, &key, generation_id),
+            0
         );
     }
 
@@ -4605,19 +4610,41 @@
     #[test]
     fn storage_node_active_sessions_reserve_capacity_from_retained_ordinary_connections() {
         let active_sessions = Arc::new(StorageNodeActiveSessions::default());
-        let mut ordinary = active_sessions.try_acquire(2).unwrap();
-        assert!(ordinary.classify_connection(false));
+        let mut ordinary = active_sessions.try_acquire(3).unwrap();
+        assert!(ordinary.classify_connection(StorageNodeSessionRetention::Ordinary));
 
-        let mut excess_ordinary = active_sessions.try_acquire(2).unwrap();
-        assert!(!excess_ordinary.classify_connection(false));
+        let mut excess_ordinary = active_sessions.try_acquire(3).unwrap();
+        assert!(!excess_ordinary.classify_connection(StorageNodeSessionRetention::Ordinary));
         drop(excess_ordinary);
 
-        let mut stateful = active_sessions.try_acquire(2).unwrap();
-        assert!(stateful.classify_connection(true));
+        let mut lease = active_sessions.try_acquire(3).unwrap();
+        assert!(lease.reserve_object_payload_lease());
+        let mut read = active_sessions.try_acquire(3).unwrap();
+        assert!(read.classify_connection(StorageNodeSessionRetention::Read));
+        assert!(active_sessions.try_acquire(3).is_none());
+
+        drop(read);
+        drop(lease);
+        assert!(active_sessions.try_acquire(3).is_some());
+    }
+
+    #[test]
+    fn storage_node_active_sessions_preserve_read_handoff_across_clients() {
+        let active_sessions = Arc::new(StorageNodeActiveSessions::default());
+        let mut first_client_lease = active_sessions.try_acquire(2).unwrap();
+        assert!(first_client_lease.reserve_object_payload_lease());
+
+        let mut second_client_lease = active_sessions.try_acquire(2).unwrap();
+        assert!(
+            !second_client_lease.reserve_object_payload_lease(),
+            "one global slot must remain available for the first client's read handoff"
+        );
+        assert!(second_client_lease.classify_connection(StorageNodeSessionRetention::Read));
         assert!(active_sessions.try_acquire(2).is_none());
 
-        drop(stateful);
-        assert!(active_sessions.try_acquire(2).is_some());
+        drop(second_client_lease);
+        let mut successor = active_sessions.try_acquire(2).unwrap();
+        assert!(successor.classify_connection(StorageNodeSessionRetention::Read));
     }
 
     #[test]

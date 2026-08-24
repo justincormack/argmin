@@ -2238,7 +2238,7 @@ impl ValidatedStaticClusterManifest {
                 .iter()
                 .find(|profile| profile.id == endpoint.transport_profile_id)
                 .ok_or_else(|| format!("storage endpoint {endpoint_id} transport profile disappeared after validation"))?;
-                StorageRpcTransportLimits::new(
+                let limits = StorageRpcTransportLimits::new(
                     usize::try_from(profile.max_frame_bytes).map_err(|_| {
                         format!("storage endpoint {endpoint_id} frame limit does not fit usize")
                     })?,
@@ -2251,7 +2251,13 @@ impl ValidatedStaticClusterManifest {
                 )
                 .map_err(|error| {
                     format!("invalid storage endpoint {endpoint_id} transport limits: {error}")
-                })
+                })?;
+                if limits.max_connections() < 2 {
+                    return Err(format!(
+                        "storage endpoint {endpoint_id} transport max_connections must be at least 2 for object-read lease handoff"
+                    ));
+                }
+                Ok(limits)
             };
         let client_transport_limits = self
             .canonical_storage_node_endpoints
@@ -7907,6 +7913,23 @@ private_key_ref = "file:/run/argmin-secrets/public.key"
                 .unwrap()
                 .test_raft_voters(),
             &[101, 102, 103]
+        );
+    }
+
+    #[test]
+    fn replicated_storage_transport_requires_object_read_handoff_capacity() {
+        let manifest_text =
+            replicated_unix_manifest().replace("max_connections = 64", "max_connections = 1");
+        let (_dir, manifest) = materialized_replicated_manifest_from("storage-1", manifest_text);
+        let material = manifest.resolve_selected_process_material().unwrap();
+        let error = manifest
+            .replicated_data_process_server_config(&material)
+            .unwrap_err();
+        assert!(
+            error.contains(
+                "transport max_connections must be at least 2 for object-read lease handoff"
+            ),
+            "{error}"
         );
     }
 

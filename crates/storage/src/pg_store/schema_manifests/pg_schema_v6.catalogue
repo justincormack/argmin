@@ -1,0 +1,1248 @@
+object-count=93
+object
+type=5:index
+name=35:idx_bucket_subresources_kind_bucket
+table=19:bucket_subresources
+sql=114:CREATE INDEX idx_bucket_subresources_kind_bucket ON bucket_subresources (kind, bucket_name) WHERE body IS NOT NULL
+object
+type=5:index
+name=22:idx_buckets_owner_list
+table=7:buckets
+sql=70:CREATE INDEX idx_buckets_owner_list ON buckets (owner_principal, name)
+object
+type=5:index
+name=39:idx_metadata_command_checkpoints_select
+table=28:metadata_command_checkpoints
+sql=131:CREATE INDEX idx_metadata_command_checkpoints_select ON metadata_command_checkpoints (cluster_epoch, pg_id, applied_log_index DESC)
+object
+type=5:index
+name=15:idx_mpc_version
+table=23:multipart_part_segments
+sql=94:CREATE INDEX idx_mpc_version ON multipart_part_segments (bucket, key, version_id, part_number)
+object
+type=5:index
+name=18:idx_mpu_bucket_key
+table=17:multipart_uploads
+sql=119:CREATE INDEX idx_mpu_bucket_key ON multipart_uploads (bucket, key, listing_cluster_epoch, listing_log_index, upload_id)
+object
+type=5:index
+name=23:idx_object_parts_offset
+table=12:object_parts
+sql=112:CREATE INDEX idx_object_parts_offset ON object_parts (bucket, key, version_id, object_offset_start, part_number)
+object
+type=5:index
+name=16:idx_objects_list
+table=7:objects
+sql=54:CREATE INDEX idx_objects_list ON objects (bucket, key)
+object
+type=5:index
+name=39:idx_objects_multipart_completion_upload
+table=7:objects
+sql=152:CREATE UNIQUE INDEX idx_objects_multipart_completion_upload ON objects (multipart_completion_upload_id) WHERE multipart_completion_upload_id IS NOT NULL
+object
+type=5:index
+name=20:idx_objects_versions
+table=7:objects
+sql=75:CREATE INDEX idx_objects_versions ON objects (bucket, key, version_id DESC)
+object
+type=5:index
+name=26:idx_objects_write_sequence
+table=7:objects
+sql=85:CREATE INDEX idx_objects_write_sequence ON objects (bucket, key, write_sequence DESC)
+object
+type=5:index
+name=49:sqlite_autoindex_bucket_delete_attempt_outcomes_1
+table=30:bucket_delete_attempt_outcomes
+sql=-
+object
+type=5:index
+name=48:sqlite_autoindex_bucket_delete_finalize_claims_1
+table=29:bucket_delete_finalize_claims
+sql=-
+object
+type=5:index
+name=38:sqlite_autoindex_bucket_subresources_1
+table=19:bucket_subresources
+sql=-
+object
+type=5:index
+name=38:sqlite_autoindex_bucket_write_drains_1
+table=19:bucket_write_drains
+sql=-
+object
+type=5:index
+name=44:sqlite_autoindex_bucket_write_reservations_1
+table=25:bucket_write_reservations
+sql=-
+object
+type=5:index
+name=26:sqlite_autoindex_buckets_1
+table=7:buckets
+sql=-
+object
+type=5:index
+name=41:sqlite_autoindex_lifecycle_sweep_claims_1
+table=22:lifecycle_sweep_claims
+sql=-
+object
+type=5:index
+name=47:sqlite_autoindex_metadata_command_checkpoints_1
+table=28:metadata_command_checkpoints
+sql=-
+object
+type=5:index
+name=39:sqlite_autoindex_metadata_command_log_1
+table=20:metadata_command_log
+sql=-
+object
+type=5:index
+name=66:sqlite_autoindex_metadata_command_pending_placed_reference_pages_1
+table=47:metadata_command_pending_placed_reference_pages
+sql=-
+object
+type=5:index
+name=67:sqlite_autoindex_metadata_command_pending_reclaim_reference_pages_1
+table=48:metadata_command_pending_reclaim_reference_pages
+sql=-
+object
+type=5:index
+name=53:sqlite_autoindex_metadata_command_terminal_receipts_1
+table=34:metadata_command_terminal_receipts
+sql=-
+object
+type=5:index
+name=41:sqlite_autoindex_metadata_table_digests_1
+table=22:metadata_table_digests
+sql=-
+object
+type=5:index
+name=42:sqlite_autoindex_multipart_part_segments_1
+table=23:multipart_part_segments
+sql=-
+object
+type=5:index
+name=34:sqlite_autoindex_multipart_parts_1
+table=15:multipart_parts
+sql=-
+object
+type=5:index
+name=50:sqlite_autoindex_multipart_reclaim_part_segments_1
+table=31:multipart_reclaim_part_segments
+sql=-
+object
+type=5:index
+name=42:sqlite_autoindex_multipart_reclaim_parts_1
+table=23:multipart_reclaim_parts
+sql=-
+object
+type=5:index
+name=37:sqlite_autoindex_multipart_reclaims_1
+table=18:multipart_reclaims
+sql=-
+object
+type=5:index
+name=36:sqlite_autoindex_multipart_uploads_1
+table=17:multipart_uploads
+sql=-
+object
+type=5:index
+name=49:sqlite_autoindex_object_generation_reservations_1
+table=30:object_generation_reservations
+sql=-
+object
+type=5:index
+name=49:sqlite_autoindex_object_generation_reservations_2
+table=30:object_generation_reservations
+sql=-
+object
+type=5:index
+name=31:sqlite_autoindex_object_parts_1
+table=12:object_parts
+sql=-
+object
+type=5:index
+name=50:sqlite_autoindex_object_segment_reclaim_segments_1
+table=31:object_segment_reclaim_segments
+sql=-
+object
+type=5:index
+name=34:sqlite_autoindex_object_segments_1
+table=15:object_segments
+sql=-
+object
+type=5:index
+name=43:sqlite_autoindex_object_segments_reclaims_1
+table=24:object_segments_reclaims
+sql=-
+object
+type=5:index
+name=42:sqlite_autoindex_object_version_counters_1
+table=23:object_version_counters
+sql=-
+object
+type=5:index
+name=40:sqlite_autoindex_object_write_counters_1
+table=21:object_write_counters
+sql=-
+object
+type=5:index
+name=26:sqlite_autoindex_objects_1
+table=7:objects
+sql=-
+object
+type=5:index
+name=49:sqlite_autoindex_placed_segment_shard_backfills_1
+table=30:placed_segment_shard_backfills
+sql=-
+object
+type=5:index
+name=47:sqlite_autoindex_placed_segment_shard_repairs_1
+table=28:placed_segment_shard_repairs
+sql=-
+object
+type=5:index
+name=47:sqlite_autoindex_shard_scavenger_observations_1
+table=28:shard_scavenger_observations
+sql=-
+object
+type=5:index
+name=25:sqlite_autoindex_shards_1
+table=6:shards
+sql=-
+object
+type=5:index
+name=41:sqlite_autoindex_stream_upload_segments_1
+table=22:stream_upload_segments
+sql=-
+object
+type=5:index
+name=33:sqlite_autoindex_stream_uploads_1
+table=14:stream_uploads
+sql=-
+object
+type=5:table
+name=30:bucket_delete_attempt_outcomes
+table=30:bucket_delete_attempt_outcomes
+sql=1444:CREATE TABLE bucket_delete_attempt_outcomes (
+    bucket_name      TEXT PRIMARY KEY,
+    drain_id         TEXT NOT NULL CHECK (length(drain_id) BETWEEN 1 AND 256),
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
+    outcome          INTEGER NOT NULL CHECK (outcome IN (0, 1, 2, 3)),
+    phase            INTEGER NOT NULL CHECK (phase IN (0, 1, 2, 3, 4, 5, 6, 7)),
+    detail           TEXT NOT NULL CHECK (length(detail) <= 1024),
+    post_reservation_next_object_pg_id INTEGER CHECK (
+        post_reservation_next_object_pg_id IS NULL OR post_reservation_next_object_pg_id >= 0
+    ),
+    stream_cleanup_next_object_pg_id INTEGER CHECK (
+        stream_cleanup_next_object_pg_id IS NULL OR stream_cleanup_next_object_pg_id >= 0
+    ),
+    stream_cleanup_next_session_id_marker TEXT,
+    stream_cleanup_aborted_uploads INTEGER NOT NULL CHECK (
+        stream_cleanup_aborted_uploads IN (0, 1)
+    ),
+    final_visibility_next_object_pg_id INTEGER CHECK (
+        final_visibility_next_object_pg_id IS NULL OR final_visibility_next_object_pg_id >= 0
+    ),
+    finalizer_next_object_pg_id INTEGER CHECK (
+        finalizer_next_object_pg_id IS NULL OR finalizer_next_object_pg_id >= 0
+    ),
+    updated_at       INTEGER NOT NULL CHECK (updated_at >= 0),
+    FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=29:bucket_delete_finalize_claims
+table=29:bucket_delete_finalize_claims
+sql=824:CREATE TABLE bucket_delete_finalize_claims (
+    bucket          TEXT NOT NULL,
+    bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
+    claim_id        TEXT NOT NULL CHECK (length(claim_id) BETWEEN 1 AND 256),
+    owner_token     TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch   INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id           INTEGER NOT NULL CHECK (pg_id >= 0),
+    claimed_at      INTEGER NOT NULL CHECK (claimed_at >= 0),
+    lease_deadline  INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    attempt_count   INTEGER NOT NULL CHECK (attempt_count >= 0),
+    last_error      TEXT,
+    PRIMARY KEY (bucket, bucket_incarnation_generation),
+    FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=19:bucket_subresources
+table=19:bucket_subresources
+sql=436:CREATE TABLE bucket_subresources (
+    bucket_name     TEXT NOT NULL,
+    kind            INTEGER NOT NULL CHECK (kind IN (0, 1, 4, 5)),
+    body            TEXT,
+    generation      INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+    aux_int_1       INTEGER,
+    PRIMARY KEY (bucket_name, kind),
+    FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE,
+    CHECK (aux_int_1 IS NULL OR aux_int_1 IN (0, 1))
+) STRICT
+object
+type=5:table
+name=19:bucket_write_drains
+table=19:bucket_write_drains
+sql=662:CREATE TABLE bucket_write_drains (
+    bucket_name      TEXT PRIMARY KEY,
+    drain_id         TEXT NOT NULL CHECK (length(drain_id) BETWEEN 1 AND 256),
+    owner_token      TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
+    state            INTEGER NOT NULL CHECK (state IN (0)),
+    created_at       INTEGER NOT NULL CHECK (created_at >= 0),
+    lease_deadline   INTEGER NOT NULL CHECK (lease_deadline >= 0),
+    FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=25:bucket_write_reservations
+table=25:bucket_write_reservations
+sql=864:CREATE TABLE bucket_write_reservations (
+    bucket_name      TEXT NOT NULL,
+    reservation_id   TEXT NOT NULL CHECK (length(reservation_id) BETWEEN 1 AND 256),
+    owner_token      TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
+    bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
+    operation_kind   TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 64),
+    created_at       INTEGER NOT NULL CHECK (created_at >= 0),
+    lease_deadline   INTEGER NOT NULL CHECK (lease_deadline >= 0),
+    target_context   TEXT,
+    PRIMARY KEY (bucket_name, reservation_id),
+    FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=7:buckets
+table=7:buckets
+sql=2946:CREATE TABLE buckets (
+    name             TEXT PRIMARY KEY,
+    owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
+    created_at       INTEGER NOT NULL,
+    region           INTEGER NOT NULL DEFAULT 0,
+    state            INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1)),
+    versioning       INTEGER NOT NULL DEFAULT 0 CHECK (versioning IN (0, 1, 2)),
+    acl_grants       TEXT NOT NULL DEFAULT 'ARGMIN-ACL-GRANTS/1
+',
+    public_read      INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
+    public_write     INTEGER NOT NULL DEFAULT 0 CHECK (public_write IN (0, 1)),
+    public_access_block_present INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_present IN (0, 1)),
+    public_access_block_block_public_acls INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_block_public_acls IN (0, 1)),
+    public_access_block_ignore_public_acls INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_ignore_public_acls IN (0, 1)),
+    public_access_block_block_public_policy INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_block_public_policy IN (0, 1)),
+    public_access_block_restrict_public_buckets INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_restrict_public_buckets IN (0, 1)),
+    ownership_controls_mode INTEGER CHECK (ownership_controls_mode IN (0, 1, 2)),
+    bucket_policy_public INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_public IN (0, 1)),
+    bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
+    bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),
+    bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_execution_generation >= 0),
+    bucket_incarnation_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_incarnation_generation >= 0),
+    multipart_upload_id_key BLOB NOT NULL CHECK (length(multipart_upload_id_key) = 32),
+    multipart_completion_barrier_sequence INTEGER NOT NULL DEFAULT 0 CHECK (multipart_completion_barrier_sequence >= 0),
+    bucket_abac_enabled INTEGER NOT NULL DEFAULT 0 CHECK (bucket_abac_enabled IN (0, 1)),
+    default_encryption_type INTEGER CHECK (
+        default_encryption_type IS NULL OR default_encryption_type IN (1)
+    ),
+    sse_c_blocked    INTEGER NOT NULL DEFAULT 1 CHECK (sse_c_blocked IN (0, 1)),
+    object_lock_enabled INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_enabled IN (0, 1)),
+    object_lock_default_mode INTEGER CHECK (
+        object_lock_default_mode IS NULL OR object_lock_default_mode IN (0, 1)
+    ),
+    object_lock_default_days INTEGER CHECK (
+        object_lock_default_days IS NULL OR object_lock_default_days > 0
+    ),
+    object_lock_default_years INTEGER CHECK (
+        object_lock_default_years IS NULL OR object_lock_default_years > 0
+    ),
+    CHECK (object_lock_enabled = 0 OR versioning = 1)
+) STRICT
+object
+type=5:table
+name=22:lifecycle_sweep_claims
+table=22:lifecycle_sweep_claims
+sql=881:CREATE TABLE lifecycle_sweep_claims (
+    bucket          TEXT NOT NULL,
+    bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
+    claim_id        TEXT NOT NULL CHECK (length(claim_id) BETWEEN 1 AND 256),
+    owner_token     TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch   INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id           INTEGER NOT NULL CHECK (pg_id >= 0),
+    claimed_at      INTEGER NOT NULL CHECK (claimed_at >= 0),
+    heartbeat_at    INTEGER NOT NULL CHECK (heartbeat_at >= 0),
+    lease_deadline  INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    attempt_count   INTEGER NOT NULL CHECK (attempt_count >= 0),
+    last_error      TEXT,
+    PRIMARY KEY (bucket, bucket_incarnation_generation),
+    FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=28:metadata_command_checkpoints
+table=28:metadata_command_checkpoints
+sql=495:CREATE TABLE metadata_command_checkpoints (
+    cluster_epoch     INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id             INTEGER NOT NULL CHECK (pg_id >= 0),
+    applied_log_index INTEGER NOT NULL CHECK (applied_log_index >= 0),
+    applied_log_hash  INTEGER NOT NULL,
+    state_digest      INTEGER NOT NULL,
+    checkpoint_crc64  INTEGER NOT NULL,
+    checkpoint_bytes  BLOB NOT NULL,
+    PRIMARY KEY (cluster_epoch, pg_id, applied_log_index, applied_log_hash, state_digest)
+) STRICT
+object
+type=5:table
+name=20:metadata_command_log
+table=20:metadata_command_log
+sql=552:CREATE TABLE metadata_command_log (
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id            INTEGER NOT NULL CHECK (pg_id >= 0),
+    log_index        INTEGER NOT NULL CHECK (log_index > 0),
+    command_checksum INTEGER NOT NULL,
+    command_bytes    BLOB NOT NULL,
+    abandoned        INTEGER NOT NULL DEFAULT 0 CHECK (abandoned IN (0, 1)),
+    previous_log_hash INTEGER,
+    log_hash         INTEGER,
+    pre_state_digest INTEGER,
+    post_state_digest INTEGER,
+    PRIMARY KEY (cluster_epoch, pg_id, log_index)
+) STRICT
+object
+type=5:table
+name=47:metadata_command_pending_placed_reference_pages
+table=47:metadata_command_pending_placed_reference_pages
+sql=513:CREATE TABLE metadata_command_pending_placed_reference_pages (
+    singleton         INTEGER NOT NULL CHECK (singleton = 0),
+    page_index        INTEGER NOT NULL CHECK (page_index >= 0),
+    reference_count   INTEGER NOT NULL CHECK (reference_count BETWEEN 1 AND 64),
+    encoded_references BLOB NOT NULL CHECK (length(encoded_references) = reference_count * 54),
+    PRIMARY KEY (singleton, page_index),
+    FOREIGN KEY (singleton) REFERENCES metadata_command_pending_slot(singleton) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=48:metadata_command_pending_reclaim_reference_pages
+table=48:metadata_command_pending_reclaim_reference_pages
+sql=514:CREATE TABLE metadata_command_pending_reclaim_reference_pages (
+    singleton         INTEGER NOT NULL CHECK (singleton = 0),
+    page_index        INTEGER NOT NULL CHECK (page_index >= 0),
+    reference_count   INTEGER NOT NULL CHECK (reference_count BETWEEN 1 AND 64),
+    encoded_references BLOB NOT NULL CHECK (length(encoded_references) = reference_count * 30),
+    PRIMARY KEY (singleton, page_index),
+    FOREIGN KEY (singleton) REFERENCES metadata_command_pending_slot(singleton) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=43:metadata_command_pending_route_dependencies
+table=43:metadata_command_pending_route_dependencies
+sql=1434:CREATE TABLE metadata_command_pending_route_dependencies (
+    singleton          INTEGER PRIMARY KEY CHECK (singleton = 0),
+    command_checksum   INTEGER NOT NULL,
+    dependency_count   INTEGER NOT NULL CHECK (dependency_count BETWEEN 0 AND 2),
+    dependency_0_cluster_epoch INTEGER CHECK (
+        dependency_0_cluster_epoch IS NULL OR dependency_0_cluster_epoch > 0
+    ),
+    dependency_0_bucket_route_hash INTEGER,
+    dependency_1_cluster_epoch INTEGER CHECK (
+        dependency_1_cluster_epoch IS NULL OR dependency_1_cluster_epoch > 0
+    ),
+    dependency_1_bucket_route_hash INTEGER,
+    dependency_checksum INTEGER NOT NULL,
+    CHECK (
+        (dependency_count = 0 AND
+         dependency_0_cluster_epoch IS NULL AND dependency_0_bucket_route_hash IS NULL AND
+         dependency_1_cluster_epoch IS NULL AND dependency_1_bucket_route_hash IS NULL) OR
+        (dependency_count = 1 AND
+         dependency_0_cluster_epoch IS NOT NULL AND dependency_0_bucket_route_hash IS NOT NULL AND
+         dependency_1_cluster_epoch IS NULL AND dependency_1_bucket_route_hash IS NULL) OR
+        (dependency_count = 2 AND
+         dependency_0_cluster_epoch IS NOT NULL AND dependency_0_bucket_route_hash IS NOT NULL AND
+         dependency_1_cluster_epoch IS NOT NULL AND dependency_1_bucket_route_hash IS NOT NULL)
+    ),
+    FOREIGN KEY (singleton) REFERENCES metadata_command_pending_slot(singleton) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=29:metadata_command_pending_slot
+table=29:metadata_command_pending_slot
+sql=722:CREATE TABLE metadata_command_pending_slot (
+    singleton        INTEGER PRIMARY KEY CHECK (singleton = 0),
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id            INTEGER NOT NULL CHECK (pg_id >= 0),
+    log_index        INTEGER NOT NULL CHECK (log_index > 0),
+    command_checksum INTEGER NOT NULL,
+    command_bytes    BLOB NOT NULL,
+    publication_started INTEGER NOT NULL DEFAULT 0 CHECK (publication_started IN (0, 1)),
+    placed_segment_reference_count INTEGER NOT NULL CHECK (placed_segment_reference_count BETWEEN 0 AND 4294967295),
+    reclaim_reference_count INTEGER NOT NULL DEFAULT 0 CHECK (reclaim_reference_count BETWEEN 0 AND 4294967295),
+    scope_bucket     TEXT
+) STRICT
+object
+type=5:table
+name=30:metadata_command_replica_state
+table=30:metadata_command_replica_state
+sql=581:CREATE TABLE metadata_command_replica_state (
+    singleton         INTEGER PRIMARY KEY CHECK (singleton = 0),
+    cluster_epoch     INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    applied_log_index INTEGER NOT NULL DEFAULT 0 CHECK (applied_log_index >= 0),
+    applied_log_hash_encoding_version INTEGER NOT NULL DEFAULT 1 CHECK (applied_log_hash_encoding_version = 1),
+    applied_log_hash  INTEGER NOT NULL DEFAULT 0,
+    state_digest_encoding_version INTEGER NOT NULL DEFAULT 5 CHECK (state_digest_encoding_version = 5),
+    state_digest      INTEGER NOT NULL DEFAULT 0
+) STRICT
+object
+type=5:table
+name=34:metadata_command_terminal_receipts
+table=34:metadata_command_terminal_receipts
+sql=549:CREATE TABLE metadata_command_terminal_receipts (
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id            INTEGER NOT NULL CHECK (pg_id >= 0),
+    log_index        INTEGER NOT NULL CHECK (log_index > 0),
+    command_checksum INTEGER NOT NULL,
+    command_sha256   BLOB NOT NULL CHECK (length(command_sha256) = 32),
+    abandoned        INTEGER NOT NULL CHECK (abandoned IN (0, 1)),
+    previous_log_hash INTEGER NOT NULL,
+    log_hash         INTEGER NOT NULL,
+    PRIMARY KEY (cluster_epoch, pg_id, log_index)
+) STRICT
+object
+type=5:table
+name=31:metadata_digest_bootstrap_state
+table=31:metadata_digest_bootstrap_state
+sql=171:CREATE TABLE metadata_digest_bootstrap_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+    completed INTEGER NOT NULL CHECK (completed IN (0, 1))
+) STRICT
+object
+type=5:table
+name=24:metadata_digest_revision
+table=24:metadata_digest_revision
+sql=168:CREATE TABLE metadata_digest_revision (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+    revision  INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
+) STRICT
+object
+type=5:table
+name=22:metadata_table_digests
+table=22:metadata_table_digests
+sql=273:CREATE TABLE metadata_table_digests (
+    table_name   TEXT PRIMARY KEY,
+    table_digest INTEGER NOT NULL,
+    row_count    INTEGER NOT NULL DEFAULT 0 CHECK (row_count >= 0),
+    row_hash_xor INTEGER NOT NULL DEFAULT 0,
+    row_hash_sum INTEGER NOT NULL DEFAULT 0
+) STRICT
+object
+type=5:table
+name=23:multipart_part_segments
+table=23:multipart_part_segments
+sql=677:CREATE TABLE multipart_part_segments (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    upload_id     TEXT NOT NULL,
+    version_id    INTEGER NOT NULL,
+    part_number   INTEGER NOT NULL,
+    segment_index INTEGER NOT NULL,
+    size          INTEGER NOT NULL,
+    segment_crc64 INTEGER NOT NULL,
+    segment_okh   BLOB NOT NULL,
+    segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
+    data_pg_id   INTEGER NOT NULL,
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, upload_id, part_number, segment_index)
+) STRICT
+object
+type=5:table
+name=15:multipart_parts
+table=15:multipart_parts
+sql=748:CREATE TABLE multipart_parts (
+    upload_id        TEXT NOT NULL,
+    part_number      INTEGER NOT NULL,
+    generation       INTEGER NOT NULL,
+    size             INTEGER NOT NULL,
+    payload_crc64    INTEGER NOT NULL,
+    etag             BLOB NOT NULL,
+    etag_kind        INTEGER NOT NULL CHECK (etag_kind IN (0, 1)),
+    part_vid         INTEGER NOT NULL CHECK (part_vid > 0),
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
+    ec_k             INTEGER NOT NULL,
+    ec_m             INTEGER NOT NULL,
+    last_modified    INTEGER NOT NULL,
+    checksum         BLOB,
+    PRIMARY KEY (upload_id, part_number),
+    FOREIGN KEY (upload_id) REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=31:multipart_reclaim_part_segments
+table=31:multipart_reclaim_part_segments
+sql=703:CREATE TABLE multipart_reclaim_part_segments (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    part_number   INTEGER NOT NULL,
+    segment_index   INTEGER NOT NULL,
+    segment_okh     BLOB NOT NULL,
+    segment_vid     INTEGER NOT NULL CHECK (segment_vid > 0),
+    data_pg_id   INTEGER NOT NULL,
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id, part_number, segment_index),
+    FOREIGN KEY (bucket, key, generation_id, part_number)
+        REFERENCES multipart_reclaim_parts(bucket, key, generation_id, part_number)
+        ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=23:multipart_reclaim_parts
+table=23:multipart_reclaim_parts
+sql=407:CREATE TABLE multipart_reclaim_parts (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    part_number   INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id, part_number),
+    FOREIGN KEY (bucket, key, generation_id)
+        REFERENCES multipart_reclaims(bucket, key, generation_id)
+        ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=18:multipart_reclaims
+table=18:multipart_reclaims
+sql=251:CREATE TABLE multipart_reclaims (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id)
+) STRICT
+object
+type=5:table
+name=17:multipart_uploads
+table=17:multipart_uploads
+sql=2237:CREATE TABLE multipart_uploads (
+    upload_id        TEXT PRIMARY KEY,
+    bucket           TEXT NOT NULL,
+    key              TEXT NOT NULL,
+    initiated_at     INTEGER NOT NULL,
+    state            INTEGER NOT NULL DEFAULT 0,
+    tags             TEXT,
+    metadata_blob    BLOB NOT NULL,
+    system_metadata_blob BLOB NOT NULL,
+    owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
+    encryption_type  INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
+    encryption_state BLOB,
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
+    initiator_principal TEXT NOT NULL CHECK (length(initiator_principal) BETWEEN 1 AND 256),
+    initiator_canonical_id TEXT NOT NULL CHECK (length(initiator_canonical_id) IN (32, 64)),
+    acl_grants TEXT NOT NULL DEFAULT 'ARGMIN-ACL-GRANTS/1
+',
+    public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
+    object_generation_id INTEGER NOT NULL CHECK (object_generation_id > 0),
+    initiated_object_kind INTEGER NOT NULL DEFAULT 0 CHECK (initiated_object_kind IN (0, 1, 2)),
+    initiated_object_version_id INTEGER,
+    initiated_object_generation_or_write_sequence INTEGER,
+    listing_cluster_epoch INTEGER NOT NULL DEFAULT 1 CHECK (listing_cluster_epoch > 0),
+    listing_log_index INTEGER NOT NULL DEFAULT 1 CHECK (listing_log_index > 0),
+    object_lock_retention_mode INTEGER CHECK (
+        object_lock_retention_mode IS NULL OR object_lock_retention_mode IN (0, 1)
+    ),
+    object_lock_retain_until INTEGER CHECK (
+        object_lock_retain_until IS NULL OR object_lock_retain_until > 0
+    ),
+    object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2)),
+    checksum_algorithm INTEGER,
+    checksum_type INTEGER,
+    CHECK (
+        (initiated_object_kind = 0 AND initiated_object_version_id IS NULL AND initiated_object_generation_or_write_sequence IS NULL)
+        OR
+        (initiated_object_kind = 1 AND initiated_object_version_id >= 0 AND initiated_object_generation_or_write_sequence > 0)
+        OR
+        (initiated_object_kind = 2 AND initiated_object_version_id >= 0 AND initiated_object_generation_or_write_sequence > 0)
+    )
+) STRICT
+object
+type=5:table
+name=30:object_generation_reservations
+table=30:object_generation_reservations
+sql=299:CREATE TABLE object_generation_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    bucket         TEXT NOT NULL,
+    key            TEXT NOT NULL,
+    generation_id  INTEGER NOT NULL CHECK (generation_id > 0),
+    created_at     INTEGER NOT NULL,
+    UNIQUE (bucket, key, generation_id)
+) STRICT
+object
+type=5:table
+name=12:object_parts
+table=12:object_parts
+sql=773:CREATE TABLE object_parts (
+    bucket           TEXT NOT NULL,
+    key              TEXT NOT NULL,
+    version_id       INTEGER NOT NULL CHECK (version_id >= 0),
+    part_number      INTEGER NOT NULL,
+    object_offset_start INTEGER NOT NULL,
+    size             INTEGER NOT NULL,
+    payload_crc64    INTEGER NOT NULL,
+    etag             BLOB NOT NULL,
+    etag_kind        INTEGER NOT NULL CHECK (etag_kind IN (0, 1)),
+    part_vid         INTEGER NOT NULL CHECK (part_vid > 0),
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
+    ec_k             INTEGER NOT NULL,
+    ec_m             INTEGER NOT NULL,
+    data_pg_id      INTEGER NOT NULL,
+    checksum         BLOB,
+    PRIMARY KEY (bucket, key, version_id, part_number)
+) STRICT
+object
+type=5:table
+name=29:object_payload_reclaim_claims
+table=29:object_payload_reclaim_claims
+sql=929:CREATE TABLE object_payload_reclaim_claims (
+    singleton       INTEGER PRIMARY KEY CHECK (singleton = 0),
+    bucket          TEXT NOT NULL,
+    bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
+    key             TEXT NOT NULL,
+    generation_id   INTEGER NOT NULL CHECK (generation_id > 0),
+    reclaim_kind    INTEGER NOT NULL CHECK (reclaim_kind IN (0, 1)),
+    claim_id        TEXT NOT NULL CHECK (length(claim_id) BETWEEN 1 AND 256),
+    owner_token     TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
+    cluster_epoch   INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id           INTEGER NOT NULL CHECK (pg_id >= 0),
+    claimed_at      INTEGER NOT NULL CHECK (claimed_at >= 0),
+    lease_deadline  INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    attempt_count   INTEGER NOT NULL CHECK (attempt_count >= 0),
+    last_error      TEXT
+) STRICT
+object
+type=5:table
+name=31:object_segment_reclaim_segments
+table=31:object_segment_reclaim_segments
+sql=629:CREATE TABLE object_segment_reclaim_segments (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    segment_index   INTEGER NOT NULL,
+    segment_okh     BLOB NOT NULL,
+    segment_vid     INTEGER NOT NULL CHECK (segment_vid > 0),
+    data_pg_id   INTEGER NOT NULL,
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id, segment_index),
+    FOREIGN KEY (bucket, key, generation_id)
+        REFERENCES object_segments_reclaims(bucket, key, generation_id)
+        ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=15:object_segments
+table=15:object_segments
+sql=612:CREATE TABLE object_segments (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    version_id    INTEGER NOT NULL CHECK (version_id >= 0),
+    segment_index INTEGER NOT NULL,
+    size          INTEGER NOT NULL,
+    segment_crc64 INTEGER NOT NULL,
+    segment_okh   BLOB NOT NULL,
+    segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
+    data_pg_id   INTEGER NOT NULL,
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, version_id, segment_index)
+) STRICT
+object
+type=5:table
+name=24:object_segments_reclaims
+table=24:object_segments_reclaims
+sql=257:CREATE TABLE object_segments_reclaims (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    generation_id INTEGER NOT NULL CHECK (generation_id > 0),
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (bucket, key, generation_id)
+) STRICT
+object
+type=5:table
+name=23:object_version_counters
+table=23:object_version_counters
+sql=213:CREATE TABLE object_version_counters (
+    bucket          TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    next_version_id INTEGER NOT NULL CHECK (next_version_id > 0),
+    PRIMARY KEY (bucket, key)
+) STRICT
+object
+type=5:table
+name=21:object_write_counters
+table=21:object_write_counters
+sql=357:CREATE TABLE object_write_counters (
+    bucket                    TEXT NOT NULL,
+    key                       TEXT NOT NULL,
+    next_write_sequence       INTEGER NOT NULL CHECK (next_write_sequence > 0),
+    max_committed_generation  INTEGER CHECK (max_committed_generation IS NULL OR max_committed_generation > 0),
+    PRIMARY KEY (bucket, key)
+) STRICT
+object
+type=5:table
+name=7:objects
+table=7:objects
+sql=2980:CREATE TABLE objects (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    version_id    INTEGER NOT NULL CHECK (version_id >= 0),
+    write_sequence INTEGER NOT NULL CHECK (write_sequence > 0),
+    generation_id INTEGER,
+    size          INTEGER NOT NULL,
+    etag          BLOB NOT NULL,
+    etag_kind     INTEGER NOT NULL,
+    last_modified INTEGER NOT NULL,
+    storage_class INTEGER NOT NULL DEFAULT 0 CHECK (storage_class IN (0)),
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    status        INTEGER NOT NULL DEFAULT 0,
+    tags          TEXT,
+    data_layout   INTEGER NOT NULL DEFAULT 0,
+    parts_count   INTEGER,
+    metadata_blob BLOB,
+    system_metadata_blob BLOB,
+    encryption_type INTEGER NOT NULL DEFAULT 0,
+    encryption_state BLOB,
+    owner_principal TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
+    acl_grants TEXT NOT NULL DEFAULT 'ARGMIN-ACL-GRANTS/1
+',
+    public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
+    object_lock_retention_mode INTEGER CHECK (
+        object_lock_retention_mode IS NULL OR object_lock_retention_mode IN (0, 1)
+    ),
+    object_lock_retain_until INTEGER CHECK (
+        object_lock_retain_until IS NULL OR object_lock_retain_until > 0
+    ),
+    object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2)),
+    multipart_completion_upload_id TEXT,
+    multipart_completion_fingerprint BLOB,
+    became_noncurrent_at INTEGER CHECK (
+        became_noncurrent_at IS NULL OR became_noncurrent_at > 0
+    ),
+    CHECK (status IN (0, 1)),
+    CHECK (etag_kind IN (0, 1)),
+    CHECK (data_layout IN (0, 1)),
+    CHECK (encryption_type IN (0, 1, 2)),
+    CHECK (
+        (multipart_completion_upload_id IS NULL AND multipart_completion_fingerprint IS NULL)
+        OR
+        (status = 0
+         AND multipart_completion_upload_id IS NOT NULL AND length(multipart_completion_upload_id) = 128
+         AND multipart_completion_fingerprint IS NOT NULL AND length(multipart_completion_fingerprint) = 32)
+    ),
+    CHECK (
+        (status = 0 AND (
+            generation_id IS NOT NULL AND generation_id > 0 AND
+            (data_layout = 0 AND parts_count IS NULL) OR
+            (data_layout = 1 AND parts_count IS NOT NULL AND parts_count > 0)
+        )) OR
+        (status = 1 AND generation_id IS NULL AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL AND system_metadata_blob IS NULL
+         AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0
+         AND encryption_type = 0 AND encryption_state IS NULL AND public_read = 0
+         AND object_lock_retention_mode IS NULL AND object_lock_retain_until IS NULL
+         AND object_lock_legal_hold = 0 AND became_noncurrent_at IS NULL)
+    ),
+    PRIMARY KEY (bucket, key, version_id)
+) STRICT
+object
+type=5:table
+name=11:pg_counters
+table=11:pg_counters
+sql=202:CREATE TABLE pg_counters (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
+    next_bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (next_bucket_execution_generation >= 0)
+) STRICT
+object
+type=5:table
+name=19:pg_durable_identity
+table=19:pg_durable_identity
+sql=244:CREATE TABLE pg_durable_identity (
+    singleton      INTEGER PRIMARY KEY CHECK (singleton = 0),
+    pg_id          INTEGER NOT NULL CHECK (pg_id >= 0),
+    identity_bytes BLOB NOT NULL CHECK (length(identity_bytes) BETWEEN 1 AND 1024)
+) STRICT
+object
+type=5:table
+name=30:placed_segment_shard_backfills
+table=30:placed_segment_shard_backfills
+sql=1927:CREATE TABLE placed_segment_shard_backfills (
+    data_pg_id             INTEGER NOT NULL CHECK (data_pg_id >= 0),
+    segment_okh            BLOB NOT NULL CHECK (length(segment_okh) = 16),
+    segment_vid            INTEGER NOT NULL CHECK (segment_vid > 0),
+    stored_size            INTEGER NOT NULL CHECK (stored_size >= 0),
+    segment_crc64          INTEGER NOT NULL,
+    ec_k                   INTEGER NOT NULL CHECK (ec_k > 0),
+    ec_m                   INTEGER NOT NULL CHECK (ec_m >= 0),
+    source_cluster_epoch   INTEGER NOT NULL CHECK (source_cluster_epoch > 0),
+    desired_cluster_epoch  INTEGER NOT NULL CHECK (desired_cluster_epoch > 0),
+    remaining_tolerance    INTEGER NOT NULL CHECK (remaining_tolerance >= 0),
+    first_seen_at          INTEGER NOT NULL CHECK (first_seen_at >= 0),
+    last_seen_at           INTEGER NOT NULL CHECK (last_seen_at >= 0),
+    observation_count      INTEGER NOT NULL CHECK (observation_count > 0),
+    claim_id               TEXT,
+    owner_token            TEXT,
+    cluster_epoch          INTEGER CHECK (cluster_epoch IS NULL OR cluster_epoch > 0),
+    claimed_at             INTEGER CHECK (claimed_at IS NULL OR claimed_at >= 0),
+    lease_deadline         INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    attempt_count          INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    next_attempt_after     INTEGER NOT NULL DEFAULT 0 CHECK (next_attempt_after >= 0),
+    last_error             TEXT,
+    CHECK (source_cluster_epoch <= desired_cluster_epoch),
+    CHECK (
+        (claim_id IS NULL AND owner_token IS NULL AND cluster_epoch IS NULL AND claimed_at IS NULL AND lease_deadline IS NULL)
+        OR
+        (claim_id IS NOT NULL AND owner_token IS NOT NULL AND cluster_epoch IS NOT NULL AND claimed_at IS NOT NULL AND lease_deadline IS NOT NULL)
+    ),
+    PRIMARY KEY (data_pg_id, segment_okh, segment_vid, source_cluster_epoch)
+) STRICT
+object
+type=5:table
+name=28:placed_segment_shard_repairs
+table=28:placed_segment_shard_repairs
+sql=1646:CREATE TABLE placed_segment_shard_repairs (
+    data_pg_id          INTEGER NOT NULL CHECK (data_pg_id >= 0),
+    segment_okh         BLOB NOT NULL CHECK (length(segment_okh) = 16),
+    segment_vid         INTEGER NOT NULL CHECK (segment_vid > 0),
+    stored_size         INTEGER NOT NULL CHECK (stored_size >= 0),
+    segment_crc64       INTEGER NOT NULL,
+    ec_k                INTEGER NOT NULL CHECK (ec_k > 0),
+    ec_m                INTEGER NOT NULL CHECK (ec_m >= 0),
+    shard_index         INTEGER NOT NULL CHECK (shard_index >= 0 AND shard_index <= 255),
+    first_seen_at       INTEGER NOT NULL CHECK (first_seen_at >= 0),
+    last_seen_at        INTEGER NOT NULL CHECK (last_seen_at >= 0),
+    observation_count   INTEGER NOT NULL CHECK (observation_count > 0),
+    claim_id            TEXT,
+    owner_token         TEXT,
+    cluster_epoch       INTEGER CHECK (cluster_epoch IS NULL OR cluster_epoch > 0),
+    claimed_at          INTEGER CHECK (claimed_at IS NULL OR claimed_at >= 0),
+    lease_deadline      INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    attempt_count       INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    next_attempt_after  INTEGER NOT NULL DEFAULT 0 CHECK (next_attempt_after >= 0),
+    last_error          TEXT,
+    CHECK (
+        (claim_id IS NULL AND owner_token IS NULL AND cluster_epoch IS NULL AND claimed_at IS NULL AND lease_deadline IS NULL)
+        OR
+        (claim_id IS NOT NULL AND owner_token IS NOT NULL AND cluster_epoch IS NOT NULL AND claimed_at IS NOT NULL AND lease_deadline IS NOT NULL)
+    ),
+    PRIMARY KEY (segment_okh, segment_vid, shard_index)
+) STRICT
+object
+type=5:table
+name=28:shard_scavenger_observations
+table=28:shard_scavenger_observations
+sql=1024:CREATE TABLE shard_scavenger_observations (
+    node_id             INTEGER NOT NULL CHECK (node_id >= 0),
+    data_pg_id          INTEGER NOT NULL CHECK (data_pg_id >= 0),
+    shard_index         INTEGER NOT NULL CHECK (shard_index >= 0 AND shard_index <= 255),
+    shard_key           BLOB NOT NULL,
+    first_seen_at       INTEGER NOT NULL CHECK (first_seen_at >= 0),
+    last_seen_at        INTEGER NOT NULL CHECK (last_seen_at >= 0),
+    observation_count   INTEGER NOT NULL CHECK (observation_count > 0),
+    data_size           INTEGER CHECK (data_size IS NULL OR data_size >= 0),
+    crc64_nvme          INTEGER,
+    file_exists         INTEGER NOT NULL CHECK (file_exists IN (0, 1)),
+    shard_row_exists    INTEGER NOT NULL CHECK (shard_row_exists IN (0, 1)),
+    reason              INTEGER NOT NULL CHECK (reason IN (0, 1, 2, 3)),
+    last_error          TEXT,
+    resolved_at         INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),
+    PRIMARY KEY (node_id, data_pg_id, shard_index, shard_key)
+) STRICT
+object
+type=5:table
+name=6:shards
+table=6:shards
+sql=258:CREATE TABLE shards (
+    shard_key       BLOB PRIMARY KEY,
+    data_size       INTEGER NOT NULL,
+    crc64_nvme      INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+    last_verified   INTEGER,
+    status          INTEGER NOT NULL DEFAULT 0
+) STRICT
+object
+type=5:table
+name=22:stream_upload_segments
+table=22:stream_upload_segments
+sql=635:CREATE TABLE stream_upload_segments (
+    session_id    TEXT NOT NULL,
+    segment_index INTEGER NOT NULL,
+    size          INTEGER NOT NULL,
+    segment_crc64 INTEGER NOT NULL,
+    payload_crc64 INTEGER NOT NULL,
+    segment_okh   BLOB NOT NULL,
+    segment_vid   INTEGER NOT NULL CHECK (segment_vid > 0),
+    data_pg_id   INTEGER NOT NULL,
+    placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
+    ec_k          INTEGER NOT NULL,
+    ec_m          INTEGER NOT NULL,
+    PRIMARY KEY (session_id, segment_index),
+    FOREIGN KEY (session_id) REFERENCES stream_uploads(session_id) ON DELETE CASCADE
+) STRICT
+object
+type=5:table
+name=14:stream_uploads
+table=14:stream_uploads
+sql=2072:CREATE TABLE stream_uploads (
+    session_id    TEXT PRIMARY KEY,
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    op_kind       INTEGER NOT NULL,
+    upload_id     TEXT,
+    part_number   INTEGER,
+    state         INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL,
+    cleanup_after INTEGER CHECK (cleanup_after > 0),
+    encryption_type INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
+    encryption_state BLOB,
+    next_segment_vid INTEGER NOT NULL DEFAULT 1 CHECK (next_segment_vid > 0),
+    bucket_write_reservation_id TEXT,
+    bucket_write_owner_token TEXT,
+    bucket_write_cluster_epoch INTEGER,
+    bucket_write_execution_generation INTEGER,
+    bucket_write_incarnation_generation INTEGER,
+    bucket_write_operation_kind TEXT,
+    bucket_write_created_at INTEGER,
+    bucket_write_lease_deadline INTEGER,
+    bucket_write_target_context TEXT,
+    CHECK (op_kind IN (0, 1)),
+    CHECK (state IN (0, 1, 2, 3)),
+    CHECK (
+        (
+            bucket_write_reservation_id IS NULL AND
+            bucket_write_owner_token IS NULL AND
+            bucket_write_cluster_epoch IS NULL AND
+            bucket_write_execution_generation IS NULL AND
+            bucket_write_incarnation_generation IS NULL AND
+            bucket_write_operation_kind IS NULL AND
+            bucket_write_created_at IS NULL AND
+            bucket_write_lease_deadline IS NULL AND
+            bucket_write_target_context IS NULL
+        ) OR (
+            bucket_write_reservation_id IS NOT NULL AND
+            bucket_write_owner_token IS NOT NULL AND
+            bucket_write_cluster_epoch IS NOT NULL AND
+            bucket_write_execution_generation IS NOT NULL AND
+            bucket_write_incarnation_generation IS NOT NULL AND
+            bucket_write_operation_kind IS NOT NULL AND
+            bucket_write_created_at IS NOT NULL
+        )
+    ),
+    CHECK (
+        (op_kind = 0 AND upload_id IS NULL AND part_number IS NULL) OR
+        (op_kind = 1 AND upload_id IS NOT NULL AND part_number BETWEEN 1 AND 10000)
+    )
+) STRICT
+object
+type=7:trigger
+name=31:check_bucket_object_lock_insert
+table=7:buckets
+sql=1971:CREATE TRIGGER check_bucket_object_lock_insert
+         BEFORE INSERT ON buckets
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid bucket object lock default mode')
+             WHERE NEW.object_lock_default_mode IS NOT NULL
+               AND NEW.object_lock_default_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid bucket object lock default days')
+             WHERE NEW.object_lock_default_days IS NOT NULL
+               AND NEW.object_lock_default_days <= 0;
+           SELECT RAISE(ABORT, 'invalid bucket object lock default years')
+             WHERE NEW.object_lock_default_years IS NOT NULL
+               AND NEW.object_lock_default_years <= 0;
+           SELECT RAISE(ABORT, 'bucket object lock defaults require object lock enabled')
+             WHERE NEW.object_lock_enabled = 0
+               AND (
+                 NEW.object_lock_default_mode IS NOT NULL
+                 OR NEW.object_lock_default_days IS NOT NULL
+                 OR NEW.object_lock_default_years IS NOT NULL
+               );
+           SELECT RAISE(ABORT, 'bucket object lock requires enabled versioning')
+             WHERE NEW.object_lock_enabled = 1
+               AND NEW.versioning != 1;
+           SELECT RAISE(ABORT, 'bucket object lock default period requires mode')
+             WHERE NEW.object_lock_default_mode IS NULL
+               AND (
+                 NEW.object_lock_default_days IS NOT NULL
+                 OR NEW.object_lock_default_years IS NOT NULL
+               );
+           SELECT RAISE(ABORT, 'bucket object lock mode requires period')
+             WHERE NEW.object_lock_default_mode IS NOT NULL
+               AND NEW.object_lock_default_days IS NULL
+               AND NEW.object_lock_default_years IS NULL;
+           SELECT RAISE(ABORT, 'bucket object lock default days/years are mutually exclusive')
+             WHERE NEW.object_lock_default_days IS NOT NULL
+               AND NEW.object_lock_default_years IS NOT NULL;
+         END
+object
+type=7:trigger
+name=31:check_bucket_object_lock_update
+table=7:buckets
+sql=2151:CREATE TRIGGER check_bucket_object_lock_update
+         BEFORE UPDATE ON buckets
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid bucket object lock default mode')
+             WHERE NEW.object_lock_default_mode IS NOT NULL
+               AND NEW.object_lock_default_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid bucket object lock default days')
+             WHERE NEW.object_lock_default_days IS NOT NULL
+               AND NEW.object_lock_default_days <= 0;
+           SELECT RAISE(ABORT, 'invalid bucket object lock default years')
+             WHERE NEW.object_lock_default_years IS NOT NULL
+               AND NEW.object_lock_default_years <= 0;
+           SELECT RAISE(ABORT, 'bucket object lock defaults require object lock enabled')
+             WHERE NEW.object_lock_enabled = 0
+               AND (
+                 NEW.object_lock_default_mode IS NOT NULL
+                 OR NEW.object_lock_default_days IS NOT NULL
+                 OR NEW.object_lock_default_years IS NOT NULL
+               );
+           SELECT RAISE(ABORT, 'bucket object lock requires enabled versioning')
+             WHERE NEW.object_lock_enabled = 1
+               AND NEW.versioning != 1;
+           SELECT RAISE(ABORT, 'bucket object lock cannot be disabled once enabled')
+             WHERE OLD.object_lock_enabled = 1
+               AND NEW.object_lock_enabled = 0;
+           SELECT RAISE(ABORT, 'bucket object lock default period requires mode')
+             WHERE NEW.object_lock_default_mode IS NULL
+               AND (
+                 NEW.object_lock_default_days IS NOT NULL
+                 OR NEW.object_lock_default_years IS NOT NULL
+               );
+           SELECT RAISE(ABORT, 'bucket object lock mode requires period')
+             WHERE NEW.object_lock_default_mode IS NOT NULL
+               AND NEW.object_lock_default_days IS NULL
+               AND NEW.object_lock_default_years IS NULL;
+           SELECT RAISE(ABORT, 'bucket object lock default days/years are mutually exclusive')
+             WHERE NEW.object_lock_default_days IS NOT NULL
+               AND NEW.object_lock_default_years IS NOT NULL;
+         END
+object
+type=7:trigger
+name=31:check_multipart_checksum_insert
+table=17:multipart_uploads
+sql=678:CREATE TRIGGER check_multipart_checksum_insert
+         BEFORE INSERT ON multipart_uploads
+         WHEN NEW.checksum_algorithm IS NOT NULL OR NEW.checksum_type IS NOT NULL
+         BEGIN
+           SELECT RAISE(ABORT, 'checksum_type without checksum_algorithm')
+             WHERE NEW.checksum_type IS NOT NULL AND NEW.checksum_algorithm IS NULL;
+           SELECT RAISE(ABORT, 'composite-only algorithm + FULL_OBJECT is invalid')
+             WHERE NEW.checksum_algorithm IN (2, 3, 5, 6, 7, 8, 9) AND NEW.checksum_type = 1;
+           SELECT RAISE(ABORT, 'CRC64NVME + COMPOSITE is invalid')
+             WHERE NEW.checksum_algorithm = 4 AND NEW.checksum_type = 0;
+         END
+object
+type=7:trigger
+name=31:check_multipart_checksum_update
+table=17:multipart_uploads
+sql=678:CREATE TRIGGER check_multipart_checksum_update
+         BEFORE UPDATE ON multipart_uploads
+         WHEN NEW.checksum_algorithm IS NOT NULL OR NEW.checksum_type IS NOT NULL
+         BEGIN
+           SELECT RAISE(ABORT, 'checksum_type without checksum_algorithm')
+             WHERE NEW.checksum_type IS NOT NULL AND NEW.checksum_algorithm IS NULL;
+           SELECT RAISE(ABORT, 'composite-only algorithm + FULL_OBJECT is invalid')
+             WHERE NEW.checksum_algorithm IN (2, 3, 5, 6, 7, 8, 9) AND NEW.checksum_type = 1;
+           SELECT RAISE(ABORT, 'CRC64NVME + COMPOSITE is invalid')
+             WHERE NEW.checksum_algorithm = 4 AND NEW.checksum_type = 0;
+         END
+object
+type=7:trigger
+name=34:check_multipart_object_lock_insert
+table=17:multipart_uploads
+sql=867:CREATE TRIGGER check_multipart_object_lock_insert
+         BEFORE INSERT ON multipart_uploads
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid multipart object lock retention mode')
+             WHERE NEW.object_lock_retention_mode IS NOT NULL
+               AND NEW.object_lock_retention_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid multipart object lock retain-until timestamp')
+             WHERE NEW.object_lock_retain_until IS NOT NULL
+               AND NEW.object_lock_retain_until <= 0;
+           SELECT RAISE(ABORT, 'invalid multipart object lock legal hold')
+             WHERE NEW.object_lock_legal_hold NOT IN (0, 1, 2);
+           SELECT RAISE(ABORT, 'multipart object lock retention mode/date must be set together')
+             WHERE (NEW.object_lock_retention_mode IS NULL) != (NEW.object_lock_retain_until IS NULL);
+         END
+object
+type=7:trigger
+name=34:check_multipart_object_lock_update
+table=17:multipart_uploads
+sql=867:CREATE TRIGGER check_multipart_object_lock_update
+         BEFORE UPDATE ON multipart_uploads
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid multipart object lock retention mode')
+             WHERE NEW.object_lock_retention_mode IS NOT NULL
+               AND NEW.object_lock_retention_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid multipart object lock retain-until timestamp')
+             WHERE NEW.object_lock_retain_until IS NOT NULL
+               AND NEW.object_lock_retain_until <= 0;
+           SELECT RAISE(ABORT, 'invalid multipart object lock legal hold')
+             WHERE NEW.object_lock_legal_hold NOT IN (0, 1, 2);
+           SELECT RAISE(ABORT, 'multipart object lock retention mode/date must be set together')
+             WHERE (NEW.object_lock_retention_mode IS NULL) != (NEW.object_lock_retain_until IS NULL);
+         END
+object
+type=7:trigger
+name=30:check_object_lock_state_insert
+table=7:objects
+sql=1139:CREATE TRIGGER check_object_lock_state_insert
+         BEFORE INSERT ON objects
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid object lock retention mode')
+             WHERE NEW.object_lock_retention_mode IS NOT NULL
+               AND NEW.object_lock_retention_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid object lock retain-until timestamp')
+             WHERE NEW.object_lock_retain_until IS NOT NULL
+               AND NEW.object_lock_retain_until <= 0;
+           SELECT RAISE(ABORT, 'invalid object lock legal hold')
+             WHERE NEW.object_lock_legal_hold NOT IN (0, 1, 2);
+           SELECT RAISE(ABORT, 'object lock retention mode/date must be set together')
+             WHERE (NEW.object_lock_retention_mode IS NULL) != (NEW.object_lock_retain_until IS NULL);
+           SELECT RAISE(ABORT, 'delete markers cannot carry object lock state')
+             WHERE NEW.status = 1
+               AND (
+                 NEW.object_lock_retention_mode IS NOT NULL
+                 OR NEW.object_lock_retain_until IS NOT NULL
+                 OR NEW.object_lock_legal_hold != 0
+               );
+         END
+object
+type=7:trigger
+name=30:check_object_lock_state_update
+table=7:objects
+sql=1139:CREATE TRIGGER check_object_lock_state_update
+         BEFORE UPDATE ON objects
+         BEGIN
+           SELECT RAISE(ABORT, 'invalid object lock retention mode')
+             WHERE NEW.object_lock_retention_mode IS NOT NULL
+               AND NEW.object_lock_retention_mode NOT IN (0, 1);
+           SELECT RAISE(ABORT, 'invalid object lock retain-until timestamp')
+             WHERE NEW.object_lock_retain_until IS NOT NULL
+               AND NEW.object_lock_retain_until <= 0;
+           SELECT RAISE(ABORT, 'invalid object lock legal hold')
+             WHERE NEW.object_lock_legal_hold NOT IN (0, 1, 2);
+           SELECT RAISE(ABORT, 'object lock retention mode/date must be set together')
+             WHERE (NEW.object_lock_retention_mode IS NULL) != (NEW.object_lock_retain_until IS NULL);
+           SELECT RAISE(ABORT, 'delete markers cannot carry object lock state')
+             WHERE NEW.status = 1
+               AND (
+                 NEW.object_lock_retention_mode IS NOT NULL
+                 OR NEW.object_lock_retain_until IS NOT NULL
+                 OR NEW.object_lock_legal_hold != 0
+               );
+         END

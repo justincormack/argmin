@@ -184,7 +184,7 @@ struct StorageNodeActivePrimaryDataRoute<'a> {
     pg_id: DataPgId,
 }
 
-struct StorageNodeActiveDataScanRoute<'a> {
+struct StorageNodeShardScavengerFileScanRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     _route_permit: &'a StorageNodeRouteAdmissionPermit,
     fence: StorageNodeRouteFence,
@@ -3121,6 +3121,27 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
         Ok(page)
     }
 
+    fn list_placed_shard_scavenger_reference_page(
+        &self,
+        after: Option<&crate::types::ShardScavengerReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<crate::types::ShardScavengerReferencePage, StorageNodeObjectScanStoreError>
+    {
+        self.require_valid_now()
+            .map_err(StorageNodeObjectScanStoreError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        ShardScavengerNodeClient::open_shard_scavenger_object_scan_route(
+            &local_client,
+            self.handler.config.cluster_epoch,
+            self.pg_id,
+        )
+        .and_then(|route| route.list_placed_shard_scavenger_reference_page(after, limit))
+        .map_err(StorageNodeObjectScanStoreError::Store)
+    }
+
     fn list_shard_scavenger_payload_references(
         &self,
     ) -> Result<Vec<crate::types::ShardScavengerPayloadReference>, StorageNodeObjectScanStoreError>
@@ -3140,11 +3161,11 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
         .map_err(StorageNodeObjectScanStoreError::Store)
     }
 
-    fn list_placed_segment_backfill_reference_page(
+    fn list_shard_scavenger_reference_page(
         &self,
-        after: Option<&crate::types::PlacedSegmentBackfillReferenceCursor>,
+        after: Option<&crate::types::ShardScavengerReferenceCursor>,
         limit: std::num::NonZeroU16,
-    ) -> Result<crate::types::PlacedSegmentBackfillReferencePage, StorageNodeObjectScanStoreError>
+    ) -> Result<crate::types::ShardScavengerReferencePage, StorageNodeObjectScanStoreError>
     {
         self.require_valid_now()
             .map_err(StorageNodeObjectScanStoreError::Route)?;
@@ -3157,12 +3178,32 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.cluster_epoch,
             self.pg_id,
         )
-        .and_then(|route| route.list_placed_segment_backfill_reference_page(after, limit))
+        .and_then(|route| route.list_shard_scavenger_reference_page(after, limit))
+        .map_err(StorageNodeObjectScanStoreError::Store)
+    }
+
+    fn shard_scavenger_reference_matches(
+        &self,
+        cursor: &crate::types::ShardScavengerReferenceCursor,
+        expected: &crate::types::ShardScavengerPlacedShardSetReference,
+    ) -> Result<bool, StorageNodeObjectScanStoreError> {
+        self.require_valid_now()
+            .map_err(StorageNodeObjectScanStoreError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        ShardScavengerNodeClient::open_shard_scavenger_object_scan_route(
+            &local_client,
+            self.handler.config.cluster_epoch,
+            self.pg_id,
+        )
+        .and_then(|route| route.shard_scavenger_reference_matches(cursor, expected))
         .map_err(StorageNodeObjectScanStoreError::Store)
     }
 }
 
-impl StorageNodeActiveDataScanRoute<'_> {
+impl StorageNodeShardScavengerFileScanRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
         self.fence.validate_rpc_at(
             crate::clock::current_time_millis(),

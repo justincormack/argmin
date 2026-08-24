@@ -187,10 +187,18 @@ fn embedded_peering_metadata_read_authorization_rejects_equal_proof_from_another
 
 struct PayloadLeaseUnavailableClient {
     inner: Arc<dyn ObjectPayloadLeaseNodeClient>,
+    failure: PayloadLeaseUnavailableFailure,
 }
 
 struct PayloadLeaseUnavailableRoute<'a> {
     inner: Box<dyn ObjectPayloadLeaseRoute + 'a>,
+    failure: PayloadLeaseUnavailableFailure,
+}
+
+#[derive(Clone, Copy)]
+enum PayloadLeaseUnavailableFailure {
+    Transport,
+    ResourceExhausted,
 }
 
 impl ObjectPayloadLeaseNodeClient for PayloadLeaseUnavailableClient {
@@ -208,6 +216,7 @@ impl ObjectPayloadLeaseNodeClient for PayloadLeaseUnavailableClient {
                 key,
                 generation_id,
             )?,
+            failure: self.failure,
         }))
     }
 }
@@ -217,10 +226,20 @@ impl ObjectPayloadLeaseRoute for PayloadLeaseUnavailableRoute<'_> {
         &self,
         _kind: ObjectPayloadLeaseKind,
     ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
-        Err(StoreError::Io {
-            context: "connect storage-node object-payload lease RPC endpoint",
-            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
-        })
+        match self.failure {
+            PayloadLeaseUnavailableFailure::Transport => Err(StoreError::StorageRpc {
+                node_id: 0,
+                operation: "connect storage-node object-payload lease RPC endpoint",
+                failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                detail: crate::StorageNodeFailureDetail::new("injected unavailable lease node"),
+            }),
+            PayloadLeaseUnavailableFailure::ResourceExhausted => {
+                Err(StoreError::storage_node_resource_exhausted(
+                    0,
+                    "broad object payload lease acquire",
+                ))
+            }
+        }
     }
 
     fn try_begin_object_payload_reclaim(
@@ -435,6 +454,16 @@ fn opaque_object_segment_fault_rejects_a_replaced_null_generation_without_mutati
 fn retained_read_with_unavailable_lease_nodes(
     unavailable_node_ids: &[NodeId],
 ) -> Result<Vec<u8>, crate::ObjectReadFailure> {
+    retained_read_with_unavailable_lease_nodes_and_failure(
+        unavailable_node_ids,
+        PayloadLeaseUnavailableFailure::Transport,
+    )
+}
+
+fn retained_read_with_unavailable_lease_nodes_and_failure(
+    unavailable_node_ids: &[NodeId],
+    failure: PayloadLeaseUnavailableFailure,
+) -> Result<Vec<u8>, crate::ObjectReadFailure> {
     let tmp = test_util::tempdir();
     let mut map = LocalClusterMap::open(
         tmp.path(),
@@ -447,7 +476,7 @@ fn retained_read_with_unavailable_lease_nodes(
         let inner = Arc::clone(map.node(*node_id).unwrap().object_payload_lease_client());
         map.replace_object_payload_lease_client_for_tests(
             *node_id,
-            Arc::new(PayloadLeaseUnavailableClient { inner }),
+            Arc::new(PayloadLeaseUnavailableClient { inner, failure }),
         );
     }
     let map = Arc::new(map);
@@ -475,10 +504,11 @@ fn retained_read_with_unavailable_lease_nodes(
             crate::ObjectReadSnapshotMode::FullPayloadLayout,
         )
         .unwrap();
-    let outcome = route
-        .load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(()))
-        .unwrap()
-        .unwrap();
+    let outcome = match route.load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(())) {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(())) => unreachable!("snapshot callback cannot fail"),
+        Err(error) => return Err(error),
+    };
     let segment = outcome.snapshot().object_segments[0].clone();
     let generation_id = outcome.snapshot().stored.as_live().unwrap().generation_id;
     let (_, _, leased_snapshot) = outcome.into_parts();
@@ -536,8 +566,41 @@ fn retained_read_rejects_a_leased_node_subset_below_ec_k() {
         NodeId::new(2),
     ])
     .unwrap_err();
-    assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
-    assert_eq!(error.diagnostic_cause_label(), "store_not_found");
+    assert_eq!(
+        error.kind(),
+        crate::ObjectReadFailureKind::RetryableConvergence
+    );
+    assert_eq!(
+        error.diagnostic_cause_label(),
+        "store_rpc_transport_failure"
+    );
+}
+
+#[test]
+fn retained_read_preserves_transport_failure_when_no_lease_node_is_available() {
+    let error = retained_read_with_unavailable_lease_nodes(&trace_node_ids()).unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::ObjectReadFailureKind::RetryableConvergence
+    );
+    assert_eq!(
+        error.diagnostic_cause_label(),
+        "store_rpc_transport_failure"
+    );
+}
+
+#[test]
+fn retained_read_preserves_resource_exhaustion_when_no_lease_node_is_available() {
+    let error = retained_read_with_unavailable_lease_nodes_and_failure(
+        &trace_node_ids(),
+        PayloadLeaseUnavailableFailure::ResourceExhausted,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::ObjectReadFailureKind::ResourceExhausted
+    );
+    assert_eq!(error.diagnostic_cause_label(), "store_resource_exhausted");
 }
 
 #[test]

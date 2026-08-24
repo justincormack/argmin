@@ -2,28 +2,115 @@
 // SPDX-License-Identifier: Apache-2.0
 
 impl StorageCluster {
+    #[cfg(test)]
     pub(crate) fn audit_shard_storage_for_scavenger(
         &self,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
-        let referenced_scan = self.collect_shard_scavenger_referenced_shards();
-        let mut reference_scan_errors = Vec::new();
-        let referenced_scan = match referenced_scan {
-            Ok(referenced_scan) => referenced_scan,
-            Err(error) => {
-                reference_scan_errors.push(format!("reference scan failed: {error}"));
-                ShardScavengerReferenceScan::default()
+        let mut first_pass = self.begin_shard_scavenger_audit_pass();
+        while self
+            .audit_next_shard_scavenger_pg(&mut first_pass)?
+            .is_some()
+        {}
+        let mut pass = self.begin_shard_scavenger_audit_pass_with_prior(
+            std::mem::take(&mut first_pass.current_unreferenced),
+        );
+        let mut observations = Vec::new();
+        while let Some(pg_observations) = self.audit_next_shard_scavenger_pg(&mut pass)? {
+            observations.extend(pg_observations);
+        }
+        Ok(observations)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_shard_scavenger_audit_pass(&self) -> ShardScavengerAuditPass {
+        self.begin_shard_scavenger_audit_pass_with_prior(HashSet::new())
+    }
+
+    pub(crate) fn begin_shard_scavenger_audit_pass_with_prior(
+        &self,
+        prior_unreferenced: HashSet<ShardScavengerObservationKey>,
+    ) -> ShardScavengerAuditPass {
+        let pg_ids = self.local_pg_routes().map(LocalPgRoute::pg_id).collect();
+        ShardScavengerAuditPass {
+            referenced_scans: HashMap::new(),
+            pg_ids,
+            next_reference_pg_index: 0,
+            reference_after: None,
+            next_pg_index: 0,
+            prior_unreferenced,
+            current_unreferenced: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn audit_next_shard_scavenger_pg(
+        &self,
+        pass: &mut ShardScavengerAuditPass,
+    ) -> Result<Option<Vec<ShardScavengerObservation>>, StoreError> {
+        if let Some(source_pg_id) = pass.pg_ids.get(pass.next_reference_pg_index).copied() {
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), source_pg_id)?;
+            let scan_pg_id = self.object_metadata_scan_pg(source_pg_id);
+            let page = node
+                .shard_scavenger_client()
+                .open_shard_scavenger_object_scan_route(self.operation_epoch(), scan_pg_id)?
+                .list_shard_scavenger_reference_page(
+                    pass.reference_after.as_ref(),
+                    NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT)
+                        .expect("reference page limit is nonzero"),
+                )?;
+            let mut page_scans = HashMap::new();
+            let mut next_reference_after = None;
+            for item in page.items {
+                next_reference_after = Some(item.cursor.clone());
+                match item.reference {
+                    ShardScavengerPayloadReference::Placed(reference) => {
+                        self.extend_referenced_shard_set(
+                            &mut page_scans,
+                            source_pg_id,
+                            &item.cursor,
+                            &reference,
+                        )?;
+                    }
+                    ShardScavengerPayloadReference::ReclaimOnly(reference) => {
+                        self.extend_reclaim_referenced_shard_set(
+                            &mut page_scans,
+                            &reference,
+                        )?;
+                    }
+                }
             }
+            Self::merge_shard_scavenger_reference_page(pass, page_scans)?;
+            if let Some(cursor) = next_reference_after {
+                pass.reference_after = Some(cursor);
+            }
+            if page.complete {
+                pass.next_reference_pg_index += 1;
+                pass.reference_after = None;
+            }
+            return Ok(Some(Vec::new()));
+        }
+
+        let Some(pg_id) = pass.pg_ids.get(pass.next_pg_index).copied() else {
+            return Ok(None);
         };
-        let mut expected_nodes_by_shard: HashMap<(u32, ShardKey), HashSet<u32>> = HashMap::new();
-        for (node_id, data_pg_id, shard_key) in &referenced_scan.locations {
+        let route = self.local_pg_route(pg_id).ok_or(StoreError::PgNotFound {
+            pg_id: pg_id.get(),
+        })?;
+        let data_pg_id = pg_id.get();
+        let empty_referenced_scan = ShardScavengerReferenceScan::default();
+        let referenced_scan = pass
+            .referenced_scans
+            .get(&data_pg_id)
+            .unwrap_or(&empty_referenced_scan);
+        let mut expected_nodes_by_shard: HashMap<ShardKey, HashSet<u32>> = HashMap::new();
+        for (node_id, shard_key) in &referenced_scan.locations {
             expected_nodes_by_shard
-                .entry((*data_pg_id, shard_key.clone()))
+                .entry(shard_key.clone())
                 .or_default()
                 .insert(*node_id);
         }
         let mut observations = Vec::new();
-
-        for route in self.local_pg_routes() {
             let primary_node = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
@@ -63,22 +150,8 @@ impl StorageCluster {
                                 .map(|error| (node_id.as_u32(), error)),
                         );
                     }
-                    Err(error) => {
-                        scan_errors.push((node_id.as_u32(), error.to_string()));
-                    }
+                    Err(error) => return Err(error),
                 }
-            }
-
-            if !reference_scan_errors.is_empty() {
-                observation_route.record_shard_scavenger_observation(
-                    &Self::shard_scavenger_scan_incomplete_observation(
-                        primary_node_id,
-                        data_pg_id,
-                        &reference_scan_errors,
-                    ),
-                )?;
-                observations.extend(observation_route.list_shard_scavenger_observations()?);
-                continue;
             }
 
             if !scan_errors.is_empty() {
@@ -94,10 +167,13 @@ impl StorageCluster {
                     )?;
                 }
                 observations.extend(observation_route.list_shard_scavenger_observations()?);
-                continue;
+                pass.referenced_scans.remove(&data_pg_id);
+                pass.next_pg_index += 1;
+                return Ok(Some(observations));
             }
 
             let mut active_observations = HashSet::new();
+            let mut current_unreferenced = HashSet::new();
             let mut file_locations = HashSet::new();
             for (node_id, files) in files_by_node {
                 for file in files {
@@ -123,38 +199,60 @@ impl StorageCluster {
                         )?;
                         continue;
                     };
-                    let shard_identity = (node_id, data_pg_id, file.key.clone());
+                    let shard_identity = (node_id, file.key.clone());
                     if referenced_scan.locations.contains(&shard_identity) {
                         continue;
                     }
-                    active_observations.insert(observation_key.clone());
-                    observation_route.record_shard_scavenger_observation(
-                        &ShardScavengerObservationRecord {
-                            key: observation_key,
-                            data_size: Some(row_ack.stored_size),
-                            crc64: Some(row_ack.crc64),
-                            file_exists: true,
-                            shard_row_exists: true,
-                            reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
-                            last_error: None,
-                        },
-                    )?;
+                    current_unreferenced.insert(observation_key.clone());
+                    if pass.prior_unreferenced.contains(&observation_key) {
+                        active_observations.insert(observation_key.clone());
+                        observation_route.record_shard_scavenger_observation(
+                            &ShardScavengerObservationRecord {
+                                key: observation_key,
+                                data_size: Some(row_ack.stored_size),
+                                crc64: Some(row_ack.crc64),
+                                file_exists: true,
+                                shard_row_exists: true,
+                                reason:
+                                    ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+                                last_error: None,
+                            },
+                        )?;
+                    }
                 }
             }
 
             for row in shard_rows {
-                let shard_identity = (data_pg_id, row.key.clone());
-                if let Some(expected_nodes) = expected_nodes_by_shard.get(&shard_identity) {
-                    for expected_node_id in expected_nodes {
-                        if file_locations.contains(&(
-                            *expected_node_id,
-                            data_pg_id,
-                            row.key.clone(),
-                        )) {
+                if let Some(expected_nodes) = expected_nodes_by_shard.get(&row.key) {
+                    let missing_nodes: Vec<u32> = expected_nodes
+                        .iter()
+                        .copied()
+                        .filter(|expected_node_id| {
+                            !file_locations.contains(&(
+                                *expected_node_id,
+                                data_pg_id,
+                                row.key.clone(),
+                            ))
+                        })
+                        .collect();
+                    if missing_nodes.is_empty() {
+                        continue;
+                    }
+                    let repair_candidate = referenced_scan
+                        .repair_work_by_shard
+                        .get(&row.key)
+                        .cloned();
+                    let reference_is_current = repair_candidate
+                        .as_ref()
+                        .map(|candidate| self.shard_scavenger_repair_candidate_is_current(candidate))
+                        .transpose()?
+                        .unwrap_or(false);
+                    for expected_node_id in missing_nodes {
+                        if !reference_is_current {
                             continue;
                         }
                         let observation_key = crate::types::ShardScavengerObservationKey {
-                            node_id: *expected_node_id,
+                            node_id: expected_node_id,
                             data_pg_id,
                             shard_index: row.key.shard_index(),
                             shard_key: row.key.clone(),
@@ -171,14 +269,10 @@ impl StorageCluster {
                                 last_error: None,
                             },
                         )?;
-                        if let Some(work_item) = referenced_scan
-                            .repair_work_by_shard
-                            .get(&(data_pg_id, row.key.clone()))
-                            .copied()
-                        {
+                        if let Some(candidate) = &repair_candidate {
                             self.schedule_placed_segment_shard_repair(
-                                work_item.request,
-                                work_item.shard_index,
+                                candidate.work_item.request,
+                                candidate.work_item.shard_index,
                             )?;
                         }
                     }
@@ -229,9 +323,46 @@ impl StorageCluster {
             }
 
             observations.extend(observation_route.list_shard_scavenger_observations()?);
-        }
 
-        Ok(observations)
+        pass.current_unreferenced.extend(current_unreferenced);
+        pass.referenced_scans.remove(&data_pg_id);
+        pass.next_pg_index += 1;
+        Ok(Some(observations))
+    }
+
+    fn shard_scavenger_repair_candidate_is_current(
+        &self,
+        candidate: &ShardScavengerRepairCandidate,
+    ) -> Result<bool, StoreError> {
+        let mut first_error = None;
+        for authority in &candidate.authorities {
+            let current = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), authority.source_pg_id)
+                .and_then(|node| {
+                    node.shard_scavenger_client()
+                        .open_shard_scavenger_object_scan_route(
+                            self.operation_epoch(),
+                            self.object_metadata_scan_pg(authority.source_pg_id),
+                        )
+                })
+                .and_then(|route| {
+                    route.shard_scavenger_reference_matches(
+                        &authority.cursor,
+                        &authority.reference,
+                    )
+                });
+            match current {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(false),
+        }
     }
 
     fn shard_scavenger_scan_incomplete_observation(
@@ -256,39 +387,14 @@ impl StorageCluster {
         }
     }
 
-    fn collect_shard_scavenger_referenced_shards(
-        &self,
-    ) -> Result<ShardScavengerReferenceScan, StoreError> {
-        let mut scan = ShardScavengerReferenceScan::default();
-        for route in self.local_pg_routes() {
-            let node = self
-                .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
-            let scan_pg_id = self.object_metadata_scan_pg(route.pg_id());
-            for reference in node
-                .shard_scavenger_client()
-                .open_shard_scavenger_object_scan_route(self.operation_epoch(), scan_pg_id)?
-                .list_shard_scavenger_payload_references()?
-            {
-                match reference {
-                    ShardScavengerPayloadReference::Placed(reference) => {
-                        self.extend_referenced_shard_set(&mut scan, &reference)?;
-                    }
-                    ShardScavengerPayloadReference::ReclaimOnly(reference) => {
-                        self.extend_reclaim_referenced_shard_set(&mut scan, &reference)?;
-                    }
-                }
-            }
-        }
-
-        Ok(scan)
-    }
-
     fn extend_referenced_shard_set(
         &self,
-        scan: &mut ShardScavengerReferenceScan,
+        scans: &mut HashMap<u32, ShardScavengerReferenceScan>,
+        source_pg_id: PgId,
+        cursor: &ShardScavengerReferenceCursor,
         reference: &ShardScavengerPlacedShardSetReference,
     ) -> Result<(), StoreError> {
+        let scan = scans.entry(reference.data_pg_id).or_default();
         self.extend_referenced_shard_locations(
             scan,
             reference.data_pg_id,
@@ -308,22 +414,44 @@ impl StorageCluster {
         for key in
             Self::payload_shard_set_keys(&reference.okh, reference.generation_id, reference.ec)
         {
-            scan.repair_work_by_shard.insert(
-                (reference.data_pg_id, key.clone()),
-                PlacedSegmentShardRepairWorkItem {
-                    request,
-                    shard_index: key.shard_index(),
-                },
-            );
+            let work_item = PlacedSegmentShardRepairWorkItem {
+                request,
+                shard_index: key.shard_index(),
+            };
+            let authority = ShardScavengerRepairAuthority {
+                source_pg_id,
+                cursor: cursor.clone(),
+                reference: reference.clone(),
+            };
+            match scan.repair_work_by_shard.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(ShardScavengerRepairCandidate {
+                        work_item,
+                        authorities: vec![authority],
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get().work_item != work_item {
+                        return Err(StoreError::PayloadShardSetMismatch {
+                            reason: "one physical shard identity has conflicting repair metadata"
+                                .to_owned(),
+                        });
+                    }
+                    if !entry.get().authorities.contains(&authority) {
+                        entry.get_mut().authorities.push(authority);
+                    }
+                }
+            }
         }
         Ok(())
     }
 
     fn extend_reclaim_referenced_shard_set(
         &self,
-        scan: &mut ShardScavengerReferenceScan,
+        scans: &mut HashMap<u32, ShardScavengerReferenceScan>,
         reference: &crate::types::ShardScavengerReclaimShardSetReference,
     ) -> Result<(), StoreError> {
+        let scan = scans.entry(reference.data_pg_id).or_default();
         self.extend_referenced_shard_locations(
             scan,
             reference.data_pg_id,
@@ -353,7 +481,7 @@ impl StorageCluster {
         for key in Self::payload_shard_set_keys(&okh, generation_id, ec) {
             let location = Self::placed_payload_shard_location(&locations, &key)?;
             scan.locations
-                .insert((location.node_id().as_u32(), data_pg_id, key.clone()));
+                .insert((location.node_id().as_u32(), key.clone()));
         }
         Ok(())
     }
@@ -1152,12 +1280,12 @@ impl StorageCluster {
                     return Ok(summary);
                 }
                 let page_limit =
-                    remaining.min(usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT));
+                    remaining.min(usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT));
                 let page_limit = NonZeroU16::new(
                     u16::try_from(page_limit).expect("bounded backfill page limit fits in u16"),
                 )
                 .expect("backfill page limit is nonzero");
-                let page = match scan_route.list_placed_segment_backfill_reference_page(
+                let page = match scan_route.list_placed_shard_scavenger_reference_page(
                     reference_after.as_ref(),
                     page_limit,
                 ) {
@@ -1173,6 +1301,12 @@ impl StorageCluster {
                 };
 
                 for item in page.items {
+                    let ShardScavengerPayloadReference::Placed(reference) = item.reference else {
+                        reference_after = Some(item.cursor.clone());
+                        cursor.active_pg_id = Some(route.pg_id());
+                        cursor.reference_after = Some(item.cursor);
+                        continue;
+                    };
                     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         cursor.active_pg_id = Some(route.pg_id());
                         cursor.reference_after = reference_after;
@@ -1180,8 +1314,8 @@ impl StorageCluster {
                         return Ok(summary);
                     }
                     scanned_references += 1;
-                    let source_epoch = item.reference.placement_cluster_epoch;
-                    let stored_size = match usize::try_from(item.reference.stored_size) {
+                    let source_epoch = reference.placement_cluster_epoch;
+                    let stored_size = match usize::try_from(reference.stored_size) {
                         Ok(stored_size) => stored_size,
                         Err(error) => {
                             note_shard_backfill_candidate_error(
@@ -1199,12 +1333,12 @@ impl StorageCluster {
                         }
                     };
                     let request = SegmentStoredBytesRequest {
-                        data_pg_id: item.reference.data_pg_id,
-                        segment_okh: item.reference.okh,
-                        segment_vid: item.reference.generation_id,
+                        data_pg_id: reference.data_pg_id,
+                        segment_okh: reference.okh,
+                        segment_vid: reference.generation_id,
                         stored_size,
-                        segment_crc64: item.reference.crc64,
-                        ec: item.reference.ec,
+                        segment_crc64: reference.crc64,
+                        ec: reference.ec,
                     };
                     let candidate_key =
                         PlacedSegmentShardBackfillCandidateKey::new(request, source_epoch);
@@ -1461,6 +1595,48 @@ impl StorageCluster {
             }
         }
         Ok(None)
+    }
+
+    fn merge_shard_scavenger_reference_page(
+        pass: &mut ShardScavengerAuditPass,
+        page_scans: HashMap<u32, ShardScavengerReferenceScan>,
+    ) -> Result<(), StoreError> {
+        for (data_pg_id, page_scan) in &page_scans {
+            let Some(scan) = pass.referenced_scans.get(data_pg_id) else {
+                continue;
+            };
+            for (shard_key, candidate) in &page_scan.repair_work_by_shard {
+                if scan
+                    .repair_work_by_shard
+                    .get(shard_key)
+                    .is_some_and(|existing| existing.work_item != candidate.work_item)
+                {
+                    return Err(StoreError::PayloadShardSetMismatch {
+                        reason: "one physical shard identity has conflicting repair metadata"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        for (data_pg_id, page_scan) in page_scans {
+            let scan = pass.referenced_scans.entry(data_pg_id).or_default();
+            scan.locations.extend(page_scan.locations);
+            for (shard_key, candidate) in page_scan.repair_work_by_shard {
+                match scan.repair_work_by_shard.entry(shard_key) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        for authority in candidate.authorities {
+                            if !entry.get().authorities.contains(&authority) {
+                                entry.get_mut().authorities.push(authority);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn complete_placed_segment_shard_backfill_claim(
@@ -2186,11 +2362,19 @@ impl StorageCluster {
             return Ok(true);
         }
 
-        if self.try_read_placed_segment_direct_into(req, dst)? {
-            return Ok(true);
-        }
+        let temporarily_unavailable = match self.try_read_placed_segment_direct_into(req, dst)? {
+            PlacedSegmentDirectReadOutcome::Complete => return Ok(true),
+            PlacedSegmentDirectReadOutcome::Recover {
+                temporarily_unavailable,
+            } => temporarily_unavailable,
+        };
 
-        self.try_read_placed_segment_recovery_into(req, dst, schedule_repair_on_recovery)
+        self.try_read_placed_segment_recovery_into(
+            req,
+            dst,
+            schedule_repair_on_recovery,
+            temporarily_unavailable,
+        )
     }
 
     fn try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(
@@ -2219,6 +2403,7 @@ impl StorageCluster {
             .map_err(cluster_build_error_to_store)?;
         let mut all_shards = vec![None; total_shards];
         let mut present_count = 0usize;
+        let mut temporarily_unavailable = None;
 
         for shard_index in 0..total_shards {
             self.try_load_placed_segment_shard_for_historical_inspection(
@@ -2230,11 +2415,15 @@ impl StorageCluster {
                 shard_size,
                 &mut all_shards,
                 &mut present_count,
+                &mut temporarily_unavailable,
                 repair_targets.as_deref_mut(),
             )?;
         }
 
         if present_count < k {
+            if let Some(error) = temporarily_unavailable {
+                return Err(error);
+            }
             return Ok(false);
         }
 
@@ -2422,7 +2611,7 @@ impl StorageCluster {
         &self,
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<PlacedSegmentDirectReadOutcome, StoreError> {
         let reader = self.current_placed_segment_shard_reader(
             req.data_pg_id,
             req.ec,
@@ -2444,19 +2633,31 @@ impl StorageCluster {
                 })?;
             let ack = match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
                 Ok(ack) => ack,
-                Err(StoreError::NotFound) => return Ok(false),
+                Err(StoreError::NotFound) => {
+                    return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                        temporarily_unavailable: None,
+                    });
+                }
                 Err(error) => return Err(error),
             };
             if ack.stored_size != shard_size as u64 {
-                return Ok(false);
+                return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                    temporarily_unavailable: None,
+                });
             }
             direct_acks.push(ack);
         }
         let mut read_handles = match reader.acquire_read_handles(0..k) {
             Ok(read_handles) => read_handles,
             Err(error) => {
-                let _ = placed_segment_recoverable_shard_error(error)?;
-                return Ok(false);
+                let temporarily_unavailable =
+                    match placed_segment_recoverable_shard_error(error)? {
+                        RecoverableShardReadFailure::RepairRequired => None,
+                        RecoverableShardReadFailure::TemporarilyUnavailable(error) => Some(error),
+                    };
+                return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                    temporarily_unavailable,
+                });
             }
         };
 
@@ -2473,15 +2674,29 @@ impl StorageCluster {
                 .maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
             {
                 read_handles.release().map_err(shard_io_error_to_store)?;
-                let _ = placed_segment_recoverable_shard_error(error)?;
-                return Ok(false);
+                let temporarily_unavailable =
+                    match placed_segment_recoverable_shard_error(error)? {
+                        RecoverableShardReadFailure::RepairRequired => None,
+                        RecoverableShardReadFailure::TemporarilyUnavailable(error) => Some(error),
+                    };
+                return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                    temporarily_unavailable,
+                });
             }
             match read_handles.read_into(shard_index, ack, &mut dst[start..end]) {
                 Ok(()) => {}
                 Err(error) => {
                     read_handles.release().map_err(shard_io_error_to_store)?;
-                    let _ = placed_segment_recoverable_shard_error(error)?;
-                    return Ok(false);
+                    let temporarily_unavailable =
+                        match placed_segment_recoverable_shard_error(error)? {
+                            RecoverableShardReadFailure::RepairRequired => None,
+                            RecoverableShardReadFailure::TemporarilyUnavailable(error) => {
+                                Some(error)
+                            }
+                        };
+                    return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                        temporarily_unavailable,
+                    });
                 }
             }
         }
@@ -2489,7 +2704,13 @@ impl StorageCluster {
 
         dst.truncate(req.stored_size);
         let actual_crc64 = checksum::crc64::checksum(dst);
-        Ok(actual_crc64 == req.segment_crc64)
+        if actual_crc64 == req.segment_crc64 {
+            Ok(PlacedSegmentDirectReadOutcome::Complete)
+        } else {
+            Ok(PlacedSegmentDirectReadOutcome::Recover {
+                temporarily_unavailable: None,
+            })
+        }
     }
 
     fn try_read_placed_segment_recovery_into(
@@ -2497,6 +2718,7 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
         schedule_repair_on_recovery: bool,
+        mut temporarily_unavailable: Option<StoreError>,
     ) -> Result<bool, StoreError> {
         let k = req.ec.k as usize;
         let m = req.ec.m as usize;
@@ -2511,7 +2733,6 @@ impl StorageCluster {
         let mut all_shards = vec![None; k + m];
         let mut present_count = 0usize;
         let mut repair_targets = Vec::new();
-
         for shard_index in 0..k {
             self.try_load_placed_segment_shard(
                 req.data_pg_id,
@@ -2520,6 +2741,7 @@ impl StorageCluster {
                 shard_size,
                 &mut all_shards,
                 &mut present_count,
+                &mut temporarily_unavailable,
                 Some(&mut repair_targets),
             )?;
         }
@@ -2536,12 +2758,16 @@ impl StorageCluster {
                     shard_size,
                     &mut all_shards,
                     &mut present_count,
+                    &mut temporarily_unavailable,
                     Some(&mut repair_targets),
                 )?;
             }
         }
 
         if present_count < k {
+            if let Some(error) = temporarily_unavailable {
+                return Err(error);
+            }
             return Ok(false);
         }
 
@@ -2646,6 +2872,7 @@ impl StorageCluster {
         shard_size: usize,
         all_shards: &mut [Option<Vec<u8>>],
         present_count: &mut usize,
+        temporarily_unavailable: &mut Option<StoreError>,
         repair_targets: Option<&mut Vec<ShardIndex>>,
     ) -> Result<(), StoreError> {
         let Some(location) = reader.location(shard_index) else {
@@ -2669,10 +2896,13 @@ impl StorageCluster {
         if let Err(error) =
             self.maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
         {
-            if placed_segment_recoverable_shard_error(error)?
-                == RecoverableShardReadFailure::RepairRequired
-            {
-                Self::record_placed_segment_repair_target(repair_targets, shard_index);
+            match placed_segment_recoverable_shard_error(error)? {
+                RecoverableShardReadFailure::RepairRequired => {
+                    Self::record_placed_segment_repair_target(repair_targets, shard_index);
+                }
+                RecoverableShardReadFailure::TemporarilyUnavailable(error) => {
+                    temporarily_unavailable.get_or_insert(error);
+                }
             }
             return Ok(());
         }
@@ -2682,10 +2912,13 @@ impl StorageCluster {
                 *present_count += 1;
             }
             Err(error) => {
-                if placed_segment_recoverable_shard_error(error)?
-                    == RecoverableShardReadFailure::RepairRequired
-                {
-                    Self::record_placed_segment_repair_target(repair_targets, shard_index);
+                match placed_segment_recoverable_shard_error(error)? {
+                    RecoverableShardReadFailure::RepairRequired => {
+                        Self::record_placed_segment_repair_target(repair_targets, shard_index);
+                    }
+                    RecoverableShardReadFailure::TemporarilyUnavailable(error) => {
+                        temporarily_unavailable.get_or_insert(error);
+                    }
                 }
             }
         }
@@ -2703,6 +2936,7 @@ impl StorageCluster {
         shard_size: usize,
         all_shards: &mut [Option<Vec<u8>>],
         present_count: &mut usize,
+        temporarily_unavailable: &mut Option<StoreError>,
         repair_targets: Option<&mut Vec<ShardIndex>>,
     ) -> Result<(), StoreError> {
         let Some(location) = locations.get(shard_index).copied() else {
@@ -2715,10 +2949,13 @@ impl StorageCluster {
         if let Err(error) =
             self.maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
         {
-            if placed_segment_recoverable_shard_error(error)?
-                == RecoverableShardReadFailure::RepairRequired
-            {
-                Self::record_placed_segment_repair_target(repair_targets, shard_index);
+            match placed_segment_recoverable_shard_error(error)? {
+                RecoverableShardReadFailure::RepairRequired => {
+                    Self::record_placed_segment_repair_target(repair_targets, shard_index);
+                }
+                RecoverableShardReadFailure::TemporarilyUnavailable(error) => {
+                    temporarily_unavailable.get_or_insert(error);
+                }
             }
             return Ok(());
         }
@@ -2731,10 +2968,13 @@ impl StorageCluster {
             }
             Ok(_) => Self::record_placed_segment_repair_target(repair_targets, shard_index),
             Err(error) => {
-                if placed_segment_recoverable_shard_error(error)?
-                    == RecoverableShardReadFailure::RepairRequired
-                {
-                    Self::record_placed_segment_repair_target(repair_targets, shard_index);
+                match placed_segment_recoverable_shard_error(error)? {
+                    RecoverableShardReadFailure::RepairRequired => {
+                        Self::record_placed_segment_repair_target(repair_targets, shard_index);
+                    }
+                    RecoverableShardReadFailure::TemporarilyUnavailable(error) => {
+                        temporarily_unavailable.get_or_insert(error);
+                    }
                 }
             }
         }

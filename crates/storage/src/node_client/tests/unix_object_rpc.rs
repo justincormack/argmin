@@ -1088,10 +1088,8 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
             ClusterEpoch::INITIAL,
             installed_scan_pg,
         )
-        .and_then(|route| route.list_placed_segment_backfill_reference_page(
-            None,
-            std::num::NonZeroU16::new(1).unwrap(),
-        ))
+        .and_then(|route| route
+            .list_shard_scavenger_reference_page(None, std::num::NonZeroU16::new(1).unwrap(),))
         .unwrap()
         .items
         .is_empty()
@@ -1102,10 +1100,8 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
             ClusterEpoch::INITIAL,
             unknown_scan_pg,
         )
-        .and_then(|route| route.list_placed_segment_backfill_reference_page(
-            None,
-            std::num::NonZeroU16::new(1).unwrap(),
-        ))
+        .and_then(|route| route
+            .list_shard_scavenger_reference_page(None, std::num::NonZeroU16::new(1).unwrap(),))
         .unwrap_err(),
         StoreError::StorageRpc {
             failure: StorageRpcErrorCode::UnknownPg,

@@ -1810,27 +1810,66 @@ impl StorageNodeConnectionHandler {
         })
     }
 
-    fn active_data_scan_route<'a>(
+    fn shard_scavenger_file_scan_route<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
         node_id: NodeId,
         cluster_epoch: ClusterEpoch,
         pg_id: PgId,
         operation: &'static str,
-    ) -> Result<StorageNodeActiveDataScanRoute<'a>, StorageRpcErrorResponse> {
+    ) -> Result<StorageNodeShardScavengerFileScanRoute<'a>, StorageRpcErrorResponse> {
         self.validate_active_admission(route_permit, operation)?;
-        self.validate_pg_route(node_id, cluster_epoch, pg_id)?;
+        self.validate_shard_scavenger_file_scan_route(node_id, cluster_epoch, pg_id)?;
         let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
         fence.validate_rpc_at(
             crate::clock::current_time_millis(),
             crate::clock::monotonic_time_millis(),
         )?;
-        Ok(StorageNodeActiveDataScanRoute {
+        Ok(StorageNodeShardScavengerFileScanRoute {
             handler: self,
             _route_permit: route_permit,
             fence,
             pg_id: self.validated_data_pg(pg_id),
         })
+    }
+
+    fn validate_shard_scavenger_file_scan_route(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_node_epoch(node_id, cluster_epoch)?;
+        self.require_current_route_map_valid_rpc()?;
+        let raw_pg_id = pg_id.get();
+        let Some(route) = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == raw_pg_id)
+        else {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownPg,
+                message: format!("PG {raw_pg_id} is not configured on this storage node"),
+            });
+        };
+        if route.cluster_epoch != cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::WrongClusterEpoch,
+                message: format!(
+                    "PG {raw_pg_id} route epoch {} does not match request epoch {}",
+                    route.cluster_epoch.get(),
+                    cluster_epoch.get()
+                ),
+            });
+        }
+        if route.state != PgState::Active {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: format!("PG {raw_pg_id} route is {}", route.state),
+            });
+        }
+        Ok(())
     }
 
     fn active_primary_object_mutation_route<'a>(

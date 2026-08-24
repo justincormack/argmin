@@ -1444,6 +1444,8 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::ShardScavengerShardRows
         | StorageRpcMessageKind::ShardScavengerPayloadReferences
         | StorageRpcMessageKind::PlacedSegmentBackfillReferencePage
+        | StorageRpcMessageKind::ShardScavengerReferencePage
+        | StorageRpcMessageKind::ShardScavengerReferenceMatch
         | StorageRpcMessageKind::ShardScavengerObservationRecord
         | StorageRpcMessageKind::ShardScavengerObservations
         | StorageRpcMessageKind::ShardScavengerObservationResolve
@@ -2069,7 +2071,12 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 21, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
             0, 146, 204, 0, 105, 155, 117, 90, 173, 97, 98, 99,
         ];
-        let request = encode_binding_with_encoded_frame(
+        const V22_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 22, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
+            0, 202, 74, 215, 141, 132, 131, 9, 128, 97, 98, 99,
+        ];
+        let old_request = encode_binding_with_encoded_frame(
             0x0102_0304_0506_0708,
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
@@ -2078,13 +2085,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
+            decode_binding(&old_request),
+            Err(StorageRpcAuthBindingError::Malformed)
+        );
+        let request = encode_binding_with_encoded_frame(
+            0x0102_0304_0506_0708,
+            TOPOLOGY_DIGEST,
+            NodeId::new(0x1122_3344),
+            None,
+            V22_FRAME,
+        )
+        .unwrap();
+        assert_eq!(
             hex_bytes(&request),
             concat!(
                 "4152475352504342000201020304050607080000004030313233343536373839",
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "6162636465663031323334353637383961626364656611223344000000003718",
-                "0000006172676d696e2d73746f726167652d7270632d6672616d651500080706",
-                "050403020103000300000092cc00699b755aad616263"
+                "0000006172676d696e2d73746f726167652d7270632d6672616d651600080706",
+                "0504030201030003000000ca4ad78d84830980616263"
             )
         );
 
@@ -2098,7 +2117,7 @@ mod tests {
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
             Some(&transcript),
-            V21_FRAME,
+            V22_FRAME,
         )
         .unwrap();
         assert_eq!(
@@ -2108,8 +2127,8 @@ mod tests {
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "616263646566303132333435363738396162636465661122334401673e6f836a",
                 "950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037",
-                "180000006172676d696e2d73746f726167652d7270632d6672616d6515000807",
-                "06050403020103000300000092cc00699b755aad616263"
+                "180000006172676d696e2d73746f726167652d7270632d6672616d6516000807",
+                "060504030201030003000000ca4ad78d84830980616263"
             )
         );
 
@@ -2524,7 +2543,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 169, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 171, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]

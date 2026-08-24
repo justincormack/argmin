@@ -573,15 +573,39 @@ fn shard_io_error_to_store(error: ShardIoError) -> StoreError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum RecoverableShardReadFailure {
     RepairRequired,
-    TemporarilyUnavailable,
+    TemporarilyUnavailable(StoreError),
 }
 
 fn placed_segment_recoverable_shard_error(
     error: ShardIoError,
 ) -> Result<RecoverableShardReadFailure, StoreError> {
+    let temporarily_unavailable = match &error {
+        ShardIoError::Store { source, .. }
+            if source.storage_node_failure_class()
+                == Some(crate::error::StorageNodeFailureClass::TransportInterrupted) =>
+        {
+            true
+        }
+        ShardIoError::Store {
+            source: StoreError::Io { context, .. },
+            ..
+        } => matches!(
+            *context,
+            "connect storage-node RPC endpoint"
+                | "connect storage-node RPC socket"
+                | "connect storage-node read-handle RPC endpoint"
+        ),
+        _ => false,
+    };
+    if temporarily_unavailable {
+        return Ok(RecoverableShardReadFailure::TemporarilyUnavailable(
+            shard_io_error_to_store(error),
+        ));
+    }
+
     match error {
         ShardIoError::Store {
             source: StoreError::NotFound,
@@ -599,23 +623,6 @@ fn placed_segment_recoverable_shard_error(
                 },
             ..
         } => Ok(RecoverableShardReadFailure::RepairRequired),
-        ShardIoError::Store { ref source, .. }
-            if source.storage_node_failure_class()
-                == Some(crate::error::StorageNodeFailureClass::TransportInterrupted) =>
-        {
-            Ok(RecoverableShardReadFailure::TemporarilyUnavailable)
-        }
-        ShardIoError::Store {
-            source:
-                StoreError::Io {
-                    context:
-                        "connect storage-node RPC endpoint"
-                        | "connect storage-node RPC socket"
-                        | "connect storage-node read-handle RPC endpoint",
-                    ..
-                },
-            ..
-        } => Ok(RecoverableShardReadFailure::TemporarilyUnavailable),
         ShardIoError::Store {
             source:
                 StoreError::StorageRpc {
@@ -956,10 +963,10 @@ mod reissue_decision_tests {
             },
         };
 
-        assert_eq!(
-            placed_segment_recoverable_shard_error(error).unwrap(),
-            RecoverableShardReadFailure::RepairRequired
-        );
+        assert!(matches!(
+            placed_segment_recoverable_shard_error(error),
+            Ok(RecoverableShardReadFailure::RepairRequired)
+        ));
     }
 
     #[test]
@@ -1003,10 +1010,10 @@ mod reissue_decision_tests {
                     },
                 };
 
-                assert_eq!(
-                    placed_segment_recoverable_shard_error(error).unwrap(),
-                    RecoverableShardReadFailure::RepairRequired
-                );
+                assert!(matches!(
+                    placed_segment_recoverable_shard_error(error),
+                    Ok(RecoverableShardReadFailure::RepairRequired)
+                ));
             }
         }
     }
@@ -1035,10 +1042,10 @@ mod reissue_decision_tests {
                 source,
             };
 
-            assert_eq!(
-                placed_segment_recoverable_shard_error(error).unwrap(),
-                RecoverableShardReadFailure::TemporarilyUnavailable
-            );
+            assert!(matches!(
+                placed_segment_recoverable_shard_error(error),
+                Ok(RecoverableShardReadFailure::TemporarilyUnavailable(_))
+            ));
         }
     }
 

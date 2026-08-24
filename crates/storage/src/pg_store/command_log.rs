@@ -1282,7 +1282,7 @@ impl PgStore {
             [],
             "clear pending command placed reference pages",
         )?;
-        let references_per_page = usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT);
+        let references_per_page = usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT);
         let reference_count = reference_count as usize;
         for (page_index, encoded) in pages.iter().enumerate() {
             let page_start = page_index * references_per_page;
@@ -1293,6 +1293,32 @@ impl PgStore {
                  VALUES (0, ?1, ?2, ?3)",
                 params![page_index as i64, page_reference_count as i64, encoded,],
                 "insert pending command placed reference page",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn replace_pending_reclaim_reference_pages(
+        &self,
+        reference_count: u32,
+        pages: &[Vec<u8>],
+    ) -> Result<(), StoreError> {
+        self.execute_cached(
+            "DELETE FROM metadata_command_pending_reclaim_reference_pages WHERE singleton = 0",
+            [],
+            "clear pending command reclaim reference pages",
+        )?;
+        let references_per_page = usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT);
+        let reference_count = reference_count as usize;
+        for (page_index, encoded) in pages.iter().enumerate() {
+            let page_start = page_index * references_per_page;
+            let page_reference_count = (reference_count - page_start).min(references_per_page);
+            self.execute_cached(
+                "INSERT INTO metadata_command_pending_reclaim_reference_pages \
+                 (singleton, page_index, reference_count, encoded_references) \
+                 VALUES (0, ?1, ?2, ?3)",
+                params![page_index as i64, page_reference_count as i64, encoded,],
+                "insert pending command reclaim reference page",
             )?;
         }
         Ok(())
@@ -1541,24 +1567,36 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         scope_bucket: Option<&BucketName>,
     ) -> Result<(), StoreError> {
-        let (reference_count, pages) =
-            self.encode_pending_placed_segment_reference_pages(command)?;
+        let PendingShardScavengerReferencePages {
+            placed_reference_count,
+            placed_pages,
+            reclaim_reference_count,
+            reclaim_pages,
+        } = self.encode_pending_shard_scavenger_reference_pages(command)?;
         let route_dependencies = Self::pending_metadata_command_route_dependency_sidecar(command);
         self.with_pending_slot_transaction(|| {
             self.execute_cached(
-                "INSERT INTO metadata_command_pending_slot (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, placed_segment_reference_count, scope_bucket) VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(singleton) DO UPDATE SET cluster_epoch = excluded.cluster_epoch, pg_id = excluded.pg_id, log_index = excluded.log_index, command_checksum = excluded.command_checksum, command_bytes = excluded.command_bytes, publication_started = 0, placed_segment_reference_count = excluded.placed_segment_reference_count, scope_bucket = excluded.scope_bucket",
+                "INSERT INTO metadata_command_pending_slot (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, placed_segment_reference_count, reclaim_reference_count, scope_bucket) VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(singleton) DO UPDATE SET cluster_epoch = excluded.cluster_epoch, pg_id = excluded.pg_id, log_index = excluded.log_index, command_checksum = excluded.command_checksum, command_bytes = excluded.command_bytes, publication_started = 0, placed_segment_reference_count = excluded.placed_segment_reference_count, reclaim_reference_count = excluded.reclaim_reference_count, scope_bucket = excluded.scope_bucket",
                 params![
                     command.id().cluster_epoch().get() as i64,
                     command.id().pg_id().get() as i64,
                     command.id().log_index().get() as i64,
                     command.checksum_crc64() as i64,
                     command.command_bytes(),
-                    reference_count as i64,
+                    placed_reference_count as i64,
+                    reclaim_reference_count as i64,
                     scope_bucket,
                 ],
                 "replace pending metadata command slot for test",
             )?;
-            self.replace_pending_placed_reference_pages(reference_count, &pages)?;
+            self.replace_pending_placed_reference_pages(
+                placed_reference_count,
+                &placed_pages,
+            )?;
+            self.replace_pending_reclaim_reference_pages(
+                reclaim_reference_count,
+                &reclaim_pages,
+            )?;
             self.replace_pending_metadata_command_route_dependency_sidecar(&route_dependencies)
         })
     }
@@ -1613,6 +1651,20 @@ impl PgStore {
             "UPDATE metadata_command_pending_slot SET command_bytes = ?1 WHERE singleton = 0",
             params![bytes],
             "replace pending metadata command bytes for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_pending_reclaim_reference_count(
+        &self,
+        reference_count: u32,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_pending_slot \
+             SET reclaim_reference_count = ?1 WHERE singleton = 0",
+            params![i64::from(reference_count)],
+            "replace pending command reclaim reference count for test",
         )?;
         Self::test_require_one_changed(changed)
     }
@@ -3535,8 +3587,13 @@ impl PgStore {
                 self.metadata_command_log_conflict(node_id, command),
             ));
         }
-        let (reference_count, pages) = self
-            .encode_pending_placed_segment_reference_pages(command)
+        let PendingShardScavengerReferencePages {
+            placed_reference_count,
+            placed_pages,
+            reclaim_reference_count,
+            reclaim_pages,
+        } = self
+            .encode_pending_shard_scavenger_reference_pages(command)
             .map_err(PendingMetadataCommandSlotInsertError::definitive)?;
         let route_dependencies = Self::pending_metadata_command_route_dependency_sidecar(command);
         self.with_pending_slot_insert_transaction(|| {
@@ -3551,8 +3608,8 @@ impl PgStore {
             let inserted = self.execute_cached(
                 "INSERT INTO metadata_command_pending_slot \
                  (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
-                  placed_segment_reference_count, scope_bucket) \
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                  placed_segment_reference_count, reclaim_reference_count, scope_bucket) \
+                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(singleton) DO NOTHING",
                 params![
                     command.id().cluster_epoch().get() as i64,
@@ -3560,13 +3617,18 @@ impl PgStore {
                     command.id().log_index().get() as i64,
                     command.checksum_crc64() as i64,
                     command.command_bytes(),
-                    reference_count as i64,
+                    placed_reference_count as i64,
+                    reclaim_reference_count as i64,
                     scope_bucket.map(BucketName::as_str),
                 ],
                 "insert metadata command pending slot",
             )?;
             if inserted == 1 {
-                self.replace_pending_placed_reference_pages(reference_count, &pages)?;
+                self.replace_pending_placed_reference_pages(placed_reference_count, &placed_pages)?;
+                self.replace_pending_reclaim_reference_pages(
+                    reclaim_reference_count,
+                    &reclaim_pages,
+                )?;
                 self.replace_pending_metadata_command_route_dependency_sidecar(
                     &route_dependencies,
                 )?;
@@ -3693,17 +3755,21 @@ impl PgStore {
             return Err(self.metadata_command_log_conflict(node_id, command));
         }
 
-        let (reference_count, pages) =
-            self.encode_pending_placed_segment_reference_pages(command)?;
+        let PendingShardScavengerReferencePages {
+            placed_reference_count,
+            placed_pages,
+            reclaim_reference_count,
+            reclaim_pages,
+        } = self.encode_pending_shard_scavenger_reference_pages(command)?;
         let route_dependencies = Self::pending_metadata_command_route_dependency_sidecar(command);
         self.with_pending_slot_transaction(|| {
             let inserted = self.execute_cached(
                 "INSERT INTO metadata_command_pending_slot \
                  (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
-                  placed_segment_reference_count, scope_bucket) \
-                 SELECT 0, ?1, ?2, ?3, ?4, ?5, ?6, ?7 \
+                  placed_segment_reference_count, reclaim_reference_count, scope_bucket) \
+                 SELECT 0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
                  WHERE NOT EXISTS ( \
-                     SELECT 1 FROM bucket_write_drains WHERE bucket_name = ?8 \
+                     SELECT 1 FROM bucket_write_drains WHERE bucket_name = ?9 \
                  ) \
                  ON CONFLICT(singleton) DO NOTHING",
                 params![
@@ -3712,14 +3778,19 @@ impl PgStore {
                     command.id().log_index().get() as i64,
                     command.checksum_crc64() as i64,
                     command.command_bytes(),
-                    reference_count as i64,
+                    placed_reference_count as i64,
+                    reclaim_reference_count as i64,
                     bucket.as_str(),
                     bucket.as_str(),
                 ],
                 "insert bucket control pending metadata command slot",
             )?;
             if inserted == 1 {
-                self.replace_pending_placed_reference_pages(reference_count, &pages)?;
+                self.replace_pending_placed_reference_pages(placed_reference_count, &placed_pages)?;
+                self.replace_pending_reclaim_reference_pages(
+                    reclaim_reference_count,
+                    &reclaim_pages,
+                )?;
                 self.replace_pending_metadata_command_route_dependency_sidecar(
                     &route_dependencies,
                 )?;
@@ -3993,8 +4064,13 @@ impl PgStore {
         }
         let expected_bytes = expected.command_bytes();
         let replacement_bytes = replacement.command_bytes();
-        let (reference_count, pages) = self
-            .encode_pending_placed_segment_reference_pages(replacement)
+        let PendingShardScavengerReferencePages {
+            placed_reference_count,
+            placed_pages,
+            reclaim_reference_count,
+            reclaim_pages,
+        } = self
+            .encode_pending_shard_scavenger_reference_pages(replacement)
             .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
         let route_dependencies =
             Self::pending_metadata_command_route_dependency_sidecar(replacement);
@@ -4038,21 +4114,23 @@ impl PgStore {
                  SET cluster_epoch = ?1, pg_id = ?2, log_index = ?3, \
                      command_checksum = ?4, command_bytes = ?5, \
                      publication_started = 0, \
-                     placed_segment_reference_count = ?6 \
+                     placed_segment_reference_count = ?6, \
+                     reclaim_reference_count = ?7 \
                  WHERE singleton = 0 \
-                   AND cluster_epoch = ?7 \
-                   AND pg_id = ?8 \
-                   AND log_index = ?9 \
-                   AND command_checksum = ?10 \
-                   AND command_bytes = ?11 \
-                   AND scope_bucket = ?12",
+                   AND cluster_epoch = ?8 \
+                   AND pg_id = ?9 \
+                   AND log_index = ?10 \
+                   AND command_checksum = ?11 \
+                   AND command_bytes = ?12 \
+                   AND scope_bucket = ?13",
                     params![
                         replacement.id().cluster_epoch().get() as i64,
                         replacement.id().pg_id().get() as i64,
                         replacement.id().log_index().get() as i64,
                         replacement.checksum_crc64() as i64,
                         replacement_bytes,
-                        reference_count as i64,
+                        placed_reference_count as i64,
+                        reclaim_reference_count as i64,
                         expected.id().cluster_epoch().get() as i64,
                         expected.id().pg_id().get() as i64,
                         expected.id().log_index().get() as i64,
@@ -4063,7 +4141,14 @@ impl PgStore {
                     "replace metadata command pending slot for reissue",
                 )?;
                 if updated == 1 {
-                    self.replace_pending_placed_reference_pages(reference_count, &pages)?;
+                    self.replace_pending_placed_reference_pages(
+                        placed_reference_count,
+                        &placed_pages,
+                    )?;
+                    self.replace_pending_reclaim_reference_pages(
+                        reclaim_reference_count,
+                        &reclaim_pages,
+                    )?;
                     self.replace_pending_metadata_command_route_dependency_sidecar(
                         &route_dependencies,
                     )?;

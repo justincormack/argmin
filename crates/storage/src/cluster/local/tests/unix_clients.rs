@@ -1226,6 +1226,64 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
 }
 
 #[test]
+fn unix_object_payload_lease_release_reuses_the_session_connection() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(0);
+    let pg_id = PgId::new(0);
+    let epoch = ClusterEpoch::INITIAL;
+    let socket_path = tmp.path().join("sockets").join("lease-reuse.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let _server = spawn_storage_node_server(
+        StorageNodeServer::bind(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: epoch,
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join("lease-reuse-node"),
+            default_ec_shape: EcShape { k: 1, m: 0 },
+            pg_ids: vec![pg_id.get()],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: pg_id.get(),
+                cluster_epoch: epoch,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![node_id],
+            }],
+            pending_metadata_command_recoveries: Vec::new(),
+            historical_pg_routes: Vec::new(),
+        })
+        .unwrap(),
+    );
+    let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+        node_id,
+        epoch,
+        crate::storage_rpc_transport::StorageRpcClientEndpoint::unix(socket_path),
+        LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+        None,
+    );
+    let bucket = BucketName::new("lease-reuse-bucket").unwrap();
+    let generation_id = GenerationId::new(1).unwrap();
+
+    for attempt in 0..2 {
+        let key = ObjectKey::new(format!("lease-reuse-key-{attempt}")).unwrap();
+        let mut lease = object_payload_lease_route(&client, epoch, &bucket, &key, generation_id)
+            .acquire_object_payload_lease(ObjectPayloadLeaseKind::BroadSnapshot)
+            .unwrap()
+            .expect("lease should be acquired");
+        assert_eq!(client.idle_session_connection_count_for_test(), 0);
+        assert_eq!(lease.release().unwrap(), 0);
+        drop(lease);
+        assert_eq!(
+            client.idle_session_connection_count_for_test(),
+            1,
+            "released session should return its connection to the bounded idle pool"
+        );
+    }
+}
+
+#[test]
 fn unix_object_payload_reclaim_fence_rejects_crossed_claim_authority() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(0);
@@ -2345,6 +2403,18 @@ impl crate::node_client::ShardReadHandleRoute for RecordingReadHandleRoute {
 }
 
 impl crate::node_client::ShardReadHandleLease for RecordingReadHandleLease {
+    fn read_placed_shard_into(
+        &mut self,
+        _location: ShardLocation,
+        _key: &ShardKey,
+        _expected_ack: WriteAck,
+        _dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "recording read-handle lease does not provide shard data",
+        })
+    }
+
     fn release(&mut self) -> Result<(), StoreError> {
         if !self.released {
             self.events
@@ -2463,12 +2533,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
         historical_pg_routes: Vec::new(),
     };
     let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..15)
-        .map(|_| {
-            let server = Arc::clone(&server);
-            thread::spawn(move || server.accept_one().unwrap())
-        })
-        .collect();
+    let server_guard = spawn_shared_storage_node_server(Arc::clone(&server));
     map.install_unix_shard_clients([LocalUnixShardNodeClientConfig::new(
         NodeId::new(1),
         socket_path,
@@ -2599,9 +2664,8 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
     assert_eq!(server.read_handle_count(location), 0);
     map.delete_payload_shard(ClusterEpoch::INITIAL, location, &key)
         .unwrap();
-    for thread in server_threads {
-        thread.join().unwrap();
-    }
+    drop(server_guard);
+    drop(server);
 
     let remote = SharedStorageNode::open_with_default_ec_shape(
         &server_config.data_dir,
@@ -5614,18 +5678,10 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
         });
         shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
     }
-    let mut server_threads = Vec::new();
+    let mut server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
-        let expected_connections = if config.node_id == NodeId::new(0) {
-            7
-        } else {
-            3
-        };
-        let server = Arc::new(StorageNodeServer::bind(config).unwrap());
-        for _ in 0..expected_connections {
-            let server = Arc::clone(&server);
-            server_threads.push(thread::spawn(move || server.accept_one().unwrap()));
-        }
+        let server = StorageNodeServer::bind(config).unwrap();
+        server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_shard_clients(shard_client_configs)
         .unwrap();
@@ -5636,9 +5692,7 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
 
     assert_eq!(committed.payload, b"direct put remote payload");
     assert_eq!(committed.written.written_shards.len(), 3);
-    for thread in server_threads {
-        thread.join().unwrap();
-    }
+    drop(server_guards);
     for written in &committed.written.written_shards {
         let location = committed
             .locations

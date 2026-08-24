@@ -28,20 +28,35 @@ backfill discovery and routine metadata-command checkpoint maintenance:
   immediately at worker startup
 - backfill discovery and metadata-command checkpoint scans retain canonical PG
   cursors across runtime-map publication and inspect at most eight PGs per tick
-- backfill discovery reads only placed segment references through native-table
-  keyset pages; pending metadata commands atomically publish indexed,
-  fixed-width child pages of at most 64 placed references, and pending cursors
-  bind the command epoch, log index, and checksum so slot replacement restarts
-  traversal; discovery has a 64-row RPC page cap, a 256-row per-tick budget, a
-  separate 256-candidate verification budget, and a 50 ms cooperative time
-  budget; the full scavenger inventory remains an audit-only operation
+- backfill discovery and audit reference discovery use native-table keyset
+  pages; pending metadata commands atomically publish indexed, fixed-width
+  placed-reference child pages, and pending cursors bind the command epoch, log
+  index, and checksum so slot replacement restarts traversal; every reference
+  RPC page contains at most 64 entries
+- backfill discovery has a 256-row per-tick budget, a separate 256-candidate
+  verification budget, and a 50 ms cooperative time budget
 - the accelerated backfill UAT cadence applies only to bounded candidate
   discovery, rather than also accelerating full shard audits and checkpoint
   scans
+- audit passes page one metadata PG reference source per scheduler tick and
+  partition references by data PG during collection, so each physical PG
+  consumes one prebuilt index without rebuilding the cluster-wide set
+- physical shard audits retain their pinned in-memory pass across ordinary
+  runtime-map publication, inspect one PG per tick after reference discovery,
+  and discard cross-generation negative-reference history; production progress
+  ticks are separated by 250 ms and complete passes start no more frequently
+  than every 30 minutes, while transient step errors retry after one second
+- unreferenced row/file observations require confirmation in two completed
+  passes, and missing-shard repair eligibility is checked against current
+  authoritative metadata immediately before durable repair scheduling
+- physical file discovery is authorized on the exact current storage node even
+  when that node is the PG spare, without granting the node ordinary acting-set
+  access
 
-Full file-tree audit cursors and budgets, static manifest controls, and the
-complete observability model below remain pending. The remaining issue is
-resource competition, not S3-visible correctness.
+Node/prefix/file cursors within one PG, static manifest controls, and the
+complete observability model below remain pending. Reference-page and PG pacing
+remove the former all-PG bursts, but a single PG file scan is not yet item- or
+time-bounded.
 
 ## Goals
 
@@ -218,8 +233,18 @@ time/item budgets.
 Status: in progress. Backfill candidate discovery now has PG and native
 metadata-row cursors plus row, candidate, RPC-page, and cooperative time
 budgets. Routine metadata-command checkpoint maintenance has a PG cursor. The
-full file-tree audit still needs the node/prefix/file cursor and budgets
-described above.
+physical audit now pages reference sources and advances one physical PG per
+tick while retaining a pinned pass across ordinary runtime-map publication. It
+still needs the node/prefix/file cursor and budgets described above to
+hard-bound work within one PG.
+
+Pending-command placed and reclaim-only references are published
+transactionally as fixed-width pages in PG schema v6, so every discovery page
+reads at most 64 references without decoding the potentially 2 MiB command
+envelope under PG serialization. Repair discovery retains every exact metadata
+cursor that authorizes one physical shard; revalidation accepts any still-live
+authority and defers on read errors when none can be confirmed, preventing a
+cleaned terminal slot from masking an applied-object reference.
 
 Regression coverage:
 

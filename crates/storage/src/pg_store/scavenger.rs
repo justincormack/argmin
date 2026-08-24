@@ -4,6 +4,7 @@
 use super::*;
 
 const PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN: usize = 54;
+const PENDING_RECLAIM_REFERENCE_RECORD_LEN: usize = 30;
 
 fn shard_scavenger_observation_reason_name(
     reason: ShardScavengerObservationReason,
@@ -1150,28 +1151,42 @@ impl PgStore {
         self.list_shard_scavenger_observations()
     }
 
-    pub(crate) fn list_placed_segment_backfill_reference_page(
+    pub(crate) fn list_shard_scavenger_reference_page(
         &self,
-        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        after: Option<&ShardScavengerReferenceCursor>,
         limit: std::num::NonZeroU16,
-    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError> {
-        debug_assert!(limit.get() <= PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT);
-        let limit = usize::from(
-            limit
-                .get()
-                .min(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
-        );
+    ) -> Result<ShardScavengerReferencePage, StoreError> {
+        debug_assert!(limit.get() <= SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT);
+        let limit = usize::from(limit.get().min(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT));
         let mut items = Vec::with_capacity(limit);
-        let start_phase = match after {
-            None | Some(PlacedSegmentBackfillReferenceCursor::ObjectSegment { .. }) => 0,
-            Some(PlacedSegmentBackfillReferenceCursor::StreamUploadSegment { .. }) => 1,
-            Some(PlacedSegmentBackfillReferenceCursor::MultipartPartSegment { .. }) => 2,
-            Some(PlacedSegmentBackfillReferenceCursor::PendingCommand { .. }) => 3,
+        let pending_cursor_replaced = matches!(
+            after,
+            Some(
+                ShardScavengerReferenceCursor::PendingPlacedCommand { .. }
+                    | ShardScavengerReferenceCursor::PendingReclaimCommand { .. }
+            )
+        ) && !self
+            .pending_shard_scavenger_cursor_matches_current_slot(
+                after.expect("pending cursor replacement check requires a cursor"),
+            )?;
+        let pending_after = if pending_cursor_replaced { None } else { after };
+        let start_phase = if pending_cursor_replaced {
+            0
+        } else {
+            match after {
+                None | Some(ShardScavengerReferenceCursor::ObjectSegment { .. }) => 0,
+                Some(ShardScavengerReferenceCursor::StreamUploadSegment { .. }) => 1,
+                Some(ShardScavengerReferenceCursor::MultipartPartSegment { .. }) => 2,
+                Some(ShardScavengerReferenceCursor::ObjectReclaimSegment { .. }) => 3,
+                Some(ShardScavengerReferenceCursor::MultipartReclaimSegment { .. }) => 4,
+                Some(ShardScavengerReferenceCursor::PendingPlacedCommand { .. }) => 5,
+                Some(ShardScavengerReferenceCursor::PendingReclaimCommand { .. }) => 6,
+            }
         };
 
         if start_phase == 0 {
             let object_after = match after {
-                Some(PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+                Some(ShardScavengerReferenceCursor::ObjectSegment {
                     bucket,
                     key,
                     version_id,
@@ -1182,7 +1197,7 @@ impl PgStore {
             let remaining = limit - items.len();
             self.extend_placed_segment_backfill_object_page(&mut items, object_after, remaining)?;
             if items.len() == limit {
-                return Ok(PlacedSegmentBackfillReferencePage {
+                return Ok(ShardScavengerReferencePage {
                     items,
                     complete: false,
                 });
@@ -1191,7 +1206,7 @@ impl PgStore {
 
         if start_phase <= 1 {
             let stream_after = match after {
-                Some(PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+                Some(ShardScavengerReferenceCursor::StreamUploadSegment {
                     session_id,
                     segment_index,
                 }) => (session_id.as_str(), *segment_index),
@@ -1200,7 +1215,7 @@ impl PgStore {
             let remaining = limit - items.len();
             self.extend_placed_segment_backfill_stream_page(&mut items, stream_after, remaining)?;
             if items.len() == limit {
-                return Ok(PlacedSegmentBackfillReferencePage {
+                return Ok(ShardScavengerReferencePage {
                     items,
                     complete: false,
                 });
@@ -1209,7 +1224,7 @@ impl PgStore {
 
         if start_phase <= 2 {
             let multipart_after = match after {
-                Some(PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+                Some(ShardScavengerReferenceCursor::MultipartPartSegment {
                     bucket,
                     key,
                     upload_id,
@@ -1231,7 +1246,70 @@ impl PgStore {
                 remaining,
             )?;
             if items.len() == limit {
-                return Ok(PlacedSegmentBackfillReferencePage {
+                return Ok(ShardScavengerReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+
+        if start_phase <= 3 {
+            let object_after = match after {
+                Some(ShardScavengerReferenceCursor::ObjectReclaimSegment {
+                    bucket,
+                    key,
+                    generation_id,
+                    segment_index,
+                }) => (
+                    bucket.as_str(),
+                    key.as_str(),
+                    generation_id.get(),
+                    *segment_index,
+                ),
+                _ => ("", "", 0, 0),
+            };
+            let remaining = limit - items.len();
+            self.extend_object_reclaim_reference_page(&mut items, object_after, remaining)?;
+            if items.len() == limit {
+                return Ok(ShardScavengerReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+
+        if start_phase <= 4 {
+            let multipart_after = match after {
+                Some(ShardScavengerReferenceCursor::MultipartReclaimSegment {
+                    bucket,
+                    key,
+                    generation_id,
+                    part_number,
+                    segment_index,
+                }) => (
+                    bucket.as_str(),
+                    key.as_str(),
+                    generation_id.get(),
+                    *part_number,
+                    *segment_index,
+                ),
+                _ => ("", "", 0, 0, 0),
+            };
+            let remaining = limit - items.len();
+            self.extend_multipart_reclaim_reference_page(&mut items, multipart_after, remaining)?;
+            if items.len() == limit {
+                return Ok(ShardScavengerReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+
+        if start_phase <= 5 {
+            let remaining = limit - items.len();
+            self.extend_placed_segment_backfill_pending_page(&mut items, pending_after, remaining)?;
+            if items.len() == limit {
+                return Ok(ShardScavengerReferencePage {
                     items,
                     complete: false,
                 });
@@ -1240,13 +1318,467 @@ impl PgStore {
 
         let remaining = limit - items.len();
         let complete =
-            self.extend_placed_segment_backfill_pending_page(&mut items, after, remaining)?;
-        Ok(PlacedSegmentBackfillReferencePage { items, complete })
+            self.extend_pending_reclaim_reference_page(&mut items, pending_after, remaining)?;
+        Ok(ShardScavengerReferencePage { items, complete })
+    }
+
+    fn pending_shard_scavenger_cursor_matches_current_slot(
+        &self,
+        cursor: &ShardScavengerReferenceCursor,
+    ) -> Result<bool, StoreError> {
+        let (cluster_epoch, pg_id, log_index, command_checksum) = match cursor {
+            ShardScavengerReferenceCursor::PendingPlacedCommand {
+                cluster_epoch,
+                pg_id,
+                log_index,
+                command_checksum,
+                ..
+            }
+            | ShardScavengerReferenceCursor::PendingReclaimCommand {
+                cluster_epoch,
+                pg_id,
+                log_index,
+                command_checksum,
+                ..
+            } => (*cluster_epoch, *pg_id, *log_index, *command_checksum),
+            _ => return Ok(true),
+        };
+        self.query_row_cached_optional(
+            "SELECT 1 FROM metadata_command_pending_slot \
+             WHERE singleton = 0 AND cluster_epoch = ?1 AND pg_id = ?2 \
+               AND log_index = ?3 AND command_checksum = ?4",
+            params![
+                cluster_epoch.get() as i64,
+                i64::from(pg_id.get()),
+                log_index as i64,
+                command_checksum as i64,
+            ],
+            "match pending command shard scavenger page cursor",
+            |_| Ok(()),
+        )
+        .map(|matched| matched.is_some())
+    }
+
+    pub(crate) fn list_placed_shard_scavenger_reference_page(
+        &self,
+        after: Option<&ShardScavengerReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<ShardScavengerReferencePage, StoreError> {
+        debug_assert!(limit.get() <= SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT);
+        let limit = usize::from(limit.get().min(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT));
+        let mut items = Vec::with_capacity(limit);
+        let pending_cursor_replaced = matches!(
+            after,
+            Some(ShardScavengerReferenceCursor::PendingPlacedCommand { .. })
+        ) && !self
+            .pending_shard_scavenger_cursor_matches_current_slot(
+                after.expect("pending cursor replacement check requires a cursor"),
+            )?;
+        let pending_after = if pending_cursor_replaced { None } else { after };
+        let start_phase = if pending_cursor_replaced {
+            0
+        } else {
+            match after {
+                None | Some(ShardScavengerReferenceCursor::ObjectSegment { .. }) => 0,
+                Some(ShardScavengerReferenceCursor::StreamUploadSegment { .. }) => 1,
+                Some(ShardScavengerReferenceCursor::MultipartPartSegment { .. }) => 2,
+                Some(ShardScavengerReferenceCursor::PendingPlacedCommand { .. }) => 3,
+                Some(
+                    ShardScavengerReferenceCursor::ObjectReclaimSegment { .. }
+                    | ShardScavengerReferenceCursor::MultipartReclaimSegment { .. }
+                    | ShardScavengerReferenceCursor::PendingReclaimCommand { .. },
+                ) => 0,
+            }
+        };
+
+        if start_phase == 0 {
+            let object_after = match after {
+                Some(ShardScavengerReferenceCursor::ObjectSegment {
+                    bucket,
+                    key,
+                    version_id,
+                    segment_index,
+                }) => (bucket.as_str(), key.as_str(), *version_id, *segment_index),
+                _ => ("", "", 0, 0),
+            };
+            let remaining = limit - items.len();
+            self.extend_placed_segment_backfill_object_page(&mut items, object_after, remaining)?;
+            if items.len() == limit {
+                return Ok(ShardScavengerReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+        if start_phase <= 1 {
+            let stream_after = match after {
+                Some(ShardScavengerReferenceCursor::StreamUploadSegment {
+                    session_id,
+                    segment_index,
+                }) => (session_id.as_str(), *segment_index),
+                _ => ("", 0),
+            };
+            let remaining = limit - items.len();
+            self.extend_placed_segment_backfill_stream_page(&mut items, stream_after, remaining)?;
+            if items.len() == limit {
+                return Ok(ShardScavengerReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+        if start_phase <= 2 {
+            let multipart_after = match after {
+                Some(ShardScavengerReferenceCursor::MultipartPartSegment {
+                    bucket,
+                    key,
+                    upload_id,
+                    part_number,
+                    segment_index,
+                }) => (
+                    bucket.as_str(),
+                    key.as_str(),
+                    upload_id.as_str(),
+                    *part_number,
+                    *segment_index,
+                ),
+                _ => ("", "", "", 0, 0),
+            };
+            let remaining = limit - items.len();
+            self.extend_placed_segment_backfill_multipart_page(
+                &mut items,
+                multipart_after,
+                remaining,
+            )?;
+            if items.len() == limit {
+                return Ok(ShardScavengerReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+        let remaining = limit - items.len();
+        let complete =
+            self.extend_placed_segment_backfill_pending_page(&mut items, pending_after, remaining)?;
+        Ok(ShardScavengerReferencePage { items, complete })
+    }
+
+    pub(crate) fn shard_scavenger_reference_matches(
+        &self,
+        cursor: &ShardScavengerReferenceCursor,
+        expected: &ShardScavengerPlacedShardSetReference,
+    ) -> Result<bool, StoreError> {
+        #[cfg(test)]
+        self.shard_scavenger_reference_match_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let actual = match cursor {
+            ShardScavengerReferenceCursor::ObjectSegment {
+                bucket,
+                key,
+                version_id,
+                segment_index,
+            } => {
+                let Ok(version_id) = i64::try_from(*version_id) else {
+                    return Ok(false);
+                };
+                self.query_row_cached_optional(
+                    "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
+                            s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                     FROM object_segments s \
+                     JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
+                     WHERE s.bucket = ?1 AND s.key = ?2 AND s.version_id = ?3 AND s.segment_index = ?4",
+                    params![bucket, key, version_id, i64::from(*segment_index)],
+                    "load exact object segment shard scavenger reference",
+                    |row| self.placed_segment_backfill_reference_from_row(row, 0, 8),
+                )?
+            }
+            ShardScavengerReferenceCursor::StreamUploadSegment {
+                session_id,
+                segment_index,
+            } => self.query_row_cached_optional(
+                "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type \
+                 FROM stream_upload_segments s \
+                 JOIN stream_uploads u ON u.session_id = s.session_id \
+                 WHERE s.session_id = ?1 AND s.segment_index = ?2",
+                params![session_id, i64::from(*segment_index)],
+                "load exact stream segment shard scavenger reference",
+                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8),
+            )?,
+            ShardScavengerReferenceCursor::MultipartPartSegment {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                segment_index,
+            } => self.query_row_cached_optional(
+                "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                 FROM multipart_part_segments s \
+                 JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
+                 WHERE s.bucket = ?1 AND s.key = ?2 AND s.upload_id = ?3 \
+                   AND s.part_number = ?4 AND s.segment_index = ?5",
+                params![
+                    bucket,
+                    key,
+                    upload_id,
+                    i64::from(*part_number),
+                    i64::from(*segment_index)
+                ],
+                "load exact multipart segment shard scavenger reference",
+                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8),
+            )?,
+            ShardScavengerReferenceCursor::PendingPlacedCommand {
+                cluster_epoch,
+                pg_id,
+                log_index,
+                command_checksum,
+                reference_index,
+            } => self.pending_placed_reference_at(
+                *cluster_epoch,
+                *pg_id,
+                *log_index,
+                *command_checksum,
+                *reference_index,
+            )?,
+            ShardScavengerReferenceCursor::ObjectReclaimSegment { .. }
+            | ShardScavengerReferenceCursor::MultipartReclaimSegment { .. }
+            | ShardScavengerReferenceCursor::PendingReclaimCommand { .. } => None,
+        };
+        Ok(actual.as_ref() == Some(expected))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_shard_scavenger_reference_match_calls(&self) -> u64 {
+        self.shard_scavenger_reference_match_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn pending_placed_reference_at(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: u64,
+        command_checksum: u64,
+        reference_index: u32,
+    ) -> Result<Option<ShardScavengerPlacedShardSetReference>, StoreError> {
+        let identity_matches = self.query_row_cached_optional(
+            "SELECT 1 FROM metadata_command_pending_slot \
+             WHERE singleton = 0 AND cluster_epoch = ?1 AND pg_id = ?2 \
+               AND log_index = ?3 AND command_checksum = ?4 \
+               AND placed_segment_reference_count > ?5",
+            params![
+                cluster_epoch.get() as i64,
+                pg_id.get() as i64,
+                log_index as i64,
+                command_checksum as i64,
+                i64::from(reference_index)
+            ],
+            "match pending command shard scavenger reference identity",
+            |_| Ok(()),
+        )?;
+        if identity_matches.is_none() {
+            return Ok(None);
+        }
+        let references_per_page = u32::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT);
+        let page_index = reference_index / references_per_page;
+        let within_page = usize::try_from(reference_index % references_per_page)
+            .expect("bounded pending reference index fits usize");
+        let encoded_page = self.query_row_cached_optional(
+            "SELECT encoded_references FROM metadata_command_pending_placed_reference_pages \
+             WHERE singleton = 0 AND page_index = ?1",
+            params![i64::from(page_index)],
+            "load exact pending command shard scavenger reference page",
+            |row| row.get::<_, Vec<u8>>(0),
+        )?;
+        let Some(encoded_page) = encoded_page else {
+            return Err(Self::invalid_pending_placed_reference_index(
+                "missing exact encoded reference page",
+            ));
+        };
+        let Some(encoded) = encoded_page
+            .chunks_exact(PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN)
+            .nth(within_page)
+        else {
+            return Err(Self::invalid_pending_placed_reference_index(
+                "missing exact encoded reference",
+            ));
+        };
+        Self::decode_pending_placed_reference(encoded).map(Some)
+    }
+
+    fn extend_object_reclaim_reference_page(
+        &self,
+        items: &mut Vec<ShardScavengerReferencePageItem>,
+        after: (&str, &str, u64, u32),
+        limit: usize,
+    ) -> Result<(), StoreError> {
+        if limit == 0 {
+            return Ok(());
+        }
+        let generation_id = i64::try_from(after.2).map_err(|_| StoreError::Db {
+            context: "list object reclaim shard reference page",
+            source: crate::error::DatabaseError::new("generation cursor exceeds SQLite range"),
+        })?;
+        let mut statement = self
+            .conn
+            .prepare_cached(
+                "SELECT bucket, key, generation_id, segment_index, data_pg_id, segment_okh, \
+                        segment_vid, ec_k, ec_m \
+                 FROM object_segment_reclaim_segments \
+                 WHERE (bucket, key, generation_id, segment_index) > (?1, ?2, ?3, ?4) \
+                 ORDER BY bucket, key, generation_id, segment_index LIMIT ?5",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list object reclaim shard reference page",
+                source: source.into(),
+            })?;
+        let rows = statement
+            .query_map(
+                params![
+                    after.0,
+                    after.1,
+                    generation_id,
+                    i64::from(after.3),
+                    limit as i64
+                ],
+                |row| {
+                    let raw_generation_id = row.get::<_, i64>(2)?;
+                    let generation_id =
+                        GenerationId::new(u64::try_from(raw_generation_id).map_err(|_| {
+                            rusqlite::Error::IntegralValueOutOfRange(2, raw_generation_id)
+                        })?)
+                        .ok_or(
+                            rusqlite::Error::IntegralValueOutOfRange(2, raw_generation_id),
+                        )?;
+                    let okh_blob: Vec<u8> = row.get(5)?;
+                    Ok(ShardScavengerReferencePageItem {
+                        cursor: ShardScavengerReferenceCursor::ObjectReclaimSegment {
+                            bucket: row.get(0)?,
+                            key: row.get(1)?,
+                            generation_id,
+                            segment_index: row.get(3)?,
+                        },
+                        reference: ShardScavengerPayloadReference::ReclaimOnly(
+                            ShardScavengerReclaimShardSetReference {
+                                data_pg_id: row.get(4)?,
+                                okh: Self::parse_okh_blob(&okh_blob, 5)?,
+                                generation_id: Self::parse_generation_id(
+                                    row.get(6)?,
+                                    6,
+                                    "object reclaim shard reference generation",
+                                )?,
+                                ec: EcShape {
+                                    k: row.get(7)?,
+                                    m: row.get(8)?,
+                                },
+                            },
+                        ),
+                    })
+                },
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list object reclaim shard reference page",
+                source: source.into(),
+            })?;
+        for row in rows {
+            items.push(row.map_err(|source| StoreError::Db {
+                context: "read object reclaim shard reference page",
+                source: source.into(),
+            })?);
+        }
+        Ok(())
+    }
+
+    fn extend_multipart_reclaim_reference_page(
+        &self,
+        items: &mut Vec<ShardScavengerReferencePageItem>,
+        after: (&str, &str, u64, u32, u32),
+        limit: usize,
+    ) -> Result<(), StoreError> {
+        if limit == 0 {
+            return Ok(());
+        }
+        let generation_id = i64::try_from(after.2).map_err(|_| StoreError::Db {
+            context: "list multipart reclaim shard reference page",
+            source: crate::error::DatabaseError::new("generation cursor exceeds SQLite range"),
+        })?;
+        let mut statement = self
+            .conn
+            .prepare_cached(
+                "SELECT bucket, key, generation_id, part_number, segment_index, data_pg_id, \
+                        segment_okh, segment_vid, ec_k, ec_m \
+                 FROM multipart_reclaim_part_segments \
+                 WHERE (bucket, key, generation_id, part_number, segment_index) \
+                       > (?1, ?2, ?3, ?4, ?5) \
+                 ORDER BY bucket, key, generation_id, part_number, segment_index LIMIT ?6",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list multipart reclaim shard reference page",
+                source: source.into(),
+            })?;
+        let rows = statement
+            .query_map(
+                params![
+                    after.0,
+                    after.1,
+                    generation_id,
+                    i64::from(after.3),
+                    i64::from(after.4),
+                    limit as i64
+                ],
+                |row| {
+                    let raw_generation_id = row.get::<_, i64>(2)?;
+                    let generation_id =
+                        GenerationId::new(u64::try_from(raw_generation_id).map_err(|_| {
+                            rusqlite::Error::IntegralValueOutOfRange(2, raw_generation_id)
+                        })?)
+                        .ok_or(
+                            rusqlite::Error::IntegralValueOutOfRange(2, raw_generation_id),
+                        )?;
+                    let okh_blob: Vec<u8> = row.get(6)?;
+                    Ok(ShardScavengerReferencePageItem {
+                        cursor: ShardScavengerReferenceCursor::MultipartReclaimSegment {
+                            bucket: row.get(0)?,
+                            key: row.get(1)?,
+                            generation_id,
+                            part_number: row.get(3)?,
+                            segment_index: row.get(4)?,
+                        },
+                        reference: ShardScavengerPayloadReference::ReclaimOnly(
+                            ShardScavengerReclaimShardSetReference {
+                                data_pg_id: row.get(5)?,
+                                okh: Self::parse_okh_blob(&okh_blob, 6)?,
+                                generation_id: Self::parse_generation_id(
+                                    row.get(7)?,
+                                    7,
+                                    "multipart reclaim shard reference generation",
+                                )?,
+                                ec: EcShape {
+                                    k: row.get(8)?,
+                                    m: row.get(9)?,
+                                },
+                            },
+                        ),
+                    })
+                },
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list multipart reclaim shard reference page",
+                source: source.into(),
+            })?;
+        for row in rows {
+            items.push(row.map_err(|source| StoreError::Db {
+                context: "read multipart reclaim shard reference page",
+                source: source.into(),
+            })?);
+        }
+        Ok(())
     }
 
     fn extend_placed_segment_backfill_object_page(
         &self,
-        items: &mut Vec<PlacedSegmentBackfillReferencePageItem>,
+        items: &mut Vec<ShardScavengerReferencePageItem>,
         after: (&str, &str, u64, u32),
         limit: usize,
     ) -> Result<(), StoreError> {
@@ -1254,7 +1786,7 @@ impl PgStore {
             return Ok(());
         }
         let version_id = i64::try_from(after.2).map_err(|_| StoreError::Db {
-            context: "list object segment backfill reference page",
+            context: "list object segment shard scavenger reference page",
             source: crate::error::DatabaseError::new("object version cursor exceeds SQLite range"),
         })?;
         let mut statement = self
@@ -1270,10 +1802,11 @@ impl PgStore {
                  LIMIT ?5",
             )
             .map_err(|source| StoreError::Db {
-                context: "list object segment backfill reference page",
+                context: "list object segment shard scavenger reference page",
                 source: source.into(),
             })?;
-        let sql_limit = i64::try_from(limit).expect("backfill reference page limit fits in i64");
+        let sql_limit =
+            i64::try_from(limit).expect("shard scavenger reference page limit fits in i64");
         let rows = statement
             .query_map(
                 params![after.0, after.1, version_id, i64::from(after.3), sql_limit],
@@ -1284,24 +1817,26 @@ impl PgStore {
                     let version_id = u64::try_from(raw_version_id)
                         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, raw_version_id))?;
                     let segment_index = row.get(3)?;
-                    Ok(PlacedSegmentBackfillReferencePageItem {
-                        cursor: PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+                    Ok(ShardScavengerReferencePageItem {
+                        cursor: ShardScavengerReferenceCursor::ObjectSegment {
                             bucket,
                             key,
                             version_id,
                             segment_index,
                         },
-                        reference: self.placed_segment_backfill_reference_from_row(row, 4, 12)?,
+                        reference: ShardScavengerPayloadReference::Placed(
+                            self.placed_segment_backfill_reference_from_row(row, 4, 12)?,
+                        ),
                     })
                 },
             )
             .map_err(|source| StoreError::Db {
-                context: "list object segment backfill reference page",
+                context: "list object segment shard scavenger reference page",
                 source: source.into(),
             })?;
         for row in rows {
             items.push(row.map_err(|source| StoreError::Db {
-                context: "list object segment backfill reference page",
+                context: "list object segment shard scavenger reference page",
                 source: source.into(),
             })?);
         }
@@ -1310,7 +1845,7 @@ impl PgStore {
 
     fn extend_placed_segment_backfill_stream_page(
         &self,
-        items: &mut Vec<PlacedSegmentBackfillReferencePageItem>,
+        items: &mut Vec<ShardScavengerReferencePageItem>,
         after: (&str, u32),
         limit: usize,
     ) -> Result<(), StoreError> {
@@ -1330,27 +1865,30 @@ impl PgStore {
                  LIMIT ?3",
             )
             .map_err(|source| StoreError::Db {
-                context: "list stream segment backfill reference page",
+                context: "list stream segment shard scavenger reference page",
                 source: source.into(),
             })?;
-        let sql_limit = i64::try_from(limit).expect("backfill reference page limit fits in i64");
+        let sql_limit =
+            i64::try_from(limit).expect("shard scavenger reference page limit fits in i64");
         let rows = statement
             .query_map(params![after.0, i64::from(after.1), sql_limit], |row| {
-                Ok(PlacedSegmentBackfillReferencePageItem {
-                    cursor: PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+                Ok(ShardScavengerReferencePageItem {
+                    cursor: ShardScavengerReferenceCursor::StreamUploadSegment {
                         session_id: row.get(0)?,
                         segment_index: row.get(1)?,
                     },
-                    reference: self.placed_segment_backfill_reference_from_row(row, 2, 10)?,
+                    reference: ShardScavengerPayloadReference::Placed(
+                        self.placed_segment_backfill_reference_from_row(row, 2, 10)?,
+                    ),
                 })
             })
             .map_err(|source| StoreError::Db {
-                context: "list stream segment backfill reference page",
+                context: "list stream segment shard scavenger reference page",
                 source: source.into(),
             })?;
         for row in rows {
             items.push(row.map_err(|source| StoreError::Db {
-                context: "list stream segment backfill reference page",
+                context: "list stream segment shard scavenger reference page",
                 source: source.into(),
             })?);
         }
@@ -1359,7 +1897,7 @@ impl PgStore {
 
     fn extend_placed_segment_backfill_multipart_page(
         &self,
-        items: &mut Vec<PlacedSegmentBackfillReferencePageItem>,
+        items: &mut Vec<ShardScavengerReferencePageItem>,
         after: (&str, &str, &str, u32, u32),
         limit: usize,
     ) -> Result<(), StoreError> {
@@ -1380,10 +1918,11 @@ impl PgStore {
                  LIMIT ?6",
             )
             .map_err(|source| StoreError::Db {
-                context: "list multipart segment backfill reference page",
+                context: "list multipart segment shard scavenger reference page",
                 source: source.into(),
             })?;
-        let sql_limit = i64::try_from(limit).expect("backfill reference page limit fits in i64");
+        let sql_limit =
+            i64::try_from(limit).expect("shard scavenger reference page limit fits in i64");
         let rows = statement
             .query_map(
                 params![
@@ -1395,25 +1934,27 @@ impl PgStore {
                     sql_limit
                 ],
                 |row| {
-                    Ok(PlacedSegmentBackfillReferencePageItem {
-                        cursor: PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+                    Ok(ShardScavengerReferencePageItem {
+                        cursor: ShardScavengerReferenceCursor::MultipartPartSegment {
                             bucket: row.get(0)?,
                             key: row.get(1)?,
                             upload_id: row.get(2)?,
                             part_number: row.get(3)?,
                             segment_index: row.get(4)?,
                         },
-                        reference: self.placed_segment_backfill_reference_from_row(row, 5, 13)?,
+                        reference: ShardScavengerPayloadReference::Placed(
+                            self.placed_segment_backfill_reference_from_row(row, 5, 13)?,
+                        ),
                     })
                 },
             )
             .map_err(|source| StoreError::Db {
-                context: "list multipart segment backfill reference page",
+                context: "list multipart segment shard scavenger reference page",
                 source: source.into(),
             })?;
         for row in rows {
             items.push(row.map_err(|source| StoreError::Db {
-                context: "list multipart segment backfill reference page",
+                context: "list multipart segment shard scavenger reference page",
                 source: source.into(),
             })?);
         }
@@ -1422,8 +1963,8 @@ impl PgStore {
 
     fn extend_placed_segment_backfill_pending_page(
         &self,
-        items: &mut Vec<PlacedSegmentBackfillReferencePageItem>,
-        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        items: &mut Vec<ShardScavengerReferencePageItem>,
+        after: Option<&ShardScavengerReferenceCursor>,
         limit: usize,
     ) -> Result<bool, StoreError> {
         if limit == 0 {
@@ -1434,7 +1975,7 @@ impl PgStore {
                     placed_segment_reference_count \
              FROM metadata_command_pending_slot WHERE singleton = 0",
             [],
-            "load pending command identity for placed segment backfill reference page",
+            "load pending command identity for shard scavenger reference page",
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -1468,7 +2009,7 @@ impl PgStore {
             .map_err(|_| Self::invalid_pending_placed_reference_index("invalid reference count"))?
             as usize;
         let start = match after {
-            Some(PlacedSegmentBackfillReferenceCursor::PendingCommand {
+            Some(ShardScavengerReferenceCursor::PendingPlacedCommand {
                 cluster_epoch: cursor_epoch,
                 pg_id: cursor_pg_id,
                 log_index: cursor_log_index,
@@ -1487,7 +2028,7 @@ impl PgStore {
             return Ok(true);
         }
 
-        let references_per_page = usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT);
+        let references_per_page = usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT);
         let first_page = start / references_per_page;
         let mut statement = self
             .conn
@@ -1498,7 +2039,7 @@ impl PgStore {
                  ORDER BY page_index LIMIT 2",
             )
             .map_err(|source| StoreError::Db {
-                context: "list pending command placed segment backfill reference pages",
+                context: "list pending command shard scavenger reference pages",
                 source: source.into(),
             })?;
         let rows = statement
@@ -1510,14 +2051,14 @@ impl PgStore {
                 ))
             })
             .map_err(|source| StoreError::Db {
-                context: "list pending command placed segment backfill reference pages",
+                context: "list pending command shard scavenger reference pages",
                 source: source.into(),
             })?;
         let mut next_reference = start;
         for row in rows {
             let (page_index, page_reference_count, encoded_page) =
                 row.map_err(|source| StoreError::Db {
-                    context: "read pending command placed segment backfill reference page",
+                    context: "read pending command shard scavenger reference page",
                     source: source.into(),
                 })?;
             let page_index = usize::try_from(page_index)
@@ -1548,8 +2089,8 @@ impl PgStore {
                 .take(limit - (next_reference - start))
             {
                 let reference_index = next_reference;
-                items.push(PlacedSegmentBackfillReferencePageItem {
-                    cursor: PlacedSegmentBackfillReferenceCursor::PendingCommand {
+                items.push(ShardScavengerReferencePageItem {
+                    cursor: ShardScavengerReferenceCursor::PendingPlacedCommand {
                         cluster_epoch,
                         pg_id,
                         log_index,
@@ -1557,7 +2098,9 @@ impl PgStore {
                         reference_index: u32::try_from(reference_index)
                             .expect("metadata command reference count must fit in u32"),
                     },
-                    reference: Self::decode_pending_placed_reference(encoded)?,
+                    reference: ShardScavengerPayloadReference::Placed(
+                        Self::decode_pending_placed_reference(encoded)?,
+                    ),
                 });
                 next_reference += 1;
             }
@@ -1573,38 +2116,223 @@ impl PgStore {
         Ok(next_reference >= total_references)
     }
 
-    pub(super) fn encode_pending_placed_segment_reference_pages(
+    fn extend_pending_reclaim_reference_page(
         &self,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<(u32, Vec<Vec<u8>>), StoreError> {
-        let mut references = Vec::new();
-        self.extend_scavenger_command_payload_references(&mut references, command.payload())?;
-        let references_per_page = usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT);
-        let mut reference_count = 0u32;
-        let mut pages: Vec<Vec<u8>> = Vec::new();
-        for reference in references {
-            let ShardScavengerPayloadReference::Placed(reference) = reference else {
-                continue;
-            };
-            if (reference_count as usize).is_multiple_of(references_per_page) {
-                pages.push(Vec::with_capacity(
-                    references_per_page * PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN,
+        items: &mut Vec<ShardScavengerReferencePageItem>,
+        after: Option<&ShardScavengerReferenceCursor>,
+        limit: usize,
+    ) -> Result<bool, StoreError> {
+        if limit == 0 {
+            return Ok(false);
+        }
+        let Some((cluster_epoch, pg_id, log_index, command_checksum, reference_count)) = self
+            .query_row_cached_optional(
+            "SELECT cluster_epoch, pg_id, log_index, command_checksum, reclaim_reference_count \
+                 FROM metadata_command_pending_slot WHERE singleton = 0",
+            [],
+            "load pending command identity for reclaim reference page",
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?
+        else {
+            return Ok(true);
+        };
+        let cluster_epoch = u64::try_from(cluster_epoch)
+            .ok()
+            .and_then(ClusterEpoch::new)
+            .ok_or_else(|| Self::invalid_pending_placed_reference_index("invalid cluster epoch"))?;
+        let pg_id = u32::try_from(pg_id)
+            .map(PgId::new)
+            .map_err(|_| Self::invalid_pending_placed_reference_index("invalid PG ID"))?;
+        let log_index = u64::try_from(log_index)
+            .map_err(|_| Self::invalid_pending_placed_reference_index("negative log index"))?;
+        let command_checksum = command_checksum as u64;
+        let total_references = u32::try_from(reference_count)
+            .map_err(|_| Self::invalid_pending_placed_reference_index("invalid reference count"))?
+            as usize;
+        let start = match after {
+            Some(ShardScavengerReferenceCursor::PendingReclaimCommand {
+                cluster_epoch: cursor_epoch,
+                pg_id: cursor_pg_id,
+                log_index: cursor_log_index,
+                command_checksum: cursor_checksum,
+                reference_index,
+            }) if *cursor_epoch == cluster_epoch
+                && *cursor_pg_id == pg_id
+                && *cursor_log_index == log_index
+                && *cursor_checksum == command_checksum =>
+            {
+                *reference_index as usize + 1
+            }
+            _ => 0,
+        };
+        if start >= total_references {
+            return Ok(true);
+        }
+
+        let references_per_page = usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT);
+        let first_page = start / references_per_page;
+        let mut statement = self
+            .conn
+            .prepare_cached(
+                "SELECT page_index, reference_count, encoded_references \
+                 FROM metadata_command_pending_reclaim_reference_pages \
+                 WHERE singleton = 0 AND page_index >= ?1 \
+                 ORDER BY page_index LIMIT 2",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list pending command reclaim reference pages",
+                source: source.into(),
+            })?;
+        let rows = statement
+            .query_map(params![first_page as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|source| StoreError::Db {
+                context: "list pending command reclaim reference pages",
+                source: source.into(),
+            })?;
+        let mut next_reference = start;
+        for row in rows {
+            let (page_index, page_reference_count, encoded_page) =
+                row.map_err(|source| StoreError::Db {
+                    context: "read pending command reclaim reference page",
+                    source: source.into(),
+                })?;
+            let page_index = usize::try_from(page_index)
+                .map_err(|_| Self::invalid_pending_placed_reference_index("negative page index"))?;
+            let expected_page_index = next_reference / references_per_page;
+            if page_index != expected_page_index {
+                return Err(Self::invalid_pending_placed_reference_index(
+                    "non-contiguous reclaim page index",
                 ));
             }
-            let encoded = pages.last_mut().expect("placed reference page exists");
-            encoded.extend_from_slice(&reference.data_pg_id.to_be_bytes());
-            encoded.extend_from_slice(&reference.okh);
-            encoded.extend_from_slice(&reference.generation_id.get().to_be_bytes());
-            encoded.extend_from_slice(&reference.placement_cluster_epoch.get().to_be_bytes());
-            encoded.extend_from_slice(&reference.stored_size.to_be_bytes());
-            encoded.extend_from_slice(&reference.crc64.to_be_bytes());
-            encoded.push(reference.ec.k);
-            encoded.push(reference.ec.m);
-            reference_count = reference_count.checked_add(1).ok_or_else(|| {
-                Self::invalid_pending_placed_reference_index("reference count overflow")
+            let page_reference_count = usize::try_from(page_reference_count).map_err(|_| {
+                Self::invalid_pending_placed_reference_index(
+                    "negative reclaim page reference count",
+                )
             })?;
+            let page_start = page_index * references_per_page;
+            let expected_page_count = (total_references - page_start).min(references_per_page);
+            if page_reference_count != expected_page_count
+                || encoded_page.len() != page_reference_count * PENDING_RECLAIM_REFERENCE_RECORD_LEN
+            {
+                return Err(Self::invalid_pending_placed_reference_index(
+                    "malformed fixed-width reclaim page",
+                ));
+            }
+            let skip = next_reference - page_start;
+            for encoded in encoded_page
+                .chunks_exact(PENDING_RECLAIM_REFERENCE_RECORD_LEN)
+                .skip(skip)
+                .take(limit - (next_reference - start))
+            {
+                let reference_index = next_reference;
+                items.push(ShardScavengerReferencePageItem {
+                    cursor: ShardScavengerReferenceCursor::PendingReclaimCommand {
+                        cluster_epoch,
+                        pg_id,
+                        log_index,
+                        command_checksum,
+                        reference_index: u32::try_from(reference_index)
+                            .expect("metadata command reclaim reference count must fit in u32"),
+                    },
+                    reference: ShardScavengerPayloadReference::ReclaimOnly(
+                        Self::decode_pending_reclaim_reference(encoded)?,
+                    ),
+                });
+                next_reference += 1;
+            }
+            if next_reference - start == limit || next_reference == total_references {
+                break;
+            }
         }
-        Ok((reference_count, pages))
+        if next_reference == start {
+            return Err(Self::invalid_pending_placed_reference_index(
+                "missing encoded reclaim reference page",
+            ));
+        }
+        Ok(next_reference >= total_references)
+    }
+
+    pub(super) fn encode_pending_shard_scavenger_reference_pages(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<PendingShardScavengerReferencePages, StoreError> {
+        let mut references = Vec::new();
+        self.extend_scavenger_command_payload_references(&mut references, command.payload())?;
+        let references_per_page = usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT);
+        let mut placed_reference_count = 0u32;
+        let mut placed_pages: Vec<Vec<u8>> = Vec::new();
+        let mut reclaim_reference_count = 0u32;
+        let mut reclaim_pages: Vec<Vec<u8>> = Vec::new();
+        for reference in references {
+            match reference {
+                ShardScavengerPayloadReference::Placed(reference) => {
+                    if (placed_reference_count as usize).is_multiple_of(references_per_page) {
+                        placed_pages.push(Vec::with_capacity(
+                            references_per_page * PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN,
+                        ));
+                    }
+                    let encoded = placed_pages
+                        .last_mut()
+                        .expect("placed reference page exists");
+                    encoded.extend_from_slice(&reference.data_pg_id.to_be_bytes());
+                    encoded.extend_from_slice(&reference.okh);
+                    encoded.extend_from_slice(&reference.generation_id.get().to_be_bytes());
+                    encoded
+                        .extend_from_slice(&reference.placement_cluster_epoch.get().to_be_bytes());
+                    encoded.extend_from_slice(&reference.stored_size.to_be_bytes());
+                    encoded.extend_from_slice(&reference.crc64.to_be_bytes());
+                    encoded.push(reference.ec.k);
+                    encoded.push(reference.ec.m);
+                    placed_reference_count =
+                        placed_reference_count.checked_add(1).ok_or_else(|| {
+                            Self::invalid_pending_placed_reference_index(
+                                "placed reference count overflow",
+                            )
+                        })?;
+                }
+                ShardScavengerPayloadReference::ReclaimOnly(reference) => {
+                    if (reclaim_reference_count as usize).is_multiple_of(references_per_page) {
+                        reclaim_pages.push(Vec::with_capacity(
+                            references_per_page * PENDING_RECLAIM_REFERENCE_RECORD_LEN,
+                        ));
+                    }
+                    let encoded = reclaim_pages
+                        .last_mut()
+                        .expect("reclaim reference page exists");
+                    encoded.extend_from_slice(&reference.data_pg_id.to_be_bytes());
+                    encoded.extend_from_slice(&reference.okh);
+                    encoded.extend_from_slice(&reference.generation_id.get().to_be_bytes());
+                    encoded.push(reference.ec.k);
+                    encoded.push(reference.ec.m);
+                    reclaim_reference_count =
+                        reclaim_reference_count.checked_add(1).ok_or_else(|| {
+                            Self::invalid_pending_placed_reference_index(
+                                "reclaim reference count overflow",
+                            )
+                        })?;
+                }
+            }
+        }
+        Ok(PendingShardScavengerReferencePages {
+            placed_reference_count,
+            placed_pages,
+            reclaim_reference_count,
+            reclaim_pages,
+        })
     }
 
     fn decode_pending_placed_reference(
@@ -1637,9 +2365,30 @@ impl PgStore {
         })
     }
 
+    fn decode_pending_reclaim_reference(
+        encoded: &[u8],
+    ) -> Result<ShardScavengerReclaimShardSetReference, StoreError> {
+        debug_assert_eq!(encoded.len(), PENDING_RECLAIM_REFERENCE_RECORD_LEN);
+        let data_pg_id = u32::from_be_bytes(encoded[0..4].try_into().unwrap());
+        let okh = encoded[4..20].try_into().unwrap();
+        let generation_id = GenerationId::new(u64::from_be_bytes(
+            encoded[20..28].try_into().unwrap(),
+        ))
+        .ok_or_else(|| Self::invalid_pending_placed_reference_index("zero generation id"))?;
+        Ok(ShardScavengerReclaimShardSetReference {
+            data_pg_id,
+            okh,
+            generation_id,
+            ec: EcShape {
+                k: encoded[28],
+                m: encoded[29],
+            },
+        })
+    }
+
     fn invalid_pending_placed_reference_index(reason: &str) -> StoreError {
         StoreError::ShardScavengerScanIncomplete {
-            context: "decode pending command placed segment reference index",
+            context: "decode pending command shard scavenger reference index",
             errors: reason.to_owned(),
         }
     }
@@ -2841,6 +3590,8 @@ fn placed_segment_shard_backfill_work_item_from_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_command::ObjectPayloadReclaimClaimProof;
+    use std::num::NonZeroU16;
 
     fn repair_claim_acquire(
         claim_id: &str,
@@ -3276,32 +4027,32 @@ mod tests {
 
         let references = store.list_shard_scavenger_payload_references().unwrap();
         let mut page_after = None;
-        let mut paged_placed = Vec::new();
+        let mut paged_items = Vec::new();
         loop {
             let page = store
-                .list_placed_segment_backfill_reference_page(
+                .list_shard_scavenger_reference_page(
                     page_after.as_ref(),
                     std::num::NonZeroU16::new(1).unwrap(),
                 )
                 .unwrap();
             if let Some(item) = page.items.into_iter().next() {
-                page_after = Some(item.cursor);
-                paged_placed.push(item.reference);
+                page_after = Some(item.cursor.clone());
+                paged_items.push(item);
             }
             if page.complete {
                 break;
             }
         }
-        assert_eq!(paged_placed.len(), 2);
-        assert!(paged_placed
+        assert_eq!(paged_items.len(), 3);
+        assert!(paged_items
             .iter()
-            .any(|reference| reference.okh == [0x44; 16]));
-        assert!(paged_placed
+            .any(|item| matches!(&item.reference, ShardScavengerPayloadReference::Placed(reference) if reference.okh == [0x44; 16])));
+        assert!(paged_items
             .iter()
-            .any(|reference| reference.okh == [0x11; 16]));
-        assert!(paged_placed
+            .any(|item| matches!(&item.reference, ShardScavengerPayloadReference::Placed(reference) if reference.okh == [0x11; 16])));
+        assert!(paged_items
             .iter()
-            .all(|reference| reference.okh != [0x33; 16]));
+            .any(|item| matches!(&item.reference, ShardScavengerPayloadReference::ReclaimOnly(reference) if reference.okh == [0x33; 16])));
         let object_segment = references
             .iter()
             .find_map(|reference| match reference {
@@ -3358,6 +4109,32 @@ mod tests {
         assert_eq!(reclaim.data_pg_id, 7);
         assert_eq!(reclaim.generation_id, GenerationId::new(44).unwrap());
         assert_eq!(reclaim.ec, EcShape { k: 4, m: 2 });
+
+        let object_item = paged_items
+            .iter()
+            .find(|item| {
+                matches!(&item.reference, ShardScavengerPayloadReference::Placed(reference) if reference.okh == [0x44; 16])
+            })
+            .unwrap();
+        let ShardScavengerPayloadReference::Placed(object_reference) = &object_item.reference
+        else {
+            unreachable!("selected reference is placed");
+        };
+        assert!(store
+            .shard_scavenger_reference_matches(&object_item.cursor, object_reference)
+            .unwrap());
+        store
+            .conn
+            .execute(
+                "DELETE FROM object_segments \
+                 WHERE bucket = 'bucket' AND key = 'segment-object' \
+                   AND version_id = 0 AND segment_index = 0",
+                [],
+            )
+            .unwrap();
+        assert!(!store
+            .shard_scavenger_reference_matches(&object_item.cursor, object_reference)
+            .unwrap());
     }
 
     #[test]
@@ -3452,30 +4229,34 @@ mod tests {
         assert_eq!(indexed_pages, 8);
         assert_eq!(
             largest_page_bytes as usize,
-            usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT)
+            usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT)
                 * PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN
         );
 
         // The candidate path must consume only the fixed-width sidecar page.
-        // Corrupting the large command proves it is neither decoded nor
-        // canonically re-encoded for each page.
+        // Corrupting the command proves candidate discovery does not decode or
+        // re-encode the full pending envelope while paging the sidecar.
         store
             .test_set_pending_metadata_command_bytes(b"not a metadata command")
             .unwrap();
         let mut cursor = None;
         let mut first_page_cursor = None;
+        let mut first_page_reference = None;
         let mut seen = 0usize;
         loop {
             let page = store
-                .list_placed_segment_backfill_reference_page(
+                .list_placed_shard_scavenger_reference_page(
                     cursor.as_ref(),
-                    std::num::NonZeroU16::new(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT)
-                        .unwrap(),
+                    std::num::NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
                 )
                 .unwrap();
-            assert!(page.items.len() <= usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT));
+            assert!(page.items.len() <= usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT));
             if first_page_cursor.is_none() {
                 first_page_cursor = page.items.last().map(|item| item.cursor.clone());
+                first_page_reference = page.items.last().and_then(|item| match &item.reference {
+                    ShardScavengerPayloadReference::Placed(reference) => Some(reference.clone()),
+                    ShardScavengerPayloadReference::ReclaimOnly(_) => None,
+                });
             }
             seen += page.items.len();
             cursor = page.items.last().map(|item| item.cursor.clone());
@@ -3486,12 +4267,18 @@ mod tests {
         assert_eq!(seen, REFERENCE_COUNT);
         assert!(matches!(
             first_page_cursor.as_ref(),
-            Some(PlacedSegmentBackfillReferenceCursor::PendingCommand {
+            Some(ShardScavengerReferenceCursor::PendingPlacedCommand {
                 log_index: 1,
                 reference_index: 63,
                 ..
             })
         ));
+        assert!(store
+            .shard_scavenger_reference_matches(
+                first_page_cursor.as_ref().unwrap(),
+                first_page_reference.as_ref().unwrap(),
+            )
+            .unwrap());
 
         let mut replacement_payload = command.payload().clone();
         let MetadataCommandPayload::CommitDirectPutObject(replacement) = &mut replacement_payload
@@ -3499,6 +4286,7 @@ mod tests {
             unreachable!("test command is a direct PUT");
         };
         replacement.segments.truncate(2);
+        let durable_segment = replacement.segments[0].clone();
         let replacement = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -3511,18 +4299,320 @@ mod tests {
             .test_replace_pending_metadata_command_slot(&replacement, Some(&bucket))
             .unwrap();
         let restarted = store
-            .list_placed_segment_backfill_reference_page(
+            .list_placed_shard_scavenger_reference_page(
                 first_page_cursor.as_ref(),
-                std::num::NonZeroU16::new(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT).unwrap(),
+                std::num::NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
             )
             .unwrap();
         assert!(restarted.complete);
         assert_eq!(restarted.items.len(), 2);
         assert!(matches!(
             restarted.items[0].cursor,
-            PlacedSegmentBackfillReferenceCursor::PendingCommand {
+            ShardScavengerReferenceCursor::PendingPlacedCommand {
                 log_index: 2,
                 reference_index: 0,
+                ..
+            }
+        ));
+        assert!(!store
+            .shard_scavenger_reference_matches(
+                first_page_cursor.as_ref().unwrap(),
+                first_page_reference.as_ref().unwrap(),
+            )
+            .unwrap());
+
+        assert!(store.test_clear_pending_metadata_command_slot().unwrap());
+        store
+            .conn
+            .execute(
+                "INSERT INTO objects \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
+                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, \
+                  owner_principal, owner_canonical_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                rusqlite::params![
+                    bucket,
+                    key,
+                    0i64,
+                    1i64,
+                    GenerationId::MIN.get() as i64,
+                    durable_segment.size as i64,
+                    b"etag".as_slice(),
+                    0i64,
+                    1i64,
+                    durable_segment.ec_k as i64,
+                    durable_segment.ec_m as i64,
+                    0i64,
+                    0i64,
+                    2i64,
+                    "owner",
+                    "c".repeat(32),
+                ],
+            )
+            .unwrap();
+        store.test_insert_object_segment(&durable_segment).unwrap();
+        let durable_restart = store
+            .list_placed_shard_scavenger_reference_page(
+                first_page_cursor.as_ref(),
+                NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
+            )
+            .unwrap();
+        assert!(durable_restart.items.iter().any(|item| matches!(
+            item.cursor,
+            ShardScavengerReferenceCursor::ObjectSegment {
+                segment_index: 0,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn pending_command_reclaim_reference_pages_are_bounded_and_replace_transactionally() {
+        const REFERENCE_COUNT: usize = 512;
+
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let bucket = trusted_bucket_name("pending-reclaim-page");
+        let key = trusted_object_key("large-reclaim");
+        let reclaim_segments = (0..REFERENCE_COUNT)
+            .map(|index| {
+                let mut okh = [0u8; 16];
+                okh[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: index as u32,
+                    segment_okh: okh,
+                    segment_vid: GenerationId::new(index as u64 + 1).unwrap(),
+                    data_pg_id: 7,
+                    ec: EcShape { k: 4, m: 2 },
+                }
+            })
+            .collect::<Vec<_>>();
+        let command_for = |log_index, segments: Vec<ObjectSegmentsReclaimSegmentRecord>| {
+            MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    ClusterEpoch::INITIAL,
+                    PgId::new(7),
+                    MetadataCommandLogIndex::new(log_index).unwrap(),
+                ),
+                MetadataCommandPayload::DeleteObjectPayloadReclaim(Box::new(
+                    DeleteObjectPayloadReclaimCommand::new(
+                        bucket.clone(),
+                        key.clone(),
+                        GenerationId::MIN,
+                        ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            generation_id: GenerationId::MIN,
+                            created_at: 1,
+                            segments,
+                        }),
+                        ObjectPayloadReclaimClaimProof {
+                            bucket_incarnation_generation: 1,
+                            reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                            claim_id: "pending-reclaim-claim".to_owned(),
+                            owner_token: "pending-reclaim-owner".to_owned(),
+                            cluster_epoch: ClusterEpoch::INITIAL,
+                        },
+                    ),
+                )),
+            )
+        };
+        let command = command_for(1, reclaim_segments.clone());
+        store
+            .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+            .unwrap();
+        let (indexed_references, indexed_pages, largest_page_bytes): (i64, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT reclaim_reference_count, \
+                        (SELECT count(*) \
+                         FROM metadata_command_pending_reclaim_reference_pages), \
+                        (SELECT max(length(encoded_references)) \
+                         FROM metadata_command_pending_reclaim_reference_pages) \
+                 FROM metadata_command_pending_slot WHERE singleton = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(indexed_references as usize, REFERENCE_COUNT);
+        assert_eq!(indexed_pages, 8);
+        assert_eq!(
+            largest_page_bytes as usize,
+            usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT)
+                * PENDING_RECLAIM_REFERENCE_RECORD_LEN
+        );
+
+        store
+            .test_set_pending_metadata_command_bytes(b"not a metadata command")
+            .unwrap();
+        let mut cursor = None;
+        let mut seen = 0usize;
+        loop {
+            let page = store
+                .list_shard_scavenger_reference_page(
+                    cursor.as_ref(),
+                    NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
+                )
+                .unwrap();
+            assert!(page.items.len() <= usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT));
+            assert!(page.items.iter().all(|item| matches!(
+                item.reference,
+                ShardScavengerPayloadReference::ReclaimOnly(_)
+            )));
+            seen += page.items.len();
+            cursor = page.items.last().map(|item| item.cursor.clone());
+            if page.complete {
+                break;
+            }
+        }
+        assert_eq!(seen, REFERENCE_COUNT);
+
+        let replacement = command_for(2, reclaim_segments[..2].to_vec());
+        store
+            .test_replace_pending_metadata_command_slot(&replacement, Some(&bucket))
+            .unwrap();
+        let (indexed_references, indexed_pages): (i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT reclaim_reference_count, \
+                        (SELECT count(*) \
+                         FROM metadata_command_pending_reclaim_reference_pages) \
+                 FROM metadata_command_pending_slot WHERE singleton = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(indexed_references, 2);
+        assert_eq!(indexed_pages, 1);
+        let page = store
+            .list_shard_scavenger_reference_page(
+                None,
+                NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
+            )
+            .unwrap();
+        assert!(page.complete);
+        assert_eq!(page.items.len(), 2);
+
+        let placed_segment = ObjectSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            segment_index: 0,
+            size: 9,
+            segment_crc64: 10,
+            segment_okh: [0x44; 16],
+            segment_vid: GenerationId::new(12).unwrap(),
+            data_pg_id: 7,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
+            ec_k: 1,
+            ec_m: 0,
+        };
+        let placed_replacement = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(7),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: placed_segment.size,
+                    etag: ObjectEtag::single_part(0),
+                    ec: EcShape { k: 1, m: 0 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                segments: vec![placed_segment.clone()],
+                generation_reservation_id: SessionId::try_from("34".repeat(16)).unwrap(),
+                write_sequence: 1,
+                last_modified_millis: 1,
+                stale_payload: None,
+                bucket_write_reservation: BucketWriteReservationProof {
+                    bucket: bucket.clone(),
+                    reservation_id: "pending-reclaim-replacement-proof".to_owned(),
+                    owner_token: "pending-reclaim-replacement-owner".to_owned(),
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    bucket_execution_generation: 1,
+                    bucket_incarnation_generation: 1,
+                    operation_kind: "direct-put-commit".to_owned(),
+                    created_at: 1,
+                    lease_deadline: 2,
+                    target_context: Some(key.as_str().to_owned()),
+                },
+            })),
+        );
+        store
+            .test_replace_pending_metadata_command_slot(&placed_replacement, Some(&bucket))
+            .unwrap();
+        let restarted = store
+            .list_shard_scavenger_reference_page(
+                cursor.as_ref(),
+                NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
+            )
+            .unwrap();
+        assert!(restarted.complete);
+        assert_eq!(restarted.items.len(), 1);
+        assert!(matches!(
+            restarted.items[0].cursor,
+            ShardScavengerReferenceCursor::PendingPlacedCommand {
+                log_index: 3,
+                reference_index: 0,
+                ..
+            }
+        ));
+
+        assert!(store.test_clear_pending_metadata_command_slot().unwrap());
+        store
+            .conn
+            .execute(
+                "INSERT INTO objects \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
+                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, \
+                  owner_principal, owner_canonical_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                rusqlite::params![
+                    bucket,
+                    key,
+                    0i64,
+                    1i64,
+                    GenerationId::MIN.get() as i64,
+                    placed_segment.size as i64,
+                    b"etag".as_slice(),
+                    0i64,
+                    1i64,
+                    1i64,
+                    0i64,
+                    0i64,
+                    0i64,
+                    2i64,
+                    "owner",
+                    "c".repeat(32),
+                ],
+            )
+            .unwrap();
+        store.test_insert_object_segment(&placed_segment).unwrap();
+        let durable_restart = store
+            .list_shard_scavenger_reference_page(
+                cursor.as_ref(),
+                NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT).unwrap(),
+            )
+            .unwrap();
+        assert!(durable_restart.complete);
+        assert_eq!(durable_restart.items.len(), 1);
+        assert!(matches!(
+            durable_restart.items[0].cursor,
+            ShardScavengerReferenceCursor::ObjectSegment {
+                segment_index: 0,
                 ..
             }
         ));

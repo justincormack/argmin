@@ -1538,12 +1538,12 @@ fn put_placed_scavenger_reference(
     put_ec_shape(out, reference.ec);
 }
 
-fn put_placed_segment_backfill_reference_cursor(
+fn put_shard_scavenger_reference_cursor(
     out: &mut Vec<u8>,
-    cursor: &PlacedSegmentBackfillReferenceCursor,
+    cursor: &ShardScavengerReferenceCursor,
 ) {
     match cursor {
-        PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+        ShardScavengerReferenceCursor::ObjectSegment {
             bucket,
             key,
             version_id,
@@ -1555,7 +1555,7 @@ fn put_placed_segment_backfill_reference_cursor(
             put_u64(out, *version_id);
             put_u32(out, *segment_index);
         }
-        PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+        ShardScavengerReferenceCursor::StreamUploadSegment {
             session_id,
             segment_index,
         } => {
@@ -1563,7 +1563,7 @@ fn put_placed_segment_backfill_reference_cursor(
             put_string(out, session_id.as_str());
             put_u32(out, *segment_index);
         }
-        PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+        ShardScavengerReferenceCursor::MultipartPartSegment {
             bucket,
             key,
             upload_id,
@@ -1577,14 +1577,54 @@ fn put_placed_segment_backfill_reference_cursor(
             put_u32(out, *part_number);
             put_u32(out, *segment_index);
         }
-        PlacedSegmentBackfillReferenceCursor::PendingCommand {
+        ShardScavengerReferenceCursor::ObjectReclaimSegment {
+            bucket,
+            key,
+            generation_id,
+            segment_index,
+        } => {
+            put_u8(out, 3);
+            put_string(out, bucket.as_str());
+            put_string(out, key.as_str());
+            put_u64(out, generation_id.get());
+            put_u32(out, *segment_index);
+        }
+        ShardScavengerReferenceCursor::MultipartReclaimSegment {
+            bucket,
+            key,
+            generation_id,
+            part_number,
+            segment_index,
+        } => {
+            put_u8(out, 4);
+            put_string(out, bucket.as_str());
+            put_string(out, key.as_str());
+            put_u64(out, generation_id.get());
+            put_u32(out, *part_number);
+            put_u32(out, *segment_index);
+        }
+        ShardScavengerReferenceCursor::PendingPlacedCommand {
             cluster_epoch,
             pg_id,
             log_index,
             command_checksum,
             reference_index,
         } => {
-            put_u8(out, 3);
+            put_u8(out, 5);
+            put_u64(out, cluster_epoch.get());
+            put_u32(out, pg_id.get());
+            put_u64(out, *log_index);
+            put_u64(out, *command_checksum);
+            put_u32(out, *reference_index);
+        }
+        ShardScavengerReferenceCursor::PendingReclaimCommand {
+            cluster_epoch,
+            pg_id,
+            log_index,
+            command_checksum,
+            reference_index,
+        } => {
+            put_u8(out, 6);
             put_u64(out, cluster_epoch.get());
             put_u32(out, pg_id.get());
             put_u64(out, *log_index);

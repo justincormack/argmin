@@ -18,6 +18,7 @@ use crate::internal_tls_protocol::InternalTlsProtocol;
 
 pub(crate) const STORAGE_RPC_TLS_ALPN: &[u8] = InternalTlsProtocol::StorageRpc.alpn();
 const STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT: usize = 8;
+const STORAGE_RPC_CLIENT_SESSION_POOL_MAX_IDLE_PER_ENDPOINT: usize = 16;
 
 pub trait StorageRpcStream: Read + Write + Send {
     fn set_operation_deadline(&mut self, deadline: Instant) -> io::Result<()>;
@@ -82,6 +83,7 @@ enum StorageRpcClientEndpointInner {
     Unix {
         socket_path: PathBuf,
         request_pool: Arc<StorageRpcClientConnectionPool>,
+        session_pool: Arc<StorageRpcClientConnectionPool>,
     },
     #[cfg(test)]
     TestUnpooledUnix { socket_path: PathBuf },
@@ -91,12 +93,14 @@ enum StorageRpcClientEndpointInner {
         server_name: String,
         tls_client_config: Arc<rustls::ClientConfig>,
         request_pool: Arc<StorageRpcClientConnectionPool>,
+        session_pool: Arc<StorageRpcClientConnectionPool>,
     },
 }
 
 struct StorageRpcClientConnectionPool {
     state: Mutex<StorageRpcClientConnectionPoolState>,
     available: Condvar,
+    max_idle: usize,
 }
 
 #[derive(Default)]
@@ -127,7 +131,12 @@ impl StorageRpcClientEndpoint {
         Self {
             inner: StorageRpcClientEndpointInner::Unix {
                 socket_path: socket_path.into(),
-                request_pool: Arc::new(StorageRpcClientConnectionPool::new()),
+                request_pool: Arc::new(StorageRpcClientConnectionPool::new(
+                    STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT,
+                )),
+                session_pool: Arc::new(StorageRpcClientConnectionPool::new(
+                    STORAGE_RPC_CLIENT_SESSION_POOL_MAX_IDLE_PER_ENDPOINT,
+                )),
             },
         }
     }
@@ -194,7 +203,12 @@ impl StorageRpcClientEndpoint {
                 addresses,
                 server_name,
                 tls_client_config,
-                request_pool: Arc::new(StorageRpcClientConnectionPool::new()),
+                request_pool: Arc::new(StorageRpcClientConnectionPool::new(
+                    STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT,
+                )),
+                session_pool: Arc::new(StorageRpcClientConnectionPool::new(
+                    STORAGE_RPC_CLIENT_SESSION_POOL_MAX_IDLE_PER_ENDPOINT,
+                )),
             },
         })
     }
@@ -308,7 +322,62 @@ impl StorageRpcClientEndpoint {
             StorageRpcClientEndpointInner::Unix {
                 socket_path,
                 request_pool,
-            } => request_pool.checkout(deadline, io_timeout, max_connections, || {
+                ..
+            } => request_pool.checkout(
+                deadline,
+                io_timeout,
+                max_connections.clamp(1, STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT),
+                || {
+                    let stream = connect_unix_stream_until(
+                        socket_path,
+                        deadline,
+                        "storage RPC absolute operation deadline expired",
+                    )
+                    .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
+                    let stream = DeadlineStream::new(
+                        stream,
+                        deadline,
+                        "storage RPC absolute operation deadline expired",
+                    )
+                    .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
+                    Ok(Box::new(stream))
+                },
+            ),
+            #[cfg(test)]
+            StorageRpcClientEndpointInner::TestUnpooledUnix { .. } => self
+                .connect_classified(deadline)
+                .map(|stream| StorageRpcRequestConnection {
+                    stream: Some(stream),
+                    pool: None,
+                    reusable: false,
+                }),
+            StorageRpcClientEndpointInner::Tcp {
+                addresses,
+                server_name,
+                tls_client_config,
+                request_pool,
+                ..
+            } => request_pool.checkout(
+                deadline,
+                io_timeout,
+                max_connections.clamp(1, STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT),
+                || connect_tls_tcp(addresses, server_name, tls_client_config, deadline),
+            ),
+        }
+    }
+
+    pub(crate) fn connect_session(
+        &self,
+        deadline: Instant,
+        io_timeout: Duration,
+        max_connections: usize,
+    ) -> Result<StorageRpcRequestConnection, StorageRpcEndpointConnectFailure> {
+        match &self.inner {
+            StorageRpcClientEndpointInner::Unix {
+                socket_path,
+                session_pool,
+                ..
+            } => session_pool.checkout(deadline, io_timeout, max_connections.max(1), || {
                 let stream = connect_unix_stream_until(
                     socket_path,
                     deadline,
@@ -335,11 +404,25 @@ impl StorageRpcClientEndpoint {
                 addresses,
                 server_name,
                 tls_client_config,
-                request_pool,
+                session_pool,
                 ..
-            } => request_pool.checkout(deadline, io_timeout, max_connections, || {
+            } => session_pool.checkout(deadline, io_timeout, max_connections.max(1), || {
                 connect_tls_tcp(addresses, server_name, tls_client_config, deadline)
             }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn idle_session_connection_count_for_test(&self) -> usize {
+        match &self.inner {
+            StorageRpcClientEndpointInner::Unix { session_pool, .. }
+            | StorageRpcClientEndpointInner::Tcp { session_pool, .. } => session_pool
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .idle
+                .len(),
+            StorageRpcClientEndpointInner::TestUnpooledUnix { .. } => 0,
         }
     }
 }
@@ -427,10 +510,11 @@ pub(crate) fn validate_storage_rpc_tls_server_config(
 }
 
 impl StorageRpcClientConnectionPool {
-    fn new() -> Self {
+    fn new(max_idle: usize) -> Self {
         Self {
             state: Mutex::new(StorageRpcClientConnectionPoolState::default()),
             available: Condvar::new(),
+            max_idle,
         }
     }
 
@@ -441,8 +525,7 @@ impl StorageRpcClientConnectionPool {
         configured_max_connections: usize,
         connect: impl FnOnce() -> Result<BoxStorageRpcStream, StorageRpcEndpointConnectFailure>,
     ) -> Result<StorageRpcRequestConnection, StorageRpcEndpointConnectFailure> {
-        let max_connections = configured_max_connections
-            .clamp(1, STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT);
+        let max_connections = configured_max_connections.max(1);
         let max_idle_age = io_timeout / 2;
         let mut connect = Some(connect);
 
@@ -519,6 +602,14 @@ impl StorageRpcClientConnectionPool {
 
     fn return_connection(&self, stream: BoxStorageRpcStream) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.idle.len() >= self.max_idle {
+            state.open = state
+                .open
+                .checked_sub(1)
+                .expect("storage RPC pool connection release without checkout");
+            self.available.notify_one();
+            return;
+        }
         state.idle.push(IdleStorageRpcConnection {
             stream,
             idle_since: Instant::now(),
@@ -528,6 +619,15 @@ impl StorageRpcClientConnectionPool {
 }
 
 impl StorageRpcRequestConnection {
+    #[cfg(test)]
+    pub(crate) fn unpooled_for_test(stream: BoxStorageRpcStream) -> Self {
+        Self {
+            stream: Some(stream),
+            pool: None,
+            reusable: false,
+        }
+    }
+
     pub(crate) fn stream_mut(&mut self) -> &mut BoxStorageRpcStream {
         self.stream
             .as_mut()
@@ -1154,7 +1254,7 @@ mod tests {
 
     #[test]
     fn request_pool_reuses_only_successfully_completed_connections() {
-        let pool = Arc::new(StorageRpcClientConnectionPool::new());
+        let pool = Arc::new(StorageRpcClientConnectionPool::new(1));
         let deadline = Instant::now() + Duration::from_secs(1);
         let (first_stream, _first_peer) = UnixStream::pair().unwrap();
         let mut first = pool
@@ -1190,5 +1290,34 @@ mod tests {
         assert_eq!(pool.state.lock().unwrap().open, 1);
         drop(replacement);
         assert_eq!(pool.state.lock().unwrap().open, 0);
+    }
+
+    #[test]
+    fn session_pool_bounds_idle_connections_below_its_active_limit() {
+        let pool = Arc::new(StorageRpcClientConnectionPool::new(1));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (first_stream, _first_peer) = UnixStream::pair().unwrap();
+        let (second_stream, _second_peer) = UnixStream::pair().unwrap();
+        let mut first = pool
+            .checkout(deadline, Duration::from_secs(1), 2, || {
+                accepted_unix_stream(first_stream, deadline)
+                    .map_err(StorageRpcEndpointConnectFailure::transport)
+            })
+            .unwrap();
+        let mut second = pool
+            .checkout(deadline, Duration::from_secs(1), 2, || {
+                accepted_unix_stream(second_stream, deadline)
+                    .map_err(StorageRpcEndpointConnectFailure::transport)
+            })
+            .unwrap();
+
+        first.mark_reusable();
+        second.mark_reusable();
+        drop(first);
+        drop(second);
+
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.open, 1);
+        assert_eq!(state.idle.len(), 1);
     }
 }

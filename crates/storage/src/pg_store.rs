@@ -69,6 +69,13 @@ pub(crate) enum PendingMetadataCommandSlotInsertError {
     MayHaveApplied(StoreError),
 }
 
+struct PendingShardScavengerReferencePages {
+    placed_reference_count: u32,
+    placed_pages: Vec<Vec<u8>>,
+    reclaim_reference_count: u32,
+    reclaim_pages: Vec<Vec<u8>>,
+}
+
 impl PendingMetadataCommandSlotInsertError {
     pub(crate) fn definitive(source: StoreError) -> Self {
         Self::Definitive(source)
@@ -728,6 +735,8 @@ pub struct PgStore {
     metadata_command_log_prefix_fast_path_hits: AtomicU64,
     #[cfg(test)]
     metadata_command_log_replay_validation_entries: AtomicU64,
+    #[cfg(test)]
+    shard_scavenger_reference_match_calls: AtomicU64,
 }
 
 #[cfg(test)]
@@ -956,6 +965,8 @@ pub(crate) fn inspect_pg_shard_inventory(
         metadata_command_log_prefix_fast_path_hits: AtomicU64::new(0),
         #[cfg(test)]
         metadata_command_log_replay_validation_entries: AtomicU64::new(0),
+        #[cfg(test)]
+        shard_scavenger_reference_match_calls: AtomicU64::new(0),
     };
     let rows = store.list_shard_inventory_rows()?;
     let scan = store.list_scavenger_shard_files()?;
@@ -1229,6 +1240,8 @@ impl PgStore {
             metadata_command_log_prefix_fast_path_hits: AtomicU64::new(0),
             #[cfg(test)]
             metadata_command_log_replay_validation_entries: AtomicU64::new(0),
+            #[cfg(test)]
+            shard_scavenger_reference_match_calls: AtomicU64::new(0),
         })
         .and_then(|store| {
             store.ensure_metadata_digest_bootstrap()?;

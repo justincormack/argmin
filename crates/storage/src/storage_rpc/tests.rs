@@ -240,7 +240,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(bytes, V21_FRAME);
+        const V22_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 22, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 202, 74, 215, 141, 132, 131, 9, 128, 97, 98, 99,
+        ];
+        assert_eq!(bytes, V22_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
@@ -257,13 +262,17 @@ mod tests {
             decode_storage_rpc_frame(V20_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(20))
         );
+        assert_eq!(
+            decode_storage_rpc_frame(V21_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(21))
+        );
     }
 
     #[test]
-    fn current_storage_rpc_v21_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
+    fn current_storage_rpc_v22_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
     {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 21);
-        const EXPECTED_V21_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65150008070605040302013a006801000070a672ed3efe83ca0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 22);
+        const EXPECTED_V22_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65160008070605040302013a0068010000ffac5bdc61c4e5260700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
 
         let bucket = BucketName::try_from("rpc").unwrap();
         let key = ObjectKey::try_from("k").unwrap();
@@ -307,7 +316,9 @@ mod tests {
             &payload,
         )
         .unwrap();
-        assert_eq!(hex_bytes(&frame), EXPECTED_V21_FRAME_HEX);
+        let encoded_frame_hex = hex_bytes(&frame);
+        assert_eq!(encoded_frame_hex.len(), EXPECTED_V22_FRAME_HEX.len());
+        assert_eq!(encoded_frame_hex, EXPECTED_V22_FRAME_HEX);
 
         let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
         assert_eq!(
@@ -423,6 +434,44 @@ mod tests {
     }
 
     #[test]
+    fn storage_rpc_v22_shard_scavenger_reclaim_reference_page_payload_is_stable() {
+        const V22_RECLAIM_REFERENCE_PAGE_PAYLOAD: &[u8] = &[
+            1, 1, 0, 3, 3, 0, 0, 0, 98, 98, 98, 1, 0, 0, 0, 107, 5, 0, 0, 0, 0, 0, 0, 0,
+            6, 0, 0, 0, 1, 7, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+            9, 0, 0, 0, 0, 0, 0, 0, 2, 1,
+        ];
+        let page = ShardScavengerReferencePage {
+            complete: true,
+            items: vec![ShardScavengerReferencePageItem {
+                cursor: ShardScavengerReferenceCursor::ObjectReclaimSegment {
+                    bucket: crate::tests::bucket_name("bbb"),
+                    key: crate::tests::object_key("k"),
+                    generation_id: GenerationId::new(5).unwrap(),
+                    segment_index: 6,
+                },
+                reference: ShardScavengerPayloadReference::ReclaimOnly(
+                    ShardScavengerReclaimShardSetReference {
+                        data_pg_id: 7,
+                        okh: [8; 16],
+                        generation_id: GenerationId::new(9).unwrap(),
+                        ec: EcShape { k: 2, m: 1 },
+                    },
+                ),
+            }],
+        };
+        let payload = encode_shard_scavenger_reference_page_response(&page).unwrap();
+
+        assert_eq!(payload, V22_RECLAIM_REFERENCE_PAGE_PAYLOAD);
+        assert_eq!(
+            decode_shard_scavenger_reference_page_response(
+                V22_RECLAIM_REFERENCE_PAGE_PAYLOAD
+            )
+            .unwrap(),
+            page
+        );
+    }
+
+    #[test]
     fn storage_rpc_frame_rejects_resealed_old_and_new_version_fixtures() {
         assert_eq!(
             decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(16)),
@@ -445,8 +494,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(20))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(22)),
-            Err(StorageRpcFrameError::UnsupportedVersion(22))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(21)),
+            Err(StorageRpcFrameError::UnsupportedVersion(21))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(23)),
+            Err(StorageRpcFrameError::UnsupportedVersion(23))
         );
     }
 
@@ -2927,37 +2980,57 @@ mod tests {
             references
         );
 
-        let page_cursor = PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+        let page_cursor = ShardScavengerReferenceCursor::ObjectSegment {
             bucket: crate::tests::bucket_name("page-bucket"),
             key: crate::tests::object_key("page-key"),
             version_id: 7,
             segment_index: 2,
         };
-        let page_request = StorageRpcPlacedSegmentBackfillReferencePageRequest {
+        let page_request = StorageRpcShardScavengerReferencePageRequest {
             route: route.clone(),
             after: Some(page_cursor.clone()),
             limit: NonZeroU16::new(32).unwrap(),
         };
         assert_eq!(
-            decode_placed_segment_backfill_reference_page_request(
-                &encode_placed_segment_backfill_reference_page_request(&page_request).unwrap()
+            decode_shard_scavenger_reference_page_request(
+                &encode_shard_scavenger_reference_page_request(&page_request).unwrap()
             )
             .unwrap(),
             page_request
         );
         for cursor in [
-            PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+            ShardScavengerReferenceCursor::StreamUploadSegment {
                 session_id: crate::tests::stream_session_id("page-session"),
                 segment_index: 3,
             },
-            PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+            ShardScavengerReferenceCursor::MultipartPartSegment {
                 bucket: crate::tests::bucket_name("page-bucket"),
                 key: crate::tests::object_key("page-key"),
                 upload_id: crate::tests::multipart_upload_id("page-upload"),
                 part_number: 4,
                 segment_index: 5,
             },
-            PlacedSegmentBackfillReferenceCursor::PendingCommand {
+            ShardScavengerReferenceCursor::ObjectReclaimSegment {
+                bucket: crate::tests::bucket_name("page-bucket"),
+                key: crate::tests::object_key("page-key"),
+                generation_id: GenerationId::new(6).unwrap(),
+                segment_index: 7,
+            },
+            ShardScavengerReferenceCursor::MultipartReclaimSegment {
+                bucket: crate::tests::bucket_name("page-bucket"),
+                key: crate::tests::object_key("page-key"),
+                generation_id: GenerationId::new(6).unwrap(),
+                part_number: 7,
+                segment_index: 8,
+            },
+            ShardScavengerReferenceCursor::PendingPlacedCommand {
+                cluster_epoch: ClusterEpoch::new(7).unwrap(),
+                pg_id: PgId::new(3),
+                log_index: 8,
+                command_checksum: 9,
+                reference_index: 6,
+            },
+            ShardScavengerReferenceCursor::PendingReclaimCommand {
                 cluster_epoch: ClusterEpoch::new(7).unwrap(),
                 pg_id: PgId::new(3),
                 log_index: 8,
@@ -2965,43 +3038,59 @@ mod tests {
                 reference_index: 6,
             },
         ] {
-            let request = StorageRpcPlacedSegmentBackfillReferencePageRequest {
+            let request = StorageRpcShardScavengerReferencePageRequest {
                 route: route.clone(),
                 after: Some(cursor),
                 limit: NonZeroU16::new(32).unwrap(),
             };
             assert_eq!(
-                decode_placed_segment_backfill_reference_page_request(
-                    &encode_placed_segment_backfill_reference_page_request(&request).unwrap()
+                decode_shard_scavenger_reference_page_request(
+                    &encode_shard_scavenger_reference_page_request(&request).unwrap()
                 )
                 .unwrap(),
                 request
             );
         }
-        let page = PlacedSegmentBackfillReferencePage {
-            items: vec![PlacedSegmentBackfillReferencePageItem {
+        let page = ShardScavengerReferencePage {
+            items: vec![ShardScavengerReferencePageItem {
                 cursor: page_cursor,
-                reference: match &references[0] {
-                    ShardScavengerPayloadReference::Placed(reference) => reference.clone(),
-                    ShardScavengerPayloadReference::ReclaimOnly(_) => unreachable!(),
-                },
+                reference: references[0].clone(),
             }],
             complete: false,
         };
         assert_eq!(
-            decode_placed_segment_backfill_reference_page_response(
-                &encode_placed_segment_backfill_reference_page_response(&page).unwrap()
+            decode_shard_scavenger_reference_page_response(
+                &encode_shard_scavenger_reference_page_response(&page).unwrap()
             )
             .unwrap(),
             page
         );
-        let oversized_request = StorageRpcPlacedSegmentBackfillReferencePageRequest {
+        let ShardScavengerPayloadReference::Placed(expected) = &references[0] else {
+            unreachable!("first test reference is placed");
+        };
+        let match_request = StorageRpcShardScavengerReferenceMatchRequest {
+            route: route.clone(),
+            cursor: page.items[0].cursor.clone(),
+            expected: expected.clone(),
+        };
+        assert_eq!(
+            decode_shard_scavenger_reference_match_request(
+                &encode_shard_scavenger_reference_match_request(&match_request).unwrap()
+            )
+            .unwrap(),
+            match_request
+        );
+        assert!(decode_shard_scavenger_reference_match_response(
+            &encode_shard_scavenger_reference_match_response(true)
+        )
+        .unwrap());
+        let oversized_request = StorageRpcShardScavengerReferencePageRequest {
             route: route.clone(),
             after: None,
-            limit: NonZeroU16::new(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT + 1).unwrap(),
+            limit: NonZeroU16::new(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT + 1).unwrap(),
         };
         assert!(matches!(
-            encode_placed_segment_backfill_reference_page_request(&oversized_request),
+            encode_shard_scavenger_reference_page_request(&oversized_request),
             Err(StorageRpcPayloadError::PayloadTooLarge { .. })
         ));
 
@@ -3441,8 +3530,18 @@ mod tests {
             ),
             (
                 StorageRpcMessageKind::PlacedSegmentBackfillReferencePage,
-                STORAGE_RPC_MAX_PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN + 1,
-                STORAGE_RPC_MAX_PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN,
+                STORAGE_RPC_MAX_SHARD_SCAVENGER_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_SCAVENGER_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerReferencePage,
+                STORAGE_RPC_MAX_SHARD_SCAVENGER_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_SCAVENGER_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerReferenceMatch,
+                STORAGE_RPC_MAX_SHARD_SCAVENGER_REFERENCE_MATCH_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_SHARD_SCAVENGER_REFERENCE_MATCH_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::ShardScavengerObservations,

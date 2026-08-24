@@ -12,7 +12,8 @@
         LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandApplyErrorKind,
         MetadataCommandInspectionNodeClient, MetadataCommandPendingSlotReplaceError,
         MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient,
-        ObjectMutationMetadataNodeClient, PlacedShardNodeClient,
+        ObjectMutationMetadataNodeClient, ObjectPayloadLeaseKind, ObjectPayloadLeaseNodeClient,
+        PlacedShardNodeClient, ShardReadHandleNodeClient,
         RetainedBucketWriteReservationNodeClient, UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
@@ -5353,7 +5354,7 @@
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [20_u16, 22] {
+            for unsupported_version in [21_u16, 23] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());
@@ -5675,6 +5676,329 @@
             assert_eq!(health.node_id, config.node_id);
             assert_eq!(health.cluster_epoch, config.cluster_epoch);
         }
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_tls_payload_lease_release_reuses_the_session_connection() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+            .bind()
+            .unwrap();
+        let address = server.tcp_listener_addr_for_test();
+        let join = thread::spawn(move || server.accept_one());
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let bucket = BucketName::new("tls-lease-reuse-bucket").unwrap();
+        let generation_id = GenerationId::new(1).unwrap();
+
+        for attempt in 0..2 {
+            let key = crate::ObjectKey::new(format!("tls-lease-reuse-key-{attempt}")).unwrap();
+            let mut lease = client
+                .open_object_payload_lease_route(
+                    config.cluster_epoch,
+                    &bucket,
+                    &key,
+                    generation_id,
+                )
+                .unwrap()
+                .acquire_object_payload_lease(ObjectPayloadLeaseKind::BroadSnapshot)
+                .unwrap()
+                .expect("lease should be acquired");
+
+            assert_eq!(client.idle_session_connection_count_for_test(), 0);
+            assert_eq!(lease.release().unwrap(), 0);
+            drop(lease);
+            assert_eq!(client.idle_session_connection_count_for_test(), 1);
+        }
+
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_tls_multi_client_lease_saturation_preserves_read_handoff() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth_with_max_connections(&credential, 2))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
+                .bind()
+                .unwrap(),
+        );
+        let address = server.tcp_listener_addr_for_test();
+        let joins = (0..3)
+            .map(|_| {
+                let server = Arc::clone(&server);
+                thread::spawn(move || server.accept_one())
+            })
+            .collect::<Vec<_>>();
+        let new_client = || {
+            let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap();
+            UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+                config.node_id,
+                config.cluster_epoch,
+                endpoint,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                Some(storage_rpc_client_auth_with_max_connections(
+                    credential.clone(),
+                    9,
+                    2,
+                )),
+            )
+        };
+        let first_client = new_client();
+        let second_client = new_client();
+        let bucket = BucketName::new("tls-lease-handoff-bucket").unwrap();
+        let key = crate::ObjectKey::new("tls-lease-handoff-key").unwrap();
+        let generation_id = GenerationId::new(1).unwrap();
+        let mut lease = first_client
+            .open_object_payload_lease_route(
+                config.cluster_epoch,
+                &bucket,
+                &key,
+                generation_id,
+            )
+            .unwrap()
+            .acquire_object_payload_lease(ObjectPayloadLeaseKind::BroadSnapshot)
+            .unwrap()
+            .expect("first client must acquire the globally admitted lease");
+
+        let error = match second_client
+            .open_object_payload_lease_route(
+                config.cluster_epoch,
+                &bucket,
+                &key,
+                generation_id,
+            )
+            .unwrap()
+            .acquire_object_payload_lease(ObjectPayloadLeaseKind::BroadSnapshot)
+        {
+            Ok(_) => panic!("second client consumed the read-handoff reservation"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            StoreError::StorageRpcResourceExhausted { .. }
+        ));
+
+        let location = test_location(config.cluster_epoch.get(), 0, config.node_id.as_u32());
+        let shard_key = test_shard_key(location.shard_index().get());
+        let shard_payload = b"read data through the saturated read-handle session";
+        let expected_ack = server
+            ._node
+            .write_shard_file(location.data_pg_id().get(), &shard_key, shard_payload)
+            .unwrap();
+        let mut read_handle = ShardReadHandleNodeClient::open_shard_read_handle_route(
+            &first_client,
+            config.cluster_epoch,
+            "saturated-read-handoff",
+            vec![(location, shard_key.clone())],
+        )
+        .unwrap()
+        .acquire()
+        .expect("the reserved server slot must admit the read-handle handoff");
+        let mut read_payload = vec![0; shard_payload.len()];
+        read_handle
+            .read_placed_shard_into(location, &shard_key, expected_ack, &mut read_payload)
+            .expect("the retained read-handle session must carry the shard read");
+        assert_eq!(read_payload, shard_payload);
+        read_handle.release().unwrap();
+        let released_error = read_handle
+            .read_placed_shard_into(location, &shard_key, expected_ack, &mut read_payload)
+            .unwrap_err();
+        assert!(matches!(
+            released_error,
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "read placed shard through released read-handle lease",
+            }
+        ));
+        assert_eq!(lease.release().unwrap(), 0);
+        drop(read_handle);
+        drop(lease);
+        drop(first_client);
+        drop(second_client);
+        for join in joins {
+            assert!(join.join().unwrap().is_ok());
+        }
+    }
+
+    #[test]
+    fn authenticated_tls_shard_reads_require_exact_active_session_handle() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
+                .bind()
+                .unwrap(),
+        );
+        let address = server.tcp_listener_addr_for_test();
+        let serving = Arc::clone(&server);
+        let join = thread::spawn(move || serving.accept_one());
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let location = test_location(config.cluster_epoch.get(), 0, config.node_id.as_u32());
+        let shard_key = test_shard_key(location.shard_index().get());
+        let payload = b"session-bound shard payload";
+        let expected_ack = server
+            ._node
+            .write_shard_file(location.data_pg_id().get(), &shard_key, payload)
+            .unwrap();
+        let foreign_location = test_location_with_shard(
+            config.cluster_epoch.get(),
+            0,
+            config.node_id.as_u32(),
+            1,
+        );
+        let foreign_key = test_shard_key(foreign_location.shard_index().get());
+        let foreign_payload = b"foreign session-bound shard payload";
+        let foreign_ack = server
+            ._node
+            .write_shard_file(
+                foreign_location.data_pg_id().get(),
+                &foreign_key,
+                foreign_payload,
+            )
+            .unwrap();
+        let mut session = client.open_read_handle_session_for_test().unwrap();
+
+        let mut read = vec![0; payload.len()];
+        let missing_full_error = session
+            .read_full_placed_shard_for_test(location, &shard_key, expected_ack)
+            .unwrap_err();
+        assert!(matches!(
+            missing_full_error,
+            StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            }
+        ));
+        let missing_error = session
+            .read_placed_shard_into_for_test(location, &shard_key, expected_ack, &mut read)
+            .unwrap_err();
+        assert!(matches!(
+            missing_error,
+            StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            }
+        ));
+
+        session
+            .acquire_read_handles("exact-read", vec![(location, shard_key.clone())])
+            .unwrap();
+        let mut foreign_read = vec![0; foreign_payload.len()];
+        let foreign_full_error = session
+            .read_full_placed_shard_for_test(foreign_location, &foreign_key, foreign_ack)
+            .unwrap_err();
+        assert!(matches!(
+            foreign_full_error,
+            StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            }
+        ));
+        let foreign_error = session
+            .read_placed_shard_into_for_test(
+                foreign_location,
+                &foreign_key,
+                foreign_ack,
+                &mut foreign_read,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            foreign_error,
+            StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            }
+        ));
+        let full_read = session
+            .read_full_placed_shard_for_test(location, &shard_key, expected_ack)
+            .unwrap();
+        assert_eq!(full_read, payload);
+        session
+            .read_placed_shard_into_for_test(location, &shard_key, expected_ack, &mut read)
+            .unwrap();
+        assert_eq!(read, payload);
+
+        session.release_read_handles("exact-read").unwrap();
+        let released_full_error = session
+            .read_full_placed_shard_for_test(location, &shard_key, expected_ack)
+            .unwrap_err();
+        assert!(matches!(
+            released_full_error,
+            StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            }
+        ));
+        let released_error = session
+            .read_placed_shard_into_for_test(location, &shard_key, expected_ack, &mut read)
+            .unwrap_err();
+        assert!(matches!(
+            released_error,
+            StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            }
+        ));
+        drop(session);
         drop(client);
         assert!(join.join().unwrap().is_ok());
     }

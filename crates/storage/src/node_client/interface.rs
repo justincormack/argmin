@@ -1228,8 +1228,10 @@ pub(crate) trait PlacedShardRoute: Send {
 
     fn repair_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError>;
 
+    #[cfg(test)]
     fn read_placed_shard(&self, expected_ack: WriteAck) -> Result<Vec<u8>, StoreError>;
 
+    #[cfg(test)]
     fn read_placed_shard_into(
         &self,
         expected_ack: WriteAck,
@@ -1258,6 +1260,14 @@ pub(crate) trait RetainedPlacedShardRoute: Send {
 }
 
 pub(crate) trait ShardReadHandleLease: Send {
+    fn read_placed_shard_into(
+        &mut self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError>;
+
     fn release(&mut self) -> Result<(), StoreError>;
 }
 
@@ -1275,6 +1285,8 @@ pub(crate) trait ShardReadHandleRoute: Send {
 }
 
 pub(crate) trait ObjectPayloadLeaseNodeLease: Send {
+    fn node_id(&self) -> NodeId;
+
     fn release(&mut self) -> Result<usize, StoreError>;
 }
 
@@ -1460,11 +1472,23 @@ pub(crate) trait ShardScavengerDataRoute: Send {
 }
 
 pub(crate) trait ShardScavengerObjectScanRoute: Send {
-    fn list_placed_segment_backfill_reference_page(
+    fn list_placed_shard_scavenger_reference_page(
         &self,
-        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        after: Option<&ShardScavengerReferenceCursor>,
         limit: std::num::NonZeroU16,
-    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError>;
+    ) -> Result<ShardScavengerReferencePage, StoreError>;
+
+    fn list_shard_scavenger_reference_page(
+        &self,
+        after: Option<&ShardScavengerReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<ShardScavengerReferencePage, StoreError>;
+
+    fn shard_scavenger_reference_matches(
+        &self,
+        cursor: &ShardScavengerReferenceCursor,
+        expected: &crate::types::ShardScavengerPlacedShardSetReference,
+    ) -> Result<bool, StoreError>;
 
     fn list_shard_scavenger_payload_references(
         &self,

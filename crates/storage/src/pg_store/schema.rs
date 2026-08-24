@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 5;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 6;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -731,6 +731,8 @@ CREATE TABLE metadata_command_pending_slot (
     publication_started INTEGER NOT NULL DEFAULT 0 CHECK (publication_started IN (0, 1)),
     placed_segment_reference_count INTEGER NOT NULL \
         CHECK (placed_segment_reference_count BETWEEN 0 AND 4294967295),
+    reclaim_reference_count INTEGER NOT NULL DEFAULT 0 \
+        CHECK (reclaim_reference_count BETWEEN 0 AND 4294967295),
     scope_bucket     TEXT
 ) STRICT";
 
@@ -744,6 +746,17 @@ CREATE TABLE metadata_command_pending_placed_reference_pages (
     page_index        INTEGER NOT NULL CHECK (page_index >= 0),
     reference_count   INTEGER NOT NULL CHECK (reference_count BETWEEN 1 AND 64),
     encoded_references BLOB NOT NULL CHECK (length(encoded_references) = reference_count * 54),
+    PRIMARY KEY (singleton, page_index),
+    FOREIGN KEY (singleton) REFERENCES metadata_command_pending_slot(singleton) ON DELETE CASCADE
+) STRICT";
+
+/// Fixed-size pages of reclaim-only references extracted from the pending command.
+const CREATE_METADATA_COMMAND_PENDING_RECLAIM_REFERENCE_PAGES_TABLE: &str = "\
+CREATE TABLE metadata_command_pending_reclaim_reference_pages (
+    singleton         INTEGER NOT NULL CHECK (singleton = 0),
+    page_index        INTEGER NOT NULL CHECK (page_index >= 0),
+    reference_count   INTEGER NOT NULL CHECK (reference_count BETWEEN 1 AND 64),
+    encoded_references BLOB NOT NULL CHECK (length(encoded_references) = reference_count * 30),
     PRIMARY KEY (singleton, page_index),
     FOREIGN KEY (singleton) REFERENCES metadata_command_pending_slot(singleton) ON DELETE CASCADE
 ) STRICT";
@@ -1017,6 +1030,10 @@ fn create_current_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE_METADATA_COMMAND_PENDING_PLACED_REFERENCE_PAGES_TABLE,
         [],
     )?;
+    conn.execute(
+        CREATE_METADATA_COMMAND_PENDING_RECLAIM_REFERENCE_PAGES_TABLE,
+        [],
+    )?;
     conn.execute(CREATE_METADATA_COMMAND_PENDING_ROUTE_DEPENDENCIES_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_CHECKPOINTS_TABLE, [])?;
@@ -1264,6 +1281,10 @@ mod tests {
             version: 5,
             catalogue: include_str!("schema_manifests/pg_schema_v5.catalogue"),
         },
+        FrozenPgSchemaManifest {
+            version: 6,
+            catalogue: include_str!("schema_manifests/pg_schema_v6.catalogue"),
+        },
     ];
 
     fn canonical_pg_schema_catalogue(conn: &Connection) -> String {
@@ -1388,7 +1409,7 @@ mod tests {
             .iter()
             .map(|manifest| manifest.version)
             .collect::<Vec<_>>();
-        assert_eq!(frozen_versions, [1, 2, 3, 4, 5]);
+        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6]);
         for manifest in FROZEN_PG_SCHEMA_MANIFESTS {
             validate_frozen_pg_schema_catalogue(manifest.catalogue);
         }
@@ -1517,7 +1538,7 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        for version in [1, 2, 3, 4, 6] {
+        for version in [1, 2, 3, 4, 5, 7] {
             let conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "user_version", version).unwrap();
 

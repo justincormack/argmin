@@ -1,7 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use super::super::{ObjectReadMetadataRoute, RequestWorkBudget, RetainedActiveRouteRepairFence};
@@ -397,7 +397,7 @@ impl StorageCluster {
             });
         }
 
-        let broad_lease = payload_lease.ok_or(StoreError::NotFound)?;
+        let mut broad_lease = payload_lease.ok_or(StoreError::NotFound)?;
         let broad_leased_node_ids = broad_lease.leased_node_ids();
         let mut locations = Vec::new();
         let mut segment_locations = Vec::with_capacity(segments.len());
@@ -421,14 +421,13 @@ impl StorageCluster {
             segment_locations.push(placed);
         }
         require_valid_route()?;
-        let narrow_lease = self.acquire_available_object_payload_lease_for_shard_locations(
-            &bucket,
-            &key,
-            live.generation_id,
-            &locations,
-        )?;
+        let retained_node_ids = locations
+            .iter()
+            .map(|location| location.node_id())
+            .collect::<BTreeSet<_>>();
+        broad_lease.retain_node_ids(&retained_node_ids)?;
         require_valid_route()?;
-        let leased_node_ids = narrow_lease.leased_node_ids().clone();
+        let leased_node_ids = broad_lease.leased_node_ids().clone();
         for (segment, placed) in segments.iter().zip(&segment_locations) {
             if segment.stored_bytes_request().stored_size == 0 {
                 continue;
@@ -439,6 +438,12 @@ impl StorageCluster {
                 .filter(|location| leased_node_ids.contains(&location.node_id()))
                 .count();
             if available < required {
+                if broad_lease.reclaim_fenced() {
+                    return Err(StoreError::NotFound);
+                }
+                if let Some(error) = broad_lease.take_unavailable_error() {
+                    return Err(error);
+                }
                 return Err(StoreError::NotFound);
             }
         }
@@ -450,10 +455,9 @@ impl StorageCluster {
             generation_id: live.generation_id,
             segments,
             leased_node_ids,
-            lease: Mutex::new(Some(narrow_lease)),
+            lease: Mutex::new(Some(broad_lease)),
             repair_fence,
         };
-        drop(broad_lease);
         Ok(Some(retained))
     }
 
@@ -480,10 +484,16 @@ impl StorageCluster {
         let key = authority.key();
         let generation_id = authority.generation_id();
         let runtime_state = self.ensure_object_payload_lease_allowed(bucket, key, generation_id)?;
-        let acquired = self
+        let mut acquired = self
             .local_map
             .try_acquire_available_object_payload_lease(authority)?;
         if acquired.node_leases.is_empty() {
+            if acquired.reclaim_fenced {
+                return Err(StoreError::NotFound);
+            }
+            if let Some(error) = acquired.unavailable_error.take() {
+                return Err(error);
+            }
             return Err(StoreError::NotFound);
         }
         Ok(ObjectPayloadLease::new(

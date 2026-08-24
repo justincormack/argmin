@@ -150,24 +150,15 @@ impl UnixStorageNodeClient {
         })
     }
 
+    #[cfg(test)]
     fn read_placed_shard(
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
         expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError> {
-        let request = StorageRpcShardReadRequest {
-            location: self.shard_location(data_pg_id, key).into(),
-            shard_key: key.clone(),
-            expected_ack,
-        };
-        let payload = encode_shard_read_request(&request).map_err(|error| {
-            self.rpc_payload_error("encode shard read request", error.to_string())
-        })?;
-        let response = self.rpc_request(StorageRpcMessageKind::ShardRead, payload)?;
-        decode_shard_read_response(&response, expected_ack).map_err(|error| {
-            self.rpc_payload_error("decode shard read response", error.to_string())
-        })
+        let location = self.shard_location(data_pg_id, key);
+        self.read_full_placed_shard_with_handle_for_test(location, key, expected_ack)
     }
 
     pub(crate) fn read_placed_shard_for_historical_inspection(
@@ -188,6 +179,7 @@ impl UnixStorageNodeClient {
         })
     }
 
+    #[cfg(test)]
     fn read_placed_shard_range(
         &self,
         data_pg_id: DataPgId,
@@ -392,31 +384,85 @@ impl UnixStorageNodeClient {
         })
     }
 
-    fn list_placed_segment_backfill_reference_page(
+    fn list_shard_scavenger_reference_page(
         &self,
         pg_id: ObjectMetadataScanPgId,
-        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        after: Option<&ShardScavengerReferenceCursor>,
         limit: std::num::NonZeroU16,
-    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError> {
-        let request = StorageRpcPlacedSegmentBackfillReferencePageRequest {
+    ) -> Result<ShardScavengerReferencePage, StoreError> {
+        let request = StorageRpcShardScavengerReferencePageRequest {
             route: self.bucket_pg_request(pg_id.pg_id()),
             after: after.cloned(),
             limit,
         };
-        let payload =
-            encode_placed_segment_backfill_reference_page_request(&request).map_err(|error| {
-                self.rpc_payload_error(
-                    "encode placed segment backfill reference page request",
-                    error.to_string(),
-                )
-            })?;
+        let payload = encode_shard_scavenger_reference_page_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode shard scavenger reference page request",
+                error.to_string(),
+            )
+        })?;
+        let response =
+            self.rpc_request(StorageRpcMessageKind::ShardScavengerReferencePage, payload)?;
+        decode_shard_scavenger_reference_page_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode shard scavenger reference page response",
+                error.to_string(),
+            )
+        })
+    }
+
+    fn list_placed_shard_scavenger_reference_page(
+        &self,
+        pg_id: ObjectMetadataScanPgId,
+        after: Option<&ShardScavengerReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<ShardScavengerReferencePage, StoreError> {
+        let request = StorageRpcShardScavengerReferencePageRequest {
+            route: self.bucket_pg_request(pg_id.pg_id()),
+            after: after.cloned(),
+            limit,
+        };
+        let payload = encode_shard_scavenger_reference_page_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode placed shard scavenger reference page request",
+                error.to_string(),
+            )
+        })?;
         let response = self.rpc_request(
             StorageRpcMessageKind::PlacedSegmentBackfillReferencePage,
             payload,
         )?;
-        decode_placed_segment_backfill_reference_page_response(&response).map_err(|error| {
+        decode_shard_scavenger_reference_page_response(&response).map_err(|error| {
             self.rpc_payload_error(
-                "decode placed segment backfill reference page response",
+                "decode placed shard scavenger reference page response",
+                error.to_string(),
+            )
+        })
+    }
+
+    fn shard_scavenger_reference_matches(
+        &self,
+        pg_id: ObjectMetadataScanPgId,
+        cursor: &ShardScavengerReferenceCursor,
+        expected: &ShardScavengerPlacedShardSetReference,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcShardScavengerReferenceMatchRequest {
+            route: self.bucket_pg_request(pg_id.pg_id()),
+            cursor: cursor.clone(),
+            expected: expected.clone(),
+        };
+        let payload =
+            encode_shard_scavenger_reference_match_request(&request).map_err(|error| {
+                self.rpc_payload_error(
+                    "encode shard scavenger reference match request",
+                    error.to_string(),
+                )
+            })?;
+        let response =
+            self.rpc_request(StorageRpcMessageKind::ShardScavengerReferenceMatch, payload)?;
+        decode_shard_scavenger_reference_match_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode shard scavenger reference match response",
                 error.to_string(),
             )
         })
@@ -1059,6 +1105,7 @@ impl PlacedShardRoute for UnixPlacedShardRoute<'_> {
         )
     }
 
+    #[cfg(test)]
     fn read_placed_shard(&self, expected_ack: WriteAck) -> Result<Vec<u8>, StoreError> {
         UnixStorageNodeClient::read_placed_shard(
             self.client,
@@ -1068,6 +1115,7 @@ impl PlacedShardRoute for UnixPlacedShardRoute<'_> {
         )
     }
 
+    #[cfg(test)]
     fn read_placed_shard_into(
         &self,
         expected_ack: WriteAck,
@@ -1592,16 +1640,42 @@ impl ShardScavengerDataRoute for UnixShardScavengerDataRoute<'_> {
 }
 
 impl ShardScavengerObjectScanRoute for UnixShardScavengerObjectScanRoute<'_> {
-    fn list_placed_segment_backfill_reference_page(
+    fn list_placed_shard_scavenger_reference_page(
         &self,
-        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        after: Option<&ShardScavengerReferenceCursor>,
         limit: std::num::NonZeroU16,
-    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError> {
-        UnixStorageNodeClient::list_placed_segment_backfill_reference_page(
+    ) -> Result<ShardScavengerReferencePage, StoreError> {
+        UnixStorageNodeClient::list_placed_shard_scavenger_reference_page(
             self.client,
             self.pg_id,
             after,
             limit,
+        )
+    }
+
+    fn list_shard_scavenger_reference_page(
+        &self,
+        after: Option<&ShardScavengerReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<ShardScavengerReferencePage, StoreError> {
+        UnixStorageNodeClient::list_shard_scavenger_reference_page(
+            self.client,
+            self.pg_id,
+            after,
+            limit,
+        )
+    }
+
+    fn shard_scavenger_reference_matches(
+        &self,
+        cursor: &ShardScavengerReferenceCursor,
+        expected: &ShardScavengerPlacedShardSetReference,
+    ) -> Result<bool, StoreError> {
+        UnixStorageNodeClient::shard_scavenger_reference_matches(
+            self.client,
+            self.pg_id,
+            cursor,
+            expected,
         )
     }
 

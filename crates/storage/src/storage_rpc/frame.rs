@@ -271,8 +271,12 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::ShardScavengerObservations => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::PlacedSegmentBackfillReferencePage => {
-            STORAGE_RPC_MAX_PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN
+        StorageRpcMessageKind::PlacedSegmentBackfillReferencePage
+        | StorageRpcMessageKind::ShardScavengerReferencePage => {
+            STORAGE_RPC_MAX_SHARD_SCAVENGER_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ShardScavengerReferenceMatch => {
+            STORAGE_RPC_MAX_SHARD_SCAVENGER_REFERENCE_MATCH_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ShardScavengerObservationRecord => {
             STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_RECORD_PAYLOAD_LEN

@@ -601,13 +601,13 @@ pub(crate) fn decode_scavenger_payload_references_response(
     Ok(references)
 }
 
-pub(crate) fn encode_placed_segment_backfill_reference_page_request(
-    request: &StorageRpcPlacedSegmentBackfillReferencePageRequest,
+pub(crate) fn encode_shard_scavenger_reference_page_request(
+    request: &StorageRpcShardScavengerReferencePageRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    if request.limit.get() > PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT {
+    if request.limit.get() > SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT {
         return Err(StorageRpcPayloadError::PayloadTooLarge {
             len: usize::from(request.limit.get()),
-            limit: usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
+            limit: usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT),
         });
     }
     let mut out = encode_bucket_pg_request(&request.route)?;
@@ -615,89 +615,128 @@ pub(crate) fn encode_placed_segment_backfill_reference_page_request(
         None => put_u8(&mut out, 0),
         Some(cursor) => {
             put_u8(&mut out, 1);
-            put_placed_segment_backfill_reference_cursor(&mut out, cursor);
+            put_shard_scavenger_reference_cursor(&mut out, cursor);
         }
     }
     put_u16(&mut out, request.limit.get());
     Ok(out)
 }
 
-pub(crate) fn decode_placed_segment_backfill_reference_page_request(
+pub(crate) fn decode_shard_scavenger_reference_page_request(
     bytes: &[u8],
-) -> Result<StorageRpcPlacedSegmentBackfillReferencePageRequest, StorageRpcPayloadError> {
+) -> Result<StorageRpcShardScavengerReferencePageRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let route = decoder.read_bucket_pg_request()?;
     let after = match decoder.read_u8()? {
         0 => None,
-        1 => Some(decoder.read_placed_segment_backfill_reference_cursor()?),
+        1 => Some(decoder.read_shard_scavenger_reference_cursor()?),
         _ => {
             return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
-                "invalid backfill reference cursor option tag",
+                "invalid shard scavenger reference cursor option tag",
             ));
         }
     };
     let limit = NonZeroU16::new(decoder.read_u16()?).ok_or(
         StorageRpcPayloadError::InvalidObjectMetadataRequest(
-            "backfill reference page limit must not be zero",
+            "shard scavenger reference page limit must not be zero",
         ),
     )?;
     decoder.finish()?;
-    if limit.get() > PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT {
+    if limit.get() > SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT {
         return Err(StorageRpcPayloadError::PayloadTooLarge {
             len: usize::from(limit.get()),
-            limit: usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
+            limit: usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT),
         });
     }
-    Ok(StorageRpcPlacedSegmentBackfillReferencePageRequest {
+    Ok(StorageRpcShardScavengerReferencePageRequest {
         route,
         after,
         limit,
     })
 }
 
-pub(crate) fn encode_placed_segment_backfill_reference_page_response(
-    page: &PlacedSegmentBackfillReferencePage,
+pub(crate) fn encode_shard_scavenger_reference_page_response(
+    page: &ShardScavengerReferencePage,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    if page.items.len() > usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT) {
+    if page.items.len() > usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT) {
         return Err(StorageRpcPayloadError::PayloadTooLarge {
             len: page.items.len(),
-            limit: usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
+            limit: usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT),
         });
     }
     let mut out = Vec::new();
     put_bool(&mut out, page.complete);
     put_u16(
         &mut out,
-        u16::try_from(page.items.len()).expect("bounded backfill reference page fits in u16"),
+        u16::try_from(page.items.len()).expect("bounded shard scavenger reference page fits in u16"),
     );
     for item in &page.items {
-        put_placed_segment_backfill_reference_cursor(&mut out, &item.cursor);
-        put_placed_scavenger_reference(&mut out, &item.reference);
+        put_shard_scavenger_reference_cursor(&mut out, &item.cursor);
+        put_scavenger_payload_reference(&mut out, &item.reference);
     }
     Ok(out)
 }
 
-pub(crate) fn decode_placed_segment_backfill_reference_page_response(
+pub(crate) fn decode_shard_scavenger_reference_page_response(
     bytes: &[u8],
-) -> Result<PlacedSegmentBackfillReferencePage, StorageRpcPayloadError> {
+) -> Result<ShardScavengerReferencePage, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let complete = decoder.read_bool()?;
     let count = usize::from(decoder.read_u16()?);
-    if count > usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT) {
+    if count > usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT) {
         return Err(StorageRpcPayloadError::PayloadTooLarge {
             len: count,
-            limit: usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
+            limit: usize::from(SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT),
         });
     }
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
-        items.push(PlacedSegmentBackfillReferencePageItem {
-            cursor: decoder.read_placed_segment_backfill_reference_cursor()?,
-            reference: decoder.read_placed_scavenger_reference()?,
+        items.push(ShardScavengerReferencePageItem {
+            cursor: decoder.read_shard_scavenger_reference_cursor()?,
+            reference: decoder.read_scavenger_payload_reference()?,
         });
     }
     decoder.finish()?;
-    Ok(PlacedSegmentBackfillReferencePage { items, complete })
+    Ok(ShardScavengerReferencePage { items, complete })
+}
+
+pub(crate) fn encode_shard_scavenger_reference_match_request(
+    request: &StorageRpcShardScavengerReferenceMatchRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_shard_scavenger_reference_cursor(&mut out, &request.cursor);
+    put_placed_scavenger_reference(&mut out, &request.expected);
+    Ok(out)
+}
+
+pub(crate) fn decode_shard_scavenger_reference_match_request(
+    bytes: &[u8],
+) -> Result<StorageRpcShardScavengerReferenceMatchRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let cursor = decoder.read_shard_scavenger_reference_cursor()?;
+    let expected = decoder.read_placed_scavenger_reference()?;
+    decoder.finish()?;
+    Ok(StorageRpcShardScavengerReferenceMatchRequest {
+        route,
+        cursor,
+        expected,
+    })
+}
+
+pub(crate) fn encode_shard_scavenger_reference_match_response(matches: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_bool(&mut out, matches);
+    out
+}
+
+pub(crate) fn decode_shard_scavenger_reference_match_response(
+    bytes: &[u8],
+) -> Result<bool, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let matches = decoder.read_bool()?;
+    decoder.finish()?;
+    Ok(matches)
 }
 
 pub(crate) fn encode_scavenger_observation_record_request(

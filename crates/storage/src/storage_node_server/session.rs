@@ -16,6 +16,7 @@ fn trace_storage_rpc_lifecycle(kind: StorageRpcMessageKind) -> bool {
 struct StorageNodeActiveSessionState {
     active: usize,
     retained_ordinary: usize,
+    retained_object_leases: usize,
 }
 
 #[derive(Debug, Default)]
@@ -58,10 +59,21 @@ impl StorageNodeActiveSessions {
         &self,
         class: &mut StorageNodeActiveSessionClass,
         limit: usize,
-        stateful: bool,
+        retention: StorageNodeSessionRetention,
     ) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.classify_connection(class, limit, stateful)
+        state.classify_connection(class, limit, retention)
+    }
+
+    fn reserve_object_payload_lease(
+        &self,
+        class: &mut StorageNodeActiveSessionClass,
+        limit: usize,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .transition(class, limit, StorageNodeSessionRetention::ObjectLease)
     }
 
     fn release(&self, class: StorageNodeActiveSessionClass) {
@@ -86,28 +98,46 @@ impl StorageNodeActiveSessionState {
         &mut self,
         class: &mut StorageNodeActiveSessionClass,
         limit: usize,
-        stateful: bool,
+        retention: StorageNodeSessionRetention,
     ) -> bool {
-        if stateful {
-            if *class == StorageNodeActiveSessionClass::RetainedOrdinary {
-                self.retained_ordinary = self
-                    .retained_ordinary
-                    .checked_sub(1)
-                    .expect("retained ordinary storage session count underflow");
-            }
-            *class = StorageNodeActiveSessionClass::Stateful;
-            return true;
-        }
+        self.transition(class, limit, retention)
+    }
 
-        if *class == StorageNodeActiveSessionClass::RetainedOrdinary {
+    fn transition(
+        &mut self,
+        class: &mut StorageNodeActiveSessionClass,
+        limit: usize,
+        retention: StorageNodeSessionRetention,
+    ) -> bool {
+        let target = match retention {
+            StorageNodeSessionRetention::Ordinary => {
+                StorageNodeActiveSessionClass::RetainedOrdinary
+            }
+            StorageNodeSessionRetention::ObjectLease => {
+                StorageNodeActiveSessionClass::ObjectLease
+            }
+            StorageNodeSessionRetention::Read => StorageNodeActiveSessionClass::Read,
+            StorageNodeSessionRetention::OtherStateful => {
+                StorageNodeActiveSessionClass::OtherStateful
+            }
+        };
+        if *class == target {
             return true;
         }
-        let ordinary_limit = limit.saturating_sub(1);
-        if self.retained_ordinary >= ordinary_limit {
+        let projected_ordinary = self.retained_ordinary
+            - usize::from(*class == StorageNodeActiveSessionClass::RetainedOrdinary)
+            + usize::from(target == StorageNodeActiveSessionClass::RetainedOrdinary);
+        let projected_object_leases = self.retained_object_leases
+            - usize::from(*class == StorageNodeActiveSessionClass::ObjectLease)
+            + usize::from(target == StorageNodeActiveSessionClass::ObjectLease);
+        if projected_ordinary > limit.saturating_sub(2)
+            || projected_ordinary + projected_object_leases > limit.saturating_sub(1)
+        {
             return false;
         }
-        self.retained_ordinary += 1;
-        *class = StorageNodeActiveSessionClass::RetainedOrdinary;
+        self.retained_ordinary = projected_ordinary;
+        self.retained_object_leases = projected_object_leases;
+        *class = target;
         true
     }
 
@@ -121,6 +151,11 @@ impl StorageNodeActiveSessionState {
                 .retained_ordinary
                 .checked_sub(1)
                 .expect("retained ordinary storage session release without classification");
+        } else if class == StorageNodeActiveSessionClass::ObjectLease {
+            self.retained_object_leases = self
+                .retained_object_leases
+                .checked_sub(1)
+                .expect("retained object-lease storage session release without classification");
         }
     }
 }
@@ -129,7 +164,17 @@ impl StorageNodeActiveSessionState {
 enum StorageNodeActiveSessionClass {
     Unclassified,
     RetainedOrdinary,
-    Stateful,
+    ObjectLease,
+    Read,
+    OtherStateful,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageNodeSessionRetention {
+    Ordinary,
+    ObjectLease,
+    Read,
+    OtherStateful,
 }
 
 struct StorageNodeActiveSessionGuard {
@@ -139,9 +184,14 @@ struct StorageNodeActiveSessionGuard {
 }
 
 impl StorageNodeActiveSessionGuard {
-    fn classify_connection(&mut self, stateful: bool) -> bool {
+    fn classify_connection(&mut self, retention: StorageNodeSessionRetention) -> bool {
         self.active_sessions
-            .classify_connection(&mut self.class, self.limit, stateful)
+            .classify_connection(&mut self.class, self.limit, retention)
+    }
+
+    fn reserve_object_payload_lease(&mut self) -> bool {
+        self.active_sessions
+            .reserve_object_payload_lease(&mut self.class, self.limit)
     }
 }
 
@@ -453,17 +503,48 @@ impl StorageNodeSession {
     fn has_active_read_state(&self) -> bool {
         self.object_payload_lease
             .as_ref()
-            .is_some_and(|lease| lease.is_acquired)
+            .is_some_and(SessionObjectPayloadLease::is_active)
             || self
                 .read_operations
                 .values()
                 .any(|existing| existing.is_acquired)
     }
 
+    fn retention(&self) -> StorageNodeSessionRetention {
+        if self
+            .read_operations
+            .values()
+            .any(|existing| existing.is_acquired)
+        {
+            StorageNodeSessionRetention::Read
+        } else if self
+            .object_payload_lease
+            .as_ref()
+            .is_some_and(SessionObjectPayloadLease::is_active)
+        {
+            StorageNodeSessionRetention::ObjectLease
+        } else if self.has_metadata_command_pg_locks() {
+            StorageNodeSessionRetention::OtherStateful
+        } else {
+            StorageNodeSessionRetention::Ordinary
+        }
+    }
+
     fn acquire_read_handles(
         &mut self,
         request: ValidatedReadHandleAcquireRequest,
     ) -> Result<Vec<ShardLocation>, StorageRpcErrorResponse> {
+        if self
+            .object_payload_lease
+            .as_ref()
+            .is_some_and(SessionObjectPayloadLease::is_active)
+        {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "read handles cannot share a session with an active object-payload lease"
+                    .to_string(),
+            });
+        }
         match self.read_operations.get(&request.read_operation_id) {
             Some(existing) if existing.entries == request.entries && existing.is_acquired => {
                 return Ok(existing
@@ -522,6 +603,26 @@ impl StorageNodeSession {
             .release(&existing.entries);
     }
 
+    fn require_active_read_handle(
+        &self,
+        location: ShardLocation,
+        shard_key: &ShardKey,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if self.read_operations.values().any(|operation| {
+            operation.is_acquired
+                && operation
+                    .entries
+                    .iter()
+                    .any(|entry| entry.0 == location && entry.1 == *shard_key)
+        }) {
+            return Ok(());
+        }
+        Err(StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: "shard read range is not bound to an active session read handle".to_string(),
+        })
+    }
+
     fn acquire_object_payload_lease(
         &mut self,
         route_cluster_epoch: ClusterEpoch,
@@ -529,17 +630,30 @@ impl StorageNodeSession {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, StorageRpcErrorResponse> {
-        let root = (bucket.clone(), key.clone(), generation_id);
-        if let Some(existing) = self.object_payload_lease.as_ref() {
-            if existing.route_cluster_epoch == route_cluster_epoch && existing.root == root {
-                return Ok(existing.is_acquired);
-            }
+        if self
+            .read_operations
+            .values()
+            .any(|existing| existing.is_acquired)
+        {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::PayloadDecode,
-                message:
-                    "object-payload lease session is already bound to a different route or subject"
-                        .to_string(),
+                message: "object-payload leases cannot share a session with active read handles"
+                    .to_string(),
             });
+        }
+        let root = (bucket.clone(), key.clone(), generation_id);
+        if let Some(existing) = self.object_payload_lease.as_ref() {
+            if existing.is_active() {
+                if existing.matches(route_cluster_epoch, &root) {
+                    return Ok(true);
+                }
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message:
+                        "object-payload lease session is already bound to a different route or subject"
+                            .to_string(),
+                });
+            }
         }
         if !self
             .node
@@ -547,11 +661,9 @@ impl StorageNodeSession {
         {
             return Ok(false);
         }
-        self.object_payload_lease = Some(SessionObjectPayloadLease {
+        self.object_payload_lease = Some(SessionObjectPayloadLease::Active {
             route_cluster_epoch,
             root,
-            is_acquired: true,
-            remaining_after_release: None,
         });
         Ok(true)
     }
@@ -564,29 +676,34 @@ impl StorageNodeSession {
         generation_id: GenerationId,
     ) -> Result<usize, StorageRpcErrorResponse> {
         let root = (bucket.clone(), key.clone(), generation_id);
-        let Some(existing) = self.object_payload_lease.as_mut() else {
+        let Some(existing) = self.object_payload_lease.as_ref() else {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::PayloadDecode,
                 message: "object-payload lease release has no session-bound acquisition"
                     .to_string(),
             });
         };
-        if existing.route_cluster_epoch != route_cluster_epoch || existing.root != root {
+        if !existing.matches(route_cluster_epoch, &root) {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::PayloadDecode,
                 message:
                     "object-payload lease release does not match its session-bound acquisition"
-                        .to_string(),
+                .to_string(),
             });
         }
-        if !existing.is_acquired {
-            return Ok(existing.remaining_after_release.unwrap_or(0));
+        if !existing.is_active() {
+            return Ok(existing.remaining_after_release().expect(
+                "released object-payload lease must retain its original result",
+            ));
         }
         let remaining = self
             .node
             .release_object_payload_lease(bucket, key, generation_id);
-        existing.is_acquired = false;
-        existing.remaining_after_release = Some(remaining);
+        self.object_payload_lease = Some(SessionObjectPayloadLease::Released {
+            route_cluster_epoch,
+            root,
+            remaining_after_release: remaining,
+        });
         Ok(remaining)
     }
 }
@@ -603,12 +720,12 @@ impl Drop for StorageNodeSession {
                 existing.is_acquired = false;
             }
         }
-        if let Some(existing) = self.object_payload_lease.take() {
-            if existing.is_acquired {
-                let (bucket, key, generation_id) = existing.root;
-                self.node
-                    .release_object_payload_lease(&bucket, &key, generation_id);
-            }
+        if let Some(SessionObjectPayloadLease::Active { root, .. }) =
+            self.object_payload_lease.take()
+        {
+            let (bucket, key, generation_id) = root;
+            self.node
+                .release_object_payload_lease(&bucket, &key, generation_id);
         }
     }
 }
@@ -619,11 +736,50 @@ struct SessionReadHandle {
     is_acquired: bool,
 }
 
-struct SessionObjectPayloadLease {
-    route_cluster_epoch: ClusterEpoch,
-    root: (BucketName, ObjectKey, GenerationId),
-    is_acquired: bool,
-    remaining_after_release: Option<usize>,
+enum SessionObjectPayloadLease {
+    Active {
+        route_cluster_epoch: ClusterEpoch,
+        root: (BucketName, ObjectKey, GenerationId),
+    },
+    Released {
+        route_cluster_epoch: ClusterEpoch,
+        root: (BucketName, ObjectKey, GenerationId),
+        remaining_after_release: usize,
+    },
+}
+
+impl SessionObjectPayloadLease {
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+
+    fn matches(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        root: &(BucketName, ObjectKey, GenerationId),
+    ) -> bool {
+        match self {
+            Self::Active {
+                route_cluster_epoch: existing_epoch,
+                root: existing_root,
+            }
+            | Self::Released {
+                route_cluster_epoch: existing_epoch,
+                root: existing_root,
+                ..
+            } => *existing_epoch == route_cluster_epoch && existing_root == root,
+        }
+    }
+
+    fn remaining_after_release(&self) -> Option<usize> {
+        match self {
+            Self::Active { .. } => None,
+            Self::Released {
+                remaining_after_release,
+                ..
+            } => Some(*remaining_after_release),
+        }
+    }
 }
 
 fn storage_node_rpc_io_timeout(rpc_auth: Option<&StorageRpcServerAuthConfig>) -> Duration {

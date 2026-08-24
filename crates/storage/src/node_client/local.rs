@@ -17,6 +17,7 @@ use crate::BucketAclSummary;
 
 struct LocalObjectPayloadLease {
     storage_node: Arc<SharedStorageNode>,
+    node_id: NodeId,
     bucket: BucketName,
     key: ObjectKey,
     generation_id: GenerationId,
@@ -25,6 +26,7 @@ struct LocalObjectPayloadLease {
 
 struct LocalObjectPayloadLeaseRoute {
     storage_node: Arc<SharedStorageNode>,
+    node_id: NodeId,
     route_cluster_epoch: ClusterEpoch,
     bucket: BucketName,
     key: ObjectKey,
@@ -52,9 +54,15 @@ struct LocalPlacedShardRoute {
 }
 
 struct LocalShardReadHandleRoute {
-    _route_cluster_epoch: ClusterEpoch,
+    storage_node: Arc<SharedStorageNode>,
     _read_operation_id: String,
-    _entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
+    entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
+}
+
+struct LocalStorageNodeReadHandleLease {
+    storage_node: Arc<SharedStorageNode>,
+    entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
+    released: bool,
 }
 
 struct LocalRetainedShardAckRoute {
@@ -263,6 +271,10 @@ struct LocalBucketDeleteReplicaMetadataRoute<'a> {
 }
 
 impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
+    fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
             return Ok(0);
@@ -473,11 +485,13 @@ impl PlacedShardRoute for LocalPlacedShardRoute {
             .write_shard_file(self.location.data_pg_id().get(), &self.key, data)
     }
 
+    #[cfg(test)]
     fn read_placed_shard(&self, _expected_ack: WriteAck) -> Result<Vec<u8>, StoreError> {
         self.storage_node
             .read_shard_file(self.location.data_pg_id().get(), &self.key)
     }
 
+    #[cfg(test)]
     fn read_placed_shard_into(
         &self,
         _expected_ack: WriteAck,
@@ -564,16 +578,20 @@ impl ShardReadHandleNodeClient for LocalStorageNodeClient {
             drop(self.storage_node.get_pg(location.data_pg_id().get())?);
         }
         Ok(Box::new(LocalShardReadHandleRoute {
-            _route_cluster_epoch: route_cluster_epoch,
+            storage_node: Arc::clone(&self.storage_node),
             _read_operation_id: read_operation_id.to_string(),
-            _entries: entries,
+            entries,
         }))
     }
 }
 
 impl ShardReadHandleRoute for LocalShardReadHandleRoute {
     fn acquire(self: Box<Self>) -> Result<Box<dyn ShardReadHandleLease>, StoreError> {
-        Ok(Box::new(LocalStorageNodeReadHandleLease))
+        Ok(Box::new(LocalStorageNodeReadHandleLease {
+            storage_node: self.storage_node,
+            entries: self.entries,
+            released: false,
+        }))
     }
 }
 
@@ -587,6 +605,7 @@ impl ObjectPayloadLeaseNodeClient for LocalStorageNodeClient {
     ) -> Result<Box<dyn ObjectPayloadLeaseRoute + '_>, StoreError> {
         Ok(Box::new(LocalObjectPayloadLeaseRoute {
             storage_node: Arc::clone(&self.storage_node),
+            node_id: self.node_id,
             route_cluster_epoch,
             bucket: bucket.clone(),
             key: key.clone(),
@@ -609,6 +628,7 @@ impl ObjectPayloadLeaseRoute for LocalObjectPayloadLeaseRoute {
         }
         Ok(Some(Box::new(LocalObjectPayloadLease {
             storage_node: Arc::clone(&self.storage_node),
+            node_id: self.node_id,
             bucket: self.bucket.clone(),
             key: self.key.clone(),
             generation_id: self.generation_id,
@@ -694,7 +714,47 @@ impl RetainedObjectPayloadReclaimRoute for LocalRetainedObjectPayloadReclaimRout
 }
 
 impl ShardReadHandleLease for LocalStorageNodeReadHandleLease {
+    fn read_placed_shard_into(
+        &mut self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        if self.released {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "read placed shard through released read-handle lease",
+            });
+        }
+        if !self
+            .entries
+            .iter()
+            .any(|entry| entry.0 == location && entry.1 == *key)
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "read placed shard through read-handle lease",
+            });
+        }
+        if dst.len() as u64 != expected_ack.stored_size {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "read-handle shard buffer size does not match expected acknowledgement"
+                    .to_string(),
+            });
+        }
+        self.storage_node
+            .read_shard_file_into(location.data_pg_id().get(), key, dst)?;
+        let actual_crc = checksum::crc64::checksum(dst);
+        if actual_crc != expected_ack.crc64 {
+            return Err(StoreError::IntegrityError {
+                expected: expected_ack.crc64,
+                actual: actual_crc,
+            });
+        }
+        Ok(())
+    }
+
     fn release(&mut self) -> Result<(), StoreError> {
+        self.released = true;
         Ok(())
     }
 }
@@ -1012,14 +1072,34 @@ impl ShardScavengerDataRoute for LocalShardScavengerDataRoute {
 }
 
 impl ShardScavengerObjectScanRoute for LocalShardScavengerObjectScanRoute {
-    fn list_placed_segment_backfill_reference_page(
+    fn list_placed_shard_scavenger_reference_page(
         &self,
-        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        after: Option<&ShardScavengerReferenceCursor>,
         limit: std::num::NonZeroU16,
-    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError> {
+    ) -> Result<ShardScavengerReferencePage, StoreError> {
         self.storage_node
             .get_pg(self.pg_id.get())?
-            .list_placed_segment_backfill_reference_page(after, limit)
+            .list_placed_shard_scavenger_reference_page(after, limit)
+    }
+
+    fn list_shard_scavenger_reference_page(
+        &self,
+        after: Option<&ShardScavengerReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<ShardScavengerReferencePage, StoreError> {
+        self.storage_node
+            .get_pg(self.pg_id.get())?
+            .list_shard_scavenger_reference_page(after, limit)
+    }
+
+    fn shard_scavenger_reference_matches(
+        &self,
+        cursor: &ShardScavengerReferenceCursor,
+        expected: &ShardScavengerPlacedShardSetReference,
+    ) -> Result<bool, StoreError> {
+        self.storage_node
+            .get_pg(self.pg_id.get())?
+            .shard_scavenger_reference_matches(cursor, expected)
     }
 
     fn list_shard_scavenger_payload_references(

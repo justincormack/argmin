@@ -52,6 +52,8 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandRecoveryRecordAbandoned = 168,
     MetadataCommandPublicationStart = 172,
     PlacedSegmentBackfillReferencePage = 169,
+    ShardScavengerReferencePage = 174,
+    ShardScavengerReferenceMatch = 173,
     ObjectPayloadReclaimCommandBuild = 170,
     MetadataCommandRetainedAbortApply = 165,
     MetadataCommandRetainedAbortFinish = 166,
@@ -342,7 +344,11 @@ impl StorageRpcMessageKind {
             Self::ShardScavengerListFiles => "shard scavenger list files",
             Self::ShardScavengerShardRows => "shard scavenger shard rows",
             Self::ShardScavengerPayloadReferences => "shard scavenger payload references",
-            Self::PlacedSegmentBackfillReferencePage => "placed segment backfill reference page",
+            Self::PlacedSegmentBackfillReferencePage => {
+                "placed segment backfill reference page"
+            }
+            Self::ShardScavengerReferencePage => "shard scavenger reference page",
+            Self::ShardScavengerReferenceMatch => "shard scavenger reference match",
             Self::ShardScavengerObservationRecord => "shard scavenger observation record",
             Self::ShardScavengerObservations => "shard scavenger observations",
             Self::ShardScavengerObservationResolve => "shard scavenger observation resolve",
@@ -599,6 +605,8 @@ impl StorageRpcMessageKind {
             168 => Ok(Self::MetadataCommandRecoveryRecordAbandoned),
             172 => Ok(Self::MetadataCommandPublicationStart),
             169 => Ok(Self::PlacedSegmentBackfillReferencePage),
+            174 => Ok(Self::ShardScavengerReferencePage),
+            173 => Ok(Self::ShardScavengerReferenceMatch),
             170 => Ok(Self::ObjectPayloadReclaimCommandBuild),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
             166 => Ok(Self::MetadataCommandRetainedAbortFinish),
@@ -875,10 +883,17 @@ pub(crate) struct StorageRpcBucketPgRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcPlacedSegmentBackfillReferencePageRequest {
+pub(crate) struct StorageRpcShardScavengerReferencePageRequest {
     pub(crate) route: StorageRpcBucketPgRequest,
-    pub(crate) after: Option<PlacedSegmentBackfillReferenceCursor>,
+    pub(crate) after: Option<ShardScavengerReferenceCursor>,
     pub(crate) limit: NonZeroU16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcShardScavengerReferenceMatchRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) cursor: ShardScavengerReferenceCursor,
+    pub(crate) expected: ShardScavengerPlacedShardSetReference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

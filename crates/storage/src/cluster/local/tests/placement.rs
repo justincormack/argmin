@@ -1971,6 +1971,130 @@ fn placed_segment_recovery_rejects_more_missing_shards_than_ec_can_tolerate() {
 }
 
 #[test]
+fn placed_segment_read_preserves_temporary_unavailability_when_ec_cannot_complete() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let cluster = crate::StorageCluster::open_static_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let segment = write_committed_direct_segment(&cluster, b"temporary shard read failure");
+    let unavailable_shards = (0..=segment.written.ec.m).collect::<BTreeSet<_>>();
+    let _read_guard =
+        cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |location, _| {
+            if unavailable_shards.contains(&location.shard_index().get()) {
+                return Err(StoreError::StorageRpc {
+                    node_id: location.node_id().as_u32(),
+                    operation: "shard read",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "injected temporary shard transport failure",
+                    ),
+                });
+            }
+            Ok(())
+        }));
+    let request = crate::SegmentStoredBytesRequest {
+        data_pg_id: segment.written.data_pg_id,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.generation_id,
+        stored_size: segment.payload.len(),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        ec: segment.written.ec,
+    };
+
+    let error = cluster
+        .read_segment_payload_stored_bytes_into(request, &mut Vec::new())
+        .unwrap_err();
+
+    assert!(!matches!(error, StoreError::NotFound));
+    assert_eq!(
+        error.storage_node_failure_class(),
+        Some(crate::error::StorageNodeFailureClass::TransportInterrupted)
+    );
+}
+
+#[test]
+fn placed_segment_read_carries_direct_temporary_unavailability_into_ec_failure() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let cluster = crate::StorageCluster::open_static_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let segment = write_committed_direct_segment(&cluster, b"direct temporary then missing EC");
+    for shard_index in 1..=(segment.written.ec.m + 1) {
+        let shard_path = cluster
+            .test_payload_shard_file_path(
+                segment.written.data_pg_id,
+                segment.written.ec,
+                &segment.segment_okh,
+                segment.generation_id,
+                shard_index,
+            )
+            .unwrap();
+        std::fs::remove_file(shard_path).unwrap();
+    }
+    let fail_direct_once = Arc::new(AtomicBool::new(true));
+    let hook_fail_direct_once = Arc::clone(&fail_direct_once);
+    let _read_guard =
+        cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |location, _| {
+            if location.shard_index().get() == 0
+                && hook_fail_direct_once.swap(false, Ordering::SeqCst)
+            {
+                return Err(StoreError::StorageRpc {
+                    node_id: location.node_id().as_u32(),
+                    operation: "shard read",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "injected direct-only shard transport failure",
+                    ),
+                });
+            }
+            Ok(())
+        }));
+    let request = crate::SegmentStoredBytesRequest {
+        data_pg_id: segment.written.data_pg_id,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.generation_id,
+        stored_size: segment.payload.len(),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        ec: segment.written.ec,
+    };
+
+    let error = cluster
+        .read_segment_payload_stored_bytes_into(request, &mut Vec::new())
+        .unwrap_err();
+
+    assert!(!fail_direct_once.load(Ordering::SeqCst));
+    assert!(!matches!(error, StoreError::NotFound));
+    assert_eq!(
+        error.storage_node_failure_class(),
+        Some(crate::error::StorageNodeFailureClass::TransportInterrupted)
+    );
+}
+
+#[test]
 fn repair_placed_segment_payload_shards_restores_multiple_missing_physical_shards() {
     let tmp = test_util::tempdir();
     let node_ids = [
