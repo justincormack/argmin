@@ -343,14 +343,22 @@ impl Coordinator {
         &self,
         req: &DeleteObjectsRequest,
     ) -> Result<DeleteObjectsResult, ServerError> {
-        let admission = self.admit_storage_route_for_request()?;
-        self.delete_objects_on_admitted_route(&admission, req)
+        self.delete_objects_impl(req, |_| {})
     }
 
-    pub fn delete_objects_on_admitted_route(
+    #[cfg(test)]
+    pub(super) fn delete_objects_with_before_entry_test_hook(
         &self,
-        admission: &StorageClusterRouteAdmission,
         req: &DeleteObjectsRequest,
+        before_entry: impl FnMut(usize),
+    ) -> Result<DeleteObjectsResult, ServerError> {
+        self.delete_objects_impl(req, before_entry)
+    }
+
+    fn delete_objects_impl(
+        &self,
+        req: &DeleteObjectsRequest,
+        mut before_entry: impl FnMut(usize),
     ) -> Result<DeleteObjectsResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -360,27 +368,44 @@ impl Coordinator {
             req.entries.len(),
             req.bypass_governance
         );
-        self.require_storage_route_admission(admission)?;
-        let entries = req.entries;
+        let admission = self.admit_storage_route_for_request()?;
+        self.require_storage_route_admission(&admission)?;
         self.checked_active_bucket_summary_for_admitted_route(
-            admission,
+            &admission,
             req.bucket.name_typed(),
             req.expected_bucket_owner(),
         )?;
+        drop(admission);
 
+        Ok(Self::collect_delete_objects_results(
+            req.entries,
+            |index, entry| {
+                let admission = self.admit_storage_route_for_request()?;
+                before_entry(index);
+                self.authorize_delete_objects_entry_on_admitted_route(&admission, req, entry)
+                    .and_then(|authorized| {
+                        self.apply_authorized_delete_object_on_admitted_route(
+                            &admission,
+                            authorized,
+                            &entry.cond,
+                        )
+                    })
+            },
+        ))
+    }
+
+    fn collect_delete_objects_results(
+        entries: &[super::DeleteEntry],
+        mut delete_entry: impl FnMut(
+            usize,
+            &super::DeleteEntry,
+        ) -> Result<DeleteObjectResult, ServerError>,
+    ) -> DeleteObjectsResult {
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
 
-        for entry in entries {
-            match self
-                .authorize_delete_objects_entry_on_admitted_route(admission, req, entry)
-                .and_then(|authorized| {
-                    self.apply_authorized_delete_object_on_admitted_route(
-                        admission,
-                        authorized,
-                        &entry.cond,
-                    )
-                }) {
+        for (index, entry) in entries.iter().enumerate() {
+            match delete_entry(index, entry) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.to_string(),
@@ -399,6 +424,6 @@ impl Coordinator {
             }
         }
 
-        Ok(DeleteObjectsResult { deleted, errors })
+        DeleteObjectsResult { deleted, errors }
     }
 }

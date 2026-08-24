@@ -11,7 +11,12 @@ mod tests {
     use auth::SecretKey;
     use ring::hmac;
     use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use storage::test_support::{
+        StorageClusterMetadataCommandTestSupport as _, StorageClusterRouteMapTestSupport as _,
+    };
+    use storage::RouteMapValidity;
 
     const TEST_SIGV4_ACCESS_KEY: &str = "AKID";
     const TEST_SIGV4_SECRET: &str = "secret";
@@ -6359,6 +6364,84 @@ mod tests {
             Ok(_) => {}
             Err(e) => panic!("expected Ok, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn delete_objects_releases_request_admission_between_entries() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        for key in ["first", "second"] {
+            let req = new_req(
+                http::Method::GET,
+                "",
+                "",
+                vec![],
+                format!("body-{key}").into_bytes(),
+            );
+            fe.dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: key.to_string(),
+                },
+            )
+            .unwrap();
+        }
+
+        let clock = storage::test_support::test_time_override_guard(1_000);
+        fe.test_storage_cluster.test_store_route_map_lease(
+            RouteMapValidity::until_ms(5_000).unwrap(),
+            Some(4_000),
+        );
+        let hook_clock = clock.control();
+        let hook_cluster = Arc::clone(&fe.test_storage_cluster);
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        let _hook = fe
+            .test_storage_cluster
+            .test_install_after_object_metadata_command_primary_apply_hook(
+                &test_bucket_name("mybucket"),
+                &storage::ObjectKey::new("first").unwrap(),
+                Arc::new(move |_| {
+                    if hook_calls_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                        hook_clock.set(4_500);
+                        hook_cluster.test_store_route_map_lease(
+                            RouteMapValidity::until_ms(10_000).unwrap(),
+                            Some(9_000),
+                        );
+                    }
+                    Ok(())
+                }),
+            );
+
+        let xml = br#"<?xml version="1.0"?>
+<Delete>
+  <Object><Key>first</Key></Object>
+  <Object><Key>second</Key></Object>
+</Delete>"#;
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "delete",
+            vec![("Content-MD5".to_string(), content_md5_value(xml))],
+            xml.to_vec(),
+        );
+        let response = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::DeleteObjects {
+                    bucket: test_bucket_name("mybucket"),
+                },
+            )
+            .unwrap();
+        assert_eq!(response.status_code, 200);
+        let body = String::from_utf8(response_body(response)).unwrap();
+        assert!(hook_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(body.matches("<Deleted>").count(), 2, "{body}");
+        assert!(!body.contains("<Error>"), "{body}");
     }
 
     #[test]

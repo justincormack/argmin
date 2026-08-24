@@ -3899,86 +3899,176 @@ fn object_delete_mutations_expire_at_pending_install_effect_boundary() {
         );
     }
 
-    clock.set(1_000);
-    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
-    let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let batch_etags = ["first", "second"].map(|key| {
-        coord
-            .get_object_on_admitted_route(
-                &admission,
-                &GetObjectRequest {
-                    object: object_version_request_with_expected_owner(
-                        "batch",
-                        key,
-                        None,
-                        test_requester(),
-                        None,
-                    ),
-                    cond: NO_READ,
-                    sse_customer: None,
-                },
-            )
-            .unwrap()
-            .etag
-    });
-    let hook_clock = clock.control();
-    let hook =
-        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
-            hook_clock.set(4_500)
-        }));
     let entries = [
         DeleteEntry {
             key: trusted_object_key("first"),
             version_id: None,
-            cond: DeleteCondition::IfMatch(batch_etags[0].clone().into()),
+            cond: DeleteCondition::None,
         },
         DeleteEntry {
             key: trusted_object_key("second"),
             version_id: None,
-            cond: DeleteCondition::IfMatch(batch_etags[1].clone().into()),
+            cond: DeleteCondition::None,
         },
     ];
+
+    clock.set(1_000);
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let hook_clock = clock.control();
+    let hook_cluster = Arc::clone(&cluster);
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some(("batch".to_string(), "first".to_string())),
+        after_object_segments_delete_metadata: Some(Arc::new(move || {
+            assert_eq!(hook_calls_for_hook.fetch_add(1, Ordering::SeqCst), 0);
+            hook_clock.set(4_500);
+            hook_cluster.test_store_route_map_lease(
+                RouteMapValidity::until_ms(10_000).unwrap(),
+                Some(9_000),
+            );
+        })),
+        ..ReclamationTestHooks::default()
+    });
     let result = coord
-        .delete_objects_on_admitted_route(
-            &admission,
-            &DeleteObjectsRequest {
-                bucket: bucket_request_with_expected_owner("batch", test_requester(), None),
-                entries: &entries,
-                bypass_governance: false,
+        .delete_objects(&DeleteObjectsRequest {
+            bucket: bucket_request_with_expected_owner("batch", test_requester(), None),
+            entries: &entries,
+            bypass_governance: false,
+        })
+        .unwrap();
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(result.deleted.len(), 2);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
+
+#[test]
+fn delete_objects_allows_content_changing_route_publication_between_entries() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("delete-objects-first-entry-before-metadata-apply");
+
+    let tmp = test_util::tempdir();
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    let (runtime_handle, route_handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let coord = Arc::new(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
+            route_handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap(),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "batch-publication", false)
+        .unwrap();
+    for key in ["first", "second"] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "batch-publication",
+                    key,
+                    test_requester(),
+                    None,
+                ),
+                data: key.as_bytes(),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
             },
         )
         .unwrap();
-    assert!(result.deleted.is_empty());
-    assert_eq!(result.errors.len(), 2);
-    assert!(result.errors.iter().all(|error| error.code == "SlowDown"));
-    drop(hook);
-    drop(admission);
-
-    clock.set(1_000);
-    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
-    for key in ["first", "second"] {
-        let current = coord
-            .get_object_on_admitted_route(
-                &fresh_admission,
-                &GetObjectRequest {
-                    object: object_version_request_with_expected_owner(
-                        "batch",
-                        key,
-                        None,
-                        test_requester(),
-                        None,
-                    ),
-                    cond: NO_READ,
-                    sse_customer: None,
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            current.body.read_all().unwrap(),
-            format!("batch/{key}").as_bytes()
-        );
     }
+
+    let first_gate = DeterministicFaultGate::new(TOKEN);
+    let _first_gate_release = first_gate.release_on_drop();
+    let entry_calls = Arc::new(AtomicUsize::new(0));
+    let second_saw_published_map = Arc::new(AtomicBool::new(false));
+
+    let (delete_result_tx, delete_result_rx) = mpsc::channel();
+    let delete_coord = Arc::clone(&coord);
+    let first_gate_for_delete = Arc::clone(&first_gate);
+    let entry_calls_for_delete = Arc::clone(&entry_calls);
+    let second_saw_published_map_for_delete = Arc::clone(&second_saw_published_map);
+    let runtime_handle_for_delete = runtime_handle.clone();
+    let initial_for_delete = Arc::clone(&initial);
+    let delete_thread = thread::spawn(move || {
+        let entries = [
+            DeleteEntry {
+                key: trusted_object_key("first"),
+                version_id: None,
+                cond: DeleteCondition::None,
+            },
+            DeleteEntry {
+                key: trusted_object_key("second"),
+                version_id: None,
+                cond: DeleteCondition::None,
+            },
+        ];
+        let result = delete_coord.delete_objects_with_before_entry_test_hook(
+            &DeleteObjectsRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "batch-publication",
+                    test_requester(),
+                    None,
+                ),
+                entries: &entries,
+                bypass_governance: false,
+            },
+            |index| {
+                assert_eq!(entry_calls_for_delete.fetch_add(1, Ordering::SeqCst), index);
+                match index {
+                    0 => {
+                        assert!(Arc::ptr_eq(
+                            &runtime_handle_for_delete.current(),
+                            &initial_for_delete
+                        ));
+                        first_gate_for_delete.wait_at(TOKEN);
+                    }
+                    1 => {
+                        assert!(
+                            !Arc::ptr_eq(&runtime_handle_for_delete.current(), &initial_for_delete),
+                            "entry two must not begin until the queued route publication completes"
+                        );
+                        second_saw_published_map_for_delete.store(true, Ordering::SeqCst);
+                    }
+                    _ => unreachable!("the request has exactly two entries"),
+                }
+            },
+        );
+        let _ = delete_result_tx.send(result);
+    });
+
+    first_gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+    let publication_complete = Arc::new(AtomicBool::new(false));
+    let publication_complete_for_thread = Arc::clone(&publication_complete);
+    let publishing_handle = runtime_handle.clone();
+    let publication_thread = thread::spawn(move || {
+        install_next_epoch_runtime_map_with_historical_routes(&publishing_handle);
+        publication_complete_for_thread.store(true, Ordering::SeqCst);
+    });
+    route_handle.test_wait_until_route_publication_is_pending();
+    assert!(!publication_complete.load(Ordering::SeqCst));
+
+    first_gate.release();
+    let result = delete_result_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .expect("batch delete did not yield to the queued route publication")
+        .unwrap();
+    assert_eq!(result.deleted.len(), 2);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(entry_calls.load(Ordering::SeqCst), 2);
+    assert!(second_saw_published_map.load(Ordering::SeqCst));
+    assert!(publication_complete.load(Ordering::SeqCst));
+    delete_thread.join().unwrap();
+    publication_thread.join().unwrap();
 }
 
 #[test]
@@ -5441,17 +5531,6 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
         bypass_governance: false,
         cond: &DeleteCondition::None,
     };
-    let delete_entries = [DeleteEntry {
-        key: trusted_object_key("key"),
-        version_id: None,
-        cond: DeleteCondition::None,
-    }];
-    let delete_objects_request = DeleteObjectsRequest {
-        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
-        entries: &delete_entries,
-        bypass_governance: false,
-    };
-
     let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
     let canary_tags = object_tag_set(
         "<Tagging><TagSet><Tag><Key>domain</Key><Value>canary</Value></Tag></TagSet></Tagging>",
@@ -5730,12 +5809,6 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
             "DeleteObject",
             local
                 .delete_object_on_admitted_route(&foreign_admission, &delete_request)
-                .map(|_| ()),
-        ),
-        (
-            "DeleteObjects",
-            local
-                .delete_objects_on_admitted_route(&foreign_admission, &delete_objects_request)
                 .map(|_| ()),
         ),
     ] {

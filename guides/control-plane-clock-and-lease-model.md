@@ -273,6 +273,18 @@ Frontends and storage nodes bind fresh runtime maps to platform-qualified or
 defensively monitored monotonic lease time, reject unavailable health samples,
 revalidate clock health on serving admission, and retain the old map's
 monotonic fence on historical storage-node mutation permits. Successor
-activation waits through the skew margin. Remaining production work is the
+activation waits through the skew margin. A content-changing frontend refresh
+closes request admission and drains the old generation before fetching its
+lease-bounded replacement from the authority. Fetching before the drain is
+unsafe for availability: admitted requests can consume the replacement's
+entire lease while publication waits, leaving no generation that can admit new
+work. Same-content lease renewal remains an in-place fast path and does not
+drain admitted requests. Aggregate requests whose entries are independent
+mutations must not pin one admission across the whole aggregate:
+`DeleteObjects` validates the request and bucket first, releases that
+admission, and admits each entry separately. This lets a pending publication
+run between entries and prevents a legal 1,000-key batch from exhausting one
+captured lease and returning `SlowDown` for the remainder. Remaining
+production work is the
 authenticated authority clock re-establishment operation, its operator
 diagnostics, and independent-host fault validation.

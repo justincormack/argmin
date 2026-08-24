@@ -30,6 +30,52 @@ mod runtime_map_refresh_invalidation_tests {
         }
     }
 
+    struct SnapshotCallRuntimeMapSource {
+        snapshot: ClusterRuntimeMapSnapshot,
+        snapshot_called: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl ControlPlaneRuntimeMapSource for SnapshotCallRuntimeMapSource {
+        fn runtime_map_snapshot(
+            &self,
+            _authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            if let Some(snapshot_called) = self
+                .snapshot_called
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                snapshot_called.send(()).unwrap();
+            }
+            Ok(self.snapshot.clone())
+        }
+
+        fn runtime_map_status(
+            &self,
+            _authority_now_ms: u64,
+        ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+            Ok(ControlPlaneRuntimeMapStatus::new(
+                self.snapshot.cluster_epoch(),
+                self.snapshot.pg_routes().len(),
+                0,
+            ))
+        }
+
+        fn serving_pg_runtime_map_snapshot(
+            &self,
+            pg_id: PgId,
+            _authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            self.snapshot
+                .pg_routes()
+                .iter()
+                .any(|route| route.pg_id() == pg_id)
+                .then(|| self.snapshot.clone())
+                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
+        }
+    }
+
     fn frontend_storage_rpc_auth() -> crate::StorageRpcClientAuthConfig {
         let credential = crate::control_plane_auth::ControlPlaneScopedCredential::new(
             crate::control_plane_auth::ControlPlaneScopedCredentialInput {
@@ -650,6 +696,81 @@ mod runtime_map_refresh_invalidation_tests {
         assert!(refreshed.rpc_auth.is_some());
         assert_eq!(refreshed.local_node_count(), 2);
         assert_eq!(refreshed.bucket_write_owner_token(), owner_token);
+    }
+
+    #[test]
+    fn content_changing_refresh_fetches_snapshot_after_admitted_requests_drain() {
+        let tmp = test_util::tempdir();
+        let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+            crate::control_plane::FileControlPlaneStore::new(
+                tmp.path().join("control-plane.state"),
+            ),
+        )
+        .unwrap();
+        authority
+            .bootstrap_initial_cluster_map(
+                vec![
+                    (NodeId::new(1), "/tmp/refresh-node-1.sock".to_string()),
+                    (NodeId::new(2), "/tmp/refresh-node-2.sock".to_string()),
+                ],
+                vec![PgId::new(31)],
+            )
+            .unwrap();
+        let initial_runtime_map = authority.snapshot().runtime_map(1_000).unwrap();
+        let cluster = StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
+            NodeId::new(1),
+            &initial_runtime_map,
+            EcShape { k: 1, m: 0 },
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(frontend_storage_rpc_auth()),
+        )
+        .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(2)])
+            .unwrap();
+        let changed_runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+        assert_ne!(
+            initial_runtime_map.content_digest(),
+            changed_runtime_map.content_digest()
+        );
+
+        let runtime_handle = StorageClusterRuntimeMapHandle::new(cluster).unwrap();
+        let route_handle = runtime_handle.route_handle();
+        let admission = crate::clock::with_time_override(1_000, || {
+            route_handle.admit_current_route().unwrap()
+        });
+        let (snapshot_called_tx, snapshot_called_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let refresh = thread::spawn(move || {
+            let source = SnapshotCallRuntimeMapSource {
+                snapshot: changed_runtime_map,
+                snapshot_called: Mutex::new(Some(snapshot_called_tx)),
+            };
+            let result = crate::clock::with_time_override(1_001, || {
+                runtime_handle.refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+                    &source,
+                    1_001,
+                    LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                )
+            });
+            result_tx.send(result).unwrap();
+        });
+
+        route_handle.test_wait_until_route_publication_is_pending();
+        assert!(matches!(
+            snapshot_called_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        drop(admission);
+        snapshot_called_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime-map snapshot was not fetched after admitted requests drained");
+        result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime-map refresh did not complete")
+            .unwrap();
+        refresh.join().unwrap();
     }
 
     #[test]

@@ -294,9 +294,27 @@ impl StorageClusterRouteHandle {
         candidate: Arc<StorageCluster>,
         after_drain: impl FnOnce(),
     ) -> Result<bool, StorageClusterRuntimeMapRefreshError> {
-        let candidate_authority = candidate.route_authority.dynamic_proof()?;
-        let _publication = self.route_admission.begin_publication();
+        candidate.route_authority.dynamic_proof()?;
+        let publication = self.route_admission.begin_publication();
         after_drain();
+        self.install_if_current_during_publication(
+            &publication,
+            expected_current,
+            candidate,
+        )
+    }
+
+    fn install_if_current_during_publication(
+        &self,
+        publication: &StorageClusterRoutePublicationGuard,
+        expected_current: Option<&Arc<StorageCluster>>,
+        candidate: Arc<StorageCluster>,
+    ) -> Result<bool, StorageClusterRuntimeMapRefreshError> {
+        debug_assert!(Arc::ptr_eq(
+            &self.route_admission.inner,
+            &publication.gate.inner
+        ));
+        let candidate_authority = candidate.route_authority.dynamic_proof()?;
         let mut current = self
             .cluster
             .write()
@@ -488,10 +506,11 @@ impl StorageClusterRouteHandle {
         {
             return Ok(current);
         }
+        let publication = self.route_admission.begin_publication();
         let candidate = self
             .current()
             .refresh_from_control_plane_runtime_map(control_plane, authority_now_ms())?;
-        self.install(Arc::clone(&candidate))?;
+        self.install_if_current_during_publication(&publication, None, Arc::clone(&candidate))?;
         Ok(candidate)
     }
 
@@ -536,6 +555,7 @@ impl StorageClusterRouteHandle {
         {
             return Ok(current);
         }
+        let publication = self.route_admission.begin_publication();
         let candidate = self
             .current()
             .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
@@ -543,7 +563,7 @@ impl StorageClusterRouteHandle {
                 authority_now_ms(),
                 admission_settings,
             )?;
-        self.install(Arc::clone(&candidate))?;
+        self.install_if_current_during_publication(&publication, None, Arc::clone(&candidate))?;
         Ok(candidate)
     }
 

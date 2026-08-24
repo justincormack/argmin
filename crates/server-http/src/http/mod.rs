@@ -1149,7 +1149,7 @@ impl HttpFrontend {
         let (result, mut storage_route_admission) = match auth {
             Ok(auth) => match self.coordinator.admit_storage_route_for_request() {
                 Ok(admission) => {
-                    let result = if let Some(s3_operation) = s3_operation {
+                    let pre_dispatch = if let Some(s3_operation) = s3_operation {
                         if auth_bucket.is_some() {
                             if let Err(err) = self.enforce_bucket_region_for_operation(
                                 &admission,
@@ -1160,19 +1160,24 @@ impl HttpFrontend {
                             } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                                 Err(err)
                             } else {
-                                self.dispatch_service(s3req, &auth, &admission, operation)
+                                Ok(())
                             }
                         } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                             Err(err)
                         } else {
-                            self.dispatch_service(s3req, &auth, &admission, operation)
+                            Ok(())
                         }
                     } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                         Err(err)
                     } else {
-                        self.dispatch_service(s3req, &auth, &admission, operation)
+                        Ok(())
                     };
-                    (result, Some(admission))
+                    match pre_dispatch {
+                        Ok(()) => self.dispatch_service_with_owned_admission(
+                            s3req, &auth, admission, operation,
+                        ),
+                        Err(error) => (Err(error), Some(admission)),
+                    }
                 }
                 Err(err) => (Err(err), None),
             },
@@ -1612,22 +1617,34 @@ impl HttpFrontend {
         })
     }
 
-    fn dispatch_service(
+    fn dispatch_service_with_owned_admission(
         &self,
         req: &S3Request,
         auth: &AuthContext,
-        storage_route_admission: &storage::StorageClusterRouteAdmission,
+        storage_route_admission: storage::StorageClusterRouteAdmission,
         operation: ServiceOperation,
-    ) -> Result<S3Response, ServerError> {
+    ) -> (
+        Result<S3Response, ServerError>,
+        Option<storage::StorageClusterRouteAdmission>,
+    ) {
         match operation {
-            ServiceOperation::S3(operation) => self.dispatch_routed_on_admitted_route(
-                req,
-                auth,
-                storage_route_admission,
-                operation,
-            ),
+            ServiceOperation::S3(S3Operation::DeleteObjects { bucket }) => {
+                drop(storage_route_admission);
+                (self.dispatch_delete_objects(req, auth, &bucket), None)
+            }
+            ServiceOperation::S3(operation) => {
+                let result = self.dispatch_routed_on_admitted_route(
+                    req,
+                    auth,
+                    &storage_route_admission,
+                    operation,
+                );
+                (result, Some(storage_route_admission))
+            }
             ServiceOperation::S3Control(operation) => {
-                self.dispatch_s3_control(req, auth, storage_route_admission, operation)
+                let result =
+                    self.dispatch_s3_control(req, auth, &storage_route_admission, operation);
+                (result, Some(storage_route_admission))
             }
         }
     }
@@ -1769,7 +1786,85 @@ impl HttpFrontend {
         operation: S3Operation,
     ) -> Result<S3Response, ServerError> {
         let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
-        self.dispatch_routed_on_admitted_route(req, auth, &storage_route_admission, operation)
+        self.dispatch_service_with_owned_admission(
+            req,
+            auth,
+            storage_route_admission,
+            ServiceOperation::S3(operation),
+        )
+        .0
+    }
+
+    fn dispatch_delete_objects(
+        &self,
+        req: &S3Request,
+        auth: &AuthContext,
+        bucket: &storage::BucketName,
+    ) -> Result<S3Response, ServerError> {
+        require_request_checksum(req, RequestChecksumRequirement::ContentMd5OrChecksumHeader)?;
+        let bypass_governance = parse_bypass_governance_retention(req);
+        let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
+        let requester = self.requester_from_auth(auth, req)?;
+        let mut entries: Vec<crate::coordinator::DeleteEntry> = Vec::new();
+        let mut validation_errors: Vec<crate::coordinator::DeleteError> = Vec::new();
+        for e in &xml_entries {
+            let version_id = match e.version_id.as_deref() {
+                Some(raw_version_id) => match parse_version_id_str(raw_version_id) {
+                    Ok(version_id) => Some(version_id),
+                    Err(ServerError::InvalidVersionId { .. }) => {
+                        validation_errors.push(crate::coordinator::DeleteError {
+                            key: e.key.to_string(),
+                            version_id: Some(crate::coordinator::DeleteErrorVersionId::Raw(
+                                raw_version_id.to_string(),
+                            )),
+                            code: "NoSuchVersion".to_string(),
+                            message: "The specified version does not exist.".to_string(),
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            };
+            let has_unsupported_form_fields = e.last_modified_time.is_some() || e.size.is_some();
+            let has_unsupported_versioned_etag = version_id.is_some() && e.etag.is_some();
+            if has_unsupported_form_fields || has_unsupported_versioned_etag {
+                validation_errors.push(crate::coordinator::DeleteError {
+                    key: e.key.to_string(),
+                    version_id: version_id.map(Into::into),
+                    code: "NotImplemented".to_string(),
+                    message:
+                        "A form field you provided implies functionality that is not implemented"
+                            .to_string(),
+                });
+                continue;
+            }
+
+            let cond = match e.etag.as_deref() {
+                Some(etag) => crate::conditional::DeleteCondition::from_delete_objects_etag(etag),
+                None => crate::conditional::DeleteCondition::None,
+            };
+            entries.push(crate::coordinator::DeleteEntry {
+                key: e.key.clone(),
+                version_id,
+                cond,
+            });
+        }
+        let mut result = if entries.is_empty() {
+            crate::coordinator::DeleteObjectsResult {
+                deleted: Vec::new(),
+                errors: Vec::new(),
+            }
+        } else {
+            let request = crate::coordinator::DeleteObjectsRequest {
+                bucket: bucket_request(bucket, requester, expected_bucket_owner(req))?,
+                entries: &entries,
+                bypass_governance,
+            };
+            self.coordinator.delete_objects(&request)?
+        };
+        result.errors.extend(validation_errors);
+        Ok(S3Response::delete_objects(&result, quiet))
     }
 
     fn dispatch_routed_on_admitted_route(
@@ -2482,82 +2577,9 @@ impl HttpFrontend {
                     result.version_id,
                 ))
             }
-            S3Operation::DeleteObjects { bucket } => {
-                require_request_checksum(
-                    req,
-                    RequestChecksumRequirement::ContentMd5OrChecksumHeader,
-                )?;
-                let bypass_governance = parse_bypass_governance_retention(req);
-                let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req)?;
-                let mut entries: Vec<crate::coordinator::DeleteEntry> = Vec::new();
-                let mut validation_errors: Vec<crate::coordinator::DeleteError> = Vec::new();
-                for e in &xml_entries {
-                    let version_id = match e.version_id.as_deref() {
-                        Some(raw_version_id) => match parse_version_id_str(raw_version_id) {
-                            Ok(version_id) => Some(version_id),
-                            Err(ServerError::InvalidVersionId { .. }) => {
-                                validation_errors.push(crate::coordinator::DeleteError {
-                                    key: e.key.to_string(),
-                                    version_id: Some(
-                                        crate::coordinator::DeleteErrorVersionId::Raw(
-                                            raw_version_id.to_string(),
-                                        ),
-                                    ),
-                                    code: "NoSuchVersion".to_string(),
-                                    message: "The specified version does not exist.".to_string(),
-                                });
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        },
-                        None => None,
-                    };
-                    let has_unsupported_form_fields =
-                        e.last_modified_time.is_some() || e.size.is_some();
-                    let has_unsupported_versioned_etag = version_id.is_some() && e.etag.is_some();
-                    if has_unsupported_form_fields || has_unsupported_versioned_etag {
-                        validation_errors.push(crate::coordinator::DeleteError {
-                            key: e.key.to_string(),
-                            version_id: version_id.map(Into::into),
-                            code: "NotImplemented".to_string(),
-                            message:
-                                "A form field you provided implies functionality that is not implemented"
-                                    .to_string(),
-                        });
-                        continue;
-                    }
-
-                    let cond = match e.etag.as_deref() {
-                        Some(etag) => {
-                            crate::conditional::DeleteCondition::from_delete_objects_etag(etag)
-                        }
-                        None => crate::conditional::DeleteCondition::None,
-                    };
-                    entries.push(crate::coordinator::DeleteEntry {
-                        key: e.key.clone(),
-                        version_id,
-                        cond,
-                    });
-                }
-                let mut result = if entries.is_empty() {
-                    crate::coordinator::DeleteObjectsResult {
-                        deleted: Vec::new(),
-                        errors: Vec::new(),
-                    }
-                } else {
-                    self.coordinator.delete_objects_on_admitted_route(
-                        storage_route_admission,
-                        &crate::coordinator::DeleteObjectsRequest {
-                            bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
-                            entries: &entries,
-                            bypass_governance,
-                        },
-                    )?
-                };
-                result.errors.extend(validation_errors);
-                Ok(S3Response::delete_objects(&result, quiet))
-            }
+            S3Operation::DeleteObjects { .. } => Err(ServerError::InternalError {
+                reason: "DeleteObjects reached the borrowed route dispatcher".to_string(),
+            }),
             S3Operation::PutBucketVersioning { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
