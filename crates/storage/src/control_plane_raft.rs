@@ -4157,7 +4157,7 @@ impl ControlPlaneRaftAuthority {
         Ok(status)
     }
 
-    /// Confirm alpha.33's proposal lease before handing a mutation to Raft.
+    /// Confirm OpenRaft's proposal lease before handing a mutation to Raft.
     ///
     /// ReadIndex proves linearizable read authority but does not refresh the
     /// quorum acknowledgement used by OpenRaft to admit writes. Avoid an extra

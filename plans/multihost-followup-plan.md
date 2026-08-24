@@ -391,6 +391,16 @@ single authority; replicated mode always uses the replicated authority.
 The existing executor-isolation implementation is baseline. This item prevents
 regression; it is not a request to redesign the completed WAL lane.
 
+The 2026-08-24 review upgraded the exact pin from 0.10.0-alpha.33 to
+0.10.0-alpha.34. The relevant upstream changes make successful log-I/O
+completion watermarks monotonic and move Raft ticks to a randomized,
+fixed-origin `heartbeat_interval * 13 / 64` grid. Argmin's serialized WAL lane
+already completes durability callbacks in order, while the upstream watermark
+guard additionally protects initialization against out-of-order completions.
+With Argmin's 250 ms heartbeat setting the new tick interval is 50 ms; this
+preserves the 1.5-3 s election window and the explicit proposal-lease
+confirmation margin.
+
 ### 4.3 Complete Operational Metrics And Resource Bounds
 
 - add bounded runtime counters for storage RPC connection, session, admission,

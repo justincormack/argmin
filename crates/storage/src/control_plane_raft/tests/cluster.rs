@@ -636,7 +636,7 @@ fn control_plane_openraft_explicit_handles_manage_membership_and_leadership() {
                 .await
                 .unwrap()
                 .linearized_authority_serving(),
-            "serving status remains true after alpha.33's proposal lease expires"
+            "serving status remains true after OpenRaft's proposal lease expires"
         );
         authority2.pause_next_proposal_after_lease_confirmation_for_test(Duration::from_millis(
             350,

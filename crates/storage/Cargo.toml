@@ -27,7 +27,7 @@ ec = { path = "../ec", default-features = false }
 futures-util = "0.3"
 libc = "0.2"
 observability = { path = "../observability" }
-openraft = { version = "=0.10.0-alpha.33", default-features = false, features = ["tokio-rt"] }
+openraft = { version = "=0.10.0-alpha.34", default-features = false, features = ["tokio-rt"] }
 placement = { path = "../placement" }
 s3-types = { path = "../s3-types", default-features = false }
 rapidhash = "4.4"
