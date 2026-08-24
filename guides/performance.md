@@ -4,11 +4,8 @@
 # Performance Guide
 
 While some performance work has taken place, this has not been a high priority.
-Most of the performance however is due to necessary work, such as writing disks,
+Much of the performance however is due to necessary work, such as writing disks,
 fsync, and the erasure coding, encryption and checksum paths documented below.
-
-In general, with SSDs, most storage servers are network bound, so this is the
-key to bear in mind for throughput.
 
 There are not yet optimisations for small objects, either on the read side
 or batched fsync on the write side.
