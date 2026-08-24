@@ -415,6 +415,76 @@ EOF. Promotion transfers the live incremental state; it does not treat the first
 complete body. The decoder must split an oversized incoming frame rather than retaining an
 unbounded overflow frame.
 
+### Segment-size and staging-boundary benchmarks
+
+The internal segment size and the request-owned-to-session promotion boundary are storage design
+parameters, not S3 multipart thresholds. Benchmark them independently of the client's choice to
+use `PutObject` or multipart APIs. In particular, Warp's default 10 MiB object is one S3
+`PutObject` with its current MinIO Go client, but crosses Argmin's current 8 MiB internal boundary.
+AWS transfer helpers also vary materially: common automatic multipart thresholds include 5, 8,
+16, and 100 MiB. No one client default is sufficient evidence for Argmin's boundary.
+
+Establish one reproducible benchmark harness before changing the boundary. It must support the
+current 8 MiB build and candidate 16 MiB build, and where practical a 4 MiB sensitivity build.
+The build variant changes the complete internal segment-size contract consistently; it must not
+fake a larger request-owned object while retaining 8 MiB manifest segments. Record the exact
+binary revision, segment size, EC profile, PG count, node count, frontend count, storage medium,
+CPU allocation, client version, and client flags with every result.
+
+Run at least this payload-size matrix:
+
+- 4 KiB and 64 KiB, to retain tiny-object fixed-cost baselines;
+- 1 MiB, 4 MiB, and 5 MiB, covering representative sub-segment objects and the S3 minimum
+  non-final multipart-part size;
+- one byte below, exactly at, and one byte above each tested internal segment boundary;
+- 10 MiB, covering Warp's default object size;
+- 16 MiB minus one, exactly 16 MiB, and 16 MiB plus one; and
+- 32 MiB, 64 MiB, and a representative large streamed object, so a larger segment does not hide
+  regressions in sustained streaming.
+
+For every relevant size, benchmark:
+
+- ordinary known-length `PutObject`, both automatic staging and test-only forced
+  request-owned/durable-session staging where the representation permits both;
+- aws-chunked `PutObject` with trailing checksum, so decoding and digest-state transfer are
+  included rather than measured separately;
+- isolated `UploadPart`, followed by completion, using one part and repeated equal-sized parts;
+- complete multipart uploads large enough to show cumulative create/append/finalize amplification;
+- overwrite and conditional-PUT variants, because fresh-object throughput alone omits terminal
+  snapshot and displaced-payload work; and
+- cleanup after the workload, including aborts and overwrites, rather than stopping once writes
+  have returned success.
+
+Run a single-client latency case, Warp's default concurrency, and a higher concurrency that
+saturates but does not intentionally overload the cluster. Measure both an embedded/local setup
+and the standard four-host 2+1 multihost setup. Use a fixed warm-up followed by a long steady-state
+window, repeat each cell enough to report dispersion, and randomize or rotate cell ordering so
+thermal state, cache warmth, and accumulated cleanup work do not consistently favor one size.
+Do not compare runs performed during unrelated soak or model-test load.
+
+Capture more than aggregate throughput:
+
+- successful operations per second, bytes per second, and p50/p95/p99/max foreground latency;
+- HTTP 4xx/5xx counts, SDK retries, Argmin `SlowDown`, and incomplete/aborted uploads;
+- frontend and storage CPU, peak and steady RSS, allocator pressure, and per-request buffered
+  bytes at each tested concurrency;
+- metadata commands, pending-slot attempts, storage RPCs, command-log/WAL bytes and fsyncs per
+  completed object or part;
+- payload shard writes and bytes, stream-session creates/appends/finalizes, direct publications,
+  and promotion counts;
+- route-heartbeat/lease stability, queue depths, worker saturation, and recovery or cleanup work
+  generated during and after the run; and
+- time and request amplification required to return all background queues and durable cleanup
+  roots to their pre-run baseline.
+
+Use the results to choose the segment size and promotion boundary separately where the design
+allows that separation. Retain 8 MiB unless another value shows a material, repeatable improvement
+in the intended workload mix without unacceptable memory growth, tail-latency regression,
+metadata amplification, lease instability, or cleanup debt. A 16 MiB boundary is not justified
+solely because MinIO Go uses it, just as 8 MiB is not justified solely by AWS CLI or Boto3. Record
+the final decision, raw benchmark commands, summarized results, and rejected alternatives in this
+plan before implementing a boundary change.
+
 ## Implementation Slices
 
 1. **Baseline and inventory**
@@ -451,10 +521,13 @@ unbounded overflow frame.
    - update the publisher registry, compiler boundary fixtures, metadata-command guide, and
      storage-format version ledger
 5. **Performance decision**
-   - repeat local and multihost benchmarks
-   - evaluate both per-request latency and cumulative metadata amplification across an upload
+   - execute the segment-size and staging-boundary matrix locally and on the four-host cluster
+   - evaluate per-request latency, memory, cumulative metadata amplification, lease stability,
+     and post-workload cleanup debt across each operation and concurrency level
    - retain the UploadPart fast path only if it materially improves the common exact-8-MiB or
      repeated-single-segment workload without regressing larger streamed parts
+   - retain or change the 8 MiB internal boundary only from the recorded comparative evidence;
+     do not infer it from any one SDK's multipart threshold
 
 ## Correctness Tests
 
