@@ -90,3 +90,8 @@ the multi-shard constrained distribution proves it.
 - automatic capacity discovery from the filesystem;
 - node addition, removal, or disk replacement; and
 - automatic acting-set migration or data balancing after bootstrap.
+
+Availability-driven replacement of a lease-expired acting node with already
+committed spare capacity is owned by Phase 3.3 of the multihost production
+follow-up plan. This plan remains responsible only for the immutable weighting
+inputs used when that controller selects an eligible destination.

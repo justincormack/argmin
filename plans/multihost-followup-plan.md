@@ -323,7 +323,154 @@ orders, leader change during joint consensus, cancellation before the first
 stage, restart after each stage, and forged higher-index but uncertified
 snapshots.
 
-### 3.3 Node Replacement Ceremony
+### 3.3 Automatic Unavailable-Node Placement Reconciliation
+
+Temporary loss of a storage process must not require an operator to mutate every
+affected PG before the cluster can use already-provisioned spare capacity. Once
+the node's heartbeat lease and a configured failure grace period have expired,
+one control-plane-owned reconciler should move affected PGs toward placements
+that exclude the unavailable incarnation. This changes PG placement, not the
+node's durable membership or identity. It supersedes the initial static
+multihost rule that only a permanent `Out` transition triggers migration when
+the committed topology already contains an eligible spare failure domain.
+
+The 2026-08-25 four-host `2+1` Warp outage exposed the missing composition. The
+authority expired the failed node and moved affected PGs to `Peering`, but no
+production component submitted replacement acting sets: control-plane
+diagnostics recorded zero acting-set mutations. Pending commands then retained
+one blocked slot on affected PGs and foreground traffic progressively collapsed
+into `SlowDown`. The multihost harness had hidden this gap by invoking the live
+metadata-transfer administration command for its selected probe PG.
+
+The first implementation may use the committed static topology and the existing
+metadata-transfer and payload-backfill primitives. It does not depend on adding
+or removing nodes dynamically and is not capacity rebalancing. It must:
+
+- select replacement actors deterministically from committed eligible nodes,
+  failure-domain policy, current availability, and the exact source acting set;
+- persist one idempotent transition identity containing the topology generation
+  and digest, source PG epoch/state/acting set, destination acting set, reason,
+  and exact failure or planned-maintenance authorization;
+- authorize an unplanned-outage transition with the unavailable node identity
+  and incarnation, exact accepted lease/availability observation, and
+  authority-clock grace cutoff;
+- begin an unplanned migration only through one replicated control-plane
+  compare-and-swap that verifies all transition fields are still current,
+  authority time has crossed the exact grace cutoff, the observed incarnation
+  has not renewed, no unexpired maintenance suppression covers it, and every
+  destination remains eligible, then atomically records the transition and
+  fences the source PG into `Peering`;
+- begin a healthy-source `migrate-before-stop` transition only through a
+  separately authorized compare-and-swap bound to the exact durable maintenance
+  record, departing incarnation, topology, source PG, and destination, without
+  pretending that its lease expired;
+- reconcile affected PGs from a durable, cursor-based queue under one logical
+  owner, with bounded concurrency, bytes in flight, retries, and per-node/PG
+  fairness rather than issuing one global migration burst;
+- fence the source route, reconstruct or transfer metadata from certified
+  available replicas, and install the destination route as `Peering`;
+- keep every destination PG in `Peering` until both the existing exact metadata
+  proof is satisfied on its required destination replicas and every destination
+  actor is leased, fenced to that route, and capable of accepting its assigned
+  payload shard, so any new write can commit all `k + m` shards;
+- retain the source placement in authenticated route history and copy or
+  EC-reconstruct historical payload asynchronously after activation, without
+  making outage duration proportional to the amount of stored payload;
+- retain route history, pending-command recovery authority, reservations, and
+  cleanup roots until every transition dependency has durably cleared;
+- expose backlog depth, oldest age, active transitions, bytes, retry cause, and
+  blocked PGs, and apply explicit admission backpressure when queued demand
+  exceeds bounded worker capacity or remaining eligible failure-domain
+  capacity falls below its configured safety minimum; and
+- resume exactly after authority failover, process restart, response loss, or
+  repeated unavailable/healthy observations without duplicating migration.
+
+Queue discovery before the compare-and-swap is advisory and cancellable: a
+renewed exact incarnation or changed topology/PG record invalidates that item
+and requires recomputation. The compare-and-swap commit is the irreversible
+boundary. Once it has durably recorded the transition and fenced the source PG,
+recovery fails forward through the destination transition; a returning source
+cannot cancel or revert it. Failure of a selected destination requires another
+fenced successor transition rather than rollback to the stale source route.
+
+Availability flapping must not cause automatic acting-set oscillation. A node
+that returns becomes eligible for future placement only after its incarnation,
+lease, local PG evidence, and retained history have been validated. Existing
+PGs remain on their recovered placements until an explicit rebalance policy or
+operator transition moves them, except for the maintenance-bound restoration
+below; outage recovery itself is not implicit failback.
+
+Planned maintenance follows the two modes defined in
+[`temporary-write-availability.md`](../guides/temporary-write-availability.md).
+Both use a durable record bound to a unique maintenance identity, topology
+generation and digest, stable node identity, departing incarnation, mode,
+authority-clock start/expiry, affected-PG source roots and progress cursor, and
+operator authorization.
+
+`migrate-before-stop` uses its healthy-source authorization to move current
+placements before shutdown. It publishes a durable safe-to-stop result only
+after every affected destination is `Active`, no current route requires the
+node, and retained-placement evidence proves historical payload keeps at least
+`k` readable shards without it. Completion does not move those PGs back.
+
+`bounded-no-migration` suppresses only failure-driven CAS operations for its
+exact departing incarnation and only before its authority-clock expiry. A
+validated return before expiry clears the record without a placement change.
+Expiry removes the suppression and enters ordinary automatic reconciliation.
+If that reconciliation crossed its irreversible boundary before the node
+returned, it must finish forward first. A validated return observation records
+the exact returning incarnation, authenticated endpoint identity, accepted live
+lease observation and deadline, and local PG-evidence generation and digest.
+The same maintenance record then authorizes at most one controlled restoration
+toward the recorded pre-maintenance acting set for each PG.
+
+Restoration uses a new CAS that revalidates the return observation atomically:
+the exact incarnation and endpoint remain current, its accepted lease is live
+at authority time, and its PG evidence generation/digest remains accepted. The
+CAS must also prove that the exact current PG is the unsuperseded terminal tip
+of the maintenance outage-transition lineage, with no later operator intent or
+unrelated recovery transition, and that topology and safety policy remain
+unchanged. It then consumes that PG's restoration authority and fences the
+restoration route into `Peering` in the same transaction. Any superseding
+placement intent, even under the same topology and even if it later produces a
+coincidentally matching route, permanently cancels the old maintenance record's
+restoration authority for that PG. Restoration preserves all intermediate
+route history and satisfies the same activation requirements as any placement
+transition. This exception is maintenance intent, not general automatic
+failback. Neither mode weakens lease fencing.
+
+The multihost release gate must kill one acting storage host in a four-host
+`2+1` deployment, without invoking any acting-set or metadata-transfer admin
+command. It must target PGs that used the failed host, prove degraded reads from
+the surviving `k` shards, observe deterministic replacement onto the spare,
+and then sustain PUT, GET, HEAD, DELETE, multipart, and streamed-PUT traffic
+after those PGs become writable. It must also prove that every affected PG is
+eventually reconciled, and that a topology without a safe spare remains
+degraded and retryable rather than activating an unsafe placement. Restart,
+leader-failover, response-loss, and node-flapping variants must retain bounded
+work and converge to the same placement.
+
+Deterministic control-plane regressions must pause immediately before the
+compare-and-swap and prove that exact-incarnation renewal, a changed topology
+digest, and a changed source PG each reject the stale proposal without mutation.
+A complementary regression must renew the source immediately after the commit
+and prove the destination transition remains fenced and resumes after leader
+restart. Activation tests must use one PG that serves both metadata and payload
+placement and prove it remains `Peering` if either the metadata proof or
+new-write destination readiness is incomplete. After both hold, a write must
+still fail unless all `k + m` new shards commit, while a large historical
+backfill may remain queued and old payload remains readable through retained
+route history. Planned-maintenance tests must prove healthy-source migration
+does not require lease expiry, an unexpired suppression rejects the automatic
+CAS, return before expiry performs no migration, and return after an expired
+transition completes one maintenance-bound restoration without dropping
+intermediate history. Restoration regressions must pause immediately before its
+CAS and prove return-lease expiry, endpoint/incarnation change, and changed PG
+evidence each reject without mutation. A same-topology operator or unrelated
+recovery transition after the outage chain must cancel restoration permanently,
+rather than allowing the old maintenance record to override the newer intent.
+
+### 3.4 Node Replacement Ceremony
 
 Loss of established durable state is replacement, not initialization or path
 relocation.
@@ -342,7 +489,7 @@ declared failure-domain tolerance. Include lost authority disk, lost storage
 disk, complete host loss, partial copied state, stale backup, and interrupted
 replacement tests.
 
-### 3.4 Storage Expansion And Rebalancing
+### 3.5 Storage Expansion And Rebalancing
 
 - add nodes and disks first as non-serving prepared topology;
 - use deterministic placement with immutable capacity weights once the
@@ -354,7 +501,7 @@ replacement tests.
 - support disk-to-host failure-domain evolution only through the committed
   topology protocol.
 
-### 3.5 Operator API
+### 3.6 Operator API
 
 Provide typed status, prepare, acknowledge, activate, replace, cancel, and
 resume operations. Mutations are issued once; ambiguous outcomes use status and
@@ -365,8 +512,10 @@ credentials or object identities.
 
 1. Membership cannot change without an exact committed authorization.
 2. Lost state cannot be silently recreated under an old identity.
-3. Replacement and expansion preserve the active failure-domain guarantee.
-4. Every transition resumes safely after leader loss and restart.
+3. A lease-expired acting node is replaced automatically when committed spare
+   capacity can restore the declared placement safely.
+4. Replacement and expansion preserve the active failure-domain guarantee.
+5. Every transition resumes safely after leader loss and restart.
 
 ## Phase 4: Replicated-Mode Production Graduation
 
@@ -599,9 +748,12 @@ progress contract.
    metrics while current soaks continue.
 3. Build the deterministic simulator and history recorder incrementally around
    those active protocols.
-4. Implement committed topology, membership authorization, and replacement.
-5. Add fourth-host network/hard-failure drills and replacement release gates.
-6. Perform replicated-mode naming/configuration graduation only after the
+4. Implement automatic unavailable-node placement reconciliation using the
+   existing transfer and backfill primitives.
+5. Implement committed topology, membership authorization, and permanent node
+   replacement.
+6. Add fourth-host network/hard-failure drills and replacement release gates.
+7. Perform replicated-mode naming/configuration graduation only after the
    supported operational gates are repeatable.
 
 ## Plan Completion Criteria
@@ -613,7 +765,8 @@ This follow-up is complete when:
    classification are closed;
 3. cleanup and all durable background work converge under route churn and
    restart;
-4. authority/storage replacement and topology expansion are committed,
+4. temporary node loss automatically uses committed spare capacity where safe,
+   while authority/storage replacement and topology expansion are committed,
    resumable, and failure-domain safe;
 5. replicated mode no longer depends on experimental configuration or naming;
 6. deterministic simulation, black-box history checking, crash matrices, and
@@ -629,6 +782,7 @@ Carried forward from the completed multihost plan:
 - physical shard identity fencing;
 - background admission and historical checkpoint policy tuning;
 - dynamic topology, membership, replacement, and expansion;
+- automatic unavailable-node PG reconciliation onto committed spare capacity;
 - Raft production naming/configuration graduation;
 - storage RPC pressure metrics and hard-failure multihost gates.
 
