@@ -47,7 +47,8 @@ impl RetainedStreamUploadCleanup {
 /// The bucket and its routed PG are fixed at construction. Operations do not
 /// accept either value again, so callers cannot combine authority for one
 /// bucket with another subject or PG. Every operation also rechecks the
-/// admission's captured absolute deadline before reaching a node client.
+/// admission's generation-gated effective deadline before reaching a node
+/// client.
 ///
 /// ```compile_fail
 /// use storage::ActiveBucketRoute;
@@ -72,8 +73,8 @@ struct BucketMetadataMutationEffectRoute<'a> {
 /// Non-cloneable active authority for an account-scoped bucket metadata scan.
 ///
 /// The scan is fixed to the admitted runtime-map generation. It rechecks the
-/// captured deadline before every bucket-PG node access, so a long scan cannot
-/// continue under a later renewal of the same generation.
+/// effective deadline before every bucket-PG node access. Same-generation
+/// renewal is visible only while no replacement publication is pending.
 ///
 /// ```compile_fail
 /// use storage::ActiveBucketMetadataScan;
@@ -145,7 +146,7 @@ pub struct ActiveObjectReadRoute<'admission> {
 ///
 /// The bucket, key, requested version, and routed object-metadata PG are fixed
 /// at construction. Mutation entry and every retry recheck the request's
-/// immutable admitted deadline. Once a metadata command is durably installed,
+/// effective admitted deadline. Once a metadata command is durably installed,
 /// applying it is convergence of that already-authorized command rather than
 /// a new frontend effect.
 ///
@@ -170,7 +171,7 @@ pub struct ActiveObjectMetadataMutationRoute<'admission> {
 /// Bucket authorization, current-object authorization, generation
 /// reservation, staged payload writes, and final metadata publication remain
 /// bound to the same bucket, key, runtime-map generation, publication domain,
-/// and immutable request deadline.
+/// and generation-gated request deadline.
 ///
 /// ```compile_fail
 /// use storage::ActivePutObjectRoute;

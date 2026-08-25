@@ -1588,6 +1588,7 @@ pub(crate) enum MetadataCommandRecoveryAdmission {
     AwaitingAuthorizedRecovery {
         wait_us: u128,
         lineage_tip: MetadataCommandEnvelope,
+        resolution: Option<MetadataCommandRecoveryResolution>,
     },
     Waited {
         wait_us: u128,
@@ -1669,6 +1670,7 @@ impl MetadataCommandRecoveryGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .resolution = Some(MetadataCommandRecoveryResolution::Outcome(outcome));
+        self.flight.done.notify_all();
     }
 
     pub(crate) fn complete_with_outcome_and_relinquish_if_requested(
@@ -1686,9 +1688,7 @@ impl MetadataCommandRecoveryGuard {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             state.resolution = Some(MetadataCommandRecoveryResolution::Outcome(outcome));
-            if outcome == super::PendingMetadataCommandOutcome::PublishedPendingRecovery
-                && state.authorized_recovery_handoff_requested
-            {
+            if outcome.retains_pending_slot() && state.authorized_recovery_handoff_requested {
                 debug_assert!(state.in_progress);
                 state.in_progress = false;
                 state.awaiting_authorized_recovery = true;
@@ -2266,6 +2266,27 @@ impl LocalClusterRuntimeState {
                 drop(state);
                 (flight, authorized_takeover)
             } else if Instant::now() >= deadline {
+                if request_authorized_handoff_on_published {
+                    let flight = Arc::new(MetadataCommandRecoveryFlight {
+                        state: Mutex::new(MetadataCommandRecoveryFlightState {
+                            in_progress: false,
+                            awaiting_authorized_recovery: true,
+                            authorized_recovery_handoff_requested: true,
+                            keys: HashSet::from([key]),
+                            lineage_root: command.clone(),
+                            lineage_tip: command.clone(),
+                            root_disposition: MetadataCommandRecoveryRootDisposition::TipOutcome,
+                            resolution: None,
+                        }),
+                        done: Condvar::new(),
+                    });
+                    flights_guard.insert(key, flight);
+                    return MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
+                        wait_us: 0,
+                        lineage_tip: command.clone(),
+                        resolution: None,
+                    };
+                }
                 return MetadataCommandRecoveryAdmission::TimedOut {
                     wait_us: 0,
                     lineage_tip: command.clone(),
@@ -2300,13 +2321,31 @@ impl LocalClusterRuntimeState {
         }
         {
             let state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.in_progress
+                && matches!(
+                    state.resolution,
+                    Some(MetadataCommandRecoveryResolution::Outcome(outcome))
+                        if outcome.retains_pending_slot()
+                )
+            {
+                return MetadataCommandRecoveryAdmission::Waited {
+                    wait_us: 0,
+                    lineage_tip: state.lineage_tip.clone(),
+                    resolution: state.resolution,
+                };
+            }
             if state.awaiting_authorized_recovery
                 && !state.in_progress
-                && !wait_for_authorized_handoff
+                && (!wait_for_authorized_handoff
+                    || matches!(
+                        state.resolution,
+                        Some(MetadataCommandRecoveryResolution::Outcome(_))
+                    ))
             {
                 return MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
                     wait_us: 0,
                     lineage_tip: state.lineage_tip.clone(),
+                    resolution: state.resolution,
                 };
             }
         }
@@ -2380,11 +2419,18 @@ impl LocalClusterRuntimeState {
         let wait_us = wait_started.elapsed().as_micros();
         let lineage_tip = guard.lineage_tip.clone();
         let resolution = guard.resolution;
-        if guard.awaiting_authorized_recovery && !guard.in_progress && !wait_for_authorized_handoff
+        if guard.awaiting_authorized_recovery
+            && !guard.in_progress
+            && (!wait_for_authorized_handoff
+                || matches!(
+                    guard.resolution,
+                    Some(MetadataCommandRecoveryResolution::Outcome(_))
+                ))
         {
             MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
                 wait_us,
                 lineage_tip,
+                resolution,
             }
         } else if guard.in_progress || guard.awaiting_authorized_recovery {
             debug_assert!(wait_result.timed_out());

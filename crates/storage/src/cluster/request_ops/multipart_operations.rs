@@ -680,7 +680,9 @@ impl super::StorageCluster {
                 &command,
                 &mut finalization_work_budget,
             )? {
-                NewObjectMetadataCommandApplyOutcome::Applied => {
+                NewObjectMetadataCommandApplyOutcome::Applied
+                | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+                | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => {
                     super::ExactPendingObjectMetadataCommandOutcome::Applied
                 }
                 NewObjectMetadataCommandApplyOutcome::Reinspect(_) => {
@@ -2706,7 +2708,9 @@ impl super::StorageCluster {
             command,
             fallback_error,
         )? {
-            NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
+            NewObjectMetadataCommandApplyOutcome::Applied
+            | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+            | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => Ok(()),
             NewObjectMetadataCommandApplyOutcome::Reinspect(error)
             | NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
         }
@@ -3021,14 +3025,27 @@ impl super::StorageCluster {
                     &bucket_write_reservation,
                     &mut work_budget,
                 );
-                let mut exact_command_is_irrevocable = false;
+                let mut pending_command_is_irrevocable = false;
                 loop {
-                    match self.drain_pending_object_metadata_command_outcome_with_work_budget(
-                        publisher,
-                        pg_id,
-                        &command,
-                        &mut work_budget,
-                    ) {
+                    // Exact request identity returned above. A command for the same upload with
+                    // a different manifest controls the eventual S3 projection, but it is still
+                    // unrelated for recovery-flight ownership.
+                    let drain = if same_upload_completion {
+                        self.drain_pending_object_metadata_command_outcome_for_semantic_projection_with_work_budget(
+                            publisher,
+                            pg_id,
+                            &command,
+                            &mut work_budget,
+                        )
+                    } else {
+                        self.drain_pending_object_metadata_command_outcome_with_work_budget(
+                            publisher,
+                            pg_id,
+                            &command,
+                            &mut work_budget,
+                        )
+                    };
+                    match drain {
                         Ok(
                             super::PendingMetadataCommandOutcome::Applied
                             | super::PendingMetadataCommandOutcome::PublishedPendingRecovery
@@ -3064,7 +3081,7 @@ impl super::StorageCluster {
                             ));
                         }
                         Ok(super::PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
-                            exact_command_is_irrevocable = true;
+                            pending_command_is_irrevocable = true;
                             if let Err(error) = Self::retry_irrevocable_multipart_command(
                                 &mut work_budget,
                                 &command,
@@ -3079,7 +3096,7 @@ impl super::StorageCluster {
                         }
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandContention { .. },
-                        )) if exact_command_is_irrevocable => {
+                        )) if pending_command_is_irrevocable => {
                             self.release_auxiliary_multipart_completion_reservation(
                                 pg_id,
                                 &bucket_write_reservation,
@@ -3090,7 +3107,7 @@ impl super::StorageCluster {
                             StoreError::MetadataCommandDependencyConvergencePending { .. }
                             | StoreError::MetadataCommandIrrevocableConvergencePending { .. },
                         )) => {
-                            exact_command_is_irrevocable = true;
+                            pending_command_is_irrevocable = true;
                             if let Err(error) = Self::retry_irrevocable_multipart_command(
                                 &mut work_budget,
                                 &command,
@@ -3786,7 +3803,9 @@ impl super::StorageCluster {
                         &command,
                         &mut pending_work_budget,
                     )? {
-                    NewObjectMetadataCommandApplyOutcome::Applied => false,
+                    NewObjectMetadataCommandApplyOutcome::Applied
+                    | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+                    | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => false,
                     NewObjectMetadataCommandApplyOutcome::Reinspect(_) => true,
                     NewObjectMetadataCommandApplyOutcome::Abandoned(error) => return Err(error),
                 }

@@ -16,9 +16,11 @@ Fixed by [`afea45b4`](https://github.com/justincormack/argmin/commit/afea45b4)
 (`Enforce route admission across streaming writes`).
 
 Streaming PUT, POST Object, and UploadPart body waits are now bounded by both
-the configured per-frame idle timeout and the immutable process-monotonic
-deadline captured by their route admission. A same-generation lease renewal
-cannot extend that request deadline. Expiry returns `OperationAborted`, stops
+the configured per-frame idle timeout and a generation-gated process-monotonic
+route deadline. Same-generation renewal extends healthy serving requests, but
+starting replacement publication atomically freezes each existing request at
+its original admission deadline and wakes any body-frame wait that sampled a
+later renewed deadline. Expiry returns `OperationAborted`, stops
 the request from performing further storage effects, and releases the route
 admission instead of allowing a trickle upload to hold publication in
 `Draining` indefinitely.
@@ -36,11 +38,12 @@ heartbeat cannot extend admission lifetime after the request has unwound.
 Admission is also enforced at each storage-effect boundary. Initial PUT
 authorization/reservation preparation, POST session creation, UploadPart
 session creation, append, direct commit, heartbeat, and finalization all
-revalidate the captured admission against the exact runtime-map generation
-used for the operation. Tests renew the raw same-epoch cluster beyond the old
-deadline and prove that the raw cluster remains admissible while the earlier
-request is rejected before creating a reservation or session. This closes the
-renewal-based bypass as well as the original slow-body path.
+revalidate the effective admission against the exact runtime-map generation
+used for the operation. Tests prove that same-generation renewal extends an
+admitted request while its route remains openly serving, then begin replacement
+publication and prove that the original admission deadline again bounds body
+waits and storage effects. This closes the renewal-based publication bypass as
+well as the original slow-body path.
 
 Runtime-map installation now revalidates a bounded candidate after admitted
 requests drain and immediately before publication. A candidate that expires

@@ -2284,7 +2284,11 @@ fn versioned_direct_put_hands_transported_trailing_contention_to_recovery() {
     ));
     assert_eq!(
         cluster
-            .drain_pending_metadata_command_with_recovery_gate(PgId::new(object_pg), &pending,)
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                PgId::new(object_pg),
+                &pending,
+                &cluster,
+            )
             .unwrap(),
         PendingMetadataCommandOutcome::Applied
     );
@@ -2484,7 +2488,11 @@ fn versioned_direct_put_converges_primary_apply_response_loss_before_success() {
     );
     assert_eq!(
         cluster
-            .drain_pending_metadata_command_with_recovery_gate(PgId::new(object_pg), &pending,)
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                PgId::new(object_pg),
+                &pending,
+                &cluster,
+            )
             .unwrap(),
         PendingMetadataCommandOutcome::Applied
     );
@@ -4455,6 +4463,207 @@ fn direct_put_retries_irreversible_uncertainty_on_the_active_route() {
 }
 
 #[test]
+fn direct_put_terminal_cleanup_handoff_does_not_block_unrelated_reservation() {
+    struct CleanupGateRelease(Option<std::sync::mpsc::SyncSender<()>>);
+
+    impl CleanupGateRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for CleanupGateRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let other_key = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        key_for_object_pg(topology, &bucket, object_pg, "cleanup-handoff-other-")
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id = crate::tests::stream_session_id("cleanup-handoff");
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"direct PUT terminal cleanup handoff";
+    let segment_okh = [0x4f; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+
+    let cleanup_attempts = Arc::new(AtomicUsize::new(0));
+    let cleanup_attempts_for_hook = Arc::clone(&cleanup_attempts);
+    let (cleanup_reached_tx, cleanup_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::sync_channel(1);
+    let cleanup_release_rx = Arc::new(Mutex::new(cleanup_release_rx));
+    let cleanup_release_rx_for_hook = Arc::clone(&cleanup_release_rx);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let cleanup_hook = cluster.test_install_global_metadata_command_terminal_slot_removal_hook(
+        Arc::new(move |command| {
+            let matches = matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.object.bucket == hook_bucket && commit.object.key == hook_key
+            );
+            if matches {
+                let attempt = cleanup_attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    cleanup_reached_tx.send(()).unwrap();
+                    cleanup_release_rx_for_hook
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("terminal cleanup gate was not released");
+                }
+            }
+            matches
+        }),
+    );
+
+    let other_reservation_id = crate::tests::stream_session_id("cleanup-other");
+    let mut cleanup_release = CleanupGateRelease(Some(cleanup_release_tx));
+    let (outcome, waiter_error, command) = thread::scope(|scope| {
+        let (owner_result_tx, owner_result_rx) = std::sync::mpsc::sync_channel(1);
+        let owner_cluster = &cluster;
+        let owner_request = &commit_req;
+        let owner_shards = &written.written_shards;
+        scope.spawn(move || {
+            owner_result_tx
+                .send(owner_cluster.commit_direct_put_object_from_payload_shards(
+                    owner_request,
+                    owner_shards,
+                    |_| Ok::<(), ()>(()),
+                ))
+                .unwrap();
+        });
+        cleanup_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("direct PUT did not reach terminal cleanup");
+
+        let pg_id = PgId::new(object_pg);
+        let command = pending_metadata_command_for_test(&map, pg_id, &bucket)
+            .expect("deferred terminal cleanup must retain the direct PUT command");
+        let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter_cluster = &cluster;
+        let waiter_bucket = &bucket;
+        let waiter_key = &other_key;
+        let waiter_reservation_id = &other_reservation_id;
+        scope.spawn(move || {
+            waiter_result_tx
+                .send(waiter_cluster.reserve_put_object_generation(
+                    waiter_bucket,
+                    waiter_key,
+                    waiter_reservation_id,
+                ))
+                .unwrap();
+        });
+        let waiter_selection_deadline = Instant::now() + Duration::from_secs(5);
+        while !map
+            .runtime_state()
+            .test_metadata_command_recovery_handoff_requested(pg_id, &command)
+        {
+            assert!(
+                Instant::now() < waiter_selection_deadline,
+                "unrelated reservation did not select the direct PUT recovery flight"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let waiter_error = waiter_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unrelated reservation waiter remained blocked by terminal cleanup")
+            .unwrap_err();
+        cleanup_release.release();
+        let outcome = owner_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("direct PUT owner did not finish after cleanup release")
+            .unwrap()
+            .unwrap();
+        (outcome, waiter_error, command)
+    });
+    assert_eq!(outcome.live_size, payload.len() as u64);
+    assert!(matches!(
+        waiter_error,
+        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+    ));
+    assert_eq!(cleanup_attempts.load(Ordering::SeqCst), 1);
+
+    let pg_id = PgId::new(object_pg);
+    assert!(matches!(
+        command.payload(),
+        MetadataCommandPayload::CommitDirectPutObject(commit)
+            if commit.object.key == key && commit.object.generation_id == generation_id
+    ));
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+
+    assert!(matches!(
+        cluster.reserve_put_object_generation(&bucket, &other_key, &other_reservation_id),
+        Err(crate::ObjectPgActionError::MetadataCommandRecoveryTransferred)
+    ));
+    assert_eq!(
+        cleanup_attempts.load(Ordering::SeqCst),
+        1,
+        "an unrelated request must not retry terminal cleanup on its request budget"
+    );
+
+    drop(cleanup_hook);
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id, &command, &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
 fn direct_put_retains_irreversible_handoff_until_authorized_recovery() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -4946,7 +5155,7 @@ fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
         .unwrap_err();
     assert!(matches!(
         error,
-        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
+        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
     ));
     assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
     assert!(pending_installed.load(Ordering::SeqCst));
@@ -4959,6 +5168,7 @@ fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
         MetadataCommandPayload::CommitDirectPutObject(commit)
             if commit.object.generation_id == contender_generation_id
     ));
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(PgId::new(2), &pending));
     let primary = map
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
         .unwrap();

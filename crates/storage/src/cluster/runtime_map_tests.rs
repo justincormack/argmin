@@ -1096,32 +1096,6 @@ mod runtime_map_refresh_invalidation_tests {
     }
 
     #[test]
-    fn admitted_frontend_route_deadline_is_not_extended_by_later_renewal() {
-        let (cluster, admission) = crate::clock::with_time_override(1_000, || {
-            let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
-            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
-            let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
-            let admission = handle.admit_current_route().unwrap();
-            (cluster, admission)
-        });
-
-        crate::clock::with_time_override(1_000, || {
-            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-        });
-        crate::clock::with_time_override(6_000, || {
-            cluster.require_route_map_valid_now().unwrap();
-            assert!(matches!(
-                admission.require_valid_now_raw(),
-                Err(StoreError::RouteMapExpired {
-                    cluster_epoch,
-                    valid_until_ms: 5_000,
-                    now_ms: 6_000,
-                }) if cluster_epoch == ClusterEpoch::INITIAL
-            ));
-        });
-    }
-
-    #[test]
     fn admitted_frontend_route_rejects_a_different_runtime_map_generation() {
         crate::clock::with_time_override(1_000, || {
             let admitted_cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
@@ -1180,7 +1154,7 @@ mod runtime_map_refresh_invalidation_tests {
     }
 
     #[test]
-    fn admitted_frontend_route_remaining_validity_uses_captured_deadline() {
+    fn admitted_frontend_route_remaining_validity_uses_renewed_deadline_while_open() {
         let (cluster, admission) = crate::clock::with_time_override(1_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
@@ -1195,22 +1169,20 @@ mod runtime_map_refresh_invalidation_tests {
         crate::clock::with_time_override(2_000, || {
             assert_eq!(
                 admission.remaining_validity().unwrap(),
-                Some(Duration::from_secs(3))
+                Some(Duration::from_secs(8))
             );
         });
-        crate::clock::with_time_override(5_000, || {
-            let error = admission.remaining_validity().unwrap_err();
+        crate::clock::with_time_override(6_000, || {
             assert_eq!(
-                error.class(),
-                crate::StoreOperationFailureClass::RetryableConvergence
+                admission.remaining_validity().unwrap(),
+                Some(Duration::from_secs(4))
             );
-            assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
         });
     }
 
     #[cfg(test)]
     #[test]
-    fn active_bucket_route_rechecks_its_admitted_deadline_before_node_access() {
+    fn active_bucket_route_uses_same_generation_renewal_while_open() {
         let cluster = crate::clock::with_time_override(1_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
@@ -1220,27 +1192,14 @@ mod runtime_map_refresh_invalidation_tests {
         let admission =
             crate::clock::with_time_override(1_000, || handle.admit_current_route().unwrap());
         let bucket = BucketName::try_from("capability-bucket").unwrap();
-        let route = crate::clock::with_time_override(1_000, || {
-            admission.active_bucket_route(&bucket).unwrap()
-        });
 
         crate::clock::with_time_override(1_000, || {
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
         });
         crate::clock::with_time_override(6_000, || {
             cluster.require_route_map_valid_now().unwrap();
-            for error in [
-                route.head_bucket_info().unwrap_err(),
-                route
-                    .load_bucket_snapshot(BucketSnapshotRequest::default())
-                    .unwrap_err(),
-            ] {
-                assert_eq!(
-                    error.kind(),
-                    &crate::BucketSnapshotLoadFailureKind::SlowDown
-                );
-                assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
-            }
+            admission.require_valid_now_raw().unwrap();
+            admission.active_bucket_route(&bucket).unwrap();
         });
     }
 
@@ -1326,6 +1285,38 @@ mod runtime_map_refresh_invalidation_tests {
         );
         crate::clock::with_time_override(6_000, || {
             cluster.require_route_map_valid_now().unwrap();
+            admission.require_valid_now_raw().unwrap();
+        });
+    }
+
+    #[test]
+    fn pending_publication_freezes_admission_at_its_original_deadline() {
+        let (cluster, handle, admission, candidate) =
+            crate::clock::with_time_override(1_000, || {
+                let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+                cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+                let handle =
+                    StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+                let admission = handle.admit_current_route().unwrap();
+                let candidate = active_test_cluster(RouteMapValidity::until_ms(20_000).unwrap());
+                candidate
+                    .test_store_route_map_validity(RouteMapValidity::until_ms(20_000).unwrap());
+                (cluster, handle, admission, candidate)
+            });
+
+        crate::clock::with_time_override(1_000, || {
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+        });
+        let installer_handle = handle.clone();
+        let installer = thread::spawn(move || {
+            crate::clock::with_time_override(1_000, || {
+                installer_handle.install(candidate).unwrap();
+            });
+        });
+        handle.route_admission.wait_until_publication_is_pending();
+
+        crate::clock::with_time_override(6_000, || {
+            cluster.require_route_map_valid_now().unwrap();
             assert!(matches!(
                 admission.require_valid_now_raw(),
                 Err(StoreError::RouteMapExpired {
@@ -1335,6 +1326,9 @@ mod runtime_map_refresh_invalidation_tests {
                 })
             ));
         });
+
+        drop(admission);
+        installer.join().unwrap();
     }
 
     #[test]

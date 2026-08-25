@@ -147,6 +147,17 @@ pub(super) enum ChunkedMode {
     UnsignedTrailer { expected_len: u64 },
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteBoundedBodyOperation {
+    PutObject,
+    PostObject,
+    UploadPart,
+}
+
+#[cfg(test)]
+type RouteBoundedBodyWaitHook = Arc<dyn Fn(RouteBoundedBodyOperation) + Send + Sync + 'static>;
+
 impl ChunkedMode {
     fn is_trailer_mode(&self) -> bool {
         matches!(
@@ -223,6 +234,8 @@ pub struct ServeConfig {
     /// Status source for frontend control-plane runtime-map refresh diagnostics.
     pub frontend_runtime_map_refresh_status:
         Option<storage::StorageClusterRuntimeMapRefreshLoopStatusHandle>,
+    #[cfg(test)]
+    route_bounded_body_wait_hook: Option<RouteBoundedBodyWaitHook>,
 }
 
 impl Default for ServeConfig {
@@ -240,6 +253,8 @@ impl Default for ServeConfig {
             #[cfg(any(test, feature = "local-debug-endpoints"))]
             local_debug_endpoint: false,
             frontend_runtime_map_refresh_status: None,
+            #[cfg(test)]
+            route_bounded_body_wait_hook: None,
         }
     }
 }
@@ -2550,6 +2565,58 @@ fn route_bounded_body_frame_timeout(
     Ok(remaining.map_or(idle_timeout, |remaining| idle_timeout.min(remaining)))
 }
 
+enum RouteBoundedBodyWait<T> {
+    Ready(T),
+    TimedOut,
+    RouteInvalid(ServerError),
+}
+
+async fn wait_for_route_bounded_body_frame<F>(
+    admission: Option<&storage::StorageClusterRouteAdmission>,
+    idle_timeout: Duration,
+    on_wait_started: impl FnOnce(),
+    frame: F,
+) -> RouteBoundedBodyWait<F::Output>
+where
+    F: std::future::Future,
+{
+    let initial_timeout = match route_bounded_body_frame_timeout(admission, idle_timeout) {
+        Ok(timeout) => timeout,
+        Err(error) => return RouteBoundedBodyWait::RouteInvalid(error),
+    };
+    tokio::pin!(frame);
+    let initial_sleep = tokio::time::sleep(initial_timeout);
+    tokio::pin!(initial_sleep);
+
+    let Some(admission) = admission else {
+        on_wait_started();
+        return tokio::select! {
+            output = &mut frame => RouteBoundedBodyWait::Ready(output),
+            () = &mut initial_sleep => RouteBoundedBodyWait::TimedOut,
+        };
+    };
+    let publication_pending = admission.wait_for_route_publication_pending();
+    tokio::pin!(publication_pending);
+    on_wait_started();
+    tokio::select! {
+        output = &mut frame => RouteBoundedBodyWait::Ready(output),
+        () = &mut initial_sleep => RouteBoundedBodyWait::TimedOut,
+        () = &mut publication_pending => {
+            let shortened_timeout = match route_bounded_body_frame_timeout(
+                Some(admission),
+                idle_timeout,
+            ) {
+                Ok(timeout) => timeout,
+                Err(error) => return RouteBoundedBodyWait::RouteInvalid(error),
+            };
+            tokio::select! {
+                output = &mut frame => RouteBoundedBodyWait::Ready(output),
+                () = tokio::time::sleep(shortened_timeout) => RouteBoundedBodyWait::TimedOut,
+            }
+        }
+    }
+}
+
 fn pre_auth_body_deadline(timeout: Duration) -> TokioInstant {
     let now = TokioInstant::now();
     now.checked_add(timeout).unwrap_or(now)
@@ -2687,23 +2754,25 @@ async fn handle_streaming_post_object(
 
     loop {
         let next_frame: Result<_, ServerError> = match ctx.as_ref() {
-            Some(ctx) => {
-                let frame_timeout = match route_bounded_body_frame_timeout(
-                    Some(ctx.storage_route_admission()),
-                    idle_timeout,
-                ) {
-                    Ok(timeout) => timeout,
-                    Err(err) => {
-                        abort_streaming_post_object(&state, ctx).await;
-                        return error_response(&err, &wire_ids);
+            Some(ctx) => match wait_for_route_bounded_body_frame(
+                Some(ctx.storage_route_admission()),
+                idle_timeout,
+                || {
+                    #[cfg(test)]
+                    if let Some(hook) = state.config.route_bounded_body_wait_hook.as_ref() {
+                        hook(RouteBoundedBodyOperation::PostObject);
                     }
-                };
-                tokio::time::timeout(frame_timeout, body.frame())
-                    .await
-                    .map_err(|_| {
-                        route_bounded_body_timeout_error(Some(ctx.storage_route_admission()))
-                    })
-            }
+                },
+                body.frame(),
+            )
+            .await
+            {
+                RouteBoundedBodyWait::Ready(frame) => Ok(frame),
+                RouteBoundedBodyWait::TimedOut => Err(route_bounded_body_timeout_error(Some(
+                    ctx.storage_route_admission(),
+                ))),
+                RouteBoundedBodyWait::RouteInvalid(error) => Err(error),
+            },
             None => await_pre_auth_body_frame(body.frame(), idle_timeout, pre_auth_deadline).await,
         };
         match next_frame {
@@ -3200,20 +3269,21 @@ async fn handle_streaming_put(
     let mut body_timing = StreamingBodyTiming::default();
     loop {
         let frame_wait_start = Instant::now();
-        let frame_timeout = match route_bounded_body_frame_timeout(
+        let next_frame = wait_for_route_bounded_body_frame(
             Some(ctx.storage_route_admission()),
             idle_timeout,
-        ) {
-            Ok(timeout) => timeout,
-            Err(err) => {
-                abort_streaming(&state, &ctx, session_id.clone()).await;
-                return error_response(&err, &wire_ids);
-            }
-        };
-        let next_frame = tokio::time::timeout(frame_timeout, body.frame()).await;
+            || {
+                #[cfg(test)]
+                if let Some(hook) = state.config.route_bounded_body_wait_hook.as_ref() {
+                    hook(RouteBoundedBodyOperation::PutObject);
+                }
+            },
+            body.frame(),
+        )
+        .await;
         body_timing.frame_wait_us += elapsed_micros(frame_wait_start);
         match next_frame {
-            Ok(Some(Ok(frame))) => {
+            RouteBoundedBodyWait::Ready(Some(Ok(frame))) => {
                 if let Some(wire_data) = frame.data_ref() {
                     body_timing.data_frames += 1;
                     if let Some(ref mut dec) = decoder {
@@ -3275,7 +3345,7 @@ async fn handle_streaming_put(
                     }
                 }
             }
-            Ok(Some(Err(_))) => {
+            RouteBoundedBodyWait::Ready(Some(Err(_))) => {
                 abort_streaming(&state, &ctx, session_id.clone()).await;
                 return error_response(
                     &ServerError::InvalidRequest {
@@ -3284,13 +3354,17 @@ async fn handle_streaming_put(
                     &wire_ids,
                 );
             }
-            Ok(None) => break, // Body complete
-            Err(_) => {
+            RouteBoundedBodyWait::Ready(None) => break, // Body complete
+            RouteBoundedBodyWait::TimedOut => {
                 abort_streaming(&state, &ctx, session_id.clone()).await;
                 return error_response(
                     &route_bounded_body_timeout_error(Some(ctx.storage_route_admission())),
                     &wire_ids,
                 );
+            }
+            RouteBoundedBodyWait::RouteInvalid(error) => {
+                abort_streaming(&state, &ctx, session_id.clone()).await;
+                return error_response(&error, &wire_ids);
             }
         }
     }
@@ -4128,20 +4202,21 @@ async fn handle_streaming_part(
     let mut body_timing = StreamingBodyTiming::default();
     loop {
         let frame_wait_start = Instant::now();
-        let frame_timeout = match route_bounded_body_frame_timeout(
+        let next_frame = wait_for_route_bounded_body_frame(
             Some(ctx.storage_route_admission()),
             idle_timeout,
-        ) {
-            Ok(timeout) => timeout,
-            Err(err) => {
-                abort_streaming_part_ctx(&state, &ctx).await;
-                return error_response(&err, &wire_ids);
-            }
-        };
-        let next_frame = tokio::time::timeout(frame_timeout, body.frame()).await;
+            || {
+                #[cfg(test)]
+                if let Some(hook) = state.config.route_bounded_body_wait_hook.as_ref() {
+                    hook(RouteBoundedBodyOperation::UploadPart);
+                }
+            },
+            body.frame(),
+        )
+        .await;
         body_timing.frame_wait_us += elapsed_micros(frame_wait_start);
         match next_frame {
-            Ok(Some(Ok(frame))) => {
+            RouteBoundedBodyWait::Ready(Some(Ok(frame))) => {
                 if let Some(wire_data) = frame.data_ref() {
                     body_timing.data_frames += 1;
                     if let Some(ref mut dec) = decoder {
@@ -4201,7 +4276,7 @@ async fn handle_streaming_part(
                     }
                 }
             }
-            Ok(Some(Err(_))) => {
+            RouteBoundedBodyWait::Ready(Some(Err(_))) => {
                 abort_streaming_part_ctx(&state, &ctx).await;
                 return error_response(
                     &ServerError::InvalidRequest {
@@ -4210,13 +4285,17 @@ async fn handle_streaming_part(
                     &wire_ids,
                 );
             }
-            Ok(None) => break,
-            Err(_) => {
+            RouteBoundedBodyWait::Ready(None) => break,
+            RouteBoundedBodyWait::TimedOut => {
                 abort_streaming_part_ctx(&state, &ctx).await;
                 return error_response(
                     &route_bounded_body_timeout_error(Some(ctx.storage_route_admission())),
                     &wire_ids,
                 );
+            }
+            RouteBoundedBodyWait::RouteInvalid(error) => {
+                abort_streaming_part_ctx(&state, &ctx).await;
+                return error_response(&error, &wire_ids);
             }
         }
     }

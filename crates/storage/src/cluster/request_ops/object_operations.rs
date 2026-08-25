@@ -4,8 +4,25 @@
 #[derive(Debug)]
 pub(super) enum NewObjectMetadataCommandApplyOutcome {
     Applied,
+    PublishedPendingRecovery,
+    TerminalCleanupPending,
     Reinspect(ObjectPgActionError),
     Abandoned(ObjectPgActionError),
+}
+
+impl NewObjectMetadataCommandApplyOutcome {
+    pub(super) fn pending_metadata_command_outcome(&self) -> Option<PendingMetadataCommandOutcome> {
+        match self {
+            Self::Applied => Some(PendingMetadataCommandOutcome::Applied),
+            Self::PublishedPendingRecovery => {
+                Some(PendingMetadataCommandOutcome::PublishedPendingRecovery)
+            }
+            Self::TerminalCleanupPending => {
+                Some(PendingMetadataCommandOutcome::TerminalCleanupPending { applied: true })
+            }
+            Self::Reinspect(_) | Self::Abandoned(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -622,7 +639,9 @@ impl super::StorageCluster {
                 recovery_guard: None,
             },
         )? {
-            NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
+            NewObjectMetadataCommandApplyOutcome::Applied
+            | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+            | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => Ok(()),
             NewObjectMetadataCommandApplyOutcome::Reinspect(error)
             | NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
         }
@@ -722,7 +741,9 @@ impl super::StorageCluster {
                 recovery_guard: None,
             },
         )? {
-            NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
+            NewObjectMetadataCommandApplyOutcome::Applied
+            | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+            | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => Ok(()),
             NewObjectMetadataCommandApplyOutcome::Reinspect(error)
             | NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
         }
@@ -746,7 +767,9 @@ impl super::StorageCluster {
                 recovery_guard: None,
             },
         )? {
-            NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
+            NewObjectMetadataCommandApplyOutcome::Applied
+            | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+            | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => Ok(()),
             NewObjectMetadataCommandApplyOutcome::Reinspect(error)
             | NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
         }
@@ -928,27 +951,46 @@ impl super::StorageCluster {
             match apply {
                 Ok(outcome) => {
                     if outcome == MetadataCommandApplyOutcome::Converged {
-                        if self
+                        if let Some(recovery_guard) = recovery_guard {
+                            recovery_guard.record_outcome(
+                                PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                    applied: true,
+                                },
+                            );
+                        }
+                        let completion = if !self
                             .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
                                 pg_id, &command,
                             )
                             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                         {
-                            self.remove_pending_metadata_command_for_bucket_with_work_budget(
-                                pg_id,
-                                command.bucket_name(),
-                                &command,
-                                work_budget,
-                            )
-                            .map_err(ObjectPgActionError::from)?;
-                        }
+                            NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending
+                        } else {
+                            let cleanup = self
+                                .remove_pending_metadata_command_for_bucket(
+                                    pg_id,
+                                    command.bucket_name(),
+                                    &command,
+                                )
+                                .map_err(ObjectPgActionError::from)?;
+                            if cleanup == PendingMetadataCommandTerminalCleanup::Deferred {
+                                NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending
+                            } else {
+                                NewObjectMetadataCommandApplyOutcome::Applied
+                            }
+                        };
                         self.after_object_metadata_command_applied(&command);
+                        #[cfg(test)]
+                        crate::node::maybe_run_after_object_metadata_command_publish_hook(
+                            self.metadata_primary_test_hook_node().test_hook_scope_id(),
+                        )?;
+                        return Ok(completion);
                     }
                     #[cfg(test)]
                     crate::node::maybe_run_after_object_metadata_command_publish_hook(
                         self.metadata_primary_test_hook_node().test_hook_scope_id(),
                     )?;
-                    return Ok(NewObjectMetadataCommandApplyOutcome::Applied);
+                    return Ok(NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery);
                 }
                 Err(error) => {
                     let MetadataCommandApplyFailure {
@@ -1061,22 +1103,39 @@ impl super::StorageCluster {
                         .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                     {
                         Some(true) => {
-                            if self
+                            if let Some(recovery_guard) = recovery_guard {
+                                recovery_guard.record_outcome(
+                                    PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                        applied: true,
+                                    },
+                                );
+                            }
+                            if !self
                                 .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
                                     pg_id, &command,
                                 )
                                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                             {
-                                self.remove_pending_metadata_command_for_bucket_with_work_budget(
+                                self.after_object_metadata_command_applied(&command);
+                                return Ok(
+                                    NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending,
+                                );
+                            }
+                            let cleanup = self
+                                .remove_pending_metadata_command_for_bucket(
                                     pg_id,
                                     command.bucket_name(),
                                     &command,
-                                    work_budget,
                                 )
                                 .map_err(ObjectPgActionError::from)?;
-                            }
                             self.after_object_metadata_command_applied(&command);
-                            return Ok(NewObjectMetadataCommandApplyOutcome::Applied);
+                            return Ok(if cleanup
+                                == PendingMetadataCommandTerminalCleanup::Deferred
+                            {
+                                NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending
+                            } else {
+                                NewObjectMetadataCommandApplyOutcome::Applied
+                            });
                         }
                         Some(false) => {
                             apply_progress = apply_progress
@@ -1304,7 +1363,7 @@ impl super::StorageCluster {
                     self.metadata_primary_test_hook_node().test_hook_scope_id(),
                 )?;
                 if can_reinspect {
-                    Ok(NewObjectMetadataCommandApplyOutcome::Applied)
+                    Ok(NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery)
                 } else {
                     Err(fallback_error)
                 }
@@ -1912,7 +1971,9 @@ impl super::StorageCluster {
                 &command,
                 &mut work_budget,
             )? {
-                NewObjectMetadataCommandApplyOutcome::Applied => {}
+                NewObjectMetadataCommandApplyOutcome::Applied
+                | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+                | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => {}
                 NewObjectMetadataCommandApplyOutcome::Reinspect(_) => continue,
                 NewObjectMetadataCommandApplyOutcome::Abandoned(error) => return Err(error),
             }
@@ -2256,7 +2317,9 @@ impl super::StorageCluster {
                 &command,
                 &mut work_budget,
             )? {
-                NewObjectMetadataCommandApplyOutcome::Applied => {}
+                NewObjectMetadataCommandApplyOutcome::Applied
+                | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+                | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => {}
                 NewObjectMetadataCommandApplyOutcome::Reinspect(_) => {
                     #[cfg(test)]
                     {

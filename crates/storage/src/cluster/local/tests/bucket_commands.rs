@@ -1387,6 +1387,140 @@ fn put_bucket_versioning_retries_abandoned_command_with_slot_cleanup_deferred() 
 }
 
 #[test]
+fn bucket_terminal_cleanup_publishes_handoff_before_blocked_slot_removal() {
+    struct CleanupRelease(Option<std::sync::mpsc::SyncSender<()>>);
+
+    impl CleanupRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for CleanupRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], EcShape { k: 2, m: 1 }).unwrap();
+    let pg_id = PgId::new(1);
+    let bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        pg_id.get(),
+        "bucket-cleanup-handoff-",
+    );
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let (cleanup_reached_tx, cleanup_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::sync_channel(1);
+    let cleanup_release_rx = Arc::new(Mutex::new(cleanup_release_rx));
+    let cleanup_release_rx_for_hook = Arc::clone(&cleanup_release_rx);
+    let hook_bucket = bucket.clone();
+    let cleanup_reached = Arc::new(AtomicBool::new(false));
+    let cleanup_reached_for_hook = Arc::clone(&cleanup_reached);
+    let cleanup_hook = cluster.test_install_global_metadata_command_terminal_slot_removal_hook(
+        Arc::new(move |command| {
+            if !matches!(
+                command.payload(),
+                MetadataCommandPayload::PutBucketVersioning(versioning)
+                    if versioning.bucket.name == hook_bucket
+            ) || cleanup_reached_for_hook.swap(true, Ordering::SeqCst)
+            {
+                return false;
+            }
+            cleanup_reached_tx.send(()).unwrap();
+            cleanup_release_rx_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bucket terminal cleanup gate was not released");
+            true
+        }),
+    );
+
+    let (owner_result, waiter_error, command) = thread::scope(|scope| {
+        let mut cleanup_release = CleanupRelease(Some(cleanup_release_tx));
+        let (owner_tx, owner_rx) = std::sync::mpsc::sync_channel(1);
+        let owner_cluster = &cluster;
+        let owner_bucket = &bucket;
+        scope.spawn(move || {
+            owner_tx
+                .send(owner_cluster.put_bucket_versioning_and_load_info_raw(
+                    owner_bucket,
+                    crate::BucketVersioningState::Enabled,
+                ))
+                .unwrap();
+        });
+        cleanup_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bucket command did not reach terminal cleanup");
+        let command = pending_metadata_command_for_test(&map, pg_id, &bucket)
+            .expect("blocked terminal cleanup must retain the bucket command");
+
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter_cluster = &cluster;
+        let waiter_bucket = &bucket;
+        let waiter_command = command.clone();
+        scope.spawn(move || {
+            waiter_tx
+                .send(waiter_cluster.drain_bucket_pg_pending_metadata_command(
+                    pg_id,
+                    waiter_bucket,
+                    &waiter_command,
+                    false,
+                ))
+                .unwrap();
+        });
+        let waiter_error = waiter_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unrelated bucket waiter remained blocked by terminal cleanup")
+            .unwrap_err();
+        cleanup_release.release();
+        let owner_result = owner_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bucket command owner did not finish after cleanup release");
+        (owner_result, waiter_error, command)
+    });
+
+    assert_eq!(
+        owner_result.unwrap().versioning,
+        crate::BucketVersioningState::Enabled
+    );
+    assert!(matches!(
+        waiter_error,
+        crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandContention { .. })
+    ));
+    assert!(cleanup_reached.load(Ordering::SeqCst));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone())
+    );
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+
+    drop(cleanup_hook);
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id, &command, &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
 fn put_bucket_versioning_command_retry_reuses_pending_partial_replica_command() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

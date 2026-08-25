@@ -1140,7 +1140,7 @@ fn stream_put_append_published_log_gap_keeps_payload_for_pending_retry() {
     );
     assert_eq!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket),
-        Some(pending_command),
+        Some(pending_command.clone()),
         "published command must remain pending for trailing recovery"
     );
 
@@ -1163,6 +1163,20 @@ fn stream_put_append_published_log_gap_keeps_payload_for_pending_retry() {
         .unwrap();
     assert_eq!(readback, payload);
 
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(
+        PgId::new(object_pg),
+        &pending_command,
+    ));
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                PgId::new(object_pg),
+                &pending_command,
+                &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
     cluster
         .commit_stream_segment_append(
             &bucket,

@@ -390,14 +390,6 @@ fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
     let pg_id = PgId::new(object_pg);
     let pending_command = pending_metadata_command_for_test(&map, pg_id, &bucket)
         .expect("partial direct PUT metadata command must remain pending");
-    let timeout_selected = Arc::new(Barrier::new(2));
-    let retry_selected = Arc::new(Barrier::new(2));
-    cluster.test_install_metadata_command_recovery_wait_hook(
-        pg_id,
-        &pending_command,
-        Arc::clone(&timeout_selected),
-        Arc::clone(&retry_selected),
-    );
     let owner_ready = Arc::new(Barrier::new(2));
     let owner_release = Arc::new(Barrier::new(2));
     let owner_ready_hook = Arc::clone(&owner_ready);
@@ -415,34 +407,44 @@ fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
         },
     ));
     let outcome = thread::scope(|scope| {
-        let owner = scope.spawn(|| {
-            cluster.drain_pending_metadata_command_with_recovery_gate(pg_id, &pending_command)
-        });
-        owner_ready.wait();
-        let waiter = scope.spawn(|| {
-            cluster.commit_direct_put_object_from_payload_shards(
-                &commit_req,
-                &written.written_shards,
-                |_| -> Result<(), ()> { panic!("retry must reuse the pending direct PUT command") },
+        let (retry_result_tx, retry_result_rx) = std::sync::mpsc::sync_channel(1);
+        let owner_cluster = &cluster;
+        let owner_command = &pending_command;
+        let owner = scope.spawn(move || {
+            owner_cluster.drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id,
+                owner_command,
+                owner_cluster,
             )
         });
-        timeout_selected.wait();
-        retry_selected.wait();
+        owner_ready.wait();
+        let retry_cluster = &cluster;
+        let retry_request = &commit_req;
+        let retry_shards = &written.written_shards;
+        let waiter = scope.spawn(move || {
+            let result = retry_cluster.commit_direct_put_object_from_payload_shards(
+                retry_request,
+                retry_shards,
+                |_| -> Result<(), ()> { panic!("retry must reuse the pending direct PUT command") },
+            );
+            retry_result_tx.send(result).unwrap();
+        });
+        let outcome = retry_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exact direct PUT retry must use the published result without waiting for trailing recovery")
+            .unwrap()
+            .unwrap();
         owner_release.wait();
         assert_eq!(
             owner.join().unwrap().unwrap(),
             PendingMetadataCommandOutcome::Applied,
             "recovery owner must apply the pending direct PUT command"
         );
-        waiter.join().unwrap().unwrap().unwrap()
+        waiter.join().unwrap();
+        outcome
     });
     drop(owner_hook);
     assert!(!block_owner_once.load(Ordering::SeqCst));
-    assert_eq!(
-        cluster.test_take_metadata_command_recovery_wait_hook_observation(),
-        (2, 0),
-        "direct PUT waiter must time out once, rejoin the active owner, and observe completion"
-    );
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     {
         let bucket_primary = map
@@ -613,7 +615,7 @@ fn direct_put_open_time_convergence_releases_bucket_write_reservation() {
 }
 
 #[test]
-fn object_generation_reservation_entry_drains_pending_direct_put_commit() {
+fn object_generation_reservation_transfers_pending_direct_put_commit_to_recovery() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -704,6 +706,29 @@ fn object_generation_reservation_entry_drains_pending_direct_put_commit() {
     );
 
     let next_reservation_id = crate::SessionId::try_from("23".repeat(16)).unwrap();
+    let error = cluster
+        .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
+        .expect_err("unrelated reservation must leave published trailing work to recovery");
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+    ));
+    let pending_command = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+        .expect("transferred direct PUT command must remain pending");
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(
+        PgId::new(object_pg),
+        &pending_command,
+    ));
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                PgId::new(object_pg),
+                &pending_command,
+                &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
     let next_generation_id = cluster
         .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
         .unwrap();
@@ -729,7 +754,7 @@ fn object_generation_reservation_entry_drains_pending_direct_put_commit() {
 }
 
 #[test]
-fn object_delete_drains_pending_direct_put_commit_before_delete() {
+fn object_delete_transfers_pending_direct_put_commit_to_recovery_before_delete() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -828,6 +853,28 @@ fn object_delete_drains_pending_direct_put_commit_before_delete() {
         let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
         assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
     }
+
+    let error = cluster
+        .delete_current_object_if(&bucket, &key, |_stored| -> Result<(), ()> {
+            panic!("unrelated delete must not run its condition before recovery")
+        })
+        .expect_err("unrelated delete must leave published trailing work to recovery");
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+    ));
+    let pending_command = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+        .expect("transferred direct PUT command must remain pending");
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                PgId::new(object_pg),
+                &pending_command,
+                &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
 
     let outcome = cluster
         .delete_current_object_if(&bucket, &key, |stored| {
@@ -3122,6 +3169,25 @@ fn multipart_completion_races_classify_published_pending_command_by_manifest() {
         ids.sort();
         ids
     };
+
+    let mut projected_manifest_request = request.clone();
+    projected_manifest_request.completion_fingerprint =
+        crate::MultipartCompletionFingerprint::from_bytes([0x4a; 32]);
+    let projected_error = cluster
+        .complete_multipart_upload_commit_serialized(projected_manifest_request)
+        .unwrap_err();
+    assert!(matches!(
+        projected_error,
+        crate::ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })
+    ));
+    let projected_pending_command =
+        pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+            .expect("different-manifest projection must retain the completion command");
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(
+        PgId::new(object_pg),
+        &projected_pending_command,
+    ));
+
     let reservations_before_typed_timeout = reservation_ids();
     let typed_timeout_observed = Arc::new(AtomicBool::new(false));
     let typed_timeout_observed_for_hook = Arc::clone(&typed_timeout_observed);
@@ -3145,10 +3211,16 @@ fn multipart_completion_races_classify_published_pending_command_by_manifest() {
         crate::ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })
     ));
     assert!(typed_timeout_observed.load(Ordering::SeqCst));
+    let pending_command = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+        .expect("different-manifest handoff must retain the completion command");
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(
+        PgId::new(object_pg),
+        &pending_command,
+    ));
     assert_eq!(
         reservation_ids(),
         reservations_before_typed_timeout,
-        "terminal replay classification must release the retry's auxiliary reservation"
+        "recovery transfer must release the retry's auxiliary reservation"
     );
 
     let auxiliary_release_observed = Arc::new(AtomicBool::new(false));
@@ -3183,10 +3255,13 @@ fn multipart_completion_races_classify_published_pending_command_by_manifest() {
     let error = cluster
         .complete_multipart_upload_commit_serialized(different_manifest)
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })
-    ));
+    assert!(
+        matches!(
+            &error,
+            crate::ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })
+        ),
+        "unexpected different-manifest result after exact recovery: {error:?}"
+    );
 
     drop(hook_guard);
     let command_release_response_lost = Arc::new(AtomicBool::new(false));

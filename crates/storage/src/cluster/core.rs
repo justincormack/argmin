@@ -210,8 +210,12 @@ mod metadata_command_drain_authority {
             self._guard.mark_irreversible_handoff(resolution);
         }
 
-        pub(super) fn record_outcome(&self, outcome: PendingMetadataCommandOutcome) {
-            self._guard.record_outcome(outcome);
+        pub(super) fn complete_with_outcome_and_relinquish_if_requested(
+            self,
+            outcome: PendingMetadataCommandOutcome,
+        ) -> bool {
+            self._guard
+                .complete_with_outcome_and_relinquish_if_requested(outcome)
         }
 
         pub(super) fn abandoned_predecessor(&self) -> Option<MetadataCommandEnvelope> {

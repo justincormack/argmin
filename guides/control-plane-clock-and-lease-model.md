@@ -284,7 +284,14 @@ mutations must not pin one admission across the whole aggregate:
 `DeleteObjects` validates the request and bucket first, releases that
 admission, and admits each entry separately. This lets a pending publication
 run between entries and prevents a legal 1,000-key batch from exhausting one
-captured lease and returning `SlowDown` for the remainder. Remaining
+lease and returning `SlowDown` for the remainder. While a generation remains
+openly serving, same-content heartbeat renewal extends its admitted requests.
+Starting replacement publication atomically freezes those requests at their
+original admission deadlines before waiting for them to drain, so renewal
+cannot let a slow request retain the old generation indefinitely. The
+transition wakes streaming body waits which may already have sampled a renewed
+deadline; they immediately recompute against the frozen admission deadline.
+Remaining
 production work is the
 authenticated authority clock re-establishment operation, its operator
 diagnostics, and independent-host fault validation.

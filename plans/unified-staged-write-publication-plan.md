@@ -360,11 +360,16 @@ apply validates equality with its local durable state and command ordering only;
 its local wall or monotonic clock. Irrevocable apply therefore cannot diverge because replica
 clocks straddle an expiry boundary.
 
-### Immutable admission fencing
+### Generation-gated admission fencing
 
 Reading or buffering a body does not extend mutation authority. Both staged capabilities carry
-the immutable effect deadline captured from request admission. The admitted fence is revalidated
-at the storage effect boundary immediately before each of the following:
+an effect deadline from request admission. While the admitted generation remains openly serving,
+same-generation heartbeat renewal can refresh that deadline. A replacement publication first
+closes admission and atomically freezes every existing request at its original deadline before
+waiting for them to drain. That transition wakes body-frame waits which sampled a renewed
+deadline, forcing them to recompute against the frozen original deadline. The admitted fence is
+revalidated at the storage effect boundary
+immediately before each of the following:
 
 - reservation or generation allocation;
 - multipart request-owned cleanup-root creation;
@@ -380,13 +385,13 @@ payload.
 
 Local publication calls enforce the conservatively bound monotonic deadline. RPC requests contain
 no monotonic timestamp and do not carry a remaining duration. Unix and TLS/TCP requests carry the
-absolute conservative wall-clock upper bound captured by the sender. The receiver shortens that
+absolute conservative wall-clock upper bound sampled by the sender. The receiver shortens that
 upper bound for inter-host skew, intersects it with the storage node's route deadline, and binds
 the resulting cutoff to its own monotonic clock before revalidating beside the durable mutation.
 Network transit can therefore consume authority but can never restart or extend it. Deterministic
-tests expire the captured admission inside each pre-effect hook while renewing the raw same-epoch
-route and prove that no reservation, session, shard, append, command ID, or pending slot is created
-after expiry; only exact retained cleanup may continue.
+tests begin replacement publication, renew the raw same-epoch route, then expire the original
+admission inside each pre-effect hook and prove that no reservation, session, shard, append,
+command ID, or pending slot is created after expiry; only exact retained cleanup may continue.
 
 ### Lazy UploadPart promotion
 

@@ -725,24 +725,44 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
     )
     .unwrap();
 
-    let (cluster, coord, admission) = storage::clock::with_time_override(1_000, || {
-        let cluster = process_local_cluster_with_route_map_validity(
-            &initial,
-            RouteMapValidity::until_ms(5_000).unwrap(),
-        );
-        let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
-            Arc::clone(&cluster),
-        );
-        let admission = coord.admit_storage_route_for_request().unwrap();
-        (cluster, coord, admission)
-    });
+    let (cluster, runtime_handle, route_handle, coord, admission) =
+        storage::clock::with_time_override(1_000, || {
+            let cluster = process_local_cluster_with_route_map_validity(
+                &initial,
+                RouteMapValidity::until_ms(5_000).unwrap(),
+            );
+            let (runtime_handle, route_handle) =
+                test_dynamic_storage_route_handles(Arc::clone(&cluster));
+            let coord = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
+            route_handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+            let admission = coord.admit_storage_route_for_request().unwrap();
+            (cluster, runtime_handle, route_handle, coord, admission)
+        });
 
     storage::clock::with_time_override(1_000, || {
         cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
     });
+    let fresh_admission = storage::clock::with_time_override(1_000, || {
+        coord.admit_storage_route_for_request().unwrap()
+    });
+    let candidate_tmp = test_util::tempdir();
+    let candidate = open_dynamic_test_storage_cluster(candidate_tmp.path(), &[0]);
+    let installer = thread::spawn(move || {
+        storage::clock::with_time_override(1_000, || {
+            runtime_handle.install(candidate).unwrap();
+        });
+    });
+    route_handle.test_wait_until_route_publication_is_pending();
     storage::clock::with_time_override(6_000, || {
-        // The renewable raw cluster remains live, but authority already handed
-        // to this request must not be extended by that renewal.
+        // Publication freezes each request at the deadline effective when it
+        // was admitted: the original request is expired while the later
+        // baseline admission remains valid.
         cluster
             .head_bucket_info(&trusted_bucket_name("bucket"))
             .unwrap();
@@ -964,7 +984,6 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             },
             request_tags: &control_request_tags,
         };
-        let fresh_admission = coord.admit_storage_route_for_request().unwrap();
         let baseline_cors = coord
             .get_bucket_cors_on_admitted_route(&fresh_admission, &request)
             .unwrap();
@@ -1478,6 +1497,9 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             0
         );
     });
+    drop(fresh_admission);
+    drop(admission);
+    installer.join().unwrap();
 }
 
 #[test]
@@ -1520,7 +1542,6 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let hook_clock = clock.control();
     let hook =
@@ -1591,7 +1612,6 @@ fn direct_put_expires_at_generation_reservation_effect_boundary() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let hook_clock = clock.control();
     let hook =
@@ -1616,6 +1636,7 @@ fn direct_put_expires_at_generation_reservation_effect_boundary() {
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
+    clock.set(1_000);
 
     assert!(cluster
         .load_existing_live_object(
@@ -1663,7 +1684,6 @@ fn direct_put_expiring_at_staged_shard_effect_writes_no_payload() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let hook_clock = clock.control();
     let hook = storage::test_support::install_payload_shard_write_attempt_hook(
@@ -1696,6 +1716,7 @@ fn direct_put_expiring_at_staged_shard_effect_writes_no_payload() {
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     let attempted = hook.finish();
     drop(admission);
+    clock.set(1_000);
 
     assert_eq!(
         attempted.count(),
@@ -1743,7 +1764,6 @@ fn direct_put_expiring_after_first_staged_shard_cleans_partial_payload() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let hook_clock = clock.control();
     let hook = storage::test_support::install_payload_shard_write_attempt_hook(
@@ -1778,6 +1798,7 @@ fn direct_put_expiring_after_first_staged_shard_cleans_partial_payload() {
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     let attempted = hook.finish();
     drop(admission);
+    clock.set(1_000);
 
     assert_eq!(
         attempted.count(),
@@ -1821,7 +1842,6 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
     let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_stream_put_create_pending_install_hook(Arc::new(move || {
@@ -1919,7 +1939,6 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let shard_hook = storage::test_support::install_payload_shard_write_attempt_hook(
         &cluster,
@@ -1953,6 +1972,7 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
     drop(append_hook);
     let attempted = shard_hook.finish();
     drop(admission);
+    clock.set(1_000);
 
     assert!(
         attempted.count() > 0,
@@ -2026,7 +2046,6 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let shard_hook = storage::test_support::install_payload_shard_write_attempt_hook(
         &cluster,
@@ -2062,6 +2081,7 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
     drop(append_hook);
     let attempted = shard_hook.finish();
     drop(admission);
+    clock.set(1_000);
 
     assert!(
         attempted.count() > 0,
@@ -2268,7 +2288,6 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let shard_hook = storage::test_support::install_payload_shard_write_attempt_hook(
         &cluster,
@@ -2429,8 +2448,6 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
         Some(5_000),
         "ordinary UploadPart must persist the captured admission deadline"
     );
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-
     let shard_hook = storage::test_support::install_payload_shard_write_attempt_hook(
         &cluster,
         Arc::new(|_| Ok(())),
@@ -2519,7 +2536,6 @@ fn stream_put_finalization_expires_inside_command_build() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
     let cleanup = coord
         .retained_stream_upload_cleanup(
             &admission,
@@ -2570,6 +2586,7 @@ fn stream_put_finalization_expires_inside_command_build() {
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
+    clock.set(1_000);
     assert!(cluster
         .load_existing_live_object(
             &trusted_bucket_name("bucket"),
@@ -2614,7 +2631,6 @@ fn multipart_creation_expires_at_pending_install_effect_boundary() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let hook_clock = clock.control();
     let hook =
@@ -2716,7 +2732,6 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
         None,
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let hook_clock = clock.control();
     let hook =
@@ -2777,7 +2792,6 @@ fn multipart_completion_expires_at_final_pending_install_effect_boundary() {
         Arc::clone(&cluster),
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let pending_install_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hook_count = Arc::clone(&pending_install_count);
@@ -3034,7 +3048,7 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
 }
 
 #[test]
-fn multipart_upload_target_preflights_reject_an_expired_admission_after_same_epoch_renewal() {
+fn multipart_upload_target_preflights_reject_an_expired_admission() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
@@ -3074,7 +3088,6 @@ fn multipart_upload_target_preflights_reject_an_expired_admission_after_same_epo
     let clock = storage::test_support::test_time_override_guard(1_000);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
     clock.set(4_500);
     let error = coord
         .validate_complete_multipart_upload_target_on_admitted_route(&admission, &request)
@@ -4121,7 +4134,6 @@ fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
     time.set(1_000);
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
     let error = coord
         .get_object_on_admitted_route(
             &admission,
@@ -4138,7 +4150,6 @@ fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
     time.set(1_000);
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
     let error = coord
         .get_object_part_on_admitted_route(
             &admission,
@@ -4156,7 +4167,6 @@ fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
     time.set(1_000);
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
     let admission = coord.admit_storage_route_for_request().unwrap();
-    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
     let error = coord
         .get_object_range_on_admitted_route(
             &admission,

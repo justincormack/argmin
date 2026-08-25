@@ -240,6 +240,15 @@ the process-wide per-command recovery flight to deduplicate convergence. The
 pending slot and bucket-write reservation remain durable until that worker has
 converged every required replica and completed terminal cleanup.
 
+The recovery flight preserves whether publication succeeded but trailing
+replica convergence or terminal cleanup remains pending. An exact semantic
+retry may project its committed result from that recorded outcome without
+waiting for cleanup. A different foreground operation must atomically request
+the authorized-recovery handoff and return retryable contention promptly; it
+must not spend its request budget retrying another operation's retained slot.
+This policy applies equally to a caller that arrives after handoff and one that
+was already waiting when the owner records the nonterminal outcome.
+
 Failure of the frontend runtime-map refresh requests one fallback current-map
 scan at the start of that failure episode. Repeated refresh failures do not
 request another full-PG scan; a failed fallback retries on a bounded cooldown,

@@ -152,6 +152,224 @@ mod tests {
         });
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_publication_interrupts_an_already_renewed_body_frame_wait() {
+        let clock = storage::test_support::test_time_override_guard(1_000);
+        let tmp = test_util::tempdir();
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"));
+        let (runtime_handle, storage_handle) =
+            test_dynamic_storage_route_handles(Arc::clone(&initial));
+        initial
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
+        let admission = storage_handle.admit_current_route().unwrap();
+        initial
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(100_000).unwrap());
+
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let mut polled_tx = Some(polled_tx);
+            let pending_frame = std::future::poll_fn(move |_| {
+                if let Some(polled_tx) = polled_tx.take() {
+                    let _ = polled_tx.send(());
+                }
+                std::task::Poll::<()>::Pending
+            });
+            wait_for_route_bounded_body_frame(
+                Some(&admission),
+                Duration::from_secs(60),
+                || {},
+                pending_frame,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), polled_rx)
+            .await
+            .expect("body-frame wait was not polled")
+            .expect("body-frame wait dropped its progress sender");
+
+        // The wait sampled the renewed deadline while the route was open. Once
+        // publication starts, it must wake and reapply the original admission
+        // deadline instead of retaining that renewal.
+        clock.set(5_000);
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"));
+        let installed_candidate = Arc::clone(&candidate);
+        let installer = std::thread::spawn(move || {
+            storage::clock::with_time_override(5_000, || {
+                runtime_handle.install(installed_candidate).unwrap();
+            });
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("publication did not interrupt the renewed body-frame wait")
+            .expect("body-frame waiter panicked");
+        assert!(matches!(
+            outcome,
+            RouteBoundedBodyWait::RouteInvalid(ServerError::SlowDown)
+        ));
+        tokio::task::spawn_blocking(move || installer.join().unwrap())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
+    }
+
+    async fn assert_route_publication_interrupts_operation_body_wait(
+        operation: RouteBoundedBodyOperation,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+        let tmp = test_util::tempdir();
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"));
+        let (runtime_handle, storage_handle) =
+            test_dynamic_storage_route_handles(Arc::clone(&initial));
+        let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
+        let bucket = match operation {
+            RouteBoundedBodyOperation::PostObject => "post-publication-wakeup-bucket",
+            RouteBoundedBodyOperation::UploadPart => "part-publication-wakeup-bucket",
+            RouteBoundedBodyOperation::PutObject => {
+                panic!("this regression helper is specific to POST Object and UploadPart")
+            }
+        };
+        let upload_id = match operation {
+            RouteBoundedBodyOperation::PostObject => {
+                create_test_bucket(&frontend, bucket);
+                None
+            }
+            RouteBoundedBodyOperation::UploadPart => {
+                Some(create_test_bucket_and_upload(&frontend, bucket, "key"))
+            }
+            RouteBoundedBodyOperation::PutObject => unreachable!(),
+        };
+        initial.test_store_route_map_validity(long_lived_test_route_map_validity());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let hook = Arc::new(move |observed_operation| {
+            if observed_operation != operation {
+                return;
+            }
+            let Some(entered_tx) = entered_tx.lock().unwrap().take() else {
+                return;
+            };
+            entered_tx.send(()).unwrap();
+        });
+        let config = ServeConfig {
+            body_idle_timeout: Duration::from_secs(60),
+            route_bounded_body_wait_hook: Some(hook),
+            ..ServeConfig::default()
+        };
+        let (addr, _server_guard) =
+            start_test_server_with_config(Arc::clone(&frontend), config, 1).await;
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+
+        match operation {
+            RouteBoundedBodyOperation::PostObject => {
+                let fields = sign_post_policy_fields(bucket, "key", &[], &[]);
+                let (content_type, prefix, suffix) =
+                    build_streaming_multipart_parts(&fields, "upload.bin");
+                let content_length = prefix.len() + 1024 + suffix.len();
+                let request = format!(
+                    "POST /{bucket} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Content-Type: {content_type}\r\n\
+Content-Length: {content_length}\r\n\
+Connection: close\r\n\r\n"
+                );
+                client.write_all(request.as_bytes()).await.unwrap();
+                client.write_all(&prefix).await.unwrap();
+            }
+            RouteBoundedBodyOperation::UploadPart => {
+                let upload_id = upload_id.as_deref().unwrap();
+                let uri = format!("/{bucket}/key?partNumber=1&uploadId={upload_id}");
+                let payload = vec![b'p'; 1024];
+                let signed = sign_headers("PUT", &uri, &addr, &payload, &[]);
+                let request = format!(
+                    "PUT {uri} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n",
+                    signed.authorization,
+                    signed.amz_date,
+                    signed.amz_content_sha256,
+                    payload.len(),
+                );
+                client.write_all(request.as_bytes()).await.unwrap();
+            }
+            RouteBoundedBodyOperation::PutObject => unreachable!(),
+        }
+        client.flush().await.unwrap();
+
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(PROGRESS_TIMEOUT)
+                .expect("operation did not enter its authorized body-frame wait");
+        })
+        .await
+        .unwrap();
+
+        // The operation already sampled the long-lived lease. Expire the
+        // current generation without sending another body frame, then begin
+        // publication. Only the publication wakeup can make this request
+        // reapply its frozen admission deadline and release the route.
+        initial.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(storage::clock::current_time_millis()).unwrap(),
+        );
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"));
+        let installed_candidate = Arc::clone(&candidate);
+        let installer = std::thread::spawn(move || {
+            runtime_handle.install(installed_candidate).unwrap();
+        });
+        let pending_handle = storage_handle.clone();
+        tokio::task::spawn_blocking(move || {
+            pending_handle.test_wait_until_route_publication_is_pending();
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(
+            PROGRESS_TIMEOUT,
+            tokio::task::spawn_blocking(move || installer.join().unwrap()),
+        )
+        .await
+        .expect("publication did not interrupt the operation body-frame wait")
+        .unwrap();
+        assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
+
+        let mut response = Vec::new();
+        tokio::time::timeout(PROGRESS_TIMEOUT, client.read_to_end(&mut response))
+            .await
+            .expect("interrupted operation did not return a response")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("<Code>SlowDown</Code>"), "{response}");
+        assert_eq!(
+            storage::test_support::stream_upload_session_count(&initial).unwrap(),
+            0,
+            "publication interruption must abort the retained streaming session"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_object_publication_interrupts_an_already_waiting_body_frame() {
+        assert_route_publication_interrupts_operation_body_wait(
+            RouteBoundedBodyOperation::PostObject,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upload_part_publication_interrupts_an_already_waiting_body_frame() {
+        assert_route_publication_interrupts_operation_body_wait(
+            RouteBoundedBodyOperation::UploadPart,
+        )
+        .await;
+    }
+
     /// Build a minimal `http::request::Parts` for testing `is_streaming_write`.
     fn make_parts(method: &str, uri: &str, headers: &[(&str, &str)]) -> http::request::Parts {
         let mut builder = http::Request::builder().method(method).uri(uri);
@@ -1037,7 +1255,7 @@ Connection: close\r\n\r\n",
     }
 
     #[test]
-    fn captured_admission_guards_put_post_and_upload_part_initial_mutations() {
+    fn expired_admission_guards_put_post_and_upload_part_initial_mutations() {
         let clock = storage::test_support::test_time_override_guard(1_000);
         let tmp = test_util::tempdir();
         let frontend = setup_dynamic_frontend(tmp.path());
@@ -1046,13 +1264,9 @@ Connection: close\r\n\r\n",
         create_test_bucket(&frontend, "initial-mutation-post-bucket");
         storage_cluster
             .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
-        let renewed = Arc::clone(&storage_cluster);
         let hook_clock = clock.control();
         let hook = storage_cluster.test_install_after_retained_stream_cleanup_capability_hook(
             Arc::new(move || {
-                renewed.test_store_route_map_validity(
-                    storage::RouteMapValidity::until_ms(5_000).unwrap(),
-                );
                 hook_clock.set(2_000);
             }),
         );
@@ -1074,7 +1288,7 @@ Connection: close\r\n\r\n",
         assert!(frontend
             .coordinator
             .admit_storage_route_for_request()
-            .is_ok());
+            .is_err());
         drop(hook);
         assert_eq!(
             storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
@@ -1085,13 +1299,9 @@ Connection: close\r\n\r\n",
         create_test_bucket(&frontend, "initial-mutation-put-bucket");
         storage_cluster
             .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
-        let renewed = Arc::clone(&storage_cluster);
         let hook_clock = clock.control();
         let hook = storage_cluster.test_install_after_retained_stream_cleanup_capability_hook(
             Arc::new(move || {
-                renewed.test_store_route_map_validity(
-                    storage::RouteMapValidity::until_ms(5_000).unwrap(),
-                );
                 hook_clock.set(2_000);
             }),
         );
@@ -1127,7 +1337,7 @@ Connection: close\r\n\r\n",
         assert!(frontend
             .coordinator
             .admit_storage_route_for_request()
-            .is_ok());
+            .is_err());
         drop(hook);
         assert_eq!(
             storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
@@ -1141,13 +1351,9 @@ Connection: close\r\n\r\n",
             create_test_bucket_and_upload(&frontend, "initial-mutation-part-bucket", "key");
         storage_cluster
             .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
-        let renewed = Arc::clone(&storage_cluster);
         let hook_clock = clock.control();
         let hook = storage_cluster.test_install_after_retained_stream_cleanup_capability_hook(
             Arc::new(move || {
-                renewed.test_store_route_map_validity(
-                    storage::RouteMapValidity::until_ms(5_000).unwrap(),
-                );
                 hook_clock.set(2_000);
             }),
         );
@@ -1176,7 +1382,7 @@ Connection: close\r\n\r\n",
         assert!(frontend
             .coordinator
             .admit_storage_route_for_request()
-            .is_ok());
+            .is_err());
         drop(hook);
         assert_eq!(
             storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
@@ -4171,7 +4377,7 @@ Connection: close\r\n\r\n",
     }
 
     #[test]
-    fn same_epoch_renewal_does_not_extend_streaming_put_effect_authority() {
+    fn same_epoch_renewal_extends_streaming_put_effect_authority_while_open() {
         let clock = storage::test_support::test_time_override_guard(1_000);
         let tmp = test_util::tempdir();
         let frontend = setup_dynamic_frontend(tmp.path());
@@ -4208,50 +4414,33 @@ Connection: close\r\n\r\n",
             .streaming_append_segment(&ctx, &session_id, 0, body)
             .unwrap();
 
-        // Renew the raw runtime-map generation before advancing beyond the
-        // request's immutable captured deadline. The completed body must not
-        // be committed through the renewed lease.
+        // With no replacement publication pending, heartbeat renewal keeps
+        // the same admitted generation usable for later stream effects.
         storage_cluster
             .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
         clock.set(2_000);
 
-        assert!(matches!(
-            frontend.heartbeat_streaming_put_object(&ctx, &session_id),
-            Err(ServerError::SlowDown)
-        ));
-        assert!(matches!(
-            frontend.streaming_append_segment(&ctx, &session_id, 1, b"late"),
-            Err(ServerError::SlowDown)
-        ));
-        assert!(matches!(
-            frontend.put_single_segment_object(&ctx, body, &[]),
-            Err(ServerError::SlowDown)
-        ));
-        assert!(matches!(
-            frontend.finalize_streaming_put(
+        frontend
+            .heartbeat_streaming_put_object(&ctx, &session_id)
+            .unwrap();
+        let late = b"late";
+        frontend
+            .streaming_append_segment(&ctx, &session_id, 1, late)
+            .unwrap();
+        let complete_body = [body.as_slice(), late.as_slice()].concat();
+        frontend
+            .finalize_streaming_put(
                 &ctx,
                 &session_id,
-                checksum::crc64::checksum(body),
-                body.len() as u64,
+                checksum::crc64::checksum(&complete_body),
+                complete_body.len() as u64,
                 &[],
-            ),
-            Err(ServerError::SlowDown)
-        ));
-        assert!(storage_cluster
-            .load_stream_upload_session(ctx.bucket(), ctx.key(), &session_id,)
-            .is_ok());
-
-        frontend.abort_streaming_put(&ctx, &session_id);
-        assert!(matches!(
-            storage_cluster
-                .load_stream_upload_session(ctx.bucket(), ctx.key(), &session_id)
-                .map_err(|error| error.kind()),
-            Err(storage::StreamUploadFailureKind::SessionNotFound)
-        ));
+            )
+            .unwrap();
     }
 
     #[test]
-    fn same_epoch_renewal_does_not_extend_post_or_upload_part_effect_authority() {
+    fn same_epoch_renewal_extends_post_and_upload_part_effect_authority_while_open() {
         let clock = storage::test_support::test_time_override_guard(1_000);
         let tmp = test_util::tempdir();
         let frontend = setup_dynamic_frontend(tmp.path());
@@ -4282,20 +4471,19 @@ Connection: close\r\n\r\n",
             .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
         clock.set(2_000);
 
-        assert!(matches!(
-            frontend.streaming_append_post_segment(&post_ctx, 1, b"late"),
-            Err(ServerError::SlowDown)
-        ));
-        assert!(matches!(
-            frontend.finalize_streaming_post_object(
+        let late = b"late";
+        frontend
+            .streaming_append_post_segment(&post_ctx, 1, late)
+            .unwrap();
+        let complete_post_body = [post_body.as_slice(), late.as_slice()].concat();
+        frontend
+            .finalize_streaming_post_object(
                 &post_ctx,
-                checksum::crc64::checksum(post_body),
-                post_body.len() as u64,
+                checksum::crc64::checksum(&complete_post_body),
+                complete_post_body.len() as u64,
                 None,
-            ),
-            Err(ServerError::SlowDown)
-        ));
-        frontend.abort_streaming_post_object(&post_ctx);
+            )
+            .unwrap();
         drop(post_ctx);
 
         clock.set(1_000);
@@ -4332,21 +4520,19 @@ Connection: close\r\n\r\n",
             .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
         clock.set(2_000);
 
-        assert!(matches!(
-            frontend.streaming_append_part_segment(&part_ctx, 1, b"late"),
-            Err(ServerError::SlowDown)
-        ));
-        assert!(matches!(
-            frontend.finalize_streaming_part(
+        frontend
+            .streaming_append_part_segment(&part_ctx, 1, late)
+            .unwrap();
+        let complete_part_body = [part_body.as_slice(), late.as_slice()].concat();
+        frontend
+            .finalize_streaming_part(
                 &part_ctx,
-                checksum::crc64::checksum(part_body),
-                part_body.len() as u64,
+                checksum::crc64::checksum(&complete_part_body),
+                complete_part_body.len() as u64,
                 &[],
                 None,
-            ),
-            Err(ServerError::SlowDown)
-        ));
-        frontend.abort_streaming_part(&part_ctx);
+            )
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

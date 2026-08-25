@@ -1723,6 +1723,46 @@ fn metadata_command_recovery_handoff_releases_waiter_and_retains_root_owner() {
 }
 
 #[test]
+fn expired_unrelated_drainer_registers_authorized_recovery_without_leading() {
+    let runtime_state = LocalClusterRuntimeState::new();
+    let pg_id = PgId::new(1);
+    let bucket = BucketName::new("expired-unrelated-recovery-handoff").unwrap();
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+
+    let admission = runtime_state.join_metadata_command_recovery_as_unrelated_drainer_until(
+        pg_id,
+        &command,
+        Instant::now(),
+    );
+    assert!(matches!(
+        admission,
+        MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
+            lineage_tip,
+            resolution: None,
+            ..
+        } if lineage_tip == command
+    ));
+    assert!(runtime_state.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+
+    let MetadataCommandRecoveryAdmission::Leader(recovery_owner) = runtime_state
+        .join_authorized_metadata_command_recovery_until(
+            pg_id,
+            &command,
+            &command,
+            Instant::now() + Duration::from_secs(1),
+        )
+    else {
+        panic!("authorized recovery must claim the expired drainer's retained flight");
+    };
+    recovery_owner.record_outcome(PendingMetadataCommandOutcome::Abandoned);
+    drop(recovery_owner);
+    assert_eq!(
+        runtime_state.test_metadata_command_recovery_flight_count(),
+        0
+    );
+}
+
+#[test]
 fn metadata_command_recovery_definite_reissue_failure_restores_waiter_lineage() {
     let runtime_state = Arc::new(LocalClusterRuntimeState::new());
     let pg_id = PgId::new(1);
@@ -1997,6 +2037,154 @@ fn reissued_object_command_transfers_owner_and_stale_waiter_lineage() {
     );
     drop(hook_guard);
     assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
+fn exact_object_drain_honors_concurrent_terminal_cleanup_handoff() {
+    struct CleanupGateRelease(Option<std::sync::mpsc::SyncSender<()>>);
+
+    impl CleanupGateRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for CleanupGateRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let other_key = key_for_object_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        &bucket,
+        object_pg,
+        "cleanup-handoff-other-",
+    );
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            key,
+            crate::VersionId::from_u64(1),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let checksum = command.checksum_crc64();
+    let (cleanup_reached_tx, cleanup_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::sync_channel(1);
+    let cleanup_release_rx = Arc::new(Mutex::new(cleanup_release_rx));
+    let cleanup_release_rx_for_hook = Arc::clone(&cleanup_release_rx);
+    let cleanup_hook = cluster.test_install_global_metadata_command_terminal_slot_removal_hook(
+        Arc::new(move |candidate| {
+            if candidate.checksum_crc64() != checksum {
+                return false;
+            }
+            cleanup_reached_tx.send(()).unwrap();
+            cleanup_release_rx_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(Duration::from_secs(5))
+                .expect("terminal cleanup gate was not released");
+            true
+        }),
+    );
+
+    let mut cleanup_release = CleanupGateRelease(Some(cleanup_release_tx));
+    let other_reservation_id = crate::tests::stream_session_id("exact-cleanup");
+    let (owner_outcome, waiter_error) = thread::scope(|scope| {
+        let (owner_tx, owner_rx) = std::sync::mpsc::sync_channel(1);
+        let owner_cluster = &cluster;
+        let owner_command = &command;
+        scope.spawn(move || {
+            owner_tx
+                .send(
+                    owner_cluster
+                        .drain_pending_metadata_command_with_recovery_gate(pg_id, owner_command),
+                )
+                .unwrap();
+        });
+        cleanup_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exact object-command owner did not reach terminal cleanup");
+
+        let (waiter_tx, waiter_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter_cluster = &cluster;
+        let waiter_bucket = &bucket;
+        let waiter_key = &other_key;
+        let waiter_reservation_id = &other_reservation_id;
+        scope.spawn(move || {
+            waiter_tx
+                .send(waiter_cluster.reserve_put_object_generation(
+                    waiter_bucket,
+                    waiter_key,
+                    waiter_reservation_id,
+                ))
+                .unwrap();
+        });
+        let waiter_error = waiter_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unrelated waiter remained blocked by exact-owner terminal cleanup")
+            .unwrap_err();
+        cleanup_release.release();
+        let owner_outcome = owner_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exact object-command owner did not finish after cleanup release")
+            .unwrap();
+        (owner_outcome, waiter_error)
+    });
+    assert_eq!(
+        owner_outcome,
+        PendingMetadataCommandOutcome::TerminalCleanupPending { applied: true }
+    );
+    assert!(matches!(
+        waiter_error,
+        ObjectPgActionError::MetadataCommandRecoveryTransferred
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone())
+    );
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+
+    drop(cleanup_hook);
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id, &command, &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
 }
 
 #[test]

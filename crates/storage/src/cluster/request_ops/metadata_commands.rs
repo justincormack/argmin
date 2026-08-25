@@ -19,7 +19,11 @@ impl CoordinatedMetadataCommandFinishDisposition {
         outcome: FinishPendingMetadataCommandResult,
     ) -> Self {
         if policy == MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
-            && outcome == FinishPendingMetadataCommandResult::PublishedPendingRecovery
+            && matches!(
+                outcome,
+                FinishPendingMetadataCommandResult::PublishedPendingRecovery
+                    | FinishPendingMetadataCommandResult::TerminalCleanupPending { .. }
+            )
         {
             Self::TransferredToAuthorizedRecovery
         } else {
@@ -2593,18 +2597,41 @@ impl super::StorageCluster {
                         },
                     );
                     debug_assert!(
-                        outcome != FinishPendingMetadataCommandResult::PublishedPendingRecovery
+                        !matches!(
+                            outcome,
+                            FinishPendingMetadataCommandResult::PublishedPendingRecovery
+                                | FinishPendingMetadataCommandResult::TerminalCleanupPending { .. }
+                        )
                             || admission_policy
                                 != MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
                             || relinquished,
-                        "unrelated published command must retain its authorized recovery flight"
+                        "unrelated nonterminal command must retain its authorized recovery flight"
                     );
                     return Ok(CoordinatedMetadataCommandFinishDisposition::for_policy(
                         admission_policy,
                         outcome,
                     ));
                 }
-                MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery { .. } => {
+                MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
+                    resolution,
+                    ..
+                } => {
+                    if admission_policy
+                        == MetadataCommandRecoveryAdmissionPolicy::ExactCommandOwner
+                    {
+                        if let Some(resolution) = resolution {
+                            return metadata_command_finish_result_from_recovery_resolution(
+                                &command,
+                                resolution,
+                            )
+                            .map(|outcome| {
+                                CoordinatedMetadataCommandFinishDisposition::for_policy(
+                                    admission_policy,
+                                    outcome,
+                                )
+                            });
+                        }
+                    }
                     return Ok(
                         CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery,
                     );
@@ -2973,14 +3000,20 @@ impl super::StorageCluster {
                         ),
                 }
                 .map_err(|error| error.source)?;
+                if let Some(recovery_guard) = recovery_guard {
+                    recovery_guard.record_outcome(
+                        super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                            applied: false,
+                        },
+                    );
+                }
                 self.release_metadata_command_bucket_write_reservation(&command)?;
                 let cleanup = match route_mode {
                     MetadataCommandRouteMode::Normal => self
-                        .remove_pending_metadata_command_for_bucket_with_work_budget(
+                        .remove_pending_metadata_command_for_bucket(
                             pg_id,
                             command_bucket,
                             &command,
-                            work_budget,
                         ),
                     MetadataCommandRouteMode::Recovery => self
                         .remove_pending_metadata_command_for_bucket_recovery(
@@ -3028,6 +3061,13 @@ impl super::StorageCluster {
                         );
                     }
                     if outcome == MetadataCommandApplyOutcome::Converged {
+                        if let Some(recovery_guard) = recovery_guard {
+                            recovery_guard.record_outcome(
+                                super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                    applied: true,
+                                },
+                            );
+                        }
                         if !self
                             .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
                                 pg_id, &command,
@@ -3041,11 +3081,10 @@ impl super::StorageCluster {
                         }
                         let cleanup = match route_mode {
                             MetadataCommandRouteMode::Normal => self
-                                .remove_pending_metadata_command_for_bucket_with_work_budget(
+                                .remove_pending_metadata_command_for_bucket(
                                     pg_id,
                                     command_bucket,
                                     &command,
-                                    work_budget,
                                 ),
                             MetadataCommandRouteMode::Recovery => self
                                 .remove_pending_metadata_command_for_bucket_recovery(

@@ -416,7 +416,10 @@ authority for one bucket/key/requested-version/object-metadata-PG tuple.
 PutObjectTagging, DeleteObjectTagging, PutObjectAcl, PutObjectRetention, and
 PutObjectLegalHold use the buffered request's existing admission for both
 policy context and the mutation command. The route rechecks that admission's
-immutable deadline before snapshot loading and command construction. It also
+generation-gated effective deadline before snapshot loading and command
+construction. Same-generation renewal may extend it only while the route
+remains openly serving; replacement publication freezes it at the original
+admission deadline. It also
 carries an `AdmittedRouteEffectFence` through bucket-write reservation
 acquisition and pending-command installation, where the embedded or RPC
 storage node revalidates the request's original epoch and clock health
@@ -426,8 +429,7 @@ timestamp: they carry a portable wall-clock upper bound which Unix and TLS/TCP
 clients derive with the cross-process skew allowance removed. Every receiving
 process binds that same representation to its own monotonic clock.
 The authority timestamp remains available for diagnostics, but is not used as
-the later cutoff. A same-epoch route renewal therefore cannot extend authority
-already handed to a request. Once the
+the later cutoff. Once the
 authorized command is installed, applying that exact command is convergence
 and may complete while a successor map waits to publish. Raw cluster
 metadata-mutation entry points are available only to storage unit tests.
@@ -435,15 +437,19 @@ metadata-mutation entry points are available only to storage unit tests.
 `ActivePutObjectRoute` is the non-cloneable authority for one complete direct
 or promoted-stream PutObject workflow, including the destination side of
 CopyObject. It fixes the bucket, key,
-bucket-metadata PG, object-metadata PG, publication domain, and immutable
-request deadline before
+bucket-metadata PG, object-metadata PG, publication domain, request identity,
+and original admission deadline before
 authorization. The same route then owns current-object loading, the durable
 bucket-write snapshot, object-generation reservation, staged data-PG shard
 writes, stream-session creation, segment-append publication, finalization, and
 final object metadata publication. Reservation acquisition, shard writes, and
 every create/append/finalize pending-command insertion carry the route's
 `AdmittedRouteEffectFence` to the actual storage-node effect. The shard-write
-RPC delegates only portable wall-clock authority and the receiver
+fence samples the route's effective deadline: healthy same-generation renewal
+may extend it while publication remains open, while pending publication
+restores the original admission deadline. Streaming body waits are notified of that
+transition so a wait already using a renewed deadline cannot delay publication.
+The shard-write RPC delegates only portable wall-clock authority and the receiver
 conservatively binds it to its own
 monotonic clock; repair writes cannot carry that frontend authority. Expiry at
 any pre-publication boundary releases transient reservations and removes only
@@ -518,8 +524,10 @@ retained-route inspection, including when the segment's placement epoch equals
 the originating frontend's epoch. If recovery discovers a corrupt shard, it
 may reacquire a short publication permit solely to record repair work, but
 only if the originating publication generation remains current and the
-admission's immutable captured deadline is still valid. After map publication
-or deadline expiry it skips that stale active-route mutation. The payload read
+admission's effective deadline is still valid. Same-generation renewal may
+extend that deadline while publication is open; a pending publication freezes
+it at the admission-time deadline. After map publication or deadline expiry it
+skips that stale active-route mutation. The payload read
 therefore remains valid if the storage nodes install a successor map before
 the body's first read. Dropping the final body reference releases the captured
 node sessions and performs the ordinary reclaim follow-up.

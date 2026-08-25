@@ -126,7 +126,7 @@ impl ActiveObjectReadRoute<'_> {
         let repair_fence = RetainedActiveRouteRepairFence {
             gate: self.admission._permit.gate.clone(),
             publication_generation: self.admission._permit.gate.publication_generation(),
-            admitted_lease: self.admission.admitted_lease,
+            admitted_lease: self.admission.effective_lease(),
         };
         self.admission
             .cluster

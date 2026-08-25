@@ -36,10 +36,21 @@ struct StorageClusterRouteAdmissionGate {
     inner: Arc<StorageClusterRouteAdmissionGateInner>,
 }
 
-#[derive(Default)]
 struct StorageClusterRouteAdmissionGateInner {
     state: Mutex<StorageClusterRouteAdmissionState>,
     changed: Condvar,
+    publication_pending: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for StorageClusterRouteAdmissionGateInner {
+    fn default() -> Self {
+        let (publication_pending, _) = tokio::sync::watch::channel(0);
+        Self {
+            state: Mutex::new(StorageClusterRouteAdmissionState::default()),
+            changed: Condvar::new(),
+            publication_pending,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -71,6 +82,34 @@ struct StorageClusterRouteAdmissionState {
 }
 
 impl StorageClusterRouteAdmissionGate {
+    fn effective_lease(
+        &self,
+        cluster: &StorageCluster,
+        admitted_lease: LocalRouteMapLeaseSnapshot,
+    ) -> LocalRouteMapLeaseSnapshot {
+        if !matches!(cluster.route_authority, StorageClusterRouteAuthority::Dynamic(_)) {
+            return admitted_lease;
+        }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_lease = cluster.local_map.route_map_lease_snapshot();
+        if state.transition == StorageClusterRouteTransitionState::Open {
+            return current_lease;
+        }
+        match (
+            admitted_lease.local_valid_until_monotonic_ms,
+            current_lease.local_valid_until_monotonic_ms,
+        ) {
+            (None, _) => current_lease,
+            (_, None) => admitted_lease,
+            (Some(admitted), Some(current)) if current < admitted => current_lease,
+            (Some(_), Some(_)) => admitted_lease,
+        }
+    }
+
     fn acquire(&self) -> StorageClusterRouteAdmissionPermit {
         let mut state = self
             .inner
@@ -107,6 +146,9 @@ impl StorageClusterRouteAdmissionGate {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
         state.transition = StorageClusterRouteTransitionState::Draining;
+        self.inner
+            .publication_pending
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         self.inner.changed.notify_all();
         while state.active_requests != 0 {
             state = self
@@ -233,9 +275,10 @@ struct RetainedActiveRouteRepairFence {
 /// generation.
 ///
 /// The guard prevents a replacement runtime map from being published while
-/// the request is admitted. Its absolute deadline is captured at admission,
-/// so a later lease renewal cannot extend authority already handed to a
-/// long-running request. It deliberately does not dereference to
+/// the request is admitted. Same-generation heartbeat renewal extends its
+/// authority only while that generation remains openly serving. Publication
+/// atomically freezes existing requests at their admission-time deadline
+/// before waiting for them to drain. It deliberately does not dereference to
 /// [`StorageCluster`]: storage operations must accept and validate an
 /// admission explicitly as those operation boundaries are migrated.
 ///
@@ -253,23 +296,53 @@ pub struct StorageClusterRouteAdmission {
 }
 
 impl StorageClusterRouteAdmission {
+    fn effective_lease(&self) -> LocalRouteMapLeaseSnapshot {
+        self._permit
+            .gate
+            .effective_lease(&self.cluster, self.admitted_lease)
+    }
+
+    /// Wait until replacement publication starts draining this admission's
+    /// generation. The subscription is established before the transition is
+    /// inspected, so publication cannot be missed between a caller's lease
+    /// sample and its asynchronous wait.
+    pub async fn wait_for_route_publication_pending(&self) {
+        let gate = &self._permit.gate.inner;
+        let mut publication_pending = gate.publication_pending.subscribe();
+        loop {
+            let is_pending = gate
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .transition
+                != StorageClusterRouteTransitionState::Open;
+            if is_pending {
+                return;
+            }
+            publication_pending
+                .changed()
+                .await
+                .expect("route publication notifier must outlive admitted requests");
+        }
+    }
+
     pub fn require_valid_now(&self) -> Result<(), crate::StoreFailure> {
         self.require_valid_now_raw().map_err(Into::into)
     }
 
     fn require_valid_now_raw(&self) -> Result<(), StoreError> {
-        self.cluster.require_route_map_valid_now()?;
+        let lease = self.effective_lease();
         let local_monotonic_ms = crate::clock::monotonic_time_millis();
         if self
             .cluster
             .local_map
-            .route_map_lease_snapshot_is_valid_at(self.admitted_lease, local_monotonic_ms)
+            .route_map_lease_snapshot_is_valid_at(lease, local_monotonic_ms)
         {
             return Ok(());
         }
         Err(StoreError::RouteMapExpired {
             cluster_epoch: self.cluster.cluster_epoch(),
-            valid_until_ms: self.admitted_lease.validity.valid_until_ms().unwrap_or(0),
+            valid_until_ms: lease.validity.valid_until_ms().unwrap_or(0),
             now_ms: crate::clock::current_time_millis(),
         })
     }
@@ -301,33 +374,32 @@ impl StorageClusterRouteAdmission {
         self.require_valid_now_raw()
     }
 
-    /// Return the remaining lifetime of this admission's captured route
-    /// authority. A bounded admission is never extended by a later route-map
-    /// renewal; callers may use this to bound waits which otherwise perform no
-    /// storage effect and therefore have no natural capability revalidation
-    /// point.
+    /// Return the remaining lifetime of this admission's effective route
+    /// authority. Same-generation renewal extends this lifetime only while no
+    /// replacement publication is pending; publication freezes it at the
+    /// admission-time deadline.
     pub fn remaining_validity(&self) -> Result<Option<Duration>, crate::StoreFailure> {
         self.remaining_validity_raw().map_err(Into::into)
     }
 
     fn remaining_validity_raw(&self) -> Result<Option<Duration>, StoreError> {
         self.require_valid_now_raw()?;
-        let Some(valid_until_monotonic_ms) = self.admitted_lease.local_valid_until_monotonic_ms
-        else {
+        let lease = self.effective_lease();
+        let Some(valid_until_monotonic_ms) = lease.local_valid_until_monotonic_ms else {
             return Ok(None);
         };
         let now_monotonic_ms = crate::clock::monotonic_time_millis();
         let Some(remaining_ms) = valid_until_monotonic_ms.checked_sub(now_monotonic_ms) else {
             return Err(StoreError::RouteMapExpired {
                 cluster_epoch: self.cluster.cluster_epoch(),
-                valid_until_ms: self.admitted_lease.validity.valid_until_ms().unwrap_or(0),
+                valid_until_ms: lease.validity.valid_until_ms().unwrap_or(0),
                 now_ms: crate::clock::current_time_millis(),
             });
         };
         if remaining_ms == 0 {
             return Err(StoreError::RouteMapExpired {
                 cluster_epoch: self.cluster.cluster_epoch(),
-                valid_until_ms: self.admitted_lease.validity.valid_until_ms().unwrap_or(0),
+                valid_until_ms: lease.validity.valid_until_ms().unwrap_or(0),
                 now_ms: crate::clock::current_time_millis(),
             });
         }
@@ -338,18 +410,19 @@ impl StorageClusterRouteAdmission {
         self.cluster.cluster_epoch()
     }
 
-    /// Authority-clock deadline captured atomically with this admission.
-    /// Stream-session creation persists it as an immutable cleanup handoff;
+    /// Effective authority-clock deadline for this admission. Stream-session
+    /// creation persists the sampled value as an immutable cleanup handoff;
     /// unlike the process-monotonic deadline, it remains meaningful after a
     /// process restart and runtime-map publication.
     pub fn authority_valid_until_ms(&self) -> Option<u64> {
-        self.admitted_lease.validity.valid_until_ms()
+        self.effective_lease().validity.valid_until_ms()
     }
 
     fn effect_fence(&self) -> AdmittedRouteEffectFence {
+        let lease = self.effective_lease();
         match (
-            self.authority_valid_until_ms(),
-            self.admitted_lease.local_valid_until_monotonic_ms,
+            lease.validity.valid_until_ms(),
+            lease.local_valid_until_monotonic_ms,
         ) {
             (Some(authority_valid_until_ms), Some(local_valid_until_monotonic_ms)) => {
                 AdmittedRouteEffectFence::bounded(
