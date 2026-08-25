@@ -5534,6 +5534,9 @@ impl StorageCluster {
             MetadataCommandRecoveryAdmission::Leader(guard) => MetadataCommandRecoveryTestGuard {
                 _guard: Box::new(guard),
             },
+            MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery { .. } => {
+                panic!("metadata command recovery admission unexpectedly awaited authorization")
+            }
             MetadataCommandRecoveryAdmission::Waited { .. } => {
                 panic!("metadata command recovery admission unexpectedly waited")
             }

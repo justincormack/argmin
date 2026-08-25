@@ -1153,7 +1153,7 @@ fn direct_put_terminal_install_conflict_reinspects_before_draining_newer_command
 }
 
 #[test]
-fn direct_put_uninstalled_candidate_maps_contender_convergence_to_contention() {
+fn direct_put_transferred_contender_exits_without_retrying_drain() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1237,38 +1237,42 @@ fn direct_put_uninstalled_candidate_maps_contender_convergence_to_contention() {
             .unwrap();
         }));
 
-    let drain_ran = Arc::new(AtomicBool::new(false));
-    let drain_ran_for_hook = Arc::clone(&drain_ran);
-    let _drain_hook = cluster.test_install_pending_object_metadata_command_drain_attempt_hook(
-        Arc::new(move |command, work_budget| {
+    let drain_attempts = Arc::new(AtomicUsize::new(0));
+    let drain_attempts_for_hook = Arc::clone(&drain_attempts);
+    let _drain_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
             if command.id() == contender_id {
-                drain_ran_for_hook.store(true, Ordering::SeqCst);
-                work_budget.expire_for_test();
-                return Err(crate::ObjectPgActionError::Store(
-                    StoreError::MetadataCommandDependencyConvergencePending {
-                        pg_id: pg_id.get(),
-                        cluster_epoch: contender_id.cluster_epoch(),
-                        log_index: contender_id.log_index().get(),
-                    },
-                ));
+                drain_attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: contender_id.cluster_epoch(),
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                });
             }
             Ok(())
-        }),
-    );
+        }));
 
+    let started = Instant::now();
     let error = cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
             Ok::<(), ()>(())
         })
         .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "transferred contender took {:?} to leave the request path",
+        started.elapsed()
+    );
     assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
-            context: "direct PUT blocked by pending command convergence"
-        })
+        &error,
+        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
     ));
     assert!(install_ran.load(Ordering::SeqCst));
-    assert!(drain_ran.load(Ordering::SeqCst));
+    assert_eq!(drain_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        crate::DirectPutFailure::from_object_pg_action(error).kind(),
+        crate::DirectPutFailureKind::MetadataCommandContention
+    );
     assert_eq!(
         pending_metadata_command_for_test(&map, pg_id, &bucket),
         Some(contender),
@@ -4359,6 +4363,95 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
         assert_eq!(live.generation_id, winner_generation_id);
         assert_eq!(live.size, winner_payload.len() as u64);
     }
+}
+
+#[test]
+fn direct_put_retries_irreversible_uncertainty_on_the_active_route() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id = crate::tests::stream_session_id("same-route");
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"direct PUT same-route recovery";
+    let segment_okh = [0x6d; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+
+    let inject_once = Arc::new(AtomicBool::new(true));
+    let inject_once_for_hook = Arc::clone(&inject_once);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let _apply_hook =
+        cluster.test_install_direct_put_metadata_apply_uncertainty_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.object.bucket == hook_bucket && commit.object.key == hook_key
+            ) && inject_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                crate::cluster::request_ops::DirectPutMetadataApplyUncertaintyTestAction::Inject
+            } else {
+                crate::cluster::request_ops::DirectPutMetadataApplyUncertaintyTestAction::None
+            }
+        }));
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_commit = Arc::clone(&action_calls);
+    let outcome = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &commit_req,
+            &written.written_shards,
+            move |_| {
+                action_calls_for_commit.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    assert!(!inject_once.load(Ordering::SeqCst));
+    assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.live_size, payload.len() as u64);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 0);
+    assert_bucket_write_reservations_released(&map, &bucket);
 }
 
 #[test]

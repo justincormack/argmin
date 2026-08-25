@@ -3128,10 +3128,16 @@ fn bucket_subresource_retains_handoff_when_unrelated_pending_command_is_irrevoca
         "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
             .to_string(),
     );
+    let started = std::time::Instant::now();
     let error = cluster
         .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
         .expect_err("an unrelated irrevocable command must block with retryable contention");
 
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "unrelated bucket-command handoff retained the request for {:?}",
+        started.elapsed()
+    );
     assert_eq!(
         error.kind(),
         &crate::BucketSnapshotLoadFailureKind::MetadataCommandContention
@@ -3144,6 +3150,25 @@ fn bucket_subresource_retains_handoff_when_unrelated_pending_command_is_irrevoca
     );
     assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 1);
     assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command,));
+
+    let retry_started = std::time::Instant::now();
+    let retry_error = cluster
+        .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
+        .expect_err("an already-transferred unrelated command must remain retryable contention");
+    assert!(
+        retry_started.elapsed() < Duration::from_secs(5),
+        "existing authorized-recovery handoff retained a later request for {:?}",
+        retry_started.elapsed()
+    );
+    assert_eq!(
+        retry_error.kind(),
+        &crate::BucketSnapshotLoadFailureKind::MetadataCommandContention
+    );
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        1,
+        "a later unrelated caller must not re-enter command application"
+    );
     for node_id in node_ids {
         let pg = map
             .node(node_id)
@@ -3164,6 +3189,378 @@ fn bucket_subresource_retains_handoff_when_unrelated_pending_command_is_irrevoca
             "the blocked request must not mutate its target bucket"
         );
     }
+}
+
+#[test]
+fn bucket_subresource_transfers_published_unrelated_command_to_recovery() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], EcShape { k: 2, m: 1 }).unwrap();
+    let pg_id = PgId::new(1);
+    let (bucket, barrier_bucket) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        (
+            bucket_for_pg(topology, pg_id.get(), "subresource-published-drain-"),
+            bucket_for_pg(topology, pg_id.get(), "subresource-published-barrier-"),
+        )
+    };
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    create_test_bucket(&cluster, &barrier_bucket);
+
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+            AdvanceMultipartCompletionBarrierCommand {
+                bucket: barrier_bucket.clone(),
+                barrier_sequence: 11,
+            },
+        ),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &barrier_bucket, &command);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let trailing_failures = Arc::new(AtomicUsize::new(0));
+    let trailing_failures_for_hook = Arc::clone(&trailing_failures);
+    let hook_command = command.clone();
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, candidate| {
+            if node_id == NodeId::new(2) && candidate == &hook_command {
+                trailing_failures_for_hook.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "injected published bucket-command trailing failure",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "injected published bucket-command trailing failure".to_owned(),
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ));
+    let tags = crate::SerializedBucketTagSet::new(
+        "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
+            .to_string(),
+    );
+
+    let started = std::time::Instant::now();
+    let error = cluster
+        .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
+        .expect_err("published unrelated command must transfer to authorized recovery");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "published unrelated bucket command retained the request for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        error.kind(),
+        &crate::BucketSnapshotLoadFailureKind::MetadataCommandContention
+    );
+    assert_eq!(trailing_failures.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &barrier_bucket),
+        Some(command.clone())
+    );
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+    for node_id in [NodeId::new(0), NodeId::new(1)] {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_record_raw(&*pg, &barrier_bucket)
+                .unwrap()
+                .multipart_completion_barrier_sequence,
+            11
+        );
+    }
+    let trailing_pg = map
+        .node(NodeId::new(2))
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    assert_eq!(
+        crate::PgMetadataStore::head_bucket_record_raw(&*trailing_pg, &barrier_bucket)
+            .unwrap()
+            .multipart_completion_barrier_sequence,
+        0
+    );
+    drop(trailing_pg);
+
+    let retry_started = std::time::Instant::now();
+    let retry_error = cluster
+        .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
+        .expect_err("later unrelated caller must observe the retained recovery handoff");
+    assert!(retry_started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        retry_error.kind(),
+        &crate::BucketSnapshotLoadFailureKind::MetadataCommandContention
+    );
+    assert_eq!(trailing_failures.load(Ordering::SeqCst), 1);
+
+    let mut multipart_budget =
+        crate::cluster::RequestWorkBudget::new(Duration::from_secs(10), None)
+            .for_operation("test_published_bucket_command_multipart_barrier")
+            .for_pg(pg_id);
+    let multipart_started = std::time::Instant::now();
+    let multipart_error = cluster
+        .test_finish_pending_command_for_multipart_completion_barrier(
+            pg_id,
+            &command,
+            &mut multipart_budget,
+        )
+        .expect_err("multipart barrier dispatch must not accept pending recovery as complete");
+    assert!(multipart_started.elapsed() < Duration::from_secs(5));
+    assert!(matches!(
+        multipart_error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
+    ));
+    assert_eq!(trailing_failures.load(Ordering::SeqCst), 1);
+
+    drop(hook_guard);
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id, &command, &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &barrier_bucket).is_none());
+}
+
+#[test]
+fn bucket_subresource_waiter_transfers_exact_owner_published_command_to_recovery() {
+    #[derive(Default)]
+    struct OwnerApplyGate {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl OwnerApplyGate {
+        fn block_until_released(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+
+        fn wait_until_arrived(&self, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            while !state.0 {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("exact owner did not reach the apply gate");
+                let (next, wait) = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|error| error.into_inner());
+                state = next;
+                assert!(
+                    !wait.timed_out() || state.0,
+                    "exact owner did not reach the apply gate"
+                );
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.1 = true;
+            self.changed.notify_all();
+        }
+
+        fn release_on_drop(self: &Arc<Self>) -> OwnerApplyGateRelease {
+            OwnerApplyGateRelease(Arc::clone(self))
+        }
+    }
+
+    struct OwnerApplyGateRelease(Arc<OwnerApplyGate>);
+
+    impl OwnerApplyGateRelease {
+        fn release(&self) {
+            self.0.release();
+        }
+    }
+
+    impl Drop for OwnerApplyGateRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], EcShape { k: 2, m: 1 }).unwrap();
+    let pg_id = PgId::new(1);
+    let (bucket, barrier_bucket) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        (
+            bucket_for_pg(topology, pg_id.get(), "subresource-published-waiter-"),
+            bucket_for_pg(topology, pg_id.get(), "subresource-published-owner-"),
+        )
+    };
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    create_test_bucket(&cluster, &barrier_bucket);
+
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+            AdvanceMultipartCompletionBarrierCommand {
+                bucket: barrier_bucket.clone(),
+                barrier_sequence: 17,
+            },
+        ),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &barrier_bucket, &command);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let owner_apply_gate = Arc::new(OwnerApplyGate::default());
+    let owner_apply_gate_for_hook = Arc::clone(&owner_apply_gate);
+    let owner_blocked = Arc::new(AtomicBool::new(false));
+    let owner_blocked_for_hook = Arc::clone(&owner_blocked);
+    let trailing_failures = Arc::new(AtomicUsize::new(0));
+    let trailing_failures_for_hook = Arc::clone(&trailing_failures);
+    let hook_command = command.clone();
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, candidate| {
+            if candidate != &hook_command {
+                return Ok(());
+            }
+            if !owner_blocked_for_hook.swap(true, Ordering::SeqCst) {
+                owner_apply_gate_for_hook.block_until_released();
+            }
+            if node_id == NodeId::new(2) {
+                trailing_failures_for_hook.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "injected exact-owner trailing bucket-command failure",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "injected exact-owner trailing bucket-command failure".to_owned(),
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ));
+    let tags = crate::SerializedBucketTagSet::new(
+        "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
+            .to_string(),
+    );
+
+    let (owner_result, waiter_result) = thread::scope(|scope| {
+        let owner_release = owner_apply_gate.release_on_drop();
+        let (owner_result_tx, owner_result_rx) = std::sync::mpsc::sync_channel(1);
+        let owner_cluster = &cluster;
+        let owner_bucket = &barrier_bucket;
+        let owner_command = &command;
+        scope.spawn(move || {
+            owner_result_tx
+                .send(owner_cluster.finish_pending_metadata_command_to_acting_set(
+                    pg_id,
+                    owner_bucket,
+                    owner_command,
+                    false,
+                ))
+                .unwrap();
+        });
+        owner_apply_gate.wait_until_arrived(Duration::from_secs(5));
+        let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter_cluster = &cluster;
+        let waiter_bucket = &bucket;
+        let waiter_tags = &tags;
+        scope.spawn(move || {
+            waiter_result_tx
+                .send(waiter_cluster.put_bucket_subresource_and_load_info(
+                    waiter_bucket,
+                    crate::PutBucketSubresource::tagging(waiter_tags),
+                ))
+                .unwrap();
+        });
+        let waiter_selection_deadline = Instant::now() + Duration::from_secs(5);
+        while !map
+            .runtime_state()
+            .test_metadata_command_recovery_handoff_requested(pg_id, &command)
+        {
+            assert!(
+                Instant::now() < waiter_selection_deadline,
+                "unrelated caller did not select the exact owner's recovery flight"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        owner_release.release();
+        (
+            owner_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("exact owner did not finish after gate release"),
+            waiter_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("unrelated waiter did not finish after publication handoff"),
+        )
+    });
+
+    assert_eq!(
+        owner_result.unwrap(),
+        PendingMetadataCommandOutcome::PublishedPendingRecovery,
+        "the exact owner must retain its committed-success projection"
+    );
+    assert_eq!(
+        waiter_result
+            .expect_err("the waiting unrelated caller must receive retryable contention")
+            .kind(),
+        &crate::BucketSnapshotLoadFailureKind::MetadataCommandContention
+    );
+    assert!(owner_blocked.load(Ordering::SeqCst));
+    assert_eq!(trailing_failures.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &barrier_bucket),
+        Some(command.clone())
+    );
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+
+    drop(hook_guard);
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id, &command, &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &barrier_bucket).is_none());
 }
 
 #[test]

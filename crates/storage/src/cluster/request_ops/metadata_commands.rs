@@ -1,6 +1,44 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetadataCommandRecoveryAdmissionPolicy {
+    ExactCommandOwner,
+    UnrelatedDrainer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoordinatedMetadataCommandFinishDisposition {
+    Finished(FinishPendingMetadataCommandResult),
+    TransferredToAuthorizedRecovery,
+}
+
+impl CoordinatedMetadataCommandFinishDisposition {
+    fn for_policy(
+        policy: MetadataCommandRecoveryAdmissionPolicy,
+        outcome: FinishPendingMetadataCommandResult,
+    ) -> Self {
+        if policy == MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
+            && outcome == FinishPendingMetadataCommandResult::PublishedPendingRecovery
+        {
+            Self::TransferredToAuthorizedRecovery
+        } else {
+            Self::Finished(outcome)
+        }
+    }
+
+    fn into_exact_result(
+        self,
+    ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
+        match self {
+            Self::Finished(outcome) => Ok(outcome),
+            Self::TransferredToAuthorizedRecovery => Err(conflicting_pending_metadata_command(
+                "exact metadata command transferred to authorized recovery",
+            )),
+        }
+    }
+}
+
 fn metadata_command_finish_result_from_recovery_resolution(
     command: &MetadataCommandEnvelope,
     resolution: MetadataCommandRecoveryResolution,
@@ -2262,7 +2300,7 @@ impl super::StorageCluster {
         clear_pending_on_zero_apply: bool,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
-        match self.finish_pending_metadata_command_to_acting_set_coordinated_inner(
+        let disposition = self.finish_pending_metadata_command_to_acting_set_coordinated_inner(
             pg_id,
             command,
             MetadataCommandFinishPolicy {
@@ -2277,8 +2315,10 @@ impl super::StorageCluster {
                 },
             },
             MetadataCommandExecutionRoute::normal(),
+            MetadataCommandRecoveryAdmissionPolicy::ExactCommandOwner,
             work_budget,
-        )? {
+        )?;
+        match disposition.into_exact_result()? {
             FinishPendingMetadataCommandResult::Applied => {
                 Ok(super::PendingMetadataCommandOutcome::Applied)
             }
@@ -2361,6 +2401,35 @@ impl super::StorageCluster {
                 },
             },
             MetadataCommandExecutionRoute::normal(),
+            MetadataCommandRecoveryAdmissionPolicy::ExactCommandOwner,
+            work_budget,
+        )
+        .and_then(CoordinatedMetadataCommandFinishDisposition::into_exact_result)
+    }
+
+    fn finish_unrelated_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        clear_pending_on_zero_apply: bool,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<CoordinatedMetadataCommandFinishDisposition, BucketSnapshotLoadError> {
+        self.finish_pending_metadata_command_to_acting_set_coordinated_inner(
+            pg_id,
+            command,
+            MetadataCommandFinishPolicy {
+                clear_pending_on_zero_apply,
+                retry_partial_exact_conflict: true,
+                convergence_requirement:
+                    MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+                progress_provenance: if clear_pending_on_zero_apply {
+                    MetadataCommandApplyProgressProvenance::Authoritative
+                } else {
+                    MetadataCommandApplyProgressProvenance::RecoveredPending
+                },
+            },
+            MetadataCommandExecutionRoute::normal(),
+            MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer,
             work_budget,
         )
     }
@@ -2424,16 +2493,31 @@ impl super::StorageCluster {
         initial_command: &MetadataCommandEnvelope,
         mut policy: MetadataCommandFinishPolicy,
         execution_route: MetadataCommandExecutionRoute<'_>,
+        admission_policy: MetadataCommandRecoveryAdmissionPolicy,
         work_budget: &mut super::RequestWorkBudget,
-    ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
+    ) -> Result<CoordinatedMetadataCommandFinishDisposition, BucketSnapshotLoadError> {
         debug_assert_eq!(execution_route.mode, MetadataCommandRouteMode::Normal);
         let mut command = initial_command.clone();
         loop {
-            match self
-                .local_map
-                .runtime_state()
-                .join_metadata_command_recovery_until(pg_id, &command, work_budget.deadline())
-            {
+            let admission = match admission_policy {
+                MetadataCommandRecoveryAdmissionPolicy::ExactCommandOwner => self
+                    .local_map
+                    .runtime_state()
+                    .join_metadata_command_recovery_and_wait_for_authorized_handoff_until(
+                        pg_id,
+                        &command,
+                        work_budget.deadline(),
+                    ),
+                MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer => self
+                    .local_map
+                    .runtime_state()
+                    .join_metadata_command_recovery_as_unrelated_drainer_until(
+                        pg_id,
+                        &command,
+                        work_budget.deadline(),
+                    ),
+            };
+            match admission {
                 MetadataCommandRecoveryAdmission::Leader(guard) => {
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
@@ -2461,17 +2545,33 @@ impl super::StorageCluster {
                                     .expect("guard requires typed irreversible uncertainty"),
                             );
                             guard.relinquish_for_authorized_recovery();
+                            if admission_policy
+                                == MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
+                            {
+                                return Ok(CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery);
+                            }
                             continue;
                         }
                         Err(error) if guard.lineage_advanced_from(&command) => {
                             guard.relinquish_for_authorized_recovery();
                             return Err(error);
                         }
+                        Err(error)
+                            if metadata_command_observation_requires_recovery_route(&error) =>
+                        {
+                            guard.relinquish_for_authorized_recovery();
+                            if admission_policy
+                                == MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
+                            {
+                                return Ok(CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery);
+                            }
+                            return Err(error);
+                        }
                         Err(error) => return Err(error),
                     };
-                    guard.record_outcome(metadata_command_recovery_outcome_from_finish_result(
-                        outcome,
-                    ));
+                    let relinquished = guard.complete_with_outcome_and_relinquish_if_requested(
+                        metadata_command_recovery_outcome_from_finish_result(outcome),
+                    );
                     self.emit_metadata_command_recovery_outcome_for_command(
                         pg_id,
                         &command,
@@ -2492,7 +2592,22 @@ impl super::StorageCluster {
                             }
                         },
                     );
-                    return Ok(outcome);
+                    debug_assert!(
+                        outcome != FinishPendingMetadataCommandResult::PublishedPendingRecovery
+                            || admission_policy
+                                != MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
+                            || relinquished,
+                        "unrelated published command must retain its authorized recovery flight"
+                    );
+                    return Ok(CoordinatedMetadataCommandFinishDisposition::for_policy(
+                        admission_policy,
+                        outcome,
+                    ));
+                }
+                MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery { .. } => {
+                    return Ok(
+                        CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery,
+                    );
                 }
                 MetadataCommandRecoveryAdmission::Waited {
                     wait_us,
@@ -2510,9 +2625,14 @@ impl super::StorageCluster {
                     );
                     if let Some(resolution) = resolution {
                         return metadata_command_finish_result_from_recovery_resolution(
-                            &command,
-                            resolution,
-                        );
+                            &command, resolution,
+                        )
+                        .map(|outcome| {
+                            CoordinatedMetadataCommandFinishDisposition::for_policy(
+                                admission_policy,
+                                outcome,
+                            )
+                        });
                     }
                     if let Err(error) =
                         work_budget.check("metadata command recovery waiter budget exhausted")
@@ -2526,7 +2646,10 @@ impl super::StorageCluster {
                             )?
                         {
                             MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => {
-                                Ok(FinishPendingMetadataCommandResult::PublishedPendingRecovery)
+                                Ok(CoordinatedMetadataCommandFinishDisposition::for_policy(
+                                    admission_policy,
+                                    FinishPendingMetadataCommandResult::PublishedPendingRecovery,
+                                ))
                             }
                             MetadataCommandBudgetExhaustionOutcome::Error(error) => {
                                 Err(error.into())
@@ -2549,11 +2672,15 @@ impl super::StorageCluster {
                     match waiter_outcome {
                         MetadataCommandRecoveryWaiterOutcome::StillPending => continue,
                         MetadataCommandRecoveryWaiterOutcome::Applied => {
-                            return Ok(FinishPendingMetadataCommandResult::Applied);
+                            return Ok(CoordinatedMetadataCommandFinishDisposition::Finished(
+                                FinishPendingMetadataCommandResult::Applied,
+                            ));
                         }
                         MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
                         | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
-                            return Ok(FinishPendingMetadataCommandResult::Abandoned);
+                            return Ok(CoordinatedMetadataCommandFinishDisposition::Finished(
+                                FinishPendingMetadataCommandResult::Abandoned,
+                            ));
                         }
                     }
                 }
@@ -2581,7 +2708,13 @@ impl super::StorageCluster {
                             return metadata_command_finish_result_from_recovery_resolution(
                                 &command,
                                 resolution,
-                            );
+                            )
+                            .map(|outcome| {
+                                CoordinatedMetadataCommandFinishDisposition::for_policy(
+                                    admission_policy,
+                                    outcome,
+                                )
+                            });
                         }
                         let result = metadata_command_finish_result_from_recovery_resolution(
                             &command,
@@ -2595,7 +2728,12 @@ impl super::StorageCluster {
                         {
                             continue;
                         }
-                        return result;
+                        return result.map(|outcome| {
+                            CoordinatedMetadataCommandFinishDisposition::for_policy(
+                                admission_policy,
+                                outcome,
+                            )
+                        });
                     }
                     if let Err(error) = work_budget.sleep_after_contention(
                         "metadata command recovery gate retry budget exhausted",
@@ -2609,7 +2747,10 @@ impl super::StorageCluster {
                             )?
                         {
                             MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => {
-                                Ok(FinishPendingMetadataCommandResult::PublishedPendingRecovery)
+                                Ok(CoordinatedMetadataCommandFinishDisposition::for_policy(
+                                    admission_policy,
+                                    FinishPendingMetadataCommandResult::PublishedPendingRecovery,
+                                ))
                             }
                             MetadataCommandBudgetExhaustionOutcome::Error(error) => {
                                 Err(error.into())
@@ -2672,6 +2813,13 @@ impl super::StorageCluster {
     ) -> Result<MetadataCommandAbandonmentObservation, BucketSnapshotLoadError> {
         match observation {
             Ok(abandoned) => Ok(MetadataCommandAbandonmentObservation::Observed(abandoned)),
+            Err(error)
+                if metadata_command_observation_requires_recovery_route(&error.source) =>
+            {
+                // This durable command's normal route can no longer make progress. Let the
+                // coordinated caller preserve its flight for authority-backed recovery.
+                Err(error.source)
+            }
             Err(error)
                 if metadata_command_abandonment_observation_error_is_retryable(&error.source) =>
             {
@@ -3094,12 +3242,23 @@ impl super::StorageCluster {
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
         self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
-        self.finish_pending_metadata_command_to_acting_set_with_work_budget(
-            pg_id,
-            command,
-            clear_pending_on_zero_apply,
-            work_budget,
-        )
+        match self
+            .finish_unrelated_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                pg_id,
+                command,
+                clear_pending_on_zero_apply,
+                work_budget,
+            )?
+        {
+            CoordinatedMetadataCommandFinishDisposition::Finished(outcome) => {
+                Ok(metadata_command_recovery_outcome_from_finish_result(outcome))
+            }
+            CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery => {
+                Err(conflicting_pending_metadata_command(
+                    "bucket metadata command transferred to authorized recovery",
+                ))
+            }
+        }
     }
 
     fn drain_bucket_pg_pending_metadata_command_requiring_convergence_with_work_budget(
@@ -3171,7 +3330,7 @@ impl super::StorageCluster {
     ) -> Result<(), BucketSnapshotLoadError> {
         if Self::metadata_command_is_bucket_pg_command(command) {
             let outcome = match self
-                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                .finish_unrelated_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
                     pg_id,
                     command,
                     false,
@@ -3185,6 +3344,14 @@ impl super::StorageCluster {
                     }
                     Err(error) => return Err(error),
                 };
+            let outcome = match outcome {
+                CoordinatedMetadataCommandFinishDisposition::Finished(outcome) => outcome,
+                CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery => {
+                    return Err(conflicting_pending_metadata_command(
+                        "bucket metadata command transferred to authorized recovery",
+                    ));
+                }
+            };
             return match outcome {
                 FinishPendingMetadataCommandResult::Applied
                 | FinishPendingMetadataCommandResult::PublishedPendingRecovery

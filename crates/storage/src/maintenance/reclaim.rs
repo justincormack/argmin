@@ -652,6 +652,7 @@ fn object_payload_reclaim_worker_should_defer(
             | ObjectPgActionError::MultipartConditionalRequestConflict
             | ObjectPgActionError::MultipartPrepublicationBarrierExhausted,
         ) => false,
+        Err(ObjectPgActionError::MetadataCommandRecoveryTransferred) => true,
     }
 }
 

@@ -3204,6 +3204,266 @@ fn stream_abort_matching_pending_install_race_returns_success() {
 }
 
 #[test]
+fn stream_put_maps_unrelated_abort_convergence_to_contention() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let waiter_key = key_for_object_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        &bucket,
+        object_pg,
+        "stream-abort-convergence-waiter-",
+    );
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("58".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let waiter_session_id = crate::SessionId::try_from("59".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &waiter_key,
+            &waiter_session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let stream_create_bucket_write_reservation = {
+        let pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        crate::PgMetadataStore::get_stream_upload(&*pg, &session_id)
+            .unwrap()
+            .bucket_write_reservation
+    };
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+            bucket: bucket.clone(),
+            key,
+            session_id,
+            staged_segments: Vec::new(),
+            stream_create_bucket_write_reservation,
+        })),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_command = command.clone();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate == &hook_command {
+                hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                let id = candidate.id();
+                return Err(StoreError::MetadataCommandIrrevocableConvergencePending {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                });
+            }
+            Ok(())
+        }));
+
+    let error = cluster
+        .finalize_put_object_stream(&bucket, &waiter_key, &waiter_session_id, 0, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: checksum::crc64::checksum(&[]),
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
+        .expect_err("an unrelated abort awaiting recovery must be retryable contention");
+
+    assert!(
+        matches!(
+            &error,
+            crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+        ),
+        "unexpected stream PUT drain error: {error:?}"
+    );
+    assert_eq!(
+        crate::StreamUploadFailure::from_object_pg_action(error).kind(),
+        crate::StreamUploadFailureKind::MetadataCommandContention
+    );
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone())
+    );
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+}
+
+#[test]
+fn stream_append_maps_unrelated_abort_convergence_to_contention_before_preparation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let waiter_key = key_for_object_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        &bucket,
+        object_pg,
+        "stream-append-abort-convergence-waiter-",
+    );
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("5a".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let waiter_session_id = crate::SessionId::try_from("5b".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &waiter_key,
+            &waiter_session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let stream_create_bucket_write_reservation = {
+        let pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        crate::PgMetadataStore::get_stream_upload(&*pg, &session_id)
+            .unwrap()
+            .bucket_write_reservation
+    };
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+            bucket: bucket.clone(),
+            key,
+            session_id,
+            staged_segments: Vec::new(),
+            stream_create_bucket_write_reservation,
+        })),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_command = command.clone();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate == &hook_command {
+                hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                let id = candidate.id();
+                return Err(StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                });
+            }
+            Ok(())
+        }));
+    let prepared = Arc::new(AtomicBool::new(false));
+    let prepared_for_callback = Arc::clone(&prepared);
+    let payload = b"append must not start";
+
+    let error = cluster
+        .test_append_stream_segment_with_after_prepare(
+            &bucket,
+            &waiter_key,
+            crate::StreamSegmentAppendInput {
+                session_id: &waiter_session_id,
+                segment_index: 0,
+                payload_crc64: checksum::crc64::checksum(payload),
+                storage_bytes: payload,
+            },
+            move || {
+                prepared_for_callback.store(true, Ordering::SeqCst);
+            },
+        )
+        .expect_err("an unrelated abort awaiting recovery must block append as contention");
+
+    assert!(
+        matches!(
+            &error,
+            crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+        ),
+        "unexpected stream append drain error: {error:?}"
+    );
+    assert_eq!(
+        crate::StreamUploadFailure::from_object_pg_action(error).kind(),
+        crate::StreamUploadFailureKind::MetadataCommandContention
+    );
+    assert!(!prepared.load(Ordering::SeqCst));
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone())
+    );
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+}
+
+#[test]
 fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

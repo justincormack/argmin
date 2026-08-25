@@ -1653,7 +1653,7 @@ fn metadata_command_recovery_reissue_lineage_shares_owner_and_deadline() {
 }
 
 #[test]
-fn metadata_command_recovery_handoff_retains_root_owner_and_resolves_reissued_waiter() {
+fn metadata_command_recovery_handoff_releases_waiter_and_retains_root_owner() {
     let runtime_state = Arc::new(LocalClusterRuntimeState::new());
     let pg_id = PgId::new(1);
     let bucket = BucketName::new("single-flight-authorized-handoff").unwrap();
@@ -1693,10 +1693,16 @@ fn metadata_command_recovery_handoff_retains_root_owner_and_resolves_reissued_wa
     );
 
     owner.relinquish_for_authorized_recovery();
-    assert!(
-        rx.recv_timeout(Duration::from_millis(50)).is_err(),
-        "normal waiter must remain blocked while the flight awaits authorized recovery"
-    );
+    let admission = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        admission,
+        MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
+            lineage_tip,
+            ..
+        } if lineage_tip == replacement
+    ));
+    waiter.join().unwrap();
+
     let MetadataCommandRecoveryAdmission::Leader(recovery_owner) = runtime_state
         .join_authorized_metadata_command_recovery_until(
             pg_id,
@@ -1710,18 +1716,10 @@ fn metadata_command_recovery_handoff_retains_root_owner_and_resolves_reissued_wa
     assert_eq!(recovery_owner.lineage_root(), source);
     recovery_owner.record_outcome(PendingMetadataCommandOutcome::Applied);
     drop(recovery_owner);
-    let admission = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(matches!(
-        admission,
-        MetadataCommandRecoveryAdmission::Waited {
-            lineage_tip,
-            resolution: Some(MetadataCommandRecoveryResolution::Outcome(
-                PendingMetadataCommandOutcome::Applied
-            )),
-            ..
-        } if lineage_tip == replacement
-    ));
-    waiter.join().unwrap();
+    assert_eq!(
+        runtime_state.test_metadata_command_recovery_flight_count(),
+        0
+    );
 }
 
 #[test]
@@ -8938,6 +8936,88 @@ fn fully_applied_primary_pending_reservation_drain_clears_exact_slot() {
 }
 
 #[test]
+fn stale_normal_route_detaches_object_command_for_authorized_recovery() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key,
+            crate::SessionId::try_from("5a".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            123,
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let route_failure_injected = Arc::new(AtomicBool::new(false));
+    let route_failure_injected_for_hook = Arc::clone(&route_failure_injected);
+    let hook_command = command.clone();
+    let hook = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |_node_id, candidate| {
+            if *candidate == hook_command
+                && !route_failure_injected_for_hook.swap(true, Ordering::SeqCst)
+            {
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: candidate.id().cluster_epoch(),
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let error = cluster
+        .drain_pending_metadata_command_with_recovery_gate(pg_id, &command)
+        .expect_err("an expired normal route must hand the command to authorized recovery");
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+    ));
+    assert!(route_failure_injected.load(Ordering::SeqCst));
+    assert!(map
+        .runtime_state()
+        .test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone())
+    );
+
+    drop(hook);
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id, &command, &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
 fn partial_abandoned_reservation_retry_does_not_report_skipped_command_success() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -10433,7 +10513,7 @@ fn direct_put_maps_irrevocable_unrelated_partial_pending_conflict_to_contention(
     assert!(matches!(
         error,
         crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
-            context: "direct PUT blocked by pending command convergence"
+            context: "request blocked by unrelated object metadata command convergence"
         })
     ));
     assert_eq!(partial_conflict_attempts.load(Ordering::SeqCst), 2);

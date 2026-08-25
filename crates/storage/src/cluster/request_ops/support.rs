@@ -191,7 +191,8 @@ pub(super) fn object_pg_action_error_is_retryable_command_observation(
         | ObjectPgActionError::SnapshotReinspectionConflict
         | ObjectPgActionError::StaleMultipartCompletionSnapshot
         | ObjectPgActionError::MultipartConditionalRequestConflict
-        | ObjectPgActionError::MultipartPrepublicationBarrierExhausted => false,
+        | ObjectPgActionError::MultipartPrepublicationBarrierExhausted
+        | ObjectPgActionError::MetadataCommandRecoveryTransferred => false,
     }
 }
 
@@ -203,6 +204,65 @@ pub(super) fn metadata_command_abandonment_observation_error_is_retryable(
             store_error_is_retryable_command_observation(error)
         }
         BucketSnapshotLoadError::Metadata(error) => error.is_command_contention(),
+    }
+}
+
+fn store_error_requires_metadata_command_recovery_route(error: &StoreError) -> bool {
+    match error {
+        StoreError::StalePayloadOperation { .. }
+        | StoreError::StaleMetadataPrimaryBridge { .. }
+        | StoreError::StaleMetadataOperation { .. }
+        | StoreError::StaleMetadataRoute { .. }
+        | StoreError::StaleMetadataReadProof { .. }
+        | StoreError::RouteMapExpired { .. }
+        | StoreError::RouteAdmissionClusterMismatch { .. }
+        | StoreError::StaleMetadataCommand { .. }
+        | StoreError::StaleShardOperation { .. }
+        | StoreError::StaleShardLocation { .. }
+        | StoreError::PgNotActive { .. }
+        | StoreError::ShardPgNotActive { .. } => true,
+        StoreError::ShardStore { source, .. } => {
+            store_error_requires_metadata_command_recovery_route(source)
+        }
+        StoreError::StorageRpc { failure, .. } => matches!(
+            failure.wire_code(),
+            StorageRpcWireErrorCode::StaleShardLocation
+                | StorageRpcWireErrorCode::InactivePgRoute
+                | StorageRpcWireErrorCode::NonActingSetAccess
+                | StorageRpcWireErrorCode::WrongClusterEpoch
+        ),
+        _ => false,
+    }
+}
+
+pub(super) fn metadata_command_observation_requires_recovery_route(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    match error {
+        BucketSnapshotLoadError::Store(error) => {
+            store_error_requires_metadata_command_recovery_route(error)
+        }
+        BucketSnapshotLoadError::Metadata(_) => false,
+    }
+}
+
+pub(super) fn object_pg_action_error_requires_metadata_command_recovery_route(
+    error: &ObjectPgActionError,
+) -> bool {
+    match error {
+        ObjectPgActionError::Store(error) => {
+            store_error_requires_metadata_command_recovery_route(error)
+        }
+        ObjectPgActionError::Metadata(_)
+        | ObjectPgActionError::InvalidRequest { .. }
+        | ObjectPgActionError::StaleObjectReadSubject
+        | ObjectPgActionError::StaleDirectPutCommitSnapshot
+        | ObjectPgActionError::StaleStreamFinalizeSnapshot
+        | ObjectPgActionError::SnapshotReinspectionConflict
+        | ObjectPgActionError::StaleMultipartCompletionSnapshot
+        | ObjectPgActionError::MultipartConditionalRequestConflict
+        | ObjectPgActionError::MultipartPrepublicationBarrierExhausted
+        | ObjectPgActionError::MetadataCommandRecoveryTransferred => false,
     }
 }
 
@@ -229,7 +289,8 @@ pub(super) fn object_pg_action_error_is_retryable_pending_drain(
         | ObjectPgActionError::SnapshotReinspectionConflict
         | ObjectPgActionError::StaleMultipartCompletionSnapshot
         | ObjectPgActionError::MultipartConditionalRequestConflict
-        | ObjectPgActionError::MultipartPrepublicationBarrierExhausted => false,
+        | ObjectPgActionError::MultipartPrepublicationBarrierExhausted
+        | ObjectPgActionError::MetadataCommandRecoveryTransferred => false,
     }
 }
 

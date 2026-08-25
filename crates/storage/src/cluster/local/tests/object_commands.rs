@@ -4361,11 +4361,9 @@ fn recovery_drain_classifies_publication_started_when_abandonment_scan_exhausts_
     assert!(
         matches!(
             error,
-            crate::ObjectPgActionError::Store(
-                StoreError::MetadataCommandIrrevocableConvergencePending { .. }
-            )
+            crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
         ),
-        "publication-started command regressed to a retryable observation error: {error:?}"
+        "publication-started command was not transferred to authorized recovery: {error:?}"
     );
     assert!(
         started.elapsed()
@@ -4984,10 +4982,7 @@ fn reissued_object_command_deadline_expiry_retains_authorized_handoff_lineage() 
     assert!(!hook_once.load(Ordering::SeqCst));
     assert!(matches!(
         error,
-        crate::ObjectPgActionError::Store(
-            StoreError::MetadataCommandOutcomeUnconfirmed { .. }
-                | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
-        )
+        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
     ));
     let replacement = pending_metadata_command_for_test(&map, pg_id, &bucket)
         .expect("C2 must remain durably pending for authorized recovery");
@@ -5087,10 +5082,7 @@ fn ambiguous_object_reissue_retains_c1_c2_flight_for_authorized_recovery() {
         .expect_err("lost object replacement response must require authorized recovery");
     assert!(matches!(
         error,
-        crate::ObjectPgActionError::Store(StoreError::MetadataCommandOutcomeUnconfirmed {
-            log_index,
-            ..
-        }) if log_index == source_index.get() + 1
+        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
     ));
     let replacement = pending_metadata_command_for_test(&map, pg_id, &bucket)
         .expect("committed object C2 must remain pending");

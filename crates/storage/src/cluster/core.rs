@@ -199,10 +199,6 @@ mod metadata_command_drain_authority {
     }
 
     impl Leader<'_> {
-        pub(super) fn lineage_tip(&self) -> MetadataCommandEnvelope {
-            self._guard.lineage_tip()
-        }
-
         pub(super) fn lineage_advanced_from(&self, command: &MetadataCommandEnvelope) -> bool {
             self._guard.lineage_advanced_from(command)
         }
@@ -1018,6 +1014,11 @@ fn object_pg_action_error_to_bucket_snapshot_error(
             BucketSnapshotLoadError::Store(StoreError::Io {
                 context: "object PG action failed during bucket snapshot operation",
                 source: std::io::Error::other("multipart prepublication barrier exhausted"),
+            })
+        }
+        ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+            BucketSnapshotLoadError::Store(StoreError::MetadataCommandContention {
+                context: "metadata command transferred to recovery",
             })
         }
     }

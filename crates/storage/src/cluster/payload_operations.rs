@@ -12,14 +12,31 @@ fn object_version_allocator_command_contention(error: &ObjectPgActionError) -> b
 fn direct_put_uninstalled_pending_drain_error(
     error: ObjectPgActionError,
 ) -> ObjectPgActionError {
+    pending_object_metadata_convergence_as_contention(
+        error,
+        "direct PUT blocked by pending command convergence",
+    )
+}
+
+fn unrelated_pending_object_metadata_drain_error(
+    error: ObjectPgActionError,
+) -> ObjectPgActionError {
+    pending_object_metadata_convergence_as_contention(
+        error,
+        "request blocked by unrelated object metadata command convergence",
+    )
+}
+
+fn pending_object_metadata_convergence_as_contention(
+    error: ObjectPgActionError,
+    context: &'static str,
+) -> ObjectPgActionError {
     match error {
         ObjectPgActionError::Store(
             StoreError::MetadataCommandOutcomeUnconfirmed { .. }
             | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
             | StoreError::MetadataCommandDependencyConvergencePending { .. },
-        ) => ObjectPgActionError::Store(StoreError::MetadataCommandContention {
-            context: "direct PUT blocked by pending command convergence",
-        }),
+        ) => ObjectPgActionError::Store(StoreError::MetadataCommandContention { context }),
         error => error,
     }
 }
@@ -1454,7 +1471,7 @@ impl StorageCluster {
                     if let Err(error) = work_budget.sleep_after_contention(
                         "partial pending object metadata convergence budget exhausted",
                     ) {
-                        return Err(match error {
+                        return Err(unrelated_pending_object_metadata_drain_error(match error {
                             StoreError::MetadataCommandContention { .. } => {
                                 let id = command.id();
                                 ObjectPgActionError::Store(
@@ -1466,7 +1483,7 @@ impl StorageCluster {
                                 )
                             }
                             error => ObjectPgActionError::Store(error),
-                        });
+                        }));
                     }
                 }
             }
@@ -1489,7 +1506,8 @@ impl StorageCluster {
             PendingMetadataCommandDrainContext::normal(
                 request_ops::MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
             ),
-        )?;
+        )
+        .map_err(unrelated_pending_object_metadata_drain_error)?;
         self.maybe_run_after_metadata_command_drain_hook();
         Ok(outcome)
     }
@@ -1688,6 +1706,24 @@ impl StorageCluster {
                         0,
                     );
                     guard
+                }
+                MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
+                    wait_us,
+                    lineage_tip,
+                } => {
+                    command = lineage_tip;
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id,
+                        &command,
+                        observability::MetadataCommandRecoveryAdmissionKind::Waited,
+                        wait_us,
+                    );
+                    self.emit_pending_slot_action_for_command(
+                        pg_id,
+                        &command,
+                        "drain_awaiting_authorized_recovery",
+                    );
+                    return Err(ObjectPgActionError::MetadataCommandRecoveryTransferred);
                 }
                 MetadataCommandRecoveryAdmission::Waited {
                     wait_us,
@@ -1910,17 +1946,28 @@ impl StorageCluster {
                     if matches!(route_mode, MetadataCommandRouteMode::Normal)
                         && metadata_command_irreversible_resolution(&error).is_some() =>
                 {
-                    command = leader.lineage_tip();
+                    // A publisher draining someone else's command cannot claim its exact
+                    // outcome. Preserve the flight for authority-backed recovery and let the
+                    // publisher boundary expose ordinary retryable contention.
                     leader.mark_irreversible_handoff(
                         metadata_command_irreversible_resolution(&error)
                             .expect("guard requires typed irreversible uncertainty"),
                     );
                     leader.relinquish_for_authorized_recovery();
-                    continue;
+                    return Err(ObjectPgActionError::MetadataCommandRecoveryTransferred);
                 }
                 Err(error) if leader.lineage_advanced_from(&command) => {
                     leader.relinquish_for_authorized_recovery();
                     return Err(error);
+                }
+                Err(error)
+                    if matches!(route_mode, MetadataCommandRouteMode::Normal)
+                        && request_ops::object_pg_action_error_requires_metadata_command_recovery_route(
+                            &error,
+                        ) =>
+                {
+                    leader.relinquish_for_authorized_recovery();
+                    return Err(ObjectPgActionError::MetadataCommandRecoveryTransferred);
                 }
                 Err(error)
                     if matches!(route_mode, MetadataCommandRouteMode::Recovery)
@@ -4785,11 +4832,11 @@ impl StorageCluster {
 
         let mut command = command;
         let mut apply_as_new = new_pending_command;
-        let command = loop {
+        let command = 'direct_recovery: loop {
             let recovery = self
                 .local_map
                 .runtime_state()
-                .join_metadata_command_recovery_until(
+                .join_metadata_command_recovery_and_wait_for_authorized_handoff_until(
                     pg_id,
                     &command,
                     work_budget.deadline(),
@@ -4803,6 +4850,19 @@ impl StorageCluster {
                         0,
                     );
                     guard
+                }
+                MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
+                    wait_us,
+                    lineage_tip,
+                } => {
+                    command = lineage_tip;
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id,
+                        &command,
+                        observability::MetadataCommandRecoveryAdmissionKind::Waited,
+                        wait_us,
+                    );
+                    return Err(ObjectPgActionError::MetadataCommandRecoveryTransferred);
                 }
                 MetadataCommandRecoveryAdmission::Waited {
                     wait_us,
@@ -5022,7 +5082,7 @@ impl StorageCluster {
                 };
             #[cfg(not(test))]
             let injected_uncertainty = false;
-            let apply = if injected_uncertainty {
+            let mut apply = if injected_uncertainty {
                 let id = command.id();
                 Err(ObjectPgActionError::Store(
                     StoreError::MetadataCommandOutcomeUnconfirmed {
@@ -5048,25 +5108,57 @@ impl StorageCluster {
                     &recovery_guard,
                 )
             };
-            let apply = match apply {
-                Ok(apply) => apply,
-                Err(error)
-                    if metadata_command_irreversible_resolution(&error).is_some() =>
-                {
-                    command = recovery_guard.lineage_tip();
-                    recovery_guard.mark_irreversible_handoff(
-                        metadata_command_irreversible_resolution(&error)
-                            .expect("guard requires typed irreversible uncertainty"),
-                    );
-                    recovery_guard.relinquish_for_authorized_recovery();
-                    apply_as_new = false;
-                    continue;
+            let mut unresolved_irreversible = None;
+            let apply = loop {
+                match apply {
+                    Ok(apply) => break apply,
+                    Err(error) if metadata_command_irreversible_resolution(&error).is_some() => {
+                        let resolution = metadata_command_irreversible_resolution(&error)
+                            .expect("guard requires typed irreversible uncertainty");
+                        command = recovery_guard.lineage_tip();
+                        apply_as_new = false;
+                        unresolved_irreversible = Some(resolution);
+                        // The request still owns this exact flight and its active route. Retry
+                        // there before depending on a later heartbeat to authorize recovery.
+                        if work_budget
+                            .sleep_after_contention(
+                                "direct PUT same-route convergence budget exhausted",
+                            )
+                            .is_err()
+                        {
+                            recovery_guard.mark_irreversible_handoff(resolution);
+                            recovery_guard.relinquish_for_authorized_recovery();
+                            continue 'direct_recovery;
+                        }
+                        apply = self
+                            .apply_recovered_pending_object_metadata_command_for_bucket_or_reinspect_with_recovery_guard(
+                                pg_id,
+                                &req.bucket,
+                                &command,
+                                &mut work_budget,
+                                &recovery_guard,
+                            );
+                    }
+                    Err(error) if unresolved_irreversible.is_some() => {
+                        recovery_guard.mark_irreversible_handoff(
+                            unresolved_irreversible
+                                .expect("same-route retry requires irreversible progress"),
+                        );
+                        if request_ops::object_pg_action_error_is_retryable_command_observation(
+                            &error,
+                        ) {
+                            recovery_guard.relinquish_for_authorized_recovery();
+                            continue 'direct_recovery;
+                        }
+                        recovery_guard.relinquish_for_authorized_recovery();
+                        return Err(error);
+                    }
+                    Err(error) if recovery_guard.lineage_advanced_from(&command) => {
+                        recovery_guard.relinquish_for_authorized_recovery();
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) if recovery_guard.lineage_advanced_from(&command) => {
-                    recovery_guard.relinquish_for_authorized_recovery();
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
             };
             match apply {
                 request_ops::NewObjectMetadataCommandApplyOutcome::Applied => {
@@ -5920,7 +6012,8 @@ impl StorageCluster {
                     &mut recovery_authority,
                     pg_id,
                     &command,
-                )?;
+                )
+                .map_err(unrelated_pending_object_metadata_drain_error)?;
                 match outcome {
                     PendingMetadataCommandOutcome::Applied
                     | PendingMetadataCommandOutcome::Abandoned => {}

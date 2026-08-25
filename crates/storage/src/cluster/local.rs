@@ -1542,6 +1542,7 @@ struct MetadataCommandRecoveryFlight {
 struct MetadataCommandRecoveryFlightState {
     in_progress: bool,
     awaiting_authorized_recovery: bool,
+    authorized_recovery_handoff_requested: bool,
     keys: HashSet<MetadataCommandRecoveryKey>,
     lineage_root: MetadataCommandEnvelope,
     lineage_tip: MetadataCommandEnvelope,
@@ -1584,6 +1585,10 @@ enum MetadataCommandRecoveryWaitTestAction {
 #[derive(Debug)]
 pub(crate) enum MetadataCommandRecoveryAdmission {
     Leader(MetadataCommandRecoveryGuard),
+    AwaitingAuthorizedRecovery {
+        wait_us: u128,
+        lineage_tip: MetadataCommandEnvelope,
+    },
     Waited {
         wait_us: u128,
         lineage_tip: MetadataCommandEnvelope,
@@ -1664,6 +1669,47 @@ impl MetadataCommandRecoveryGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .resolution = Some(MetadataCommandRecoveryResolution::Outcome(outcome));
+    }
+
+    pub(crate) fn complete_with_outcome_and_relinquish_if_requested(
+        mut self,
+        outcome: super::PendingMetadataCommandOutcome,
+    ) -> bool {
+        let relinquished = {
+            let mut flights = self
+                .flights
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let mut state = self
+                .flight
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.resolution = Some(MetadataCommandRecoveryResolution::Outcome(outcome));
+            if outcome == super::PendingMetadataCommandOutcome::PublishedPendingRecovery
+                && state.authorized_recovery_handoff_requested
+            {
+                debug_assert!(state.in_progress);
+                state.in_progress = false;
+                state.awaiting_authorized_recovery = true;
+                true
+            } else {
+                state.in_progress = false;
+                state.awaiting_authorized_recovery = false;
+                for key in &state.keys {
+                    if flights
+                        .get(key)
+                        .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+                    {
+                        flights.remove(key);
+                    }
+                }
+                false
+            }
+        };
+        self.flight.done.notify_all();
+        self.remove_flight_on_drop = false;
+        relinquished
     }
 
     pub(crate) fn relinquish_for_authorized_recovery(mut self) {
@@ -2088,6 +2134,27 @@ impl LocalClusterRuntimeState {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_metadata_command_recovery_handoff_requested(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> bool {
+        let flights = self
+            .metadata_command_recovery_flights
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        flights
+            .get(&MetadataCommandRecoveryKey::new(pg_id, command))
+            .is_some_and(|flight| {
+                flight
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .authorized_recovery_handoff_requested
+            })
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_metadata_command_recovery_commands_share_flight(
         &self,
         pg_id: PgId,
@@ -2125,7 +2192,27 @@ impl LocalClusterRuntimeState {
         command: &MetadataCommandEnvelope,
         deadline: Instant,
     ) -> MetadataCommandRecoveryAdmission {
-        self.join_metadata_command_recovery_until_inner(pg_id, command, None, deadline)
+        self.join_metadata_command_recovery_until_inner(
+            pg_id, command, None, deadline, false, false,
+        )
+    }
+
+    pub(crate) fn join_metadata_command_recovery_as_unrelated_drainer_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> MetadataCommandRecoveryAdmission {
+        self.join_metadata_command_recovery_until_inner(pg_id, command, None, deadline, false, true)
+    }
+
+    pub(crate) fn join_metadata_command_recovery_and_wait_for_authorized_handoff_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> MetadataCommandRecoveryAdmission {
+        self.join_metadata_command_recovery_until_inner(pg_id, command, None, deadline, true, false)
     }
 
     pub(crate) fn join_authorized_metadata_command_recovery_until(
@@ -2140,6 +2227,8 @@ impl LocalClusterRuntimeState {
             command,
             Some(authorized_source),
             deadline,
+            false,
+            false,
         )
     }
 
@@ -2149,6 +2238,8 @@ impl LocalClusterRuntimeState {
         command: &MetadataCommandEnvelope,
         authorized_source: Option<&MetadataCommandEnvelope>,
         deadline: Instant,
+        wait_for_authorized_handoff: bool,
+        request_authorized_handoff_on_published: bool,
     ) -> MetadataCommandRecoveryAdmission {
         let key = MetadataCommandRecoveryKey::new(pg_id, command);
         let flights = Arc::clone(&self.metadata_command_recovery_flights);
@@ -2156,8 +2247,8 @@ impl LocalClusterRuntimeState {
             let mut flights_guard = flights.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(flight) = flights_guard.get(&key) {
                 let flight = Arc::clone(flight);
+                let mut state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
                 let authorized_takeover = authorized_source.is_some_and(|source| {
-                    let mut state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
                     if state.awaiting_authorized_recovery
                         && !state.in_progress
                         && state.lineage_root == *source
@@ -2169,6 +2260,10 @@ impl LocalClusterRuntimeState {
                         false
                     }
                 });
+                if request_authorized_handoff_on_published && !authorized_takeover {
+                    state.authorized_recovery_handoff_requested = true;
+                }
+                drop(state);
                 (flight, authorized_takeover)
             } else if Instant::now() >= deadline {
                 return MetadataCommandRecoveryAdmission::TimedOut {
@@ -2181,6 +2276,8 @@ impl LocalClusterRuntimeState {
                     state: Mutex::new(MetadataCommandRecoveryFlightState {
                         in_progress: true,
                         awaiting_authorized_recovery: false,
+                        authorized_recovery_handoff_requested:
+                            request_authorized_handoff_on_published,
                         keys: HashSet::from([key]),
                         lineage_root: command.clone(),
                         lineage_tip: command.clone(),
@@ -2200,6 +2297,18 @@ impl LocalClusterRuntimeState {
                 flights,
                 remove_flight_on_drop: true,
             });
+        }
+        {
+            let state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.awaiting_authorized_recovery
+                && !state.in_progress
+                && !wait_for_authorized_handoff
+            {
+                return MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
+                    wait_us: 0,
+                    lineage_tip: state.lineage_tip.clone(),
+                };
+            }
         }
         if Instant::now() >= deadline {
             let state = flight.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2262,13 +2371,22 @@ impl LocalClusterRuntimeState {
             .wait_timeout_while(
                 flight.state.lock().unwrap_or_else(|e| e.into_inner()),
                 wait_timeout,
-                |state| state.in_progress || state.awaiting_authorized_recovery,
+                |state| {
+                    state.in_progress
+                        || (wait_for_authorized_handoff && state.awaiting_authorized_recovery)
+                },
             )
             .unwrap_or_else(|e| e.into_inner());
         let wait_us = wait_started.elapsed().as_micros();
         let lineage_tip = guard.lineage_tip.clone();
         let resolution = guard.resolution;
-        if guard.in_progress || guard.awaiting_authorized_recovery {
+        if guard.awaiting_authorized_recovery && !guard.in_progress && !wait_for_authorized_handoff
+        {
+            MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
+                wait_us,
+                lineage_tip,
+            }
+        } else if guard.in_progress || guard.awaiting_authorized_recovery {
             debug_assert!(wait_result.timed_out());
             MetadataCommandRecoveryAdmission::TimedOut {
                 wait_us,

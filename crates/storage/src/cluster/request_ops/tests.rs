@@ -159,6 +159,30 @@ mod pending_command_terminal_cleanup_tests {
     }
 
     #[test]
+    fn stale_metadata_command_routes_handoff_instead_of_polling() {
+        assert!(metadata_command_observation_requires_recovery_route(
+            &StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            }
+            .into()
+        ));
+        assert!(metadata_command_observation_requires_recovery_route(
+            &remote_failure(StorageRpcErrorCode::InactivePgRoute)
+        ));
+        assert!(metadata_command_observation_requires_recovery_route(
+            &remote_failure(StorageRpcErrorCode::WrongClusterEpoch)
+        ));
+        assert!(!metadata_command_observation_requires_recovery_route(
+            &remote_failure(StorageRpcErrorCode::TransportTimeout)
+        ));
+        assert!(!metadata_command_observation_requires_recovery_route(
+            &remote_failure(StorageRpcErrorCode::MetadataCommandContention)
+        ));
+    }
+
+    #[test]
     fn published_command_handoff_excludes_divergent_and_semantic_conflicts() {
         assert!(metadata_command_apply_error_can_handoff_to_recovery(
             &remote_failure(StorageRpcErrorCode::TransportTimeout)

@@ -2365,6 +2365,7 @@ pub(crate) enum ObjectPgActionError {
     StaleMultipartCompletionSnapshot,
     MultipartConditionalRequestConflict,
     MultipartPrepublicationBarrierExhausted,
+    MetadataCommandRecoveryTransferred,
 }
 
 impl ObjectPgActionError {
@@ -2389,6 +2390,7 @@ impl ObjectPgActionError {
             Self::MultipartPrepublicationBarrierExhausted => {
                 "multipart_prepublication_barrier_exhausted"
             }
+            Self::MetadataCommandRecoveryTransferred => "metadata_command_recovery_transferred",
         }
     }
 
@@ -2410,7 +2412,8 @@ impl ObjectPgActionError {
             | Self::SnapshotReinspectionConflict
             | Self::StaleMultipartCompletionSnapshot
             | Self::MultipartConditionalRequestConflict
-            | Self::MultipartPrepublicationBarrierExhausted => false,
+            | Self::MultipartPrepublicationBarrierExhausted
+            | Self::MetadataCommandRecoveryTransferred => false,
         }
     }
 }
@@ -2467,6 +2470,7 @@ enum ObjectOperationFailureDiagnosticCategory {
     MultipartConditionalRequestConflict,
     SnapshotReinspectionConflict,
     MultipartPrepublicationBarrierExhausted,
+    MetadataCommandRecoveryTransferred,
     UnexpectedObjectOperationOutcome,
 }
 
@@ -2482,6 +2486,7 @@ impl ObjectOperationFailureDiagnosticCategory {
             Self::MultipartPrepublicationBarrierExhausted => {
                 "multipart_prepublication_barrier_exhausted"
             }
+            Self::MetadataCommandRecoveryTransferred => "metadata_command_recovery_transferred",
             Self::UnexpectedObjectOperationOutcome => "unexpected_object_operation_outcome",
         }
     }
@@ -2516,6 +2521,9 @@ fn object_pg_action_diagnostic_category(
         }
         ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
             ObjectOperationFailureDiagnosticCategory::MultipartPrepublicationBarrierExhausted
+        }
+        ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+            ObjectOperationFailureDiagnosticCategory::MetadataCommandRecoveryTransferred
         }
         ObjectPgActionError::StaleDirectPutCommitSnapshot
         | ObjectPgActionError::StaleStreamFinalizeSnapshot => {
@@ -2557,6 +2565,9 @@ fn classify_object_pg_action(
             ObjectOperationFailureKind::ObjectNotFound
         }
         ObjectPgActionError::Metadata(error) if error.is_command_contention() => {
+            ObjectOperationFailureKind::MetadataCommandContention
+        }
+        ObjectPgActionError::MetadataCommandRecoveryTransferred => {
             ObjectOperationFailureKind::MetadataCommandContention
         }
         ObjectPgActionError::Metadata(_)
@@ -3348,6 +3359,9 @@ impl MultipartManagementFailure {
             ObjectPgActionError::Metadata(error) if error.is_command_contention() => {
                 MultipartManagementFailureKind::MetadataCommandContention
             }
+            ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+                MultipartManagementFailureKind::MetadataCommandContention
+            }
             ObjectPgActionError::Metadata(_)
             | ObjectPgActionError::InvalidRequest { .. }
             | ObjectPgActionError::StaleObjectReadSubject
@@ -3527,6 +3541,9 @@ impl MultipartCompletionFailure {
             }
             ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
                 MultipartCompletionFailureOutcome::PrepublicationBarrierExhausted
+            }
+            ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+                MultipartCompletionFailureOutcome::MetadataCommandContention
             }
             ObjectPgActionError::Metadata(_)
             | ObjectPgActionError::InvalidRequest { .. }
@@ -3739,6 +3756,9 @@ impl StreamUploadFailure {
             ObjectPgActionError::SnapshotReinspectionConflict => {
                 ObjectOperationFailureDiagnosticCategory::SnapshotReinspectionConflict
             }
+            ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+                ObjectOperationFailureDiagnosticCategory::MetadataCommandRecoveryTransferred
+            }
         };
         let outcome = match error {
             ObjectPgActionError::Store(error) => match error.operation_failure_class() {
@@ -3773,6 +3793,9 @@ impl StreamUploadFailure {
             }
             ObjectPgActionError::SnapshotReinspectionConflict => {
                 StreamUploadFailureOutcome::SnapshotReinspectionConflict
+            }
+            ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+                StreamUploadFailureOutcome::MetadataCommandContention
             }
             ObjectPgActionError::Metadata(_)
             | ObjectPgActionError::StaleObjectReadSubject
