@@ -434,6 +434,475 @@ introduce independently versioned per-PG route generations before increasing
 worker concurrency; merely adding workers around the current global-next-epoch
 CAS would increase conflicts without reducing recovery time.
 
+#### 3.3.1 Bounded unavailable-PG transition batches
+
+The batching slice must change the replicated transition protocol, not merely
+collect calls around the existing single-PG worker. The target protocol for one
+bounded group is:
+
+1. commit one batch begin command;
+2. prepare and export each PG's metadata outside Raft;
+3. commit one batch staging-intent authorization without advancing the cluster
+   map epoch;
+4. create destination intents, stage the exact artifacts, and commit bounded
+   receipt evidence;
+5. commit one batch destination-install command using the completed proofs;
+6. import and validate metadata on every destination outside Raft; and
+7. commit one batch readiness-and-activation command.
+
+Use three homogeneous command domains rather than one mixed-stage command:
+`BeginUnavailablePgPlacementTransitions`,
+`InstallUnavailablePgPlacementTransitions`, and
+`CompleteUnavailablePgPlacementTransitions`. Each command contains between one
+and `MAX_UNAVAILABLE_PG_TRANSITION_BATCH` entries, requires canonical ascending
+PG-ID order with no duplicates, validates every entry against one immutable
+source snapshot, applies every mutation to one cloned destination snapshot,
+and advances the global cluster epoch exactly once. Initial implementation
+may use 16 as an independent entry-count safety bound, but the scan bound is
+not a wire-size proof. Define a batch encoded-byte ceiling below the maximum
+Raft command-entry payload after accounting for the command frame and fixed
+envelope. The manager incrementally measures candidates with the production
+command encoder and closes the batch before either the count or encoded-byte
+bound would be exceeded. A legal single entry must be proven to fit; failure of
+one entry to fit is a typed fatal configuration or invariant error, not a
+retryable batch that the manager reconstructs forever. Decoder and state-machine
+validation independently enforce both bounds. Expose count, encoded bytes,
+fill, and latency metrics before tuning either limit.
+
+Artifact selection uses a fourth homogeneous command,
+`AuthorizeUnavailablePgStagingIntents`. It records the exact transition,
+staging generation, canonical artifact digest and length, and staging-store
+format version after export but before any destination intent or byte write.
+It is a durable Raft state-machine mutation with its own batch receipt, but it
+does not change a PG route or advance the global cluster-map epoch. Every
+destination staging capability and receipt must consume that committed tuple;
+an old leader cannot authorize a different artifact after leadership changes.
+This fourth command uses the same entry-count and exact production-encoded
+byte ceilings, canonical ordering, local pre-proposal splitting, decoder and
+state-machine bounds, and legal-single-entry fit requirement as the three route
+commands. The shared batch constructor owns those rules so adding a new batch
+stage cannot silently bypass them.
+
+Batch application is all-or-nothing. A stale, malformed, divergent, or
+unauthorized member rejects the complete command without changing state. An
+exact replay is accepted as a no-op only when every member is the exact prior
+request; mixed new and replayed members are rejected. The manager then
+rederives a batch without the stale member, deferring or quarantining only that
+PG according to its typed failure. Every member retains its own exact
+transition binding, predecessor tip, unavailable observation, source proof,
+destination placement, and replay identity even though all members share the
+batch's resulting global epoch. Multiple PG transitions may therefore
+legitimately share one transition epoch or destination epoch, and snapshot and
+history validation must reproduce that command-reachable state.
+
+Member-local identities are not sufficient to distinguish an exact replay
+from a subset or regrouping of a committed batch. Every batch therefore has a
+canonical receipt covering the stage, source and target epochs, topology and
+authority binding where applicable, ordered member count, and digest of the
+complete canonically encoded member vector. Each affected transition records
+the receipt identity for that stage, and the state retains one corresponding
+receipt record containing the canonical digest and ordered member identities.
+Replay succeeds only when the supplied complete vector reproduces that receipt
+and every member points back to it. A subset, superset, reordered vector, or
+regrouping across prior receipts is rejected even when every supplied member is
+individually exact. Receipts survive snapshots and Raft-log compaction and are
+pruned atomically only when every member's transition lineage and command
+replay evidence have left the retained-history window; receipt storage must be
+bounded by that same explicit retention policy rather than by process-local
+cleanup.
+
+Do not implement batch application by sequentially applying the current
+single-PG commands: those commands each derive and advance the next global
+epoch. Refactor each stage into pure validation against the unchanged source
+snapshot followed by mutation helpers that accept the explicit batch target
+epoch. Validate the full vector before invoking any mutation helper. Keep
+ordinary metadata-transfer commands and unavailable-transition installation
+as disjoint command domains; a generic metadata-transfer command must reject a
+PG owned by an unavailable-placement transition rather than accepting an
+optional transition binding.
+
+Command v20 removes the singular
+`BeginUnavailablePgPlacementTransition` and
+`CompleteUnavailablePgPlacementTransition` variants and removes the optional
+unavailable-transition branch from `SetPgActingSetWithMetadataTransfer`.
+Unavailable-transition route installation exists only through the plural
+install command; the ordinary transfer command rejects an active transition.
+Likewise, use a dedicated exact-transition fence operation rather than an
+optional transition field on the generic fence command. Worker, direct-admin,
+test, and recovery entry points submit plural commands, wrapping one entry when
+only one PG is available. State-v32 validation requires every active and
+retained unavailable transition to carry the applicable batch receipts and
+staging generation, so no singular command or decoded legacy state can bypass
+batch accounting.
+
+The current live-transfer operation cannot be batched as written because it
+fences, exports, commits the destination route, and imports in one call. Split
+it into explicit `prepare`, batch `install`, and `import` phases. Preparation
+retains the exact transition binding, source route and proof, artifact digest,
+and the imported proof precomputed for one expected target epoch. Artifact
+decoding, retained-command validation, canonical re-encoding, hashing, and
+epoch rebasing all occur outside the heartbeat update gate. Gated install
+derivation only compares the current next epoch with the prepared expected
+epoch and validates compact fixed-width bindings. If the epoch changed, it
+releases the gate and recomputes the proof outside the gate before retrying; it
+never processes up to a batch of metadata artifacts while excluding heartbeat
+renewal.
+
+An ownership token alone is not sufficient once the committed imported proof
+is bound to exact artifact bytes. Before destination-route installation, the
+prepare phase durably stages the immutable artifact under its transition
+binding and content digest on every destination actor and obtains authenticated
+fsync-complete receipts. `CreateStagingIntent` compare-and-swaps the complete
+committed authorization tuple: exact transition, staging generation, artifact
+digest, artifact byte length, and staging-store format version. Exact replay is
+idempotent; any field mismatch is a typed intent conflict and no bytes are
+accepted. This prevents concurrent or superseded leaders from selecting
+different artifacts under one generation on different destinations.
+
+A canonical staging receipt contains the storage node identity and incarnation,
+endpoint identity, exact transition binding, artifact digest and byte length,
+staging generation, storage-format version, and an
+explicit fsync scope covering the artifact, catalogue record, and parent
+directory publication. Transport authentication alone is not replicated proof.
+Receipt evidence uses a mandatory control-plane RPC v18 operation separate
+from lease heartbeat renewal. Each authenticated storage node maintains a
+durable outbox of receipt and tombstone deltas. A page binds node identity and
+incarnation, required `previous_generation` and
+`previous_apply_receipt_digest` fields, a strictly monotonic
+evidence-page generation, canonical page digest, and bounded ordered evidence
+entries. For the first page, `previous_generation` is zero and
+`previous_apply_receipt_digest` is the all-zero value of the canonical digest
+width; no other page may use that genesis pair. Both fields are part of the
+canonical operation payload covered by request authentication. Both entry
+count and exact encoded bytes, including the predecessor digest, are capped
+beneath the control-plane RPC frame and Raft-command limits; larger delta
+inventories are sent as successive page generations. Exact page
+retransmission is idempotent, gaps are rejected and retried, and a page cannot
+be assembled or decoded on the lease-renewal path. Lease renewal uses
+its existing bounded request and submission path regardless of receipt backlog
+or failure, so staging evidence can stall without expiring a serving node.
+
+Page assignment and acknowledgement are themselves durable staging-store
+state. The node transactionally selects a bounded prefix of unacknowledged
+deltas, assigns `(previous_generation, previous_apply_receipt_digest,
+generation)`, encodes the canonical page operation-payload bytes and digest,
+and persists that exact in-flight payload before transmission. The page builder
+accepts an opaque durably recorded apply-receipt token, from which it alone
+extracts the predecessor generation and digest; production callers cannot
+supply or combine those raw fields. A separate internal genesis token produces
+only the fixed genesis pair. The persisted bytes exclude the freshness-bound
+RPC authentication envelope. Every transmission and retry wraps the identical
+canonical operation payload in a newly generated request ID, timestamp,
+expiry, and authenticator; replaying stale authentication material is
+prohibited. It sends no later generation while one page is unacknowledged.
+Response loss, process restart, newly queued deltas, or expiry of the prior
+authentication window cause byte-for-byte retransmission of the retained
+operation payload under a fresh envelope, never reconstruction with different
+members.
+
+Applying a page creates a canonical, authority-backend-neutral apply receipt
+bound to node identity and incarnation, previous generation, previous
+apply-receipt digest, generation, page digest, and the resulting accepted
+evidence generation. The control-plane state persists that receipt together
+with the highest accepted generation.
+The control plane cannot observe the node's durable recording from the response
+it sends. It therefore retains the highest accepted page and apply receipt
+across finalized-floor advancement, detailed evidence pruning, snapshots,
+journal compaction, Raft compaction, and authority failover. That receipt is
+replaced only when the control plane accepts the exact successor page whose
+`previous_generation` and previous apply-receipt digest cite it. Because the
+node may construct that successor only after durably recording the cited
+receipt, acceptance is the observable acknowledgement boundary. This retains
+at most one such replay receipt per node incarnation rather than one per page.
+
+A Raft log ID or standalone journal position may accompany the apply receipt
+as diagnostic metadata, but is not part of receipt identity or required for
+replay. The response uses a fresh authenticated envelope carrying the
+canonical receipt. Only after the node durably records the exact receipt does
+it retire the page's deltas, advance its acknowledged generation, and build
+the next page. Exact replay lookup precedes finalized-floor and pruned-evidence
+rejection: replay of the retained page returns the same canonical apply receipt
+under a fresh response envelope without recreating evidence, while any
+different payload at that generation is rejected. For a new generation,
+server admission requires both predecessor fields and compares them with the
+retained receipt before changing evidence or replacing that receipt. An
+omitted, malformed, genesis-on-successor, or incorrect predecessor digest is a
+protocol error that leaves the retained receipt and all evidence unchanged. A
+conflicting digest for an assigned generation is fatal protocol evidence.
+
+Receipt evidence has bounded low-priority admission independent of lease
+renewal. It uses a separate connection/session allowance, request-worker
+semaphore, submission queue, and at most one in-flight evidence proposal per
+node. Lease traffic has reserved connection, worker, and Raft-host admission
+capacity; an evidence backlog or saturated evidence queue receives typed
+backpressure and cannot consume the final lease-renewal permit, hold the
+heartbeat update gate ahead of a renewal, or run an internal proposal retry
+loop while renewal work is queued. Evidence-page application is explicitly
+cluster-map-epoch-neutral: it records durable control evidence without bumping
+the global epoch, changing a PG route, invalidating a serving runtime map, or
+requesting fresh PG observations.
+
+Applying a receipt-evidence page records durable evidence keyed by transition,
+staging generation, and node rather than dropping it when a later heartbeat or
+page omits the entry. The control plane retains each node incarnation's highest
+accepted evidence-page generation and a per-PG finalized staging-generation
+floor. Receipt evidence at or below that floor is rejected even if carried in
+a later authenticated page; retransmission of a pre-cleanup page therefore
+cannot resurrect tombstoned state after detailed evidence is pruned. The
+install entry binds the artifact digest, expected target epoch, imported proof,
+exact destination set, and canonical receipt-set digest. Every state-machine
+replica verifies each referenced receipt against the committed evidence,
+current node identity/incarnation and endpoint, committed staging authorization,
+transition destination, byte length, format version, fsync scope, and exact
+receipt-set digest. Snapshot validation repeats those relationships without
+trusting the command builder. Receipt evidence is consumed by install but
+retained through terminal import and cleanup evidence so replay and failover
+remain independently verifiable.
+
+The staging authorization creates one cleanup obligation for every destination
+in its exact authorized destination set, independent of which staging responses
+or receipts the control plane observed. Pre-install cancellation and
+supersession must send the exact tombstone operation to every authorized
+destination. Each destination durably tombstones the generation and returns a
+canonical cleanup receipt even when it has no local intent or artifact; this
+rejects a delayed `CreateStagingIntent`, stage write, or lost committed response
+for that generation. Installation requires a complete receipt set for that
+same authorized destination set, so post-install cleanup retains, rather than
+narrows, the original obligation set.
+
+The global per-PG finalized floor advances only through an exact replicated,
+cluster-map-epoch-neutral cleanup CAS. Every obligated destination must have
+committed a canonical cleanup receipt for the same transition, staging
+generation, artifact tuple, and tombstoned local generation; partial cleanup
+cannot advance the floor or prune staging authorization. Per-node tombstone
+evidence rejects that node's stale receipt pages while evidence for an offline
+destination remains admissible. Cleanup evidence and finalized-floor changes
+do not advance the global epoch, change a PG route, invalidate a serving
+runtime map, or request fresh PG observations.
+
+This cleanup CAS is intentionally one per PG, not a fifth multi-PG batch
+command. Epoch-neutral cleanup does not need batching to amortize cluster-map
+epoch changes, and independent commands avoid cross-PG failure coupling. The
+manager may execute a bounded number concurrently, with the same queue and
+encoded single-command limits as other control-plane maintenance, but each
+command has its own PG-local replay identity and succeeds or fails
+independently. Introducing a cleanup batch later would require its own explicit
+count and byte bounds, all-or-nothing validation, canonical whole-batch receipt,
+and stale-member splitting protocol.
+
+A destination cleanup receipt may be replaced only by an exact durable
+fenced-incarnation retirement certificate. That certificate identifies the
+authorized node, incarnation, endpoint and storage-authentication generation,
+transition, staging generation, and artifact tuple, and proves that certified
+disk/incarnation loss or replacement has made every credential and endpoint
+capability capable of issuing stale staging RPCs permanently unusable. Its CAS
+must reject a merely offline, lease-expired, or potentially returning actor,
+and must compose with node replacement and credential revocation before it can
+satisfy cleanup. The certificate itself remains as the cleanup evidence for
+that actor; it does not claim that bytes were physically removed from a disk
+that may return under the retired identity.
+
+Once every obligation has either its exact cleanup receipt or a valid
+fenced-incarnation retirement certificate, the CAS advances the floor, prunes
+detailed authorization and receipt state atomically, and retains a compact
+floor-derived cleanup certificate containing the generation, complete
+obligation set, cleanup receipt-set digest, and retirement-certificate digest.
+An offline destination returning after partial cleanup therefore uses the
+retained exact authorization to tombstone and remove its artifact before global
+pruning can occur, while a certified permanently lost destination cannot retain
+unbounded control-plane state.
+
+Before the first destination write, the transition owns a durable staging
+intent. Its staging generation is not caller-selected: it is exactly the
+transition epoch, which is globally monotonic and therefore monotonic for each
+PG. Batch begin derives that value, and both live-state and snapshot validation
+require equality. After detailed transition and receipt history is pruned, the
+control-plane per-PG finalized staging-generation floor remains and every
+successor transition must have a greater epoch. The staging-authorization
+command binds that generation to the artifact tuple, and each destination
+commits the exact `CreateStagingIntent` CAS before accepting artifact bytes.
+Stage, publish, import, and cleanup operations compare-and-swap the complete
+transition, generation, digest, length, and format tuple. Install atomically
+consumes the matching control-plane intent; it cannot refer to bytes from
+another preparation attempt. Terminal cleanup first durably tombstones the
+generation, then unlinks artifact bytes and fsyncs
+the directory. A delayed stage or publish RPC for a tombstoned or lower
+generation is rejected and cannot recreate an artifact after cleanup. Retain a
+bounded per-PG finalized-generation floor after detailed tombstone pruning so
+old requests remain rejected without accumulating one permanent row per
+transition.
+
+Thus leader or process failover after installation retrieves the same bytes
+from destination staging rather than attempting to reconstruct them from the
+route proof. Stage/read/remove operations require a dedicated,
+transition-scoped storage capability and enforce aggregate byte and object
+limits as admission backpressure.
+
+If the exact source is lost before all staging receipts exist, no route install
+is allowed: the PG remains fenced and deferred until the source returns or a
+separately certified successor transition proves another exact source. Once
+all destination staging receipts exist, source loss does not prevent import.
+Partial staging and rejected/stale install batches retain exact ownership for
+bounded retry. Pre-install cleanup requires an exact control-plane cancellation
+or supersession certificate for the staging intent and CAS-tombstones its
+generation on every destination in the staging authorization, including actors
+for which no intent or receipt was observed; absence of an install receipt is
+never sufficient authority.
+Successful staging is removed only after activation and durable confirmation
+that every destination imported the exact artifact. Cleanup is idempotent,
+recoverable, and cannot race delayed writes because the tombstone precedes
+physical removal. Tests must cover source loss before and after staging, leader
+failure after install but before import, cleanup racing a delayed stage and
+publish response, partial destination import, stale-batch cleanup, and
+destination loss during each phase. Prepared and staged artifact bytes must
+have aggregate bounds and must not accumulate unboundedly in manager memory or
+destination storage.
+
+Replace the manager's singleton in-flight state with bounded, per-PG stage
+queues for begin candidates, transfer preparation, prepared installation,
+destination import, and activation. Use bounded transfer concurrency and
+per-PG deferral/quarantine state; four transfer workers is an appropriate
+initial limit, subject to measured storage pressure. Flush a non-empty partial
+batch after a short bounded delay so a final underfilled batch cannot wait
+indefinitely. Do not begin more transitions than the configured active
+transition, transfer-worker, and prepared-artifact capacity can retain. A
+failed member must not discard already prepared work for unrelated members or
+monopolize the scanner.
+
+Begin, install, and activation batches must all use Raft's gated command
+derivation primitive. Command construction reads the effective
+durable-plus-heartbeat-overlay snapshot while holding the heartbeat update
+gate, clamps authority time to that snapshot's committed high-water mark, and
+retains the guard through proposal dispatch. Activation readiness is derived
+inside that critical section from every destination's exact incarnation,
+endpoint, lease, route, and proof. A renewal after a batch was prepared rejects
+the stale command and requires rederivation; it never relaxes exact lease
+equality.
+
+This slice changes both command grammar and command-reachable durable state.
+Advance the control-plane command version from v19 to v20 and state version
+from v31 to v32, retaining immutable v19/v31 rejection evidence and updating
+the nested journal, Raft WAL, snapshot, aggregate, and retained batch-receipt
+vectors. The new transition-scoped artifact staging operations cross the
+storage RPC boundary and therefore require the corresponding storage-RPC
+version advance, fixed old/new frame evidence, authenticated Unix/TLS coverage,
+and explicit exclusion from ordinary frontend capabilities. Receipt-evidence
+publication crosses the control-plane RPC boundary, so advance control-plane
+RPC v17 to v18 unconditionally. Preserve complete v17 rejection evidence and
+add fixed v18 frames for a genesis page, a successor carrying a non-genesis
+`previous_apply_receipt_digest`, minimum, maximum-count, maximum-byte,
+multipage, generation-gap, exact-replay, and tombstone/finalized-floor
+evidence. Frame-limit constants and exact-boundary fixtures include the full
+predecessor digest. Omitted, truncated, genesis-on-successor, and incorrect
+digest fixtures must fail before dispatch without replacing the retained apply
+receipt or mutating evidence. Batch transition commands remain leader-internal
+and require no additional
+control-plane RPC operation beyond that receipt protocol.
+
+Durable artifact staging uses a separate storage-owned format rather than
+silently extending the PG schema. Introduce staging-store format v1 with a
+versioned root manifest, generation catalogue, content-addressed artifact
+files, published receipts, import status, tombstones, and per-PG finalized
+generation floors. The catalogue also persists pending receipt/tombstone
+deltas, the exact assigned in-flight evidence operation-payload bytes and
+digest, and the canonical authority-neutral apply receipt through atomic delta
+retirement. Fresh RPC authentication envelopes are never persisted as replay
+material. Publication writes a generation-scoped temporary file,
+fsyncs and validates its exact length and digest, atomically renames it, fsyncs
+the containing directory, then commits and syncs the catalogue state before
+issuing a receipt. Startup validates the manifest and complete catalogue/file
+inventory before serving staging RPCs: unknown versions, digest or length
+mismatch, missing published files, generation regression, and contradictory
+receipt/tombstone state fail closed. Bounded startup reconciliation removes
+unpublished temporary files, completes tombstone-directed unlink and directory
+sync, and quarantines unexplained final files rather than authorizing them.
+Store admission accounts for temporary, published, and tombstoned cleanup
+bytes. Add immutable v0/v2 rejection fixtures and a fixed v1 manifest,
+catalogue, receipt, and crash-state corpus to the storage format ledger; no
+upgrade decoder is required while the repository supports one format at a
+time.
+
+Required deterministic and generated coverage includes:
+
+- one global epoch advance for each begin, install, and activation batch;
+- zero mutation when any member is stale or invalid;
+- exact whole-batch replay and rejection of partial or mixed replay;
+- subset, superset, reordered, and regrouped replay after snapshot and log
+  compaction;
+- empty, duplicate, unordered, oversized, and over-frame-limit batches;
+- production-encoder splitting at count and encoded-byte boundaries, including
+  maximum acting sets and endpoint lengths;
+- identical count and encoded-byte splitting, decoder rejection, and legal
+  single-entry fit coverage for staging-intent authorization batches;
+- v20 rejection of every singular unavailable-transition command path and
+  singleton operation through each plural worker/admin entry point;
+- multiple PGs sharing transition and destination epochs;
+- heartbeat renewal between batch preparation and gated derivation;
+- proof preparation and stale-epoch recomputation without artifact work under
+  the heartbeat gate;
+- partial transfer failure, bounded retry, and preservation of successful
+  prepared work;
+- durable artifact retrieval and exact-byte import after leader/process loss,
+  with source and destination loss at every staging boundary;
+- independently verified committed staging receipts, forged receipt fields,
+  stale incarnation/endpoint evidence, and incomplete fsync scope;
+- receipt-page count and encoded-byte limits, generation gaps, page replay,
+  backlog isolation from lease renewal, and old-page rejection after the
+  control-plane finalized-generation floor advances;
+- genesis and successor predecessor-receipt fields, authentication failure
+  after digest tampering, and admission rejection for omitted, malformed,
+  genesis-on-successor, or incorrect digests without evidence mutation or
+  retained-receipt replacement; page-builder tests consume only the opaque
+  durable receipt token;
+- crashes before exact page persistence, after transmission, after
+  control-plane commit, after response loss, and before and after durable local
+  acknowledgement, proving byte-identical operation-payload replay under fresh
+  authentication and ordered delta retirement, including a restart delayed
+  beyond the original authentication freshness window;
+- exact apply-receipt replay after Raft snapshot and log compaction and after a
+  standalone journal restart, with backend log positions changed or absent;
+- a cleanup-evidence page committed with its response lost, followed by
+  finalized-floor advancement, detailed-evidence pruning, snapshot or journal
+  compaction, and authority restart; exact replay must return the retained
+  apply receipt, permit durable outbox retirement, and a successor page citing
+  that receipt must become the new bounded replay receipt in both Raft and
+  standalone modes;
+- blocked and saturated evidence connections, workers, and Raft proposals while
+  lease deadlines continue to advance and the global cluster-map epoch remains
+  unchanged;
+- partial cleanup with one destination offline, its later authenticated return
+  and cleanup, rejection of premature floor advancement, and exact all-actor
+  floor advancement with replay through the compact cleanup certificate;
+- pre-install cancellation where one authorized destination reports no intent
+  and another committed staging but lost its response, proving both durably
+  tombstone before the finalized floor advances;
+- permanent destination loss using an exact fenced-incarnation retirement
+  certificate after credential and endpoint retirement, plus rejection while
+  that actor is merely offline, expired, or capable of returning;
+- multiple independent epoch-neutral cleanup CAS operations across different
+  PGs, including concurrent success and one stale failure, proving receipt,
+  retirement-certificate, floor, pruning, and compact-certificate mutations do
+  not change the global cluster-map epoch or couple PG outcomes;
+- competing staging-intent authorization and destination creation with
+  mismatched artifact digest, length, or format version;
+- cleanup before install, delayed stage and publish after cleanup, generation
+  reuse, tombstone restart, and finalized-generation-floor rejection;
+- staging-store publication crashes before and after file fsync, rename,
+  directory fsync, catalogue commit, and receipt issuance;
+- restart and leader failover before and after every batch boundary;
+- stale batch rejection after a successor transition;
+- normalized equivalence between sequential single-PG model transitions and
+  batched state; and
+- a four-host outage release gate proving epoch growth is proportional to
+  batch count rather than affected-PG count while unaffected PGs continue to
+  serve.
+
+Record submitted, applied, replayed, and rejected batch totals; entry counts
+and encoded-byte fill ratios; queue, prepared-artifact, and durable-staging
+depth and bytes; per-stage latency and deferrals; receipt retention/pruning;
+and global epochs consumed per recovered PG. These metrics are part of the
+release evidence, not optional diagnostics.
+
 The first implementation may use the committed static topology and the existing
 metadata-transfer and payload-backfill primitives. It does not depend on adding
 or removing nodes dynamically and is not capacity rebalancing. It must:
