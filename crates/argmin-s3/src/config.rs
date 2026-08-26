@@ -20,9 +20,9 @@ use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE
 use storage::storage_rpc_transport::StorageRpcClientEndpoint;
 use storage::LocalUnixStorageNodeClientConfig;
 use storage::{
-    FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability,
-    StaticInitialControlPlaneTopology, StorageNodeStorageRpcClientCapability,
-    StorageRpcServerAuthConfig,
+    FrontendStorageRpcClientCapability, LivePgMetadataTransferStorageRpcClientCapability,
+    MaintenanceStorageRpcClientCapability, StaticInitialControlPlaneTopology,
+    StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig,
 };
 
 const MAX_LOCAL_NODE_COUNT: u32 = 4_096;
@@ -483,6 +483,8 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_rpc_admission_wait_timeout: Duration,
     pub(crate) storage_node_rpc_control_admission_wait_timeout: Duration,
     pub(crate) storage_rpc_frontend_client_auth: Option<FrontendStorageRpcClientCapability>,
+    pub(crate) storage_rpc_live_pg_metadata_transfer_client_auth:
+        Option<LivePgMetadataTransferStorageRpcClientCapability>,
     pub(crate) storage_rpc_maintenance_client_auth: Option<MaintenanceStorageRpcClientCapability>,
     pub(crate) storage_rpc_storage_node_client_auth: Option<StorageNodeStorageRpcClientCapability>,
     pub(crate) storage_rpc_server_auth: Option<StorageRpcServerAuthConfig>,
@@ -1196,6 +1198,7 @@ impl ServerConfig {
             storage_node_rpc_admission_wait_timeout,
             storage_node_rpc_control_admission_wait_timeout,
             storage_rpc_frontend_client_auth: None,
+            storage_rpc_live_pg_metadata_transfer_client_auth: None,
             storage_rpc_maintenance_client_auth: None,
             storage_rpc_storage_node_client_auth: None,
             storage_rpc_server_auth: None,

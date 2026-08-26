@@ -63,6 +63,7 @@ pub(crate) mod storage_rpc;
 pub(crate) mod storage_rpc_auth;
 pub mod storage_rpc_transport;
 pub mod types;
+mod unavailable_pg_reconciliation;
 
 // Narrow facades preserve the crate's established module paths while the
 // concrete engine, adapters, and server share a private compiler boundary.
@@ -175,6 +176,7 @@ pub use maintenance::{
     StorageReclaimSweeper, StorageShardBackfillSweeper, StorageShardRepairSweeper,
     StorageShardScavengerSweeper, StorageStreamSessionSweeper,
 };
+pub use unavailable_pg_reconciliation::UnavailablePgReconciliationWorker;
 
 /// Feature-gated support for tests which must cross the storage crate boundary.
 ///
@@ -3936,7 +3938,7 @@ pub use static_topology::{
 pub use storage_rpc::StorageNodeFailure;
 pub(crate) use storage_rpc_auth::StorageRpcClientAuthConfig;
 pub use storage_rpc_auth::{
-    AdminStorageRpcClientCapability, FrontendStorageRpcClientCapability,
+    FrontendStorageRpcClientCapability, LivePgMetadataTransferStorageRpcClientCapability,
     MaintenanceStorageRpcClientCapability, StorageNodeStorageRpcClientCapability,
     StorageRpcServerAuthConfig, StorageRpcTransportLimits, STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN,
 };

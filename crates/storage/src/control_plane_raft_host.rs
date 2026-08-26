@@ -17,7 +17,9 @@ use crate::control_plane::{
     ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRpcResponsePublication,
     ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapSource,
     ControlPlaneRuntimeMapStatus, FencedPgMetadataTransferSnapshot, LeaseHorizonAuthorityBinding,
-    NodeHeartbeat, PgMetadataTransferProof,
+    NodeHeartbeat, PgMetadataTransferProof, UnavailablePgReconciliationCandidate,
+    UnavailablePgReconciliationCursor, UnavailablePgReconciliationStage,
+    UnavailablePgReconciliationWork,
 };
 use crate::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use crate::control_plane_raft::{
@@ -401,6 +403,63 @@ impl ControlPlaneRaftAuthorityHost {
             expired_nodes: expired_nodes.len(),
             peering_pgs: peering_pgs.len(),
         })
+    }
+
+    pub fn poll_unavailable_pg_reconciliation(
+        &mut self,
+        cursor: &mut UnavailablePgReconciliationCursor,
+        supplied_now_ms: u64,
+    ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError> {
+        let now_ms = self.authority_now_ms(supplied_now_ms)?;
+        let snapshot = self.current_snapshot()?;
+        let scan = snapshot.scan_unavailable_pg_reconciliation(*cursor, now_ms);
+        *cursor = scan.next_cursor;
+        match scan.candidate {
+            None => Ok(None),
+            Some(UnavailablePgReconciliationCandidate::Resume(work)) => Ok(Some(work)),
+            Some(UnavailablePgReconciliationCandidate::Begin {
+                pg_id,
+                unavailable_node_id,
+            }) => {
+                let command = snapshot.begin_unavailable_pg_placement_transition_command(
+                    pg_id,
+                    unavailable_node_id,
+                    now_ms,
+                )?;
+                self.submit_raft_command(command)?;
+                let current = self.current_snapshot()?;
+                let transition = current
+                    .unavailable_pg_placement_transition(pg_id)
+                    .ok_or_else(|| {
+                        ControlPlaneError::invariant_failure(
+                            "committed unavailable PG transition is absent from current state",
+                        )
+                    })?;
+                Ok(Some(UnavailablePgReconciliationWork::from_transition(
+                    transition,
+                    UnavailablePgReconciliationStage::MetadataTransfer,
+                )))
+            }
+        }
+    }
+
+    pub fn complete_unavailable_pg_reconciliation(
+        &mut self,
+        work: &UnavailablePgReconciliationWork,
+        supplied_now_ms: u64,
+    ) -> Result<bool, ControlPlaneError> {
+        let now_ms = self.authority_now_ms(supplied_now_ms)?;
+        let snapshot = self.current_snapshot()?;
+        let Some(transition) = snapshot.unavailable_pg_placement_transition(work.pg_id()) else {
+            return Ok(false);
+        };
+        if !work.mutation_binding().matches_transition(transition) {
+            return Ok(false);
+        }
+        let command =
+            snapshot.complete_unavailable_pg_placement_transition_command(work, now_ms)?;
+        self.submit_raft_command(command)?;
+        Ok(true)
     }
 
     fn block_on<F: Future>(&self, future: F) -> F::Output {
@@ -919,14 +978,14 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
         self.current_snapshot()
     }
 
-    fn record_unavailable_pg_payload_readiness(
+    fn complete_unavailable_pg_placement_transition(
         &mut self,
-        pg_id: PgId,
+        work: &UnavailablePgReconciliationWork,
         ready_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         let command = self
             .current_snapshot()?
-            .record_unavailable_pg_payload_readiness_command(pg_id, ready_at_ms)?;
+            .complete_unavailable_pg_placement_transition_command(work, ready_at_ms)?;
         self.submit_raft_command(command)?;
         self.current_snapshot()
     }
@@ -950,6 +1009,30 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
                 pg_id,
                 source_primary_lease_deadline_ms: None,
                 lease_horizon_authority: None,
+                unavailable_transition: None,
+            })?;
+        let ControlPlaneCommandResponse::FencePgForMetadataTransfer {
+            source_primary_lease_deadline_ms,
+        } = response
+        else {
+            unreachable!("metadata transfer fence command returned the wrong response");
+        };
+        Ok(FencedPgMetadataTransferSnapshot::new(
+            self.current_snapshot()?,
+            source_primary_lease_deadline_ms,
+        ))
+    }
+
+    fn fence_unavailable_pg_transition_with_source_lease(
+        &mut self,
+        binding: crate::control_plane::UnavailablePgTransitionMutationBinding,
+    ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
+        let response =
+            self.submit_raft_command(ControlPlaneCommand::FencePgForMetadataTransfer {
+                pg_id: binding.pg_id(),
+                source_primary_lease_deadline_ms: None,
+                lease_horizon_authority: None,
+                unavailable_transition: Some(binding),
             })?;
         let ControlPlaneCommandResponse::FencePgForMetadataTransfer {
             source_primary_lease_deadline_ms,
@@ -975,6 +1058,23 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
             acting_set,
             transfer,
             expected_destination_epoch,
+            unavailable_transition: None,
+        })?;
+        self.current_snapshot()
+    }
+
+    fn install_unavailable_pg_transition_metadata_transfer(
+        &mut self,
+        binding: crate::control_plane::UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.submit_raft_command(ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
+            pg_id: binding.pg_id(),
+            acting_set: binding.destination_acting_set().to_vec(),
+            transfer,
+            expected_destination_epoch,
+            unavailable_transition: Some(binding),
         })?;
         self.current_snapshot()
     }
@@ -1042,12 +1142,199 @@ fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Out
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::thread;
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("test runtime should build")
+    }
+
+    #[test]
+    fn durable_raft_host_poll_commits_grace_expired_unavailable_pg_transition() {
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("authority.state");
+        let runtime = runtime();
+        let authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                        "unavailable-pg-reconciliation-raft-host",
+                        1,
+                        &artifact_path,
+                    ),
+                )
+                .unwrap(),
+        );
+        runtime
+            .block_on(authority.initialize_single_node_membership(1))
+            .unwrap();
+        runtime
+            .block_on(authority.wait_for_current_leader(
+                1,
+                Duration::from_secs(1),
+                "unavailable-PG reconciliation test authority startup",
+            ))
+            .unwrap();
+        let mut host = ControlPlaneRaftAuthorityHost::start_durable(
+            runtime.handle().clone(),
+            Arc::clone(&authority),
+        )
+        .unwrap();
+        let pg_id = PgId::new(7);
+        let nodes = (1..=4)
+            .map(|node_id| {
+                (
+                    NodeId::new(node_id),
+                    tmp.path()
+                        .join(format!("node-{node_id}.sock"))
+                        .display()
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let pgs = vec![(pg_id, vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)])];
+        let topology =
+            crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                7,
+                [0x4d; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                vec![1],
+                &nodes,
+                &pgs,
+                crate::control_plane::test_certified_storage_placement_policy(
+                    (1..=4).map(NodeId::new),
+                    3,
+                    2_000,
+                ),
+            )
+            .unwrap();
+        host.submit_command_for_test(ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes: nodes.clone(),
+            pg_acting_sets: pgs,
+            topology,
+        })
+        .unwrap();
+
+        let heartbeat = |host: &mut ControlPlaneRaftAuthorityHost,
+                         node_id: u32,
+                         lease_ms: u64,
+                         state: Option<PgState>| {
+            for _ in 0..4 {
+                let observed_epoch = host.current_snapshot_for_test().unwrap().cluster_epoch();
+                let refresh = match host.refresh_node_heartbeat(
+                    NodeHeartbeat {
+                        node_id: NodeId::new(node_id),
+                        node_incarnation: 1,
+                        endpoint: nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                        observed_epoch,
+                        requested_lease_duration_ms: lease_ms,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                            .unwrap(),
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: state
+                            .map(|state| crate::control_plane::NodePgHeartbeatObservation {
+                                pg_id,
+                                state,
+                                metadata_proof: crate::control_plane::PgMetadataProof::empty(),
+                                pending_metadata_command: None,
+                            })
+                            .into_iter()
+                            .collect(),
+                    },
+                    crate::clock::current_time_millis(),
+                ) {
+                    Ok(refresh) => refresh,
+                    Err(ControlPlaneError::PgPrimaryObservationNotActive { .. })
+                        if state == Some(PgState::Active) =>
+                    {
+                        continue;
+                    }
+                    Err(ControlPlaneError::PgPrimaryObservationNotActive { .. })
+                        if state == Some(PgState::Peering) =>
+                    {
+                        return;
+                    }
+                    Err(error) => {
+                        panic!("node {node_id} {state:?} heartbeat failed: {error:?}")
+                    }
+                };
+                if refresh.lease().serving() {
+                    return;
+                }
+            }
+            panic!("node {node_id} did not receive a serving lease");
+        };
+        heartbeat(&mut host, 2, 10_000, Some(PgState::Peering));
+        heartbeat(&mut host, 2, 10_000, Some(PgState::Active));
+        heartbeat(&mut host, 1, 50, Some(PgState::Active));
+        heartbeat(&mut host, 3, 10_000, Some(PgState::Active));
+        heartbeat(&mut host, 4, 10_000, None);
+        thread::sleep(Duration::from_millis(60));
+        host.expire_heartbeat_leases(crate::clock::current_time_millis())
+            .unwrap();
+        thread::sleep(Duration::from_millis(
+            crate::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 10,
+        ));
+        heartbeat(&mut host, 2, 10_000, None);
+        heartbeat(&mut host, 3, 10_000, None);
+        heartbeat(&mut host, 4, 10_000, None);
+        heartbeat(&mut host, 2, 10_000, Some(PgState::Peering));
+        heartbeat(&mut host, 3, 10_000, Some(PgState::Peering));
+        heartbeat(&mut host, 2, 10_000, Some(PgState::Active));
+        heartbeat(&mut host, 3, 10_000, Some(PgState::Active));
+        heartbeat(&mut host, 4, 10_000, None);
+        let reactivated = host.current_snapshot_for_test().unwrap();
+        assert_eq!(
+            reactivated.pg(pg_id).unwrap().state(),
+            PgState::Active,
+            "surviving primary must reactivate the degraded source before reconciliation"
+        );
+        let grace_cutoff_ms = reactivated
+            .unavailable_node_observation(NodeId::new(1))
+            .unwrap()
+            .observed_at_ms()
+            .saturating_add(2_000);
+        thread::sleep(Duration::from_millis(
+            grace_cutoff_ms
+                .saturating_sub(crate::clock::current_time_millis())
+                .saturating_add(2),
+        ));
+
+        let mut cursor = UnavailablePgReconciliationCursor::start();
+        let work = host
+            .poll_unavailable_pg_reconciliation(&mut cursor, crate::clock::current_time_millis())
+            .unwrap()
+            .expect("grace-expired unavailable actor should atomically produce Raft work");
+        assert_eq!(
+            host.current_snapshot_for_test()
+                .unwrap()
+                .pg(pg_id)
+                .unwrap()
+                .state(),
+            PgState::Peering
+        );
+        assert_eq!(work.pg_id(), pg_id);
+        assert_eq!(
+            work.stage(),
+            UnavailablePgReconciliationStage::MetadataTransfer
+        );
+        assert_eq!(
+            work.destination_acting_set(),
+            &[NodeId::new(4), NodeId::new(2), NodeId::new(3)]
+        );
+        let snapshot = host.current_snapshot_for_test().unwrap();
+        let transition = snapshot
+            .unavailable_pg_placement_transition(pg_id)
+            .expect("Raft poll must durably install the exact transition");
+        assert_eq!(transition.transition_epoch(), work.transition_epoch());
+        assert_eq!(
+            transition.destination_acting_set(),
+            work.destination_acting_set()
+        );
+
+        drop(host);
+        runtime.block_on(authority.shutdown()).unwrap();
     }
 
     #[test]

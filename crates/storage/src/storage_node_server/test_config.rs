@@ -384,6 +384,23 @@
         )
     }
 
+    fn live_pg_metadata_transfer_storage_rpc_client_auth(
+        credential: ControlPlaneScopedCredential,
+    ) -> Arc<StorageRpcClientAuthConfig> {
+        Arc::new(
+            crate::LivePgMetadataTransferStorageRpcClientCapability::new_with_transport_limits(
+                credential,
+                9,
+                STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                storage_rpc_test_transport_limits(
+                    crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+                ),
+            )
+            .unwrap()
+            .into(),
+        )
+    }
+
     fn storage_rpc_tls_certified_key() -> Arc<rustls::sign::CertifiedKey> {
         let certificates = CertificateDer::pem_slice_iter(include_bytes!(
             "../../../s3-tests/testdata/localhost-cert.pem"
@@ -6095,6 +6112,109 @@
     #[test]
     fn authenticated_tls_skipped_transfer_destination_epoch_uses_current_marker() {
         authenticated_skipped_transfer_destination_epoch_uses_current_marker(true);
+    }
+
+    fn authenticated_live_pg_transfer_replays_nonempty_suffix(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let mut config = bounded_runtime_refresh_config(test_config(&tmp));
+        config.pg_routes[0].state = PgState::Peering;
+        config.pg_routes[0].metadata_transfer_destination_epoch = Some(config.cluster_epoch);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Admin {
+            instance_id: "live-pg-transfer-1".to_owned(),
+        });
+        let mut prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        if tcp {
+            prepared = prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        }
+        let server = prepared.bind().unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(live_pg_metadata_transfer_storage_rpc_client_auth(
+                credential,
+            )),
+        );
+        let route = client
+            .open_metadata_command_peering_route(PgId::new(0), config.cluster_epoch)
+            .unwrap();
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let acl_grants = AclGrants::default();
+        let create_config = CreateBucketConfig {
+            name: "metadata-rpc-bucket",
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let first = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                config.cluster_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config_for_test(&create_config, 1_234, 1).unwrap(),
+            ),
+        );
+        let first_state = route.replay_metadata_command_for_peering(&first).unwrap();
+        assert_eq!(first_state.applied_log_index, 1);
+
+        let validated = route
+            .validate_metadata_command_replay_state_preserving_pending_slot()
+            .unwrap();
+        assert_eq!(validated, first_state);
+
+        let second = test_metadata_command_for_subject(
+            0,
+            2,
+            crate::tests::bucket_name("metadata-rpc-bucket"),
+            crate::tests::object_key("second-object"),
+        );
+        let second_state = route.replay_metadata_command_for_peering(&second).unwrap();
+        assert_eq!(second_state.applied_log_index, 2);
+        assert_ne!(second_state.state_digest, first_state.state_digest);
+
+        drop(route);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_live_pg_transfer_replays_nonempty_suffix() {
+        authenticated_live_pg_transfer_replays_nonempty_suffix(false);
+    }
+
+    #[test]
+    fn authenticated_tls_live_pg_transfer_replays_nonempty_suffix() {
+        authenticated_live_pg_transfer_replays_nonempty_suffix(true);
     }
 
     fn authenticated_checkpoint_export_uses_current_peering_source_fence(tcp: bool) {

@@ -527,7 +527,7 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
         ),
         (
             2196,
-            "9e74dd07a08e1653a60b43e8dceea001cc30f3b502b48d6fe676357a0213a765"
+            "bbf1f9bf74aeb4a6159fa026148ad3f60f2801614e5723b352f4968d031c5edb"
                 .to_string()
         )
     );

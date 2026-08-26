@@ -1007,6 +1007,10 @@ impl ControlPlaneError {
             diagnostic.kind(),
             ErrorKind::TimedOut
                 | ErrorKind::WouldBlock
+                | ErrorKind::AddrNotAvailable
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+                | ErrorKind::NetworkDown
                 | ErrorKind::UnexpectedEof
                 | ErrorKind::ConnectionReset
                 | ErrorKind::ConnectionAborted
@@ -1019,8 +1023,23 @@ impl ControlPlaneError {
     }
 
     #[must_use]
+    pub fn is_retryable_authority_clock_wait_error(&self) -> bool {
+        matches!(
+            self,
+            Self::CommittedTimestampRegression { .. }
+                | Self::CommittedTimestampTooFarAhead { .. }
+                | Self::PreviousLeaseGrantHorizonStillActive { .. }
+                | Self::AuthorityClockLeadershipChanged { .. }
+                | Self::AuthorityClockSourceUnavailable
+                | Self::AuthorityClockNotEstablished { .. }
+                | Self::AuthorityClockSampleWindowTooWide { .. }
+        )
+    }
+
+    #[must_use]
     pub fn is_retryable_runtime_map_observation_error(&self) -> bool {
         self.is_retryable_read_only_rpc_transport_error()
+            || self.is_retryable_authority_clock_wait_error()
             || self.is_transient_runtime_map_serving_gap()
     }
 

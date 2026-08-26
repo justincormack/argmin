@@ -454,22 +454,22 @@ fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_req
         "lease_grant_horizon=-\n",
     );
     const SNAPSHOT_SEED: u64 = 0xe4f6_8c40_ea55_9033;
-    const FIRST_COMMAND_V18: &[u8] = &[
-        65, 82, 71, 67, 80, 67, 77, 68, 0, 18, 0, 2, 0, 0, 0, 7, 2, 183, 3, 215, 121, 86, 98, 136,
-        45,
+    const FIRST_COMMAND_V19: &[u8] = &[
+        65, 82, 71, 67, 80, 67, 77, 68, 0, 19, 0, 2, 0, 0, 0, 7, 2, 150, 234, 161, 103, 115, 68,
+        169, 129,
     ];
-    const FIRST_CHAIN_DIGEST: u64 = 0xa10a_971a_1858_c7a9;
-    const SECOND_COMMAND_V18: &[u8] = &[
-        65, 82, 71, 67, 80, 67, 77, 68, 0, 18, 0, 3, 0, 0, 0, 9, 3, 135, 148, 66, 148, 182, 215,
-        100, 175,
+    const FIRST_CHAIN_DIGEST: u64 = 0xf65f_9524_9d3f_56ee;
+    const SECOND_COMMAND_V19: &[u8] = &[
+        65, 82, 71, 67, 80, 67, 77, 68, 0, 19, 0, 3, 0, 0, 0, 9, 3, 166, 125, 52, 138, 147, 241,
+        69, 3,
     ];
-    const SECOND_CHAIN_DIGEST: u64 = 0xd9e7_900a_4c81_bb58;
+    const SECOND_CHAIN_DIGEST: u64 = 0x9239_1747_bf63_856e;
     const COMMAND_RECORD_V2: &[u8] = &[
         65, 82, 71, 67, 80, 83, 74, 82, 0, 2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 228, 246, 140, 64, 234, 85,
-        144, 51, 161, 10, 151, 26, 24, 88, 199, 169, 2, 0, 0, 0, 25, 65, 82, 71, 67, 80, 67, 77,
-        68, 0, 18, 0, 2, 0, 0, 0, 7, 2, 183, 3, 215, 121, 86, 98, 136, 45, 111, 161, 83, 101, 68,
-        254, 174, 107,
+        144, 51, 246, 95, 149, 36, 157, 63, 86, 238, 2, 0, 0, 0, 25, 65, 82, 71, 67, 80, 67, 77,
+        68, 0, 19, 0, 2, 0, 0, 0, 7, 2, 150, 234, 161, 103, 115, 68, 169, 129, 63, 91, 31, 210,
+        248, 109, 4, 108,
     ];
 
     let snapshot = ClusterControlSnapshot::empty();
@@ -480,9 +480,9 @@ fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_req
         membership: NodeMembershipState::Active,
     };
     let encoded_first = encode_control_plane_command(&first_command).unwrap();
-    assert_eq!(encoded_first, FIRST_COMMAND_V18);
+    assert_eq!(encoded_first, FIRST_COMMAND_V19);
     assert_eq!(
-        single_authority_command_chain_digest(SNAPSHOT_SEED, FIRST_COMMAND_V18),
+        single_authority_command_chain_digest(SNAPSHOT_SEED, FIRST_COMMAND_V19),
         FIRST_CHAIN_DIGEST
     );
     let second_command = ControlPlaneCommand::MarkNodeAvailability {
@@ -490,9 +490,9 @@ fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_req
         availability: NodeAvailabilityState::Unavailable,
     };
     let encoded_second = encode_control_plane_command(&second_command).unwrap();
-    assert_eq!(encoded_second, SECOND_COMMAND_V18);
+    assert_eq!(encoded_second, SECOND_COMMAND_V19);
     assert_eq!(
-        single_authority_command_chain_digest(FIRST_CHAIN_DIGEST, SECOND_COMMAND_V18),
+        single_authority_command_chain_digest(FIRST_CHAIN_DIGEST, SECOND_COMMAND_V19),
         SECOND_CHAIN_DIGEST
     );
     let binding = ControlPlaneAuthorityClockCheckpointBinding([
@@ -699,7 +699,7 @@ fn single_authority_journal_v2_full_file_layout_is_exact() {
         (bytes.len(), hex_encode(&checksum::sha256::digest(&bytes))),
         (
             209,
-            "29344aeeab33c86a40212944dc3050cadddb13378fc783767d06d0a8d3405af8".to_owned()
+            "4c273876cc810dfd604f910ecdd0ef3b08d204c262f3bbb881ab8132a064d6fe".to_owned()
         )
     );
 }
@@ -937,7 +937,7 @@ fn file_backed_authority_rejects_previous_and_future_state_versions() {
 
 #[test]
 fn file_backed_authority_rejects_noncurrent_nested_command_versions_before_replay() {
-    for version in [14, 15, 16, 17, 19] {
+    for version in [14, 15, 16, 17, 18, 20] {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(
             tmp.path()

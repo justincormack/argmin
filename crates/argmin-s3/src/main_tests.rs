@@ -662,6 +662,7 @@ mod tests {
             storage_node_rpc_control_admission_wait_timeout:
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
             storage_rpc_frontend_client_auth: None,
+            storage_rpc_live_pg_metadata_transfer_client_auth: None,
             storage_rpc_maintenance_client_auth: None,
             storage_rpc_storage_node_client_auth: None,
             storage_rpc_server_auth: None,
@@ -1350,6 +1351,12 @@ mod tests {
             &ControlPlaneError::PreviousLeaseGrantHorizonStillActive {
                 authority_now_ms: 1_999,
                 fenced_until_ms: 2_000,
+            }
+        ));
+        assert!(control_plane_lease_expiry_error_is_clock_wait(
+            &ControlPlaneError::AuthorityClockSampleWindowTooWide {
+                narrowest_window_ms: 3,
+                max_window_ms: 2,
             }
         ));
         assert!(!control_plane_lease_expiry_error_is_clock_wait(

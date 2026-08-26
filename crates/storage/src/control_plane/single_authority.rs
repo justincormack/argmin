@@ -2799,16 +2799,77 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
-    pub fn record_unavailable_pg_payload_readiness(
+    pub fn complete_unavailable_pg_placement_transition(
         &mut self,
-        pg_id: PgId,
+        work: &UnavailablePgReconciliationWork,
         ready_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         let command = self
             .snapshot
-            .record_unavailable_pg_payload_readiness_command(pg_id, ready_at_ms)?;
+            .complete_unavailable_pg_placement_transition_command(work, ready_at_ms)?;
         self.apply_and_commit_command(command)?;
         Ok(self.snapshot.clone())
+    }
+
+    pub fn poll_unavailable_pg_reconciliation(
+        &mut self,
+        cursor: &mut UnavailablePgReconciliationCursor,
+        now_ms: u64,
+    ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError> {
+        let scan = self
+            .snapshot
+            .scan_unavailable_pg_reconciliation(*cursor, now_ms);
+        *cursor = scan.next_cursor;
+        match scan.candidate {
+            None => Ok(None),
+            Some(UnavailablePgReconciliationCandidate::Resume(work)) => Ok(Some(work)),
+            Some(UnavailablePgReconciliationCandidate::Begin {
+                pg_id,
+                unavailable_node_id,
+            }) => {
+                let command = self
+                    .snapshot
+                    .begin_unavailable_pg_placement_transition_command(
+                        pg_id,
+                        unavailable_node_id,
+                        now_ms,
+                    )?;
+                self.apply_and_commit_command(command)?;
+                let transition = self
+                    .snapshot
+                    .unavailable_pg_placement_transition(pg_id)
+                    .ok_or_else(|| {
+                        ControlPlaneError::invariant_failure(
+                            "committed unavailable PG transition is absent from current state",
+                        )
+                })?;
+                Ok(Some(UnavailablePgReconciliationWork::from_transition(
+                    transition,
+                    UnavailablePgReconciliationStage::MetadataTransfer,
+                )))
+            }
+        }
+    }
+
+    pub fn complete_unavailable_pg_reconciliation(
+        &mut self,
+        work: &UnavailablePgReconciliationWork,
+        now_ms: u64,
+    ) -> Result<bool, ControlPlaneError> {
+        let Some(transition) = self
+            .snapshot
+            .unavailable_pg_placement_transition(work.pg_id())
+        else {
+            return Ok(false);
+        };
+        if !work.mutation_binding().matches_transition(transition) {
+            return Ok(false);
+        }
+        let command = self
+            .snapshot
+            .complete_unavailable_pg_placement_transition_command(work, now_ms)?;
+        self.apply_and_commit_command(command)?;
+        Ok(true)
     }
 
     pub fn set_pg_acting_set_with_metadata_transfer(
@@ -2838,6 +2899,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             acting_set,
             transfer,
             expected_destination_epoch,
+            unavailable_transition: None,
         })?;
         Ok(self.snapshot.clone())
     }
@@ -2861,6 +2923,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 pg_id,
                 source_primary_lease_deadline_ms: None,
                 lease_horizon_authority: None,
+                unavailable_transition: None,
             })?;
         let source_primary_lease_deadline_ms = match applied.response() {
             ControlPlaneCommandResponse::FencePgForMetadataTransfer {
@@ -2872,6 +2935,48 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             self.snapshot.clone(),
             source_primary_lease_deadline_ms,
         ))
+    }
+
+    pub fn fence_unavailable_pg_transition_with_source_lease(
+        &mut self,
+        binding: UnavailablePgTransitionMutationBinding,
+    ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
+        let pg_id = binding.pg_id();
+        let applied =
+            self.apply_and_commit_command(ControlPlaneCommand::FencePgForMetadataTransfer {
+                pg_id,
+                source_primary_lease_deadline_ms: None,
+                lease_horizon_authority: None,
+                unavailable_transition: Some(binding),
+            })?;
+        let source_primary_lease_deadline_ms = match applied.response() {
+            ControlPlaneCommandResponse::FencePgForMetadataTransfer {
+                source_primary_lease_deadline_ms,
+            } => *source_primary_lease_deadline_ms,
+            _ => unreachable!("metadata transfer fence command returned the wrong response"),
+        };
+        Ok(FencedPgMetadataTransferSnapshot::new(
+            self.snapshot.clone(),
+            source_primary_lease_deadline_ms,
+        ))
+    }
+
+    pub fn install_unavailable_pg_transition_metadata_transfer(
+        &mut self,
+        binding: UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.apply_and_commit_command(
+            ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
+                pg_id: binding.pg_id(),
+                acting_set: binding.destination_acting_set().to_vec(),
+                transfer,
+                expected_destination_epoch,
+                unavailable_transition: Some(binding),
+            },
+        )?;
+        Ok(self.snapshot.clone())
     }
 
     pub fn set_pg_state(
@@ -3606,14 +3711,14 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         )
     }
 
-    fn record_unavailable_pg_payload_readiness(
+    fn complete_unavailable_pg_placement_transition(
         &mut self,
-        pg_id: PgId,
+        work: &UnavailablePgReconciliationWork,
         ready_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::record_unavailable_pg_payload_readiness(
+        SingleAuthorityControlPlane::complete_unavailable_pg_placement_transition(
             self,
-            pg_id,
+            work,
             ready_at_ms,
         )
     }
@@ -3632,6 +3737,15 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         SingleAuthorityControlPlane::fence_pg_for_metadata_transfer_with_source_lease(self, pg_id)
     }
 
+    fn fence_unavailable_pg_transition_with_source_lease(
+        &mut self,
+        binding: UnavailablePgTransitionMutationBinding,
+    ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::fence_unavailable_pg_transition_with_source_lease(
+            self, binding,
+        )
+    }
+
     fn set_pg_acting_set_with_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -3643,6 +3757,20 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
             self,
             pg_id,
             acting_set,
+            transfer,
+            expected_destination_epoch,
+        )
+    }
+
+    fn install_unavailable_pg_transition_metadata_transfer(
+        &mut self,
+        binding: UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::install_unavailable_pg_transition_metadata_transfer(
+            self,
+            binding,
             transfer,
             expected_destination_epoch,
         )

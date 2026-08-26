@@ -43,9 +43,9 @@ use storage::storage_node_server::StorageNodeRpcListenerConfig;
 use storage::storage_rpc_transport::StorageRpcClientEndpoint;
 use storage::{
     ControlPlaneRaftPeerBootstrap, FrontendStorageRpcClientCapability,
-    MaintenanceStorageRpcClientCapability, StaticInitialControlPlaneTopology,
-    StaticInitialPgPlacement, StaticStorageFailureDomain, StaticStorageNodeEndpoint,
-    StaticStoragePlacementNode, StaticStoragePlacementParameters,
+    LivePgMetadataTransferStorageRpcClientCapability, MaintenanceStorageRpcClientCapability,
+    StaticInitialControlPlaneTopology, StaticInitialPgPlacement, StaticStorageFailureDomain,
+    StaticStorageNodeEndpoint, StaticStoragePlacementNode, StaticStoragePlacementParameters,
     StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig, StorageRpcTransportLimits,
 };
 use x509_cert::der::Decode;
@@ -79,6 +79,12 @@ const FULL_CONFIG_FINGERPRINT_DOMAIN: &str = "argmin-static-cluster-full-config-
 const FULL_CONFIG_FINGERPRINT_VERSION: u32 = 1;
 const TEST_ENV_SHAPED_CONFIG: &str = "ARGMIN_TEST_ENV_SHAPED_CONFIG";
 const STATIC_CLUSTER_MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+type ConfiguredStaticStorageRpcClients = (
+    Vec<ConfiguredStorageNodeSocket>,
+    Vec<(u32, StorageRpcClientEndpoint)>,
+    StorageRpcTransportLimits,
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum StaticClusterManifestPreflightError {
@@ -1127,6 +1133,7 @@ impl ValidatedStaticClusterManifest {
         let mut protocols = BTreeSet::new();
         if selected_process.kind.has_control_plane() {
             protocols.insert(EndpointProtocol::RaftPeer);
+            protocols.insert(EndpointProtocol::StorageRpc);
         }
         if selected_process.kind.has_storage_node() || selected_process.kind.has_frontend() {
             protocols.insert(EndpointProtocol::ControlPlane);
@@ -1591,6 +1598,149 @@ impl ValidatedStaticClusterManifest {
         Ok(ConfiguredStaticControlPlaneRpcClients { endpoints })
     }
 
+    fn storage_rpc_transport_limits(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<StorageRpcTransportLimits, String> {
+        let endpoint = self
+            .manifest
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == endpoint_id)
+            .ok_or_else(|| {
+                format!("storage endpoint {endpoint_id} disappeared after validation")
+            })?;
+        let profile = self
+            .manifest
+            .transport_profiles
+            .iter()
+            .find(|profile| profile.id == endpoint.transport_profile_id)
+            .ok_or_else(|| {
+                format!(
+                    "storage endpoint {endpoint_id} transport profile disappeared after validation"
+                )
+            })?;
+        let limits = StorageRpcTransportLimits::new(
+            usize::try_from(profile.max_frame_bytes).map_err(|_| {
+                format!("storage endpoint {endpoint_id} frame limit does not fit usize")
+            })?,
+            usize::try_from(profile.max_connections).map_err(|_| {
+                format!("storage endpoint {endpoint_id} connection limit does not fit usize")
+            })?,
+            Duration::from_millis(profile.io_timeout_ms),
+        )
+        .map_err(|error| {
+            format!("invalid storage endpoint {endpoint_id} transport limits: {error}")
+        })?;
+        if limits.max_connections() < 2 {
+            return Err(format!(
+                "storage endpoint {endpoint_id} transport max_connections must be at least 2 for object-read lease handoff"
+            ));
+        }
+        Ok(limits)
+    }
+
+    fn configured_static_storage_rpc_clients(
+        &self,
+        material: &ResolvedStaticClusterMaterial,
+    ) -> Result<ConfiguredStaticStorageRpcClients, String> {
+        let mut storage_node_sockets = Vec::with_capacity(self.manifest.storage_nodes.len());
+        let mut storage_rpc_client_endpoints =
+            Vec::with_capacity(self.manifest.storage_nodes.len());
+        let mut client_transport_limits = None;
+        for storage_node in &self.manifest.storage_nodes {
+            let canonical_endpoint = self
+                .canonical_storage_node_endpoints
+                .get(&storage_node.node_id)
+                .expect("validated storage-node endpoint map contains every node");
+            let endpoint = self
+                .manifest
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == canonical_endpoint.endpoint_id)
+                .expect("validated canonical storage endpoint exists in manifest");
+            let endpoint_limits = self.storage_rpc_transport_limits(&endpoint.id)?;
+            client_transport_limits = Some(client_transport_limits.map_or(
+                endpoint_limits,
+                |current: StorageRpcTransportLimits| {
+                    StorageRpcTransportLimits::new(
+                        current
+                            .max_frame_bytes()
+                            .min(endpoint_limits.max_frame_bytes()),
+                        current
+                            .max_connections()
+                            .min(endpoint_limits.max_connections()),
+                        current.io_timeout().min(endpoint_limits.io_timeout()),
+                    )
+                    .expect("minimum validated storage transport limits remain valid")
+                },
+            ));
+            let client_endpoint =
+                match parse_endpoint_address(&canonical_endpoint.advertise, false)? {
+                    EndpointAddress::Unix(path) => {
+                        storage_node_sockets.push(ConfiguredStorageNodeSocket {
+                            node_id: storage_node.node_id,
+                            socket_path: path.to_string_lossy().into_owned(),
+                        });
+                        StorageRpcClientEndpoint::unix(path)
+                    }
+                    EndpointAddress::Tcp { host, port } => {
+                        let trust_bundle_id = endpoint
+                            .tls_trust_bundle_id
+                            .as_deref()
+                            .expect("validated storage TCP endpoint has a TLS trust bundle");
+                        let roots =
+                            material
+                                .tls_trust_bundles
+                                .get(trust_bundle_id)
+                                .ok_or_else(|| {
+                                    format!(
+                                "selected process did not resolve storage endpoint {} trust bundle",
+                                endpoint.id
+                            )
+                                })?;
+                        let server_name = endpoint
+                            .tls_server_name
+                            .clone()
+                            .expect("validated storage TCP endpoint has a TLS server name");
+                        let mut addresses = (host.as_str(), port)
+                            .to_socket_addrs()
+                            .map_err(|error| {
+                                format!(
+                                    "failed to resolve storage endpoint {} address: {error}",
+                                    endpoint.id
+                                )
+                            })?
+                            .collect::<Vec<_>>();
+                        addresses.sort_unstable();
+                        addresses.dedup();
+                        storage_node_sockets.push(ConfiguredStorageNodeSocket {
+                            node_id: storage_node.node_id,
+                            socket_path: canonical_endpoint.advertise.clone(),
+                        });
+                        StorageRpcClientEndpoint::tls_tcp(
+                            canonical_endpoint.advertise.clone(),
+                            addresses,
+                            server_name,
+                            Arc::clone(&roots.roots),
+                        )
+                        .map_err(|error| {
+                            format!("invalid storage endpoint {}: {error}", endpoint.id)
+                        })?
+                    }
+                };
+            storage_rpc_client_endpoints.push((storage_node.node_id, client_endpoint));
+        }
+        storage_node_sockets.sort_by_key(|node| node.node_id);
+        storage_rpc_client_endpoints.sort_by_key(|(node_id, _)| *node_id);
+        Ok((
+            storage_node_sockets,
+            storage_rpc_client_endpoints,
+            client_transport_limits
+                .ok_or_else(|| "replicated process has no storage transport limits".to_string())?,
+        ))
+    }
+
     fn replicated_unix_control_plane_server_config(
         &self,
         material: &ResolvedStaticClusterMaterial,
@@ -1797,28 +1947,15 @@ impl ValidatedStaticClusterManifest {
         }
         raft_peer_sockets.sort_by_key(|peer| peer.node_id);
 
-        let mut storage_node_sockets = Vec::new();
-        for storage_node in &self.manifest.storage_nodes {
-            let endpoint = self
-                .canonical_storage_node_endpoints
-                .get(&storage_node.node_id)
-                .expect("validated storage-node endpoint map contains every storage node");
-            let address = match parse_endpoint_address(&endpoint.advertise, false)? {
-                EndpointAddress::Unix(path) => path.to_string_lossy().into_owned(),
-                EndpointAddress::Tcp { .. } => endpoint.advertise.clone(),
-            };
-            storage_node_sockets.push(ConfiguredStorageNodeSocket {
-                node_id: storage_node.node_id,
-                socket_path: address,
-            });
-        }
-        storage_node_sockets.sort_by_key(|node| node.node_id);
+        let (storage_node_sockets, storage_rpc_client_endpoints, storage_transport_limits) =
+            self.configured_static_storage_rpc_clients(material)?;
 
         let mut raft_auth_credentials = Vec::new();
         let mut storage_auth_credentials = Vec::new();
         let mut frontend_auth_credentials = Vec::new();
         let mut admin_auth_credentials = Vec::new();
         let mut raft_signer = None;
+        let mut live_pg_metadata_transfer_storage_signer = None;
         for credential in &material.auth_credentials {
             let secret = BinarySecretConfigValue::from_bytes(credential.secret.clone());
             let signer = (
@@ -1862,6 +1999,26 @@ impl ValidatedStaticClusterManifest {
                         credential_version: credential.credential_version,
                         secret,
                     });
+                    if credential.use_for_signing
+                        && selected.admin_instance_id.as_ref() == Some(instance_id)
+                    {
+                        live_pg_metadata_transfer_storage_signer = Some(
+                            ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+                                cluster_id: self.manifest.cluster.id.clone(),
+                                credential_id: credential.credential_id.clone(),
+                                credential_version: credential.credential_version,
+                                principal: ControlPlaneAuthPrincipal::Admin {
+                                    instance_id: instance_id.clone(),
+                                },
+                                secret: credential.secret.clone(),
+                            })
+                            .map_err(|error| {
+                                format!(
+                                    "invalid live PG metadata transfer storage RPC credential: {error}"
+                                )
+                            })?,
+                        );
+                    }
                 }
                 (AuthPrincipal::Maintenance, _) => {
                     return Err(
@@ -1902,6 +2059,19 @@ impl ValidatedStaticClusterManifest {
         })?;
         let admin_instance_id = selected.admin_instance_id.clone().ok_or_else(|| {
             "selected replicated control-plane process has no admin instance id".to_string()
+        })?;
+        let storage_rpc_live_pg_metadata_transfer_client_auth =
+            LivePgMetadataTransferStorageRpcClientCapability::new_with_transport_limits(
+            live_pg_metadata_transfer_storage_signer.ok_or_else(|| {
+                "selected replicated control-plane process has no active live PG metadata transfer storage RPC signing credential"
+                    .to_string()
+            })?,
+            self.manifest.cluster.topology_generation,
+            self.topology_digest.clone(),
+            storage_transport_limits,
+        )
+        .map_err(|error| {
+            format!("invalid live PG metadata transfer storage RPC capability: {error}")
         })?;
 
         let mut manifest_values = BTreeMap::<&'static str, String>::new();
@@ -1983,6 +2153,9 @@ impl ValidatedStaticClusterManifest {
         let static_initial_cluster_map =
             self.configured_static_initial_cluster_map(&storage_node_sockets)?;
         config.storage_node_sockets = storage_node_sockets;
+        config.storage_rpc_client_endpoints = storage_rpc_client_endpoints;
+        config.storage_rpc_live_pg_metadata_transfer_client_auth =
+            Some(storage_rpc_live_pg_metadata_transfer_client_auth);
         config.static_cluster_identity = Some(self.configured_static_identity());
         config.static_initial_cluster_map = Some(static_initial_cluster_map);
         Ok(config)
@@ -5213,7 +5386,9 @@ fn validate_endpoints(
             }
         }
         let remote_control_plane_client = processes.values().any(|client| {
-            (client.kind.has_frontend() || client.kind.has_storage_node())
+            (client.kind.has_control_plane()
+                || client.kind.has_frontend()
+                || client.kind.has_storage_node())
                 && client.host_id != process.host_id
         });
         if remote_control_plane_client
@@ -5254,7 +5429,9 @@ fn validate_endpoints(
         }
         let process = processes[storage_node.process_id.as_str()];
         let remote_storage_client = processes.values().any(|client| {
-            (client.kind.has_frontend() || client.kind.has_storage_node())
+            (client.kind.has_control_plane()
+                || client.kind.has_frontend()
+                || client.kind.has_storage_node())
                 && client.host_id != process.host_id
         });
         if remote_storage_client
@@ -5667,7 +5844,11 @@ fn resolve_canonical_storage_node_endpoints(
     let storage_client_hosts = manifest
         .processes
         .iter()
-        .filter(|process| process.kind.has_frontend() || process.kind.has_storage_node())
+        .filter(|process| {
+            process.kind.has_control_plane()
+                || process.kind.has_frontend()
+                || process.kind.has_storage_node()
+        })
         .map(|process| process.host_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut resolved = BTreeMap::new();
@@ -6737,15 +6918,32 @@ mod tests {
             0o644,
         );
         write_material_file(
-            &material_dir.join("host-1.crt"),
-            include_bytes!("../../s3-tests/testdata/localhost-cert.pem"),
+            &material_dir.join("storage-ca.pem"),
+            include_bytes!("../../s3-tests/testdata/storage-ca-cert.pem"),
             0o644,
         );
         write_material_file(
-            &material_dir.join("host-1.key"),
-            include_bytes!("../../s3-tests/testdata/localhost-key.pem"),
+            &material_dir.join("storage-localhost.crt"),
+            include_bytes!("../../s3-tests/testdata/storage-localhost-cert.pem"),
+            0o644,
+        );
+        write_material_file(
+            &material_dir.join("storage-localhost.key"),
+            include_bytes!("../../s3-tests/testdata/storage-localhost-key.pem"),
             0o600,
         );
+        for host_number in 1..=3 {
+            write_material_file(
+                &material_dir.join(format!("host-{host_number}.crt")),
+                include_bytes!("../../s3-tests/testdata/localhost-cert.pem"),
+                0o644,
+            );
+            write_material_file(
+                &material_dir.join(format!("host-{host_number}.key")),
+                include_bytes!("../../s3-tests/testdata/localhost-key.pem"),
+                0o600,
+            );
+        }
         for principal in ["raft", "storage", "admin"] {
             for number in 1..=3 {
                 let credential_id = format!("{principal}-{number}");
@@ -6777,13 +6975,33 @@ mod tests {
         let manifest = manifest
             .replace("/run/argmin-secrets", material_dir.to_str().unwrap())
             .replace("tcp://control-1.internal:", "tcp://localhost:")
+            .replace("tcp://control-2.internal:", "tcp://localhost:")
+            .replace("tcp://control-3.internal:", "tcp://localhost:")
             .replace("tcp://storage-1.internal:", "tcp://localhost:")
+            .replace("tcp://storage-2.internal:", "tcp://localhost:")
+            .replace("tcp://storage-3.internal:", "tcp://localhost:")
             .replace(
                 "tls_server_name = \"control-1.internal\"",
                 "tls_server_name = \"localhost\"",
             )
             .replace(
+                "tls_server_name = \"control-2.internal\"",
+                "tls_server_name = \"localhost\"",
+            )
+            .replace(
+                "tls_server_name = \"control-3.internal\"",
+                "tls_server_name = \"localhost\"",
+            )
+            .replace(
                 "tls_server_name = \"storage-1.internal\"",
+                "tls_server_name = \"localhost\"",
+            )
+            .replace(
+                "tls_server_name = \"storage-2.internal\"",
+                "tls_server_name = \"localhost\"",
+            )
+            .replace(
+                "tls_server_name = \"storage-3.internal\"",
                 "tls_server_name = \"localhost\"",
             );
         let validated = parse_static_cluster_manifest(&manifest, selected_process_id).unwrap();
@@ -7339,33 +7557,19 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
             );
         }
         for host_number in 1..=3 {
-            let tcp_block = format!(
-                r#"[[endpoints]]
-id = "storage-{host_number}"
-owner_process_id = "storage-{host_number}"
-protocol = "storage-rpc"
-priority = 10
-listen = "tcp://0.0.0.0:{port}"
-advertise = "tcp://storage-{host_number}.internal:{port}"
-transport_profile_id = "internal"
-tls_identity_id = "host-{host_number}-identity"
-tls_trust_bundle_id = "cluster-ca"
-tls_server_name = "storage-{host_number}.internal"
-"#,
-                port = 7700 + host_number
-            );
             let unix_block = format!(
-                r#"[[endpoints]]
-id = "storage-{host_number}"
+                r#"
+[[endpoints]]
+id = "storage-{host_number}-local"
 owner_process_id = "storage-{host_number}"
 protocol = "storage-rpc"
-priority = 10
+priority = 1
 listen = "unix:///run/argmin/storage-{host_number}.sock"
 advertise = "unix:///run/argmin/storage-{host_number}.sock"
 transport_profile_id = "internal"
 "#
             );
-            manifest = replace_once(&manifest, &tcp_block, &unix_block);
+            manifest.push_str(&unix_block);
         }
         manifest.push_str(
             r#"
@@ -7793,6 +7997,10 @@ private_key_ref = "file:/run/argmin-secrets/public.key"
             .unwrap();
 
         assert_eq!(config.process_role, ProcessRole::ControlPlane);
+        assert_eq!(config.storage_rpc_client_endpoints.len(), 3);
+        assert!(config
+            .storage_rpc_live_pg_metadata_transfer_client_auth
+            .is_some());
         assert!(config.control_plane_experimental_raft);
         assert_eq!(config.control_plane_raft_node_id, Some(101));
         assert_eq!(config.control_plane_raft_peer_max_connections, 17);
@@ -8854,10 +9062,14 @@ transport_profile_id = "internal"
                 .collect::<Vec<_>>(),
             vec![
                 (1, "tcp://localhost:7701"),
-                (2, "tcp://storage-2.internal:7702"),
-                (3, "tcp://storage-3.internal:7703"),
+                (2, "tcp://localhost:7702"),
+                (3, "tcp://localhost:7703"),
             ]
         );
+        assert_eq!(config.storage_rpc_client_endpoints.len(), 3);
+        assert!(config
+            .storage_rpc_live_pg_metadata_transfer_client_auth
+            .is_some());
     }
 
     #[test]
@@ -8891,6 +9103,100 @@ transport_profile_id = "internal"
             config.storage_node_sockets[0].socket_path,
             "tcp://localhost:7701"
         );
+    }
+
+    #[test]
+    fn dedicated_control_plane_resolves_storage_tls_and_tcp_fallback() {
+        let mut manifest = replicated_manifest()
+            .replace("failure_domain = \"host\"", "failure_domain = \"disk\"")
+            .replace(
+            "[[tls_trust_bundles]]\nid = \"cluster-ca\"\nca_bundle_ref = \"file:/run/argmin-secrets/cluster-ca.pem\"",
+            "[[tls_trust_bundles]]\nid = \"cluster-ca\"\nca_bundle_ref = \"file:/run/argmin-secrets/cluster-ca.pem\"\n\n[[tls_trust_bundles]]\nid = \"storage-ca\"\nca_bundle_ref = \"file:/run/argmin-secrets/storage-ca.pem\"\n\n[[tls_identities]]\nid = \"storage-server\"\ncertificate_ref = \"file:/run/argmin-secrets/storage-localhost.crt\"\nprivate_key_ref = \"file:/run/argmin-secrets/storage-localhost.key\"",
+        );
+        for storage_number in 1..=3 {
+            if storage_number > 1 {
+                manifest = manifest.replace(
+                    &format!(
+                        "id = \"host-{storage_number}-data\"\nhost_id = \"host-{storage_number}\""
+                    ),
+                    &format!("id = \"host-{storage_number}-data\"\nhost_id = \"host-1\""),
+                );
+                manifest = manifest.replace(
+                    &format!(
+                        "id = \"storage-{storage_number}\"\nhost_id = \"host-{storage_number}\"\nkind = \"storage-node\""
+                    ),
+                    &format!(
+                        "id = \"storage-{storage_number}\"\nhost_id = \"host-1\"\nkind = \"storage-node\""
+                    ),
+                );
+            }
+            let storage_block = format!(
+                r#"[[endpoints]]
+id = "storage-{storage_number}"
+owner_process_id = "storage-{storage_number}"
+protocol = "storage-rpc"
+priority = 10
+listen = "tcp://0.0.0.0:{port}"
+advertise = "tcp://storage-{storage_number}.internal:{port}"
+transport_profile_id = "internal"
+tls_identity_id = "host-{storage_number}-identity"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "storage-{storage_number}.internal"
+"#,
+                port = 7700 + storage_number
+            );
+            let storage_block_with_distinct_ca = storage_block
+                .replace(
+                    &format!("tls_identity_id = \"host-{storage_number}-identity\""),
+                    "tls_identity_id = \"storage-server\"",
+                )
+                .replace(
+                    "tls_trust_bundle_id = \"cluster-ca\"",
+                    "tls_trust_bundle_id = \"storage-ca\"",
+                );
+            manifest = replace_once(&manifest, &storage_block, &storage_block_with_distinct_ca);
+            writeln!(
+                manifest,
+                r#"
+[[endpoints]]
+id = "storage-{storage_number}-local"
+owner_process_id = "storage-{storage_number}"
+protocol = "storage-rpc"
+priority = 1
+listen = "unix:///run/argmin/storage-{storage_number}.sock"
+advertise = "unix:///run/argmin/storage-{storage_number}.sock"
+transport_profile_id = "internal"
+"#
+            )
+            .unwrap();
+        }
+
+        let (dir, manifest) = materialized_replicated_manifest_from("control-2", manifest);
+        let material = manifest.resolve_selected_process_material_at(1).unwrap();
+        assert_eq!(material.tls_trust_bundle_count(), 2);
+        assert!(material.tls_trust_bundles.contains_key("storage-ca"));
+        assert_ne!(material.tls_trust_bundles["cluster-ca"].roots.len(), 0);
+        assert_ne!(material.tls_trust_bundles["storage-ca"].roots.len(), 0);
+        assert_ne!(
+            std::fs::read(dir.path().join("material/cluster-ca.pem")).unwrap(),
+            std::fs::read(dir.path().join("material/storage-ca.pem")).unwrap()
+        );
+
+        let config = manifest
+            .replicated_unix_control_plane_server_config(&material)
+            .unwrap();
+        assert_eq!(config.storage_rpc_client_endpoints.len(), 3);
+        assert!(config
+            .storage_rpc_live_pg_metadata_transfer_client_auth
+            .is_some());
+        assert!(config
+            .storage_rpc_client_endpoints
+            .iter()
+            .all(|(_, endpoint)| endpoint.advertised_endpoint().starts_with("tcp://")));
+        assert!(config
+            .storage_node_sockets
+            .iter()
+            .all(|node| node.socket_path.starts_with("tcp://")));
     }
 
     #[test]
@@ -9960,8 +10266,21 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         assert_eq!(storage_config.storage_node_ids, vec![1, 2, 3]);
         assert_eq!(
             storage_config.storage_node_socket_path.as_deref(),
-            Some("/run/argmin/storage-1.sock")
+            Some("tcp://localhost:7701")
         );
+        assert_eq!(storage_config.storage_rpc_listeners.len(), 2);
+        assert_eq!(
+            storage_config
+                .storage_rpc_listeners
+                .iter()
+                .filter(|listener| listener.is_tls_tcp())
+                .count(),
+            1
+        );
+        assert!(storage_config
+            .storage_rpc_client_endpoints
+            .iter()
+            .all(|(_, endpoint)| endpoint.is_tls_tcp()));
         assert!(storage_config
             .storage_rpc_storage_node_client_auth
             .is_some());

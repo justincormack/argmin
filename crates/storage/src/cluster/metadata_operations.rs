@@ -3765,6 +3765,29 @@ impl StorageCluster {
         )
     }
 
+    pub fn from_runtime_map_with_storage_rpc_endpoints_and_live_pg_metadata_transfer_auth(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        endpoints: impl IntoIterator<
+            Item = (
+                NodeId,
+                crate::storage_rpc_transport::StorageRpcClientEndpoint,
+            ),
+        >,
+        capability: crate::LivePgMetadataTransferStorageRpcClientCapability,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_runtime_map_with_storage_rpc_endpoints_and_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+            admission_settings,
+            endpoints,
+            capability.into(),
+        )
+    }
+
     pub fn from_runtime_map_with_storage_rpc_endpoints_and_maintenance_auth(
         metadata_primary_node_id: NodeId,
         runtime_map: &ClusterRuntimeMapSnapshot,
@@ -3937,6 +3960,22 @@ impl StorageCluster {
         default_ec_shape: EcShape,
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
         capability: crate::FrontendStorageRpcClientCapability,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+            admission_settings,
+            Some(capability.into()),
+        )
+    }
+
+    pub fn from_runtime_map_with_unix_storage_node_client_admission_settings_and_live_pg_metadata_transfer_auth(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        capability: crate::LivePgMetadataTransferStorageRpcClientCapability,
     ) -> Result<Arc<Self>, ClusterBuildError> {
         Self::from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
             metadata_primary_node_id,

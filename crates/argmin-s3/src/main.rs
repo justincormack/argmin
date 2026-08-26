@@ -69,6 +69,7 @@ use storage::{
     ControlPlaneRpcServerListenerInput, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgState,
     RouteMapValidity, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    UnavailablePgReconciliationWorker,
 };
 #[cfg(test)]
 use storage::{
@@ -99,7 +100,6 @@ const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT: usize = 64;
 const CONTROL_PLANE_RAFT_PEER_PRE_AUTH_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 const CONTROL_PLANE_STANDALONE_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 macro_rules! process_info {
     ($($arg:tt)*) => {{
         #[cfg(not(test))]
@@ -1203,50 +1203,80 @@ fn build_live_pg_metadata_transfer_admin(
 ) -> Result<storage::LivePgMetadataTransferAdmin, String> {
     let config = static_cluster_config::load_server_config_from_environment()
         .map_err(|error| format!("configuration error: {error}"))?;
+    build_live_pg_metadata_transfer_admin_from_config(&config, socket_path, failpoint)
+}
+
+fn build_live_pg_metadata_transfer_admin_from_config(
+    config: &ServerConfig,
+    socket_path: &Path,
+    failpoint: Option<storage::LivePgMetadataTransferFailpoint>,
+) -> Result<storage::LivePgMetadataTransferAdmin, String> {
     let ec_config = EcConfig::new(config.ec_k, config.ec_m)
         .map_err(|error| format!("invalid EC config: {error}"))?;
-    let frontend = build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)?;
-    let admin_credential = if static_cluster_command_configured() {
-        build_admin_credential_binding_from_config(&config)?
+    let admin = if static_cluster_command_configured() {
+        build_admin_control_plane_client_from_config(config, socket_path)?
     } else {
-        build_admin_credential_binding_from_command_auth_env()?
+        build_admin_control_plane_client_from_command_auth_env(socket_path)?
     };
-    let control_plane = storage::LivePgMetadataTransferControlPlaneClient::with_frontend_client(
-        &frontend,
-        &admin_credential,
-    )
-    .map_err(|error| error.to_string())?;
+    let control_plane =
+        storage::LivePgMetadataTransferControlPlaneClient::with_admin_client(&admin)
+            .map_err(|error| error.to_string())?;
     let ec_shape = EcShape {
         k: ec_config.data_shards(),
         m: ec_config.parity_shards(),
     };
-    let admission_settings = unix_storage_node_client_admission_settings(&config);
+    let admission_settings = unix_storage_node_client_admission_settings(config);
     let admin = if config.storage_rpc_client_endpoints.is_empty() {
-        if config.storage_rpc_frontend_client_auth.is_none()
-            && !config.allow_unauthenticated_internal_rpc_for_tests
+        if let Some(auth) = config
+            .storage_rpc_live_pg_metadata_transfer_client_auth
+            .clone()
         {
+            storage::LivePgMetadataTransferAdmin::with_unix_storage_nodes_and_live_pg_metadata_transfer_auth(
+                control_plane,
+                ec_shape,
+                admission_settings,
+                auth,
+            )
+        } else if config.storage_rpc_frontend_client_auth.is_some()
+            || config.allow_unauthenticated_internal_rpc_for_tests
+        {
+            storage::LivePgMetadataTransferAdmin::with_unix_storage_nodes(
+                control_plane,
+                ec_shape,
+                admission_settings,
+                config.storage_rpc_frontend_client_auth.clone(),
+            )
+        } else {
             return Err("live metadata transfer requires authenticated storage RPC".to_string());
         }
-        storage::LivePgMetadataTransferAdmin::with_unix_storage_nodes(
-            control_plane,
-            ec_shape,
-            admission_settings,
-            config.storage_rpc_frontend_client_auth.clone(),
-        )
     } else {
-        let auth = config
-            .storage_rpc_frontend_client_auth
+        if let Some(auth) = config
+            .storage_rpc_live_pg_metadata_transfer_client_auth
             .clone()
-            .ok_or_else(|| {
-                "configured storage RPC endpoints require frontend authentication".to_owned()
-            })?;
-        storage::LivePgMetadataTransferAdmin::with_storage_rpc_endpoints(
-            control_plane,
-            ec_shape,
-            admission_settings,
-            config.storage_rpc_client_endpoints.clone(),
-            auth,
-        )
+        {
+            storage::LivePgMetadataTransferAdmin::with_storage_rpc_endpoints_and_live_pg_metadata_transfer_auth(
+                control_plane,
+                ec_shape,
+                admission_settings,
+                config.storage_rpc_client_endpoints.clone(),
+                auth,
+            )
+        } else {
+            let auth = config
+                .storage_rpc_frontend_client_auth
+                .clone()
+                .ok_or_else(|| {
+                    "configured storage RPC endpoints require frontend or admin authentication"
+                        .to_owned()
+                })?;
+            storage::LivePgMetadataTransferAdmin::with_storage_rpc_endpoints(
+                control_plane,
+                ec_shape,
+                admission_settings,
+                config.storage_rpc_client_endpoints.clone(),
+                auth,
+            )
+        }
     }
     .with_failpoint(failpoint);
     Ok(admin)
@@ -1712,6 +1742,15 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         Arc::clone(&authority_clock_checkpoint_target),
         fatal_error_handler,
     );
+    let mut unavailable_pg_reconciler = config.static_initial_cluster_map.as_ref().map(|_| {
+        let reconciliation_admin =
+            build_live_pg_metadata_transfer_admin_from_config(config, Path::new(socket_path), None)
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to configure unavailable PG reconciler: {error}");
+                    std::process::exit(1);
+                });
+        UnavailablePgReconciliationWorker::spawn(reconciliation_admin)
+    });
 
     loop {
         let expiry = (|| {
@@ -1749,6 +1788,24 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 eprintln!("control-plane lease expiry failed: {error}");
                 std::process::exit(1);
             }
+        }
+        let reconciliation = (|| {
+            let now_ms = authority_clock
+                .lock()
+                .expect("control-plane authority clock mutex poisoned")
+                .effective_process_now_ms()?;
+            let mut authority = authority
+                .lock()
+                .expect("control-plane authority mutex poisoned");
+            if let Some(reconciler) = unavailable_pg_reconciler.as_mut() {
+                reconciler.poll_single_authority(&mut authority, now_ms);
+            }
+            Ok::<(), ControlPlaneError>(())
+        })();
+        if let Err(error) = reconciliation {
+            eprintln!(
+                "unavailable PG reconciliation deferred because authority time is unavailable: {error}"
+            );
         }
         thread::sleep(config.control_plane_lease_scan_interval);
     }
@@ -2119,6 +2176,15 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             eprintln!("failed to start experimental OpenRaft RPC server: {error}");
             std::process::exit(1);
         });
+    let mut unavailable_pg_reconciler = config.static_initial_cluster_map.as_ref().map(|_| {
+        let reconciliation_admin =
+            build_live_pg_metadata_transfer_admin_from_config(config, Path::new(socket_path), None)
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to configure unavailable PG reconciler: {error}");
+                    std::process::exit(1);
+                });
+        UnavailablePgReconciliationWorker::spawn(reconciliation_admin)
+    });
 
     let mut lease_expiry_not_before_ms = None;
     loop {
@@ -2215,6 +2281,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 std::process::exit(1);
             }
         }
+        if let Some(reconciler) = unavailable_pg_reconciler.as_mut() {
+            reconciler.observe_transfer_worker();
+            if local_raft_authority_serving {
+                reconciler.poll_raft(authority_service.host_mut(), expiry_now_ms);
+            }
+        }
         thread::sleep(config.control_plane_lease_scan_interval);
     }
 }
@@ -2254,15 +2326,7 @@ fn successor_heartbeat_renewal_not_before_ms(
 }
 
 fn control_plane_lease_expiry_error_is_clock_wait(error: &ControlPlaneError) -> bool {
-    matches!(
-        error,
-        ControlPlaneError::CommittedTimestampRegression { .. }
-            | ControlPlaneError::CommittedTimestampTooFarAhead { .. }
-            | ControlPlaneError::PreviousLeaseGrantHorizonStillActive { .. }
-            | ControlPlaneError::AuthorityClockLeadershipChanged { .. }
-            | ControlPlaneError::AuthorityClockSourceUnavailable
-            | ControlPlaneError::AuthorityClockNotEstablished { .. }
-    )
+    error.is_retryable_authority_clock_wait_error()
 }
 
 fn experimental_raft_error_is_non_local_leader(error: &ControlPlaneError) -> bool {

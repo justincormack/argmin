@@ -348,9 +348,9 @@ define_storage_rpc_client_capability!(
     "storage-node"
 );
 define_storage_rpc_client_capability!(
-    AdminStorageRpcClientCapability,
+    LivePgMetadataTransferStorageRpcClientCapability,
     ControlPlaneAuthPrincipal::Admin { .. },
-    "admin"
+    "live PG metadata transfer"
 );
 
 #[derive(Clone, Debug)]
@@ -358,7 +358,7 @@ pub(crate) enum StorageRpcClientAuthConfig {
     Frontend(FrontendStorageRpcClientCapability),
     Maintenance(MaintenanceStorageRpcClientCapability),
     StorageNode(StorageNodeStorageRpcClientCapability),
-    Admin(AdminStorageRpcClientCapability),
+    LivePgMetadataTransfer(LivePgMetadataTransferStorageRpcClientCapability),
 }
 
 impl StorageRpcClientAuthConfig {
@@ -367,7 +367,7 @@ impl StorageRpcClientAuthConfig {
             Self::Frontend(capability) => &capability.0,
             Self::Maintenance(capability) => &capability.0,
             Self::StorageNode(capability) => &capability.0,
-            Self::Admin(capability) => &capability.0,
+            Self::LivePgMetadataTransfer(capability) => &capability.0,
         }
     }
 
@@ -414,9 +414,9 @@ impl From<StorageNodeStorageRpcClientCapability> for StorageRpcClientAuthConfig 
     }
 }
 
-impl From<AdminStorageRpcClientCapability> for StorageRpcClientAuthConfig {
-    fn from(value: AdminStorageRpcClientCapability) -> Self {
-        Self::Admin(value)
+impl From<LivePgMetadataTransferStorageRpcClientCapability> for StorageRpcClientAuthConfig {
+    fn from(value: LivePgMetadataTransferStorageRpcClientCapability) -> Self {
+        Self::LivePgMetadataTransfer(value)
     }
 }
 
@@ -1321,7 +1321,11 @@ fn principal_allows_operation(
         | ControlPlaneAuthPrincipal::StorageNodeProcess { .. } => {
             roles.allows(StorageRpcCallerRole::StorageNode)
         }
-        ControlPlaneAuthPrincipal::Admin { .. } => roles.allows(StorageRpcCallerRole::Admin),
+        ControlPlaneAuthPrincipal::Admin { .. } => {
+            roles.allows(StorageRpcCallerRole::Admin)
+                && (kind == StorageRpcMessageKind::Health
+                    || admin_live_pg_metadata_transfer_operation(kind))
+        }
         ControlPlaneAuthPrincipal::LocalMaintenance { .. } => {
             roles.allows(StorageRpcCallerRole::Maintenance)
         }
@@ -1355,6 +1359,9 @@ impl StorageRpcAuthorizedRoles {
     const FRONTEND_STORAGE: Self = Self(Self::FRONTEND | Self::STORAGE_NODE);
     const FRONTEND_STORAGE_MAINTENANCE: Self =
         Self(Self::FRONTEND | Self::STORAGE_NODE | Self::MAINTENANCE);
+    const FRONTEND_STORAGE_MAINTENANCE_ADMIN: Self =
+        Self(Self::FRONTEND | Self::STORAGE_NODE | Self::MAINTENANCE | Self::ADMIN);
+    const FRONTEND_STORAGE_ADMIN: Self = Self(Self::FRONTEND | Self::STORAGE_NODE | Self::ADMIN);
     const MAINTENANCE_ONLY: Self = Self(Self::MAINTENANCE);
     const STORAGE_MAINTENANCE: Self = Self(Self::STORAGE_NODE | Self::MAINTENANCE);
 
@@ -1374,17 +1381,20 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         StorageRpcMessageKind::Health => StorageRpcAuthorizedRoles::ALL_INTERNAL,
 
         StorageRpcMessageKind::MetadataCommandReplicaState
-        | StorageRpcMessageKind::MetadataCommandAcceptance
+        | StorageRpcMessageKind::MetadataCommandPendingEnvelope
+        | StorageRpcMessageKind::MetadataCommandCheckpointCandidates => {
+            StorageRpcAuthorizedRoles::FRONTEND_STORAGE_MAINTENANCE_ADMIN
+        }
+
+        StorageRpcMessageKind::MetadataCommandAcceptance
         | StorageRpcMessageKind::MetadataCommandAbandonAcceptance
         | StorageRpcMessageKind::MetadataCommandPendingSlotInsert
         | StorageRpcMessageKind::MetadataCommandPendingSlotRemove
         | StorageRpcMessageKind::MetadataCommandMaxLogIndex
         | StorageRpcMessageKind::MetadataCommandNextId
-        | StorageRpcMessageKind::MetadataCommandPendingEnvelope
         | StorageRpcMessageKind::MetadataCommandPublicationStart
         | StorageRpcMessageKind::MetadataCommandValidateReplayState
         | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
-        | StorageRpcMessageKind::MetadataCommandCheckpointCandidates
         | StorageRpcMessageKind::MetadataCommandCheckpointRecordCurrent
         | StorageRpcMessageKind::MetadataCommandLogCompact
         | StorageRpcMessageKind::MetadataCommandAbandoned
@@ -1396,7 +1406,7 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::ShardAckLoad
         | StorageRpcMessageKind::ShardAckHistoricalLoad
         | StorageRpcMessageKind::ShardAckDelete => {
-            StorageRpcAuthorizedRoles::FRONTEND_STORAGE_MAINTENANCE
+            StorageRpcAuthorizedRoles::FRONTEND_STORAGE_MAINTENANCE_ADMIN
         }
 
         StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize
@@ -1408,9 +1418,13 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
         | StorageRpcMessageKind::MetadataCommandMatchingAppliedLog
         | StorageRpcMessageKind::MetadataCommandRetainedLogHashes
-        | StorageRpcMessageKind::MetadataCommandRetainedLogEntries
-        | StorageRpcMessageKind::ShardAckRecord
-        | StorageRpcMessageKind::ShardAckValidate => StorageRpcAuthorizedRoles::FRONTEND_STORAGE,
+        | StorageRpcMessageKind::MetadataCommandRetainedLogEntries => {
+            StorageRpcAuthorizedRoles::FRONTEND_STORAGE_ADMIN
+        }
+
+        StorageRpcMessageKind::ShardAckRecord | StorageRpcMessageKind::ShardAckValidate => {
+            StorageRpcAuthorizedRoles::FRONTEND_STORAGE
+        }
 
         StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord
         | StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned
@@ -1419,7 +1433,7 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::MetadataCommandRetainedAbortFinish
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
         | StorageRpcMessageKind::ClusterMapHistoryReferenceSummary => {
-            StorageRpcAuthorizedRoles::FRONTEND_STORAGE_MAINTENANCE
+            StorageRpcAuthorizedRoles::FRONTEND_STORAGE_MAINTENANCE_ADMIN
         }
 
         StorageRpcMessageKind::ShardRepairWrite
@@ -1571,6 +1585,27 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
             StorageRpcAuthorizedRoles::FRONTEND_ONLY
         }
     }
+}
+
+fn admin_live_pg_metadata_transfer_operation(kind: StorageRpcMessageKind) -> bool {
+    matches!(
+        kind,
+        StorageRpcMessageKind::MetadataCommandReplicaState
+            | StorageRpcMessageKind::MetadataCommandPendingEnvelope
+            | StorageRpcMessageKind::MetadataCommandCheckpointCandidates
+            | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize
+            | StorageRpcMessageKind::MetadataCommandTransferStateAdopt
+            | StorageRpcMessageKind::MetadataCommandTransferEmptyStateInitialize
+            | StorageRpcMessageKind::MetadataCommandTransferMatchingStateInitialize
+            | StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall
+            | StorageRpcMessageKind::MetadataCommandCheckpointExport
+            | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
+            | StorageRpcMessageKind::MetadataCommandMatchingAppliedLog
+            | StorageRpcMessageKind::MetadataCommandRetainedLogHashes
+            | StorageRpcMessageKind::MetadataCommandRetainedLogEntries
+            | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
+            | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
+    )
 }
 
 #[cfg(test)]
@@ -2553,8 +2588,9 @@ mod tests {
             );
             assert_eq!(
                 principal_allows_operation(&admin, kind),
-                kind == StorageRpcMessageKind::Health,
-                "admin must remain health-only for {kind:?}"
+                kind == StorageRpcMessageKind::Health
+                    || admin_live_pg_metadata_transfer_operation(kind),
+                "admin access must remain scoped to health and live PG metadata transfer for {kind:?}"
             );
             assert!(!principal_allows_operation(&raft, kind));
             assert!(!principal_allows_operation(&service, kind));
@@ -2568,9 +2604,21 @@ mod tests {
             &admin,
             StorageRpcMessageKind::ShardWrite
         ));
-        assert!(!principal_allows_operation(
+        assert!(principal_allows_operation(
             &admin,
             StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall
+        ));
+        assert!(principal_allows_operation(
+            &admin,
+            StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
+        ));
+        assert!(principal_allows_operation(
+            &admin,
+            StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
+        ));
+        assert!(!principal_allows_operation(
+            &admin,
+            StorageRpcMessageKind::MetadataCommandPendingSlotInsert
         ));
         assert!(!principal_allows_operation(
             &maintenance,

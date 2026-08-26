@@ -55,11 +55,12 @@ use crate::{
 const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 pub const DEFAULT_UNAVAILABLE_PLACEMENT_GRACE_MS: u64 = 30_000;
+pub const UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE: usize = 16;
 pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 16;
+const CONTROL_PLANE_RPC_VERSION: u16 = 17;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -901,6 +902,179 @@ pub struct UnavailablePgPlacementTransition {
     payload_readiness: Option<UnavailablePgPayloadReadiness>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnavailablePgReconciliationCursor {
+    after_pg_id: Option<PgId>,
+}
+
+impl UnavailablePgReconciliationCursor {
+    #[must_use]
+    pub fn start() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn after_pg_id(self) -> Option<PgId> {
+        self.after_pg_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailablePgReconciliationWork {
+    binding: UnavailablePgTransitionMutationBinding,
+    stage: UnavailablePgReconciliationStage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailablePgTransitionMutationBinding {
+    pg_id: PgId,
+    transition_epoch: ClusterEpoch,
+    source_epoch: ClusterEpoch,
+    source_acting_set: Vec<NodeId>,
+    destination_acting_set: Vec<NodeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailablePgReconciliationStage {
+    MetadataTransfer,
+    PayloadReadiness,
+}
+
+impl UnavailablePgReconciliationWork {
+    pub(crate) fn new(
+        pg_id: PgId,
+        transition_epoch: ClusterEpoch,
+        source_epoch: ClusterEpoch,
+        source_acting_set: Vec<NodeId>,
+        destination_acting_set: Vec<NodeId>,
+        stage: UnavailablePgReconciliationStage,
+    ) -> Self {
+        Self {
+            binding: UnavailablePgTransitionMutationBinding::new(
+                pg_id,
+                transition_epoch,
+                source_epoch,
+                source_acting_set,
+                destination_acting_set,
+            ),
+            stage,
+        }
+    }
+
+    pub(crate) fn from_transition(
+        transition: &UnavailablePgPlacementTransition,
+        stage: UnavailablePgReconciliationStage,
+    ) -> Self {
+        Self::new(
+            transition.pg_id,
+            transition.transition_epoch,
+            transition.source_epoch,
+            transition.source_acting_set.clone(),
+            transition.destination_acting_set.clone(),
+            stage,
+        )
+    }
+
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.binding.pg_id
+    }
+
+    #[must_use]
+    pub fn transition_epoch(&self) -> ClusterEpoch {
+        self.binding.transition_epoch
+    }
+
+    #[must_use]
+    pub fn source_epoch(&self) -> ClusterEpoch {
+        self.binding.source_epoch
+    }
+
+    #[must_use]
+    pub fn source_acting_set(&self) -> &[NodeId] {
+        &self.binding.source_acting_set
+    }
+
+    #[must_use]
+    pub fn destination_acting_set(&self) -> &[NodeId] {
+        &self.binding.destination_acting_set
+    }
+
+    #[must_use]
+    pub fn stage(&self) -> UnavailablePgReconciliationStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub fn mutation_binding(&self) -> &UnavailablePgTransitionMutationBinding {
+        &self.binding
+    }
+}
+
+impl UnavailablePgTransitionMutationBinding {
+    pub(crate) fn new(
+        pg_id: PgId,
+        transition_epoch: ClusterEpoch,
+        source_epoch: ClusterEpoch,
+        source_acting_set: Vec<NodeId>,
+        destination_acting_set: Vec<NodeId>,
+    ) -> Self {
+        Self {
+            pg_id,
+            transition_epoch,
+            source_epoch,
+            source_acting_set,
+            destination_acting_set,
+        }
+    }
+
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub fn transition_epoch(&self) -> ClusterEpoch {
+        self.transition_epoch
+    }
+
+    #[must_use]
+    pub fn source_epoch(&self) -> ClusterEpoch {
+        self.source_epoch
+    }
+
+    #[must_use]
+    pub fn source_acting_set(&self) -> &[NodeId] {
+        &self.source_acting_set
+    }
+
+    #[must_use]
+    pub fn destination_acting_set(&self) -> &[NodeId] {
+        &self.destination_acting_set
+    }
+
+    pub(crate) fn matches_transition(&self, transition: &UnavailablePgPlacementTransition) -> bool {
+        self.pg_id == transition.pg_id
+            && self.transition_epoch == transition.transition_epoch
+            && self.source_epoch == transition.source_epoch
+            && self.source_acting_set == transition.source_acting_set
+            && self.destination_acting_set == transition.destination_acting_set
+    }
+}
+
+pub(crate) enum UnavailablePgReconciliationCandidate {
+    Begin {
+        pg_id: PgId,
+        unavailable_node_id: NodeId,
+    },
+    Resume(UnavailablePgReconciliationWork),
+}
+
+pub(crate) struct UnavailablePgReconciliationScan {
+    pub(crate) candidate: Option<UnavailablePgReconciliationCandidate>,
+    pub(crate) next_cursor: UnavailablePgReconciliationCursor,
+}
+
 impl UnavailablePgPlacementTransition {
     #[must_use]
     pub fn pg_id(&self) -> PgId {
@@ -1119,6 +1293,103 @@ impl ClusterControlSnapshot {
         self.retained_unavailable_pg_placement_transitions.values()
     }
 
+    pub(crate) fn scan_unavailable_pg_reconciliation(
+        &self,
+        cursor: UnavailablePgReconciliationCursor,
+        now_ms: u64,
+    ) -> UnavailablePgReconciliationScan {
+        let start = cursor
+            .after_pg_id
+            .map_or(std::ops::Bound::Unbounded, |pg_id| {
+                std::ops::Bound::Excluded(pg_id)
+            });
+        let mut records = self.pgs.range((start, std::ops::Bound::Unbounded));
+        let mut last_examined = None;
+        for _ in 0..UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE {
+            let Some((&pg_id, pg)) = records.next() else {
+                return UnavailablePgReconciliationScan {
+                    candidate: None,
+                    next_cursor: UnavailablePgReconciliationCursor::start(),
+                };
+            };
+            last_examined = Some(pg_id);
+            let active_transition = self.unavailable_pg_placement_transitions.get(&pg_id);
+            let unavailable_node_id = pg
+                .acting_set
+                .iter()
+                .copied()
+                .filter(|node_id| {
+                    active_transition
+                        .is_none_or(|transition| transition.unavailable_node.node_id != *node_id)
+                })
+                .filter_map(|node_id| {
+                    let observation = self.unavailable_node_observations.get(&node_id)?;
+                    let topology = self.initial_topology.as_ref()?;
+                    let grace_cutoff_ms = observation.observed_at_ms.checked_add(
+                        topology
+                            .placement_policy()
+                            .unavailable_replacement_grace_ms(),
+                    )?;
+                    (now_ms >= grace_cutoff_ms).then_some(node_id)
+                })
+                .min();
+            let candidate = if let Some(unavailable_node_id) = unavailable_node_id {
+                Some(UnavailablePgReconciliationCandidate::Begin {
+                    pg_id,
+                    unavailable_node_id,
+                })
+            } else {
+                active_transition.map(|transition| {
+                    let stage = if transition.destination_epoch.is_some() {
+                        UnavailablePgReconciliationStage::PayloadReadiness
+                    } else {
+                        UnavailablePgReconciliationStage::MetadataTransfer
+                    };
+                    UnavailablePgReconciliationCandidate::Resume(
+                        UnavailablePgReconciliationWork::from_transition(transition, stage),
+                    )
+                })
+            };
+            if candidate.is_some() {
+                return UnavailablePgReconciliationScan {
+                    candidate,
+                    next_cursor: UnavailablePgReconciliationCursor {
+                        after_pg_id: Some(pg_id),
+                    },
+                };
+            }
+        }
+        UnavailablePgReconciliationScan {
+            candidate: None,
+            next_cursor: UnavailablePgReconciliationCursor {
+                after_pg_id: last_examined,
+            },
+        }
+    }
+
+    fn unavailable_replacement_grace_elapsed_for_pg(
+        &self,
+        pg: &PgControlRecord,
+        now_ms: u64,
+    ) -> bool {
+        let Some(topology) = self.initial_topology.as_ref() else {
+            return false;
+        };
+        let grace_ms = topology
+            .placement_policy()
+            .unavailable_replacement_grace_ms();
+        pg.acting_set.iter().any(|node_id| {
+            self.unavailable_node_observations
+                .get(node_id)
+                .is_some_and(|observation| {
+                    observation
+                        .observed_at_ms
+                        .checked_add(grace_ms)
+                        .is_none_or(|cutoff_ms| now_ms >= cutoff_ms)
+                })
+        })
+    }
+
     pub(crate) fn begin_unavailable_pg_placement_transition_command(
         &self,
         pg_id: PgId,
@@ -1199,17 +1470,26 @@ impl ClusterControlSnapshot {
         })
     }
 
-    pub(crate) fn record_unavailable_pg_payload_readiness_command(
+    pub(crate) fn complete_unavailable_pg_placement_transition_command(
         &self,
-        pg_id: PgId,
+        work: &UnavailablePgReconciliationWork,
         ready_at_ms: u64,
     ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        let pg_id = work.pg_id();
         let transition = self
             .unavailable_pg_placement_transitions
             .get(&pg_id)
             .ok_or_else(|| ControlPlaneError::CommandDecode {
                 message: format!("PG {} has no active unavailable transition", pg_id.get()),
             })?;
+        if !work.mutation_binding().matches_transition(transition) {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} reconciliation work does not match its active transition",
+                    pg_id.get()
+                ),
+            });
+        }
         let destination_epoch =
             transition
                 .destination_epoch
@@ -1240,15 +1520,45 @@ impl ClusterControlSnapshot {
                 })
             })
             .collect::<Result<Vec<_>, ControlPlaneError>>()?;
-        Ok(ControlPlaneCommand::RecordUnavailablePgPayloadReadiness {
+        let readiness = UnavailablePgPayloadReadiness {
             pg_id,
             transition_epoch: transition.transition_epoch,
             destination_epoch,
             topology_generation: transition.topology_generation,
             topology_digest: transition.topology_digest,
             ready_at_ms,
-            destinations,
-        })
+            destinations: destinations.clone(),
+        };
+        validate_unavailable_pg_payload_readiness(self, transition, &readiness)?;
+        let mut ready_snapshot = self.clone();
+        ready_snapshot
+            .unavailable_pg_placement_transitions
+            .get_mut(&pg_id)
+            .expect("unavailable transition was validated")
+            .payload_readiness = Some(readiness);
+        let completion = ready_snapshot
+            .ready_pg_peering_completions(ready_at_ms)?
+            .into_iter()
+            .find(|completion| completion.pg_id == pg_id)
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} destination is not ready for atomic activation",
+                    pg_id.get()
+                ),
+            })?;
+        Ok(
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
+                unavailable_transition: work.mutation_binding().clone(),
+                pg_id,
+                transition_epoch: transition.transition_epoch,
+                destination_epoch,
+                topology_generation: transition.topology_generation,
+                topology_digest: transition.topology_digest,
+                ready_at_ms,
+                destinations,
+                completion,
+            },
+        )
     }
 
     pub fn cluster_map_history(&self) -> &[ClusterMapHistoryRecord] {
@@ -2201,13 +2511,19 @@ impl ClusterControlSnapshot {
         durable_snapshot: &Self,
         command: ControlPlaneCommand,
     ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        let ControlPlaneCommand::FencePgForMetadataTransfer { pg_id, .. } = command else {
+        let ControlPlaneCommand::FencePgForMetadataTransfer {
+            pg_id,
+            unavailable_transition,
+            ..
+        } = command
+        else {
             return Ok(command);
         };
         let fence_command = || ControlPlaneCommand::FencePgForMetadataTransfer {
             pg_id,
             source_primary_lease_deadline_ms: None,
             lease_horizon_authority: None,
+            unavailable_transition: unavailable_transition.clone(),
         };
         let source_deadline = |snapshot: &Self| -> Result<Option<u64>, ControlPlaneError> {
             let applied = snapshot.apply_control_plane_command(fence_command())?;
@@ -2257,6 +2573,7 @@ impl ClusterControlSnapshot {
             pg_id,
             source_primary_lease_deadline_ms: Some(live_source_deadline_ms),
             lease_horizon_authority: Some(lease_horizon_authority),
+            unavailable_transition,
         })
     }
 
@@ -2448,6 +2765,12 @@ impl ClusterControlSnapshot {
                 return Err(
                     "active unavailable PG transition key does not match its subject".into(),
                 );
+            }
+            if transition.payload_readiness.is_some() {
+                return Err(format!(
+                    "active unavailable PG transition {} retains standalone payload readiness",
+                    pg_id.get()
+                ));
             }
             validate_unavailable_pg_transition_invariant(self, transition)?;
             let pg = self.pgs.get(pg_id).ok_or_else(|| {
@@ -2968,6 +3291,9 @@ impl ClusterControlSnapshot {
         let mut ready = Vec::new();
         for record in self.pgs.values() {
             if record.state != PgState::Peering {
+                continue;
+            }
+            if self.unavailable_replacement_grace_elapsed_for_pg(record, now_ms) {
                 continue;
             }
             if self
@@ -4041,7 +4367,9 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 let record = self
                     .pg(pg_id)
                     .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-                if record.state != PgState::Peering || record.acting_set != source_acting_set {
+                if !matches!(record.state, PgState::Active | PgState::Peering)
+                    || record.acting_set != source_acting_set
+                {
                     return Err(ControlPlaneError::CommandDecode {
                         message: format!("PG {} unavailable placement source changed", pg_id.get()),
                     });
@@ -4091,14 +4419,42 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 next_snapshot
                     .unavailable_pg_placement_transitions
                     .insert(pg_id, requested);
-                next_snapshot
+                let previous_primary_lease = active_primary_lease(self, record)
+                    .or_else(|| record.previous_primary_lease.clone())
+                    .map(PreviousPrimaryLease::without_reactivation_preference);
+                let fenced_primary_lease_deadline_ms = previous_primary_lease
+                    .as_ref()
+                    .map(|lease| lease.lease_deadline_ms)
+                    .unwrap_or(supplied_observation.lease_deadline_ms);
+                let record = next_snapshot
                     .pgs
                     .get_mut(&pg_id)
-                    .expect("unavailable transition PG was validated")
-                    .acting_set = unavailable_transition_source_route_acting_set(
+                    .expect("unavailable transition PG was validated");
+                record.acting_set = unavailable_transition_source_route_acting_set(
                     &source_acting_set,
                     source_node_id,
                 );
+                record.state = PgState::Peering;
+                record.active_primary = None;
+                record.active_metadata_proof = None;
+                record.active_metadata_proof_epoch = None;
+                record.active_metadata_transfer_imported = false;
+                record.previous_primary_lease = previous_primary_lease;
+                record.peering_metadata_proof_floor =
+                    Some(begin_authorization.source_metadata_floor);
+                record.peering_metadata_proof_floor_epoch =
+                    begin_authorization.source_metadata_floor_epoch;
+                record.peering_metadata_proof_floor_imported =
+                    begin_authorization.source_metadata_floor_imported;
+                record.peering_metadata_transfer = None;
+                record.peering_metadata_transfer_source_route_epoch = None;
+                record.peering_metadata_transfer_source_node_id = None;
+                record.metadata_transfer_fenced = true;
+                record.metadata_transfer_fence_source_lease_deadline_ms =
+                    Some(fenced_primary_lease_deadline_ms);
+                record.metadata_transfer_fence_source_imported =
+                    begin_authorization.source_metadata_floor_imported;
+                record.metadata_transfer_fence_epoch = Some(expected_transition_epoch);
                 next_snapshot.bump_epoch()?;
                 Ok(applied_control_plane_command(
                     self,
@@ -4107,7 +4463,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     true,
                 ))
             }
-            ControlPlaneCommand::RecordUnavailablePgPayloadReadiness {
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
+                unavailable_transition,
                 pg_id,
                 transition_epoch,
                 destination_epoch,
@@ -4115,17 +4472,41 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 topology_digest,
                 ready_at_ms,
                 destinations,
+                completion,
             } => {
                 self.validate_serving_timestamp(ready_at_ms)?;
-                let transition = self
-                    .unavailable_pg_placement_transitions
-                    .get(&pg_id)
-                    .ok_or_else(|| ControlPlaneError::CommandDecode {
+                let Some(transition) = self.unavailable_pg_placement_transitions.get(&pg_id) else {
+                    if self
+                        .retained_unavailable_pg_placement_transitions
+                        .get(&(pg_id, unavailable_transition.transition_epoch()))
+                        .is_some_and(|retained| unavailable_transition.matches_transition(retained))
+                        && self.pg(pg_id).is_some_and(|pg| {
+                            pg.state == PgState::Active
+                                && pg.acting_set == unavailable_transition.destination_acting_set
+                        })
+                    {
+                        return Ok(applied_control_plane_command(
+                            self,
+                            self.clone(),
+                            ControlPlaneCommandResponse::CompleteUnavailablePgPlacementTransition,
+                            false,
+                        ));
+                    }
+                    return Err(ControlPlaneError::CommandDecode {
                         message: format!(
-                            "PG {} has no active unavailable placement transition",
+                            "PG {} has no matching active unavailable placement transition",
                             pg_id.get()
                         ),
-                    })?;
+                    });
+                };
+                if !unavailable_transition.matches_transition(transition) {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} completion does not match its active unavailable placement transition",
+                            pg_id.get()
+                        ),
+                    });
+                }
                 let readiness = UnavailablePgPayloadReadiness {
                     pg_id,
                     transition_epoch,
@@ -4135,26 +4516,62 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     ready_at_ms,
                     destinations,
                 };
-                if transition.payload_readiness.as_ref() == Some(&readiness) {
-                    return Ok(applied_control_plane_command(
-                        self,
-                        self.clone(),
-                        ControlPlaneCommandResponse::RecordUnavailablePgPayloadReadiness,
-                        false,
-                    ));
-                }
                 validate_unavailable_pg_payload_readiness(self, transition, &readiness)?;
-                let mut next_snapshot = self.clone();
-                next_snapshot.record_committed_timestamp(ready_at_ms);
-                next_snapshot
+                let mut ready_snapshot = self.clone();
+                ready_snapshot
                     .unavailable_pg_placement_transitions
                     .get_mut(&pg_id)
                     .expect("payload-readiness transition was validated")
                     .payload_readiness = Some(readiness);
+                validate_pg_peering_completion(PgPeeringCompletionValidation {
+                    snapshot: &ready_snapshot,
+                    pg_id,
+                    primary: completion.primary,
+                    node_incarnation: completion.node_incarnation,
+                    completed_at_ms: ready_at_ms,
+                    expected: Some(ExpectedPgPeeringCompletion {
+                        active_metadata_proof: completion.active_metadata_proof,
+                        active_metadata_proof_epoch: completion.active_metadata_proof_epoch,
+                    }),
+                })?;
+                ready_snapshot.record_committed_timestamp(ready_at_ms);
+                let record = ready_snapshot
+                    .pgs
+                    .get_mut(&pg_id)
+                    .expect("unavailable placement completion PG was validated");
+                record.state = PgState::Active;
+                record.active_primary = Some(completion.primary);
+                record.active_metadata_proof = Some(completion.active_metadata_proof);
+                record.active_metadata_transfer_imported =
+                    record.peering_metadata_transfer.is_some();
+                record.previous_primary_lease = None;
+                record.peering_metadata_proof_floor = None;
+                record.peering_metadata_proof_floor_epoch = None;
+                record.peering_metadata_proof_floor_imported = false;
+                record.peering_metadata_transfer = None;
+                record.peering_metadata_transfer_source_route_epoch = None;
+                record.peering_metadata_transfer_source_node_id = None;
+                record.metadata_transfer_fenced = false;
+                record.metadata_transfer_fence_source_lease_deadline_ms = None;
+                record.metadata_transfer_fence_source_imported = false;
+                record.metadata_transfer_fence_epoch = None;
+                let transition = ready_snapshot
+                    .unavailable_pg_placement_transitions
+                    .remove(&pg_id)
+                    .expect("completed unavailable transition was validated");
+                ready_snapshot
+                    .retained_unavailable_pg_placement_transitions
+                    .insert((pg_id, transition.transition_epoch), transition);
+                ready_snapshot.bump_epoch()?;
+                ready_snapshot
+                    .pgs
+                    .get_mut(&pg_id)
+                    .expect("unavailable placement PG activated before epoch bump")
+                    .active_metadata_proof_epoch = Some(completion.active_metadata_proof_epoch);
                 Ok(applied_control_plane_command(
                     self,
-                    next_snapshot,
-                    ControlPlaneCommandResponse::RecordUnavailablePgPayloadReadiness,
+                    ready_snapshot,
+                    ControlPlaneCommandResponse::CompleteUnavailablePgPlacementTransition,
                     true,
                 ))
             }
@@ -4301,16 +4718,23 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 acting_set,
                 transfer,
                 expected_destination_epoch,
+                unavailable_transition,
             } => {
-                if let Some(transition) = self.unavailable_pg_placement_transitions.get(&pg_id) {
-                    if acting_set != transition.destination_acting_set {
-                        return Err(ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} metadata transfer does not match its unavailable placement destination",
-                                pg_id.get()
-                            ),
-                        });
-                    }
+                validate_unavailable_transition_mutation_binding(
+                    self,
+                    pg_id,
+                    unavailable_transition.as_ref(),
+                )?;
+                if unavailable_transition
+                    .as_ref()
+                    .is_some_and(|binding| acting_set != binding.destination_acting_set)
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} metadata transfer does not match its unavailable placement destination",
+                            pg_id.get()
+                        ),
+                    });
                 }
                 validate_acting_set(self, pg_id, &acting_set)?;
                 validate_acting_set_preserves_pending_recovery(self, pg_id, &acting_set)?;
@@ -4470,7 +4894,13 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 pg_id,
                 source_primary_lease_deadline_ms: committed_source_lease_deadline_ms,
                 lease_horizon_authority,
+                unavailable_transition,
             } => {
+                validate_unavailable_transition_mutation_binding(
+                    self,
+                    pg_id,
+                    unavailable_transition.as_ref(),
+                )?;
                 let record = self
                     .pg(pg_id)
                     .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
@@ -5083,36 +5513,109 @@ fn unavailable_pg_transition_begin_authorization(
     unavailable_node: &NodeUnavailableObservation,
     begin_at_ms: u64,
 ) -> Result<UnavailablePgTransitionBeginAuthorization, ControlPlaneError> {
-    if record.state != PgState::Peering {
-        return Err(ControlPlaneError::CommandDecode {
-            message: format!(
-                "PG {} metadata-transfer source route is not Peering",
-                record.pg_id.get()
-            ),
-        });
-    }
-    let source_route = peering_metadata_read_route_for_snapshot(snapshot, record, begin_at_ms)
-        .ok_or_else(|| ControlPlaneError::CommandDecode {
-            message: format!(
-                "PG {} has no proof-qualified serving metadata-transfer source",
-                record.pg_id.get()
-            ),
-        })?;
-    let source_node_id = source_route.node_id();
+    let (source_node_id, source_metadata_proof, source_floor, source_floor_epoch, source_imported) =
+        match record.state {
+            PgState::Active => {
+                let source_node_id =
+                    record
+                        .active_primary
+                        .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                            pg_id: record.pg_id.get(),
+                            cluster_epoch: snapshot.cluster_epoch,
+                        })?;
+                let source_node = snapshot.node(source_node_id).ok_or(
+                    ControlPlaneError::UnknownActingSetNode {
+                        pg_id: record.pg_id.get(),
+                        node_id: source_node_id.as_u32(),
+                    },
+                )?;
+                if !source_node.can_serve_primary(snapshot.cluster_epoch, begin_at_ms) {
+                    return Err(ControlPlaneError::NodeLeaseExpired {
+                        node_id: source_node_id.as_u32(),
+                        now_ms: begin_at_ms,
+                        lease_deadline_ms: source_node.lease_deadline_ms,
+                    });
+                }
+                let observation = source_node.pg_observation(record.pg_id).ok_or(
+                    ControlPlaneError::PgPrimaryMissingActiveObservation {
+                        pg_id: record.pg_id.get(),
+                        node_id: source_node_id.as_u32(),
+                        cluster_epoch: snapshot.cluster_epoch,
+                    },
+                )?;
+                let source_floor = record.active_metadata_proof.ok_or(
+                    ControlPlaneError::ActivePgMissingMetadataProof {
+                        pg_id: record.pg_id.get(),
+                    },
+                )?;
+                if observation.observed_epoch != snapshot.cluster_epoch
+                    || observation.state != PgState::Active
+                    || observation.has_pending_metadata_command()
+                    || !metadata_proof_satisfies_active_primary_observation_floor(
+                        source_floor,
+                        observation.metadata_proof,
+                        metadata_proof_progress_provenance(
+                            record.active_metadata_transfer_imported,
+                            record.active_metadata_proof_epoch,
+                        ),
+                        observation.observed_epoch,
+                    )
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} Active metadata-transfer source is not exactly proof-qualified",
+                            record.pg_id.get()
+                        ),
+                    });
+                }
+                (
+                    source_node_id,
+                    observation.metadata_proof,
+                    source_floor,
+                    record.active_metadata_proof_epoch,
+                    record.active_metadata_transfer_imported,
+                )
+            }
+            PgState::Peering => {
+                let source_route =
+                    peering_metadata_read_route_for_snapshot(snapshot, record, begin_at_ms)
+                        .ok_or_else(|| ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} has no proof-qualified serving metadata-transfer source",
+                                record.pg_id.get()
+                            ),
+                        })?;
+                let source_floor =
+                    record
+                        .peering_metadata_proof_floor_context()
+                        .ok_or_else(|| ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} metadata-transfer source has no certified proof floor",
+                                record.pg_id.get()
+                            ),
+                        })?;
+                (
+                    source_route.node_id(),
+                    source_route.proof(),
+                    source_floor.proof,
+                    source_floor.epoch,
+                    source_floor.imported,
+                )
+            }
+            state => {
+                return Err(ControlPlaneError::PgNotActive {
+                    pg_id: record.pg_id.get(),
+                    cluster_epoch: snapshot.cluster_epoch,
+                    state,
+                });
+            }
+        };
     let source_node = snapshot
         .node(source_node_id)
         .expect("proof-qualified source route references a known node");
     let source_observation = source_node
         .pg_observation(record.pg_id)
         .expect("proof-qualified source route references an exact observation");
-    let source_floor = record
-        .peering_metadata_proof_floor_context()
-        .ok_or_else(|| ControlPlaneError::CommandDecode {
-            message: format!(
-                "PG {} metadata-transfer source has no certified proof floor",
-                record.pg_id.get()
-            ),
-        })?;
     let replacement_node_id = record
         .acting_set
         .iter()
@@ -5150,15 +5653,15 @@ fn unavailable_pg_transition_begin_authorization(
         begin_at_ms,
         unavailable_node: unavailable_node.clone(),
         source_route: HistoricalPgRouteRecord::from(record),
-        source_metadata_floor: source_floor.proof,
-        source_metadata_floor_epoch: source_floor.epoch,
-        source_metadata_floor_imported: source_floor.imported,
+        source_metadata_floor: source_floor,
+        source_metadata_floor_epoch: source_floor_epoch,
+        source_metadata_floor_imported: source_imported,
         source_node_id,
         source_node_incarnation: source_node.node_incarnation,
         source_endpoint: source_node.endpoint.clone(),
         source_lease_deadline_ms,
         source_observed_at_ms: source_observation.observed_at_ms,
-        source_metadata_proof: source_route.proof(),
+        source_metadata_proof,
         replacement_node_id,
         replacement_node_incarnation: replacement.node_incarnation,
         replacement_endpoint: replacement.endpoint.clone(),
@@ -5234,6 +5737,36 @@ fn validate_unavailable_pg_payload_readiness(
         }
     }
     Ok(())
+}
+
+fn validate_unavailable_transition_mutation_binding(
+    snapshot: &ClusterControlSnapshot,
+    pg_id: PgId,
+    supplied: Option<&UnavailablePgTransitionMutationBinding>,
+) -> Result<(), ControlPlaneError> {
+    let active = snapshot.unavailable_pg_placement_transitions.get(&pg_id);
+    match (active, supplied) {
+        (None, None) => Ok(()),
+        (Some(transition), Some(binding)) if binding.matches_transition(transition) => Ok(()),
+        (Some(_), None) => Err(ControlPlaneError::CommandDecode {
+            message: format!(
+                "PG {} metadata transfer requires its exact unavailable transition binding",
+                pg_id.get()
+            ),
+        }),
+        (None, Some(_)) => Err(ControlPlaneError::CommandDecode {
+            message: format!(
+                "PG {} unavailable transition binding has no active transition",
+                pg_id.get()
+            ),
+        }),
+        (Some(_), Some(_)) => Err(ControlPlaneError::CommandDecode {
+            message: format!(
+                "PG {} unavailable transition binding does not match the active transition",
+                pg_id.get()
+            ),
+        }),
+    }
 }
 
 fn validate_unavailable_pg_payload_readiness_at(
@@ -5346,19 +5879,7 @@ fn validate_unavailable_pg_transition_invariant(
     if authorization.begin_at_ms < transition.grace_cutoff_ms
         || authorization.unavailable_node != transition.unavailable_node
         || authorization.source_route.pg_id != transition.pg_id
-        || authorization.source_route.state != PgState::Peering
         || authorization.source_route.acting_set != transition.source_acting_set
-        || authorization.source_route.active_primary.is_some()
-        || authorization.source_route.peering_metadata_proof_floor
-            != Some(authorization.source_metadata_floor)
-        || authorization
-            .source_route
-            .peering_metadata_proof_floor_epoch
-            != authorization.source_metadata_floor_epoch
-        || authorization
-            .source_route
-            .peering_metadata_proof_floor_imported
-            != authorization.source_metadata_floor_imported
         || authorization.source_node_id != transition.source_node_id
         || authorization.source_node_incarnation == 0
         || authorization.source_endpoint.is_empty()
@@ -5376,30 +5897,78 @@ fn validate_unavailable_pg_transition_invariant(
             transition.pg_id.get()
         ));
     }
-    validate_peering_metadata_proof_state(
-        transition.pg_id,
-        Some(authorization.source_metadata_floor),
-        authorization.source_metadata_floor_epoch,
-        authorization.source_metadata_floor_imported,
-        authorization.source_route.peering_metadata_transfer,
-        transition.source_epoch,
-    )
-    .map_err(|error| {
-        format!(
-            "unavailable PG transition {} has invalid source proof authorization: {error}",
-            transition.pg_id.get()
-        )
-    })?;
-    let expected_source_proof = authorization
-        .source_route
-        .peering_metadata_transfer
-        .map(PgMetadataTransferProof::metadata_proof)
-        .unwrap_or(authorization.source_metadata_floor);
-    if authorization.source_metadata_proof != expected_source_proof {
-        return Err(format!(
-            "unavailable PG transition {} source proof is not certified by its route",
-            transition.pg_id.get()
-        ));
+    match authorization.source_route.state {
+        PgState::Active => {
+            if authorization.source_route.active_primary != Some(authorization.source_node_id)
+                || authorization
+                    .source_route
+                    .peering_metadata_proof_floor
+                    .is_some()
+                || authorization
+                    .source_route
+                    .peering_metadata_transfer
+                    .is_some()
+                || !metadata_proof_satisfies_active_floor(
+                    authorization.source_metadata_floor,
+                    authorization.source_metadata_proof,
+                )
+            {
+                return Err(format!(
+                    "unavailable PG transition {} has invalid Active source authorization",
+                    transition.pg_id.get()
+                ));
+            }
+        }
+        PgState::Peering => {
+            if authorization.source_route.active_primary.is_some()
+                || authorization.source_route.peering_metadata_proof_floor
+                    != Some(authorization.source_metadata_floor)
+                || authorization
+                    .source_route
+                    .peering_metadata_proof_floor_epoch
+                    != authorization.source_metadata_floor_epoch
+                || authorization
+                    .source_route
+                    .peering_metadata_proof_floor_imported
+                    != authorization.source_metadata_floor_imported
+            {
+                return Err(format!(
+                    "unavailable PG transition {} has invalid Peering source authorization",
+                    transition.pg_id.get()
+                ));
+            }
+            validate_peering_metadata_proof_state(
+                transition.pg_id,
+                Some(authorization.source_metadata_floor),
+                authorization.source_metadata_floor_epoch,
+                authorization.source_metadata_floor_imported,
+                authorization.source_route.peering_metadata_transfer,
+                transition.source_epoch,
+            )
+            .map_err(|error| {
+                format!(
+                    "unavailable PG transition {} has invalid source proof authorization: {error}",
+                    transition.pg_id.get()
+                )
+            })?;
+            let expected_source_proof = authorization
+                .source_route
+                .peering_metadata_transfer
+                .map(PgMetadataTransferProof::metadata_proof)
+                .unwrap_or(authorization.source_metadata_floor);
+            if authorization.source_metadata_proof != expected_source_proof {
+                return Err(format!(
+                    "unavailable PG transition {} source proof is not certified by its route",
+                    transition.pg_id.get()
+                ));
+            }
+        }
+        state => {
+            return Err(format!(
+                "unavailable PG transition {} has invalid source route state {state:?}",
+                transition.pg_id.get()
+            ));
+        }
     }
     if let Some(destination_route) = &transition.destination_route {
         if destination_route.pg_id != transition.pg_id
@@ -8613,14 +9182,14 @@ pub trait ControlPlaneAdmin {
         ))
     }
 
-    fn record_unavailable_pg_payload_readiness(
+    fn complete_unavailable_pg_placement_transition(
         &mut self,
-        pg_id: PgId,
+        work: &UnavailablePgReconciliationWork,
         ready_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let _ = (pg_id, ready_at_ms);
+        let _ = (work, ready_at_ms);
         Err(ControlPlaneError::rpc_remote(
-            "unavailable PG payload readiness is not supported by this authority".to_owned(),
+            "unavailable PG placement completion is not supported by this authority".to_owned(),
         ))
     }
 
@@ -8634,6 +9203,16 @@ pub trait ControlPlaneAdmin {
         pg_id: PgId,
     ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError>;
 
+    fn fence_unavailable_pg_transition_with_source_lease(
+        &mut self,
+        binding: UnavailablePgTransitionMutationBinding,
+    ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
+        let _ = binding;
+        Err(ControlPlaneError::rpc_remote(
+            "unavailable PG transition fencing is not supported by this authority".to_owned(),
+        ))
+    }
+
     fn set_pg_acting_set_with_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -8641,6 +9220,19 @@ pub trait ControlPlaneAdmin {
         transfer: PgMetadataTransferProof,
         expected_destination_epoch: ClusterEpoch,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
+
+    fn install_unavailable_pg_transition_metadata_transfer(
+        &mut self,
+        binding: UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let _ = (binding, transfer, expected_destination_epoch);
+        Err(ControlPlaneError::rpc_remote(
+            "unavailable PG transition metadata transfer is not supported by this authority"
+                .to_owned(),
+        ))
+    }
 
     fn transfer_raft_leadership_to(&mut self, node_id: u64) -> Result<(), ControlPlaneError> {
         let _ = node_id;
@@ -11649,6 +12241,14 @@ fn validate_pg_peering_completion(
             pg_id: pg_id.get(),
             cluster_epoch: snapshot.cluster_epoch,
             state: record.state,
+        });
+    }
+    if snapshot.unavailable_replacement_grace_elapsed_for_pg(record, completed_at_ms) {
+        return Err(ControlPlaneError::CommandDecode {
+            message: format!(
+                "PG {} cannot complete peering after an acting-set node's unavailable replacement grace elapsed",
+                pg_id.get()
+            ),
         });
     }
     if peering_pg_primary_for_snapshot(snapshot, record, completed_at_ms) != Some(primary) {

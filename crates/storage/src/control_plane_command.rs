@@ -11,7 +11,7 @@ use crate::control_plane::{
     NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation,
     PendingMetadataCommandObservation, PgMetadataProof, PgMetadataTransferProof,
     RuntimeMapFreshnessProof, UnavailablePgPayloadDestinationReadiness,
-    UnavailablePgTransitionBeginAuthorization,
+    UnavailablePgTransitionBeginAuthorization, UnavailablePgTransitionMutationBinding,
 };
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::types::{PgId, PgState};
@@ -24,7 +24,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 18;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 19;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -209,7 +209,8 @@ pub enum ControlPlaneCommand {
         expected_transition_epoch: ClusterEpoch,
         begin_at_ms: u64,
     },
-    RecordUnavailablePgPayloadReadiness {
+    CompleteUnavailablePgPlacementTransition {
+        unavailable_transition: UnavailablePgTransitionMutationBinding,
         pg_id: PgId,
         transition_epoch: ClusterEpoch,
         destination_epoch: ClusterEpoch,
@@ -217,6 +218,7 @@ pub enum ControlPlaneCommand {
         topology_digest: [u8; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
         ready_at_ms: u64,
         destinations: Vec<UnavailablePgPayloadDestinationReadiness>,
+        completion: ReadyPgPeeringCompletion,
     },
     EstablishLeaseGrantHorizon {
         authority: LeaseHorizonAuthorityBinding,
@@ -232,11 +234,13 @@ pub enum ControlPlaneCommand {
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
         expected_destination_epoch: ClusterEpoch,
+        unavailable_transition: Option<UnavailablePgTransitionMutationBinding>,
     },
     FencePgForMetadataTransfer {
         pg_id: PgId,
         source_primary_lease_deadline_ms: Option<u64>,
         lease_horizon_authority: Option<LeaseHorizonAuthorityBinding>,
+        unavailable_transition: Option<UnavailablePgTransitionMutationBinding>,
     },
     SetPgState {
         pg_id: PgId,
@@ -339,17 +343,21 @@ impl std::fmt::Display for ControlPlaneCommand {
                 destination_acting_set.len(),
                 expected_transition_epoch.get()
             ),
-            ControlPlaneCommand::RecordUnavailablePgPayloadReadiness {
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
+                unavailable_transition,
                 pg_id,
                 transition_epoch,
                 destinations,
+                completion,
                 ..
             } => write!(
                 f,
-                "record-unavailable-pg-payload-readiness(pg={},transition_epoch={},nodes={})",
+                "complete-unavailable-pg-placement-transition(pg={},transition_epoch={},nodes={},primary={},binding_epoch={})",
                 pg_id.get(),
                 transition_epoch.get(),
-                destinations.len()
+                destinations.len(),
+                completion.primary.as_u32(),
+                unavailable_transition.transition_epoch().get()
             ),
             ControlPlaneCommand::EstablishLeaseGrantHorizon {
                 authority,
@@ -374,22 +382,26 @@ impl std::fmt::Display for ControlPlaneCommand {
                 acting_set,
                 transfer,
                 expected_destination_epoch,
+                unavailable_transition,
             } => write!(
                 f,
-                "set-pg-acting-set-with-metadata-transfer(pg={},nodes={},source_epoch={},destination_epoch={})",
+                "set-pg-acting-set-with-metadata-transfer(pg={},nodes={},source_epoch={},destination_epoch={},unavailable_transition={})",
                 pg_id.get(),
                 acting_set.len(),
                 transfer.source_epoch().get(),
-                expected_destination_epoch.get()
+                expected_destination_epoch.get(),
+                unavailable_transition.is_some()
             ),
             ControlPlaneCommand::FencePgForMetadataTransfer {
                 pg_id,
                 source_primary_lease_deadline_ms,
                 lease_horizon_authority,
+                unavailable_transition,
             } => write!(
                 f,
-                "fence-pg-for-metadata-transfer(pg={},source_lease_deadline_ms={source_primary_lease_deadline_ms:?},lease_horizon_authority={lease_horizon_authority:?})",
-                pg_id.get()
+                "fence-pg-for-metadata-transfer(pg={},source_lease_deadline_ms={source_primary_lease_deadline_ms:?},lease_horizon_authority={lease_horizon_authority:?},unavailable_transition={})",
+                pg_id.get(),
+                unavailable_transition.is_some()
             ),
             ControlPlaneCommand::SetPgState { pg_id, state } => {
                 write!(f, "set-pg-state(pg={},state={state:?})", pg_id.get())
@@ -486,16 +498,22 @@ pub fn encode_control_plane_command(
             acting_set,
             transfer,
             expected_destination_epoch,
+            unavailable_transition,
         } => {
             write_u16(&mut out, 7);
             write_pg_acting_set(&mut out, *pg_id, acting_set)?;
             write_pg_metadata_transfer_proof(&mut out, *transfer);
             write_u64(&mut out, expected_destination_epoch.get());
+            write_unavailable_pg_transition_mutation_binding(
+                &mut out,
+                unavailable_transition.as_ref(),
+            )?;
         }
         ControlPlaneCommand::FencePgForMetadataTransfer {
             pg_id,
             source_primary_lease_deadline_ms,
             lease_horizon_authority,
+            unavailable_transition,
         } => {
             if source_primary_lease_deadline_ms.is_some() != lease_horizon_authority.is_some() {
                 return Err(command_protocol_error(
@@ -506,6 +524,10 @@ pub fn encode_control_plane_command(
             write_u32(&mut out, pg_id.get());
             write_option_u64(&mut out, *source_primary_lease_deadline_ms);
             write_lease_horizon_authority(&mut out, *lease_horizon_authority);
+            write_unavailable_pg_transition_mutation_binding(
+                &mut out,
+                unavailable_transition.as_ref(),
+            )?;
         }
         ControlPlaneCommand::SetPgState { pg_id, state } => {
             write_u16(&mut out, 9);
@@ -690,7 +712,8 @@ pub fn encode_control_plane_command(
             write_u64(&mut out, expected_transition_epoch.get());
             write_u64(&mut out, *begin_at_ms);
         }
-        ControlPlaneCommand::RecordUnavailablePgPayloadReadiness {
+        ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
+            unavailable_transition,
             pg_id,
             transition_epoch,
             destination_epoch,
@@ -698,8 +721,13 @@ pub fn encode_control_plane_command(
             topology_digest,
             ready_at_ms,
             destinations,
+            completion,
         } => {
             write_u16(&mut out, 17);
+            write_unavailable_pg_transition_mutation_binding(
+                &mut out,
+                Some(unavailable_transition),
+            )?;
             write_u32(&mut out, pg_id.get());
             write_u64(&mut out, transition_epoch.get());
             write_u64(&mut out, destination_epoch.get());
@@ -716,6 +744,11 @@ pub fn encode_control_plane_command(
                 write_string(&mut out, &destination.endpoint)?;
                 write_u64(&mut out, destination.lease_deadline_ms);
             }
+            write_u32(&mut out, completion.pg_id.get());
+            write_u32(&mut out, completion.primary.as_u32());
+            write_u64(&mut out, completion.node_incarnation);
+            write_pg_metadata_proof(&mut out, completion.active_metadata_proof);
+            write_u64(&mut out, completion.active_metadata_proof_epoch.get());
         }
         ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
             nodes,
@@ -870,6 +903,9 @@ pub fn decode_control_plane_command(
                 acting_set,
                 transfer,
                 expected_destination_epoch,
+                unavailable_transition: read_unavailable_pg_transition_mutation_binding(
+                    &mut reader,
+                )?,
             }
         }
         8 => {
@@ -885,6 +921,9 @@ pub fn decode_control_plane_command(
                 pg_id,
                 source_primary_lease_deadline_ms,
                 lease_horizon_authority,
+                unavailable_transition: read_unavailable_pg_transition_mutation_binding(
+                    &mut reader,
+                )?,
             }
         }
         9 => ControlPlaneCommand::SetPgState {
@@ -1062,6 +1101,12 @@ pub fn decode_control_plane_command(
             }
         }
         17 => {
+            let unavailable_transition =
+                read_unavailable_pg_transition_mutation_binding(&mut reader)?.ok_or_else(|| {
+                    command_protocol_error(
+                        "unavailable placement completion requires a transition binding",
+                    )
+                })?;
             let pg_id = PgId::new(reader.read_u32()?);
             let transition_epoch =
                 read_cluster_epoch(&mut reader, "payload readiness transition epoch")?;
@@ -1083,7 +1128,18 @@ pub fn decode_control_plane_command(
                     lease_deadline_ms: reader.read_u64()?,
                 });
             }
-            ControlPlaneCommand::RecordUnavailablePgPayloadReadiness {
+            let completion = ReadyPgPeeringCompletion {
+                pg_id: PgId::new(reader.read_u32()?),
+                primary: NodeId::new(reader.read_u32()?),
+                node_incarnation: reader.read_u64()?,
+                active_metadata_proof: read_pg_metadata_proof(&mut reader)?,
+                active_metadata_proof_epoch: read_cluster_epoch(
+                    &mut reader,
+                    "unavailable placement completion proof epoch",
+                )?,
+            };
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
+                unavailable_transition,
                 pg_id,
                 transition_epoch,
                 destination_epoch,
@@ -1091,6 +1147,7 @@ pub fn decode_control_plane_command(
                 topology_digest,
                 ready_at_ms,
                 destinations,
+                completion,
             }
         }
         15 => {
@@ -1361,7 +1418,7 @@ pub enum ControlPlaneCommandResponse {
     EstablishLeaseGrantHorizon,
     PromoteNodeHeartbeatLeases,
     BeginUnavailablePgPlacementTransition,
-    RecordUnavailablePgPayloadReadiness,
+    CompleteUnavailablePgPlacementTransition,
     ExpireHeartbeatLeases {
         expired_nodes: Vec<NodeId>,
         peering_pgs: Vec<PgId>,
@@ -2049,38 +2106,7 @@ fn write_unavailable_pg_transition_begin_authorization(
     authorization: &UnavailablePgTransitionBeginAuthorization,
     source_epoch: ClusterEpoch,
 ) -> Result<(), ControlPlaneError> {
-    if authorization.source_route.peering_metadata_proof_floor
-        != Some(authorization.source_metadata_floor)
-        || authorization
-            .source_route
-            .peering_metadata_proof_floor_epoch
-            != authorization.source_metadata_floor_epoch
-        || authorization
-            .source_route
-            .peering_metadata_proof_floor_imported
-            != authorization.source_metadata_floor_imported
-    {
-        return Err(ControlPlaneError::CommandDecode {
-            message: "transition source route proof authorization is not canonical".to_owned(),
-        });
-    }
-    validate_peering_metadata_proof_state(
-        authorization.source_route.pg_id,
-        authorization.source_route.peering_metadata_proof_floor,
-        authorization
-            .source_route
-            .peering_metadata_proof_floor_epoch,
-        authorization
-            .source_route
-            .peering_metadata_proof_floor_imported,
-        authorization.source_route.peering_metadata_transfer,
-        source_epoch,
-    )
-    .map_err(|error| {
-        command_protocol_error(format!(
-            "transition source proof authorization is invalid: {error}"
-        ))
-    })?;
+    validate_transition_source_proof_authorization(authorization, source_epoch)?;
     write_u64(out, authorization.begin_at_ms);
     write_u32(out, authorization.unavailable_node.node_id.as_u32());
     write_u64(out, authorization.unavailable_node.node_incarnation);
@@ -2142,6 +2168,53 @@ fn write_unavailable_pg_transition_begin_authorization(
     Ok(())
 }
 
+fn write_unavailable_pg_transition_mutation_binding(
+    out: &mut Vec<u8>,
+    binding: Option<&UnavailablePgTransitionMutationBinding>,
+) -> Result<(), ControlPlaneError> {
+    let Some(binding) = binding else {
+        write_u8(out, 0);
+        return Ok(());
+    };
+    write_u8(out, 1);
+    write_pg_acting_set(out, binding.pg_id(), binding.source_acting_set())?;
+    write_u64(out, binding.transition_epoch().get());
+    write_u64(out, binding.source_epoch().get());
+    write_pg_acting_set(out, binding.pg_id(), binding.destination_acting_set())?;
+    Ok(())
+}
+
+fn read_unavailable_pg_transition_mutation_binding(
+    reader: &mut PayloadReader<'_>,
+) -> Result<Option<UnavailablePgTransitionMutationBinding>, ControlPlaneError> {
+    match reader.read_u8()? {
+        0 => Ok(None),
+        1 => {
+            let (pg_id, source_acting_set) = read_pg_acting_set(reader)?;
+            let transition_epoch =
+                read_cluster_epoch(reader, "unavailable transition mutation epoch")?;
+            let source_epoch =
+                read_cluster_epoch(reader, "unavailable transition mutation source epoch")?;
+            let (destination_pg_id, destination_acting_set) = read_pg_acting_set(reader)?;
+            if destination_pg_id != pg_id {
+                return Err(command_protocol_error(
+                    "unavailable transition mutation source and destination PG identities differ",
+                ));
+            }
+            Ok(Some(UnavailablePgTransitionMutationBinding::new(
+                pg_id,
+                transition_epoch,
+                source_epoch,
+                source_acting_set,
+                destination_acting_set,
+            )))
+        }
+        _ => Err(command_protocol_error(
+            "unavailable transition mutation binding marker must be zero or one",
+        )),
+    }
+}
+
 fn read_unavailable_pg_transition_begin_authorization(
     reader: &mut PayloadReader<'_>,
     source_epoch: ClusterEpoch,
@@ -2182,21 +2255,25 @@ fn read_unavailable_pg_transition_begin_authorization(
             ))
         }
     };
+    let source_route = HistoricalPgRouteRecord {
+        pg_id,
+        state,
+        acting_set,
+        active_primary,
+        peering_metadata_proof_floor: (state == PgState::Peering).then_some(source_metadata_floor),
+        peering_metadata_proof_floor_epoch: (state == PgState::Peering)
+            .then_some(source_metadata_floor_epoch)
+            .flatten(),
+        peering_metadata_proof_floor_imported: state == PgState::Peering
+            && source_metadata_floor_imported,
+        peering_metadata_transfer,
+        peering_metadata_transfer_source_route_epoch,
+        peering_metadata_transfer_source_node_id,
+    };
     let authorization = UnavailablePgTransitionBeginAuthorization {
         begin_at_ms,
         unavailable_node,
-        source_route: HistoricalPgRouteRecord {
-            pg_id,
-            state,
-            acting_set,
-            active_primary,
-            peering_metadata_proof_floor: Some(source_metadata_floor),
-            peering_metadata_proof_floor_epoch: source_metadata_floor_epoch,
-            peering_metadata_proof_floor_imported: source_metadata_floor_imported,
-            peering_metadata_transfer,
-            peering_metadata_transfer_source_route_epoch,
-            peering_metadata_transfer_source_node_id,
-        },
+        source_route,
         source_metadata_floor,
         source_metadata_floor_epoch,
         source_metadata_floor_imported,
@@ -2211,24 +2288,71 @@ fn read_unavailable_pg_transition_begin_authorization(
         replacement_endpoint: reader.read_string()?.to_owned(),
         replacement_lease_deadline_ms: reader.read_u64()?,
     };
-    validate_peering_metadata_proof_state(
-        authorization.source_route.pg_id,
-        authorization.source_route.peering_metadata_proof_floor,
-        authorization
-            .source_route
-            .peering_metadata_proof_floor_epoch,
-        authorization
-            .source_route
-            .peering_metadata_proof_floor_imported,
-        authorization.source_route.peering_metadata_transfer,
-        source_epoch,
-    )
-    .map_err(|error| {
-        command_protocol_error(format!(
-            "transition source proof authorization is invalid: {error}"
-        ))
-    })?;
+    validate_transition_source_proof_authorization(&authorization, source_epoch)?;
     Ok(authorization)
+}
+
+fn validate_transition_source_proof_authorization(
+    authorization: &UnavailablePgTransitionBeginAuthorization,
+    source_epoch: ClusterEpoch,
+) -> Result<(), ControlPlaneError> {
+    let route = &authorization.source_route;
+    match route.state {
+        PgState::Active => {
+            if route.active_primary.is_none()
+                || route.peering_metadata_proof_floor.is_some()
+                || route.peering_metadata_proof_floor_epoch.is_some()
+                || route.peering_metadata_proof_floor_imported
+                || route.peering_metadata_transfer.is_some()
+                || route.peering_metadata_transfer_source_route_epoch.is_some()
+                || route.peering_metadata_transfer_source_node_id.is_some()
+                || authorization.source_metadata_floor_epoch.is_none()
+                || authorization
+                    .source_metadata_floor_epoch
+                    .is_some_and(|epoch| epoch > source_epoch)
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: "transition Active source proof authorization is not canonical"
+                        .to_owned(),
+                });
+            }
+        }
+        PgState::Peering => {
+            if route.active_primary.is_some()
+                || route.peering_metadata_proof_floor != Some(authorization.source_metadata_floor)
+                || route.peering_metadata_proof_floor_epoch
+                    != authorization.source_metadata_floor_epoch
+                || route.peering_metadata_proof_floor_imported
+                    != authorization.source_metadata_floor_imported
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: "transition Peering source proof authorization is not canonical"
+                        .to_owned(),
+                });
+            }
+            validate_peering_metadata_proof_state(
+                route.pg_id,
+                route.peering_metadata_proof_floor,
+                route.peering_metadata_proof_floor_epoch,
+                route.peering_metadata_proof_floor_imported,
+                route.peering_metadata_transfer,
+                source_epoch,
+            )
+            .map_err(|error| {
+                command_protocol_error(format!(
+                    "transition source proof authorization is invalid: {error}"
+                ))
+            })?;
+        }
+        state => {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "transition source proof authorization has invalid route state {state:?}"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn read_option_cluster_epoch(
@@ -2830,7 +2954,14 @@ mod tests {
                 expected_transition_epoch: ClusterEpoch::new(14).unwrap(),
                 begin_at_ms: 3_100,
             },
-            ControlPlaneCommand::RecordUnavailablePgPayloadReadiness {
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
+                unavailable_transition: UnavailablePgTransitionMutationBinding::new(
+                    PgId::new(3),
+                    ClusterEpoch::new(14).unwrap(),
+                    ClusterEpoch::new(13).unwrap(),
+                    vec![NodeId::new(1), NodeId::new(2)],
+                    vec![NodeId::new(3), NodeId::new(2)],
+                ),
                 pg_id: PgId::new(3),
                 transition_epoch: ClusterEpoch::new(14).unwrap(),
                 destination_epoch: ClusterEpoch::new(15).unwrap(),
@@ -2843,6 +2974,13 @@ mod tests {
                     endpoint: "/tmp/node-3.sock".to_owned(),
                     lease_deadline_ms: 4_000,
                 }],
+                completion: ReadyPgPeeringCompletion {
+                    pg_id: PgId::new(3),
+                    primary: NodeId::new(3),
+                    node_incarnation: 8,
+                    active_metadata_proof: proof,
+                    active_metadata_proof_epoch: ClusterEpoch::new(15).unwrap(),
+                },
             },
             ControlPlaneCommand::PromoteNodeHeartbeatLeases {
                 authority: LeaseHorizonAuthorityBinding::new(7, Some(11)),
@@ -2873,11 +3011,13 @@ mod tests {
                 acting_set: vec![NodeId::new(2)],
                 transfer,
                 expected_destination_epoch: ClusterEpoch::new(10).unwrap(),
+                unavailable_transition: None,
             },
             ControlPlaneCommand::FencePgForMetadataTransfer {
                 pg_id: PgId::new(3),
                 source_primary_lease_deadline_ms: Some(1_100),
                 lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(7, Some(11))),
+                unavailable_transition: None,
             },
             ControlPlaneCommand::SetPgState {
                 pg_id: PgId::new(3),
@@ -3014,6 +3154,7 @@ mod tests {
                     max_proof,
                 ),
                 expected_destination_epoch: ClusterEpoch::new(u64::MAX).unwrap(),
+                unavailable_transition: None,
             },
             ControlPlaneCommand::CompletePgPeering {
                 pg_id: PgId::new(u32::MAX),
@@ -3254,7 +3395,40 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_command_v18_aggregate_encoding_is_stable() {
+    fn control_plane_command_v18_aggregate_remains_rejected_evidence() {
+        const AGGREGATE: &[u8] = include_bytes!("control_plane/testdata/command_v18.aggregate");
+        assert_eq!(
+            (
+                AGGREGATE.len(),
+                checksum::compute_checksum(checksum::ChecksumAlgorithm::Sha256, AGGREGATE).bytes()
+            ),
+            (
+                2_689,
+                &[
+                    93, 5, 80, 35, 83, 103, 179, 1, 9, 241, 95, 74, 210, 91, 175, 179, 112, 34, 2,
+                    130, 23, 114, 131, 23, 181, 1, 103, 17, 41, 217, 191, 180,
+                ][..],
+            )
+        );
+        let mut remaining = AGGREGATE;
+        let mut count = 0usize;
+        while !remaining.is_empty() {
+            let (raw_len, tail) = remaining.split_at(4);
+            let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+            let (command, tail) = tail.split_at(len);
+            assert!(matches!(
+                decode_control_plane_command(command),
+                Err(ControlPlaneError::CommandDecode { message })
+                    if message == "unsupported control-plane command version 18"
+            ));
+            remaining = tail;
+            count += 1;
+        }
+        assert!(count > 1, "v18 aggregate must contain the command corpus");
+    }
+
+    #[test]
+    fn control_plane_command_v19_aggregate_encoding_is_stable() {
         let mut aggregate = Vec::new();
         for command in sample_commands().into_iter().chain(degenerate_commands()) {
             let encoded = encode_control_plane_command(&command).unwrap();
@@ -3272,10 +3446,10 @@ mod tests {
         assert_eq!(
             (aggregate.len(), digest),
             (
-                2_689,
+                2_791,
                 [
-                    93, 5, 80, 35, 83, 103, 179, 1, 9, 241, 95, 74, 210, 91, 175, 179, 112, 34, 2,
-                    130, 23, 114, 131, 23, 181, 1, 103, 17, 41, 217, 191, 180,
+                    161, 182, 30, 83, 204, 204, 49, 38, 140, 56, 212, 26, 17, 102, 114, 217, 8,
+                    169, 203, 68, 179, 121, 159, 148, 178, 100, 90, 184, 22, 246, 201, 28,
                 ],
             )
         );
@@ -3302,7 +3476,7 @@ mod tests {
             Err(ControlPlaneCommandFormatError::UnknownMagic)
         );
 
-        for version in [15_u16, 16, 17, 19] {
+        for version in [15_u16, 16, 17, 18, 20] {
             let mut unsupported = Vec::from(CONTROL_PLANE_COMMAND_MAGIC.as_slice());
             unsupported.extend_from_slice(&version.to_be_bytes());
             assert_eq!(
@@ -3335,7 +3509,7 @@ mod tests {
         append_control_plane_command_checksum(&mut bad_magic);
         assert_decode_error_contains(&bad_magic, "invalid control-plane command magic");
 
-        for version in [14, 15, 16, 17, 19] {
+        for version in [14, 15, 16, 17, 18, 20] {
             let encoded = encode_control_plane_command_with_version_for_test(
                 &ControlPlaneCommand::ExpireHeartbeatLeases {
                     expire_at_ms: 1_000,
@@ -3443,7 +3617,7 @@ mod tests {
         assert!(matches!(
             encode_control_plane_command(&inconsistent_transition),
             Err(ControlPlaneError::CommandDecode { message })
-                if message.contains("source route proof authorization is not canonical")
+                if message.contains("source proof authorization is not canonical")
         ));
 
         let mut invalid_provenance_transition = sample_commands()
@@ -3626,6 +3800,7 @@ mod tests {
             pg_id: PgId::new(7),
             source_primary_lease_deadline_ms: Some(1_100),
             lease_horizon_authority: None,
+            unavailable_transition: None,
         };
         assert!(matches!(
             encode_control_plane_command(&incomplete_fence),

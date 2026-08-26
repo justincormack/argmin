@@ -138,7 +138,7 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
         ),
         (
             714,
-            "5b1d3572e5bb79e54c8ade4845653381d4c35a493f69bb23287fd2ca0288414c".to_owned()
+            "7bb1df32b867390ab02c7dbef273b241afae699d82987eb8f91afa4573258bf1".to_owned()
         )
     );
 }

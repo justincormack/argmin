@@ -251,7 +251,22 @@ fn control_plane_rpc_v15_frame_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v16_frame_encoding_is_exact() {
+fn control_plane_rpc_v16_frame_remains_rejected_evidence() {
+    const FRAME: &[u8] = &[
+        97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97, 110,
+        101, 45, 114, 112, 99, 0, 16, 0, 12, 0, 0, 0, 3, 168, 219, 98, 75, 82, 215, 243, 245, 1, 2,
+        3,
+    ];
+    let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(FRAME)).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str() == "unsupported control-plane RPC version 16"
+    ));
+}
+
+#[test]
+fn control_plane_rpc_v17_frame_encoding_is_exact() {
     let frame =
         encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
             .unwrap();
@@ -260,8 +275,8 @@ fn control_plane_rpc_v16_frame_encoding_is_exact() {
         frame,
         [
             97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
-            110, 101, 45, 114, 112, 99, 0, 16, 0, 12, 0, 0, 0, 3, 168, 219, 98, 75, 82, 215, 243,
-            245, 1, 2, 3,
+            110, 101, 45, 114, 112, 99, 0, 17, 0, 12, 0, 0, 0, 3, 250, 168, 44, 232, 181, 241, 15,
+            161, 1, 2, 3,
         ]
     );
 }
@@ -1920,15 +1935,22 @@ fn canonical_control_plane_state_v31_representative_aggregate_is_stable() {
     unavailable_authority
         .begin_unavailable_pg_placement_transition(PgId::new(7), NodeId::new(1), begin_at_ms)
         .unwrap();
+    let work = unavailable_authority
+        .poll_unavailable_pg_reconciliation(
+            &mut UnavailablePgReconciliationCursor::start(),
+            begin_at_ms,
+        )
+        .unwrap()
+        .expect("new unavailable transition remains recoverable");
     snapshots.push(unavailable_authority.snapshot().clone());
     unavailable_authority
-        .set_pg_acting_set_with_metadata_transfer(
-            PgId::new(7),
-            vec![NodeId::new(3), NodeId::new(2)],
+        .install_unavailable_pg_transition_metadata_transfer(
+            work.mutation_binding().clone(),
             PgMetadataTransferProof::new(
                 unavailable_authority.snapshot().cluster_epoch(),
                 unavailable_transition_proof,
             ),
+            ClusterEpoch::new(unavailable_authority.snapshot().cluster_epoch().get() + 1).unwrap(),
         )
         .unwrap();
     let payload_ready_at_ms = unavailable_authority
@@ -1952,16 +1974,15 @@ fn canonical_control_plane_state_v31_representative_aggregate_is_stable() {
         .max_committed_timestamp_ms()
         .unwrap()
         .max(unavailable_deadline_ms + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1);
-    unavailable_authority
-        .record_unavailable_pg_payload_readiness(PgId::new(7), payload_ready_at_ms)
-        .unwrap();
-    unavailable_authority
-        .complete_pg_peering(
-            PgId::new(7),
-            NodeId::new(3),
-            node_incarnation(&unavailable_authority, 3),
+    let work = unavailable_authority
+        .poll_unavailable_pg_reconciliation(
+            &mut UnavailablePgReconciliationCursor::start(),
             payload_ready_at_ms,
         )
+        .unwrap()
+        .expect("installed unavailable transition remains recoverable");
+    unavailable_authority
+        .complete_unavailable_pg_placement_transition(&work, payload_ready_at_ms)
         .unwrap();
     snapshots.push(unavailable_authority.snapshot().clone());
 
@@ -2309,8 +2330,8 @@ fn canonical_control_plane_state_v31_representative_aggregate_is_stable() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            11_004,
-            "0870eaea3629677982ba9fc2a04edd491a2dd3ebdedc8912b1509a149cdb61f2".to_owned()
+            11_009,
+            "2832390e31e23a98c527fb924163e738f39d89e3cfcd590480527297fafc2db8".to_owned()
         )
     );
 }

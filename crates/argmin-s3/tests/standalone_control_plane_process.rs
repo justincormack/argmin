@@ -130,6 +130,10 @@ fn spawn_standalone_control_plane(
             "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
             "server-admin=admin-server-admin:1:admin-secret",
         )
+        .env(
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID",
+            "server-admin",
+        )
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()

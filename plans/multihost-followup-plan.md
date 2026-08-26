@@ -342,40 +342,62 @@ one blocked slot on affected PGs and foreground traffic progressively collapsed
 into `SlowDown`. The multihost harness had hidden this gap by invoking the live
 metadata-transfer administration command for its selected probe PG.
 
-Implementation status (2026-08-25): the control-plane state-machine slice is
-complete. Lease expiry now persists the exact unavailable incarnation,
+Implementation status (2026-08-26): the control-plane state-machine slice and
+the first bounded production reconciliation worker are complete. Lease expiry
+now persists the exact unavailable incarnation,
 endpoint, lease deadline, and authority observation. The certified initial
 topology also owns the EC shape, failure-domain identities and policy, failure
 tolerance, and exact unavailable-replacement grace interval. A new replicated
 compare-and-swap binds that evidence to the exact source PG and epoch, exact
 proof-qualified surviving metadata route and process observation, policy-valid
 Active spare process and placement, certified grace cutoff, predecessor
-transition tip, and transition epoch. Its
-commit atomically records the durable transition, establishes a
-source-authorized `Peering` route, and prevents acting-set mutation or
-activation from bypassing metadata transfer.
+transition tip, and transition epoch. Its commit atomically records the durable
+transition and converts the exact `Active` or already-`Peering` source route to
+a source-authorized fenced `Peering` route. There is no preceding generic
+`SetPgState` mutation, so a stale scan cannot fence a renewed incarnation or a
+newer route when the exact begin compare-and-swap rejects.
 
-The existing transfer command must install the exact committed destination and
-records its epoch. Explicit and batch activation then require a durable
-payload-readiness token bound to every `k + m` destination's exact node
-incarnation, endpoint, live lease, destination route, transition, topology, and
-authority time. Explicit and batch activation revalidate every token-bound
-destination process and exact lease in the activation CAS; a same-incarnation
-lease renewal invalidates readiness until it is republished. State validation
+The fence and transfer-install RPCs carry the exact transition PG, source epoch,
+source acting set, destination acting set, and transition epoch. The state
+machine rejects generic transfer mutations while a transition owns the PG and
+rejects stale exact mutations after that transition is archived or superseded.
+After transfer installation, one atomic readiness-and-activation command binds
+every `k + m` destination's exact node incarnation, endpoint, live lease,
+destination route, transition, topology, and authority time. It revalidates all
+of that evidence in the activation compare-and-swap before changing the PG to
+`Active`; no independently durable readiness token can be invalidated by the
+heartbeat that would otherwise need to consume it. A same-incarnation lease
+renewal invalidates an already-built command, and the worker must derive a new
+atomic command from current evidence. State validation
 retains the source route's proof floor, epoch, and imported provenance in route
 history, binds source and destination transfer provenance to that reconstructed
 history, and rejects coordinated transition evidence that no command could
 produce.
 Activation archives the completed tip into retained historical
 dependency state; it no longer blocks a later ordinary placement change or a
-CAS-bound successor transition. State v31 and command v18 seal the active and
-retained lineage, readiness, certified placement policy, and immutable v30/v17
-rejection evidence. The production reconciler queue, bounded discovery and
-execution, storage-side readiness evidence collection, historical payload
-backfill, terminal dependency cleanup, backpressure, maintenance modes, and
-multihost outage release gate remain to be implemented. There is deliberately
-no production transition initiator until those worker and evidence-producing
-paths exist.
+CAS-bound successor transition. State v31 and command v19 seal the active and
+retained lineage, readiness, certified placement policy, and immutable state-v30
+and command-v18 rejection evidence. Command v19 additionally seals the
+post-grace completion fence that prevents survivor heartbeats from indefinitely
+reactivating the old acting set; immutable command v18 remains rejection
+evidence. A control-plane RPC v17 adds exact transition-bound fence and install
+operations plus typed transient authority-clock wait responses, retaining the
+complete v16 operation corpus as rejection evidence. A
+control-plane-owned cursor examines at most 16 PGs per tick, commits the exact
+certified transition before dispatch, and retains one exact transition identity
+through a capacity-one storage transfer worker.
+Restart or authority failover rediscovers active durable transitions; repeated
+manager polls cannot duplicate an in-flight transfer; stale completion cannot
+activate a successor. Transfer and activation failures are deferred per PG so
+one unavailable destination does not monopolize the global worker; explicit
+durability, invariant, snapshot, and protocol failures quarantine only their
+exact transition while scanning continues. The worker uses the existing
+metadata-transfer path and activates only after every destination has supplied
+current exact metadata proof and payload-write readiness. Historical payload
+backfill, terminal dependency cleanup,
+backpressure, maintenance modes, pre-install successor selection when a newly
+chosen destination fails before route installation, operational metrics, and
+the multihost outage release gate remain to be implemented.
 
 The first implementation may use the committed static topology and the existing
 metadata-transfer and payload-backfill primitives. It does not depend on adding

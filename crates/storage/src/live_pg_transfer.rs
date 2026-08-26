@@ -9,22 +9,25 @@ use std::time::{Duration, Instant};
 use crate::control_plane::{
     AuthenticatedUnixControlPlaneClient, ClusterRuntimeMapSnapshot, ControlPlaneError,
     ControlPlaneRuntimeMapSource, PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot,
-    UnixControlPlaneClient,
+    UnavailablePgReconciliationWork, UnixControlPlaneClient,
 };
 use crate::control_plane_auth::ControlPlaneScopedCredential;
-use crate::control_plane_client_bootstrap::ControlPlaneAdminCredentialBinding;
+use crate::control_plane_client_bootstrap::{
+    ControlPlaneAdminClientBootstrap, ControlPlaneAdminCredentialBinding,
+};
 use crate::control_plane_service_client::ControlPlaneFrontendClient;
 use crate::peering::PgMetadataTransferArtifact;
 use crate::storage_rpc_transport::StorageRpcClientEndpoint;
 use crate::{
     BucketName, ClusterEpoch, EcShape, FrontendStorageRpcClientCapability,
-    LocalUnixStorageNodeClientAdmissionSettings, NodeId, ObjectKey,
-    ObjectPayloadPlacementDiagnostic, PgId, PgState, StorageCluster,
+    LivePgMetadataTransferStorageRpcClientCapability, LocalUnixStorageNodeClientAdmissionSettings,
+    NodeId, ObjectKey, ObjectPayloadPlacementDiagnostic, PgId, PgState, StorageCluster,
 };
 
 enum LivePgMetadataTransferReadDispatch {
     Plain(UnixControlPlaneClient),
     Authenticated(AuthenticatedUnixControlPlaneClient),
+    AuthenticatedAdmin(AuthenticatedUnixControlPlaneClient),
 }
 
 enum LivePgMetadataTransferAdminDispatch {
@@ -111,6 +114,28 @@ impl LivePgMetadataTransferControlPlaneClient {
         Self::new(client, read_credential, admin.credential.clone())
     }
 
+    pub fn with_admin_client(
+        admin: &ControlPlaneAdminClientBootstrap,
+    ) -> Result<Self, LivePgMetadataTransferError> {
+        let read = match &admin.credential {
+            Some(credential) => LivePgMetadataTransferReadDispatch::AuthenticatedAdmin(
+                AuthenticatedUnixControlPlaneClient::new(admin.client.clone(), credential.clone()),
+            ),
+            None => LivePgMetadataTransferReadDispatch::Plain(admin.client.clone()),
+        };
+        let admin_dispatch = match &admin.credential {
+            Some(credential) => LivePgMetadataTransferAdminDispatch::Authenticated(
+                AuthenticatedUnixControlPlaneClient::new(admin.client.clone(), credential.clone()),
+            ),
+            None => LivePgMetadataTransferAdminDispatch::Plain(admin.client.clone()),
+        };
+        Ok(Self {
+            read,
+            admin: admin_dispatch,
+            _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
+        })
+    }
+
     fn pg_runtime_map_snapshot(
         &self,
         pg_id: PgId,
@@ -122,6 +147,9 @@ impl LivePgMetadataTransferControlPlaneClient {
             }
             LivePgMetadataTransferReadDispatch::Authenticated(client) => {
                 client.pg_runtime_map_snapshot(pg_id, authority_now_ms)
+            }
+            LivePgMetadataTransferReadDispatch::AuthenticatedAdmin(client) => {
+                client.admin_pg_runtime_map_snapshot(pg_id, authority_now_ms)
             }
         }
     }
@@ -138,36 +166,53 @@ impl LivePgMetadataTransferControlPlaneClient {
             LivePgMetadataTransferReadDispatch::Authenticated(client) => {
                 client.serving_pg_runtime_map_snapshot(pg_id, authority_now_ms)
             }
+            LivePgMetadataTransferReadDispatch::AuthenticatedAdmin(client) => {
+                client.admin_serving_pg_runtime_map_snapshot(pg_id, authority_now_ms)
+            }
         }
     }
 
     fn fence_with_source_lease(
         &self,
         pg_id: PgId,
+        unavailable_transition: Option<
+            &crate::control_plane::UnavailablePgTransitionMutationBinding,
+        >,
     ) -> Result<crate::control_plane::FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
         match &self.admin {
-            LivePgMetadataTransferAdminDispatch::Plain(client) => {
-                client.fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(pg_id)
+            LivePgMetadataTransferAdminDispatch::Plain(client) => match unavailable_transition {
+                Some(binding) => client
+                    .fence_unavailable_pg_transition_runtime_map_with_source_lease_checked(binding),
+                None => client
+                    .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(pg_id),
+            },
+            LivePgMetadataTransferAdminDispatch::Authenticated(client) => {
+                let now_ms = crate::clock::current_time_millis();
+                match unavailable_transition {
+                    Some(binding) => client
+                        .fence_unavailable_pg_transition_runtime_map_with_source_lease_checked(
+                            binding, now_ms,
+                        ),
+                    None => client
+                        .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+                            pg_id, now_ms,
+                        ),
+                }
             }
-            LivePgMetadataTransferAdminDispatch::Authenticated(client) => client
-                .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
-                    pg_id,
-                    crate::clock::current_time_millis(),
-                ),
         }
     }
 
-    fn refresh_fence(&self, pg_id: PgId) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        match &self.admin {
-            LivePgMetadataTransferAdminDispatch::Plain(client) => {
-                client.fence_pg_for_metadata_transfer_runtime_map_checked(pg_id)
-            }
-            LivePgMetadataTransferAdminDispatch::Authenticated(client) => client
-                .fence_pg_for_metadata_transfer_runtime_map_checked(
-                    pg_id,
-                    crate::clock::current_time_millis(),
-                ),
-        }
+    fn refresh_fence(
+        &self,
+        pg_id: PgId,
+        unavailable_transition: Option<
+            &crate::control_plane::UnavailablePgTransitionMutationBinding,
+        >,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        Ok(self
+            .fence_with_source_lease(pg_id, unavailable_transition)?
+            .into_parts()
+            .0)
     }
 
     fn install_transfer(
@@ -176,34 +221,58 @@ impl LivePgMetadataTransferControlPlaneClient {
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
         expected_destination_epoch: ClusterEpoch,
+        unavailable_transition: Option<
+            &crate::control_plane::UnavailablePgTransitionMutationBinding,
+        >,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         match &self.admin {
-            LivePgMetadataTransferAdminDispatch::Plain(client) => client
-                .set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+            LivePgMetadataTransferAdminDispatch::Plain(client) => match unavailable_transition {
+                Some(binding) => client.install_unavailable_pg_transition_runtime_map_checked(
+                    binding,
+                    transfer,
+                    expected_destination_epoch,
+                ),
+                None => client.set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
                     pg_id,
                     acting_set,
                     transfer,
                     expected_destination_epoch,
                 ),
-            LivePgMetadataTransferAdminDispatch::Authenticated(client) => client
-                .set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
-                    pg_id,
-                    acting_set,
-                    transfer,
-                    expected_destination_epoch,
-                    crate::clock::current_time_millis(),
-                ),
+            },
+            LivePgMetadataTransferAdminDispatch::Authenticated(client) => {
+                let now_ms = crate::clock::current_time_millis();
+                match unavailable_transition {
+                    Some(binding) => client.install_unavailable_pg_transition_runtime_map_checked(
+                        binding,
+                        transfer,
+                        expected_destination_epoch,
+                        now_ms,
+                    ),
+                    None => client.set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+                        pg_id,
+                        acting_set,
+                        transfer,
+                        expected_destination_epoch,
+                        now_ms,
+                    ),
+                }
+            }
         }
     }
 }
 
+enum LivePgMetadataTransferStorageAuth {
+    Frontend(FrontendStorageRpcClientCapability),
+    LivePgMetadataTransfer(LivePgMetadataTransferStorageRpcClientCapability),
+}
+
 enum LivePgMetadataTransferStorageTransport {
     Unix {
-        auth: Option<FrontendStorageRpcClientCapability>,
+        auth: Option<LivePgMetadataTransferStorageAuth>,
     },
     ConfiguredEndpoints {
         endpoints: Vec<(NodeId, StorageRpcClientEndpoint)>,
-        auth: FrontendStorageRpcClientCapability,
+        auth: LivePgMetadataTransferStorageAuth,
     },
     #[cfg(test)]
     InProcess {
@@ -250,7 +319,41 @@ pub struct LivePgMetadataTransferSummary {
 /// remain inside their owning crate.
 pub struct LivePgMetadataTransferError {
     stage: LivePgMetadataTransferStage,
+    disposition: LivePgMetadataTransferFailureDisposition,
     _diagnostic: Box<str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LivePgMetadataTransferFailureDisposition {
+    Retryable,
+    Fatal,
+}
+
+struct LivePgMetadataTransferFailure {
+    disposition: LivePgMetadataTransferFailureDisposition,
+    diagnostic: String,
+}
+
+impl LivePgMetadataTransferFailure {
+    fn retryable(diagnostic: String) -> Self {
+        Self {
+            disposition: LivePgMetadataTransferFailureDisposition::Retryable,
+            diagnostic,
+        }
+    }
+
+    fn fatal(diagnostic: String) -> Self {
+        Self {
+            disposition: LivePgMetadataTransferFailureDisposition::Fatal,
+            diagnostic,
+        }
+    }
+}
+
+impl From<String> for LivePgMetadataTransferFailure {
+    fn from(diagnostic: String) -> Self {
+        Self::fatal(diagnostic)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,10 +416,20 @@ impl std::error::Error for LiveObjectPayloadPlacementInspectionError {}
 
 impl LivePgMetadataTransferError {
     fn new(diagnostic: String) -> Self {
-        Self::at_stage(LivePgMetadataTransferStage::Configuration, diagnostic)
+        Self::at_stage(
+            LivePgMetadataTransferStage::Configuration,
+            LivePgMetadataTransferFailure::fatal(diagnostic),
+        )
     }
 
-    fn at_stage(stage: LivePgMetadataTransferStage, diagnostic: String) -> Self {
+    fn at_stage(
+        stage: LivePgMetadataTransferStage,
+        failure: LivePgMetadataTransferFailure,
+    ) -> Self {
+        let LivePgMetadataTransferFailure {
+            disposition,
+            diagnostic,
+        } = failure;
         let _ = observability::event(
             "storage_live_pg_transfer",
             "live_pg_metadata_transfer_error",
@@ -327,8 +440,13 @@ impl LivePgMetadataTransferError {
         );
         Self {
             stage,
+            disposition,
             _diagnostic: diagnostic.into_boxed_str(),
         }
+    }
+
+    pub(crate) fn is_fatal(&self) -> bool {
+        self.disposition == LivePgMetadataTransferFailureDisposition::Fatal
     }
 
     #[cfg(test)]
@@ -342,6 +460,7 @@ impl fmt::Debug for LivePgMetadataTransferError {
         formatter
             .debug_struct("LivePgMetadataTransferError")
             .field("stage", &self.stage)
+            .field("disposition", &self.disposition)
             .field("diagnostic", &"<redacted>")
             .finish()
     }
@@ -358,6 +477,57 @@ impl fmt::Display for LivePgMetadataTransferError {
 }
 
 impl std::error::Error for LivePgMetadataTransferError {}
+
+fn control_plane_transfer_failure(
+    context: &str,
+    error: ControlPlaneError,
+) -> LivePgMetadataTransferFailure {
+    let retryable = error.is_retryable_runtime_map_observation_error()
+        || matches!(error, ControlPlaneError::RpcUnconfirmed { .. })
+        || matches!(
+            error,
+            ControlPlaneError::OpenRaftOperation {
+                kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::ForwardToLeader
+                    | crate::control_plane::ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+                ..
+            }
+        );
+    let diagnostic = format!("{context}: {}", error.retained_diagnostic_message());
+    if retryable {
+        LivePgMetadataTransferFailure::retryable(diagnostic)
+    } else {
+        LivePgMetadataTransferFailure::fatal(diagnostic)
+    }
+}
+
+fn metadata_transfer_failure(
+    context: &str,
+    error: crate::error::PgMetadataTransferError,
+) -> LivePgMetadataTransferFailure {
+    let retryable = error.requires_route_refresh_retry()
+        || error.is_transient_import_blocker()
+        || match &error {
+            crate::error::PgMetadataTransferError::Store(error)
+            | crate::error::PgMetadataTransferError::Apply(
+                crate::error::BucketSnapshotLoadError::Store(error),
+            ) => !matches!(
+                error.operation_failure_class(),
+                crate::StoreOperationFailureClass::Other
+            ),
+            crate::error::PgMetadataTransferError::Apply(
+                crate::error::BucketSnapshotLoadError::Metadata(_),
+            )
+            | crate::error::PgMetadataTransferError::Reconstruction { .. } => false,
+            crate::error::PgMetadataTransferError::PendingMetadataCommand { .. }
+            | crate::error::PgMetadataTransferError::RouteRefreshRequired { .. } => true,
+        };
+    let diagnostic = format!("{context}: {error}");
+    if retryable {
+        LivePgMetadataTransferFailure::retryable(diagnostic)
+    } else {
+        LivePgMetadataTransferFailure::fatal(diagnostic)
+    }
+}
 
 impl LivePgMetadataTransferSummary {
     #[must_use]
@@ -438,7 +608,9 @@ impl LivePgMetadataTransferAdmin {
             control_plane,
             default_ec_shape,
             admission_settings,
-            transport: LivePgMetadataTransferStorageTransport::Unix { auth },
+            transport: LivePgMetadataTransferStorageTransport::Unix {
+                auth: auth.map(LivePgMetadataTransferStorageAuth::Frontend),
+            },
             failpoint: None,
             _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             #[cfg(test)]
@@ -463,7 +635,56 @@ impl LivePgMetadataTransferAdmin {
                     .into_iter()
                     .map(|(node_id, endpoint)| (NodeId::new(node_id), endpoint))
                     .collect(),
-                auth,
+                auth: LivePgMetadataTransferStorageAuth::Frontend(auth),
+            },
+            failpoint: None,
+            _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
+            #[cfg(test)]
+            after_transfer_install_hook: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_unix_storage_nodes_and_live_pg_metadata_transfer_auth(
+        control_plane: LivePgMetadataTransferControlPlaneClient,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        auth: LivePgMetadataTransferStorageRpcClientCapability,
+    ) -> Self {
+        Self {
+            control_plane,
+            default_ec_shape,
+            admission_settings,
+            transport: LivePgMetadataTransferStorageTransport::Unix {
+                auth: Some(LivePgMetadataTransferStorageAuth::LivePgMetadataTransfer(
+                    auth,
+                )),
+            },
+            failpoint: None,
+            _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
+            #[cfg(test)]
+            after_transfer_install_hook: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_storage_rpc_endpoints_and_live_pg_metadata_transfer_auth(
+        control_plane: LivePgMetadataTransferControlPlaneClient,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        endpoints: impl IntoIterator<Item = (u32, StorageRpcClientEndpoint)>,
+        auth: LivePgMetadataTransferStorageRpcClientCapability,
+    ) -> Self {
+        Self {
+            control_plane,
+            default_ec_shape,
+            admission_settings,
+            transport: LivePgMetadataTransferStorageTransport::ConfiguredEndpoints {
+                endpoints: endpoints
+                    .into_iter()
+                    .map(|(node_id, endpoint)| (NodeId::new(node_id), endpoint))
+                    .collect(),
+                auth: LivePgMetadataTransferStorageAuth::LivePgMetadataTransfer(auth),
             },
             failpoint: None,
             _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
@@ -542,7 +763,24 @@ impl LivePgMetadataTransferAdmin {
     ) -> Result<LivePgMetadataTransferSummary, LivePgMetadataTransferError> {
         let pg_id = PgId::new(pg_id);
         let acting_set = acting_set.into_iter().map(NodeId::new).collect::<Vec<_>>();
-        self.transfer_typed(pg_id, acting_set)
+        self.transfer_typed(pg_id, acting_set, None)
+    }
+
+    pub fn transfer_unavailable_pg_reconciliation(
+        &self,
+        work: &UnavailablePgReconciliationWork,
+    ) -> Result<LivePgMetadataTransferSummary, LivePgMetadataTransferError> {
+        if work.stage() != crate::control_plane::UnavailablePgReconciliationStage::MetadataTransfer
+        {
+            return Err(LivePgMetadataTransferError::new(
+                "payload-readiness work cannot enter metadata transfer".to_owned(),
+            ));
+        }
+        self.transfer_typed(
+            work.pg_id(),
+            work.destination_acting_set().to_vec(),
+            Some(work.mutation_binding()),
+        )
     }
 
     pub fn inspect_object_payload_placement(
@@ -601,15 +839,24 @@ impl LivePgMetadataTransferAdmin {
             .map(|node| node.node_id())
             .ok_or_else(|| "control-plane runtime map has no routed nodes".to_owned())?;
         match &self.transport {
-            LivePgMetadataTransferStorageTransport::Unix { auth: Some(auth) } => {
-                StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_frontend_auth(
-                    metadata_primary_node_id,
-                    runtime_map,
-                    self.default_ec_shape,
-                    self.admission_settings,
-                    auth.clone(),
-                )
-            }
+            LivePgMetadataTransferStorageTransport::Unix {
+                auth: Some(LivePgMetadataTransferStorageAuth::Frontend(auth)),
+            } => StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_frontend_auth(
+                metadata_primary_node_id,
+                runtime_map,
+                self.default_ec_shape,
+                self.admission_settings,
+                auth.clone(),
+            ),
+            LivePgMetadataTransferStorageTransport::Unix {
+                auth: Some(LivePgMetadataTransferStorageAuth::LivePgMetadataTransfer(auth)),
+            } => StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_live_pg_metadata_transfer_auth(
+                metadata_primary_node_id,
+                runtime_map,
+                self.default_ec_shape,
+                self.admission_settings,
+                auth.clone(),
+            ),
             LivePgMetadataTransferStorageTransport::Unix { auth: None } => {
                 StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings(
                     metadata_primary_node_id,
@@ -618,9 +865,26 @@ impl LivePgMetadataTransferAdmin {
                     self.admission_settings,
                 )
             }
-            LivePgMetadataTransferStorageTransport::ConfiguredEndpoints { endpoints, auth } => {
+            LivePgMetadataTransferStorageTransport::ConfiguredEndpoints {
+                endpoints,
+                auth: LivePgMetadataTransferStorageAuth::Frontend(auth),
+            } => {
                 let scoped_endpoints = configured_endpoints_for_runtime_map(runtime_map, endpoints);
                 StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_frontend_auth(
+                    metadata_primary_node_id,
+                    runtime_map,
+                    self.default_ec_shape,
+                    self.admission_settings,
+                    scoped_endpoints,
+                    auth.clone(),
+                )
+            }
+            LivePgMetadataTransferStorageTransport::ConfiguredEndpoints {
+                endpoints,
+                auth: LivePgMetadataTransferStorageAuth::LivePgMetadataTransfer(auth),
+            } => {
+                let scoped_endpoints = configured_endpoints_for_runtime_map(runtime_map, endpoints);
+                StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_live_pg_metadata_transfer_auth(
                     metadata_primary_node_id,
                     runtime_map,
                     self.default_ec_shape,
@@ -681,82 +945,90 @@ impl LivePgMetadataTransferAdmin {
         &self,
         pg_id: PgId,
         acting_set: Vec<NodeId>,
+        unavailable_transition: Option<
+            &crate::control_plane::UnavailablePgTransitionMutationBinding,
+        >,
     ) -> Result<LivePgMetadataTransferSummary, LivePgMetadataTransferError> {
         let mut stage = LivePgMetadataTransferStage::Preflight;
-        let result = (|| -> Result<LivePgMetadataTransferSummary, String> {
-            if let Some(summary) = self.completed_summary(pg_id, &acting_set)? {
-                return Ok(summary);
-            }
-            stage = LivePgMetadataTransferStage::Fence;
-            let fenced = self
-                .control_plane
-                .fence_with_source_lease(pg_id)
-                .map_err(|error| {
-                    format!(
-                        "failed to fence live PG for metadata transfer: {}",
-                        error.retained_diagnostic_message()
-                    )
-                })?;
-            let (fenced_runtime, source_lease_deadline_ms) = fenced.into_parts();
-            let source_node_id = peering_source_node_id(&fenced_runtime, pg_id)?;
-            if let Some(source_lease_deadline_ms) = source_lease_deadline_ms {
-                wait_for_source_lease_to_expire(source_lease_deadline_ms);
-            }
-            let fenced_source_runtime =
-                self.control_plane.refresh_fence(pg_id).map_err(|error| {
-                    format!(
-                        "failed to refresh fenced PG metadata transfer map: {}",
-                        error.retained_diagnostic_message()
-                    )
-                })?;
-            peering_source_route_matches(&fenced_source_runtime, pg_id, source_node_id)?;
-            let expected_source_route = peering_route(&fenced_source_runtime, pg_id)?.clone();
-            let source_runtime = self
-                .control_plane
-                .serving_pg_runtime_map_snapshot(pg_id, crate::clock::current_time_millis())
-                .map_err(|error| {
-                    format!(
-                        "failed to obtain serving metadata transfer source map: {}",
-                        error.retained_diagnostic_message()
-                    )
-                })?;
-            let source_route = peering_route(&source_runtime, pg_id)?;
-            if !transfer_route_matches(&expected_source_route, source_route) {
-                return Err(format!(
-                "serving metadata transfer source for PG {} changed: expected route {:?}; actual route {:?}",
-                pg_id.get(), expected_source_route, source_route
-            ));
-            }
-            self.maybe_fail(LivePgMetadataTransferFailpoint::AfterFence)?;
+        let result =
+            (|| -> Result<LivePgMetadataTransferSummary, LivePgMetadataTransferFailure> {
+                if let Some(summary) = self.completed_summary(pg_id, &acting_set)? {
+                    return Ok(summary);
+                }
+                stage = LivePgMetadataTransferStage::Fence;
+                let fenced = self
+                    .control_plane
+                    .fence_with_source_lease(pg_id, unavailable_transition)
+                    .map_err(|error| {
+                        control_plane_transfer_failure(
+                            "failed to fence live PG for metadata transfer",
+                            error,
+                        )
+                    })?;
+                let (fenced_runtime, source_lease_deadline_ms) = fenced.into_parts();
+                let source_node_id = peering_source_node_id(&fenced_runtime, pg_id)?;
+                if let Some(source_lease_deadline_ms) = source_lease_deadline_ms {
+                    wait_for_source_lease_to_expire(source_lease_deadline_ms);
+                }
+                let fenced_source_runtime = self
+                    .control_plane
+                    .refresh_fence(pg_id, unavailable_transition)
+                    .map_err(|error| {
+                        control_plane_transfer_failure(
+                            "failed to refresh fenced PG metadata transfer map",
+                            error,
+                        )
+                    })?;
+                peering_source_route_matches(&fenced_source_runtime, pg_id, source_node_id)?;
+                let expected_source_route = peering_route(&fenced_source_runtime, pg_id)?.clone();
+                let source_runtime = self
+                    .control_plane
+                    .serving_pg_runtime_map_snapshot(pg_id, crate::clock::current_time_millis())
+                    .map_err(|error| {
+                        control_plane_transfer_failure(
+                            "failed to obtain serving metadata transfer source map",
+                            error,
+                        )
+                    })?;
+                let source_route = peering_route(&source_runtime, pg_id)?;
+                if !transfer_route_matches(&expected_source_route, source_route) {
+                    return Err(format!(
+                    "serving metadata transfer source for PG {} changed: expected route {:?}; actual route {:?}",
+                    pg_id.get(), expected_source_route, source_route
+                )
+                .into());
+                }
+                self.maybe_fail(LivePgMetadataTransferFailpoint::AfterFence)?;
 
-            stage = LivePgMetadataTransferStage::Export;
-            let (artifact, destination_runtime, import_epoch, imported_proof, source_node_id) =
-                if let Some(existing_transfer) = source_route.peering_metadata_transfer() {
-                    if source_route.acting_set() != acting_set.as_slice() {
-                        return Err(format!(
-                        "PG {} already has transfer marker for acting set {:?}, not requested {:?}",
-                        pg_id.get(),
-                        source_route.acting_set(),
-                        acting_set
-                    ));
-                    }
-                    let source_route_epoch = source_route
-                        .peering_metadata_transfer_source_route_epoch()
-                        .ok_or_else(|| {
-                            format!(
-                                "PG {} transfer marker is missing source route epoch",
-                                pg_id.get()
-                            )
-                        })?;
-                    let existing_source_node_id = source_route
-                        .peering_metadata_transfer_source_node_id()
-                        .ok_or_else(|| {
-                            format!(
-                                "PG {} transfer marker is missing source node id",
-                                pg_id.get()
-                            )
-                        })?;
-                    let export_runtime = source_runtime
+                stage = LivePgMetadataTransferStage::Export;
+                let (artifact, destination_runtime, import_epoch, imported_proof, source_node_id) =
+                    if let Some(existing_transfer) = source_route.peering_metadata_transfer() {
+                        if source_route.acting_set() != acting_set.as_slice() {
+                            return Err(format!(
+                            "PG {} already has transfer marker for acting set {:?}, not requested {:?}",
+                            pg_id.get(),
+                            source_route.acting_set(),
+                            acting_set
+                        )
+                        .into());
+                        }
+                        let source_route_epoch = source_route
+                            .peering_metadata_transfer_source_route_epoch()
+                            .ok_or_else(|| {
+                                format!(
+                                    "PG {} transfer marker is missing source route epoch",
+                                    pg_id.get()
+                                )
+                            })?;
+                        let existing_source_node_id = source_route
+                            .peering_metadata_transfer_source_node_id()
+                            .ok_or_else(|| {
+                                format!(
+                                    "PG {} transfer marker is missing source node id",
+                                    pg_id.get()
+                                )
+                            })?;
+                        let export_runtime = source_runtime
                     .metadata_transfer_source_runtime_map(
                         &expected_source_route,
                         source_route_epoch,
@@ -768,55 +1040,58 @@ impl LivePgMetadataTransferAdmin {
                             pg_id.get(), source_route_epoch.get(), error.retained_diagnostic_message()
                         )
                     })?;
-                    let export_route = peering_route(&export_runtime, pg_id)?;
-                    if export_route.primary_node_id() != existing_source_node_id {
-                        return Err(format!(
-                        "PG {} transfer marker source node {} does not match retained source route primary {}",
-                        pg_id.get(), existing_source_node_id.as_u32(), export_route.primary_node_id().as_u32()
-                    ));
-                    }
-                    let source_cluster = self.build_cluster(&export_runtime)?;
-                    let artifact = self.export_retrying_stale_route(
-                        &source_cluster,
-                        ExportContext {
-                            pg_id,
-                            source_node_id: existing_source_node_id,
-                            expected_current_route: source_route.clone(),
-                            export_epoch: source_route_epoch,
-                        },
-                    )?;
-                    if artifact.cluster_epoch() != existing_transfer.source_epoch()
-                        || artifact.source_metadata_proof()
-                            != existing_transfer.source_metadata_proof()
-                    {
-                        return Err(format!(
-                        "PG {} resumed transfer artifact {:?} at epoch {} does not match installed marker {:?}",
-                        pg_id.get(), artifact.source_metadata_proof(), artifact.cluster_epoch().get(), existing_transfer
-                    ));
-                    }
-                    let destination_epoch = source_route
-                        .peering_metadata_transfer_destination_epoch()
-                        .ok_or_else(|| {
-                            format!(
+                        let export_route = peering_route(&export_runtime, pg_id)?;
+                        if export_route.primary_node_id() != existing_source_node_id {
+                            return Err(format!(
+                            "PG {} transfer marker source node {} does not match retained source route primary {}",
+                            pg_id.get(), existing_source_node_id.as_u32(), export_route.primary_node_id().as_u32()
+                        )
+                        .into());
+                        }
+                        let source_cluster = self.build_cluster(&export_runtime)?;
+                        let artifact = self.export_retrying_stale_route(
+                            &source_cluster,
+                            ExportContext {
+                                pg_id,
+                                source_node_id: existing_source_node_id,
+                                expected_current_route: source_route.clone(),
+                                export_epoch: source_route_epoch,
+                            },
+                        )?;
+                        if artifact.cluster_epoch() != existing_transfer.source_epoch()
+                            || artifact.source_metadata_proof()
+                                != existing_transfer.source_metadata_proof()
+                        {
+                            return Err(format!(
+                            "PG {} resumed transfer artifact {:?} at epoch {} does not match installed marker {:?}",
+                            pg_id.get(), artifact.source_metadata_proof(), artifact.cluster_epoch().get(), existing_transfer
+                        )
+                        .into());
+                        }
+                        let destination_epoch = source_route
+                            .peering_metadata_transfer_destination_epoch()
+                            .ok_or_else(|| {
+                                format!(
                                 "PG {} transfer marker is missing its committed destination epoch",
                                 pg_id.get()
                             )
-                        })?;
-                    let recomputed_imported_proof =
-                        StorageCluster::metadata_transfer_imported_proof_at_epoch(
-                            &artifact,
-                            destination_epoch,
+                            })?;
+                        let recomputed_imported_proof =
+                            StorageCluster::metadata_transfer_imported_proof_at_epoch(
+                                &artifact,
+                                destination_epoch,
+                            )
+                            .map_err(|error| {
+                                format!("failed to compute imported PG metadata proof: {error}")
+                            })?;
+                        if recomputed_imported_proof != existing_transfer.metadata_proof() {
+                            return Err(format!(
+                            "PG {} resumed transfer imported proof {:?} does not match installed marker {:?}",
+                            pg_id.get(), recomputed_imported_proof, existing_transfer.metadata_proof()
                         )
-                        .map_err(|error| {
-                            format!("failed to compute imported PG metadata proof: {error}")
-                        })?;
-                    if recomputed_imported_proof != existing_transfer.metadata_proof() {
-                        return Err(format!(
-                        "PG {} resumed transfer imported proof {:?} does not match installed marker {:?}",
-                        pg_id.get(), recomputed_imported_proof, existing_transfer.metadata_proof()
-                    ));
-                    }
-                    let destination_runtime = source_runtime
+                        .into());
+                        }
+                        let destination_runtime = source_runtime
                     .metadata_transfer_destination_runtime_map(
                         pg_id,
                         &acting_set,
@@ -828,108 +1103,112 @@ impl LivePgMetadataTransferAdmin {
                             pg_id.get(), error.retained_diagnostic_message()
                         )
                     })?;
-                    (
-                        artifact,
-                        destination_runtime,
-                        destination_epoch,
-                        existing_transfer.metadata_proof(),
-                        existing_source_node_id,
-                    )
-                } else {
-                    let export_runtime = source_runtime
-                        .metadata_transfer_source_runtime_map(
-                            &expected_source_route,
-                            expected_source_route.cluster_epoch(),
-                            source_node_id,
-                        )
-                        .map_err(|error| {
-                            format!(
-                                "failed to authorize PG {} fenced metadata transfer source: {}",
-                                pg_id.get(),
-                                error.retained_diagnostic_message()
-                            )
-                        })?;
-                    let source_cluster = self.build_cluster(&export_runtime)?;
-                    let artifact = self.export_retrying_stale_route(
-                        &source_cluster,
-                        ExportContext {
-                            pg_id,
-                            source_node_id,
-                            expected_current_route: source_route.clone(),
-                            export_epoch: expected_source_route.cluster_epoch(),
-                        },
-                    )?;
-                    stage = LivePgMetadataTransferStage::Install;
-                    let install = self.install_transfer_retrying_epoch(
-                        pg_id,
-                        &acting_set,
-                        source_route,
-                        source_runtime.clone(),
-                        &artifact,
-                    )?;
-                    match install {
-                        TransferInstallOutcome::Ready {
-                            destination_runtime,
-                            destination_epoch,
-                            imported_proof,
-                        } => (
+                        (
                             artifact,
                             destination_runtime,
                             destination_epoch,
-                            imported_proof,
-                            source_node_id,
-                        ),
-                        TransferInstallOutcome::Completed {
-                            destination_epoch,
-                            imported_proof,
-                        } => {
-                            self.maybe_fail(LivePgMetadataTransferFailpoint::AfterTransferInstall)?;
-                            return Ok(summary(
+                            existing_transfer.metadata_proof(),
+                            existing_source_node_id,
+                        )
+                    } else {
+                        let export_runtime = source_runtime
+                            .metadata_transfer_source_runtime_map(
+                                &expected_source_route,
+                                expected_source_route.cluster_epoch(),
                                 source_node_id,
-                                artifact.cluster_epoch(),
+                            )
+                            .map_err(|error| {
+                                format!(
+                                    "failed to authorize PG {} fenced metadata transfer source: {}",
+                                    pg_id.get(),
+                                    error.retained_diagnostic_message()
+                                )
+                            })?;
+                        let source_cluster = self.build_cluster(&export_runtime)?;
+                        let artifact = self.export_retrying_stale_route(
+                            &source_cluster,
+                            ExportContext {
+                                pg_id,
+                                source_node_id,
+                                expected_current_route: source_route.clone(),
+                                export_epoch: expected_source_route.cluster_epoch(),
+                            },
+                        )?;
+                        stage = LivePgMetadataTransferStage::Install;
+                        let install = self.install_transfer_retrying_epoch(
+                            pg_id,
+                            &acting_set,
+                            source_route,
+                            source_runtime.clone(),
+                            &artifact,
+                            unavailable_transition,
+                        )?;
+                        match install {
+                            TransferInstallOutcome::Ready {
+                                destination_runtime,
                                 destination_epoch,
                                 imported_proof,
-                                false,
-                            ));
+                            } => (
+                                artifact,
+                                destination_runtime,
+                                destination_epoch,
+                                imported_proof,
+                                source_node_id,
+                            ),
+                            TransferInstallOutcome::Completed {
+                                destination_epoch,
+                                imported_proof,
+                            } => {
+                                self.maybe_fail(
+                                    LivePgMetadataTransferFailpoint::AfterTransferInstall,
+                                )?;
+                                return Ok(summary(
+                                    source_node_id,
+                                    artifact.cluster_epoch(),
+                                    destination_epoch,
+                                    imported_proof,
+                                    false,
+                                ));
+                            }
                         }
-                    }
-                };
+                    };
 
-            stage = LivePgMetadataTransferStage::Install;
-            self.maybe_fail(LivePgMetadataTransferFailpoint::AfterTransferInstall)?;
-            stage = LivePgMetadataTransferStage::Import;
-            let destination_cluster = self.build_cluster(&destination_runtime)?;
-            let expected_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
-                artifact.cluster_epoch(),
-                artifact.source_metadata_proof(),
-                imported_proof,
-            );
-            let actual_imported_proof = self.import_retrying_stale_route(
-                &destination_cluster,
-                ImportContext {
-                    pg_id,
-                    acting_set: &acting_set,
-                    destination_epoch: import_epoch,
-                    expected_transfer,
+                stage = LivePgMetadataTransferStage::Install;
+                self.maybe_fail(LivePgMetadataTransferFailpoint::AfterTransferInstall)?;
+                stage = LivePgMetadataTransferStage::Import;
+                let destination_cluster = self.build_cluster(&destination_runtime)?;
+                let expected_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+                    artifact.cluster_epoch(),
+                    artifact.source_metadata_proof(),
                     imported_proof,
-                },
-                &artifact,
-            )?;
-            if actual_imported_proof != imported_proof {
-                return Err(format!(
-                    "imported PG metadata proof {:?} did not match expected {:?}",
-                    actual_imported_proof, imported_proof
-                ));
-            }
-            self.maybe_fail(LivePgMetadataTransferFailpoint::AfterImport)?;
-            Ok(summary(
-                source_node_id,
-                artifact.cluster_epoch(),
-                import_epoch,
-                imported_proof,
-                false,
-            ))
-        })();
+                );
+                let actual_imported_proof = self.import_retrying_stale_route(
+                    &destination_cluster,
+                    ImportContext {
+                        pg_id,
+                        acting_set: &acting_set,
+                        destination_epoch: import_epoch,
+                        expected_transfer,
+                        imported_proof,
+                    },
+                    &artifact,
+                )?;
+                if actual_imported_proof != imported_proof {
+                    return Err(format!(
+                        "imported PG metadata proof {:?} did not match expected {:?}",
+                        actual_imported_proof, imported_proof
+                    )
+                    .into());
+                }
+                self.maybe_fail(LivePgMetadataTransferFailpoint::AfterImport)?;
+                Ok(summary(
+                    source_node_id,
+                    artifact.cluster_epoch(),
+                    import_epoch,
+                    imported_proof,
+                    false,
+                ))
+            })();
         result.map_err(|diagnostic| LivePgMetadataTransferError::at_stage(stage, diagnostic))
     }
 
@@ -937,7 +1216,7 @@ impl LivePgMetadataTransferAdmin {
         &self,
         pg_id: PgId,
         acting_set: &[NodeId],
-    ) -> Result<Option<LivePgMetadataTransferSummary>, String> {
+    ) -> Result<Option<LivePgMetadataTransferSummary>, LivePgMetadataTransferFailure> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let runtime_map = match self
@@ -953,9 +1232,12 @@ impl LivePgMetadataTransferAdmin {
                     continue;
                 }
                 Err(error) => {
-                    return Err(format!(
-                        "failed to fetch control-plane PG {} runtime map before metadata transfer: {}",
-                        pg_id.get(), error.retained_diagnostic_message()
+                    return Err(control_plane_transfer_failure(
+                        &format!(
+                            "failed to fetch control-plane PG {} runtime map before metadata transfer",
+                            pg_id.get()
+                        ),
+                        error,
                     ));
                 }
             };
@@ -986,7 +1268,10 @@ impl LivePgMetadataTransferAdmin {
         source_route: &PgRouteSnapshot,
         mut source_runtime: ClusterRuntimeMapSnapshot,
         artifact: &PgMetadataTransferArtifact,
-    ) -> Result<TransferInstallOutcome, String> {
+        unavailable_transition: Option<
+            &crate::control_plane::UnavailablePgTransitionMutationBinding,
+        >,
+    ) -> Result<TransferInstallOutcome, LivePgMetadataTransferFailure> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let destination_epoch = source_runtime
@@ -1010,6 +1295,7 @@ impl LivePgMetadataTransferAdmin {
                 acting_set.to_vec(),
                 transfer,
                 destination_epoch,
+                unavailable_transition,
             ) {
                 Ok(runtime) => {
                     if runtime.cluster_epoch() < destination_epoch {
@@ -1018,7 +1304,8 @@ impl LivePgMetadataTransferAdmin {
                             pg_id.get(),
                             destination_epoch.get(),
                             runtime.cluster_epoch().get()
-                        ));
+                        )
+                        .into());
                     }
                     self.run_after_transfer_install_hook();
                     let serving_runtime = loop {
@@ -1034,10 +1321,12 @@ impl LivePgMetadataTransferAdmin {
                                 thread::sleep(Duration::from_millis(100));
                             }
                             Err(error) => {
-                                return Err(format!(
-                                    "failed to obtain serving PG {} metadata transfer destination map after install: {}",
-                                    pg_id.get(),
-                                    error.retained_diagnostic_message()
+                                return Err(control_plane_transfer_failure(
+                                    &format!(
+                                        "failed to obtain serving PG {} metadata transfer destination map after install",
+                                        pg_id.get()
+                                    ),
+                                    error,
                                 ));
                             }
                         }
@@ -1048,7 +1337,8 @@ impl LivePgMetadataTransferAdmin {
                             pg_id.get(),
                             destination_epoch.get(),
                             serving_runtime.cluster_epoch().get()
-                        ));
+                        )
+                        .into());
                     }
                     if active_route_matches(&serving_runtime, pg_id, acting_set, imported_proof)? {
                         return Ok(TransferInstallOutcome::Completed {
@@ -1079,7 +1369,9 @@ impl LivePgMetadataTransferAdmin {
                     && expected_destination_epoch == destination_epoch =>
                 {
                     if Instant::now() >= deadline {
-                        return Err("failed to install transfer-backed live PG acting set before the destination-epoch retry deadline".to_owned());
+                        return Err(LivePgMetadataTransferFailure::retryable(
+                            "failed to install transfer-backed live PG acting set before the destination-epoch retry deadline".to_owned(),
+                        ));
                     }
                     source_runtime = loop {
                         match self.control_plane.serving_pg_runtime_map_snapshot(
@@ -1094,9 +1386,9 @@ impl LivePgMetadataTransferAdmin {
                                 thread::sleep(Duration::from_millis(100));
                             }
                             Err(error) => {
-                                return Err(format!(
-                                    "failed to refresh metadata transfer source map after destination epoch changed: {}",
-                                    error.retained_diagnostic_message()
+                                return Err(control_plane_transfer_failure(
+                                    "failed to refresh metadata transfer source map after destination epoch changed",
+                                    error,
                                 ));
                             }
                         }
@@ -1106,13 +1398,14 @@ impl LivePgMetadataTransferAdmin {
                         return Err(format!(
                             "metadata transfer source route for PG {} changed while rebasing the destination epoch: expected {:?}; actual {:?}",
                             pg_id.get(), source_route, refreshed_route
-                        ));
+                        )
+                        .into());
                     }
                 }
                 Err(error) => {
-                    return Err(format!(
-                        "failed to install transfer-backed live PG acting set: {}",
-                        error.retained_diagnostic_message()
+                    return Err(control_plane_transfer_failure(
+                        "failed to install transfer-backed live PG acting set",
+                        error,
                     ));
                 }
             }
@@ -1123,7 +1416,7 @@ impl LivePgMetadataTransferAdmin {
         &self,
         initial_cluster: &Arc<StorageCluster>,
         context: ExportContext,
-    ) -> Result<PgMetadataTransferArtifact, String> {
+    ) -> Result<PgMetadataTransferArtifact, LivePgMetadataTransferFailure> {
         let mut cluster = Arc::clone(initial_cluster);
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
@@ -1143,14 +1436,15 @@ impl LivePgMetadataTransferAdmin {
                         cluster = refreshed;
                     }
                     if Instant::now() >= deadline {
-                        return Err(format!(
+                        return Err(LivePgMetadataTransferFailure::retryable(format!(
                             "timed out exporting PG metadata transfer artifact: {error}"
-                        ));
+                        )));
                     }
                 }
                 Err(error) => {
-                    return Err(format!(
-                        "failed to export PG metadata transfer artifact: {error}"
+                    return Err(metadata_transfer_failure(
+                        "failed to export PG metadata transfer artifact",
+                        error,
                     ));
                 }
             }
@@ -1161,7 +1455,7 @@ impl LivePgMetadataTransferAdmin {
     fn refresh_export_route(
         &self,
         context: &ExportContext,
-    ) -> Result<Option<Arc<StorageCluster>>, String> {
+    ) -> Result<Option<Arc<StorageCluster>>, LivePgMetadataTransferFailure> {
         let runtime_map = match self
             .control_plane
             .serving_pg_runtime_map_snapshot(context.pg_id, crate::clock::current_time_millis())
@@ -1169,10 +1463,12 @@ impl LivePgMetadataTransferAdmin {
             Ok(runtime_map) => runtime_map,
             Err(error) if error.is_retryable_runtime_map_observation_error() => return Ok(None),
             Err(error) => {
-                return Err(format!(
-                    "failed to refresh live PG {} metadata transfer source state: {}",
-                    context.pg_id.get(),
-                    error.retained_diagnostic_message()
+                return Err(control_plane_transfer_failure(
+                    &format!(
+                        "failed to refresh live PG {} metadata transfer source state",
+                        context.pg_id.get()
+                    ),
+                    error,
                 ));
             }
         };
@@ -1193,7 +1489,8 @@ impl LivePgMetadataTransferAdmin {
             return Err(format!(
                 "refreshed metadata transfer source for PG {} changed: expected route {:?}; actual route {:?} at authoritative epoch {}",
                 context.pg_id.get(), context.expected_current_route, current_route, runtime_map.cluster_epoch().get()
-            ));
+            )
+            .into());
         }
         let export_epoch =
             refreshed_export_source_epoch(&runtime_map, current_route, context.export_epoch);
@@ -1214,9 +1511,10 @@ impl LivePgMetadataTransferAdmin {
             return Err(format!(
                 "refreshed PG {} metadata transfer source route at epoch {} has primary {}, expected {}",
                 context.pg_id.get(), export_epoch.get(), export_route.primary_node_id().as_u32(), context.source_node_id.as_u32()
-            ));
+            )
+            .into());
         }
-        self.build_cluster(&export_runtime).map(Some)
+        Ok(self.build_cluster(&export_runtime).map(Some)?)
     }
 
     fn import_retrying_stale_route(
@@ -1224,7 +1522,7 @@ impl LivePgMetadataTransferAdmin {
         initial_cluster: &Arc<StorageCluster>,
         context: ImportContext<'_>,
         artifact: &PgMetadataTransferArtifact,
-    ) -> Result<PgMetadataProof, String> {
+    ) -> Result<PgMetadataProof, LivePgMetadataTransferFailure> {
         let mut cluster = Arc::clone(initial_cluster);
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut first_refresh_error = None;
@@ -1251,15 +1549,16 @@ impl LivePgMetadataTransferAdmin {
                         ImportRouteRefresh::NotReady => {}
                     }
                     if Instant::now() >= deadline {
-                        return Err(format!(
+                        return Err(LivePgMetadataTransferFailure::retryable(format!(
                             "timed out importing PG metadata transfer artifact after {refresh_failures} route-refresh failures (first: {}; last: {error})",
                             first_refresh_error.as_deref().unwrap_or("<unavailable>")
-                        ));
+                        )));
                     }
                 }
                 Err(error) => {
-                    return Err(format!(
-                        "failed to import PG metadata transfer artifact: {error}"
+                    return Err(metadata_transfer_failure(
+                        "failed to import PG metadata transfer artifact",
+                        error,
                     ));
                 }
             }
@@ -1346,7 +1645,7 @@ impl LivePgMetadataTransferAdmin {
     fn refresh_import_route(
         &self,
         context: &ImportContext<'_>,
-    ) -> Result<ImportRouteRefresh, String> {
+    ) -> Result<ImportRouteRefresh, LivePgMetadataTransferFailure> {
         let observed_runtime = match self
             .control_plane
             .pg_runtime_map_snapshot(context.pg_id, crate::clock::current_time_millis())
@@ -1356,10 +1655,12 @@ impl LivePgMetadataTransferAdmin {
                 return Ok(ImportRouteRefresh::NotReady);
             }
             Err(error) => {
-                return Err(format!(
-                    "failed to refresh live PG {} metadata transfer state: {}",
-                    context.pg_id.get(),
-                    error.retained_diagnostic_message()
+                return Err(control_plane_transfer_failure(
+                    &format!(
+                        "failed to refresh live PG {} metadata transfer state",
+                        context.pg_id.get()
+                    ),
+                    error,
                 ));
             }
         };
@@ -1393,7 +1694,8 @@ impl LivePgMetadataTransferAdmin {
             return Err(format!(
                 "refreshed metadata transfer destination for PG {} does not match committed transfer state",
                 context.pg_id.get()
-            ));
+            )
+            .into());
         }
         let expected_route = route.clone();
         let runtime_map = match self
@@ -1405,10 +1707,12 @@ impl LivePgMetadataTransferAdmin {
                 return Ok(ImportRouteRefresh::NotReady);
             }
             Err(error) => {
-                return Err(format!(
-                    "failed to obtain serving PG {} metadata transfer destination map: {}",
-                    context.pg_id.get(),
-                    error.retained_diagnostic_message()
+                return Err(control_plane_transfer_failure(
+                    &format!(
+                        "failed to obtain serving PG {} metadata transfer destination map",
+                        context.pg_id.get()
+                    ),
+                    error,
                 ));
             }
         };
@@ -1426,7 +1730,8 @@ impl LivePgMetadataTransferAdmin {
             return Err(format!(
                 "serving metadata transfer destination for PG {} changed after scoped observation",
                 context.pg_id.get()
-            ));
+            )
+            .into());
         }
         let destination_runtime = runtime_map
             .metadata_transfer_destination_runtime_map(
@@ -1441,8 +1746,9 @@ impl LivePgMetadataTransferAdmin {
                     error.retained_diagnostic_message()
                 )
             })?;
-        self.build_cluster(&destination_runtime)
-            .map(ImportRouteRefresh::Retry)
+        Ok(self
+            .build_cluster(&destination_runtime)
+            .map(ImportRouteRefresh::Retry)?)
     }
 }
 
@@ -1620,14 +1926,36 @@ fn wait_for_source_lease_to_expire(lease_deadline_ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
     use crate::control_plane::{
         ControlPlaneHeartbeatSink, ControlPlaneRpcServerListener, ControlPlaneRpcServerPolicy,
-        ControlPlaneRpcServerRole, FileControlPlaneStore, NodeHeartbeat, NodeMembershipState,
-        NodePgHeartbeatObservation, SingleAuthorityControlPlane, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        ControlPlaneRpcServerRole, ControlPlaneStore, FileControlPlaneStore, NodeHeartbeat,
+        NodeMembershipState, NodePgHeartbeatObservation, SingleAuthorityControlPlane,
+        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
     };
-    use crate::control_plane_auth::{ControlPlaneAuthPrincipal, ControlPlaneScopedCredentialInput};
+    use crate::control_plane_auth::{
+        ControlPlaneAuthPrincipal, ControlPlaneScopedCredentialInput,
+        ControlPlaneScopedCredentialStore,
+    };
+    use crate::control_plane_command::ControlPlaneCommandStateMachine;
+    use crate::metadata_command::{
+        metadata_command_log_hash, CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
+        MetadataCommandLogIndex, MetadataCommandPayload,
+    };
+    use crate::node::SharedStorageNode;
+    use crate::storage_node_server::{
+        PreparedStorageNodeServer, StorageNodeProcessConfig, StorageNodeRpcListenerConfig,
+    };
+    use crate::{
+        AclGrants, BucketObjectLockConfig, BucketOwnershipControls, BucketVersioningState,
+        CreateBucketConfig, OwnerIdentity,
+    };
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
 
     fn bound_plain_control_plane(
         socket_path: &std::path::Path,
@@ -1803,6 +2131,760 @@ mod tests {
         )
     }
 
+    const COMPOSED_TRANSFER_TOPOLOGY_DIGEST: &str =
+        "89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567";
+
+    fn composed_transfer_credential() -> ControlPlaneScopedCredential {
+        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: "composed-live-pg-transfer".to_owned(),
+            credential_id: "control-plane-transfer-1".to_owned(),
+            credential_version: 1,
+            principal: ControlPlaneAuthPrincipal::Admin {
+                instance_id: "control-plane-1".to_owned(),
+            },
+            secret: b"composed-live-pg-transfer-secret".to_vec(),
+        })
+        .unwrap()
+    }
+
+    fn composed_transfer_server_auth(
+        credential: &ControlPlaneScopedCredential,
+    ) -> crate::StorageRpcServerAuthConfig {
+        crate::StorageRpcServerAuthConfig::new(
+            credential.cluster_id(),
+            ControlPlaneScopedCredentialStore::new(vec![credential.clone()]).unwrap(),
+            9,
+            COMPOSED_TRANSFER_TOPOLOGY_DIGEST,
+        )
+        .unwrap()
+    }
+
+    fn composed_transfer_capability(
+        credential: ControlPlaneScopedCredential,
+    ) -> LivePgMetadataTransferStorageRpcClientCapability {
+        LivePgMetadataTransferStorageRpcClientCapability::new_with_transport_limits(
+            credential,
+            9,
+            COMPOSED_TRANSFER_TOPOLOGY_DIGEST,
+            crate::StorageRpcTransportLimits::DEFAULT,
+        )
+        .unwrap()
+    }
+
+    fn composed_transfer_tls_certified_key() -> Arc<rustls::sign::CertifiedKey> {
+        let certificates = CertificateDer::pem_slice_iter(include_bytes!(
+            "../../s3-tests/testdata/storage-localhost-cert.pem"
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let private_key = PrivateKeyDer::from_pem_slice(include_bytes!(
+            "../../s3-tests/testdata/storage-localhost-key.pem"
+        ))
+        .unwrap();
+        Arc::new(
+            rustls::sign::CertifiedKey::from_der(
+                certificates,
+                private_key,
+                &tls_provider::build_provider(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn composed_transfer_tls_client_config() -> Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::pem_slice_iter(include_bytes!(
+                    "../../s3-tests/testdata/storage-ca-cert.pem"
+                ))
+                .next()
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+        crate::storage_rpc_transport::storage_rpc_tls_client_config(Arc::new(roots)).unwrap()
+    }
+
+    enum ComposedTransferServerWake {
+        Unix(std::path::PathBuf),
+        Tls(std::net::SocketAddr, Arc<rustls::ClientConfig>),
+    }
+
+    impl ComposedTransferServerWake {
+        fn wake(self) {
+            match self {
+                Self::Unix(path) => {
+                    drop(UnixStream::connect(path).unwrap());
+                }
+                Self::Tls(address, client_config) => {
+                    let socket = TcpStream::connect(address).unwrap();
+                    let connection = rustls::ClientConnection::new(
+                        client_config,
+                        ServerName::try_from("localhost").unwrap().to_owned(),
+                    )
+                    .unwrap();
+                    let mut stream = rustls::StreamOwned::new(connection, socket);
+                    while stream.conn.is_handshaking() {
+                        stream.conn.complete_io(&mut stream.sock).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    fn seed_composed_transfer_source(
+        data_dir: &std::path::Path,
+        node_id: NodeId,
+        pg_id: PgId,
+        source_epoch: ClusterEpoch,
+    ) -> (PgMetadataProof, MetadataCommandEnvelope) {
+        let node = SharedStorageNode::open_with_default_ec_shape_and_epoch(
+            data_dir,
+            &[pg_id.get()],
+            EcShape { k: 1, m: 0 },
+            source_epoch,
+        )
+        .unwrap();
+        let owner = OwnerIdentity::from_principal("composed-transfer-owner");
+        let grants = AclGrants::default();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                source_epoch,
+                pg_id,
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config_for_test(
+                    &CreateBucketConfig {
+                        name: "composed-transfer-bucket",
+                        owner_principal: &owner.principal,
+                        owner_canonical_id: &owner.canonical_id,
+                        acl_grants: &grants,
+                        public_read: false,
+                        public_write: false,
+                        versioning: BucketVersioningState::Disabled,
+                        object_lock: BucketObjectLockConfig::default(),
+                        ownership_controls: BucketOwnershipControls {
+                            object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                        },
+                    },
+                    1_234,
+                    1,
+                )
+                .unwrap(),
+            ),
+        );
+        let state = node
+            .get_pg(pg_id.get())
+            .unwrap()
+            .apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .unwrap();
+        (
+            PgMetadataProof::current(
+                state.applied_log_index,
+                state.applied_log_hash,
+                state.state_digest,
+            ),
+            command,
+        )
+    }
+
+    fn composed_transfer_imported_proof(
+        source: &MetadataCommandEnvelope,
+        destination_epoch: ClusterEpoch,
+        source_proof: PgMetadataProof,
+    ) -> PgMetadataProof {
+        let rebased = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                destination_epoch,
+                source.id().pg_id(),
+                source.id().log_index(),
+            ),
+            source.payload().clone(),
+        );
+        PgMetadataProof::current(
+            1,
+            metadata_command_log_hash(
+                destination_epoch,
+                rebased.id().pg_id(),
+                rebased.id().log_index(),
+                0,
+                rebased.checksum_crc64(),
+            ),
+            source_proof.state_digest,
+        )
+    }
+
+    fn spawn_composed_transfer_control_plane(
+        socket_path: &std::path::Path,
+        authority: Arc<Mutex<SingleAuthorityControlPlane<FileControlPlaneStore>>>,
+        authority_now_ms: u64,
+        stop: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
+        let listener = std::os::unix::net::UnixListener::bind(socket_path).unwrap();
+        let listener = ControlPlaneRpcServerListener::unix(
+            listener,
+            8,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let policy =
+            ControlPlaneRpcServerPolicy::new(ControlPlaneRpcServerRole::Ordinary, 8, 1024 * 1024)
+                .unwrap();
+        thread::spawn(move || {
+            listener
+                .serve_shared_until_stop_for_test(
+                    authority,
+                    policy,
+                    authority_now_ms,
+                    stop.as_ref(),
+                )
+                .unwrap();
+        })
+    }
+
+    fn authenticated_composed_nonempty_live_transfer(tcp: bool) {
+        let tmp = test_util::tempdir();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pg_id = PgId::new(11);
+        let source_node_id = NodeId::new(7);
+        let destination_node_id = NodeId::new(8);
+        let source_data_dir = tmp.path().join("source-data");
+        let destination_data_dir = tmp.path().join("destination-data");
+        let source_socket = tmp.path().join("source.sock");
+        let destination_socket = tmp.path().join("destination.sock");
+        let control_plane_socket = tmp.path().join("control-plane.sock");
+        let source_tcp_address = tcp.then(|| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        });
+        let destination_tcp_address = tcp.then(|| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        });
+        let source_advertised_endpoint = source_tcp_address.map_or_else(
+            || source_socket.display().to_string(),
+            |address| format!("tcp://localhost:{}", address.port()),
+        );
+        let destination_advertised_endpoint = destination_tcp_address.map_or_else(
+            || destination_socket.display().to_string(),
+            |address| format!("tcp://localhost:{}", address.port()),
+        );
+        let now_ms = crate::clock::current_time_millis();
+        let _time = crate::clock::test_time_override_guard(now_ms);
+
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(source_node_id, NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_node_membership(destination_node_id, NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(pg_id, vec![source_node_id])
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        let (source_proof, source_command) =
+            seed_composed_transfer_source(&source_data_dir, source_node_id, pg_id, source_epoch);
+        submit_heartbeat_until_serving(
+            &mut authority,
+            source_node_id,
+            source_advertised_endpoint.clone(),
+            10_000,
+            vec![NodePgHeartbeatObservation {
+                pg_id,
+                state: PgState::Peering,
+                metadata_proof: source_proof,
+                pending_metadata_command: None,
+            }],
+            now_ms,
+        );
+        submit_heartbeat_until_serving(
+            &mut authority,
+            destination_node_id,
+            destination_advertised_endpoint.clone(),
+            10_000,
+            Vec::new(),
+            now_ms.saturating_add(5),
+        );
+        submit_heartbeat_until_serving(
+            &mut authority,
+            source_node_id,
+            source_advertised_endpoint.clone(),
+            10_000,
+            vec![NodePgHeartbeatObservation {
+                pg_id,
+                state: PgState::Peering,
+                metadata_proof: source_proof,
+                pending_metadata_command: None,
+            }],
+            now_ms.saturating_add(8),
+        );
+        authority
+            .complete_pg_peering(pg_id, source_node_id, 1, now_ms.saturating_add(10))
+            .unwrap();
+        submit_heartbeat_until_serving(
+            &mut authority,
+            source_node_id,
+            source_advertised_endpoint.clone(),
+            10_000,
+            vec![NodePgHeartbeatObservation {
+                pg_id,
+                state: PgState::Active,
+                metadata_proof: source_proof,
+                pending_metadata_command: None,
+            }],
+            now_ms.saturating_add(15),
+        );
+
+        authority.fence_pg_for_metadata_transfer(pg_id).unwrap();
+        submit_heartbeat_until_serving(
+            &mut authority,
+            source_node_id,
+            source_advertised_endpoint.clone(),
+            10_000,
+            vec![NodePgHeartbeatObservation {
+                pg_id,
+                state: PgState::Peering,
+                metadata_proof: source_proof,
+                pending_metadata_command: None,
+            }],
+            now_ms.saturating_add(18),
+        );
+        submit_heartbeat_until_serving(
+            &mut authority,
+            destination_node_id,
+            destination_advertised_endpoint.clone(),
+            10_000,
+            Vec::new(),
+            now_ms.saturating_add(19),
+        );
+        let destination_epoch =
+            ClusterEpoch::new(authority.snapshot().cluster_epoch().get() + 1).unwrap();
+        let imported_proof =
+            composed_transfer_imported_proof(&source_command, destination_epoch, source_proof);
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            source_epoch,
+            source_proof,
+            imported_proof,
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer_at_epoch(
+                pg_id,
+                vec![destination_node_id],
+                transfer,
+                destination_epoch,
+            )
+            .unwrap();
+        submit_heartbeat_until_serving(
+            &mut authority,
+            source_node_id,
+            source_advertised_endpoint.clone(),
+            10_000,
+            Vec::new(),
+            now_ms.saturating_add(23),
+        );
+        submit_heartbeat_until_serving(
+            &mut authority,
+            destination_node_id,
+            destination_advertised_endpoint.clone(),
+            10_000,
+            Vec::new(),
+            now_ms.saturating_add(24),
+        );
+        let transfer_runtime = authority
+            .pg_runtime_map_snapshot(pg_id, now_ms.saturating_add(25))
+            .unwrap();
+
+        let source_config = StorageNodeProcessConfig::from_runtime_map(
+            source_node_id,
+            &source_data_dir,
+            EcShape { k: 1, m: 0 },
+            &transfer_runtime,
+        )
+        .unwrap();
+        let destination_config = StorageNodeProcessConfig::from_runtime_map(
+            destination_node_id,
+            &destination_data_dir,
+            EcShape { k: 1, m: 0 },
+            &transfer_runtime,
+        )
+        .unwrap();
+        let credential = composed_transfer_credential();
+        let mut source_prepared = PreparedStorageNodeServer::new(source_config)
+            .with_rpc_auth(composed_transfer_server_auth(&credential));
+        let mut destination_prepared = PreparedStorageNodeServer::new(destination_config)
+            .with_rpc_auth(composed_transfer_server_auth(&credential));
+        if tcp {
+            source_prepared =
+                source_prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp(
+                    source_tcp_address.unwrap(),
+                    composed_transfer_tls_certified_key(),
+                )
+                .unwrap()]);
+            destination_prepared = destination_prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp(
+                    destination_tcp_address.unwrap(),
+                    composed_transfer_tls_certified_key(),
+                )
+                .unwrap(),
+            ]);
+        }
+        let source_server = Arc::new(source_prepared.bind().unwrap());
+        let destination_server = Arc::new(destination_prepared.bind().unwrap());
+        let tls_client_config = tcp.then(composed_transfer_tls_client_config);
+        let source_endpoint = if let Some(client_config) = &tls_client_config {
+            let address = source_server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                source_advertised_endpoint,
+                vec![address],
+                "localhost",
+                Arc::clone(client_config),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(source_socket.clone())
+        };
+        let destination_endpoint = if let Some(client_config) = &tls_client_config {
+            let address = destination_server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                destination_advertised_endpoint,
+                vec![address],
+                "localhost",
+                Arc::clone(client_config),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(destination_socket.clone())
+        };
+
+        let source_stop = Arc::new(AtomicBool::new(false));
+        let source_join = {
+            let server = Arc::clone(&source_server);
+            let stop = Arc::clone(&source_stop);
+            thread::spawn(move || server.serve_until_stop_for_test(stop.as_ref()).unwrap())
+        };
+        let destination_stop = Arc::new(AtomicBool::new(false));
+        let destination_join = {
+            let server = Arc::clone(&destination_server);
+            let stop = Arc::clone(&destination_stop);
+            thread::spawn(move || server.serve_until_stop_for_test(stop.as_ref()).unwrap())
+        };
+        let control_plane_stop = Arc::new(AtomicBool::new(false));
+        let control_plane_join = spawn_composed_transfer_control_plane(
+            &control_plane_socket,
+            Arc::new(Mutex::new(authority)),
+            now_ms.saturating_add(100),
+            Arc::clone(&control_plane_stop),
+        );
+
+        let admin =
+            LivePgMetadataTransferAdmin::with_storage_rpc_endpoints_and_live_pg_metadata_transfer_auth(
+                bound_plain_control_plane(&control_plane_socket),
+                EcShape { k: 1, m: 0 },
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                [
+                    (source_node_id.as_u32(), source_endpoint),
+                    (destination_node_id.as_u32(), destination_endpoint),
+                ],
+                composed_transfer_capability(credential),
+            );
+        let summary = admin
+            .transfer(pg_id.get(), vec![destination_node_id.as_u32()])
+            .unwrap_or_else(|error| panic!("composed transfer failed: {}", error._diagnostic));
+        assert!(!summary.already_completed());
+        assert_eq!(summary.imported_log_index(), 1);
+        assert_eq!(
+            summary.imported_log_hash(),
+            imported_proof.applied_log_hash.value()
+        );
+        assert_eq!(
+            summary.imported_state_digest(),
+            imported_proof.state_digest.value()
+        );
+        drop(admin);
+
+        source_stop.store(true, Ordering::Release);
+        destination_stop.store(true, Ordering::Release);
+        if let Some(client_config) = tls_client_config {
+            ComposedTransferServerWake::Tls(
+                source_server.tcp_listener_addr_for_test(),
+                Arc::clone(&client_config),
+            )
+            .wake();
+            ComposedTransferServerWake::Tls(
+                destination_server.tcp_listener_addr_for_test(),
+                client_config,
+            )
+            .wake();
+        } else {
+            ComposedTransferServerWake::Unix(source_socket).wake();
+            ComposedTransferServerWake::Unix(destination_socket).wake();
+        }
+        source_join.join().unwrap();
+        destination_join.join().unwrap();
+        drop(source_server);
+        drop(destination_server);
+
+        control_plane_stop.store(true, Ordering::Release);
+        drop(UnixStream::connect(&control_plane_socket).unwrap());
+        control_plane_join.join().unwrap();
+
+        let destination_store = crate::pg_store::PgStore::open(
+            &destination_data_dir.join(format!("pg-{:04}", pg_id.get())),
+            pg_id.get(),
+        )
+        .unwrap();
+        let destination_state = destination_store.metadata_command_replica_state().unwrap();
+        assert_eq!(destination_state.applied_log_index, 1);
+        assert_eq!(
+            destination_state.applied_log_hash,
+            imported_proof.applied_log_hash
+        );
+        assert_eq!(destination_state.state_digest, imported_proof.state_digest);
+    }
+
+    #[test]
+    fn authenticated_unix_composed_nonempty_live_transfer() {
+        authenticated_composed_nonempty_live_transfer(false);
+    }
+
+    #[test]
+    fn authenticated_tls_composed_nonempty_live_transfer() {
+        authenticated_composed_nonempty_live_transfer(true);
+    }
+
+    #[test]
+    fn unavailable_pg_reconciliation_transfers_to_spare_and_activates() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let pg_id = PgId::new(19);
+        let nodes = (1..=4)
+            .map(|node_id| {
+                (
+                    NodeId::new(node_id),
+                    tmp.path()
+                        .join(format!("node-{node_id}.sock"))
+                        .display()
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let pgs = vec![(pg_id, vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)])];
+        let topology =
+            crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                7,
+                [0x7a; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                vec![1, 2, 3],
+                &nodes,
+                &pgs,
+                crate::control_plane::test_certified_storage_placement_policy(
+                    (1..=4).map(NodeId::new),
+                    3,
+                    50,
+                ),
+            )
+            .unwrap();
+        let snapshot = crate::control_plane::ClusterControlSnapshot::empty()
+            .apply_control_plane_command(
+                crate::control_plane_command::ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                    nodes: nodes.clone(),
+                    pg_acting_sets: pgs,
+                    topology,
+                },
+            )
+            .unwrap()
+            .into_snapshot();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        store.checkpoint(None, &snapshot).unwrap();
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let proof_store =
+            crate::pg_store::PgStore::open(&tmp.path().join("certified-empty-proof"), pg_id.get())
+                .unwrap();
+        let proof_state = proof_store.metadata_command_replica_state().unwrap();
+        let proof = PgMetadataProof {
+            applied_log_index: proof_state.applied_log_index,
+            applied_log_hash: proof_state.applied_log_hash,
+            state_digest: proof_state.state_digest,
+        };
+        let now_ms = crate::clock::current_time_millis();
+        for node_id in 1..=4 {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                10_000,
+                (node_id <= 3)
+                    .then_some(NodePgHeartbeatObservation {
+                        pg_id,
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    })
+                    .into_iter()
+                    .collect(),
+                now_ms + u64::from(node_id),
+            );
+        }
+        for node_id in 1..=3 {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                10_000,
+                vec![NodePgHeartbeatObservation {
+                    pg_id,
+                    state: PgState::Peering,
+                    metadata_proof: proof,
+                    pending_metadata_command: None,
+                }],
+                now_ms + 10 + u64::from(node_id),
+            );
+        }
+        authority
+            .complete_pg_peering(pg_id, NodeId::new(1), 1, now_ms + 20)
+            .unwrap();
+        for node_id in 1..=3 {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                if node_id == 1 { 50 } else { 10_000 },
+                vec![NodePgHeartbeatObservation {
+                    pg_id,
+                    state: PgState::Active,
+                    metadata_proof: proof,
+                    pending_metadata_command: None,
+                }],
+                now_ms + 30 + u64::from(node_id),
+            );
+        }
+        let failed_deadline_ms = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        authority
+            .expire_heartbeat_leases(failed_deadline_ms)
+            .unwrap();
+        for node_id in [2, 3] {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                10_000,
+                vec![NodePgHeartbeatObservation {
+                    pg_id,
+                    state: PgState::Peering,
+                    metadata_proof: proof,
+                    pending_metadata_command: None,
+                }],
+                failed_deadline_ms + u64::from(node_id),
+            );
+        }
+        submit_heartbeat_until_serving(
+            &mut authority,
+            NodeId::new(4),
+            nodes[3].1.clone(),
+            10_000,
+            Vec::new(),
+            failed_deadline_ms + 4,
+        );
+        for node_id in [2, 3] {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                10_000,
+                vec![NodePgHeartbeatObservation {
+                    pg_id,
+                    state: PgState::Peering,
+                    metadata_proof: proof,
+                    pending_metadata_command: None,
+                }],
+                failed_deadline_ms + 10 + u64::from(node_id),
+            );
+        }
+        let begin_at_ms = authority
+            .snapshot()
+            .unavailable_node_observation(NodeId::new(1))
+            .unwrap()
+            .observed_at_ms()
+            + 50;
+        let work = authority
+            .poll_unavailable_pg_reconciliation(
+                &mut crate::control_plane::UnavailablePgReconciliationCursor::start(),
+                begin_at_ms,
+            )
+            .unwrap()
+            .expect("expired acting node must produce reconciliation work");
+        assert_eq!(
+            work.destination_acting_set(),
+            &[NodeId::new(4), NodeId::new(2), NodeId::new(3)]
+        );
+
+        let authority = Arc::new(Mutex::new(authority));
+        let server = spawn_live_transfer_control_plane(
+            &socket_path,
+            Arc::clone(&authority),
+            (1..=6).map(|offset| begin_at_ms + offset).collect(),
+        );
+        let _time = crate::clock::test_time_override_guard(begin_at_ms + 10);
+        let summary = LivePgMetadataTransferAdmin::with_in_process_storage_nodes(
+            bound_plain_control_plane(&socket_path),
+            EcShape { k: 2, m: 1 },
+            tmp.path().join("storage"),
+        )
+        .transfer_unavailable_pg_reconciliation(&work)
+        .unwrap_or_else(|error| {
+            panic!(
+                "unavailable PG metadata transfer failed: {}",
+                error._diagnostic
+            )
+        });
+        server.join().unwrap();
+
+        let imported_proof = PgMetadataProof::current(
+            summary.imported_log_index(),
+            summary.imported_log_hash(),
+            summary.imported_state_digest(),
+        );
+        let mut authority = authority.lock().unwrap();
+        for (offset, node_id) in [4, 2, 3].into_iter().enumerate() {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                10_000,
+                vec![NodePgHeartbeatObservation {
+                    pg_id,
+                    state: PgState::Peering,
+                    metadata_proof: imported_proof,
+                    pending_metadata_command: None,
+                }],
+                begin_at_ms + 20 + u64::try_from(offset).unwrap(),
+            );
+        }
+        let complete_at_ms = failed_deadline_ms
+            .saturating_add(crate::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS)
+            .saturating_add(1);
+        assert!(authority
+            .complete_unavailable_pg_reconciliation(&work, complete_at_ms)
+            .unwrap());
+        let pg = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(pg.state(), PgState::Active);
+        assert_eq!(
+            pg.acting_set(),
+            &[NodeId::new(4), NodeId::new(2), NodeId::new(3)]
+        );
+    }
+
     fn frontend_storage_rpc_capability() -> FrontendStorageRpcClientCapability {
         let credential = crate::control_plane_auth::ControlPlaneScopedCredential::new(
             ControlPlaneScopedCredentialInput {
@@ -1963,10 +3045,119 @@ mod tests {
         );
         assert_eq!(
             format!("{error:?}"),
-            "LivePgMetadataTransferError { stage: Configuration, diagnostic: \"<redacted>\" }"
+            "LivePgMetadataTransferError { stage: Configuration, disposition: Fatal, diagnostic: \"<redacted>\" }"
         );
         assert!(!error.to_string().contains(secret));
         assert!(!format!("{error:?}").contains(secret));
+    }
+
+    #[test]
+    fn live_transfer_failure_disposition_preserves_fatal_and_retryable_evidence() {
+        let fatal = control_plane_transfer_failure(
+            "test fatal Raft operation",
+            ControlPlaneError::OpenRaftOperation {
+                kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::Fatal,
+                message: "fatal state-machine failure".to_owned(),
+            },
+        );
+        assert_eq!(
+            fatal.disposition,
+            LivePgMetadataTransferFailureDisposition::Fatal
+        );
+        let retryable = control_plane_transfer_failure(
+            "test leader transition",
+            ControlPlaneError::OpenRaftOperation {
+                kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                message: "leadership changed".to_owned(),
+            },
+        );
+        assert_eq!(
+            retryable.disposition,
+            LivePgMetadataTransferFailureDisposition::Retryable
+        );
+
+        for clock_wait in [
+            ControlPlaneError::AuthorityClockLeadershipChanged {
+                established_term: Some(7),
+                current_term: 8,
+            },
+            ControlPlaneError::AuthorityClockSampleWindowTooWide {
+                narrowest_window_ms: 3,
+                max_window_ms: 2,
+            },
+            ControlPlaneError::AuthorityClockSourceUnavailable,
+            ControlPlaneError::AuthorityClockNotEstablished {
+                blocked_reason: Some(
+                    crate::control_plane::ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged,
+                ),
+            },
+            ControlPlaneError::CommittedTimestampRegression {
+                timestamp_ms: 9,
+                max_committed_timestamp_ms: 10,
+            },
+            ControlPlaneError::CommittedTimestampTooFarAhead {
+                timestamp_ms: 12,
+                max_committed_timestamp_ms: 10,
+                max_forward_jump_ms: 1,
+            },
+            ControlPlaneError::PreviousLeaseGrantHorizonStillActive {
+                authority_now_ms: 10,
+                fenced_until_ms: 11,
+            },
+        ] {
+            let clock_transition =
+                control_plane_transfer_failure("test authority clock wait", clock_wait);
+            assert_eq!(
+                clock_transition.disposition,
+                LivePgMetadataTransferFailureDisposition::Retryable
+            );
+        }
+
+        for kind in [
+            std::io::ErrorKind::AddrNotAvailable,
+            std::io::ErrorKind::HostUnreachable,
+            std::io::ErrorKind::NetworkUnreachable,
+            std::io::ErrorKind::NetworkDown,
+        ] {
+            let network_transition = control_plane_transfer_failure(
+                "test control-plane network transition",
+                ControlPlaneError::io("connect control-plane RPC", std::io::Error::from(kind)),
+            );
+            assert_eq!(
+                network_transition.disposition,
+                LivePgMetadataTransferFailureDisposition::Retryable,
+                "network reachability failure {kind:?} must defer reconciliation"
+            );
+        }
+
+        for class in [
+            crate::StoreOperationFailureClass::ResourceExhausted,
+            crate::StoreOperationFailureClass::MetadataCommandContention,
+            crate::StoreOperationFailureClass::RetryableConvergence,
+        ] {
+            let failure = metadata_transfer_failure(
+                "test transient storage operation",
+                crate::error::PgMetadataTransferError::Store(
+                    crate::test_support::store_error_for_operation_failure_class(class),
+                ),
+            );
+            assert_eq!(
+                failure.disposition,
+                LivePgMetadataTransferFailureDisposition::Retryable
+            );
+        }
+        let fatal = metadata_transfer_failure(
+            "test fatal storage operation",
+            crate::error::PgMetadataTransferError::Store(
+                crate::test_support::store_error_for_operation_failure_class(
+                    crate::StoreOperationFailureClass::Other,
+                ),
+            ),
+        );
+        assert_eq!(
+            fatal.disposition,
+            LivePgMetadataTransferFailureDisposition::Fatal
+        );
     }
 
     #[test]
@@ -2517,7 +3708,9 @@ mod tests {
             Ok(_) => panic!("import refresh must reject a mismatched Active proof"),
         };
 
-        assert!(error.contains("does not match expected imported proof"));
+        assert!(error
+            .diagnostic
+            .contains("does not match expected imported proof"));
         server.join().unwrap();
     }
 

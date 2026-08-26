@@ -2147,6 +2147,36 @@ impl UnixControlPlaneClient {
         })
     }
 
+    pub(crate) fn fence_unavailable_pg_transition_runtime_map_with_source_lease_checked(
+        &self,
+        binding: &UnavailablePgTransitionMutationBinding,
+    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+        let pg_id = binding.pg_id();
+        retry_checked_metadata_transfer_fence(pg_id, |deadline| {
+            let mut payload = Vec::new();
+            write_unavailable_pg_transition_mutation_binding(&mut payload, binding)?;
+            let payload = self.send_mutating_request_until(
+                ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap,
+                &payload,
+                deadline,
+            )?;
+            decode_admin_mutation_success(
+                ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap,
+                || {
+                    let mut reader = PayloadReader::new(&payload);
+                    let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+                    let source_primary_lease_deadline_ms = reader.read_option_u64()?;
+                    reader.finish()?;
+                    Ok(FencedPgMetadataTransferRuntimeMap::new(
+                        runtime_map,
+                        source_primary_lease_deadline_ms,
+                    ))
+                },
+            )
+            .and_then(|fenced| self.validate_metadata_transfer_fence_response(pg_id, fenced))
+        })
+    }
+
     pub(crate) fn set_pg_acting_set_with_metadata_transfer(
         &self,
         pg_id: PgId,
@@ -2384,6 +2414,41 @@ impl UnixControlPlaneClient {
         }
     }
 
+    pub(crate) fn install_unavailable_pg_transition_runtime_map_checked(
+        &self,
+        binding: &UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_unavailable_pg_transition_mutation_binding(&mut payload, binding)?;
+        write_rpc_pg_metadata_transfer_proof(&mut payload, transfer);
+        write_u64(&mut payload, expected_destination_epoch.get());
+        let kind = ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap;
+        let payload =
+            self.send_mutating_request_with_read_timeout(kind, &payload, CONTROL_PLANE_RPC_IO_TIMEOUT)?;
+        decode_admin_mutation_success(kind, || {
+            let mut reader = PayloadReader::new(&payload);
+            let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+            reader.finish()?;
+            if !metadata_transfer_install_applied(
+                &runtime_map,
+                binding.pg_id(),
+                binding.destination_acting_set(),
+                transfer,
+                expected_destination_epoch,
+            ) {
+                return Err(ControlPlaneError::RpcUnconfirmed {
+                    message: format!(
+                        "unavailable transition metadata-transfer install for PG {} returned without the expected exact route/proof",
+                        binding.pg_id().get()
+                    ),
+                });
+            }
+            Ok(runtime_map)
+        })
+    }
+
     pub fn transfer_raft_leadership_to(&self, node_id: u64) -> Result<(), ControlPlaneError> {
         let mut payload = Vec::new();
         write_u64(&mut payload, node_id);
@@ -2564,7 +2629,11 @@ impl AuthenticatedUnixControlPlaneClient {
     ) -> Result<Vec<u8>, ControlPlaneError> {
         debug_assert!(
             kind.auth_operation() == ControlPlaneAuthOperation::AdminControlPlaneCommand
-                || kind == ControlPlaneRpcKind::PgRuntimeMapSnapshot
+                || matches!(
+                    kind,
+                    ControlPlaneRpcKind::PgRuntimeMapSnapshot
+                        | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot
+                )
         );
         let expires_at_ms = authority_now_ms
             .checked_add(CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS)
@@ -2722,9 +2791,10 @@ impl AuthenticatedUnixControlPlaneClient {
         write_pg_id_request(&mut payload, pg_id);
         let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
         let response = loop {
+            let attempt_deadline = (Instant::now() + read_timeout).min(deadline);
             match self.send_verified_request_with_endpoint_failover_until(
                 ControlPlaneRpcKind::PgRuntimeMapSnapshot,
-                Instant::now() + read_timeout,
+                attempt_deadline,
                 || {
                     self.sign_admin_control_plane_request(
                         ControlPlaneRpcKind::PgRuntimeMapSnapshot,
@@ -2735,6 +2805,64 @@ impl AuthenticatedUnixControlPlaneClient {
                 |response| {
                     self.verify_admin_control_plane_response(
                         ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+                        retry_clock.now_ms(),
+                        response,
+                    )
+                },
+            ) {
+                Ok(response) => break response,
+                Err(error)
+                    if error.is_retryable_read_only_rpc_transport_error()
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let mut reader = PayloadReader::new(&response);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
+    }
+
+    pub(crate) fn admin_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.admin_pg_runtime_map_snapshot_with_read_timeout(
+            pg_id,
+            AuthenticatedAdminRetryClock::new(authority_now_ms),
+            CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn admin_serving_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, pg_id);
+        let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
+        let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
+        let response = loop {
+            let attempt_deadline =
+                (Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT).min(deadline);
+            match self.send_verified_request_with_endpoint_failover_until(
+                ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot,
+                attempt_deadline,
+                || {
+                    self.sign_admin_control_plane_request(
+                        ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot,
+                        retry_clock.now_ms(),
+                        payload.clone(),
+                    )
+                },
+                |response| {
+                    self.verify_admin_control_plane_response(
+                        ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot,
                         retry_clock.now_ms(),
                         response,
                     )
@@ -3156,6 +3284,44 @@ impl AuthenticatedUnixControlPlaneClient {
         )
     }
 
+    pub(crate) fn fence_unavailable_pg_transition_runtime_map_with_source_lease_checked(
+        &self,
+        binding: &UnavailablePgTransitionMutationBinding,
+        authority_now_ms: u64,
+    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+        let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
+        let pg_id = binding.pg_id();
+        retry_checked_metadata_transfer_fence(pg_id, |deadline| {
+            let mut payload = Vec::new();
+            write_unavailable_pg_transition_mutation_binding(&mut payload, binding)?;
+            let payload = self.send_admin_request_until_and_clocks(
+                ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap,
+                payload,
+                deadline,
+                || Ok(retry_clock.now_ms()),
+                || Ok(crate::clock::current_time_millis()),
+            )?;
+            let (runtime_map, source_primary_lease_deadline_ms) =
+                decode_authenticated_admin_mutation_success(
+                    ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap,
+                    || {
+                        let mut reader = PayloadReader::new(&payload);
+                        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+                        let source_primary_lease_deadline_ms = reader.read_option_u64()?;
+                        reader.finish()?;
+                        Ok((runtime_map, source_primary_lease_deadline_ms))
+                    },
+                )?;
+            self.inner.validate_metadata_transfer_fence_response(
+                pg_id,
+                FencedPgMetadataTransferRuntimeMap::new(
+                    runtime_map,
+                    source_primary_lease_deadline_ms,
+                ),
+            )
+        })
+    }
+
     pub(crate) fn set_pg_acting_set_with_metadata_transfer_runtime_map(
         &self,
         pg_id: PgId,
@@ -3234,6 +3400,46 @@ impl AuthenticatedUnixControlPlaneClient {
                 ),
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) fn install_unavailable_pg_transition_runtime_map_checked(
+        &self,
+        binding: &UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_unavailable_pg_transition_mutation_binding(&mut payload, binding)?;
+        write_rpc_pg_metadata_transfer_proof(&mut payload, transfer);
+        write_u64(&mut payload, expected_destination_epoch.get());
+        let kind = ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap;
+        let payload = self.send_admin_request_with_read_timeout(
+            kind,
+            authority_now_ms,
+            payload,
+            CONTROL_PLANE_RPC_IO_TIMEOUT,
+        )?;
+        decode_authenticated_admin_mutation_success(kind, || {
+            let mut reader = PayloadReader::new(&payload);
+            let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+            reader.finish()?;
+            if !metadata_transfer_install_applied(
+                &runtime_map,
+                binding.pg_id(),
+                binding.destination_acting_set(),
+                transfer,
+                expected_destination_epoch,
+            ) {
+                return Err(ControlPlaneError::RpcUnconfirmed {
+                    message: format!(
+                        "unavailable transition metadata-transfer install for PG {} returned without the expected exact route/proof",
+                        binding.pg_id().get()
+                    ),
+                });
+            }
+            Ok(runtime_map)
+        })
     }
 
     pub(crate) fn set_pg_acting_set_with_metadata_transfer_checked(
@@ -5593,6 +5799,30 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap => {
+            let mut reader = PayloadReader::new(&payload);
+            let binding = read_unavailable_pg_transition_mutation_binding(&mut reader)?;
+            reader.finish()?;
+            match control_plane
+                .fence_unavailable_pg_transition_with_source_lease(binding.clone())
+                .and_then(|fenced| {
+                    let (snapshot, source_primary_lease_deadline_ms) = fenced.into_parts();
+                    snapshot
+                        .reconstructed_runtime_map_for_pg_with_fallback_validity(
+                            binding.pg_id(),
+                            non_serving_runtime_map_validity(authority_now_ms),
+                        )
+                        .map(|runtime_map| (runtime_map, source_primary_lease_deadline_ms))
+                }) {
+                Ok((snapshot, source_primary_lease_deadline_ms)) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    write_option_u64(&mut response, source_primary_lease_deadline_ms);
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
         ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer => {
             let mut reader = PayloadReader::new(&payload);
             let (pg_id, acting_set, transfer, expected_destination_epoch) =
@@ -5627,6 +5857,33 @@ where
                 .and_then(|snapshot| {
                     snapshot.reconstructed_runtime_map_for_pg_with_fallback_validity(
                         pg_id,
+                        non_serving_runtime_map_validity(authority_now_ms),
+                    )
+                }) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap => {
+            let mut reader = PayloadReader::new(&payload);
+            let binding = read_unavailable_pg_transition_mutation_binding(&mut reader)?;
+            let transfer = read_rpc_pg_metadata_transfer_proof(&mut reader)?;
+            let expected_destination_epoch =
+                read_cluster_epoch(&mut reader, "metadata transfer destination epoch")?;
+            reader.finish()?;
+            match control_plane
+                .install_unavailable_pg_transition_metadata_transfer(
+                    binding.clone(),
+                    transfer,
+                    expected_destination_epoch,
+                )
+                .and_then(|snapshot| {
+                    snapshot.reconstructed_runtime_map_for_pg_with_fallback_validity(
+                        binding.pg_id(),
                         non_serving_runtime_map_validity(authority_now_ms),
                     )
                 }) {
@@ -5890,6 +6147,8 @@ enum ControlPlaneRpcKind {
     ReestablishAuthorityClock = 15,
     RuntimeMapDiagnostics = 16,
     ServingPgRuntimeMapSnapshot = 17,
+    FenceUnavailablePgTransitionRuntimeMap = 18,
+    InstallUnavailablePgTransitionRuntimeMap = 19,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5972,7 +6231,7 @@ fn control_plane_rpc_frame_format_error(
 
 impl ControlPlaneRpcKind {
     #[cfg(test)]
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 18] = [
         Self::RuntimeMapSnapshot,
         Self::RefreshNodeHeartbeat,
         Self::SetPgActingSet,
@@ -5989,6 +6248,8 @@ impl ControlPlaneRpcKind {
         Self::ReestablishAuthorityClock,
         Self::RuntimeMapDiagnostics,
         Self::ServingPgRuntimeMapSnapshot,
+        Self::FenceUnavailablePgTransitionRuntimeMap,
+        Self::InstallUnavailablePgTransitionRuntimeMap,
     ];
 
     fn as_u16(self) -> u16 {
@@ -6013,6 +6274,8 @@ impl ControlPlaneRpcKind {
             15 => Ok(Self::ReestablishAuthorityClock),
             16 => Ok(Self::RuntimeMapDiagnostics),
             17 => Ok(Self::ServingPgRuntimeMapSnapshot),
+            18 => Ok(Self::FenceUnavailablePgTransitionRuntimeMap),
+            19 => Ok(Self::InstallUnavailablePgTransitionRuntimeMap),
             _ => Err(ControlPlaneError::rpc_protocol(format!(
                 "unknown control-plane RPC kind {value}"
             ))),
@@ -6034,6 +6297,8 @@ impl ControlPlaneRpcKind {
             | Self::SetPgActingSetWithMetadataTransfer
             | Self::SetPgActingSetWithMetadataTransferRuntimeMap
             | Self::FencePgForMetadataTransferRuntimeMap
+            | Self::FenceUnavailablePgTransitionRuntimeMap
+            | Self::InstallUnavailablePgTransitionRuntimeMap
             | Self::TransferRaftLeadership
             | Self::TriggerRaftSnapshotAndPurge
             | Self::TriggerRaftElection
@@ -6055,6 +6320,12 @@ impl ControlPlaneRpcKind {
             }
             Self::FencePgForMetadataTransferRuntimeMap => {
                 Some("control-plane PG metadata-transfer fence")
+            }
+            Self::FenceUnavailablePgTransitionRuntimeMap => {
+                Some("control-plane unavailable-PG transition fence")
+            }
+            Self::InstallUnavailablePgTransitionRuntimeMap => {
+                Some("control-plane unavailable-PG transition metadata-transfer install")
             }
             Self::TransferRaftLeadership => Some("control-plane Raft leadership transfer"),
             Self::TriggerRaftSnapshotAndPurge => Some("control-plane Raft snapshot/purge trigger"),
@@ -6088,6 +6359,12 @@ impl ControlPlaneRpcKind {
             }
             Self::FencePgForMetadataTransferRuntimeMap => {
                 MetricKind::FencePgForMetadataTransferRuntimeMap
+            }
+            Self::FenceUnavailablePgTransitionRuntimeMap => {
+                MetricKind::FencePgForMetadataTransferRuntimeMap
+            }
+            Self::InstallUnavailablePgTransitionRuntimeMap => {
+                MetricKind::SetPgActingSetWithMetadataTransferRuntimeMap
             }
             Self::TransferRaftLeadership => MetricKind::TransferRaftLeadership,
             Self::PgRuntimeMapSnapshot => MetricKind::PgRuntimeMapSnapshot,
@@ -6462,6 +6739,35 @@ impl ControlPlaneRpcServerListener {
                 .lock()
                 .expect("control-plane test authority mutex poisoned");
             after_request(&authority);
+        }
+        Ok(())
+    }
+
+    /// Serves shared test requests until `stop` is set and one final connection wakes accept.
+    #[cfg(test)]
+    pub(crate) fn serve_shared_until_stop_for_test<T>(
+        self,
+        authority: Arc<Mutex<T>>,
+        mut policy: ControlPlaneRpcServerPolicy,
+        authority_now_ms: u64,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), ControlPlaneRpcServerError>
+    where
+        T: ControlPlaneAdmin
+            + ControlPlaneHeartbeatRuntimeMapSource
+            + ControlPlaneRuntimeMapSource
+            + Send
+            + 'static,
+    {
+        policy.test_authority_now_ms = Some(authority_now_ms);
+        while !stop.load(Ordering::Acquire) {
+            self.accept_one(
+                &|| ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )?;
+        }
+        while policy.active_workers() != 0 {
+            std::thread::yield_now();
         }
         Ok(())
     }
@@ -7115,11 +7421,17 @@ enum ControlPlaneRpcResponseStatus {
     UnknownActingSetNode = 13,
     AuthorityClockLeadershipChanged = 14,
     PgMetadataTransferDestinationEpochMismatch = 15,
+    CommittedTimestampRegression = 16,
+    CommittedTimestampTooFarAhead = 17,
+    PreviousLeaseGrantHorizonStillActive = 18,
+    AuthorityClockSourceUnavailable = 19,
+    AuthorityClockNotEstablished = 20,
+    AuthorityClockSampleWindowTooWide = 21,
 }
 
 impl ControlPlaneRpcResponseStatus {
     #[cfg(test)]
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 22] = [
         Self::Success,
         Self::RemoteFailure,
         Self::PgPeeringPendingMetadataCommand,
@@ -7136,6 +7448,12 @@ impl ControlPlaneRpcResponseStatus {
         Self::UnknownActingSetNode,
         Self::AuthorityClockLeadershipChanged,
         Self::PgMetadataTransferDestinationEpochMismatch,
+        Self::CommittedTimestampRegression,
+        Self::CommittedTimestampTooFarAhead,
+        Self::PreviousLeaseGrantHorizonStillActive,
+        Self::AuthorityClockSourceUnavailable,
+        Self::AuthorityClockNotEstablished,
+        Self::AuthorityClockSampleWindowTooWide,
     ];
 
     const fn as_u8(self) -> u8 {
@@ -7160,6 +7478,12 @@ impl ControlPlaneRpcResponseStatus {
             13 => Ok(Self::UnknownActingSetNode),
             14 => Ok(Self::AuthorityClockLeadershipChanged),
             15 => Ok(Self::PgMetadataTransferDestinationEpochMismatch),
+            16 => Ok(Self::CommittedTimestampRegression),
+            17 => Ok(Self::CommittedTimestampTooFarAhead),
+            18 => Ok(Self::PreviousLeaseGrantHorizonStillActive),
+            19 => Ok(Self::AuthorityClockSourceUnavailable),
+            20 => Ok(Self::AuthorityClockNotEstablished),
+            21 => Ok(Self::AuthorityClockSampleWindowTooWide),
             _ => Err(ControlPlaneError::rpc_protocol(format!(
                 "invalid control-plane RPC response status {status}"
             ))),
@@ -7324,6 +7648,65 @@ fn encode_control_plane_rpc_response(
             write_u32(&mut payload, pg_id);
             write_u64(&mut payload, expected_destination_epoch.get());
             write_u64(&mut payload, actual_destination_epoch.get());
+        }
+        Err(ControlPlaneError::CommittedTimestampRegression {
+            timestamp_ms,
+            max_committed_timestamp_ms,
+        }) => {
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::CommittedTimestampRegression.as_u8(),
+            );
+            write_u64(&mut payload, timestamp_ms);
+            write_u64(&mut payload, max_committed_timestamp_ms);
+        }
+        Err(ControlPlaneError::CommittedTimestampTooFarAhead {
+            timestamp_ms,
+            max_committed_timestamp_ms,
+            max_forward_jump_ms,
+        }) => {
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::CommittedTimestampTooFarAhead.as_u8(),
+            );
+            write_u64(&mut payload, timestamp_ms);
+            write_u64(&mut payload, max_committed_timestamp_ms);
+            write_u64(&mut payload, max_forward_jump_ms);
+        }
+        Err(ControlPlaneError::PreviousLeaseGrantHorizonStillActive {
+            authority_now_ms,
+            fenced_until_ms,
+        }) => {
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::PreviousLeaseGrantHorizonStillActive.as_u8(),
+            );
+            write_u64(&mut payload, authority_now_ms);
+            write_u64(&mut payload, fenced_until_ms);
+        }
+        Err(ControlPlaneError::AuthorityClockSourceUnavailable) => {
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::AuthorityClockSourceUnavailable.as_u8(),
+            );
+        }
+        Err(ControlPlaneError::AuthorityClockNotEstablished { blocked_reason }) => {
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::AuthorityClockNotEstablished.as_u8(),
+            );
+            write_authority_clock_blocked_reason(&mut payload, blocked_reason);
+        }
+        Err(ControlPlaneError::AuthorityClockSampleWindowTooWide {
+            narrowest_window_ms,
+            max_window_ms,
+        }) => {
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::AuthorityClockSampleWindowTooWide.as_u8(),
+            );
+            write_u64(&mut payload, narrowest_window_ms);
+            write_u64(&mut payload, max_window_ms);
         }
         Err(error) => {
             write_u8(
@@ -7528,6 +7911,65 @@ fn decode_control_plane_rpc_response_frame(
                 },
             ))
         }
+        ControlPlaneRpcResponseStatus::CommittedTimestampRegression => {
+            let timestamp_ms = reader.read_u64()?;
+            let max_committed_timestamp_ms = reader.read_u64()?;
+            reader.finish()?;
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::CommittedTimestampRegression {
+                    timestamp_ms,
+                    max_committed_timestamp_ms,
+                },
+            ))
+        }
+        ControlPlaneRpcResponseStatus::CommittedTimestampTooFarAhead => {
+            let timestamp_ms = reader.read_u64()?;
+            let max_committed_timestamp_ms = reader.read_u64()?;
+            let max_forward_jump_ms = reader.read_u64()?;
+            reader.finish()?;
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::CommittedTimestampTooFarAhead {
+                    timestamp_ms,
+                    max_committed_timestamp_ms,
+                    max_forward_jump_ms,
+                },
+            ))
+        }
+        ControlPlaneRpcResponseStatus::PreviousLeaseGrantHorizonStillActive => {
+            let authority_now_ms = reader.read_u64()?;
+            let fenced_until_ms = reader.read_u64()?;
+            reader.finish()?;
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::PreviousLeaseGrantHorizonStillActive {
+                    authority_now_ms,
+                    fenced_until_ms,
+                },
+            ))
+        }
+        ControlPlaneRpcResponseStatus::AuthorityClockSourceUnavailable => {
+            reader.finish()?;
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::AuthorityClockSourceUnavailable,
+            ))
+        }
+        ControlPlaneRpcResponseStatus::AuthorityClockNotEstablished => {
+            let blocked_reason = read_authority_clock_blocked_reason(&mut reader)?;
+            reader.finish()?;
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::AuthorityClockNotEstablished { blocked_reason },
+            ))
+        }
+        ControlPlaneRpcResponseStatus::AuthorityClockSampleWindowTooWide => {
+            let narrowest_window_ms = reader.read_u64()?;
+            let max_window_ms = reader.read_u64()?;
+            reader.finish()?;
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::AuthorityClockSampleWindowTooWide {
+                    narrowest_window_ms,
+                    max_window_ms,
+                },
+            ))
+        }
     }
 }
 
@@ -7726,6 +8168,39 @@ fn read_pg_id_request(reader: &mut PayloadReader<'_>) -> Result<PgId, ControlPla
     Ok(PgId::new(reader.read_u32()?))
 }
 
+fn write_unavailable_pg_transition_mutation_binding(
+    out: &mut Vec<u8>,
+    binding: &UnavailablePgTransitionMutationBinding,
+) -> Result<(), ControlPlaneError> {
+    write_pg_acting_set_request(out, binding.pg_id(), binding.source_acting_set())?;
+    write_u64(out, binding.transition_epoch().get());
+    write_u64(out, binding.source_epoch().get());
+    write_pg_acting_set_request(out, binding.pg_id(), binding.destination_acting_set())?;
+    Ok(())
+}
+
+fn read_unavailable_pg_transition_mutation_binding(
+    reader: &mut PayloadReader<'_>,
+) -> Result<UnavailablePgTransitionMutationBinding, ControlPlaneError> {
+    let (pg_id, source_acting_set) = read_pg_acting_set_request(reader)?;
+    let transition_epoch =
+        read_cluster_epoch(reader, "unavailable transition mutation epoch")?;
+    let source_epoch = read_cluster_epoch(reader, "unavailable transition source epoch")?;
+    let (destination_pg_id, destination_acting_set) = read_pg_acting_set_request(reader)?;
+    if destination_pg_id != pg_id {
+        return Err(ControlPlaneError::rpc_protocol(
+            "unavailable transition mutation source and destination PG identities differ",
+        ));
+    }
+    Ok(UnavailablePgTransitionMutationBinding::new(
+        pg_id,
+        transition_epoch,
+        source_epoch,
+        source_acting_set,
+        destination_acting_set,
+    ))
+}
+
 fn write_pg_acting_set_with_metadata_transfer_request(
     out: &mut Vec<u8>,
     pg_id: PgId,
@@ -7739,6 +8214,25 @@ fn write_pg_acting_set_with_metadata_transfer_request(
     write_pg_metadata_proof(out, transfer.metadata_proof());
     write_u64(out, expected_destination_epoch.get());
     Ok(())
+}
+
+fn write_rpc_pg_metadata_transfer_proof(
+    out: &mut Vec<u8>,
+    transfer: PgMetadataTransferProof,
+) {
+    write_u64(out, transfer.source_epoch().get());
+    write_pg_metadata_proof(out, transfer.source_metadata_proof());
+    write_pg_metadata_proof(out, transfer.metadata_proof());
+}
+
+fn read_rpc_pg_metadata_transfer_proof(
+    reader: &mut PayloadReader<'_>,
+) -> Result<PgMetadataTransferProof, ControlPlaneError> {
+    Ok(PgMetadataTransferProof::new_with_imported_metadata_proof(
+        read_cluster_epoch(reader, "metadata transfer source epoch")?,
+        read_pg_metadata_proof(reader)?,
+        read_pg_metadata_proof(reader)?,
+    ))
 }
 
 fn read_pg_acting_set_with_metadata_transfer_request(
