@@ -386,6 +386,17 @@ complete v16 operation corpus as rejection evidence. A
 control-plane-owned cursor examines at most 16 PGs per tick, commits the exact
 certified transition before dispatch, and retains one exact transition identity
 through a capacity-one storage transfer worker.
+Raft reconciliation derives both the begin command and the atomic
+readiness-and-activation command while holding the same volatile-heartbeat
+update gate used by heartbeat publication. The exact lease-bound CAS therefore
+cannot be invalidated in the gap between reading a snapshot and submitting its
+command; a renewal queued after derivation runs immediately after the command
+has committed. This preserves exact lease equality rather than weakening the
+authorization to accept a later, independently sampled lease. The sampled
+authority time is also clamped to the gated snapshot's committed timestamp
+high-water mark, so a preceding durable heartbeat cannot make the derived
+command regress authority time. Direct Raft admin transition entry points use
+the same gated derivation primitive.
 Restart or authority failover rediscovers active durable transitions; repeated
 manager polls cannot duplicate an in-flight transfer; stale completion cannot
 activate a successor. Transfer and activation failures are deferred per PG so
@@ -398,6 +409,30 @@ backfill, terminal dependency cleanup,
 backpressure, maintenance modes, pre-install successor selection when a newly
 chosen destination fails before route installation, operational metrics, and
 the multihost outage release gate remain to be implemented.
+
+The 2026-08-26 four-host read-only outage exposed the next availability bound.
+One failed actor affected 83 of 116 PGs. Recovery advanced the global cluster
+epoch from 18 to 267: exactly one begin, one destination-install, and one
+activation epoch for each affected PG. Because every global epoch requires
+fresh storage-node map installation and current-epoch PG observations, a
+capacity-one worker serializes recovery behind three whole-cluster heartbeat
+rounds per PG. The cluster eventually recovered all 116 PGs, but served only a
+progressively increasing subset for several minutes and returned transient 503
+responses for the rest. Removing command-derivation races reduces retries but
+does not remove this linear outage duration.
+
+The next reconciliation slice must make global epoch count independent of the
+number of affected PGs. Prefer bounded batch commands for exact transition
+begin, destination installation, and activation, with per-PG proofs and
+all-or-nothing validation inside each batch. Metadata transfer and payload
+readiness remain bounded and fair outside the state-machine lock; completed
+proofs accumulate into bounded batches. A batch advances the global epoch once,
+preserves each PG's independent transition lineage and replay identity, and
+retries a failed member separately without discarding successful transfer work.
+If those invariants cannot be represented cleanly with batch commands,
+introduce independently versioned per-PG route generations before increasing
+worker concurrency; merely adding workers around the current global-next-epoch
+CAS would increase conflicts without reducing recovery time.
 
 The first implementation may use the committed static topology and the existing
 metadata-transfer and payload-backfill primitives. It does not depend on adding

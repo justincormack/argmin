@@ -465,6 +465,8 @@ pub struct ControlPlaneRaftAuthority {
         Mutex<Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>>,
     #[cfg(test)]
     linearized_state_machine_response_ready_notify: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    #[cfg(test)]
+    before_heartbeat_update_gate_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -2918,6 +2920,8 @@ impl ControlPlaneRaftAuthority {
             linearized_snapshot_retirement_hook: Mutex::new(None),
             #[cfg(test)]
             linearized_state_machine_response_ready_notify: Mutex::new(None),
+            #[cfg(test)]
+            before_heartbeat_update_gate_hook: Mutex::new(None),
         }
     }
 
@@ -2968,6 +2972,8 @@ impl ControlPlaneRaftAuthority {
             linearized_snapshot_retirement_hook: Mutex::new(None),
             #[cfg(test)]
             linearized_state_machine_response_ready_notify: Mutex::new(None),
+            #[cfg(test)]
+            before_heartbeat_update_gate_hook: Mutex::new(None),
         }
     }
 
@@ -3379,6 +3385,34 @@ impl ControlPlaneRaftAuthority {
             .lock()
             .expect("linearized state-machine response notification should not be poisoned")
             .take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_heartbeat_update_gate_hook_for_test(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        let previous = self
+            .before_heartbeat_update_gate_hook
+            .lock()
+            .expect("heartbeat update-gate test hook should not be poisoned")
+            .replace(hook);
+        assert!(
+            previous.is_none(),
+            "heartbeat update-gate test hook already set"
+        );
+    }
+
+    #[cfg(test)]
+    fn run_before_heartbeat_update_gate_hook_for_test(&self) {
+        let hook = self
+            .before_heartbeat_update_gate_hook
+            .lock()
+            .expect("heartbeat update-gate test hook should not be poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     fn retained_snapshot_generation(
@@ -3842,11 +3876,26 @@ impl ControlPlaneRaftAuthority {
         &self,
         command: ControlPlaneCommand,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+        self.submit_control_plane_command_derived(move |_| Ok(command))
+            .await
+    }
+
+    pub(crate) async fn submit_control_plane_command_derived<F>(
+        &self,
+        derive_command: F,
+    ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>
+    where
+        F: FnOnce(&ClusterControlSnapshot) -> Result<ControlPlaneCommand, ControlPlaneError>,
+    {
         let queue_started = Instant::now();
-        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        #[cfg(test)]
+        self.run_before_heartbeat_update_gate_hook_for_test();
+        let update_guard = self.volatile_heartbeat_update_gate.lock().await;
         let queue_wait = queue_started.elapsed();
         let operation_started = Instant::now();
-        let result = self.submit_control_plane_command_locked(command).await;
+        let result = self
+            .submit_control_plane_command_derived_locked(&update_guard, derive_command)
+            .await;
         let operation = operation_started.elapsed();
         observability::record_control_plane_raft_command_submission(
             queue_wait,
@@ -4383,6 +4432,8 @@ impl ControlPlaneRaftAuthority {
 
     async fn submit_control_plane_command_with_proposal_retry(
         &self,
+        // Keep heartbeat publication excluded through every proposal attempt.
+        _update_guard: &tokio::sync::MutexGuard<'_, ()>,
         command: ControlPlaneCommand,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
         validate_control_plane_command_replication_size_detailed(&command)?;
@@ -4427,10 +4478,14 @@ impl ControlPlaneRaftAuthority {
             .load(Ordering::Relaxed)
     }
 
-    async fn submit_control_plane_command_locked(
+    async fn submit_control_plane_command_derived_locked<F>(
         &self,
-        mut command: ControlPlaneCommand,
-    ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+        update_guard: &tokio::sync::MutexGuard<'_, ()>,
+        derive_command: F,
+    ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>
+    where
+        F: FnOnce(&ClusterControlSnapshot) -> Result<ControlPlaneCommand, ControlPlaneError>,
+    {
         let status = self.confirmed_linearized_authority_status().await?;
         let authority_term = status.current_term();
         let (mut durable_snapshot, durable_applied) = self.durable_snapshot_and_applied().await?;
@@ -4454,7 +4509,7 @@ impl ControlPlaneRaftAuthority {
                     .apply_control_plane_command(promotion.clone())?
                     .into_snapshot();
                 let submitted_promotion = self
-                    .submit_control_plane_command_with_proposal_retry(promotion)
+                    .submit_control_plane_command_with_proposal_retry(update_guard, promotion)
                     .await?;
                 match submitted_promotion.into_outcome() {
                     ControlPlaneRaftCommandOutcome::Applied(
@@ -4474,10 +4529,12 @@ impl ControlPlaneRaftAuthority {
                 overlay_snapshot = Some((overlay_authority_term, live_snapshot));
             }
         }
-        command = overlay_snapshot
+        let effective_snapshot = overlay_snapshot
             .as_ref()
-            .map_or(&durable_snapshot, |(_, snapshot)| snapshot)
-            .bind_metadata_transfer_fence_command(&durable_snapshot, command)?;
+            .map_or(&durable_snapshot, |(_, snapshot)| snapshot);
+        let command = derive_command(effective_snapshot)?;
+        let command =
+            effective_snapshot.bind_metadata_transfer_fence_command(&durable_snapshot, command)?;
         let overlay_rebase = overlay_snapshot
             .map(|(authority_term, snapshot)| {
                 let durable_would_apply = durable_snapshot
@@ -4497,7 +4554,7 @@ impl ControlPlaneRaftAuthority {
             .transpose()?;
 
         let submitted = self
-            .submit_control_plane_command_with_proposal_retry(command)
+            .submit_control_plane_command_with_proposal_retry(update_guard, command)
             .await?;
         if let Some((authority_term, previous_snapshot, applied_snapshot)) = overlay_rebase {
             let snapshot = match submitted.outcome() {
@@ -4530,6 +4587,8 @@ impl ControlPlaneRaftAuthority {
         &self,
         command: ControlPlaneCommand,
     ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
+        #[cfg(test)]
+        self.run_before_heartbeat_update_gate_hook_for_test();
         let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
         let status = self.status().await?;
         let Some(authority_term) = status

@@ -33,6 +33,11 @@ use crate::control_plane_server_bootstrap::{
 use crate::static_topology::UncertifiedInitialControlPlaneTopology;
 use crate::types::{ClusterEpoch, PgId, PgState};
 
+#[cfg(test)]
+type UnavailableReconciliationCommandDerivedHook = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+#[cfg(test)]
+type UnavailableReconciliationTimeSampledHook = Arc<Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>>;
+
 /// Storage-owned logical host for one durable Raft control-plane authority.
 ///
 /// The host derives its durability lifecycle and authority clock from the exact
@@ -47,6 +52,10 @@ pub struct ControlPlaneRaftAuthorityHost {
     authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
     #[cfg(any(test, feature = "test-hooks"))]
     after_heartbeat_commit_term: Arc<Mutex<Option<u64>>>,
+    #[cfg(test)]
+    after_unavailable_reconciliation_command_derived: UnavailableReconciliationCommandDerivedHook,
+    #[cfg(test)]
+    after_unavailable_reconciliation_time_sampled: UnavailableReconciliationTimeSampledHook,
 }
 
 pub(crate) struct DurableAuthorityHostLifecycle {
@@ -263,6 +272,10 @@ impl ControlPlaneRaftAuthorityHost {
             authority_clock: Some(Arc::clone(&lifecycle.authority_clock)),
             #[cfg(any(test, feature = "test-hooks"))]
             after_heartbeat_commit_term: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_unavailable_reconciliation_command_derived: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_unavailable_reconciliation_time_sampled: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -421,12 +434,23 @@ impl ControlPlaneRaftAuthorityHost {
                 pg_id,
                 unavailable_node_id,
             }) => {
-                let command = snapshot.begin_unavailable_pg_placement_transition_command(
-                    pg_id,
-                    unavailable_node_id,
-                    now_ms,
-                )?;
-                self.submit_raft_command(command)?;
+                #[cfg(test)]
+                self.run_after_unavailable_reconciliation_time_sampled_hook(now_ms);
+                #[cfg(test)]
+                let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
+                self.submit_raft_command_derived(|current| {
+                    let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
+                    let command = current.begin_unavailable_pg_placement_transition_command(
+                        pg_id,
+                        unavailable_node_id,
+                        command_now_ms,
+                    )?;
+                    #[cfg(test)]
+                    if let Some(after_derived) = after_derived {
+                        after_derived();
+                    }
+                    Ok(command)
+                })?;
                 let current = self.current_snapshot()?;
                 let transition = current
                     .unavailable_pg_placement_transition(pg_id)
@@ -456,9 +480,20 @@ impl ControlPlaneRaftAuthorityHost {
         if !work.mutation_binding().matches_transition(transition) {
             return Ok(false);
         }
-        let command =
-            snapshot.complete_unavailable_pg_placement_transition_command(work, now_ms)?;
-        self.submit_raft_command(command)?;
+        #[cfg(test)]
+        self.run_after_unavailable_reconciliation_time_sampled_hook(now_ms);
+        #[cfg(test)]
+        let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
+        self.submit_raft_command_derived(|current| {
+            let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
+            let command = current
+                .complete_unavailable_pg_placement_transition_command(work, command_now_ms)?;
+            #[cfg(test)]
+            if let Some(after_derived) = after_derived {
+                after_derived();
+            }
+            Ok(command)
+        })?;
         Ok(true)
     }
 
@@ -571,6 +606,21 @@ impl ControlPlaneRaftAuthorityHost {
         self.submit_raft_command_with_checkpoint_policy(command, true)
     }
 
+    fn submit_raft_command_derived<F>(
+        &mut self,
+        derive_command: F,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError>
+    where
+        F: FnOnce(&ClusterControlSnapshot) -> Result<ControlPlaneCommand, ControlPlaneError>,
+    {
+        self.ensure_not_durably_poisoned()?;
+        let submitted = self.block_on(
+            self.authority
+                .submit_control_plane_command_derived(derive_command),
+        )?;
+        self.finish_submitted_raft_command(submitted, true)
+    }
+
     fn submit_raft_liveness_command(
         &mut self,
         command: ControlPlaneCommand,
@@ -664,6 +714,10 @@ impl ControlPlaneRaftAuthorityHost {
             resample_authority_time: false,
             authority_clock: None,
             after_heartbeat_commit_term: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_unavailable_reconciliation_command_derived: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_unavailable_reconciliation_time_sampled: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -747,6 +801,55 @@ impl ControlPlaneRaftAuthorityHost {
             .after_heartbeat_commit_term
             .lock()
             .expect("heartbeat test hook mutex should not be poisoned") = Some(raft_term);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_unavailable_reconciliation_command_derived_for_test(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self
+            .after_unavailable_reconciliation_command_derived
+            .lock()
+            .expect("unavailable reconciliation test hook mutex should not be poisoned") =
+            Some(hook);
+    }
+
+    #[cfg(test)]
+    fn take_unavailable_reconciliation_command_derived_hook(
+        &self,
+    ) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        self.after_unavailable_reconciliation_command_derived
+            .lock()
+            .expect("unavailable reconciliation test hook mutex should not be poisoned")
+            .take()
+    }
+
+    #[cfg(test)]
+    fn set_after_unavailable_reconciliation_time_sampled_for_test(
+        &self,
+        hook: Arc<dyn Fn(u64) + Send + Sync>,
+    ) {
+        *self
+            .after_unavailable_reconciliation_time_sampled
+            .lock()
+            .expect(
+                "unavailable reconciliation time-sampled test hook mutex should not be poisoned",
+            ) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_after_unavailable_reconciliation_time_sampled_hook(&self, now_ms: u64) {
+        let hook = self
+            .after_unavailable_reconciliation_time_sampled
+            .lock()
+            .expect(
+                "unavailable reconciliation time-sampled test hook mutex should not be poisoned",
+            )
+            .take();
+        if let Some(hook) = hook {
+            hook(now_ms);
+        }
     }
 
     pub fn shares_lifecycle_for_test(&self, other: &Self) -> bool {
@@ -967,14 +1070,13 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
         unavailable_node_id: NodeId,
         begin_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .current_snapshot()?
-            .begin_unavailable_pg_placement_transition_command(
+        self.submit_raft_command_derived(|current| {
+            current.begin_unavailable_pg_placement_transition_command(
                 pg_id,
                 unavailable_node_id,
-                begin_at_ms,
-            )?;
-        self.submit_raft_command(command)?;
+                authority_time_not_before_snapshot(current, begin_at_ms),
+            )
+        })?;
         self.current_snapshot()
     }
 
@@ -983,10 +1085,12 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
         work: &UnavailablePgReconciliationWork,
         ready_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .current_snapshot()?
-            .complete_unavailable_pg_placement_transition_command(work, ready_at_ms)?;
-        self.submit_raft_command(command)?;
+        self.submit_raft_command_derived(|current| {
+            current.complete_unavailable_pg_placement_transition_command(
+                work,
+                authority_time_not_before_snapshot(current, ready_at_ms),
+            )
+        })?;
         self.current_snapshot()
     }
 
@@ -1130,6 +1234,15 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
     }
 }
 
+fn authority_time_not_before_snapshot(
+    snapshot: &ClusterControlSnapshot,
+    sampled_now_ms: u64,
+) -> u64 {
+    snapshot
+        .max_committed_timestamp_ms()
+        .map_or(sampled_now_ms, |committed| committed.max(sampled_now_ms))
+}
+
 fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Output {
     if Handle::try_current().is_ok() {
         tokio::task::block_in_place(|| runtime.block_on(future))
@@ -1142,7 +1255,180 @@ fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Out
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::mpsc;
     use std::thread;
+
+    struct ReconciliationCommandRelease(Option<mpsc::SyncSender<()>>);
+
+    impl ReconciliationCommandRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for ReconciliationCommandRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn wall_clock_sample_after(timestamp_ms: u64) -> u64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let now_ms = crate::clock::current_time_millis();
+            if now_ms > timestamp_ms {
+                return now_ms;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wall clock did not advance beyond the paused authority sample"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn assert_committed_timestamp_advanced_past(
+        host: &ControlPlaneRaftAuthorityHost,
+        previous_timestamp_ms: u64,
+    ) -> u64 {
+        let committed_timestamp_ms = host
+            .current_snapshot_for_test()
+            .unwrap()
+            .max_committed_timestamp_ms()
+            .expect("durable heartbeat must publish a committed timestamp");
+        assert!(
+            committed_timestamp_ms > previous_timestamp_ms,
+            "durable heartbeat did not advance committed authority time: \
+             committed={committed_timestamp_ms} previous={previous_timestamp_ms}"
+        );
+        committed_timestamp_ms
+    }
+
+    fn run_reconciliation_across_durable_heartbeat_races<T: Send>(
+        host: &mut ControlPlaneRaftAuthorityHost,
+        reconcile: impl FnOnce(&mut ControlPlaneRaftAuthorityHost) -> T + Send,
+        commit_before_derivation: impl FnOnce(&mut ControlPlaneRaftAuthorityHost, u64),
+        wait_after_derivation: impl FnOnce(&mut ControlPlaneRaftAuthorityHost, u64) + Send,
+    ) -> T {
+        let (sampled_tx, sampled_rx) = mpsc::sync_channel(1);
+        let (sampled_release_tx, sampled_release_rx) = mpsc::sync_channel(1);
+        let sampled_release_rx = Arc::new(Mutex::new(sampled_release_rx));
+        host.set_after_unavailable_reconciliation_time_sampled_for_test(Arc::new({
+            let sampled_release_rx = Arc::clone(&sampled_release_rx);
+            move |now_ms| {
+                sampled_tx.send(now_ms).unwrap();
+                sampled_release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("reconciliation time sample was not released");
+            }
+        }));
+        let (derived_tx, derived_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        host.set_after_unavailable_reconciliation_command_derived_for_test(Arc::new({
+            let release_rx = Arc::clone(&release_rx);
+            move || {
+                derived_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("reconciliation command derivation was not released");
+            }
+        }));
+        let mut committed_heartbeat_host = host.clone();
+        let mut waiting_heartbeat_host = host.clone();
+        let authority = Arc::clone(&host.authority);
+        thread::scope(|scope| {
+            let mut sampled_release = ReconciliationCommandRelease(Some(sampled_release_tx));
+            let mut release = ReconciliationCommandRelease(Some(release_tx));
+            let reconciliation = scope.spawn(|| reconcile(host));
+            let sampled_now_ms = sampled_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reconciliation authority time was not sampled");
+            let heartbeat_at_ms = wall_clock_sample_after(sampled_now_ms);
+            commit_before_derivation(&mut committed_heartbeat_host, heartbeat_at_ms);
+            let first_committed_timestamp_ms =
+                assert_committed_timestamp_advanced_past(&committed_heartbeat_host, sampled_now_ms);
+            sampled_release.release();
+            derived_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reconciliation command was not derived");
+            let (heartbeat_arrived_tx, heartbeat_arrived_rx) = mpsc::sync_channel(1);
+            authority.set_before_heartbeat_update_gate_hook_for_test(Arc::new(move || {
+                heartbeat_arrived_tx.send(()).unwrap();
+            }));
+            let (heartbeat_done_tx, heartbeat_done_rx) = mpsc::sync_channel(1);
+            let renewing_heartbeat = scope.spawn(move || {
+                let heartbeat_at_ms = wall_clock_sample_after(first_committed_timestamp_ms);
+                wait_after_derivation(&mut waiting_heartbeat_host, heartbeat_at_ms);
+                heartbeat_done_tx.send(()).unwrap();
+                waiting_heartbeat_host
+            });
+            heartbeat_arrived_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("concurrent heartbeat did not reach the update gate");
+            assert!(matches!(
+                heartbeat_done_rx.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            release.release();
+            let result = reconciliation
+                .join()
+                .expect("reconciliation thread panicked");
+            let waiting_heartbeat_host = renewing_heartbeat
+                .join()
+                .expect("concurrent heartbeat thread panicked");
+            heartbeat_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("concurrent heartbeat did not complete after command submission");
+            assert_committed_timestamp_advanced_past(
+                &waiting_heartbeat_host,
+                first_committed_timestamp_ms,
+            );
+            result
+        })
+    }
+
+    fn run_admin_derivation_after_durable_heartbeat<T: Send>(
+        host: &mut ControlPlaneRaftAuthorityHost,
+        command_time_ms: u64,
+        operation: impl FnOnce(&mut ControlPlaneRaftAuthorityHost) -> T + Send,
+        renew: impl FnOnce(&mut ControlPlaneRaftAuthorityHost, u64),
+    ) -> T {
+        let (arrived_tx, arrived_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        host.authority
+            .set_before_heartbeat_update_gate_hook_for_test(Arc::new({
+                let release_rx = Arc::clone(&release_rx);
+                move || {
+                    arrived_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("admin command gate arrival was not released");
+                }
+            }));
+        let mut heartbeat_host = host.clone();
+        thread::scope(|scope| {
+            let mut release = ReconciliationCommandRelease(Some(release_tx));
+            let command = scope.spawn(|| operation(host));
+            arrived_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("admin command did not reach the update gate");
+            let heartbeat_at_ms = wall_clock_sample_after(command_time_ms);
+            renew(&mut heartbeat_host, heartbeat_at_ms);
+            assert_committed_timestamp_advanced_past(&heartbeat_host, command_time_ms);
+            release.release();
+            command.join().expect("admin command thread panicked")
+        })
+    }
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -1183,7 +1469,8 @@ mod tests {
         )
         .unwrap();
         let pg_id = PgId::new(7);
-        let nodes = (1..=4)
+        let admin_pg_id = PgId::new(8);
+        let nodes = (1..=5)
             .map(|node_id| {
                 (
                     NodeId::new(node_id),
@@ -1194,7 +1481,11 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let pgs = vec![(pg_id, vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)])];
+        let source_acting_set = vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+        let pgs = vec![
+            (pg_id, source_acting_set.clone()),
+            (admin_pg_id, source_acting_set),
+        ];
         let topology =
             crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
                 7,
@@ -1203,7 +1494,7 @@ mod tests {
                 &nodes,
                 &pgs,
                 crate::control_plane::test_certified_storage_placement_policy(
-                    (1..=4).map(NodeId::new),
+                    (1..=5).map(NodeId::new),
                     3,
                     2_000,
                 ),
@@ -1219,7 +1510,9 @@ mod tests {
         let heartbeat = |host: &mut ControlPlaneRaftAuthorityHost,
                          node_id: u32,
                          lease_ms: u64,
-                         state: Option<PgState>| {
+                         state: Option<PgState>,
+                         heartbeat_at_ms: u64,
+                         observed_pg_ids: &[PgId]| {
             for _ in 0..4 {
                 let observed_epoch = host.current_snapshot_for_test().unwrap().cluster_epoch();
                 let refresh = match host.refresh_node_heartbeat(
@@ -1233,16 +1526,21 @@ mod tests {
                             .unwrap(),
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: state
-                            .map(|state| crate::control_plane::NodePgHeartbeatObservation {
-                                pg_id,
-                                state,
-                                metadata_proof: crate::control_plane::PgMetadataProof::empty(),
-                                pending_metadata_command: None,
-                            })
                             .into_iter()
+                            .flat_map(|state| {
+                                observed_pg_ids.iter().copied().map(move |pg_id| {
+                                    crate::control_plane::NodePgHeartbeatObservation {
+                                        pg_id,
+                                        state,
+                                        metadata_proof:
+                                            crate::control_plane::PgMetadataProof::empty(),
+                                        pending_metadata_command: None,
+                                    }
+                                })
+                            })
                             .collect(),
                     },
-                    crate::clock::current_time_millis(),
+                    heartbeat_at_ms,
                 ) {
                     Ok(refresh) => refresh,
                     Err(ControlPlaneError::PgPrimaryObservationNotActive { .. })
@@ -1265,25 +1563,81 @@ mod tests {
             }
             panic!("node {node_id} did not receive a serving lease");
         };
-        heartbeat(&mut host, 2, 10_000, Some(PgState::Peering));
-        heartbeat(&mut host, 2, 10_000, Some(PgState::Active));
-        heartbeat(&mut host, 1, 50, Some(PgState::Active));
-        heartbeat(&mut host, 3, 10_000, Some(PgState::Active));
-        heartbeat(&mut host, 4, 10_000, None);
+        heartbeat(
+            &mut host,
+            2,
+            3_000,
+            Some(PgState::Peering),
+            crate::clock::current_time_millis(),
+            &[pg_id, admin_pg_id],
+        );
+        heartbeat(
+            &mut host,
+            2,
+            3_000,
+            Some(PgState::Active),
+            crate::clock::current_time_millis(),
+            &[pg_id, admin_pg_id],
+        );
+        heartbeat(
+            &mut host,
+            1,
+            50,
+            Some(PgState::Active),
+            crate::clock::current_time_millis(),
+            &[pg_id, admin_pg_id],
+        );
+        heartbeat(
+            &mut host,
+            3,
+            10_000,
+            Some(PgState::Active),
+            crate::clock::current_time_millis(),
+            &[pg_id, admin_pg_id],
+        );
+        heartbeat(
+            &mut host,
+            4,
+            10_000,
+            None,
+            crate::clock::current_time_millis(),
+            &[pg_id, admin_pg_id],
+        );
+        heartbeat(
+            &mut host,
+            5,
+            10_000,
+            None,
+            crate::clock::current_time_millis(),
+            &[pg_id, admin_pg_id],
+        );
         thread::sleep(Duration::from_millis(60));
         host.expire_heartbeat_leases(crate::clock::current_time_millis())
             .unwrap();
         thread::sleep(Duration::from_millis(
             crate::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 10,
         ));
-        heartbeat(&mut host, 2, 10_000, None);
-        heartbeat(&mut host, 3, 10_000, None);
-        heartbeat(&mut host, 4, 10_000, None);
-        heartbeat(&mut host, 2, 10_000, Some(PgState::Peering));
-        heartbeat(&mut host, 3, 10_000, Some(PgState::Peering));
-        heartbeat(&mut host, 2, 10_000, Some(PgState::Active));
-        heartbeat(&mut host, 3, 10_000, Some(PgState::Active));
-        heartbeat(&mut host, 4, 10_000, None);
+        for (node_id, lease_ms, state) in [
+            (2, 3_000, None),
+            (3, 10_000, None),
+            (4, 10_000, None),
+            (5, 10_000, None),
+            (2, 3_000, Some(PgState::Peering)),
+            (3, 10_000, Some(PgState::Peering)),
+            (2, 3_000, Some(PgState::Active)),
+            (3, 10_000, Some(PgState::Active)),
+            (4, 10_000, None),
+            (5, 10_000, None),
+        ] {
+            heartbeat(
+                &mut host,
+                node_id,
+                lease_ms,
+                state,
+                crate::clock::current_time_millis(),
+                &[pg_id, admin_pg_id],
+            );
+        }
         let reactivated = host.current_snapshot_for_test().unwrap();
         assert_eq!(
             reactivated.pg(pg_id).unwrap().state(),
@@ -1302,10 +1656,19 @@ mod tests {
         ));
 
         let mut cursor = UnavailablePgReconciliationCursor::start();
-        let work = host
-            .poll_unavailable_pg_reconciliation(&mut cursor, crate::clock::current_time_millis())
-            .unwrap()
-            .expect("grace-expired unavailable actor should atomically produce Raft work");
+        let work = run_reconciliation_across_durable_heartbeat_races(
+            &mut host,
+            |host| {
+                host.poll_unavailable_pg_reconciliation(
+                    &mut cursor,
+                    crate::clock::current_time_millis(),
+                )
+                .unwrap()
+                .expect("grace-expired unavailable actor should atomically produce Raft work")
+            },
+            |host, now_ms| heartbeat(host, 3, 10_000, Some(PgState::Peering), now_ms, &[pg_id]),
+            |host, now_ms| heartbeat(host, 3, 10_000, Some(PgState::Peering), now_ms, &[pg_id]),
+        );
         assert_eq!(
             host.current_snapshot_for_test()
                 .unwrap()
@@ -1331,6 +1694,196 @@ mod tests {
         assert_eq!(
             transition.destination_acting_set(),
             work.destination_acting_set()
+        );
+
+        let source_lease_deadline_ms = snapshot
+            .node(NodeId::new(2))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        thread::sleep(Duration::from_millis(
+            source_lease_deadline_ms
+                .saturating_sub(crate::clock::current_time_millis())
+                .saturating_add(
+                    crate::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 10,
+                ),
+        ));
+
+        let transfer = PgMetadataTransferProof::new(
+            snapshot.cluster_epoch(),
+            crate::control_plane::PgMetadataProof::empty(),
+        );
+        let destination_epoch = ClusterEpoch::new(snapshot.cluster_epoch().get() + 1).unwrap();
+        host.install_unavailable_pg_transition_metadata_transfer(
+            work.mutation_binding().clone(),
+            transfer,
+            destination_epoch,
+        )
+        .unwrap();
+        for &node_id in work.destination_acting_set() {
+            heartbeat(
+                &mut host,
+                node_id.as_u32(),
+                10_000,
+                Some(PgState::Peering),
+                crate::clock::current_time_millis(),
+                &[pg_id],
+            );
+        }
+        let readiness_work = UnavailablePgReconciliationWork::from_transition(
+            host.current_snapshot_for_test()
+                .unwrap()
+                .unavailable_pg_placement_transition(pg_id)
+                .unwrap(),
+            UnavailablePgReconciliationStage::PayloadReadiness,
+        );
+        assert!(run_reconciliation_across_durable_heartbeat_races(
+            &mut host,
+            |host| {
+                host.complete_unavailable_pg_reconciliation(
+                    &readiness_work,
+                    crate::clock::current_time_millis(),
+                )
+                .unwrap()
+            },
+            |host, now_ms| { heartbeat(host, 3, 10_000, Some(PgState::Peering), now_ms, &[pg_id]) },
+            |host, now_ms| { heartbeat(host, 3, 10_000, Some(PgState::Peering), now_ms, &[pg_id]) },
+        ));
+        assert_eq!(
+            host.current_snapshot_for_test()
+                .unwrap()
+                .pg(pg_id)
+                .unwrap()
+                .state(),
+            PgState::Active
+        );
+
+        for (node_id, lease_ms, state) in [
+            (2, 3_000, Some(PgState::Peering)),
+            (3, 10_000, Some(PgState::Peering)),
+            (2, 3_000, Some(PgState::Active)),
+            (3, 10_000, Some(PgState::Active)),
+            (5, 10_000, None),
+        ] {
+            heartbeat(
+                &mut host,
+                node_id,
+                lease_ms,
+                state,
+                crate::clock::current_time_millis(),
+                state.map_or(&[], |_| std::slice::from_ref(&admin_pg_id)),
+            );
+        }
+        let direct_begin_at_ms = crate::clock::current_time_millis();
+        run_admin_derivation_after_durable_heartbeat(
+            &mut host,
+            direct_begin_at_ms,
+            |host| {
+                <ControlPlaneRaftAuthorityHost as ControlPlaneAdmin>::begin_unavailable_pg_placement_transition(
+                    host,
+                    admin_pg_id,
+                    NodeId::new(1),
+                    direct_begin_at_ms,
+                )
+                .unwrap()
+            },
+            |host, now_ms| {
+                heartbeat(
+                    host,
+                    3,
+                    10_000,
+                    Some(PgState::Peering),
+                    now_ms,
+                    &[admin_pg_id],
+                )
+            },
+        );
+        let direct_begin_snapshot = host.current_snapshot_for_test().unwrap();
+        assert_eq!(
+            direct_begin_snapshot.pg(admin_pg_id).unwrap().state(),
+            PgState::Peering
+        );
+        let direct_work = UnavailablePgReconciliationWork::from_transition(
+            direct_begin_snapshot
+                .unavailable_pg_placement_transition(admin_pg_id)
+                .expect("direct admin begin must install the exact transition"),
+            UnavailablePgReconciliationStage::MetadataTransfer,
+        );
+        let direct_source_lease_deadline_ms = direct_begin_snapshot
+            .node(NodeId::new(2))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        thread::sleep(Duration::from_millis(
+            direct_source_lease_deadline_ms
+                .saturating_sub(crate::clock::current_time_millis())
+                .saturating_add(
+                    crate::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 10,
+                ),
+        ));
+        host.install_unavailable_pg_transition_metadata_transfer(
+            direct_work.mutation_binding().clone(),
+            PgMetadataTransferProof::new(
+                direct_begin_snapshot.cluster_epoch(),
+                crate::control_plane::PgMetadataProof::empty(),
+            ),
+            ClusterEpoch::new(direct_begin_snapshot.cluster_epoch().get() + 1).unwrap(),
+        )
+        .unwrap();
+        for &node_id in direct_work.destination_acting_set() {
+            heartbeat(
+                &mut host,
+                node_id.as_u32(),
+                10_000,
+                Some(PgState::Peering),
+                crate::clock::current_time_millis(),
+                &[admin_pg_id],
+            );
+        }
+        let direct_readiness_work = UnavailablePgReconciliationWork::from_transition(
+            host.current_snapshot_for_test()
+                .unwrap()
+                .unavailable_pg_placement_transition(admin_pg_id)
+                .unwrap(),
+            UnavailablePgReconciliationStage::PayloadReadiness,
+        );
+        let direct_ready_at_ms = crate::clock::current_time_millis();
+        host.current_snapshot_for_test()
+            .unwrap()
+            .complete_unavailable_pg_placement_transition_command(
+                &direct_readiness_work,
+                direct_ready_at_ms,
+            )
+            .expect("direct admin destination must be ready before the renewal race");
+        run_admin_derivation_after_durable_heartbeat(
+            &mut host,
+            direct_ready_at_ms,
+            |host| {
+                <ControlPlaneRaftAuthorityHost as ControlPlaneAdmin>::complete_unavailable_pg_placement_transition(
+                    host,
+                    &direct_readiness_work,
+                    direct_ready_at_ms,
+                )
+                .unwrap()
+            },
+            |host, now_ms| {
+                heartbeat(
+                    host,
+                    3,
+                    10_000,
+                    Some(PgState::Peering),
+                    now_ms,
+                    &[admin_pg_id],
+                )
+            },
+        );
+        assert_eq!(
+            host.current_snapshot_for_test()
+                .unwrap()
+                .pg(admin_pg_id)
+                .unwrap()
+                .state(),
+            PgState::Active
         );
 
         drop(host);
