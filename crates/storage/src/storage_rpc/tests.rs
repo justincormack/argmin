@@ -1527,17 +1527,19 @@ mod tests {
         assert_eq!(decoded.commands[0].post_state_digest, 1234);
 
         for offset in [16, 29, 38] {
-            let mut unsupported = bytes.clone();
-            unsupported[offset] = 6;
-            assert_eq!(
-                decode_metadata_command_transfer_adopt_request(
-                    &unsupported,
-                    &metadata_command_decode_authority_for_test(),
-                ),
-                Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
-                    "state-digest"
-                ))
-            );
+            for version in [4, 6] {
+                let mut unsupported = bytes.clone();
+                unsupported[offset] = version;
+                assert_eq!(
+                    decode_metadata_command_transfer_adopt_request(
+                        &unsupported,
+                        &metadata_command_decode_authority_for_test(),
+                    ),
+                    Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                        "state-digest"
+                    ))
+                );
+            }
         }
     }
 
@@ -1555,14 +1557,16 @@ mod tests {
 
         assert_eq!(decoded, request);
 
-        let mut unsupported = bytes;
-        unsupported[16] = 6;
-        assert_eq!(
-            decode_metadata_command_transfer_empty_state_request(&unsupported),
-            Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
-                "state-digest"
-            ))
-        );
+        for version in [4, 6] {
+            let mut unsupported = bytes.clone();
+            unsupported[16] = version;
+            assert_eq!(
+                decode_metadata_command_transfer_empty_state_request(&unsupported),
+                Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                    "state-digest"
+                ))
+            );
+        }
     }
 
     #[test]
@@ -1585,16 +1589,20 @@ mod tests {
 
         assert_eq!(decoded, request);
 
-        for (offset, version, carrier) in [(24, 2, "log-hash"), (33, 6, "state-digest")]
-        {
-            let mut unsupported = bytes.clone();
-            unsupported[offset] = version;
-            assert_eq!(
-                decode_metadata_command_transfer_matching_state_request(&unsupported),
-                Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
-                    carrier
-                ))
-            );
+        for (offset, versions, carrier) in [
+            (24, &[2][..], "log-hash"),
+            (33, &[4, 6][..], "state-digest"),
+        ] {
+            for version in versions {
+                let mut unsupported = bytes.clone();
+                unsupported[offset] = *version;
+                assert_eq!(
+                    decode_metadata_command_transfer_matching_state_request(&unsupported),
+                    Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                        carrier
+                    ))
+                );
+            }
         }
     }
 
@@ -1646,12 +1654,12 @@ mod tests {
                 payload_sha256,
             ),
             (
-                0x79f7_3076_ed02_b41a,
-                6_711,
+                0x9f9b_42d2_1111_d2a0,
+                7_079,
                 [
-                    28, 202, 18, 92, 22, 241, 115, 179, 114, 18, 138, 165, 80, 182, 53,
-                    81, 246, 215, 121, 166, 10, 125, 201, 3, 78, 217, 127, 21, 159, 33,
-                    174, 174,
+                    106, 39, 58, 149, 225, 125, 131, 221, 38, 179, 191, 153, 175, 243, 23,
+                    91, 226, 68, 187, 170, 27, 119, 183, 140, 44, 202, 150, 157, 164, 112,
+                    65, 60,
                 ],
             )
         );
@@ -1659,7 +1667,7 @@ mod tests {
 
         assert_eq!(decoded, request.checkpoint);
 
-        for unsupported in [1_u16, 3] {
+        for unsupported in [1_u16, 2, 4] {
             let mut unsupported_checkpoint = request.checkpoint.clone();
             crate::PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
                 &mut unsupported_checkpoint,
@@ -1677,15 +1685,20 @@ mod tests {
                 )
             );
         }
-        for (offset, version, carrier) in [(30, 2, "log-hash"), (39, 6, "state-digest")] {
-            let mut unsupported_bytes = bytes.clone();
-            unsupported_bytes[offset] = version;
-            assert_eq!(
-                decode_metadata_command_checkpoint_payload(&unsupported_bytes),
-                Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
-                    carrier
-                ))
-            );
+        for (offset, versions, carrier) in [
+            (30, &[2][..], "log-hash"),
+            (39, &[4, 6][..], "state-digest"),
+        ] {
+            for version in versions {
+                let mut unsupported_bytes = bytes.clone();
+                unsupported_bytes[offset] = *version;
+                assert_eq!(
+                    decode_metadata_command_checkpoint_payload(&unsupported_bytes),
+                    Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                        carrier
+                    ))
+                );
+            }
         }
         assert_eq!(
             decode_metadata_command_checkpoint_payload(&bytes[10..]),
@@ -2224,15 +2237,20 @@ mod tests {
 
         assert_eq!(decoded, response);
 
-        for (offset, version, carrier) in [(16, 2, "log-hash"), (25, 6, "state-digest")] {
-            let mut unsupported = bytes.clone();
-            unsupported[offset] = version;
-            assert_eq!(
-                decode_metadata_command_state_response(&unsupported),
-                Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
-                    carrier
-                ))
-            );
+        for (offset, versions, carrier) in [
+            (16, &[2][..], "log-hash"),
+            (25, &[4, 6][..], "state-digest"),
+        ] {
+            for version in versions {
+                let mut unsupported = bytes.clone();
+                unsupported[offset] = *version;
+                assert_eq!(
+                    decode_metadata_command_state_response(&unsupported),
+                    Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                        carrier
+                    ))
+                );
+            }
         }
     }
 

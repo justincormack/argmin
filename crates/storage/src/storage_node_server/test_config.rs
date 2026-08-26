@@ -5234,7 +5234,7 @@
             Some(storage_rpc_client_auth(credential, 9)),
         );
 
-        for unsupported_version in [1_u16, 3] {
+        for unsupported_version in [1_u16, 2, 4] {
             let mut unsupported = checkpoint.clone();
             PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
                 &mut unsupported,

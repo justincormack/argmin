@@ -3684,7 +3684,7 @@ fn insert_digest_multipart_upload(store: &PgStore, upload_id: &UploadId) {
 }
 
 #[test]
-fn metadata_state_digest_table_inventory_is_explicit() {
+fn metadata_state_digest_and_checkpoint_table_inventories_are_explicit() {
     let tables: Vec<_> = METADATA_DIGEST_TABLES
         .iter()
         .map(|table| (table.name, table.filter))
@@ -3730,6 +3730,65 @@ fn metadata_state_digest_table_inventory_is_explicit() {
             table.name
         );
     }
+    assert_eq!(
+        crate::node_runtime::pg_store::command_log::STREAM_UPLOAD_CHECKPOINT_COLUMNS,
+        [
+            "session_id",
+            "bucket",
+            "key",
+            "op_kind",
+            "upload_id",
+            "part_number",
+            "state",
+            "created_at",
+            "cleanup_after",
+            "encryption_type",
+            "encryption_state",
+            "next_segment_vid",
+            "bucket_write_reservation_id",
+            "bucket_write_owner_token",
+            "bucket_write_cluster_epoch",
+            "bucket_write_execution_generation",
+            "bucket_write_incarnation_generation",
+            "bucket_write_operation_kind",
+            "bucket_write_created_at",
+            "bucket_write_lease_deadline",
+            "bucket_write_target_context",
+        ]
+    );
+
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let mut inventory_mismatches = Vec::new();
+    for table in METADATA_DIGEST_TABLES {
+        let physical_columns = store
+            .conn
+            .prepare(&format!("PRAGMA table_info({})", table.name))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let checkpoint_columns =
+            crate::node_runtime::pg_store::command_log::metadata_checkpoint_columns(table);
+        let missing = physical_columns
+            .iter()
+            .filter(|column| !checkpoint_columns.contains(&column.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let unknown = checkpoint_columns
+            .iter()
+            .filter(|column| !physical_columns.iter().any(|actual| actual == **column))
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() || !unknown.is_empty() {
+            inventory_mismatches.push((table.name, missing, unknown));
+        }
+    }
+    assert!(
+        inventory_mismatches.is_empty(),
+        "checkpoint inventory mismatch: {inventory_mismatches:?}"
+    );
 }
 
 #[test]
@@ -4621,11 +4680,21 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
     assert_eq!(bounded_candidates, vec![first_checkpoint.clone()]);
 
     let replica_state_before_rejections = store.metadata_command_replica_state().unwrap();
-    for format in ["corrupt", "unframed-v1", "framed-v1", "framed-v3"] {
+    for format in [
+        "corrupt",
+        "unframed-v1",
+        "framed-v1",
+        "framed-v2",
+        "framed-v4",
+    ] {
         let (checkpoint_crc64, checkpoint_bytes) = if format == "corrupt" {
             (second_checkpoint.checkpoint_crc64, vec![0])
         } else {
-            let encoding_version = if format == "framed-v3" { 3 } else { 1 };
+            let encoding_version = match format {
+                "framed-v2" => 2,
+                "framed-v4" => 4,
+                _ => 1,
+            };
             let mut unsupported = second_checkpoint.clone();
             PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
                 &mut unsupported,
@@ -5264,6 +5333,139 @@ fn install_metadata_transfer_checkpoint_base_restores_materialized_rows() {
         .values
         .iter()
         .any(|value| matches!(value, MetadataCheckpointValue::Blob(bytes) if bytes == &okh)));
+}
+
+#[test]
+fn install_metadata_transfer_checkpoint_base_restores_complete_stream_session() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-stream-session");
+    let key = trusted_object_key("object");
+    let session_id = SessionId::try_from("bc".repeat(16)).unwrap();
+    let proof = test_bucket_write_reservation_proof(
+        &bucket,
+        &key,
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    );
+    let expected = StreamUploadRecord {
+        session_id: session_id.clone(),
+        bucket,
+        key,
+        target: StreamUploadTarget::PutObject,
+        state: StreamUploadState::InProgress,
+        created_at: 123,
+        cleanup_after: Some(456),
+        encryption: ObjectEncryption::None,
+        next_segment_vid: GenerationId::new(7).unwrap(),
+        bucket_write_reservation: Some(proof),
+    };
+    source
+        .create_stream_upload_explicit(
+            &StreamUploadCommandRecord::from(&expected),
+            expected.next_segment_vid,
+            expected.cleanup_after,
+            expected.bucket_write_reservation.as_ref(),
+        )
+        .unwrap();
+    source.refresh_metadata_command_state_digest().unwrap();
+    let checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    destination
+        .install_metadata_transfer_checkpoint_base(2, ClusterEpoch::new(19).unwrap(), &checkpoint)
+        .unwrap();
+
+    assert_eq!(
+        destination.get_stream_upload(&session_id).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn install_metadata_transfer_checkpoint_base_restores_multipart_listing_position() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let upload_id = crate::tests::multipart_upload_id("checkpoint-listing-position");
+    insert_digest_multipart_upload(&source, &upload_id);
+    source
+        .conn
+        .execute(
+            "UPDATE multipart_uploads \
+             SET listing_cluster_epoch = ?1, listing_log_index = ?2 \
+             WHERE upload_id = ?3",
+            params![17_i64, 29_i64, upload_id.as_str()],
+        )
+        .unwrap();
+    source.refresh_metadata_command_state_digest().unwrap();
+    let checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    destination
+        .install_metadata_transfer_checkpoint_base(2, ClusterEpoch::new(19).unwrap(), &checkpoint)
+        .unwrap();
+
+    assert_eq!(
+        destination
+            .conn
+            .query_row(
+                "SELECT listing_cluster_epoch, listing_log_index \
+                 FROM multipart_uploads WHERE upload_id = ?1",
+                params![upload_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        (17, 29)
+    );
+}
+
+#[test]
+fn checkpoint_based_transfer_replays_streamed_direct_put_commit() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-stream-commit");
+    let key = trusted_object_key("object");
+    let session_id = SessionId::try_from("bd".repeat(16)).unwrap();
+    insert_direct_put_terminal_staging(&source, &bucket, &key, &session_id);
+    source.refresh_metadata_command_state_digest().unwrap();
+    let checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    let destination_epoch = ClusterEpoch::new(19).unwrap();
+    destination
+        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .unwrap();
+    let source_command = direct_put_terminal_cleanup_command(&bucket, &key, &session_id);
+    let rebased = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            destination_epoch,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        source_command.payload().clone(),
+    );
+
+    destination
+        .apply_metadata_command_and_record(2, &rebased)
+        .unwrap();
+    assert!(matches!(
+        destination
+            .get_object_version(&bucket, &key, VersionId::Null)
+            .unwrap(),
+        StoredObject::Live(_)
+    ));
+    assert!(matches!(
+        destination.get_stream_upload(&session_id),
+        Err(MetadataError::StreamSessionNotFound { .. })
+    ));
 }
 
 #[test]

@@ -260,11 +260,12 @@ impl MetadataCommandCheckpoint {
         {
             Self::verify_table_identity(table, &summary.table_name)?;
             Self::verify_table_identity(table, &block.table_name)?;
+            let checkpoint_columns = metadata_checkpoint_columns(table);
             if block
                 .columns
                 .iter()
                 .map(String::as_str)
-                .ne(table.columns.iter().copied())
+                .ne(checkpoint_columns.iter().copied())
             {
                 return Err(
                     MetadataCommandCheckpointValidationError::TableColumnsMismatch {
@@ -292,47 +293,84 @@ impl MetadataCommandCheckpoint {
                 );
             }
 
-            let mut stats = MetadataTableDigestStats {
+            let canonical_column_indexes =
+                PgStore::metadata_checkpoint_canonical_column_indexes(table, checkpoint_columns)
+                    .ok_or_else(|| {
+                        MetadataCommandCheckpointValidationError::TableColumnsMismatch {
+                            table_name: table.name.to_owned(),
+                        }
+                    })?;
+            let mut canonical_stats = MetadataTableDigestStats {
+                row_count: 0,
+                row_hash_xor: 0,
+                row_hash_sum: 0,
+            };
+            let mut checkpoint_stats = MetadataTableDigestStats {
                 row_count: 0,
                 row_hash_xor: 0,
                 row_hash_sum: 0,
             };
             for (row_index, row) in block.rows.iter().enumerate() {
-                let row_digest = PgStore::metadata_checkpoint_row_digest(table, &row.values);
-                if row_digest != row.row_digest {
+                let checkpoint_row_digest =
+                    PgStore::metadata_checkpoint_row_digest(table, &row.values);
+                if checkpoint_row_digest != row.row_digest {
                     return Err(
                         MetadataCommandCheckpointValidationError::RowDigestMismatch {
                             table_name: table.name.to_owned(),
                             row_index,
                             expected_digest: row.row_digest,
-                            actual_digest: row_digest,
+                            actual_digest: checkpoint_row_digest,
                         },
                     );
                 }
-                Self::verify_row_semantics(table, row_index, &row.values)?;
-                stats.row_count += 1;
-                stats.row_hash_xor ^= row_digest;
-                stats.row_hash_sum = stats.row_hash_sum.wrapping_add(row_digest);
+                Self::verify_row_semantics(table, checkpoint_columns, row_index, &row.values)?;
+                checkpoint_stats.row_count += 1;
+                checkpoint_stats.row_hash_xor ^= checkpoint_row_digest;
+                checkpoint_stats.row_hash_sum = checkpoint_stats
+                    .row_hash_sum
+                    .wrapping_add(checkpoint_row_digest);
+
+                let canonical_row_digest = PgStore::metadata_checkpoint_row_digest_for_indexes(
+                    table,
+                    &row.values,
+                    &canonical_column_indexes,
+                )
+                .ok_or_else(|| {
+                    MetadataCommandCheckpointValidationError::TableColumnsMismatch {
+                        table_name: table.name.to_owned(),
+                    }
+                })?;
+                canonical_stats.row_count += 1;
+                canonical_stats.row_hash_xor ^= canonical_row_digest;
+                canonical_stats.row_hash_sum = canonical_stats
+                    .row_hash_sum
+                    .wrapping_add(canonical_row_digest);
             }
-            let table_digest = metadata_table_digest_from_stats(table, stats);
-            if table_digest != summary.table_digest
-                || stats.row_count != summary.row_count
-                || stats.row_hash_xor != summary.row_hash_xor
-                || stats.row_hash_sum != summary.row_hash_sum
-                || table_digest != block.table_digest
-                || stats.row_count != block.row_count
-                || stats.row_hash_xor != block.row_hash_xor
-                || stats.row_hash_sum != block.row_hash_sum
+            let canonical_table_digest = metadata_table_digest_from_stats(table, canonical_stats);
+            let checkpoint_table_digest =
+                metadata_table_digest_from_columns(table, checkpoint_columns, checkpoint_stats);
+            if canonical_table_digest != summary.table_digest
+                || canonical_stats.row_count != summary.row_count
+                || canonical_stats.row_hash_xor != summary.row_hash_xor
+                || canonical_stats.row_hash_sum != summary.row_hash_sum
+                || checkpoint_table_digest != block.table_digest
+                || checkpoint_stats.row_count != block.row_count
+                || checkpoint_stats.row_hash_xor != block.row_hash_xor
+                || checkpoint_stats.row_hash_sum != block.row_hash_sum
             {
                 return Err(
                     MetadataCommandCheckpointValidationError::TableDigestMismatch {
                         table_name: table.name.to_owned(),
                         expected_digest: summary.table_digest,
-                        actual_digest: table_digest,
+                        actual_digest: canonical_table_digest,
                     },
                 );
             }
-            PgStore::digest_metadata_table_digest_entry(&mut state_hasher, table, table_digest);
+            PgStore::digest_metadata_table_digest_entry(
+                &mut state_hasher,
+                table,
+                canonical_table_digest,
+            );
         }
 
         let state_digest = state_hasher.finalize();
@@ -375,11 +413,12 @@ impl MetadataCommandCheckpoint {
 
     fn verify_row_semantics(
         table: &MetadataDigestTable,
+        columns: &[&str],
         row_index: usize,
         values: &[MetadataCheckpointValue],
     ) -> Result<(), MetadataCommandCheckpointValidationError> {
         Self::verify_bucket_tag_row(table, row_index, values)?;
-        Self::verify_acl_grants_row(table, row_index, values)
+        Self::verify_acl_grants_row(table, columns, row_index, values)
     }
 
     fn verify_bucket_tag_row(
@@ -420,14 +459,11 @@ impl MetadataCommandCheckpoint {
 
     fn verify_acl_grants_row(
         table: &MetadataDigestTable,
+        columns: &[&str],
         row_index: usize,
         values: &[MetadataCheckpointValue],
     ) -> Result<(), MetadataCommandCheckpointValidationError> {
-        let Some(acl_column) = table
-            .columns
-            .iter()
-            .position(|column| *column == "acl_grants")
-        else {
+        let Some(acl_column) = columns.iter().position(|column| *column == "acl_grants") else {
             return Ok(());
         };
         let valid = matches!(
@@ -852,6 +888,68 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
     },
 ];
 
+const MULTIPART_UPLOAD_CHECKPOINT_COLUMNS: &[&str] = &[
+    "upload_id",
+    "bucket",
+    "key",
+    "initiated_at",
+    "state",
+    "tags",
+    "metadata_blob",
+    "system_metadata_blob",
+    "owner_principal",
+    "encryption_type",
+    "encryption_state",
+    "owner_canonical_id",
+    "initiator_principal",
+    "initiator_canonical_id",
+    "acl_grants",
+    "public_read",
+    "object_generation_id",
+    "initiated_object_kind",
+    "initiated_object_version_id",
+    "initiated_object_generation_or_write_sequence",
+    "listing_cluster_epoch",
+    "listing_log_index",
+    "object_lock_retention_mode",
+    "object_lock_retain_until",
+    "object_lock_legal_hold",
+    "checksum_algorithm",
+    "checksum_type",
+];
+
+pub(super) const STREAM_UPLOAD_CHECKPOINT_COLUMNS: &[&str] = &[
+    "session_id",
+    "bucket",
+    "key",
+    "op_kind",
+    "upload_id",
+    "part_number",
+    "state",
+    "created_at",
+    "cleanup_after",
+    "encryption_type",
+    "encryption_state",
+    "next_segment_vid",
+    "bucket_write_reservation_id",
+    "bucket_write_owner_token",
+    "bucket_write_cluster_epoch",
+    "bucket_write_execution_generation",
+    "bucket_write_incarnation_generation",
+    "bucket_write_operation_kind",
+    "bucket_write_created_at",
+    "bucket_write_lease_deadline",
+    "bucket_write_target_context",
+];
+
+pub(super) fn metadata_checkpoint_columns(table: &MetadataDigestTable) -> &'static [&'static str] {
+    match table.name {
+        "multipart_uploads" => MULTIPART_UPLOAD_CHECKPOINT_COLUMNS,
+        "stream_uploads" => STREAM_UPLOAD_CHECKPOINT_COLUMNS,
+        _ => table.columns,
+    }
+}
+
 /// Feed a variable-length byte field into a canonical digest.
 ///
 /// The length prefix is part of the canonical state encoding. Without it,
@@ -957,12 +1055,20 @@ fn metadata_table_digest_from_stats(
     table: &MetadataDigestTable,
     stats: MetadataTableDigestStats,
 ) -> u64 {
+    metadata_table_digest_from_columns(table, table.columns, stats)
+}
+
+fn metadata_table_digest_from_columns(
+    table: &MetadataDigestTable,
+    columns: &[&str],
+    stats: MetadataTableDigestStats,
+) -> u64 {
     let mut hasher = checksum::crc64::Hasher::new();
     digest_u8(&mut hasher, 0x10);
     digest_len_prefixed_bytes(&mut hasher, table.name.as_bytes());
     digest_len_prefixed_bytes(&mut hasher, table.filter.canonical_name().as_bytes());
-    digest_u64(&mut hasher, table.columns.len() as u64);
-    for column in table.columns {
+    digest_u64(&mut hasher, columns.len() as u64);
+    for column in columns {
         digest_len_prefixed_bytes(&mut hasher, column.as_bytes());
     }
     digest_u64(&mut hasher, table.order_columns.len() as u64);
@@ -4347,14 +4453,38 @@ impl PgStore {
         let state =
             self.validate_metadata_command_checkpoint_state_read_only(node_id, cluster_epoch)?;
         let table_blocks = self.metadata_checkpoint_table_blocks()?;
-        let table_digests = table_blocks
+        let table_digests = METADATA_DIGEST_TABLES
             .iter()
-            .map(|block| MetadataCheckpointTableDigest {
-                table_name: block.table_name.clone(),
-                row_count: block.row_count,
-                row_hash_xor: block.row_hash_xor,
-                row_hash_sum: block.row_hash_sum,
-                table_digest: block.table_digest,
+            .zip(&table_blocks)
+            .map(|(table, block)| {
+                let indexes = Self::metadata_checkpoint_canonical_column_indexes(
+                    table,
+                    metadata_checkpoint_columns(table),
+                )
+                .expect("checkpoint inventory contains every canonical column");
+                let mut stats = MetadataTableDigestStats {
+                    row_count: 0,
+                    row_hash_xor: 0,
+                    row_hash_sum: 0,
+                };
+                for row in &block.rows {
+                    let row_digest = Self::metadata_checkpoint_row_digest_for_indexes(
+                        table,
+                        &row.values,
+                        &indexes,
+                    )
+                    .expect("captured checkpoint row contains every canonical column");
+                    stats.row_count += 1;
+                    stats.row_hash_xor ^= row_digest;
+                    stats.row_hash_sum = stats.row_hash_sum.wrapping_add(row_digest);
+                }
+                MetadataCheckpointTableDigest {
+                    table_name: table.name.to_owned(),
+                    row_count: stats.row_count,
+                    row_hash_xor: stats.row_hash_xor,
+                    row_hash_sum: stats.row_hash_sum,
+                    table_digest: metadata_table_digest_from_stats(table, stats),
+                }
             })
             .collect::<Vec<_>>();
         let state_digest = self.metadata_state_digest_from_checkpoint_tables(&table_digests);
@@ -6802,13 +6932,13 @@ impl PgStore {
             return Ok(());
         }
         let table_sql = quote_sql_identifier(table.name);
-        let columns = table
-            .columns
+        let checkpoint_columns = metadata_checkpoint_columns(table);
+        let columns = checkpoint_columns
             .iter()
             .map(|column| quote_sql_identifier(column))
             .collect::<Vec<_>>()
             .join(", ");
-        let placeholders = (1..=table.columns.len())
+        let placeholders = (1..=checkpoint_columns.len())
             .map(|index| format!("?{index}"))
             .collect::<Vec<_>>()
             .join(", ");
@@ -6868,8 +6998,8 @@ impl PgStore {
     ) -> Result<MetadataCheckpointTableBlock, StoreError> {
         let where_clause = Self::metadata_digest_where_clause(table.filter);
         let table_sql = quote_sql_identifier(table.name);
-        let quoted_columns: Vec<String> = table
-            .columns
+        let checkpoint_columns = metadata_checkpoint_columns(table);
+        let quoted_columns: Vec<String> = checkpoint_columns
             .iter()
             .map(|column| quote_sql_identifier(column))
             .collect();
@@ -6900,8 +7030,8 @@ impl PgStore {
             context: "scan canonical metadata checkpoint table block row",
             source: e.into(),
         })? {
-            let mut values = Vec::with_capacity(table.columns.len());
-            for index in 0..table.columns.len() {
+            let mut values = Vec::with_capacity(checkpoint_columns.len());
+            for index in 0..checkpoint_columns.len() {
                 let value = row.get_ref(index).map_err(|e| StoreError::Db {
                     context: "read canonical metadata checkpoint row value",
                     source: e.into(),
@@ -6914,11 +7044,10 @@ impl PgStore {
             stats.row_hash_sum = stats.row_hash_sum.wrapping_add(row_digest);
             checkpoint_rows.push(MetadataCheckpointRow { values, row_digest });
         }
-        let table_digest = metadata_table_digest_from_stats(table, stats);
+        let table_digest = metadata_table_digest_from_columns(table, checkpoint_columns, stats);
         Ok(MetadataCheckpointTableBlock {
             table_name: table.name.to_owned(),
-            columns: table
-                .columns
+            columns: checkpoint_columns
                 .iter()
                 .map(|column| (*column).to_owned())
                 .collect(),
@@ -7003,26 +7132,47 @@ impl PgStore {
             .zip(&mut checkpoint.table_digests)
             .zip(&mut checkpoint.table_blocks)
         {
-            let mut stats = MetadataTableDigestStats {
+            let checkpoint_columns = block.columns.iter().map(String::as_str).collect::<Vec<_>>();
+            let canonical_column_indexes =
+                Self::metadata_checkpoint_canonical_column_indexes(table, &checkpoint_columns)
+                    .expect("checkpoint inventory contains every canonical column");
+            let mut canonical_stats = MetadataTableDigestStats {
+                row_count: 0,
+                row_hash_xor: 0,
+                row_hash_sum: 0,
+            };
+            let mut checkpoint_stats = MetadataTableDigestStats {
                 row_count: 0,
                 row_hash_xor: 0,
                 row_hash_sum: 0,
             };
             for row in &mut block.rows {
                 row.row_digest = Self::metadata_checkpoint_row_digest(table, &row.values);
-                stats.row_count += 1;
-                stats.row_hash_xor ^= row.row_digest;
-                stats.row_hash_sum = stats.row_hash_sum.wrapping_add(row.row_digest);
+                checkpoint_stats.row_count += 1;
+                checkpoint_stats.row_hash_xor ^= row.row_digest;
+                checkpoint_stats.row_hash_sum =
+                    checkpoint_stats.row_hash_sum.wrapping_add(row.row_digest);
+                let canonical_row_digest = Self::metadata_checkpoint_row_digest_for_indexes(
+                    table,
+                    &row.values,
+                    &canonical_column_indexes,
+                )
+                .expect("checkpoint row contains every canonical column");
+                canonical_stats.row_count += 1;
+                canonical_stats.row_hash_xor ^= canonical_row_digest;
+                canonical_stats.row_hash_sum = canonical_stats
+                    .row_hash_sum
+                    .wrapping_add(canonical_row_digest);
             }
-            let table_digest = metadata_table_digest_from_stats(table, stats);
-            summary.row_count = stats.row_count;
-            summary.row_hash_xor = stats.row_hash_xor;
-            summary.row_hash_sum = stats.row_hash_sum;
-            summary.table_digest = table_digest;
-            block.row_count = stats.row_count;
-            block.row_hash_xor = stats.row_hash_xor;
-            block.row_hash_sum = stats.row_hash_sum;
-            block.table_digest = table_digest;
+            summary.row_count = canonical_stats.row_count;
+            summary.row_hash_xor = canonical_stats.row_hash_xor;
+            summary.row_hash_sum = canonical_stats.row_hash_sum;
+            summary.table_digest = metadata_table_digest_from_stats(table, canonical_stats);
+            block.row_count = checkpoint_stats.row_count;
+            block.row_hash_xor = checkpoint_stats.row_hash_xor;
+            block.row_hash_sum = checkpoint_stats.row_hash_sum;
+            block.table_digest =
+                metadata_table_digest_from_columns(table, &checkpoint_columns, checkpoint_stats);
         }
         let mut state_hasher = checksum::crc64::Hasher::new();
         Self::digest_canonical_pg_state_header(&mut state_hasher);
@@ -7079,6 +7229,36 @@ impl PgStore {
             Self::digest_metadata_checkpoint_value(&mut hasher, value);
         }
         hasher.finalize()
+    }
+
+    fn metadata_checkpoint_canonical_column_indexes(
+        table: &MetadataDigestTable,
+        checkpoint_columns: &[&str],
+    ) -> Option<Vec<usize>> {
+        table
+            .columns
+            .iter()
+            .map(|column| {
+                checkpoint_columns
+                    .iter()
+                    .position(|candidate| candidate == column)
+            })
+            .collect()
+    }
+
+    fn metadata_checkpoint_row_digest_for_indexes(
+        table: &MetadataDigestTable,
+        values: &[MetadataCheckpointValue],
+        indexes: &[usize],
+    ) -> Option<u64> {
+        let mut hasher = checksum::crc64::Hasher::new();
+        digest_u8(&mut hasher, 0x20);
+        digest_len_prefixed_bytes(&mut hasher, table.name.as_bytes());
+        digest_u64(&mut hasher, indexes.len() as u64);
+        for index in indexes {
+            Self::digest_metadata_checkpoint_value(&mut hasher, values.get(*index)?);
+        }
+        Some(hasher.finalize())
     }
 
     fn metadata_checkpoint_value_from_sql(value: ValueRef<'_>) -> MetadataCheckpointValue {
@@ -7502,10 +7682,10 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn current_checksum_tags_match_frozen_canonical_state_v5_and_checkpoint_v2_evidence_and_require_version_bumps(
+    fn current_checksum_tags_match_frozen_canonical_state_v5_and_checkpoint_v3_evidence_and_require_version_bumps(
     ) {
         assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 5);
-        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 2);
+        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 3);
 
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -7557,12 +7737,23 @@ mod canonical_format_baseline_tests {
             .find(|block| block.table_name == "multipart_uploads")
             .unwrap();
         assert_eq!(multipart_uploads.rows.len(), 1);
+        let checksum_algorithm_index = multipart_uploads
+            .columns
+            .iter()
+            .position(|column| column == "checksum_algorithm")
+            .unwrap();
+        let checksum_type_index = multipart_uploads
+            .columns
+            .iter()
+            .position(|column| column == "checksum_type")
+            .unwrap();
         assert_eq!(
-            &multipart_uploads.rows[0].values[12..14],
-            &[
-                MetadataCheckpointValue::Integer(4),
-                MetadataCheckpointValue::Integer(1),
-            ]
+            multipart_uploads.rows[0].values[checksum_algorithm_index],
+            MetadataCheckpointValue::Integer(4),
+        );
+        assert_eq!(
+            multipart_uploads.rows[0].values[checksum_type_index],
+            MetadataCheckpointValue::Integer(1),
         );
 
         let encoded = encode_metadata_command_checkpoint_payload(&checkpoint).unwrap();
@@ -7576,6 +7767,60 @@ mod canonical_format_baseline_tests {
             ),
             (
                 0xaf12_e777_e798_6326,
+                0xaee3_00e7_7c85_39ce,
+                7_563,
+                &[
+                    73, 225, 247, 225, 57, 46, 87, 253, 244, 249, 98, 226, 194, 240, 88, 170, 80,
+                    223, 60, 48, 33, 2, 153, 255, 59, 18, 244, 132, 67, 107, 214, 60,
+                ][..],
+            )
+        );
+
+        let mut checkpoint_v2 = checkpoint.clone();
+        for (table, block) in METADATA_DIGEST_TABLES
+            .iter()
+            .zip(&mut checkpoint_v2.table_blocks)
+        {
+            let canonical_indexes = table
+                .columns
+                .iter()
+                .map(|column| {
+                    block
+                        .columns
+                        .iter()
+                        .position(|candidate| candidate == column)
+                        .expect("v3 checkpoint must contain every v2 canonical column")
+                })
+                .collect::<Vec<_>>();
+            for row in &mut block.rows {
+                row.values = canonical_indexes
+                    .iter()
+                    .map(|index| row.values[*index].clone())
+                    .collect();
+            }
+            block.columns = table
+                .columns
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect();
+        }
+        PgStore::test_reseal_metadata_command_checkpoint(&mut checkpoint_v2);
+        PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
+            &mut checkpoint_v2,
+            2,
+        );
+        let mut encoded_v2 = encode_metadata_command_checkpoint_payload(&checkpoint_v2).unwrap();
+        encoded_v2[8..10].copy_from_slice(&2_u16.to_be_bytes());
+        let encoded_v2_sha256 = checksum::compute_checksum(ChecksumAlgorithm::Sha256, &encoded_v2);
+        assert_eq!(
+            (
+                checkpoint_v2.state_digest.value(),
+                checkpoint_v2.checkpoint_crc64,
+                encoded_v2.len(),
+                encoded_v2_sha256.bytes(),
+            ),
+            (
+                0xaf12_e777_e798_6326,
                 0x628c_2605_8430_0187,
                 7_177,
                 &[
@@ -7584,5 +7829,11 @@ mod canonical_format_baseline_tests {
                 ][..],
             )
         );
+        assert!(matches!(
+            decode_metadata_command_checkpoint_payload(&encoded_v2),
+            Err(crate::storage_rpc::StorageRpcPayloadError::UnsupportedMetadataCheckpointEncodingVersion {
+                actual: 2
+            })
+        ));
     }
 }

@@ -171,7 +171,7 @@ pub(crate) use scavenger::{ScavengerShardFile, ScavengerShardFileScan, Scavenger
 
 const LIFECYCLE_SUBRESOURCE_KIND_SQL: i64 = BucketSubresourceKind::Lifecycle as u8 as i64;
 pub(crate) const METADATA_COMMAND_CHECKPOINT_MAGIC: &[u8; 8] = b"ARGMCPKT";
-pub(crate) const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u16 = 2;
+pub(crate) const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u16 = 3;
 const BUCKET_INFO_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
