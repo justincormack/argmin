@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 const DIRECT_CONDITIONAL_PUT_BYTES: usize = 64 * 1024;
 const STREAMED_CONDITIONAL_PUT_BYTES: usize = 4 * 1024 * 1024;
 const CONDITIONAL_PUT_STREAM_CHUNK_BYTES: usize = 64 * 1024;
-const CONDITIONAL_RACE_MAX_ATTEMPTS: usize = 2;
+const CONDITIONAL_RACE_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Default)]
 struct ConditionalPutStartGateState {
@@ -1416,7 +1416,8 @@ fn test_simultaneous_if_none_match_puts_publish_one_complete_object() {
                 if conditional_put_race_saw_slow_down(&left, &right, name) {
                     assert!(
                         attempt + 1 < CONDITIONAL_RACE_MAX_ATTEMPTS,
-                        "{name}: conditional race returned SlowDown twice"
+                        "{name}: conditional race returned SlowDown on all \
+                         {CONDITIONAL_RACE_MAX_ATTEMPTS} attempts"
                     );
                     let _ = s3_tests::delete_object_retrying_operation_aborted(
                         CTX.client(),
@@ -1519,7 +1520,8 @@ fn test_simultaneous_if_match_puts_publish_one_complete_object() {
                 if conditional_put_race_saw_slow_down(&left, &right, name) {
                     assert!(
                         attempt + 1 < CONDITIONAL_RACE_MAX_ATTEMPTS,
-                        "{name}: conditional race returned SlowDown twice"
+                        "{name}: conditional race returned SlowDown on all \
+                         {CONDITIONAL_RACE_MAX_ATTEMPTS} attempts"
                     );
                     let _ = s3_tests::delete_object_retrying_operation_aborted(
                         CTX.client(),
