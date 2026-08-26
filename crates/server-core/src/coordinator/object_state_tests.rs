@@ -6073,6 +6073,27 @@ fn upload_part_copy_retrying_operation_contention(
     unreachable!("retry loop must return on its final attempt")
 }
 
+fn copy_object_retrying_operation_contention(
+    coord: &Coordinator,
+    req: &CopyObjectRequest<'_>,
+) -> Result<CopyObjectResult, ServerError> {
+    const MAX_ATTEMPTS: usize = 2;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match coord.copy_object(req) {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if server_error_is_retryable_operation_contention(&error)
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("retry loop must return on its final attempt")
+}
+
 #[test]
 fn get_object_is_consistent_during_concurrent_overwrite() {
     let tmp = test_util::tempdir();
@@ -6251,25 +6272,28 @@ fn copy_object_is_consistent_during_concurrent_overwrite() {
         });
         let t_copy = thread::spawn(move || {
             b2.wait();
-            copier.copy_object(&CopyObjectRequest {
-                source: copy_source("src-bucket", "src", None),
-                destination: object_request_with_expected_owner(
-                    "dst-bucket",
-                    &dst_key_for_copy,
-                    test_requester(),
-                    None,
-                ),
-                dst_condition: NO_WRITE,
-                directive: MetadataDirective::Copy,
-                website_redirect_location: None,
-                tagging: TaggingDirective::Copy,
+            copy_object_retrying_operation_contention(
+                &copier,
+                &CopyObjectRequest {
+                    source: copy_source("src-bucket", "src", None),
+                    destination: object_request_with_expected_owner(
+                        "dst-bucket",
+                        &dst_key_for_copy,
+                        test_requester(),
+                        None,
+                    ),
+                    dst_condition: NO_WRITE,
+                    directive: MetadataDirective::Copy,
+                    website_redirect_location: None,
+                    tagging: TaggingDirective::Copy,
 
-                acl: NO_PUT_OBJECT_ACL.into(),
-                policy_context: PutObjectPolicyContext::default(),
-                source_sse_customer: None,
-                destination_encryption: WriteEncryptionRequest::none(),
-                object_lock: ObjectLockState::default(),
-            })
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    source_sse_customer: None,
+                    destination_encryption: WriteEncryptionRequest::none(),
+                    object_lock: ObjectLockState::default(),
+                },
+            )
         });
 
         barrier.wait();
