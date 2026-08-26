@@ -382,10 +382,18 @@ metadata-transfer and payload-backfill primitives. It does not depend on adding
 or removing nodes dynamically and is not capacity rebalancing. It must:
 
 - select replacement actors deterministically from committed eligible nodes,
-  failure-domain policy, current availability, and the exact source acting set;
+  failure-domain policy, current availability, and the exact source acting set.
+  Selection must call the storage-owned placement operation defined by the
+  immutable capacity-weight plan: use the retained derivation version and
+  stable PG key to rank the complete committed weighted policy, then filter
+  unavailable, already-acting, and failure-domain-conflicting nodes without
+  renormalizing the transient eligible subset. The controller must not inspect
+  weights, reconstruct placement nodes, reread the static manifest, or fall back
+  to node-ID ordering;
 - persist one idempotent transition identity containing the topology generation
-  and digest, source PG epoch/state/acting set, destination acting set, reason,
-  and exact failure or planned-maintenance authorization;
+  and digest, placement derivation version, source PG epoch/state/acting set,
+  destination acting set, reason, and exact failure or planned-maintenance
+  authorization;
 - authorize an unplanned-outage transition with the unavailable node identity
   and incarnation, exact accepted lease/availability observation, and
   authority-clock grace cutoff;
@@ -419,6 +427,13 @@ or removing nodes dynamically and is not capacity rebalancing. It must:
   capacity falls below its configured safety minimum; and
 - resume exactly after authority failover, process restart, response loss, or
   repeated unavailable/healthy observations without duplicating migration.
+
+Deterministic replacement coverage must include multiple differently weighted
+eligible spares and a changing availability subset. It must prove that retries,
+authority failover, and subset changes preserve the ranking derived from the
+complete committed policy and that the selected transition remains bound to the
+exact topology generation, digest, derivation version, source acting set, and
+availability evidence.
 
 Queue discovery before the compare-and-swap is advisory and cancellable: a
 renewed exact incarnation or changed topology/PG record invalidates that item
