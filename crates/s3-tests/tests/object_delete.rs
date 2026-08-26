@@ -3,7 +3,8 @@
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration,
+    BucketVersioningStatus, Delete, DeletedObject, Error as DeleteObjectError, ObjectIdentifier,
+    VersioningConfiguration,
 };
 use s3_tests::{
     assert_s3_err_code, content_md5_header, create_objects, create_objects_with_keys,
@@ -162,7 +163,139 @@ async fn race_conditional_delete_objects_with_put(
         .await
     });
     let (delete, put) = tokio::join!(delete_task, put_task);
-    (delete.unwrap(), put.unwrap())
+    let delete = match delete.unwrap() {
+        Ok(output) => {
+            Ok(
+                retry_delete_objects_canary_slow_down(bucket, canary_key, canary_etag, output)
+                    .await,
+            )
+        }
+        Err(error) => Err(error),
+    };
+    (delete, put.unwrap())
+}
+
+async fn retry_delete_objects_canary_slow_down(
+    bucket: &str,
+    canary_key: &str,
+    canary_etag: &str,
+    output: aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput,
+) -> aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput {
+    if !validate_canary_slow_down_for_retry(&output, canary_key) {
+        return output;
+    }
+
+    // Preserve the conditional target's exact race result. Only replay the
+    // independent canary entry whose SlowDown means it was not admitted.
+    let retry = delete_objects_with_md5(
+        CTX.client(),
+        bucket,
+        Delete::builder()
+            .objects(make_object_id_with_etag(canary_key, canary_etag))
+            .quiet(false)
+            .build()
+            .unwrap(),
+    )
+    .send()
+    .await
+    .unwrap_or_else(|error| panic!("retried multi-delete canary failed: {error:?}"));
+    assert!(
+        retry.errors().is_empty(),
+        "retried multi-delete canary failed: {retry:?}"
+    );
+    assert_eq!(retry.deleted().len(), 1, "{retry:?}");
+    assert_eq!(retry.deleted()[0].key(), Some(canary_key));
+
+    let mut deleted = output.deleted().to_vec();
+    deleted.extend(retry.deleted().iter().cloned());
+    let errors = output
+        .errors()
+        .iter()
+        .filter(|error| error.key() != Some(canary_key))
+        .cloned()
+        .collect::<Vec<_>>();
+    aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput::builder()
+        .set_deleted(Some(deleted))
+        .set_errors((!errors.is_empty()).then_some(errors))
+        .build()
+}
+
+fn validate_canary_slow_down_for_retry(
+    output: &aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput,
+    canary_key: &str,
+) -> bool {
+    let canary_errors = output
+        .errors()
+        .iter()
+        .filter(|error| error.key() == Some(canary_key))
+        .collect::<Vec<_>>();
+    if !canary_errors
+        .iter()
+        .any(|error| error.code() == Some("SlowDown"))
+    {
+        return false;
+    }
+
+    assert!(
+        output
+            .deleted()
+            .iter()
+            .all(|deleted| deleted.key() != Some(canary_key)),
+        "canary cannot be both deleted and SlowDown before retry: {output:?}"
+    );
+    assert_eq!(
+        canary_errors.len(),
+        1,
+        "canary must have exactly one error before retry: {output:?}"
+    );
+    assert_eq!(canary_errors[0].code(), Some("SlowDown"));
+    true
+}
+
+fn test_delete_objects_output(
+    deleted: Vec<DeletedObject>,
+    errors: Vec<DeleteObjectError>,
+) -> aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput {
+    aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput::builder()
+        .set_deleted((!deleted.is_empty()).then_some(deleted))
+        .set_errors((!errors.is_empty()).then_some(errors))
+        .build()
+}
+
+fn test_delete_objects_error(key: &str, code: &str) -> DeleteObjectError {
+    DeleteObjectError::builder().key(key).code(code).build()
+}
+
+#[test]
+fn canary_slow_down_retry_accepts_one_undeleted_error() {
+    let output = test_delete_objects_output(
+        Vec::new(),
+        vec![test_delete_objects_error("canary", "SlowDown")],
+    );
+    assert!(validate_canary_slow_down_for_retry(&output, "canary"));
+}
+
+#[test]
+#[should_panic(expected = "canary cannot be both deleted and SlowDown before retry")]
+fn canary_slow_down_retry_rejects_deleted_canary() {
+    let output = test_delete_objects_output(
+        vec![DeletedObject::builder().key("canary").build()],
+        vec![test_delete_objects_error("canary", "SlowDown")],
+    );
+    validate_canary_slow_down_for_retry(&output, "canary");
+}
+
+#[test]
+#[should_panic(expected = "canary must have exactly one error before retry")]
+fn canary_slow_down_retry_rejects_duplicate_errors() {
+    let output = test_delete_objects_output(
+        Vec::new(),
+        vec![
+            test_delete_objects_error("canary", "SlowDown"),
+            test_delete_objects_error("canary", "SlowDown"),
+        ],
+    );
+    validate_canary_slow_down_for_retry(&output, "canary");
 }
 
 fn classify_conditional_delete_objects_entry(

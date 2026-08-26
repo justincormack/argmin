@@ -2032,43 +2032,51 @@ mod harness {
             shape.bucket_public_read,
             shape.bucket_public_write,
         );
-        coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
-
-        coord.put_bucket_versioning(&PutBucketVersioningRequest {
-            bucket: BucketRequest::new(
-                trusted_bucket_name(bucket),
-                fixtures.bucket_owner_requester(shape.owner_principal),
-                None,
-            ),
-            state: BucketVersioningState::Enabled,
+        retry_authz_setup_operation(|| {
+            coord.create_bucket_with_acl_grants(&owner, bucket, grants.clone(), false)
         })?;
 
-        if shape.ownership == OwnershipShape::BucketOwnerEnforced {
-            coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+        retry_authz_setup_operation(|| {
+            coord.put_bucket_versioning(&PutBucketVersioningRequest {
                 bucket: BucketRequest::new(
                     trusted_bucket_name(bucket),
                     fixtures.bucket_owner_requester(shape.owner_principal),
                     None,
                 ),
-                config: BucketOwnershipControls {
-                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
-                },
+                state: BucketVersioningState::Enabled,
+            })
+        })?;
+
+        if shape.ownership == OwnershipShape::BucketOwnerEnforced {
+            retry_authz_setup_operation(|| {
+                coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        fixtures.bucket_owner_requester(shape.owner_principal),
+                        None,
+                    ),
+                    config: BucketOwnershipControls {
+                        object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                    },
+                })
             })?;
         }
 
         if shape.block_public_acls || shape.ignore_public_acls || shape.restrict_public_buckets {
-            coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
-                bucket: BucketRequest::new(
-                    trusted_bucket_name(bucket),
-                    fixtures.bucket_owner_requester(shape.owner_principal),
-                    None,
-                ),
-                config: PublicAccessBlockConfig {
-                    block_public_acls: shape.block_public_acls,
-                    ignore_public_acls: shape.ignore_public_acls,
-                    block_public_policy: false,
-                    restrict_public_buckets: shape.restrict_public_buckets,
-                },
+            retry_authz_setup_operation(|| {
+                coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        fixtures.bucket_owner_requester(shape.owner_principal),
+                        None,
+                    ),
+                    config: PublicAccessBlockConfig {
+                        block_public_acls: shape.block_public_acls,
+                        ignore_public_acls: shape.ignore_public_acls,
+                        block_public_policy: false,
+                        restrict_public_buckets: shape.restrict_public_buckets,
+                    },
+                })
             })?;
         }
 
@@ -2089,39 +2097,43 @@ mod harness {
             let policy = format!(
                 r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/{KEY}"}}]}}"#
             );
-            coord.put_bucket_policy(&PutBucketPolicyRequest {
-                bucket: BucketRequest::new(
-                    trusted_bucket_name(bucket),
-                    fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
-                    None,
-                ),
-                config: &policy,
-                confirm_remove_self_bucket_access: false,
+            retry_authz_setup_operation(|| {
+                coord.put_bucket_policy(&PutBucketPolicyRequest {
+                    bucket: BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
+                        None,
+                    ),
+                    config: &policy,
+                    confirm_remove_self_bucket_access: false,
+                })
             })?;
         }
 
         let writer =
             fixtures.object_writer(scenario.bucket.owner_principal, scenario.object.owner_kind);
-        let put = test_helpers::put_object(
-            coord,
-            &PutObjectRequest {
-                encryption: WriteEncryptionRequest::none(),
-                policy_context: PutObjectPolicyContext::default(),
-                object_lock: ObjectLockState::default(),
-                object: ObjectRequest::new(
-                    trusted_bucket_name(bucket),
-                    trusted_object_key(KEY),
-                    writer,
-                    None,
-                ),
-                data: b"phase-1-data",
-                metadata: &MetadataBlob::new(),
-                system_metadata: &SystemMetadata::EMPTY,
-                tags: None,
-                cond: NO_WRITE,
-                acl: object_write_acl(fixtures, scenario),
-            },
-        )?;
+        let put = retry_authz_setup_operation(|| {
+            test_helpers::put_object(
+                coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        writer.clone(),
+                        None,
+                    ),
+                    data: b"phase-1-data",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: object_write_acl(fixtures, scenario),
+                },
+            )
+        })?;
         Ok(put.version_id)
     }
 
@@ -2154,26 +2166,28 @@ mod harness {
         bucket: &str,
         owner_principal: BucketOwnerPrincipalShape,
     ) -> Result<VersionId, ServerError> {
-        let put = test_helpers::put_object(
-            coord,
-            &PutObjectRequest {
-                encryption: WriteEncryptionRequest::none(),
-                policy_context: PutObjectPolicyContext::default(),
-                object_lock: ObjectLockState::default(),
-                object: ObjectRequest::new(
-                    trusted_bucket_name(bucket),
-                    trusted_object_key(KEY),
-                    fixtures.bucket_owner_requester(owner_principal),
-                    None,
-                ),
-                data: b"phase-3-data",
-                metadata: &MetadataBlob::new(),
-                system_metadata: &SystemMetadata::EMPTY,
-                tags: None,
-                cond: NO_WRITE,
-                acl: PutObjectWriteAcl::None,
-            },
-        )?;
+        let put = retry_authz_setup_operation(|| {
+            test_helpers::put_object(
+                coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        fixtures.bucket_owner_requester(owner_principal),
+                        None,
+                    ),
+                    data: b"phase-3-data",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: PutObjectWriteAcl::None,
+                },
+            )
+        })?;
         Ok(put.version_id)
     }
 
@@ -2185,23 +2199,27 @@ mod harness {
     ) -> Result<(), ServerError> {
         let Some(policy) = policy_document(fixtures, bucket, scenario) else {
             if scenario.object.owner_kind != ObjectOwnerKind::BucketOwner {
-                coord.delete_bucket_policy(&BucketRequest::new(
-                    trusted_bucket_name(bucket),
-                    fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
-                    None,
-                ))?;
+                retry_authz_setup_operation(|| {
+                    coord.delete_bucket_policy(&BucketRequest::new(
+                        trusted_bucket_name(bucket),
+                        fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
+                        None,
+                    ))
+                })?;
             }
             return Ok(());
         };
 
-        coord.put_bucket_policy(&PutBucketPolicyRequest {
-            bucket: BucketRequest::new(
-                trusted_bucket_name(bucket),
-                fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
-                None,
-            ),
-            config: &policy,
-            confirm_remove_self_bucket_access: false,
+        retry_authz_setup_operation(|| {
+            coord.put_bucket_policy(&PutBucketPolicyRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
+                    None,
+                ),
+                config: &policy,
+                confirm_remove_self_bucket_access: false,
+            })
         })
     }
 
@@ -2216,15 +2234,37 @@ mod harness {
             return Ok(());
         };
 
-        coord.put_bucket_policy(&PutBucketPolicyRequest {
-            bucket: BucketRequest::new(
-                trusted_bucket_name(bucket),
-                fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
-                None,
-            ),
-            config: &policy,
-            confirm_remove_self_bucket_access: false,
+        retry_authz_setup_operation(|| {
+            coord.put_bucket_policy(&PutBucketPolicyRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
+                    None,
+                ),
+                config: &policy,
+                confirm_remove_self_bucket_access: false,
+            })
         })
+    }
+
+    fn retry_authz_setup_operation<T>(
+        mut operation: impl FnMut() -> Result<T, ServerError>,
+    ) -> Result<T, ServerError> {
+        const MAX_ATTEMPTS: usize = 2;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            match operation() {
+                Ok(result) => return Ok(result),
+                Err(error)
+                    if server_error_is_retryable_operation_contention(&error)
+                        && attempt + 1 < MAX_ATTEMPTS =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("retry loop must return on its final attempt")
     }
 
     fn run_action(

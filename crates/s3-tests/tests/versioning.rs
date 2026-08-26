@@ -9,7 +9,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
     delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
-    err_status, get_object_body_retrying_operation_aborted,
+    err_status, get_object_body_retrying_operation_aborted, is_retryable_operation_contention,
     is_retryable_operation_contention_response, raw_bucket, raw_object, raw_object_query,
     send_signed_request,
     shape::{
@@ -39,15 +39,27 @@ async fn put_object_retrying_operation_aborted(
     key: &str,
     body: Vec<u8>,
 ) -> aws_sdk_s3::operation::put_object::PutObjectOutput {
-    s3_tests::retrying_operation_aborted("put object during versioning setup", || {
-        client
+    const MAX_ATTEMPTS: usize = 2;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match client
             .put_object()
             .bucket(bucket)
             .key(key)
             .body(ByteStream::from(body.clone()))
             .send()
-    })
-    .await
+            .await
+        {
+            Ok(output) => return output,
+            Err(error)
+                if is_retryable_operation_contention(&error) && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("put object during versioning setup: {error:?}"),
+        }
+    }
+    unreachable!("retry loop must return on its final attempt")
 }
 
 async fn upload_part_retrying_operation_aborted(

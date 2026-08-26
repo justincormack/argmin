@@ -6052,6 +6052,27 @@ fn delete_object_retrying_operation_contention(
     }
 }
 
+fn upload_part_copy_retrying_operation_contention(
+    coord: &Coordinator,
+    req: &UploadPartCopyRequest<'_>,
+) -> Result<UploadPartCopyResult, ServerError> {
+    const MAX_ATTEMPTS: usize = 2;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match coord.upload_part_copy(req) {
+            Ok(result) => return Ok(result),
+            Err(error)
+                if server_error_is_retryable_operation_contention(&error)
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("retry loop must return on its final attempt")
+}
+
 #[test]
 fn get_object_is_consistent_during_concurrent_overwrite() {
     let tmp = test_util::tempdir();
@@ -6679,23 +6700,26 @@ fn upload_part_copy_is_consistent_during_concurrent_overwrite() {
         });
         let t_copy = thread::spawn(move || {
             b2.wait();
-            copier.upload_part_copy(&UploadPartCopyRequest {
-                source: copy_source("bucket", "src", None),
-                upload: multipart_object_request_with_expected_owner(
-                    "bucket",
-                    &dst_key_for_copy,
-                    &upload_id_for_copy,
-                    test_requester(),
-                    None,
-                ),
-                part_number: 1,
-                copy_source_range: None,
+            upload_part_copy_retrying_operation_contention(
+                &copier,
+                &UploadPartCopyRequest {
+                    source: copy_source("bucket", "src", None),
+                    upload: multipart_object_request_with_expected_owner(
+                        "bucket",
+                        &dst_key_for_copy,
+                        &upload_id_for_copy,
+                        test_requester(),
+                        None,
+                    ),
+                    part_number: 1,
+                    copy_source_range: None,
 
-                policy_context: PutObjectPolicyContext::default(),
+                    policy_context: PutObjectPolicyContext::default(),
 
-                source_sse_customer: None,
-                sse_customer: None,
-            })
+                    source_sse_customer: None,
+                    sse_customer: None,
+                },
+            )
         });
 
         barrier.wait();
