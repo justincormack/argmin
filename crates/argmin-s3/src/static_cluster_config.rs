@@ -45,8 +45,8 @@ use storage::{
     ControlPlaneRaftPeerBootstrap, FrontendStorageRpcClientCapability,
     MaintenanceStorageRpcClientCapability, StaticInitialControlPlaneTopology,
     StaticInitialPgPlacement, StaticStorageFailureDomain, StaticStorageNodeEndpoint,
-    StaticStoragePlacementNode, StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig,
-    StorageRpcTransportLimits,
+    StaticStoragePlacementNode, StaticStoragePlacementParameters,
+    StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig, StorageRpcTransportLimits,
 };
 use x509_cert::der::Decode;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
@@ -5456,9 +5456,12 @@ fn validate_initial_pg_placement(
     };
     storage::derive_static_initial_pg_placement(
         manifest.storage.pg_count,
-        manifest.storage.ec_data_shards,
-        manifest.storage.ec_parity_shards,
-        failure_domain,
+        StaticStoragePlacementParameters::new(
+            manifest.storage.ec_data_shards,
+            manifest.storage.ec_parity_shards,
+            failure_domain,
+            manifest.deployment.failure_tolerance,
+        ),
         &hosts
             .iter()
             .map(|host| (*host).to_owned())
@@ -7545,9 +7548,7 @@ max_snapshot_bytes = 15728640
         let manifest = compact_identity_manifest_input();
         let placement = storage::derive_static_initial_pg_placement(
             1,
-            1,
-            0,
-            StaticStorageFailureDomain::None,
+            StaticStoragePlacementParameters::new(1, 0, StaticStorageFailureDomain::None, 0),
             &["h".to_string()],
             &["d".to_string()],
             &[StaticStoragePlacementNode::new(7, "h", "d")],

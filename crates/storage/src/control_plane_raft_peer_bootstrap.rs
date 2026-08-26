@@ -1163,6 +1163,7 @@ mod tests {
     use crate::{
         derive_static_initial_control_plane_topology, derive_static_initial_pg_placement,
         StaticStorageFailureDomain, StaticStorageNodeEndpoint, StaticStoragePlacementNode,
+        StaticStoragePlacementParameters,
     };
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -1491,9 +1492,7 @@ mod tests {
 
         let placement = derive_static_initial_pg_placement(
             1,
-            1,
-            0,
-            StaticStorageFailureDomain::None,
+            StaticStoragePlacementParameters::new(1, 0, StaticStorageFailureDomain::None, 0),
             &["host-a".to_owned(), "host-b".to_owned()],
             &["disk-a".to_owned(), "disk-b".to_owned()],
             &[

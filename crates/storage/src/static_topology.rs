@@ -1,8 +1,10 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+pub use crate::control_plane::CertifiedStorageFailureDomain as StaticStorageFailureDomain;
 use crate::control_plane::{
-    ClusterControlSnapshot, ControlPlaneError, InitialClusterTopologyCertificate,
+    CertifiedStorageNodeDomain, CertifiedStoragePlacementPolicy, ClusterControlSnapshot,
+    ControlPlaneError, InitialClusterTopologyCertificate, DEFAULT_UNAVAILABLE_PLACEMENT_GRACE_MS,
 };
 use crate::control_plane_command::{
     encode_control_plane_command, ControlPlaneCommand, ControlPlaneCommandStateMachine,
@@ -19,14 +21,6 @@ use std::fmt;
 
 const INITIAL_PG_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin-initial-pg-placement-v1";
 const MAX_STATIC_STORAGE_PGS: usize = 4_096;
-
-/// Deployment failure domain used to derive the initial storage placement.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StaticStorageFailureDomain {
-    None,
-    Disk,
-    Host,
-}
 
 /// Logical deployment identity for one storage node.
 ///
@@ -72,6 +66,7 @@ impl StaticStoragePlacementNode {
 pub struct StaticInitialPgPlacement {
     node_ids: Vec<u32>,
     acting_sets: Vec<Vec<u32>>,
+    placement_policy: CertifiedStoragePlacementPolicy,
 }
 
 impl StaticInitialPgPlacement {
@@ -335,6 +330,7 @@ pub fn derive_static_initial_control_plane_topology(
         raft_voters.to_vec(),
         &nodes,
         &pg_acting_sets,
+        placement.placement_policy,
     )
     .map_err(|error| StaticStorageTopologyError::new(error.to_string()))?;
     let topology = StaticInitialControlPlaneTopology {
@@ -473,17 +469,46 @@ impl fmt::Display for StaticStoragePlacementError {
 
 impl std::error::Error for StaticStoragePlacementError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticStoragePlacementParameters {
+    ec_data_shards: u8,
+    ec_parity_shards: u8,
+    failure_domain: StaticStorageFailureDomain,
+    failure_tolerance: u8,
+}
+
+impl StaticStoragePlacementParameters {
+    #[must_use]
+    pub const fn new(
+        ec_data_shards: u8,
+        ec_parity_shards: u8,
+        failure_domain: StaticStorageFailureDomain,
+        failure_tolerance: u8,
+    ) -> Self {
+        Self {
+            ec_data_shards,
+            ec_parity_shards,
+            failure_domain,
+            failure_tolerance,
+        }
+    }
+}
+
 /// Validate and derive the deterministic initial PG acting sets for a static
 /// deployment.
 pub fn derive_static_initial_pg_placement(
     pg_count: u32,
-    ec_data_shards: u8,
-    ec_parity_shards: u8,
-    failure_domain: StaticStorageFailureDomain,
+    parameters: StaticStoragePlacementParameters,
     declared_hosts: &[String],
     declared_disks: &[String],
     nodes: &[StaticStoragePlacementNode],
 ) -> Result<StaticInitialPgPlacement, StaticStoragePlacementError> {
+    let StaticStoragePlacementParameters {
+        ec_data_shards,
+        ec_parity_shards,
+        failure_domain,
+        failure_tolerance,
+    } = parameters;
     let pg_count = usize::try_from(pg_count).map_err(|_| {
         StaticStoragePlacementError::new("storage PG count does not fit this platform")
     })?;
@@ -596,9 +621,29 @@ pub fn derive_static_initial_pg_placement(
         );
     }
 
+    let placement_policy = CertifiedStoragePlacementPolicy::new(
+        ec_data_shards,
+        ec_parity_shards,
+        failure_domain,
+        failure_tolerance,
+        DEFAULT_UNAVAILABLE_PLACEMENT_GRACE_MS,
+        ordered_nodes
+            .iter()
+            .map(|node| {
+                CertifiedStorageNodeDomain::new(
+                    PlacementNodeId::new(node.node_id),
+                    node.host.clone(),
+                    node.disk.clone(),
+                )
+            })
+            .collect(),
+    )
+    .map_err(|error| StaticStoragePlacementError::new(error.to_string()))?;
+
     Ok(StaticInitialPgPlacement {
         node_ids: ordered_nodes.iter().map(|node| node.node_id).collect(),
         acting_sets,
+        placement_policy,
     })
 }
 
@@ -652,6 +697,20 @@ mod tests {
             .collect()
     }
 
+    const fn placement_parameters(
+        data_shards: u8,
+        parity_shards: u8,
+        failure_domain: StaticStorageFailureDomain,
+        failure_tolerance: u8,
+    ) -> StaticStoragePlacementParameters {
+        StaticStoragePlacementParameters::new(
+            data_shards,
+            parity_shards,
+            failure_domain,
+            failure_tolerance,
+        )
+    }
+
     fn initial_topology_inputs() -> (StaticInitialPgPlacement, Vec<StaticStorageNodeEndpoint>) {
         let nodes = vec![
             StaticStoragePlacementNode::new(1, "host-a", "disk-a"),
@@ -659,9 +718,7 @@ mod tests {
         ];
         let placement = derive_static_initial_pg_placement(
             2,
-            1,
-            0,
-            StaticStorageFailureDomain::None,
+            placement_parameters(1, 0, StaticStorageFailureDomain::None, 0),
             &["host-a".to_owned(), "host-b".to_owned()],
             &["disk-a".to_owned(), "disk-b".to_owned()],
             &nodes,
@@ -757,9 +814,7 @@ mod tests {
         let nodes = placement_nodes();
         let expected = derive_static_initial_pg_placement(
             8,
-            2,
-            1,
-            StaticStorageFailureDomain::Host,
+            placement_parameters(2, 1, StaticStorageFailureDomain::Host, 1),
             &placement_hosts(),
             &placement_disks(),
             &nodes,
@@ -769,9 +824,7 @@ mod tests {
         reversed.reverse();
         let actual = derive_static_initial_pg_placement(
             8,
-            2,
-            1,
-            StaticStorageFailureDomain::Host,
+            placement_parameters(2, 1, StaticStorageFailureDomain::Host, 1),
             &placement_hosts(),
             &placement_disks(),
             &reversed,
@@ -805,9 +858,7 @@ mod tests {
         ];
         let host_error = derive_static_initial_pg_placement(
             1,
-            2,
-            1,
-            StaticStorageFailureDomain::Host,
+            placement_parameters(2, 1, StaticStorageFailureDomain::Host, 1),
             &hosts,
             &disks,
             &nodes,
@@ -819,9 +870,7 @@ mod tests {
 
         let disk = derive_static_initial_pg_placement(
             1,
-            2,
-            1,
-            StaticStorageFailureDomain::Disk,
+            placement_parameters(2, 1, StaticStorageFailureDomain::Disk, 1),
             &hosts,
             &disks,
             &nodes,
@@ -834,9 +883,7 @@ mod tests {
     fn static_initial_placement_rejects_unbounded_pg_count_before_allocation() {
         let error = derive_static_initial_pg_placement(
             u32::try_from(MAX_STATIC_STORAGE_PGS + 1).unwrap(),
-            1,
-            0,
-            StaticStorageFailureDomain::None,
+            placement_parameters(1, 0, StaticStorageFailureDomain::None, 0),
             &placement_hosts(),
             &placement_disks(),
             &placement_nodes(),
@@ -852,9 +899,7 @@ mod tests {
     fn static_initial_placement_rejects_node_domains_absent_from_declared_topology() {
         let error = derive_static_initial_pg_placement(
             1,
-            1,
-            0,
-            StaticStorageFailureDomain::None,
+            placement_parameters(1, 0, StaticStorageFailureDomain::None, 0),
             &["host-a".to_owned()],
             &["disk-a".to_owned()],
             &[StaticStoragePlacementNode::new(
@@ -874,9 +919,7 @@ mod tests {
     fn static_initial_placement_rejects_zero_pg_count_and_invalid_ec_shape() {
         let zero_pg_error = derive_static_initial_pg_placement(
             0,
-            1,
-            0,
-            StaticStorageFailureDomain::None,
+            placement_parameters(1, 0, StaticStorageFailureDomain::None, 0),
             &placement_hosts(),
             &placement_disks(),
             &placement_nodes(),
@@ -889,9 +932,7 @@ mod tests {
 
         let invalid_ec_error = derive_static_initial_pg_placement(
             1,
-            0,
-            1,
-            StaticStorageFailureDomain::None,
+            placement_parameters(0, 1, StaticStorageFailureDomain::None, 0),
             &placement_hosts(),
             &placement_disks(),
             &placement_nodes(),

@@ -2782,6 +2782,35 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    pub fn begin_unavailable_pg_placement_transition(
+        &mut self,
+        pg_id: PgId,
+        unavailable_node_id: NodeId,
+        begin_at_ms: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .snapshot
+            .begin_unavailable_pg_placement_transition_command(
+                pg_id,
+                unavailable_node_id,
+                begin_at_ms,
+            )?;
+        self.apply_and_commit_command(command)?;
+        Ok(self.snapshot.clone())
+    }
+
+    pub fn record_unavailable_pg_payload_readiness(
+        &mut self,
+        pg_id: PgId,
+        ready_at_ms: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .snapshot
+            .record_unavailable_pg_payload_readiness_command(pg_id, ready_at_ms)?;
+        self.apply_and_commit_command(command)?;
+        Ok(self.snapshot.clone())
+    }
+
     pub fn set_pg_acting_set_with_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -3561,6 +3590,32 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         acting_set: Vec<NodeId>,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         SingleAuthorityControlPlane::set_pg_acting_set(self, pg_id, acting_set)
+    }
+
+    fn begin_unavailable_pg_placement_transition(
+        &mut self,
+        pg_id: PgId,
+        unavailable_node_id: NodeId,
+        begin_at_ms: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::begin_unavailable_pg_placement_transition(
+            self,
+            pg_id,
+            unavailable_node_id,
+            begin_at_ms,
+        )
+    }
+
+    fn record_unavailable_pg_payload_readiness(
+        &mut self,
+        pg_id: PgId,
+        ready_at_ms: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::record_unavailable_pg_payload_readiness(
+            self,
+            pg_id,
+            ready_at_ms,
+        )
     }
 
     fn fence_pg_for_metadata_transfer(

@@ -3,6 +3,1114 @@
 
 use super::*;
 
+fn certified_spare_authority() -> (
+    test_util::TempDir,
+    FileControlPlaneStore,
+    SingleAuthorityControlPlane<FileControlPlaneStore>,
+    PgId,
+) {
+    certified_spare_authority_with_policy(
+        4,
+        test_certified_storage_placement_policy((1..=4).map(NodeId::new), 3, 50),
+    )
+}
+
+fn certified_spare_authority_with_policy(
+    node_count: u32,
+    placement_policy: CertifiedStoragePlacementPolicy,
+) -> (
+    test_util::TempDir,
+    FileControlPlaneStore,
+    SingleAuthorityControlPlane<FileControlPlaneStore>,
+    PgId,
+) {
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let pg_id = PgId::new(7);
+    let nodes = (1..=node_count)
+        .map(|node_id| {
+            (
+                NodeId::new(node_id),
+                format!("/tmp/transition-node-{node_id}.sock"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let pgs = vec![(pg_id, vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)])];
+    let topology = InitialClusterTopologyCertificate::new_for_bootstrap_map(
+        3,
+        [0x5a; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+        (1..=u64::from(node_count)).collect(),
+        &nodes,
+        &pgs,
+        placement_policy,
+    )
+    .unwrap();
+    let snapshot = ClusterControlSnapshot::empty()
+        .apply_control_plane_command(ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes,
+            pg_acting_sets: pgs,
+            topology,
+        })
+        .unwrap()
+        .into_snapshot();
+    store.checkpoint(None, &snapshot).unwrap();
+    let authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+    (tmp, store, authority, pg_id)
+}
+
+fn heartbeat_spare_node(
+    authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
+    node_id: u32,
+    now_ms: u64,
+) {
+    let now_ms = authority
+        .snapshot()
+        .max_committed_timestamp_ms()
+        .map_or(now_ms, |committed| committed.max(now_ms));
+    let mut request = heartbeat(node_id, authority.snapshot().cluster_epoch(), now_ms);
+    request.endpoint = format!("/tmp/transition-node-{node_id}.sock");
+    request.requested_lease_duration_ms = 10_000;
+    authority.heartbeat(request, now_ms).unwrap();
+    let epoch = authority.snapshot().cluster_epoch();
+    let mut request = heartbeat_from_record(authority, node_id, epoch, now_ms + 1);
+    request.requested_lease_duration_ms = 10_000;
+    authority.heartbeat(request, now_ms + 1).unwrap();
+}
+
+#[test]
+fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
+    let (_tmp, store, mut authority, pg_id) = certified_spare_authority();
+    for node_id in 1..=4 {
+        heartbeat_spare_node(&mut authority, node_id, 1_000 + u64::from(node_id));
+    }
+    let active_proof = PgMetadataProof::current(17, 0x1717, 0x2727);
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            active_proof,
+            false,
+            (2_000 + u64::from(node_id), 10_000),
+        );
+    }
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            2_004,
+        )
+        .unwrap();
+    for node_id in 1..=3 {
+        let lease_duration_ms = if node_id == 1 { 100 } else { 10_000 };
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Active,
+            active_proof,
+            false,
+            (3_000 + u64::from(node_id), lease_duration_ms),
+        );
+    }
+    let failed_deadline = authority
+        .snapshot()
+        .node(NodeId::new(1))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    authority.expire_heartbeat_leases(failed_deadline).unwrap();
+    for node_id in 2..=4 {
+        heartbeat_spare_node(
+            &mut authority,
+            node_id,
+            failed_deadline + u64::from(node_id),
+        );
+    }
+    let survivor_refresh_at_ms = authority.snapshot().max_committed_timestamp_ms().unwrap() + 1;
+    for node_id in 2..=4 {
+        heartbeat_spare_node(
+            &mut authority,
+            node_id,
+            survivor_refresh_at_ms + u64::from(node_id),
+        );
+    }
+    let begin_at_without_pg_evidence = authority
+        .snapshot()
+        .unavailable_node_observation(NodeId::new(1))
+        .unwrap()
+        .observed_at_ms()
+        + 50;
+    assert!(authority
+        .snapshot()
+        .begin_unavailable_pg_placement_transition_command(
+            pg_id,
+            NodeId::new(1),
+            begin_at_without_pg_evidence,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("no proof-qualified serving metadata-transfer source"));
+    for node_id in [2, 3] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            active_proof,
+            false,
+            (survivor_refresh_at_ms + 10 + u64::from(node_id), 10_000),
+        );
+    }
+    let observation = authority
+        .snapshot()
+        .unavailable_node_observation(NodeId::new(1))
+        .unwrap()
+        .clone();
+    let begin_at_ms = observation.observed_at_ms() + 50;
+    for node_id in 2..=4 {
+        let node = authority.snapshot().node(NodeId::new(node_id)).unwrap();
+        assert!(
+            node.can_serve_primary(authority.snapshot().cluster_epoch(), begin_at_ms),
+            "node {node_id} should serve at {begin_at_ms}: {node:?}"
+        );
+    }
+    let stale_proposal = authority
+        .snapshot()
+        .begin_unavailable_pg_placement_transition_command(pg_id, NodeId::new(1), begin_at_ms)
+        .unwrap();
+    let mut wrong_topology = stale_proposal.clone();
+    let ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
+        topology_digest, ..
+    } = &mut wrong_topology
+    else {
+        unreachable!("builder returned the wrong command kind");
+    };
+    topology_digest[0] ^= 1;
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(wrong_topology)
+        .is_err());
+    let mut wrong_destination = stale_proposal.clone();
+    let ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
+        destination_acting_set,
+        ..
+    } = &mut wrong_destination
+    else {
+        unreachable!("builder returned the wrong command kind");
+    };
+    destination_acting_set.swap(0, 1);
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(wrong_destination)
+        .is_err());
+    let mut shortened_grace = stale_proposal.clone();
+    let ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
+        grace_cutoff_ms, ..
+    } = &mut shortened_grace
+    else {
+        unreachable!("builder returned the wrong command kind");
+    };
+    *grace_cutoff_ms -= 1;
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(shortened_grace)
+        .is_err());
+
+    let before = authority.snapshot().clone();
+    let too_early = before
+        .begin_unavailable_pg_placement_transition_command(pg_id, NodeId::new(1), begin_at_ms - 1)
+        .unwrap();
+    assert!(before.apply_control_plane_command(too_early).is_err());
+    assert_eq!(authority.snapshot(), &before);
+
+    authority
+        .begin_unavailable_pg_placement_transition(pg_id, NodeId::new(1), begin_at_ms)
+        .unwrap();
+    let transition = authority
+        .snapshot()
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        transition.source_acting_set(),
+        &[NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+    );
+    assert_eq!(transition.source_node_id(), NodeId::new(2));
+    assert_eq!(
+        transition.destination_acting_set(),
+        &[NodeId::new(4), NodeId::new(2), NodeId::new(3)]
+    );
+    assert_eq!(transition.unavailable_node(), &observation);
+    assert_eq!(transition.destination_epoch(), None);
+    assert_eq!(
+        authority.snapshot().pg(pg_id).unwrap().state(),
+        PgState::Peering
+    );
+    assert_eq!(
+        authority.snapshot().pg(pg_id).unwrap().acting_set(),
+        &[NodeId::new(2), NodeId::new(1), NodeId::new(3)]
+    );
+    let formatted = format_snapshot(authority.snapshot());
+    assert!(formatted.contains(&format!(
+        "unavailable_node=1,11,{},{},{}\n",
+        hex_encode(b"/tmp/transition-node-1.sock"),
+        observation.lease_deadline_ms(),
+        observation.observed_at_ms()
+    )));
+    assert!(formatted.contains(&format!(
+        "unavailable_pg_transition=7,{},-,{},{}",
+        transition.transition_epoch().get(),
+        3,
+        hex_encode(&[0x5a; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN])
+    )));
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::SetPgActingSet {
+            pg_id,
+            acting_set: vec![NodeId::new(2), NodeId::new(3), NodeId::new(4)],
+        })
+        .is_err());
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::CompletePgPeering {
+            pg_id,
+            primary: NodeId::new(2),
+            node_incarnation: 12,
+            complete_at_ms: begin_at_ms + 1,
+        })
+        .is_err());
+
+    let replayed = authority
+        .snapshot()
+        .apply_control_plane_command(stale_proposal.clone())
+        .unwrap();
+    assert!(!replayed.changed());
+    assert_eq!(replayed.snapshot(), authority.snapshot());
+    assert_persisted_snapshot_matches_authority(&authority, &store);
+    let restarted = reopen_file_authority(&store);
+    assert_eq!(
+        restarted
+            .snapshot()
+            .unavailable_pg_placement_transition(pg_id),
+        Some(&transition)
+    );
+    drop(authority);
+    let mut authority = restarted;
+
+    let transfer = PgMetadataTransferProof::new(authority.snapshot().cluster_epoch(), active_proof);
+    authority
+        .set_pg_acting_set_with_metadata_transfer(
+            pg_id,
+            vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
+            transfer,
+        )
+        .unwrap();
+    let destination_epoch = authority.snapshot().cluster_epoch();
+    assert_eq!(
+        authority
+            .snapshot()
+            .unavailable_pg_placement_transition(pg_id)
+            .unwrap()
+            .destination_epoch(),
+        Some(destination_epoch)
+    );
+    let replayed_after_transfer = authority
+        .snapshot()
+        .apply_control_plane_command(stale_proposal.clone())
+        .unwrap();
+    assert!(!replayed_after_transfer.changed());
+    assert_eq!(replayed_after_transfer.snapshot(), authority.snapshot());
+    let pg = authority.snapshot().pg(pg_id).unwrap();
+    assert_eq!(
+        pg.peering_metadata_transfer_source_node_id(),
+        Some(NodeId::new(2))
+    );
+    let complete_at_ms = failed_deadline + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1;
+    for node_id in [4, 2, 3] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            active_proof,
+            false,
+            (complete_at_ms - 10 + u64::from(node_id), 10_000),
+        );
+    }
+    let primary_incarnation = node_incarnation(&authority, 4);
+    assert!(matches!(
+        authority.snapshot().apply_control_plane_command(
+            ControlPlaneCommand::CompletePgPeering {
+                pg_id,
+                primary: NodeId::new(4),
+                node_incarnation: primary_incarnation,
+                complete_at_ms,
+            }
+        ),
+        Err(ControlPlaneError::CommandDecode { message })
+            if message.contains("not payload-write ready")
+    ));
+    assert!(matches!(
+        authority.snapshot().apply_control_plane_command(
+            ControlPlaneCommand::CompleteReadyPgPeerings {
+                ready_at_ms: complete_at_ms,
+                ready: vec![ReadyPgPeeringCompletion {
+                    pg_id,
+                    primary: NodeId::new(4),
+                    node_incarnation: primary_incarnation,
+                    active_metadata_proof: active_proof,
+                    active_metadata_proof_epoch: authority.snapshot().cluster_epoch(),
+                }],
+            }
+        ),
+        Err(ControlPlaneError::CommandDecode { message })
+            if message.contains("not payload-write ready")
+    ));
+    authority
+        .record_unavailable_pg_payload_readiness(pg_id, complete_at_ms)
+        .unwrap();
+    assert!(authority
+        .snapshot()
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap()
+        .payload_readiness()
+        .is_some());
+    let readiness = authority
+        .snapshot()
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap()
+        .payload_readiness()
+        .unwrap()
+        .clone();
+    let expired_destination = authority
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::ExpireHeartbeatLeases {
+            expire_at_ms: readiness.destinations[0].lease_deadline_ms,
+        })
+        .unwrap()
+        .into_snapshot();
+    assert!(expired_destination
+        .apply_control_plane_command(ControlPlaneCommand::CompletePgPeering {
+            pg_id,
+            primary: NodeId::new(4),
+            node_incarnation: primary_incarnation,
+            complete_at_ms: readiness.destinations[0].lease_deadline_ms,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("payload"));
+    assert!(expired_destination
+        .ready_pg_peering_completions(readiness.destinations[0].lease_deadline_ms)
+        .unwrap()
+        .is_empty());
+
+    let mut changed_incarnation = authority.snapshot().clone();
+    changed_incarnation
+        .nodes
+        .get_mut(&readiness.destinations[1].node_id)
+        .unwrap()
+        .node_incarnation += 1;
+    assert!(changed_incarnation
+        .apply_control_plane_command(ControlPlaneCommand::CompleteReadyPgPeerings {
+            ready_at_ms: complete_at_ms + 1,
+            ready: vec![ReadyPgPeeringCompletion {
+                pg_id,
+                primary: NodeId::new(4),
+                node_incarnation: primary_incarnation,
+                active_metadata_proof: active_proof,
+                active_metadata_proof_epoch: changed_incarnation.cluster_epoch(),
+            }],
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("payload"));
+
+    let renewed_destination = readiness.destinations[0].clone();
+    let renewal_at_ms = complete_at_ms + 1;
+    let renewed_lease = heartbeat_with_pg_proof_and_lease_duration(
+        &mut authority,
+        renewed_destination.node_id.as_u32(),
+        pg_id.get(),
+        PgState::Peering,
+        active_proof,
+        false,
+        (renewal_at_ms, 10_000),
+    );
+    let renewed_node = authority
+        .snapshot()
+        .node(renewed_destination.node_id)
+        .unwrap();
+    assert_eq!(
+        renewed_node.node_incarnation(),
+        renewed_destination.node_incarnation
+    );
+    assert_eq!(renewed_node.endpoint(), renewed_destination.endpoint);
+    assert_ne!(
+        renewed_lease.lease_deadline_ms(),
+        renewed_destination.lease_deadline_ms
+    );
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::CompletePgPeering {
+            pg_id,
+            primary: NodeId::new(4),
+            node_incarnation: primary_incarnation,
+            complete_at_ms: renewal_at_ms,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("payload"));
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::CompleteReadyPgPeerings {
+            ready_at_ms: renewal_at_ms,
+            ready: vec![ReadyPgPeeringCompletion {
+                pg_id,
+                primary: NodeId::new(4),
+                node_incarnation: primary_incarnation,
+                active_metadata_proof: active_proof,
+                active_metadata_proof_epoch: authority.snapshot().cluster_epoch(),
+            }],
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("payload"));
+    assert!(authority
+        .snapshot()
+        .ready_pg_peering_completions(renewal_at_ms)
+        .unwrap()
+        .is_empty());
+
+    let republished_ready_at_ms = renewal_at_ms + 1;
+    authority
+        .record_unavailable_pg_payload_readiness(pg_id, republished_ready_at_ms)
+        .unwrap();
+    let republished_readiness = authority
+        .snapshot()
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap()
+        .payload_readiness()
+        .unwrap();
+    let rebound_destination = republished_readiness
+        .destinations
+        .iter()
+        .find(|destination| destination.node_id == renewed_destination.node_id)
+        .unwrap();
+    assert_eq!(
+        rebound_destination.lease_deadline_ms,
+        renewed_lease.lease_deadline_ms()
+    );
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(4),
+            primary_incarnation,
+            republished_ready_at_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        authority.snapshot().pg(pg_id).unwrap().state(),
+        PgState::Active
+    );
+    let terminal_transition = authority
+        .snapshot()
+        .retained_unavailable_pg_placement_transitions()
+        .find(|transition| transition.pg_id() == pg_id)
+        .expect("historical payload still requires the durable transition");
+    assert_eq!(
+        terminal_transition.destination_epoch(),
+        Some(destination_epoch)
+    );
+    let replayed_after_activation = authority
+        .snapshot()
+        .apply_control_plane_command(stale_proposal)
+        .unwrap();
+    assert!(!replayed_after_activation.changed());
+    assert_eq!(replayed_after_activation.snapshot(), authority.snapshot());
+    for node_id in [4, 2, 3] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Active,
+            active_proof,
+            false,
+            (complete_at_ms + 10 + u64::from(node_id), 10_000),
+        );
+    }
+    authority
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::SetPgActingSet {
+            pg_id,
+            acting_set: vec![NodeId::new(4), NodeId::new(3), NodeId::new(2)],
+        })
+        .unwrap();
+    assert_persisted_snapshot_matches_authority(&authority, &store);
+
+    let mut forged_grace = authority.snapshot().clone();
+    forged_grace
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, transition.transition_epoch()))
+        .unwrap()
+        .grace_cutoff_ms -= 1;
+    let forged_grace_error = forged_grace
+        .validate_current_state_invariants()
+        .unwrap_err();
+    assert!(
+        forged_grace_error.contains("lease or grace evidence"),
+        "unexpected forged grace error: {forged_grace_error}"
+    );
+
+    let mut coordinated_time_forgery = authority.snapshot().clone();
+    let coordinated = coordinated_time_forgery
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, transition.transition_epoch()))
+        .unwrap();
+    coordinated.unavailable_node.lease_deadline_ms -= 1;
+    coordinated.unavailable_node.observed_at_ms -= 1;
+    coordinated.grace_cutoff_ms -= 1;
+    let coordinated_time_error = coordinated_time_forgery
+        .validate_current_state_invariants()
+        .unwrap_err();
+    assert!(
+        coordinated_time_error.contains("invalid begin authorization"),
+        "unexpected coordinated time forgery error: {coordinated_time_error}"
+    );
+
+    let mut invalid_provenance_forgery = authority.snapshot().clone();
+    let invalid_authorization = &mut invalid_provenance_forgery
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, transition.transition_epoch()))
+        .unwrap()
+        .begin_authorization;
+    invalid_authorization.source_metadata_floor_epoch = None;
+    invalid_authorization.source_metadata_floor_imported = true;
+    invalid_authorization
+        .source_route
+        .peering_metadata_proof_floor_epoch = None;
+    invalid_authorization
+        .source_route
+        .peering_metadata_proof_floor_imported = true;
+    let invalid_historical_route = invalid_provenance_forgery
+        .history
+        .iter_mut()
+        .find(|record| record.cluster_epoch() == transition.source_epoch())
+        .and_then(|record| record.pgs.iter_mut().find(|record| record.pg_id == pg_id))
+        .expect("transition source route must be retained in history");
+    invalid_historical_route.peering_metadata_proof_floor_epoch = None;
+    invalid_historical_route.peering_metadata_proof_floor_imported = true;
+    let invalid_provenance_error = invalid_provenance_forgery
+        .validate_current_state_invariants()
+        .unwrap_err();
+    assert!(
+        invalid_provenance_error.contains("imported floor provenance without a floor epoch"),
+        "unexpected proof-provenance forgery error: {invalid_provenance_error}"
+    );
+    let invalid_provenance_parse_error =
+        parse_snapshot(&format_snapshot(&invalid_provenance_forgery)).unwrap_err();
+    assert!(
+        invalid_provenance_parse_error
+            .to_string()
+            .contains("imported floor provenance without a floor epoch"),
+        "unexpected parsed proof-provenance error: {invalid_provenance_parse_error}"
+    );
+
+    let mut coordinated_proof_forgery = authority.snapshot().clone();
+    let forged_proof = PgMetadataProof::current(18, 0x1818, 0x2828);
+    let forged_transition = coordinated_proof_forgery
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, transition.transition_epoch()))
+        .unwrap();
+    let forged_authorization = &mut forged_transition.begin_authorization;
+    forged_authorization.source_metadata_floor = forged_proof;
+    forged_authorization.source_metadata_proof = forged_proof;
+    forged_authorization
+        .source_route
+        .peering_metadata_proof_floor = Some(forged_proof);
+    let destination_transfer = forged_transition
+        .destination_route
+        .as_ref()
+        .unwrap()
+        .peering_metadata_transfer
+        .unwrap();
+    forged_transition
+        .destination_route
+        .as_mut()
+        .unwrap()
+        .peering_metadata_transfer =
+        Some(PgMetadataTransferProof::new_with_imported_metadata_proof(
+            destination_transfer.source_epoch(),
+            forged_proof,
+            destination_transfer.metadata_proof(),
+        ));
+    coordinated_proof_forgery
+        .validate_current_state_invariants()
+        .unwrap();
+    assert!(coordinated_proof_forgery
+        .validate_publication_invariants()
+        .unwrap_err()
+        .to_string()
+        .contains("source route does not match retained CAS evidence"));
+    let coordinated_proof_parse_error =
+        parse_snapshot(&format_snapshot(&coordinated_proof_forgery)).unwrap_err();
+    assert!(
+        coordinated_proof_parse_error
+            .to_string()
+            .contains("source route does not match retained CAS evidence"),
+        "unexpected parsed coordinated-proof error: {coordinated_proof_parse_error}"
+    );
+
+    let mut forged_source = authority.snapshot().clone();
+    forged_source
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, transition.transition_epoch()))
+        .unwrap()
+        .source_node_id = NodeId::new(3);
+    assert!(forged_source
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .contains("invalid begin authorization"));
+
+    let mut forged_epoch_order = authority.snapshot().clone();
+    forged_epoch_order
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, transition.transition_epoch()))
+        .unwrap()
+        .destination_epoch = Some(transition.transition_epoch());
+    assert!(forged_epoch_order
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .contains("invalid epoch ordering"));
+
+    let mut forged_substitution = authority.snapshot().clone();
+    forged_substitution
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, transition.transition_epoch()))
+        .unwrap()
+        .destination_acting_set
+        .swap(0, 1);
+    assert!(forged_substitution
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .contains("destination-route evidence"));
+
+    let mut forged_history = authority.snapshot().clone();
+    let historical_route = forged_history
+        .history
+        .iter_mut()
+        .filter(|record| record.cluster_epoch() >= transition.transition_epoch())
+        .find_map(|record| record.pgs.iter_mut().find(|record| record.pg_id == pg_id))
+        .expect("transition route must be retained in history");
+    historical_route.acting_set.swap(0, 1);
+    assert!(forged_history
+        .validate_publication_invariants()
+        .unwrap_err()
+        .contains("does not match retained cluster-map history"));
+
+    let mut forged_destination_provenance = authority.snapshot().clone();
+    let forged_transition = forged_destination_provenance
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, transition.transition_epoch()))
+        .unwrap();
+    forged_transition
+        .destination_route
+        .as_mut()
+        .unwrap()
+        .peering_metadata_transfer = None;
+    assert!(forged_destination_provenance
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .contains("invalid destination-route evidence"));
+
+    let protected_epochs = [
+        transition.source_epoch(),
+        transition.transition_epoch(),
+        destination_epoch,
+    ];
+    let mut advanced = authority.snapshot().clone();
+    for step in 0..(CLUSTER_MAP_HISTORY_LIMIT + 16) {
+        let membership = if step % 2 == 0 {
+            NodeMembershipState::Active
+        } else {
+            NodeMembershipState::Draining
+        };
+        advanced = advanced
+            .apply_control_plane_command(ControlPlaneCommand::SetNodeMembership {
+                node_id: NodeId::new(99),
+                membership,
+            })
+            .unwrap()
+            .into_snapshot();
+    }
+    for epoch in protected_epochs {
+        assert!(
+            historical_pg_exists_at_epoch(&advanced.history, &advanced.pgs, pg_id, epoch),
+            "terminal transition lost protected PG route at epoch {epoch}"
+        );
+    }
+    let encoded = format_snapshot(&advanced);
+    assert_eq!(parse_snapshot(&encoded).unwrap(), advanced);
+}
+
+#[test]
+fn unavailable_pg_transition_successor_consumes_retained_lineage_tip() {
+    let (_tmp, _store, mut authority, pg_id) = certified_spare_authority_with_policy(
+        5,
+        test_certified_storage_placement_policy((1..=5).map(NodeId::new), 3, 10),
+    );
+    for node_id in 1..=5 {
+        heartbeat_spare_node(&mut authority, node_id, 1_000 + u64::from(node_id));
+    }
+    let proof = PgMetadataProof::current(17, 0x1717, 0x2727);
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            (2_000 + u64::from(node_id), 10_000),
+        );
+    }
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            2_004,
+        )
+        .unwrap();
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Active,
+            proof,
+            false,
+            (
+                3_000 + u64::from(node_id),
+                if node_id == 1 { 100 } else { 10_000 },
+            ),
+        );
+    }
+    let first_deadline = authority
+        .snapshot()
+        .node(NodeId::new(1))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    authority.expire_heartbeat_leases(first_deadline).unwrap();
+    for round in 0..2 {
+        for node_id in 2..=5 {
+            heartbeat_spare_node(
+                &mut authority,
+                node_id,
+                first_deadline + round * 10 + u64::from(node_id),
+            );
+        }
+    }
+    for node_id in [2, 3] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            (first_deadline + 30 + u64::from(node_id), 10_000),
+        );
+    }
+    let first_begin_at = (authority
+        .snapshot()
+        .unavailable_node_observation(NodeId::new(1))
+        .unwrap()
+        .observed_at_ms()
+        + 10)
+        .max(authority.snapshot().max_committed_timestamp_ms().unwrap());
+    for node_id in 2..=5 {
+        let node = authority.snapshot().node(NodeId::new(node_id)).unwrap();
+        assert!(
+            node.can_serve_primary(authority.snapshot().cluster_epoch(), first_begin_at),
+            "node {node_id} should serve at {first_begin_at}: {node:?}"
+        );
+    }
+    authority
+        .begin_unavailable_pg_placement_transition(pg_id, NodeId::new(1), first_begin_at)
+        .unwrap();
+    let first_transition_epoch = authority
+        .snapshot()
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap()
+        .transition_epoch();
+    authority
+        .set_pg_acting_set_with_metadata_transfer(
+            pg_id,
+            vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
+            PgMetadataTransferProof::new(authority.snapshot().cluster_epoch(), proof),
+        )
+        .unwrap();
+    let post_transfer_time = authority.snapshot().max_committed_timestamp_ms().unwrap() + 1;
+    for node_id in [4, 2, 3] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            (
+                post_transfer_time + u64::from(node_id),
+                if node_id == 4 { 100 } else { 10_000 },
+            ),
+        );
+    }
+    heartbeat_spare_node(&mut authority, 5, post_transfer_time + 10);
+    let second_deadline = authority
+        .snapshot()
+        .node(NodeId::new(4))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    authority.expire_heartbeat_leases(second_deadline).unwrap();
+    for round in 0..2 {
+        for node_id in [2, 3, 5] {
+            heartbeat_spare_node(
+                &mut authority,
+                node_id,
+                second_deadline + round * 10 + u64::from(node_id),
+            );
+        }
+    }
+    for node_id in [2, 3] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            (second_deadline + 30 + u64::from(node_id), 10_000),
+        );
+    }
+    let second_begin_at = (authority
+        .snapshot()
+        .unavailable_node_observation(NodeId::new(4))
+        .unwrap()
+        .observed_at_ms()
+        + 10)
+        .max(authority.snapshot().max_committed_timestamp_ms().unwrap());
+    authority
+        .begin_unavailable_pg_placement_transition(pg_id, NodeId::new(4), second_begin_at)
+        .unwrap();
+
+    let successor = authority
+        .snapshot()
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap();
+    assert_eq!(
+        successor.predecessor_transition_epoch(),
+        Some(first_transition_epoch)
+    );
+    assert_eq!(
+        successor.destination_acting_set(),
+        &[NodeId::new(5), NodeId::new(2), NodeId::new(3)]
+    );
+    assert_eq!(
+        authority
+            .snapshot()
+            .retained_unavailable_pg_placement_transitions()
+            .map(UnavailablePgPlacementTransition::transition_epoch)
+            .collect::<Vec<_>>(),
+        vec![first_transition_epoch]
+    );
+
+    let mut forged_lineage = authority.snapshot().clone();
+    forged_lineage
+        .unavailable_pg_placement_transitions
+        .get_mut(&pg_id)
+        .unwrap()
+        .predecessor_transition_epoch = None;
+    assert!(forged_lineage
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .contains("predecessor"));
+}
+
+#[test]
+fn unavailable_pg_spare_selection_enforces_domains_and_excludes_draining_nodes() {
+    let policy = CertifiedStoragePlacementPolicy::new(
+        3,
+        0,
+        CertifiedStorageFailureDomain::Host,
+        0,
+        10,
+        vec![
+            CertifiedStorageNodeDomain::new(NodeId::new(1), "host-a", "disk-1"),
+            CertifiedStorageNodeDomain::new(NodeId::new(2), "host-b", "disk-2"),
+            CertifiedStorageNodeDomain::new(NodeId::new(3), "host-c", "disk-3"),
+            CertifiedStorageNodeDomain::new(NodeId::new(4), "host-b", "disk-4"),
+            CertifiedStorageNodeDomain::new(NodeId::new(5), "host-d", "disk-5"),
+            CertifiedStorageNodeDomain::new(NodeId::new(6), "host-e", "disk-6"),
+        ],
+    )
+    .unwrap();
+    let (_tmp, _store, mut authority, pg_id) = certified_spare_authority_with_policy(6, policy);
+    for node_id in 1..=6 {
+        heartbeat_spare_node(&mut authority, node_id, 1_000 + u64::from(node_id));
+    }
+    let proof = PgMetadataProof::current(21, 0x2121, 0x3131);
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            (1_100 + u64::from(node_id), 10_000),
+        );
+    }
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            1_104,
+        )
+        .unwrap();
+    authority
+        .set_node_membership(NodeId::new(5), NodeMembershipState::Draining)
+        .unwrap();
+    let epoch = authority.snapshot().cluster_epoch();
+    for node_id in [1, 2, 3, 4, 6] {
+        heartbeat_spare_node(
+            &mut authority,
+            node_id,
+            2_000 + epoch.get() + u64::from(node_id),
+        );
+    }
+    let unavailable = NodeId::new(1);
+    let deadline = authority
+        .snapshot()
+        .node(unavailable)
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    authority.expire_heartbeat_leases(deadline).unwrap();
+    for node_id in [2, 3, 4, 6] {
+        heartbeat_spare_node(&mut authority, node_id, deadline + u64::from(node_id));
+    }
+    for node_id in [2, 3] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            (deadline + 10 + u64::from(node_id), 10_000),
+        );
+    }
+    let begin_at = (authority
+        .snapshot()
+        .unavailable_node_observation(unavailable)
+        .unwrap()
+        .observed_at_ms()
+        + 10)
+        .max(authority.snapshot().max_committed_timestamp_ms().unwrap());
+    authority
+        .begin_unavailable_pg_placement_transition(pg_id, unavailable, begin_at)
+        .unwrap();
+    assert_eq!(
+        authority
+            .snapshot()
+            .unavailable_pg_placement_transition(pg_id)
+            .unwrap()
+            .destination_acting_set(),
+        &[NodeId::new(6), NodeId::new(2), NodeId::new(3)]
+    );
+}
+
+#[test]
+fn unavailable_pg_transition_rejects_a_proposal_after_exact_incarnation_renewal() {
+    let (_tmp, _store, mut authority, pg_id) = certified_spare_authority();
+    for node_id in 1..=4 {
+        heartbeat_spare_node(&mut authority, node_id, 2_000 + u64::from(node_id));
+    }
+    let proof = PgMetadataProof::current(23, 0x2323, 0x3333);
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            (2_100 + u64::from(node_id), 10_000),
+        );
+    }
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            2_104,
+        )
+        .unwrap();
+    let failed_deadline = authority
+        .snapshot()
+        .node(NodeId::new(1))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    authority.expire_heartbeat_leases(failed_deadline).unwrap();
+    for node_id in 2..=4 {
+        heartbeat_spare_node(
+            &mut authority,
+            node_id,
+            failed_deadline + u64::from(node_id),
+        );
+    }
+    for node_id in [2, 3] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            (failed_deadline + 10 + u64::from(node_id), 10_000),
+        );
+    }
+    let observed_at_ms = authority
+        .snapshot()
+        .unavailable_node_observation(NodeId::new(1))
+        .unwrap()
+        .observed_at_ms();
+    let proposal_at_ms =
+        (observed_at_ms + 1).max(authority.snapshot().max_committed_timestamp_ms().unwrap());
+    let proposal = authority
+        .snapshot()
+        .begin_unavailable_pg_placement_transition_command(pg_id, NodeId::new(1), proposal_at_ms)
+        .unwrap();
+
+    heartbeat_spare_node(&mut authority, 1, observed_at_ms + 2);
+    let renewed = authority.snapshot().clone();
+    assert!(renewed
+        .unavailable_node_observation(NodeId::new(1))
+        .is_none());
+    assert!(renewed.apply_control_plane_command(proposal).is_err());
+    assert!(authority
+        .snapshot()
+        .unavailable_pg_placement_transition(pg_id)
+        .is_none());
+}
+
 #[test]
 fn administrative_unavailable_fence_survives_heartbeat_and_restart() {
     let tmp = test_util::tempdir();

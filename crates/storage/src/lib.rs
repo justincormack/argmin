@@ -3930,8 +3930,8 @@ pub use static_topology::{
     derive_static_initial_control_plane_topology, derive_static_initial_pg_placement,
     derive_uncertified_initial_control_plane_topology, StaticInitialControlPlaneTopology,
     StaticInitialPgPlacement, StaticStorageFailureDomain, StaticStorageNodeEndpoint,
-    StaticStoragePlacementError, StaticStoragePlacementNode, StaticStorageTopologyError,
-    UncertifiedInitialControlPlaneTopology,
+    StaticStoragePlacementError, StaticStoragePlacementNode, StaticStoragePlacementParameters,
+    StaticStorageTopologyError, UncertifiedInitialControlPlaneTopology,
 };
 pub use storage_rpc::StorageNodeFailure;
 pub(crate) use storage_rpc_auth::StorageRpcClientAuthConfig;

@@ -1564,15 +1564,15 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         require_current_control_plane_state_version(None),
         Err(ControlPlaneStateVersionError::Missing)
     );
-    for version in [28, 29, 31] {
+    for version in [28, 29, 30, 32] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
             Err(ControlPlaneStateVersionError::Unsupported(version))
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(30)),
-        Ok(30)
+        require_current_control_plane_state_version(Some(31)),
+        Ok(31)
     );
 
     assert!(matches!(
@@ -1715,11 +1715,29 @@ fn canonical_control_plane_state_v29_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v30_text_is_exact() {
+fn canonical_control_plane_state_v30_text_remains_rejected_evidence() {
+    const V30: &str = concat!(
+        "version=30\n",
+        "authority_incarnation=1\n",
+        "cluster_epoch=1\n",
+        "initial_topology=-\n",
+        "max_committed_timestamp_ms=123\n",
+        "lease_grant_horizon=-\n",
+        "node=1,active,1,healthy,11,1,100,200,-,6e6f64652d312e736f636b\n",
+    );
+    assert!(matches!(
+        parse_snapshot(V30),
+        Err(ControlPlaneError::Parse { line: 1, message })
+            if message == "unsupported control-plane state version 30"
+    ));
+}
+
+#[test]
+fn canonical_control_plane_state_v31_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=30\n",
+            "version=31\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -1731,7 +1749,38 @@ fn canonical_control_plane_state_v30_text_is_exact() {
 }
 
 #[test]
-fn canonical_control_plane_state_v30_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v30_representative_aggregate_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("testdata/state_v30_representative.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            5_199,
+            "4e6e430bb64dad8a2048a09be56988943442f0f7d50d9eec6b286ab76d22938d".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0;
+    while !remaining.is_empty() {
+        let (length, tail) = remaining.split_at(8);
+        let length = usize::try_from(u64::from_be_bytes(length.try_into().unwrap())).unwrap();
+        let (snapshot, tail) = tail.split_at(length);
+        let snapshot = std::str::from_utf8(snapshot).unwrap();
+        assert!(matches!(
+            parse_snapshot(snapshot),
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 30"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > 1, "v30 aggregate must contain a corpus");
+}
+
+#[test]
+fn canonical_control_plane_state_v31_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -1749,6 +1798,7 @@ fn canonical_control_plane_state_v30_representative_aggregate_is_stable() {
         vec![101, 102, 103],
         &certified_nodes,
         &certified_pgs,
+        test_certified_storage_placement_policy((1..=3).map(NodeId::new), 2, 50),
     )
     .unwrap();
     let certified = ClusterControlSnapshot::empty()
@@ -1759,7 +1809,161 @@ fn canonical_control_plane_state_v30_representative_aggregate_is_stable() {
         })
         .unwrap()
         .into_snapshot();
-    snapshots.push(certified);
+    snapshots.push(certified.clone());
+
+    let unavailable_tmp = test_util::tempdir();
+    let unavailable_store =
+        FileControlPlaneStore::new(unavailable_tmp.path().join("unavailable-transition.state"));
+    unavailable_store.checkpoint(None, &certified).unwrap();
+    let mut unavailable_authority = SingleAuthorityControlPlane::open(unavailable_store).unwrap();
+    for node_id in 1..=3 {
+        let now_ms = 6_000 + u64::from(node_id);
+        let mut request = heartbeat(
+            node_id,
+            unavailable_authority.snapshot().cluster_epoch(),
+            now_ms,
+        );
+        request.endpoint = format!("/tmp/node-{node_id}.sock");
+        request.requested_lease_duration_ms = 10_000;
+        unavailable_authority.heartbeat(request, now_ms).unwrap();
+        let mut request = heartbeat_from_record(
+            &unavailable_authority,
+            node_id,
+            unavailable_authority.snapshot().cluster_epoch(),
+            now_ms + 1,
+        );
+        request.requested_lease_duration_ms = 10_000;
+        unavailable_authority
+            .heartbeat(request, now_ms + 1)
+            .unwrap();
+    }
+    let unavailable_transition_proof = PgMetadataProof::current(31, 32, 33);
+    for node_id in 1..=2 {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut unavailable_authority,
+            node_id,
+            7,
+            PgState::Peering,
+            unavailable_transition_proof,
+            false,
+            (6_100 + u64::from(node_id), 10_000),
+        );
+    }
+    unavailable_authority
+        .complete_pg_peering(
+            PgId::new(7),
+            NodeId::new(1),
+            node_incarnation(&unavailable_authority, 1),
+            6_103,
+        )
+        .unwrap();
+    for node_id in 1..=2 {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut unavailable_authority,
+            node_id,
+            7,
+            PgState::Active,
+            unavailable_transition_proof,
+            false,
+            (
+                6_110 + u64::from(node_id),
+                if node_id == 1 { 100 } else { 10_000 },
+            ),
+        );
+    }
+    let unavailable_deadline_ms = unavailable_authority
+        .snapshot()
+        .node(NodeId::new(1))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    unavailable_authority
+        .expire_heartbeat_leases(unavailable_deadline_ms)
+        .unwrap();
+    for _ in 0..2 {
+        for node_id in 2..=3 {
+            let now_ms = unavailable_authority
+                .snapshot()
+                .max_committed_timestamp_ms()
+                .unwrap()
+                + 1;
+            let mut request = heartbeat_from_record(
+                &unavailable_authority,
+                node_id,
+                unavailable_authority.snapshot().cluster_epoch(),
+                now_ms,
+            );
+            request.requested_lease_duration_ms = 10_000;
+            unavailable_authority.heartbeat(request, now_ms).unwrap();
+        }
+    }
+    let source_observed_at_ms = unavailable_authority
+        .snapshot()
+        .max_committed_timestamp_ms()
+        .unwrap()
+        + 1;
+    heartbeat_with_pg_proof_and_lease_duration(
+        &mut unavailable_authority,
+        2,
+        7,
+        PgState::Peering,
+        unavailable_transition_proof,
+        false,
+        (source_observed_at_ms, 10_000),
+    );
+    let begin_at_ms = unavailable_authority
+        .snapshot()
+        .unavailable_node_observation(NodeId::new(1))
+        .unwrap()
+        .observed_at_ms()
+        + 50;
+    unavailable_authority
+        .begin_unavailable_pg_placement_transition(PgId::new(7), NodeId::new(1), begin_at_ms)
+        .unwrap();
+    snapshots.push(unavailable_authority.snapshot().clone());
+    unavailable_authority
+        .set_pg_acting_set_with_metadata_transfer(
+            PgId::new(7),
+            vec![NodeId::new(3), NodeId::new(2)],
+            PgMetadataTransferProof::new(
+                unavailable_authority.snapshot().cluster_epoch(),
+                unavailable_transition_proof,
+            ),
+        )
+        .unwrap();
+    let payload_ready_at_ms = unavailable_authority
+        .snapshot()
+        .max_committed_timestamp_ms()
+        .unwrap()
+        + 1;
+    for node_id in [3, 2] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut unavailable_authority,
+            node_id,
+            7,
+            PgState::Peering,
+            unavailable_transition_proof,
+            false,
+            (payload_ready_at_ms + u64::from(node_id), 10_000),
+        );
+    }
+    let payload_ready_at_ms = unavailable_authority
+        .snapshot()
+        .max_committed_timestamp_ms()
+        .unwrap()
+        .max(unavailable_deadline_ms + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1);
+    unavailable_authority
+        .record_unavailable_pg_payload_readiness(PgId::new(7), payload_ready_at_ms)
+        .unwrap();
+    unavailable_authority
+        .complete_pg_peering(
+            PgId::new(7),
+            NodeId::new(3),
+            node_incarnation(&unavailable_authority, 3),
+            payload_ready_at_ms,
+        )
+        .unwrap();
+    snapshots.push(unavailable_authority.snapshot().clone());
 
     let with_horizon = canonical_snapshot_with_node()
         .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
@@ -2078,7 +2282,7 @@ fn canonical_control_plane_state_v30_representative_aggregate_is_stable() {
         aggregate_text.push_str(&formatted);
     }
     for required_record in [
-        "version=30\n",
+        "version=31\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -2090,6 +2294,9 @@ fn canonical_control_plane_state_v30_representative_aggregate_is_stable() {
         "node_history_route_retiring=",
         "node_pg=",
         "pg=",
+        "unavailable_node=",
+        "unavailable_pg_transition=",
+        "retained_unavailable_pg_transition=",
     ] {
         assert!(
             aggregate_text.contains(required_record),
@@ -2102,8 +2309,8 @@ fn canonical_control_plane_state_v30_representative_aggregate_is_stable() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            5_199,
-            "4e6e430bb64dad8a2048a09be56988943442f0f7d50d9eec6b286ab76d22938d".to_owned()
+            11_004,
+            "0870eaea3629677982ba9fc2a04edd491a2dd3ebdedc8912b1509a149cdb61f2".to_owned()
         )
     );
 }
@@ -5000,6 +5207,9 @@ fn retained_history_transfer_chain_remains_a_debug_audit() {
                 state: PgState::Active,
                 acting_set: vec![NodeId::new(2)],
                 active_primary: Some(NodeId::new(2)),
+                peering_metadata_proof_floor: None,
+                peering_metadata_proof_floor_epoch: None,
+                peering_metadata_proof_floor_imported: false,
                 peering_metadata_transfer: None,
                 peering_metadata_transfer_source_route_epoch: None,
                 peering_metadata_transfer_source_node_id: None,
@@ -5015,6 +5225,9 @@ fn retained_history_transfer_chain_remains_a_debug_audit() {
                 state: PgState::Peering,
                 acting_set: vec![NodeId::new(1)],
                 active_primary: None,
+                peering_metadata_proof_floor: Some(PgMetadataProof::empty()),
+                peering_metadata_proof_floor_epoch: Some(ClusterEpoch::INITIAL),
+                peering_metadata_proof_floor_imported: true,
                 peering_metadata_transfer: Some(PgMetadataTransferProof::new(
                     ClusterEpoch::INITIAL,
                     PgMetadataProof::empty(),
@@ -5616,6 +5829,7 @@ fn certified_bootstrap_persists_exact_topology_and_pg_placements() {
         vec![101, 102, 103],
         &nodes,
         &pg_acting_sets,
+        test_certified_storage_placement_policy((1..=3).map(NodeId::new), 2, 50),
     )
     .unwrap();
     let snapshot = ClusterControlSnapshot::empty()

@@ -902,6 +902,35 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
         self.current_snapshot()
     }
 
+    fn begin_unavailable_pg_placement_transition(
+        &mut self,
+        pg_id: PgId,
+        unavailable_node_id: NodeId,
+        begin_at_ms: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .current_snapshot()?
+            .begin_unavailable_pg_placement_transition_command(
+                pg_id,
+                unavailable_node_id,
+                begin_at_ms,
+            )?;
+        self.submit_raft_command(command)?;
+        self.current_snapshot()
+    }
+
+    fn record_unavailable_pg_payload_readiness(
+        &mut self,
+        pg_id: PgId,
+        ready_at_ms: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .current_snapshot()?
+            .record_unavailable_pg_payload_readiness_command(pg_id, ready_at_ms)?;
+        self.submit_raft_command(command)?;
+        self.current_snapshot()
+    }
+
     fn fence_pg_for_metadata_transfer(
         &mut self,
         pg_id: PgId,

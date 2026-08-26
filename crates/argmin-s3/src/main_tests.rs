@@ -819,9 +819,12 @@ mod tests {
         .expect("static identity should initialize before durable state exists");
         let placement = storage::derive_static_initial_pg_placement(
             1,
-            1,
-            0,
-            storage::StaticStorageFailureDomain::None,
+            storage::StaticStoragePlacementParameters::new(
+                1,
+                0,
+                storage::StaticStorageFailureDomain::None,
+                0,
+            ),
             &["host-1".to_owned()],
             &["disk-1".to_owned()],
             &[storage::StaticStoragePlacementNode::new(

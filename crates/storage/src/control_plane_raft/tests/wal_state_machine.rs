@@ -138,7 +138,7 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
         ),
         (
             714,
-            "e8b1af25ceb9f6f9278445e8237c43ad6ec7afc24b759a051166eae0f094a547".to_owned()
+            "5b1d3572e5bb79e54c8ade4845653381d4c35a493f69bb23287fd2ca0288414c".to_owned()
         )
     );
 }
@@ -565,7 +565,7 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         (
             75,
             236,
-            "8aa679691b60f6aecb4d6e93fe44ef346745c117e76ad16e96c03343fca4c16b".to_owned(),
+            "5731190a2fcb5a6c0fa9cbcdf55fde1cff9256190c4cdbb5bf5fb55ff77ac1fb".to_owned(),
             112,
             "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62".to_owned()
         )
@@ -850,6 +850,11 @@ fn control_plane_raft_established_static_policy_requires_matching_topology_certi
         vec![1, 2],
         &bootstrap_nodes,
         &bootstrap_pgs,
+        crate::control_plane::test_certified_storage_placement_policy(
+            [NodeId::new(11)],
+            1,
+            1_000,
+        ),
     )
     .unwrap();
     let bootstrap_entry = normal_entry(
@@ -932,9 +937,12 @@ fn static_initial_topology_for_submission_test(
 ) -> StaticInitialControlPlaneTopology {
     let placement = crate::derive_static_initial_pg_placement(
         1,
-        1,
-        0,
-        crate::StaticStorageFailureDomain::None,
+        crate::StaticStoragePlacementParameters::new(
+            1,
+            0,
+            crate::StaticStorageFailureDomain::None,
+            0,
+        ),
         &["host-1".to_owned()],
         &["disk-1".to_owned()],
         &[crate::StaticStoragePlacementNode::new(

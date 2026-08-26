@@ -527,7 +527,7 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
         ),
         (
             2196,
-            "9baeca4ade9c28d2fb81ccd8cca54656d6bb0d5777f22d55757be1c11313e5c9"
+            "9e74dd07a08e1653a60b43e8dceea001cc30f3b502b48d6fe676357a0213a765"
                 .to_string()
         )
     );
@@ -2131,6 +2131,11 @@ fn control_plane_openraft_static_restore_requires_certificate_before_raft_start(
                 vec![1, 2],
                 &bootstrap_nodes,
                 &bootstrap_pgs,
+                crate::control_plane::test_certified_storage_placement_policy(
+                    [NodeId::new(11), NodeId::new(12)],
+                    1,
+                    1_000,
+                ),
             )
             .unwrap();
         let policy = policy.with_initial_topology_certificate(topology.clone());
@@ -2216,6 +2221,11 @@ fn control_plane_openraft_static_restore_requires_certificate_before_raft_start(
                             (NodeId::new(12), "node-12".to_string()),
                         ],
                         &[(crate::PgId::new(0), vec![NodeId::new(11)])],
+                        crate::control_plane::test_certified_storage_placement_policy(
+                            [NodeId::new(11), NodeId::new(12)],
+                            1,
+                            1_000,
+                        ),
                     )
                     .unwrap(),
             },
@@ -2323,6 +2333,11 @@ fn control_plane_openraft_static_pending_restore_accepts_only_expected_bootstrap
                 vec![1, 2],
                 &expected_nodes,
                 &expected_pgs,
+                crate::control_plane::test_certified_storage_placement_policy(
+                    [NodeId::new(11)],
+                    1,
+                    1_000,
+                ),
             )
             .unwrap();
         let policy = policy.with_initial_topology_certificate(expected_topology.clone());
@@ -2434,6 +2449,11 @@ fn control_plane_openraft_static_pending_restore_accepts_only_expected_bootstrap
                             vec![1, 2],
                             &[(NodeId::new(11), "node-11".to_string())],
                             &[(crate::PgId::new(0), vec![NodeId::new(11)])],
+                            crate::control_plane::test_certified_storage_placement_policy(
+                                [NodeId::new(11)],
+                                1,
+                                1_000,
+                            ),
                         )
                         .unwrap(),
                     },

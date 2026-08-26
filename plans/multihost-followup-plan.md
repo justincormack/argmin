@@ -342,6 +342,41 @@ one blocked slot on affected PGs and foreground traffic progressively collapsed
 into `SlowDown`. The multihost harness had hidden this gap by invoking the live
 metadata-transfer administration command for its selected probe PG.
 
+Implementation status (2026-08-25): the control-plane state-machine slice is
+complete. Lease expiry now persists the exact unavailable incarnation,
+endpoint, lease deadline, and authority observation. The certified initial
+topology also owns the EC shape, failure-domain identities and policy, failure
+tolerance, and exact unavailable-replacement grace interval. A new replicated
+compare-and-swap binds that evidence to the exact source PG and epoch, exact
+proof-qualified surviving metadata route and process observation, policy-valid
+Active spare process and placement, certified grace cutoff, predecessor
+transition tip, and transition epoch. Its
+commit atomically records the durable transition, establishes a
+source-authorized `Peering` route, and prevents acting-set mutation or
+activation from bypassing metadata transfer.
+
+The existing transfer command must install the exact committed destination and
+records its epoch. Explicit and batch activation then require a durable
+payload-readiness token bound to every `k + m` destination's exact node
+incarnation, endpoint, live lease, destination route, transition, topology, and
+authority time. Explicit and batch activation revalidate every token-bound
+destination process and exact lease in the activation CAS; a same-incarnation
+lease renewal invalidates readiness until it is republished. State validation
+retains the source route's proof floor, epoch, and imported provenance in route
+history, binds source and destination transfer provenance to that reconstructed
+history, and rejects coordinated transition evidence that no command could
+produce.
+Activation archives the completed tip into retained historical
+dependency state; it no longer blocks a later ordinary placement change or a
+CAS-bound successor transition. State v31 and command v18 seal the active and
+retained lineage, readiness, certified placement policy, and immutable v30/v17
+rejection evidence. The production reconciler queue, bounded discovery and
+execution, storage-side readiness evidence collection, historical payload
+backfill, terminal dependency cleanup, backpressure, maintenance modes, and
+multihost outage release gate remain to be implemented. There is deliberately
+no production transition initiator until those worker and evidence-producing
+paths exist.
+
 The first implementation may use the committed static topology and the existing
 metadata-transfer and payload-backfill primitives. It does not depend on adding
 or removing nodes dynamically and is not capacity rebalancing. It must:
