@@ -102,6 +102,8 @@ type PutObjectCallResult = Result<
     aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
 >;
 
+const CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS: usize = 3;
+
 #[derive(Debug)]
 enum ConditionalDeleteObjectsEntryOutcome {
     Deleted {
@@ -110,6 +112,31 @@ enum ConditionalDeleteObjectsEntryOutcome {
     Rejected {
         code: String,
     },
+}
+
+struct ConditionalDeleteObjectsPutRace<T> {
+    key: String,
+    canary_key: String,
+    original: aws_sdk_s3::operation::put_object::PutObjectOutput,
+    delete: aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput,
+    replacement: aws_sdk_s3::operation::put_object::PutObjectOutput,
+    context: T,
+}
+
+struct ConditionalDeleteObjectsMarkerRace {
+    key: String,
+    canary_key: String,
+    original: aws_sdk_s3::operation::put_object::PutObjectOutput,
+    batch: aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput,
+    competing: aws_sdk_s3::operation::delete_object::DeleteObjectOutput,
+}
+
+fn conditional_delete_objects_race_key(base: &str, attempt: usize) -> String {
+    if attempt == 0 {
+        base.to_string()
+    } else {
+        format!("retry-{attempt}-{base}")
+    }
 }
 
 async fn race_conditional_delete_objects_with_put(
@@ -175,6 +202,175 @@ async fn race_conditional_delete_objects_with_put(
     (delete, put.unwrap())
 }
 
+async fn race_conditional_delete_objects_with_put_retrying_slow_down<T: Clone>(
+    bucket: &str,
+    base_key: &str,
+    base_canary_key: &str,
+    original_body: &'static [u8],
+    replacement_body: &'static [u8],
+    replacement_state: &'static str,
+    attempt_contexts: &[T],
+) -> ConditionalDeleteObjectsPutRace<T> {
+    assert_eq!(
+        attempt_contexts.len(),
+        CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS
+    );
+
+    for (attempt, context) in attempt_contexts.iter().enumerate() {
+        let key = conditional_delete_objects_race_key(base_key, attempt);
+        let canary_key = conditional_delete_objects_race_key(base_canary_key, attempt);
+        let original = put_object(CTX.client(), bucket, &key, original_body).await;
+        let canary = put_object(CTX.client(), bucket, &canary_key, b"canary").await;
+        let (delete, replacement) = race_conditional_delete_objects_with_put(
+            bucket,
+            &key,
+            original.e_tag().unwrap(),
+            &canary_key,
+            canary.e_tag().unwrap(),
+            replacement_body,
+            replacement_state,
+        )
+        .await;
+
+        let delete_transport_contention = delete
+            .as_ref()
+            .err()
+            .is_some_and(s3_tests::is_retryable_operation_contention);
+        let replacement_transport_contention = replacement
+            .as_ref()
+            .err()
+            .is_some_and(s3_tests::is_retryable_operation_contention);
+        if let Ok(output) = &delete {
+            assert_delete_objects_canary_succeeded(output, &canary_key);
+        }
+        let target_slow_down = delete
+            .as_ref()
+            .ok()
+            .is_some_and(|output| validate_target_slow_down_for_retry(output, &key));
+        if delete_transport_contention || replacement_transport_contention || target_slow_down {
+            assert!(
+                attempt + 1 < CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS,
+                "{base_key}: conditional batch-delete race returned operation contention on all \
+                 {CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS} attempts"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        }
+
+        return ConditionalDeleteObjectsPutRace {
+            key,
+            canary_key,
+            original,
+            delete: delete.unwrap_or_else(|error| {
+                panic!("conditional batch delete failed for {base_key}: {error:?}")
+            }),
+            replacement: replacement.unwrap_or_else(|error| {
+                panic!("batch-delete replacement failed for {base_key}: {error:?}")
+            }),
+            context: context.clone(),
+        };
+    }
+    unreachable!("retry loop must return on its final attempt")
+}
+
+async fn race_conditional_delete_objects_with_marker_retrying_slow_down(
+    bucket: &str,
+) -> ConditionalDeleteObjectsMarkerRace {
+    const BASE_KEY: &str = "batch-delete-race-versioned-current-marker";
+    const BASE_CANARY_KEY: &str = "batch-delete-race-versioned-marker-canary";
+
+    for attempt in 0..CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS {
+        let key = conditional_delete_objects_race_key(BASE_KEY, attempt);
+        let canary_key = conditional_delete_objects_race_key(BASE_CANARY_KEY, attempt);
+        let original = put_object(CTX.client(), bucket, &key, b"marker original").await;
+        let canary = put_object(CTX.client(), bucket, &canary_key, b"canary").await;
+        let delete = Delete::builder()
+            .set_objects(Some(vec![
+                make_object_id_with_etag(&key, original.e_tag().unwrap()),
+                make_object_id_with_etag(&canary_key, canary.e_tag().unwrap()),
+            ]))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let batch_client = CTX.client().clone();
+        let batch_bucket = bucket.to_string();
+        let batch_barrier = Arc::clone(&barrier);
+        let batch = tokio::spawn(async move {
+            batch_barrier.wait().await;
+            delete_objects_retrying_exact_operation_aborted_result(
+                &batch_client,
+                &batch_bucket,
+                delete,
+            )
+            .await
+        });
+        let competing_client = CTX.client().clone();
+        let competing_bucket = bucket.to_string();
+        let competing_key = key.clone();
+        let competing = tokio::spawn(async move {
+            barrier.wait().await;
+            competing_client
+                .delete_object()
+                .bucket(competing_bucket)
+                .key(competing_key)
+                .send_retrying_exact_operation_aborted(
+                    "insert competing marker during conditional batch-delete race",
+                )
+                .await
+        });
+        let (batch, competing) = tokio::join!(batch, competing);
+        let batch = match batch.unwrap() {
+            Ok(output) => Ok(retry_delete_objects_canary_slow_down(
+                bucket,
+                &canary_key,
+                canary.e_tag().unwrap(),
+                output,
+            )
+            .await),
+            Err(error) => Err(error),
+        };
+        let competing = competing.unwrap();
+
+        let batch_transport_contention = batch
+            .as_ref()
+            .err()
+            .is_some_and(s3_tests::is_retryable_operation_contention);
+        let competing_transport_contention = competing
+            .as_ref()
+            .err()
+            .is_some_and(s3_tests::is_retryable_operation_contention);
+        if let Ok(output) = &batch {
+            assert_delete_objects_canary_succeeded(output, &canary_key);
+        }
+        let target_slow_down = batch
+            .as_ref()
+            .ok()
+            .is_some_and(|output| validate_target_slow_down_for_retry(output, &key));
+        if batch_transport_contention || competing_transport_contention || target_slow_down {
+            assert!(
+                attempt + 1 < CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS,
+                "{BASE_KEY}: conditional marker race returned operation contention on all \
+                 {CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS} attempts"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        }
+
+        return ConditionalDeleteObjectsMarkerRace {
+            key,
+            canary_key,
+            original,
+            batch: batch.unwrap_or_else(|error| {
+                panic!("conditional marker batch delete failed: {error:?}")
+            }),
+            competing: competing
+                .unwrap_or_else(|error| panic!("competing marker insertion failed: {error:?}")),
+        };
+    }
+    unreachable!("retry loop must return on its final attempt")
+}
+
 async fn retry_delete_objects_canary_slow_down(
     bucket: &str,
     canary_key: &str,
@@ -187,49 +383,108 @@ async fn retry_delete_objects_canary_slow_down(
 
     // Preserve the conditional target's exact race result. Only replay the
     // independent canary entry whose SlowDown means it was not admitted.
-    let retry = delete_objects_with_md5(
-        CTX.client(),
-        bucket,
-        Delete::builder()
-            .objects(make_object_id_with_etag(canary_key, canary_etag))
-            .quiet(false)
-            .build()
-            .unwrap(),
-    )
-    .send()
-    .await
-    .unwrap_or_else(|error| panic!("retried multi-delete canary failed: {error:?}"));
-    assert!(
-        retry.errors().is_empty(),
-        "retried multi-delete canary failed: {retry:?}"
-    );
-    assert_eq!(retry.deleted().len(), 1, "{retry:?}");
-    assert_eq!(retry.deleted()[0].key(), Some(canary_key));
+    for attempt in 1..CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS {
+        let retry = delete_objects_with_md5(
+            CTX.client(),
+            bucket,
+            Delete::builder()
+                .objects(make_object_id_with_etag(canary_key, canary_etag))
+                .quiet(false)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await;
+        let transport_contention = retry
+            .as_ref()
+            .err()
+            .is_some_and(s3_tests::is_retryable_operation_contention);
+        let embedded_slow_down = retry
+            .as_ref()
+            .ok()
+            .is_some_and(|retry| validate_canary_slow_down_for_retry(retry, canary_key));
+        if transport_contention || embedded_slow_down {
+            assert!(
+                attempt + 1 < CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS,
+                "multi-delete canary returned operation contention on all \
+                 {CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS} attempts"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        }
 
-    let mut deleted = output.deleted().to_vec();
-    deleted.extend(retry.deleted().iter().cloned());
-    let errors = output
-        .errors()
-        .iter()
-        .filter(|error| error.key() != Some(canary_key))
-        .cloned()
-        .collect::<Vec<_>>();
-    aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput::builder()
-        .set_deleted(Some(deleted))
-        .set_errors((!errors.is_empty()).then_some(errors))
-        .build()
+        let retry =
+            retry.unwrap_or_else(|error| panic!("retried multi-delete canary failed: {error:?}"));
+        assert!(
+            retry.errors().is_empty(),
+            "retried multi-delete canary failed: {retry:?}"
+        );
+        assert_eq!(retry.deleted().len(), 1, "{retry:?}");
+        assert_eq!(retry.deleted()[0].key(), Some(canary_key));
+
+        let mut deleted = output.deleted().to_vec();
+        deleted.extend(retry.deleted().iter().cloned());
+        let errors = output
+            .errors()
+            .iter()
+            .filter(|error| error.key() != Some(canary_key))
+            .cloned()
+            .collect::<Vec<_>>();
+        return aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput::builder()
+            .set_deleted(Some(deleted))
+            .set_errors((!errors.is_empty()).then_some(errors))
+            .build();
+    }
+    unreachable!("retry loop must return on its final attempt")
 }
 
 fn validate_canary_slow_down_for_retry(
     output: &aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput,
     canary_key: &str,
 ) -> bool {
-    let canary_errors = output
+    validate_delete_objects_entry_slow_down_for_retry(output, canary_key, "canary")
+}
+
+fn validate_target_slow_down_for_retry(
+    output: &aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput,
+    key: &str,
+) -> bool {
+    validate_delete_objects_entry_slow_down_for_retry(output, key, "conditional target")
+}
+
+fn assert_delete_objects_canary_succeeded(
+    output: &aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput,
+    canary_key: &str,
+) {
+    assert_eq!(
+        output
+            .deleted()
+            .iter()
+            .filter(|deleted| deleted.key() == Some(canary_key))
+            .count(),
+        1,
+        "canary must be deleted exactly once: {output:?}"
+    );
+    assert!(
+        output
+            .errors()
+            .iter()
+            .all(|error| error.key() != Some(canary_key)),
+        "deleted canary cannot also have an error: {output:?}"
+    );
+}
+
+fn validate_delete_objects_entry_slow_down_for_retry(
+    output: &aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput,
+    key: &str,
+    entry_name: &str,
+) -> bool {
+    let entry_errors = output
         .errors()
         .iter()
-        .filter(|error| error.key() == Some(canary_key))
+        .filter(|error| error.key() == Some(key))
         .collect::<Vec<_>>();
-    if !canary_errors
+    if !entry_errors
         .iter()
         .any(|error| error.code() == Some("SlowDown"))
     {
@@ -240,15 +495,15 @@ fn validate_canary_slow_down_for_retry(
         output
             .deleted()
             .iter()
-            .all(|deleted| deleted.key() != Some(canary_key)),
-        "canary cannot be both deleted and SlowDown before retry: {output:?}"
+            .all(|deleted| deleted.key() != Some(key)),
+        "{entry_name} cannot be both deleted and SlowDown before retry: {output:?}"
     );
     assert_eq!(
-        canary_errors.len(),
+        entry_errors.len(),
         1,
-        "canary must have exactly one error before retry: {output:?}"
+        "{entry_name} must have exactly one error before retry: {output:?}"
     );
-    assert_eq!(canary_errors[0].code(), Some("SlowDown"));
+    assert_eq!(entry_errors[0].code(), Some("SlowDown"));
     true
 }
 
@@ -273,6 +528,66 @@ fn canary_slow_down_retry_accepts_one_undeleted_error() {
         vec![test_delete_objects_error("canary", "SlowDown")],
     );
     assert!(validate_canary_slow_down_for_retry(&output, "canary"));
+}
+
+#[test]
+fn conditional_target_slow_down_requests_whole_race_replay() {
+    let output = test_delete_objects_output(
+        vec![DeletedObject::builder().key("canary").build()],
+        vec![test_delete_objects_error("target", "SlowDown")],
+    );
+    assert_delete_objects_canary_succeeded(&output, "canary");
+    assert!(validate_target_slow_down_for_retry(&output, "target"));
+}
+
+#[test]
+#[should_panic(expected = "canary must be deleted exactly once")]
+fn target_slow_down_replay_rejects_missing_canary() {
+    let output = test_delete_objects_output(
+        Vec::new(),
+        vec![test_delete_objects_error("target", "SlowDown")],
+    );
+    assert_delete_objects_canary_succeeded(&output, "canary");
+}
+
+#[test]
+#[should_panic(expected = "deleted canary cannot also have an error")]
+fn target_slow_down_replay_rejects_canary_error() {
+    let output = test_delete_objects_output(
+        vec![DeletedObject::builder().key("canary").build()],
+        vec![
+            test_delete_objects_error("target", "SlowDown"),
+            test_delete_objects_error("canary", "AccessDenied"),
+        ],
+    );
+    assert_delete_objects_canary_succeeded(&output, "canary");
+}
+
+#[test]
+#[should_panic(expected = "canary must be deleted exactly once")]
+fn target_slow_down_replay_rejects_duplicate_canary_deletions() {
+    let output = test_delete_objects_output(
+        vec![
+            DeletedObject::builder().key("canary").build(),
+            DeletedObject::builder().key("canary").build(),
+        ],
+        vec![test_delete_objects_error("target", "SlowDown")],
+    );
+    assert_delete_objects_canary_succeeded(&output, "canary");
+}
+
+#[test]
+fn conditional_race_retry_keys_do_not_share_prefixes() {
+    let keys = (0..CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS)
+        .map(|attempt| conditional_delete_objects_race_key("target", attempt))
+        .collect::<Vec<_>>();
+    for (left_index, left) in keys.iter().enumerate() {
+        for (right_index, right) in keys.iter().enumerate() {
+            if left_index != right_index {
+                assert!(!right.starts_with(left), "left={left:?} right={right:?}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -303,19 +618,7 @@ fn classify_conditional_delete_objects_entry(
     key: &str,
     canary_key: &str,
 ) -> ConditionalDeleteObjectsEntryOutcome {
-    let canary = output
-        .deleted()
-        .iter()
-        .find(|deleted| deleted.key() == Some(canary_key))
-        .unwrap_or_else(|| panic!("missing successful canary deletion: {output:?}"));
-    let _ = canary;
-    assert!(
-        output
-            .errors()
-            .iter()
-            .all(|error| error.key() != Some(canary_key)),
-        "canary unexpectedly failed: {output:?}"
-    );
+    assert_delete_objects_canary_succeeded(output, canary_key);
 
     let deleted = output
         .deleted()
@@ -829,30 +1132,20 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let different_key = "batch-delete-race-unversioned-different-etag";
-        let different_canary = "batch-delete-race-unversioned-different-canary";
-        let different_original = put_object(client, &bucket, different_key, b"original").await;
-        let different_canary_put = put_object(client, &bucket, different_canary, b"canary").await;
-        let (different_delete, different_put) = race_conditional_delete_objects_with_put(
+        let different = race_conditional_delete_objects_with_put_retrying_slow_down(
             &bucket,
-            different_key,
-            different_original.e_tag().unwrap(),
-            different_canary,
-            different_canary_put.e_tag().unwrap(),
+            "batch-delete-race-unversioned-different-etag",
+            "batch-delete-race-unversioned-different-canary",
+            b"original",
             b"different replacement",
             "different-etag",
+            &[(); CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS],
         )
         .await;
-        let different_delete = different_delete.unwrap_or_else(|error| {
-            panic!("unversioned conditional batch delete failed: {error:?}")
-        });
-        different_put.unwrap_or_else(|error| {
-            panic!("unversioned batch-delete replacement failed: {error:?}")
-        });
         match classify_conditional_delete_objects_entry(
-            &different_delete,
-            different_key,
-            different_canary,
+            &different.delete,
+            &different.key,
+            &different.canary_key,
         ) {
             ConditionalDeleteObjectsEntryOutcome::Deleted {
                 delete_marker_version_id,
@@ -867,7 +1160,7 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         let different_current = client
             .get_object()
             .bucket(&bucket)
-            .key(different_key)
+            .key(&different.key)
             .send_retrying_operation_aborted("get unversioned conditional batch-delete replacement")
             .await
             .unwrap();
@@ -889,27 +1182,19 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
             b"different replacement"
         );
 
-        let same_key = "batch-delete-race-unversioned-same-etag";
-        let same_canary = "batch-delete-race-unversioned-same-canary";
-        let same_original = put_object(client, &bucket, same_key, b"same bytes").await;
-        let same_canary_put = put_object(client, &bucket, same_canary, b"canary").await;
-        let (same_delete, same_put) = race_conditional_delete_objects_with_put(
+        let same = race_conditional_delete_objects_with_put_retrying_slow_down(
             &bucket,
-            same_key,
-            same_original.e_tag().unwrap(),
-            same_canary,
-            same_canary_put.e_tag().unwrap(),
+            "batch-delete-race-unversioned-same-etag",
+            "batch-delete-race-unversioned-same-canary",
+            b"same bytes",
             b"same bytes",
             "same-etag",
+            &[(); CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS],
         )
         .await;
-        let same_delete = same_delete
-            .unwrap_or_else(|error| panic!("same-ETag conditional batch delete failed: {error:?}"));
-        let same_put = same_put
-            .unwrap_or_else(|error| panic!("same-ETag batch-delete replacement failed: {error:?}"));
-        assert_eq!(same_put.e_tag(), same_original.e_tag());
+        assert_eq!(same.replacement.e_tag(), same.original.e_tag());
         let same_outcome =
-            classify_conditional_delete_objects_entry(&same_delete, same_key, same_canary);
+            classify_conditional_delete_objects_entry(&same.delete, &same.key, &same.canary_key);
         let same_delete_succeeded = match same_outcome {
             ConditionalDeleteObjectsEntryOutcome::Deleted {
                 delete_marker_version_id,
@@ -925,12 +1210,12 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         match client
             .get_object()
             .bucket(&bucket)
-            .key(same_key)
+            .key(&same.key)
             .send_retrying_operation_aborted("get same-ETag conditional batch-delete result")
             .await
         {
             Ok(current) => {
-                assert_eq!(current.e_tag(), same_original.e_tag());
+                assert_eq!(current.e_tag(), same.original.e_tag());
                 assert_eq!(
                     current
                         .metadata()
@@ -956,31 +1241,22 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
 
         s3_tests::enable_bucket_versioning(client, &bucket).await;
 
-        let versioned_key = "batch-delete-race-versioned-different-etag";
-        let versioned_canary = "batch-delete-race-versioned-canary";
-        let versioned_original =
-            put_object(client, &bucket, versioned_key, b"versioned original").await;
-        let original_version = versioned_original.version_id().unwrap().to_string();
-        let versioned_canary_put = put_object(client, &bucket, versioned_canary, b"canary").await;
-        let (versioned_delete, versioned_put) = race_conditional_delete_objects_with_put(
+        let versioned = race_conditional_delete_objects_with_put_retrying_slow_down(
             &bucket,
-            versioned_key,
-            versioned_original.e_tag().unwrap(),
-            versioned_canary,
-            versioned_canary_put.e_tag().unwrap(),
+            "batch-delete-race-versioned-different-etag",
+            "batch-delete-race-versioned-canary",
+            b"versioned original",
             b"versioned replacement",
             "versioned-different-etag",
+            &[(); CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS],
         )
         .await;
-        let versioned_delete = versioned_delete
-            .unwrap_or_else(|error| panic!("versioned conditional batch delete failed: {error:?}"));
-        let versioned_put = versioned_put
-            .unwrap_or_else(|error| panic!("versioned batch-delete replacement failed: {error:?}"));
-        let replacement_version = versioned_put.version_id().unwrap().to_string();
+        let original_version = versioned.original.version_id().unwrap().to_string();
+        let replacement_version = versioned.replacement.version_id().unwrap().to_string();
         let versioned_outcome = classify_conditional_delete_objects_entry(
-            &versioned_delete,
-            versioned_key,
-            versioned_canary,
+            &versioned.delete,
+            &versioned.key,
+            &versioned.canary_key,
         );
         let expected_marker_version = match &versioned_outcome {
             ConditionalDeleteObjectsEntryOutcome::Deleted {
@@ -1001,7 +1277,7 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         let versioned_versions = client
             .list_object_versions()
             .bucket(&bucket)
-            .prefix(versioned_key)
+            .prefix(&versioned.key)
             .send_retrying_operation_aborted("list versioned conditional batch-delete race")
             .await
             .unwrap();
@@ -1028,56 +1304,15 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
                 .unwrap_or(false));
         }
 
-        let marker_key = "batch-delete-race-versioned-current-marker";
-        let marker_canary = "batch-delete-race-versioned-marker-canary";
-        let marker_original = put_object(client, &bucket, marker_key, b"marker original").await;
-        let marker_original_version = marker_original.version_id().unwrap().to_string();
-        let marker_canary_put = put_object(client, &bucket, marker_canary, b"canary").await;
-        let marker_delete = Delete::builder()
-            .set_objects(Some(vec![
-                make_object_id_with_etag(marker_key, marker_original.e_tag().unwrap()),
-                make_object_id_with_etag(marker_canary, marker_canary_put.e_tag().unwrap()),
-            ]))
-            .quiet(false)
-            .build()
-            .unwrap();
-        let marker_barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let batch_client = client.clone();
-        let batch_bucket = bucket.clone();
-        let batch_barrier = Arc::clone(&marker_barrier);
-        let batch = tokio::spawn(async move {
-            batch_barrier.wait().await;
-            delete_objects_retrying_exact_operation_aborted_result(
-                &batch_client,
-                &batch_bucket,
-                marker_delete,
-            )
-            .await
-        });
-        let competing_client = client.clone();
-        let competing_bucket = bucket.clone();
-        let competing = tokio::spawn(async move {
-            marker_barrier.wait().await;
-            competing_client
-                .delete_object()
-                .bucket(competing_bucket)
-                .key(marker_key)
-                .send_retrying_exact_operation_aborted(
-                    "insert competing marker during conditional batch-delete race",
-                )
-                .await
-        });
-        let (batch, competing) = tokio::join!(batch, competing);
-        let batch = batch
-            .unwrap()
-            .unwrap_or_else(|error| panic!("conditional marker batch delete failed: {error:?}"));
-        let competing = competing
-            .unwrap()
-            .unwrap_or_else(|error| panic!("competing marker insertion failed: {error:?}"));
-        assert_eq!(competing.delete_marker(), Some(true));
-        let competing_marker_version = competing.version_id().unwrap().to_string();
-        let marker_outcome =
-            classify_conditional_delete_objects_entry(&batch, marker_key, marker_canary);
+        let marker = race_conditional_delete_objects_with_marker_retrying_slow_down(&bucket).await;
+        let marker_original_version = marker.original.version_id().unwrap().to_string();
+        assert_eq!(marker.competing.delete_marker(), Some(true));
+        let competing_marker_version = marker.competing.version_id().unwrap().to_string();
+        let marker_outcome = classify_conditional_delete_objects_entry(
+            &marker.batch,
+            &marker.key,
+            &marker.canary_key,
+        );
         let batch_marker_version = match &marker_outcome {
             ConditionalDeleteObjectsEntryOutcome::Deleted {
                 delete_marker_version_id,
@@ -1097,7 +1332,7 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         let marker_versions = client
             .list_object_versions()
             .bucket(&bucket)
-            .prefix(marker_key)
+            .prefix(&marker.key)
             .send_retrying_operation_aborted("list competing batch-delete markers")
             .await
             .unwrap();
@@ -1126,22 +1361,24 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
             1
         );
 
-        let suspended_key = "batch-delete-race-suspended-different-etag";
-        let suspended_canary = "batch-delete-race-suspended-canary";
-        let suspended_same_key = "batch-delete-race-suspended-same-etag";
-        let suspended_same_canary = "batch-delete-race-suspended-same-canary";
-        let suspended_numbered =
-            put_object(client, &bucket, suspended_key, b"numbered history").await;
-        let suspended_numbered_version = suspended_numbered.version_id().unwrap().to_string();
-        let suspended_same_numbered = put_object(
-            client,
-            &bucket,
-            suspended_same_key,
-            b"numbered same history",
-        )
-        .await;
-        let suspended_same_numbered_version =
-            suspended_same_numbered.version_id().unwrap().to_string();
+        let mut suspended_numbered_versions = Vec::new();
+        let mut suspended_same_numbered_versions = Vec::new();
+        for attempt in 0..CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS {
+            let key = conditional_delete_objects_race_key(
+                "batch-delete-race-suspended-different-etag",
+                attempt,
+            );
+            let numbered = put_object(client, &bucket, &key, b"numbered history").await;
+            suspended_numbered_versions.push(numbered.version_id().unwrap().to_string());
+
+            let same_key = conditional_delete_objects_race_key(
+                "batch-delete-race-suspended-same-etag",
+                attempt,
+            );
+            let same_numbered =
+                put_object(client, &bucket, &same_key, b"numbered same history").await;
+            suspended_same_numbered_versions.push(same_numbered.version_id().unwrap().to_string());
+        }
         client
             .put_bucket_versioning()
             .bucket(&bucket)
@@ -1153,28 +1390,21 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
             .send_retrying_operation_aborted("suspend versioning for conditional batch-delete race")
             .await
             .unwrap();
-        let suspended_original =
-            put_object(client, &bucket, suspended_key, b"suspended original").await;
-        assert_eq!(suspended_original.version_id(), None);
-        let suspended_canary_put = put_object(client, &bucket, suspended_canary, b"canary").await;
-        let (suspended_delete, suspended_put) = race_conditional_delete_objects_with_put(
+        let suspended = race_conditional_delete_objects_with_put_retrying_slow_down(
             &bucket,
-            suspended_key,
-            suspended_original.e_tag().unwrap(),
-            suspended_canary,
-            suspended_canary_put.e_tag().unwrap(),
+            "batch-delete-race-suspended-different-etag",
+            "batch-delete-race-suspended-canary",
+            b"suspended original",
             b"suspended replacement",
             "suspended-different-etag",
+            &suspended_numbered_versions,
         )
         .await;
-        let suspended_delete = suspended_delete
-            .unwrap_or_else(|error| panic!("suspended conditional batch delete failed: {error:?}"));
-        suspended_put
-            .unwrap_or_else(|error| panic!("suspended batch-delete replacement failed: {error:?}"));
+        assert_eq!(suspended.original.version_id(), None);
         match classify_conditional_delete_objects_entry(
-            &suspended_delete,
-            suspended_key,
-            suspended_canary,
+            &suspended.delete,
+            &suspended.key,
+            &suspended.canary_key,
         ) {
             ConditionalDeleteObjectsEntryOutcome::Deleted {
                 delete_marker_version_id,
@@ -1189,14 +1419,14 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         let suspended_versions = client
             .list_object_versions()
             .bucket(&bucket)
-            .prefix(suspended_key)
+            .prefix(&suspended.key)
             .send_retrying_operation_aborted("list suspended conditional batch-delete race")
             .await
             .unwrap();
         assert_eq!(suspended_versions.versions().len(), 2);
         assert!(suspended_versions.delete_markers().is_empty());
         assert!(suspended_versions.versions().iter().any(|version| {
-            version.version_id() == Some(suspended_numbered_version.as_str())
+            version.version_id() == Some(suspended.context.as_str())
                 && !version.is_latest().unwrap_or(false)
         }));
         assert!(suspended_versions.versions().iter().any(|version| {
@@ -1205,7 +1435,7 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         let suspended_current = client
             .get_object()
             .bucket(&bucket)
-            .key(suspended_key)
+            .key(&suspended.key)
             .send_retrying_operation_aborted("get suspended conditional batch-delete replacement")
             .await
             .unwrap();
@@ -1217,32 +1447,25 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
             Some("suspended-different-etag")
         );
 
-        let suspended_same_original =
-            put_object(client, &bucket, suspended_same_key, b"suspended same bytes").await;
-        assert_eq!(suspended_same_original.version_id(), None);
-        let suspended_same_canary_put =
-            put_object(client, &bucket, suspended_same_canary, b"canary").await;
-        let (suspended_same_delete, suspended_same_put) = race_conditional_delete_objects_with_put(
+        let suspended_same = race_conditional_delete_objects_with_put_retrying_slow_down(
             &bucket,
-            suspended_same_key,
-            suspended_same_original.e_tag().unwrap(),
-            suspended_same_canary,
-            suspended_same_canary_put.e_tag().unwrap(),
+            "batch-delete-race-suspended-same-etag",
+            "batch-delete-race-suspended-same-canary",
+            b"suspended same bytes",
             b"suspended same bytes",
             "suspended-same-etag",
+            &suspended_same_numbered_versions,
         )
         .await;
-        let suspended_same_delete = suspended_same_delete.unwrap_or_else(|error| {
-            panic!("suspended same-ETag conditional batch delete failed: {error:?}")
-        });
-        let suspended_same_put = suspended_same_put.unwrap_or_else(|error| {
-            panic!("suspended same-ETag batch-delete replacement failed: {error:?}")
-        });
-        assert_eq!(suspended_same_put.e_tag(), suspended_same_original.e_tag());
+        assert_eq!(suspended_same.original.version_id(), None);
+        assert_eq!(
+            suspended_same.replacement.e_tag(),
+            suspended_same.original.e_tag()
+        );
         let suspended_same_outcome = classify_conditional_delete_objects_entry(
-            &suspended_same_delete,
-            suspended_same_key,
-            suspended_same_canary,
+            &suspended_same.delete,
+            &suspended_same.key,
+            &suspended_same.canary_key,
         );
         match &suspended_same_outcome {
             ConditionalDeleteObjectsEntryOutcome::Deleted {
@@ -1255,7 +1478,7 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         let suspended_same_versions = client
             .list_object_versions()
             .bucket(&bucket)
-            .prefix(suspended_same_key)
+            .prefix(&suspended_same.key)
             .send_retrying_operation_aborted(
                 "list suspended same-ETag conditional batch-delete race",
             )
@@ -1269,7 +1492,7 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
             2
         );
         assert!(suspended_same_versions.versions().iter().any(|version| {
-            version.version_id() == Some(suspended_same_numbered_version.as_str())
+            version.version_id() == Some(suspended_same.context.as_str())
                 && !version.is_latest().unwrap_or(false)
         }));
         if let Some(null_version) = suspended_same_versions
@@ -1282,7 +1505,7 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
             let current = client
                 .get_object()
                 .bucket(&bucket)
-                .key(suspended_same_key)
+                .key(&suspended_same.key)
                 .send_retrying_operation_aborted(
                     "get suspended same-ETag conditional batch-delete replacement",
                 )
@@ -1315,7 +1538,7 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
             let current = client
                 .get_object()
                 .bucket(&bucket)
-                .key(suspended_same_key)
+                .key(&suspended_same.key)
                 .send_retrying_operation_aborted(
                     "get suspended same-ETag conditional batch-delete marker",
                 )
