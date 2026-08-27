@@ -1,14 +1,15 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::control_plane::{
     ControlPlaneError, FileControlPlaneStore, SingleAuthorityControlPlane,
-    UnavailablePgReconciliationCursor, UnavailablePgReconciliationStage,
+    UnavailablePgReconciliationCompletionBatch, UnavailablePgReconciliationCursor,
+    UnavailablePgReconciliationPollBatch, UnavailablePgReconciliationStage,
     UnavailablePgReconciliationWork,
 };
 use crate::{ClusterEpoch, ControlPlaneRaftAuthorityHost, LivePgMetadataTransferAdmin, PgId};
@@ -38,52 +39,52 @@ impl ReconciliationTransferError {
 }
 
 trait ReconciliationAuthority {
-    fn poll_reconciliation(
+    fn poll_reconciliation_batch(
         &mut self,
         cursor: &mut UnavailablePgReconciliationCursor,
         now_ms: u64,
-    ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError>;
+    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError>;
 
-    fn complete_reconciliation(
+    fn complete_reconciliation_batch(
         &mut self,
-        work: &UnavailablePgReconciliationWork,
+        work: &[UnavailablePgReconciliationWork],
         now_ms: u64,
-    ) -> Result<bool, ControlPlaneError>;
+    ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError>;
 }
 
 impl ReconciliationAuthority for ControlPlaneRaftAuthorityHost {
-    fn poll_reconciliation(
+    fn poll_reconciliation_batch(
         &mut self,
         cursor: &mut UnavailablePgReconciliationCursor,
         now_ms: u64,
-    ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError> {
-        self.poll_unavailable_pg_reconciliation(cursor, now_ms)
+    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
+        self.poll_unavailable_pg_reconciliation_batch(cursor, now_ms)
     }
 
-    fn complete_reconciliation(
+    fn complete_reconciliation_batch(
         &mut self,
-        work: &UnavailablePgReconciliationWork,
+        work: &[UnavailablePgReconciliationWork],
         now_ms: u64,
-    ) -> Result<bool, ControlPlaneError> {
-        self.complete_unavailable_pg_reconciliation(work, now_ms)
+    ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
+        self.complete_unavailable_pg_reconciliation_batch(work, now_ms)
     }
 }
 
 impl ReconciliationAuthority for SingleAuthorityControlPlane<FileControlPlaneStore> {
-    fn poll_reconciliation(
+    fn poll_reconciliation_batch(
         &mut self,
         cursor: &mut UnavailablePgReconciliationCursor,
         now_ms: u64,
-    ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError> {
-        self.poll_unavailable_pg_reconciliation(cursor, now_ms)
+    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
+        self.poll_unavailable_pg_reconciliation_batch(cursor, now_ms)
     }
 
-    fn complete_reconciliation(
+    fn complete_reconciliation_batch(
         &mut self,
-        work: &UnavailablePgReconciliationWork,
+        work: &[UnavailablePgReconciliationWork],
         now_ms: u64,
-    ) -> Result<bool, ControlPlaneError> {
-        self.complete_unavailable_pg_reconciliation(work, now_ms)
+    ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
+        self.complete_unavailable_pg_reconciliation_batch(work, now_ms)
     }
 }
 
@@ -93,6 +94,8 @@ pub struct UnavailablePgReconciliationWorker {
     cursor: UnavailablePgReconciliationCursor,
     in_flight: Option<UnavailablePgReconciliationWork>,
     transfer_completed: bool,
+    pending_transfers: VecDeque<UnavailablePgReconciliationWork>,
+    ready_for_activation: Vec<UnavailablePgReconciliationWork>,
     authority_retry_not_before: Instant,
     deferred: BTreeMap<PgId, (ClusterEpoch, Instant)>,
     blocked: BTreeMap<PgId, ClusterEpoch>,
@@ -149,6 +152,8 @@ impl UnavailablePgReconciliationWorker {
             cursor: UnavailablePgReconciliationCursor::start(),
             in_flight: None,
             transfer_completed: false,
+            pending_transfers: VecDeque::new(),
+            ready_for_activation: Vec::new(),
             authority_retry_not_before: Instant::now(),
             deferred: BTreeMap::new(),
             blocked: BTreeMap::new(),
@@ -273,6 +278,69 @@ impl UnavailablePgReconciliationWorker {
         }
     }
 
+    fn record_completion_error(
+        &mut self,
+        work: &UnavailablePgReconciliationWork,
+        error: ControlPlaneError,
+    ) {
+        let diagnostic = error.to_string();
+        if reconciliation_completion_error_is_fatal(&error) {
+            eprintln!("unavailable PG reconciliation blocked by fatal error: {diagnostic}");
+            self.blocked.insert(work.pg_id(), work.transition_epoch());
+        } else {
+            self.record_diagnostic(diagnostic);
+            self.defer(work);
+        }
+    }
+
+    fn complete_ready_batch(
+        &mut self,
+        authority: &mut impl ReconciliationAuthority,
+        mut work: Vec<UnavailablePgReconciliationWork>,
+        now_ms: u64,
+    ) {
+        if work.is_empty() {
+            return;
+        }
+        work.sort_by_key(UnavailablePgReconciliationWork::pg_id);
+        match authority.complete_reconciliation_batch(&work, now_ms) {
+            Ok(outcome) => {
+                let completed_cleanly = outcome.rejected.is_empty() && outcome.rederive.is_empty();
+                for work in outcome.completed {
+                    self.deferred.remove(&work.pg_id());
+                    self.blocked.remove(&work.pg_id());
+                }
+                for (work, error) in outcome.rejected {
+                    self.record_completion_error(&work, error);
+                }
+                for work in outcome.rederive {
+                    self.defer(&work);
+                }
+                if completed_cleanly {
+                    self.clear_diagnostic();
+                }
+            }
+            Err(error) => {
+                let diagnostic = error.to_string();
+                let fatal = reconciliation_completion_error_is_fatal(&error);
+                for work in work {
+                    if fatal {
+                        self.blocked.insert(work.pg_id(), work.transition_epoch());
+                    } else {
+                        self.defer(&work);
+                    }
+                }
+                if fatal {
+                    eprintln!(
+                        "unavailable PG reconciliation batch blocked by fatal error: {diagnostic}"
+                    );
+                } else {
+                    self.record_diagnostic(diagnostic);
+                }
+            }
+        }
+    }
+
     fn poll(&mut self, authority: &mut impl ReconciliationAuthority, now_ms: u64) {
         self.observe_transfer_worker();
         if Instant::now() < self.authority_retry_not_before {
@@ -281,44 +349,63 @@ impl UnavailablePgReconciliationWorker {
         if self.transfer_completed {
             let work = self
                 .in_flight
-                .as_ref()
-                .expect("completed transfer must retain exact work")
-                .clone();
-            match authority.complete_reconciliation(&work, now_ms) {
-                Ok(_) => {
-                    self.deferred.remove(&work.pg_id());
-                    self.blocked.remove(&work.pg_id());
-                    self.in_flight = None;
-                    self.transfer_completed = false;
-                    self.clear_diagnostic();
-                }
-                Err(error) => {
-                    let diagnostic = error.to_string();
-                    if reconciliation_completion_error_is_fatal(&error) {
-                        eprintln!(
-                            "unavailable PG reconciliation blocked by fatal error: {diagnostic}"
-                        );
-                        self.blocked.insert(work.pg_id(), work.transition_epoch());
-                    } else {
-                        self.record_diagnostic(diagnostic);
-                        self.defer(&work);
-                    }
-                    self.in_flight = None;
-                    self.transfer_completed = false;
-                }
+                .take()
+                .expect("completed transfer must retain exact work");
+            self.ready_for_activation.push(work);
+            self.transfer_completed = false;
+            if let Some(work) = self.pending_transfers.pop_front() {
+                self.dispatch(work);
+                return;
             }
+            let ready = std::mem::take(&mut self.ready_for_activation);
+            self.complete_ready_batch(authority, ready, now_ms);
             return;
         }
         if self.in_flight.is_some() {
             return;
         }
-        match authority.poll_reconciliation(&mut self.cursor, now_ms) {
-            Ok(Some(work)) => {
-                if !self.candidate_is_deferred_or_blocked(&work) {
+        if let Some(work) = self.pending_transfers.pop_front() {
+            self.dispatch(work);
+            return;
+        }
+        if !self.ready_for_activation.is_empty() {
+            let ready = std::mem::take(&mut self.ready_for_activation);
+            self.complete_ready_batch(authority, ready, now_ms);
+            return;
+        }
+        match authority.poll_reconciliation_batch(&mut self.cursor, now_ms) {
+            Ok(batch) => {
+                let had_rejections = !batch.rejected.is_empty();
+                for (pg_id, error) in batch.rejected {
+                    self.record_diagnostic(format!(
+                        "PG {} begin candidate rejected: {error}",
+                        pg_id.get()
+                    ));
+                }
+                let had_work = !batch.work.is_empty();
+                for work in batch.work {
+                    if self.candidate_is_deferred_or_blocked(&work) {
+                        continue;
+                    }
+                    match work.stage() {
+                        UnavailablePgReconciliationStage::PayloadReadiness => {
+                            self.ready_for_activation.push(work);
+                        }
+                        UnavailablePgReconciliationStage::MetadataTransfer => {
+                            self.pending_transfers.push_back(work);
+                        }
+                    }
+                }
+                if let Some(work) = self.pending_transfers.pop_front() {
                     self.dispatch(work);
+                } else {
+                    let ready = std::mem::take(&mut self.ready_for_activation);
+                    self.complete_ready_batch(authority, ready, now_ms);
+                }
+                if had_rejections && !had_work {
+                    self.authority_retry_not_before = Instant::now() + self.retry_backoff;
                 }
             }
-            Ok(None) => {}
             Err(error) => {
                 self.record_diagnostic(error.to_string());
                 self.authority_retry_not_before = Instant::now() + self.retry_backoff;
@@ -368,28 +455,44 @@ mod tests {
     #[derive(Default)]
     struct FakeAuthority {
         candidates: VecDeque<UnavailablePgReconciliationWork>,
+        poll_batch_size: usize,
         poll_count: usize,
         published: Vec<UnavailablePgReconciliationWork>,
-        publish_results: VecDeque<Result<bool, ControlPlaneError>>,
+        published_batches: Vec<Vec<UnavailablePgReconciliationWork>>,
+        publish_results:
+            VecDeque<Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError>>,
     }
 
     impl ReconciliationAuthority for FakeAuthority {
-        fn poll_reconciliation(
+        fn poll_reconciliation_batch(
             &mut self,
             _cursor: &mut UnavailablePgReconciliationCursor,
             _now_ms: u64,
-        ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError> {
+        ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
             self.poll_count += 1;
-            Ok(self.candidates.pop_front())
+            let batch_size = self.poll_batch_size.max(1);
+            Ok(UnavailablePgReconciliationPollBatch {
+                work: (0..batch_size)
+                    .filter_map(|_| self.candidates.pop_front())
+                    .collect(),
+                rejected: Vec::new(),
+            })
         }
 
-        fn complete_reconciliation(
+        fn complete_reconciliation_batch(
             &mut self,
-            work: &UnavailablePgReconciliationWork,
+            work: &[UnavailablePgReconciliationWork],
             _now_ms: u64,
-        ) -> Result<bool, ControlPlaneError> {
-            self.published.push(work.clone());
-            self.publish_results.pop_front().unwrap_or(Ok(true))
+        ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
+            self.published_batches.push(work.to_vec());
+            self.published.extend_from_slice(work);
+            self.publish_results.pop_front().unwrap_or_else(|| {
+                Ok(UnavailablePgReconciliationCompletionBatch {
+                    completed: work.to_vec(),
+                    rejected: Vec::new(),
+                    rederive: Vec::new(),
+                })
+            })
         }
     }
 
@@ -406,6 +509,16 @@ mod tests {
             vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
             stage,
         )
+    }
+
+    fn completed(
+        work: Vec<UnavailablePgReconciliationWork>,
+    ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
+        Ok(UnavailablePgReconciliationCompletionBatch {
+            completed: work,
+            rejected: Vec::new(),
+            rederive: Vec::new(),
+        })
     }
 
     #[test]
@@ -522,7 +635,10 @@ mod tests {
         );
         let mut authority = FakeAuthority {
             candidates: VecDeque::from([stale.clone(), successor.clone()]),
-            publish_results: VecDeque::from([Ok(false), Ok(true)]),
+            publish_results: VecDeque::from([
+                completed(vec![stale.clone()]),
+                completed(vec![successor.clone()]),
+            ]),
             ..FakeAuthority::default()
         };
 
@@ -532,7 +648,7 @@ mod tests {
 
         assert_eq!(authority.published, vec![stale, successor]);
         assert_eq!(*transfer_count.lock().unwrap(), 0);
-        assert_eq!(authority.poll_count, 2);
+        assert_eq!(authority.poll_count, 4);
     }
 
     #[test]
@@ -549,7 +665,7 @@ mod tests {
                 Err(ControlPlaneError::CommandDecode {
                     message: "destination lease changed before activation".to_owned(),
                 }),
-                Ok(true),
+                completed(vec![successor.clone()]),
             ]),
             ..FakeAuthority::default()
         };
@@ -559,7 +675,7 @@ mod tests {
         }
 
         assert_eq!(authority.published, vec![deferred.clone(), successor]);
-        assert_eq!(authority.poll_count, 2);
+        assert_eq!(authority.poll_count, 4);
         assert_eq!(
             worker.deferred.get(&deferred.pg_id()).map(|entry| entry.0),
             Some(deferred.transition_epoch())
@@ -581,7 +697,7 @@ mod tests {
                 Err(ControlPlaneError::durability_failure(
                     "injected reconciliation durability failure",
                 )),
-                Ok(true),
+                completed(vec![successor.clone()]),
             ]),
             ..FakeAuthority::default()
         };
@@ -591,7 +707,7 @@ mod tests {
         }
 
         assert_eq!(authority.published, vec![blocked.clone(), successor]);
-        assert_eq!(authority.poll_count, 3);
+        assert_eq!(authority.poll_count, 5);
         assert_eq!(
             worker.blocked.get(&blocked.pg_id()),
             Some(&blocked.transition_epoch())
@@ -655,5 +771,163 @@ mod tests {
                 message: "injected fatal state-machine failure".to_owned(),
             }
         ));
+    }
+
+    #[test]
+    fn ready_page_is_activated_as_one_batch() {
+        let first = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let second = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            |_| panic!("activation-stage work must not invoke metadata transfer"),
+            Duration::ZERO,
+        );
+        let mut authority = FakeAuthority {
+            candidates: VecDeque::from([first.clone(), second.clone()]),
+            poll_batch_size: 16,
+            ..FakeAuthority::default()
+        };
+
+        worker.poll(&mut authority, 100);
+
+        assert_eq!(authority.poll_count, 1);
+        assert_eq!(authority.published_batches, vec![vec![first, second]]);
+        assert!(worker.in_flight.is_none());
+        assert!(worker.pending_transfers.is_empty());
+    }
+
+    #[test]
+    fn transferred_page_is_accumulated_before_one_activation_batch() {
+        let first = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
+        let second = work(8, 11, UnavailablePgReconciliationStage::MetadataTransfer);
+        let transfer_count = Arc::new(Mutex::new(0));
+        let observed_transfer_count = Arc::clone(&transfer_count);
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            move |_| {
+                *observed_transfer_count.lock().unwrap() += 1;
+                Ok(())
+            },
+            Duration::ZERO,
+        );
+        let mut authority = FakeAuthority {
+            candidates: VecDeque::from([first.clone(), second.clone()]),
+            poll_batch_size: 16,
+            ..FakeAuthority::default()
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while authority.published_batches.is_empty() {
+            worker.poll(&mut authority, 100);
+            assert!(
+                Instant::now() < deadline,
+                "transferred page did not reach batch activation"
+            );
+            thread::yield_now();
+        }
+
+        assert_eq!(*transfer_count.lock().unwrap(), 2);
+        assert_eq!(authority.published_batches, vec![vec![first, second]]);
+        assert!(worker.in_flight.is_none());
+        assert!(worker.pending_transfers.is_empty());
+        assert!(worker.ready_for_activation.is_empty());
+    }
+
+    #[test]
+    fn mixed_ready_and_transferred_page_is_canonicalized_before_activation() {
+        let transferred = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
+        let already_ready = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let mut worker =
+            UnavailablePgReconciliationWorker::spawn_with_transfer(|_| Ok(()), Duration::ZERO);
+        let mut authority = FakeAuthority {
+            candidates: VecDeque::from([transferred.clone(), already_ready.clone()]),
+            poll_batch_size: 16,
+            ..FakeAuthority::default()
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while authority.published_batches.is_empty() {
+            worker.poll(&mut authority, 100);
+            assert!(
+                Instant::now() < deadline,
+                "mixed-stage page did not reach batch activation"
+            );
+            thread::yield_now();
+        }
+
+        assert_eq!(
+            authority.published_batches,
+            vec![vec![transferred, already_ready]]
+        );
+        assert!(worker.in_flight.is_none());
+        assert!(worker.pending_transfers.is_empty());
+        assert!(worker.ready_for_activation.is_empty());
+    }
+
+    #[test]
+    fn fatal_batch_submission_is_not_retried_as_singleton_mutations() {
+        let first = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let second = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            |_| panic!("activation-stage work must not invoke metadata transfer"),
+            Duration::ZERO,
+        );
+        let mut authority = FakeAuthority {
+            candidates: VecDeque::from([first.clone(), second.clone()]),
+            poll_batch_size: 16,
+            publish_results: VecDeque::from([Err(ControlPlaneError::durability_failure(
+                "injected batch durability failure",
+            ))]),
+            ..FakeAuthority::default()
+        };
+
+        worker.poll(&mut authority, 100);
+
+        assert_eq!(
+            authority.published_batches,
+            vec![vec![first.clone(), second.clone()]]
+        );
+        assert_eq!(
+            worker.blocked.get(&first.pg_id()),
+            Some(&first.transition_epoch())
+        );
+        assert_eq!(
+            worker.blocked.get(&second.pg_id()),
+            Some(&second.transition_epoch())
+        );
+    }
+
+    #[test]
+    fn rejected_ready_batch_is_classified_per_member() {
+        let stale = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let ready = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            |_| panic!("activation-stage work must not invoke metadata transfer"),
+            Duration::from_secs(60),
+        );
+        let mut authority = FakeAuthority {
+            candidates: VecDeque::from([stale.clone(), ready.clone()]),
+            poll_batch_size: 16,
+            publish_results: VecDeque::from([Ok(UnavailablePgReconciliationCompletionBatch {
+                completed: vec![ready.clone()],
+                rejected: vec![(
+                    stale.clone(),
+                    ControlPlaneError::CommandDecode {
+                        message: "stale destination lease".to_owned(),
+                    },
+                )],
+                rederive: Vec::new(),
+            })]),
+            ..FakeAuthority::default()
+        };
+
+        worker.poll(&mut authority, 100);
+
+        assert_eq!(
+            authority.published_batches,
+            vec![vec![stale.clone(), ready]]
+        );
+        assert_eq!(
+            worker.deferred.get(&stale.pg_id()).map(|entry| entry.0),
+            Some(stale.transition_epoch())
+        );
     }
 }

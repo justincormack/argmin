@@ -77,6 +77,7 @@ use crate::control_plane_auth::{
 };
 use crate::control_plane_command::{
     decode_control_plane_command, encode_control_plane_command,
+    encode_control_plane_command_without_replication_limit,
     validate_control_plane_snapshot_for_install, ControlPlaneCommand, ControlPlaneCommandResponse,
     ControlPlaneCommandStateMachine, ControlPlaneLogId, ControlPlaneSnapshotArtifact,
     ReplicatedControlPlaneStateMachine,
@@ -2388,10 +2389,15 @@ enum ExperimentalRaftTimerMode {
 const CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES: u64 =
     ControlPlaneRaftPeerTransportLimits::REPLICATION_REQUIRED_APPEND_ENTRIES as u64;
 const CONTROL_PLANE_RAFT_APPEND_ENTRIES_COUNT_BYTES: usize = 4;
-const CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES: usize =
+pub(crate) const CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES: usize =
     (ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES_BYTES
         - CONTROL_PLANE_RAFT_APPEND_ENTRIES_COUNT_BYTES)
         / CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES as usize;
+const CONTROL_PLANE_RAFT_NORMAL_COMMAND_ENTRY_ENVELOPE_BYTES: usize =
+    3 * std::mem::size_of::<u64>() + std::mem::size_of::<u8>() + std::mem::size_of::<u32>();
+pub(crate) const CONTROL_PLANE_RAFT_MAX_COMMAND_BYTES: usize =
+    CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+        - CONTROL_PLANE_RAFT_NORMAL_COMMAND_ENTRY_ENVELOPE_BYTES;
 const _: () = assert!(
     CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES
         <= ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES as u64
@@ -5914,6 +5920,18 @@ pub fn validate_control_plane_command_replication_size(
 fn validate_control_plane_command_replication_size_detailed(
     command: &ControlPlaneCommand,
 ) -> Result<(), ControlPlaneError> {
+    let encoded_len = control_plane_command_replication_encoded_len(command)?;
+    if encoded_len <= CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
+        return Ok(());
+    }
+    Err(ControlPlaneError::rpc_protocol(format!(
+            "control-plane command encodes to {encoded_len} OpenRaft entry bytes, exceeding the replication-safe per-entry limit {CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES}"
+        )))
+}
+
+pub(crate) fn control_plane_command_replication_encoded_len(
+    command: &ControlPlaneCommand,
+) -> Result<usize, ControlPlaneError> {
     let entry = ControlPlaneRaftEntry {
         log_id: LogId::new(
             LeaderId {
@@ -5925,14 +5943,12 @@ fn validate_control_plane_command_replication_size_detailed(
         payload: EntryPayload::Normal(command.clone()),
     };
     let mut encoded = Vec::new();
-    write_raft_entry(&mut encoded, &entry)?;
-    if encoded.len() <= CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
-        return Ok(());
-    }
-    Err(ControlPlaneError::rpc_protocol(format!(
-            "control-plane command encodes to {} OpenRaft entry bytes, exceeding the replication-safe per-entry limit {}",
-            encoded.len(), CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
-        )))
+    write_raft_entry_with_command_encoder(
+        &mut encoded,
+        &entry,
+        encode_control_plane_command_without_replication_limit,
+    )?;
+    Ok(encoded.len())
 }
 
 pub async fn runtime_map_via_openraft_read_index(
@@ -9849,6 +9865,14 @@ fn write_raft_entry(
     out: &mut Vec<u8>,
     entry: &ControlPlaneRaftEntry,
 ) -> Result<(), ControlPlaneError> {
+    write_raft_entry_with_command_encoder(out, entry, encode_control_plane_command)
+}
+
+fn write_raft_entry_with_command_encoder(
+    out: &mut Vec<u8>,
+    entry: &ControlPlaneRaftEntry,
+    encode_command: impl FnOnce(&ControlPlaneCommand) -> Result<Vec<u8>, ControlPlaneError>,
+) -> Result<(), ControlPlaneError> {
     write_raft_log_id(out, entry.log_id);
     write_raft_u8(out, control_plane_raft_entry_payload_tag(entry).as_u8());
     match &entry.payload {
@@ -9857,7 +9881,7 @@ fn write_raft_entry(
             write_raft_membership(out, membership)?;
         }
         EntryPayload::Normal(command) => {
-            let encoded = encode_control_plane_command(command)?;
+            let encoded = encode_command(command)?;
             write_raft_bytes(out, &encoded)?;
         }
     }

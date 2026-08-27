@@ -29,7 +29,8 @@ use crate::control_plane_command::{
     decode_control_plane_command, encode_control_plane_command, AppliedControlPlaneCommand,
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneCommandStateMachine,
     ControlPlaneLogId, ExpiredNodeHeartbeatLease, PromotedNodeHeartbeatLease,
-    ReadyPgPeeringCompletion,
+    ReadyPgPeeringCompletion, UnavailablePgTransitionBeginRequest,
+    UnavailablePgTransitionCompletionRequest,
 };
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::control_plane_lease::{
@@ -73,7 +74,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 32;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 33;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
@@ -947,21 +948,6 @@ struct UnavailablePgTransitionBatchReceipt {
     target_epoch: ClusterEpoch,
 }
 
-#[derive(Debug, Clone)]
-struct UnavailablePgTransitionBeginRequest {
-    pg_id: PgId,
-    predecessor_transition_epoch: Option<ClusterEpoch>,
-    source_epoch: ClusterEpoch,
-    source_acting_set: Vec<NodeId>,
-    source_node_id: NodeId,
-    begin_authorization: UnavailablePgTransitionBeginAuthorization,
-    unavailable_node: NodeUnavailableObservation,
-    grace_cutoff_ms: u64,
-    topology_generation: u64,
-    topology_digest: [u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
-    destination_acting_set: Vec<NodeId>,
-}
-
 #[derive(Debug)]
 enum ValidatedUnavailablePgTransitionBegin {
     ExactReplay {
@@ -981,18 +967,6 @@ impl ValidatedUnavailablePgTransitionBegin {
             Self::Apply { requested, .. } => requested.pg_id,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct UnavailablePgTransitionCompletionRequest {
-    unavailable_transition: UnavailablePgTransitionMutationBinding,
-    pg_id: PgId,
-    transition_epoch: ClusterEpoch,
-    destination_epoch: ClusterEpoch,
-    topology_generation: u64,
-    topology_digest: [u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
-    destinations: Vec<UnavailablePgPayloadDestinationReadiness>,
-    completion: ReadyPgPeeringCompletion,
 }
 
 #[derive(Debug)]
@@ -1396,6 +1370,34 @@ pub(crate) struct UnavailablePgReconciliationScan {
     pub(crate) next_cursor: UnavailablePgReconciliationCursor,
 }
 
+pub(crate) struct UnavailablePgReconciliationBatchScan {
+    pub(crate) candidates: Vec<UnavailablePgReconciliationCandidate>,
+    pub(crate) next_cursor: UnavailablePgReconciliationCursor,
+}
+
+pub(crate) struct PreparedUnavailablePgBeginBatch {
+    pub(crate) command: Option<ControlPlaneCommand>,
+    pub(crate) included: Vec<(PgId, NodeId)>,
+    pub(crate) rejected: Vec<(PgId, ControlPlaneError)>,
+}
+
+pub(crate) struct PreparedUnavailablePgCompletionBatch {
+    pub(crate) command: Option<ControlPlaneCommand>,
+    pub(crate) included: Vec<UnavailablePgReconciliationWork>,
+    pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
+}
+
+pub(crate) struct UnavailablePgReconciliationPollBatch {
+    pub(crate) work: Vec<UnavailablePgReconciliationWork>,
+    pub(crate) rejected: Vec<(PgId, ControlPlaneError)>,
+}
+
+pub(crate) struct UnavailablePgReconciliationCompletionBatch {
+    pub(crate) completed: Vec<UnavailablePgReconciliationWork>,
+    pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
+    pub(crate) rederive: Vec<UnavailablePgReconciliationWork>,
+}
+
 impl UnavailablePgPlacementTransition {
     #[must_use]
     pub fn pg_id(&self) -> PgId {
@@ -1634,43 +1636,7 @@ impl ClusterControlSnapshot {
                 };
             };
             last_examined = Some(pg_id);
-            let active_transition = self.unavailable_pg_placement_transitions.get(&pg_id);
-            let unavailable_node_id = pg
-                .acting_set
-                .iter()
-                .copied()
-                .filter(|node_id| {
-                    active_transition
-                        .is_none_or(|transition| transition.unavailable_node.node_id != *node_id)
-                })
-                .filter_map(|node_id| {
-                    let observation = self.unavailable_node_observations.get(&node_id)?;
-                    let topology = self.initial_topology.as_ref()?;
-                    let grace_cutoff_ms = observation.observed_at_ms.checked_add(
-                        topology
-                            .placement_policy()
-                            .unavailable_replacement_grace_ms(),
-                    )?;
-                    (now_ms >= grace_cutoff_ms).then_some(node_id)
-                })
-                .min();
-            let candidate = if let Some(unavailable_node_id) = unavailable_node_id {
-                Some(UnavailablePgReconciliationCandidate::Begin {
-                    pg_id,
-                    unavailable_node_id,
-                })
-            } else {
-                active_transition.map(|transition| {
-                    let stage = if transition.destination_epoch.is_some() {
-                        UnavailablePgReconciliationStage::PayloadReadiness
-                    } else {
-                        UnavailablePgReconciliationStage::MetadataTransfer
-                    };
-                    UnavailablePgReconciliationCandidate::Resume(
-                        UnavailablePgReconciliationWork::from_transition(transition, stage),
-                    )
-                })
-            };
+            let candidate = self.unavailable_pg_reconciliation_candidate(pg_id, pg, now_ms);
             if candidate.is_some() {
                 return UnavailablePgReconciliationScan {
                     candidate,
@@ -1686,6 +1652,84 @@ impl ClusterControlSnapshot {
                 after_pg_id: last_examined,
             },
         }
+    }
+
+    pub(crate) fn scan_unavailable_pg_reconciliation_batch(
+        &self,
+        cursor: UnavailablePgReconciliationCursor,
+        now_ms: u64,
+    ) -> UnavailablePgReconciliationBatchScan {
+        let start = cursor
+            .after_pg_id
+            .map_or(std::ops::Bound::Unbounded, |pg_id| {
+                std::ops::Bound::Excluded(pg_id)
+            });
+        let mut records = self.pgs.range((start, std::ops::Bound::Unbounded));
+        let mut candidates = Vec::new();
+        let mut last_examined = None;
+        for _ in 0..UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE {
+            let Some((&pg_id, pg)) = records.next() else {
+                return UnavailablePgReconciliationBatchScan {
+                    candidates,
+                    next_cursor: UnavailablePgReconciliationCursor::start(),
+                };
+            };
+            last_examined = Some(pg_id);
+            if let Some(candidate) = self.unavailable_pg_reconciliation_candidate(pg_id, pg, now_ms)
+            {
+                candidates.push(candidate);
+            }
+        }
+        UnavailablePgReconciliationBatchScan {
+            candidates,
+            next_cursor: UnavailablePgReconciliationCursor {
+                after_pg_id: last_examined,
+            },
+        }
+    }
+
+    fn unavailable_pg_reconciliation_candidate(
+        &self,
+        pg_id: PgId,
+        pg: &PgControlRecord,
+        now_ms: u64,
+    ) -> Option<UnavailablePgReconciliationCandidate> {
+        let active_transition = self.unavailable_pg_placement_transitions.get(&pg_id);
+        let unavailable_node_id = pg
+            .acting_set
+            .iter()
+            .copied()
+            .filter(|node_id| {
+                active_transition
+                    .is_none_or(|transition| transition.unavailable_node.node_id != *node_id)
+            })
+            .filter_map(|node_id| {
+                let observation = self.unavailable_node_observations.get(&node_id)?;
+                let topology = self.initial_topology.as_ref()?;
+                let grace_cutoff_ms = observation.observed_at_ms.checked_add(
+                    topology
+                        .placement_policy()
+                        .unavailable_replacement_grace_ms(),
+                )?;
+                (now_ms >= grace_cutoff_ms).then_some(node_id)
+            })
+            .min();
+        if let Some(unavailable_node_id) = unavailable_node_id {
+            return Some(UnavailablePgReconciliationCandidate::Begin {
+                pg_id,
+                unavailable_node_id,
+            });
+        }
+        active_transition.map(|transition| {
+            let stage = if transition.destination_epoch.is_some() {
+                UnavailablePgReconciliationStage::PayloadReadiness
+            } else {
+                UnavailablePgReconciliationStage::MetadataTransfer
+            };
+            UnavailablePgReconciliationCandidate::Resume(
+                UnavailablePgReconciliationWork::from_transition(transition, stage),
+            )
+        })
     }
 
     fn unavailable_replacement_grace_elapsed_for_pg(
@@ -1761,34 +1805,34 @@ impl ClusterControlSnapshot {
             begin_at_ms,
         )?;
         let source_node_id = begin_authorization.source_node_id;
-        Ok(ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
-            pg_id,
-            predecessor_transition_epoch: self
-                .unavailable_pg_placement_transitions
-                .get(&pg_id)
-                .map(|transition| transition.transition_epoch)
-                .or_else(|| {
-                    self.retained_unavailable_pg_placement_transitions
-                        .range((pg_id, ClusterEpoch::INITIAL)..=(pg_id, self.cluster_epoch))
-                        .next_back()
-                        .map(|(_, transition)| transition.transition_epoch)
-                }),
-            source_epoch: self.cluster_epoch,
-            source_acting_set: pg.acting_set.clone(),
-            source_node_id,
-            begin_authorization: Box::new(begin_authorization),
-            unavailable_node_id,
-            unavailable_node_incarnation: observation.node_incarnation,
-            unavailable_endpoint: observation.endpoint.clone(),
-            unavailable_lease_deadline_ms: observation.lease_deadline_ms,
-            unavailable_observed_at_ms: observation.observed_at_ms,
-            grace_cutoff_ms,
-            topology_generation: topology.topology_generation(),
-            topology_digest: *topology.topology_digest(),
-            destination_acting_set,
-            expected_transition_epoch: next_epoch(self.cluster_epoch)?,
-            begin_at_ms,
-        })
+        Ok(
+            ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
+                transitions: vec![UnavailablePgTransitionBeginRequest {
+                    pg_id,
+                    predecessor_transition_epoch: self
+                        .unavailable_pg_placement_transitions
+                        .get(&pg_id)
+                        .map(|transition| transition.transition_epoch)
+                        .or_else(|| {
+                            self.retained_unavailable_pg_placement_transitions
+                                .range((pg_id, ClusterEpoch::INITIAL)..=(pg_id, self.cluster_epoch))
+                                .next_back()
+                                .map(|(_, transition)| transition.transition_epoch)
+                        }),
+                    source_epoch: self.cluster_epoch,
+                    source_acting_set: pg.acting_set.clone(),
+                    source_node_id,
+                    begin_authorization,
+                    unavailable_node: observation.clone(),
+                    grace_cutoff_ms,
+                    topology_generation: topology.topology_generation(),
+                    topology_digest: *topology.topology_digest(),
+                    destination_acting_set,
+                }],
+                expected_transition_epoch: next_epoch(self.cluster_epoch)?,
+                begin_at_ms,
+            },
+        )
     }
 
     fn validate_unavailable_pg_transition_begin(
@@ -2000,6 +2044,126 @@ impl ClusterControlSnapshot {
         })
     }
 
+    pub(crate) fn begin_unavailable_pg_placement_transition_batch_command(
+        &self,
+        candidates: &[(PgId, NodeId)],
+        begin_at_ms: u64,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "begin",
+            candidates.iter().map(|(pg_id, _)| *pg_id),
+        )?;
+        let mut transitions = Vec::with_capacity(candidates.len());
+        let mut expected_transition_epoch = None;
+        for (pg_id, unavailable_node_id) in candidates {
+            let ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
+                transitions: mut member,
+                expected_transition_epoch: member_epoch,
+                begin_at_ms: member_begin_at_ms,
+            } = self.begin_unavailable_pg_placement_transition_command(
+                *pg_id,
+                *unavailable_node_id,
+                begin_at_ms,
+            )?
+            else {
+                unreachable!("unavailable transition member builder returned wrong command");
+            };
+            if member.len() != 1 || member_begin_at_ms != begin_at_ms {
+                return Err(ControlPlaneError::invariant_failure(
+                    "unavailable transition member builder returned a non-singleton envelope",
+                ));
+            }
+            if expected_transition_epoch
+                .replace(member_epoch)
+                .is_some_and(|expected| expected != member_epoch)
+            {
+                return Err(ControlPlaneError::invariant_failure(
+                    "unavailable transition batch members derived different target epochs",
+                ));
+            }
+            transitions.push(member.remove(0));
+        }
+        Ok(
+            ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
+                transitions,
+                expected_transition_epoch: expected_transition_epoch
+                    .expect("canonical batch validation rejects an empty candidate vector"),
+                begin_at_ms,
+            },
+        )
+    }
+
+    pub(crate) fn prepare_unavailable_pg_placement_transition_batch(
+        &self,
+        candidates: &[(PgId, NodeId)],
+        begin_at_ms: u64,
+    ) -> Result<PreparedUnavailablePgBeginBatch, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "begin preparation",
+            candidates.iter().map(|(pg_id, _)| *pg_id),
+        )?;
+        let mut included = Vec::new();
+        let mut rejected = Vec::new();
+        for candidate in candidates {
+            let singleton = match self.begin_unavailable_pg_placement_transition_command(
+                candidate.0,
+                candidate.1,
+                begin_at_ms,
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    rejected.push((candidate.0, error));
+                    continue;
+                }
+            };
+            if let Err(error) = self.apply_control_plane_command(singleton) {
+                rejected.push((candidate.0, error));
+                continue;
+            }
+
+            let mut tentative = included.clone();
+            tentative.push(*candidate);
+            let command = self
+                .begin_unavailable_pg_placement_transition_batch_command(&tentative, begin_at_ms)?;
+            let encoded_len =
+                crate::control_plane_raft::control_plane_command_replication_encoded_len(&command)?;
+            if encoded_len > crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
+                if included.is_empty() {
+                    rejected.push((
+                        candidate.0,
+                        ControlPlaneError::invariant_failure(format!(
+                            "single PG {} unavailable transition command encodes to {encoded_len} OpenRaft entry bytes, exceeding the replication-safe limit {}",
+                            candidate.0.get(),
+                            crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+                        )),
+                    ));
+                    continue;
+                }
+                break;
+            }
+            included = tentative;
+        }
+
+        let command = if included.is_empty() {
+            None
+        } else {
+            let command = self
+                .begin_unavailable_pg_placement_transition_batch_command(&included, begin_at_ms)?;
+            self.apply_control_plane_command(command.clone())
+                .map_err(|error| {
+                    ControlPlaneError::invariant_failure(format!(
+                        "individually valid unavailable transition begin members form an invalid batch: {error}"
+                    ))
+                })?;
+            Some(command)
+        };
+        Ok(PreparedUnavailablePgBeginBatch {
+            command,
+            included,
+            rejected,
+        })
+    }
+
     fn validate_unavailable_pg_transition_begin_batch(
         &self,
         requests: Vec<UnavailablePgTransitionBeginRequest>,
@@ -2198,18 +2362,127 @@ impl ClusterControlSnapshot {
                 ),
             })?;
         Ok(
-            ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
-                unavailable_transition: work.mutation_binding().clone(),
-                pg_id,
-                transition_epoch: transition.transition_epoch,
-                destination_epoch,
-                topology_generation: transition.topology_generation,
-                topology_digest: transition.topology_digest,
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
                 ready_at_ms,
-                destinations,
-                completion,
+                transitions: vec![UnavailablePgTransitionCompletionRequest {
+                    unavailable_transition: work.mutation_binding().clone(),
+                    pg_id,
+                    transition_epoch: transition.transition_epoch,
+                    destination_epoch,
+                    topology_generation: transition.topology_generation,
+                    topology_digest: transition.topology_digest,
+                    destinations,
+                    completion,
+                }],
             },
         )
+    }
+
+    pub(crate) fn complete_unavailable_pg_placement_transition_batch_command(
+        &self,
+        work: &[UnavailablePgReconciliationWork],
+        ready_at_ms: u64,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "completion",
+            work.iter().map(UnavailablePgReconciliationWork::pg_id),
+        )?;
+        let mut transitions = Vec::with_capacity(work.len());
+        for member_work in work {
+            let ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
+                ready_at_ms: member_ready_at_ms,
+                transitions: mut member,
+            } = self
+                .complete_unavailable_pg_placement_transition_command(member_work, ready_at_ms)?
+            else {
+                unreachable!("unavailable completion member builder returned wrong command");
+            };
+            if member.len() != 1 || member_ready_at_ms != ready_at_ms {
+                return Err(ControlPlaneError::invariant_failure(
+                    "unavailable completion member builder returned a non-singleton envelope",
+                ));
+            }
+            transitions.push(member.remove(0));
+        }
+        Ok(
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
+                ready_at_ms,
+                transitions,
+            },
+        )
+    }
+
+    pub(crate) fn prepare_unavailable_pg_placement_completion_batch(
+        &self,
+        work: &[UnavailablePgReconciliationWork],
+        ready_at_ms: u64,
+    ) -> Result<PreparedUnavailablePgCompletionBatch, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "completion preparation",
+            work.iter().map(UnavailablePgReconciliationWork::pg_id),
+        )?;
+        let mut included = Vec::new();
+        let mut rejected = Vec::new();
+        for candidate in work {
+            let singleton = match self
+                .complete_unavailable_pg_placement_transition_command(candidate, ready_at_ms)
+            {
+                Ok(command) => command,
+                Err(error) => {
+                    rejected.push((candidate.clone(), error));
+                    continue;
+                }
+            };
+            if let Err(error) = self.apply_control_plane_command(singleton) {
+                rejected.push((candidate.clone(), error));
+                continue;
+            }
+
+            let mut tentative = included.clone();
+            tentative.push(candidate.clone());
+            let command = self.complete_unavailable_pg_placement_transition_batch_command(
+                &tentative,
+                ready_at_ms,
+            )?;
+            let encoded_len =
+                crate::control_plane_raft::control_plane_command_replication_encoded_len(&command)?;
+            if encoded_len > crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
+                if included.is_empty() {
+                    rejected.push((
+                        candidate.clone(),
+                        ControlPlaneError::invariant_failure(format!(
+                            "single PG {} unavailable transition completion encodes to {encoded_len} OpenRaft entry bytes, exceeding the replication-safe limit {}",
+                            candidate.pg_id().get(),
+                            crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+                        )),
+                    ));
+                    continue;
+                }
+                break;
+            }
+            included = tentative;
+        }
+
+        let command = if included.is_empty() {
+            None
+        } else {
+            let command = self.complete_unavailable_pg_placement_transition_batch_command(
+                &included,
+                ready_at_ms,
+            )?;
+            self.apply_control_plane_command(command.clone())
+                .map_err(|error| {
+                    ControlPlaneError::invariant_failure(format!(
+                        "individually valid unavailable transition completion members form an invalid batch: {error}"
+                    ))
+                })?;
+            Some(command)
+        };
+        Ok(PreparedUnavailablePgCompletionBatch {
+            command,
+            included,
+            rejected,
+        })
     }
 
     fn validate_unavailable_pg_transition_completion(
@@ -5064,46 +5337,13 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     changed,
                 ))
             }
-            ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
-                pg_id,
-                predecessor_transition_epoch,
-                source_epoch,
-                source_acting_set,
-                source_node_id,
-                begin_authorization,
-                unavailable_node_id,
-                unavailable_node_incarnation,
-                unavailable_endpoint,
-                unavailable_lease_deadline_ms,
-                unavailable_observed_at_ms,
-                grace_cutoff_ms,
-                topology_generation,
-                topology_digest,
-                destination_acting_set,
+            ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
+                transitions,
                 expected_transition_epoch,
                 begin_at_ms,
             } => {
-                let request = UnavailablePgTransitionBeginRequest {
-                    pg_id,
-                    predecessor_transition_epoch,
-                    topology_generation,
-                    topology_digest,
-                    source_epoch,
-                    source_acting_set,
-                    source_node_id,
-                    begin_authorization: *begin_authorization,
-                    unavailable_node: NodeUnavailableObservation {
-                        node_id: unavailable_node_id,
-                        node_incarnation: unavailable_node_incarnation,
-                        endpoint: unavailable_endpoint,
-                        lease_deadline_ms: unavailable_lease_deadline_ms,
-                        observed_at_ms: unavailable_observed_at_ms,
-                    },
-                    grace_cutoff_ms,
-                    destination_acting_set,
-                };
                 let validated = self.validate_unavailable_pg_transition_begin_batch(
-                    vec![request],
+                    transitions,
                     expected_transition_epoch,
                     begin_at_ms,
                 )?;
@@ -5116,33 +5356,16 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 Ok(applied_control_plane_command(
                     self,
                     next_snapshot.unwrap_or_else(|| self.clone()),
-                    ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransition,
+                    ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransitions,
                     changed,
                 ))
             }
-            ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
-                unavailable_transition,
-                pg_id,
-                transition_epoch,
-                destination_epoch,
-                topology_generation,
-                topology_digest,
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
                 ready_at_ms,
-                destinations,
-                completion,
+                transitions,
             } => {
-                let request = UnavailablePgTransitionCompletionRequest {
-                    unavailable_transition,
-                    pg_id,
-                    transition_epoch,
-                    destination_epoch,
-                    topology_generation,
-                    topology_digest,
-                    destinations,
-                    completion,
-                };
                 let validated = self.validate_unavailable_pg_transition_completion_batch(
-                    vec![request],
+                    transitions,
                     ready_at_ms,
                 )?;
                 let ready_snapshot = self.apply_validated_unavailable_pg_transition_completions(
@@ -5153,7 +5376,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 Ok(applied_control_plane_command(
                     self,
                     ready_snapshot.unwrap_or_else(|| self.clone()),
-                    ControlPlaneCommandResponse::CompleteUnavailablePgPlacementTransition,
+                    ControlPlaneCommandResponse::CompleteUnavailablePgPlacementTransitions,
                     changed,
                 ))
             }
@@ -6757,14 +6980,9 @@ fn validate_unavailable_pg_transition_batch_receipt(
     receipt: &UnavailablePgTransitionBatchReceipt,
     expected_stage: UnavailablePgTransitionBatchStage,
 ) -> Result<(), String> {
-    if receipt.identity.member_pg_ids.len() != 1 {
-        return Err(format!(
-            "control-plane state v32 requires a singleton {} receipt for unavailable PG transition {}",
-            expected_stage.as_str(),
-            transition.pg_id.get()
-        ));
-    }
-    if receipt.identity.stage != expected_stage
+    if receipt.identity.member_pg_ids.is_empty()
+        || receipt.identity.member_pg_ids.len() > MAX_UNAVAILABLE_PG_TRANSITION_BATCH
+        || receipt.identity.stage != expected_stage
         || receipt
             .identity
             .member_pg_ids

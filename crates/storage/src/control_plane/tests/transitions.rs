@@ -132,78 +132,28 @@ fn heartbeat_with_pg_proofs_and_lease_duration(
 }
 
 fn begin_request_from_command(command: ControlPlaneCommand) -> UnavailablePgTransitionBeginRequest {
-    let ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
-        pg_id,
-        predecessor_transition_epoch,
-        source_epoch,
-        source_acting_set,
-        source_node_id,
-        begin_authorization,
-        unavailable_node_id,
-        unavailable_node_incarnation,
-        unavailable_endpoint,
-        unavailable_lease_deadline_ms,
-        unavailable_observed_at_ms,
-        grace_cutoff_ms,
-        topology_generation,
-        topology_digest,
-        destination_acting_set,
-        ..
+    let ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
+        mut transitions, ..
     } = command
     else {
         panic!("unavailable transition builder returned the wrong command kind");
     };
-    UnavailablePgTransitionBeginRequest {
-        pg_id,
-        predecessor_transition_epoch,
-        source_epoch,
-        source_acting_set,
-        source_node_id,
-        begin_authorization: *begin_authorization,
-        unavailable_node: NodeUnavailableObservation {
-            node_id: unavailable_node_id,
-            node_incarnation: unavailable_node_incarnation,
-            endpoint: unavailable_endpoint,
-            lease_deadline_ms: unavailable_lease_deadline_ms,
-            observed_at_ms: unavailable_observed_at_ms,
-        },
-        grace_cutoff_ms,
-        topology_generation,
-        topology_digest,
-        destination_acting_set,
-    }
+    assert_eq!(transitions.len(), 1);
+    transitions.remove(0)
 }
 
 fn completion_request_from_command(
     command: ControlPlaneCommand,
 ) -> (UnavailablePgTransitionCompletionRequest, u64) {
-    let ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
-        unavailable_transition,
-        pg_id,
-        transition_epoch,
-        destination_epoch,
-        topology_generation,
-        topology_digest,
+    let ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
         ready_at_ms,
-        destinations,
-        completion,
+        mut transitions,
     } = command
     else {
         panic!("unavailable transition builder returned the wrong command kind");
     };
-    (
-        UnavailablePgTransitionCompletionRequest {
-            unavailable_transition,
-            pg_id,
-            transition_epoch,
-            destination_epoch,
-            topology_generation,
-            topology_digest,
-            destinations,
-            completion,
-        },
-        ready_at_ms,
-    )
+    assert_eq!(transitions.len(), 1);
+    (transitions.remove(0), ready_at_ms)
 }
 
 #[test]
@@ -259,7 +209,7 @@ fn unavailable_pg_transition_batch_limit_is_owned_by_command_mutation() {
 }
 
 #[test]
-fn unavailable_pg_internal_begin_batch_is_atomic_but_v32_rejects_plural_receipts() {
+fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay() {
     let pg_ids = [PgId::new(7), PgId::new(8)];
     let (_tmp, _store, mut authority, _) = certified_spare_authority_with_policy_and_pgs(
         4,
@@ -355,6 +305,72 @@ fn unavailable_pg_internal_begin_batch_is_atomic_but_v32_rejects_plural_receipts
     );
     assert_eq!(source, *authority.snapshot());
 
+    let prepared_with_invalid_member = source
+        .prepare_unavailable_pg_placement_transition_batch(
+            &[
+                (PgId::new(6), NodeId::new(1)),
+                (pg_ids[0], NodeId::new(1)),
+                (pg_ids[1], NodeId::new(1)),
+            ],
+            begin_at_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        prepared_with_invalid_member.included,
+        pg_ids.map(|pg_id| (pg_id, NodeId::new(1))).to_vec(),
+        "unexpected preparation rejections: {:?}",
+        prepared_with_invalid_member.rejected
+    );
+    assert_eq!(prepared_with_invalid_member.rejected.len(), 1);
+    assert_eq!(prepared_with_invalid_member.rejected[0].0, PgId::new(6));
+    assert!(prepared_with_invalid_member.command.is_some());
+
+    let mut large_source = source.clone();
+    let large_endpoint = "x".repeat(40_000);
+    large_source
+        .unavailable_node_observations
+        .get_mut(&NodeId::new(1))
+        .unwrap()
+        .endpoint = large_endpoint.clone();
+    large_source
+        .nodes
+        .get_mut(&NodeId::new(1))
+        .unwrap()
+        .endpoint = large_endpoint;
+    let oversized_batch = large_source
+        .begin_unavailable_pg_placement_transition_batch_command(
+            &pg_ids.map(|pg_id| (pg_id, NodeId::new(1))),
+            begin_at_ms,
+        )
+        .unwrap();
+    let oversized_batch_len =
+        crate::control_plane_raft::control_plane_command_replication_encoded_len(&oversized_batch)
+            .unwrap();
+    assert!(
+        oversized_batch_len > crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES,
+        "two-member begin entry encoded to {oversized_batch_len} bytes"
+    );
+    let split = large_source
+        .prepare_unavailable_pg_placement_transition_batch(
+            &pg_ids.map(|pg_id| (pg_id, NodeId::new(1))),
+            begin_at_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        split.included,
+        vec![(pg_ids[0], NodeId::new(1))],
+        "split rejections: {:?}",
+        split.rejected
+    );
+    assert!(split.rejected.is_empty());
+    assert!(
+        crate::control_plane_raft::control_plane_command_replication_encoded_len(
+            split.command.as_ref().unwrap()
+        )
+        .unwrap()
+            <= crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+    );
+
     let validated = source
         .validate_unavailable_pg_transition_begin_batch(requests.clone(), target_epoch, begin_at_ms)
         .unwrap();
@@ -370,31 +386,240 @@ fn unavailable_pg_internal_begin_batch_is_atomic_but_v32_rejects_plural_receipts
             .collect::<Vec<_>>(),
         vec![(PgId::new(7), target_epoch), (PgId::new(8), target_epoch)]
     );
-    let recorded = applied_control_plane_command(
+    let expected_recorded = applied_control_plane_command(
         &source,
         applied,
-        ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransition,
+        ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransitions,
         true,
     )
     .into_snapshot();
-    let publication_error = recorded.validate_current_state_invariants().unwrap_err();
-    assert!(
-        publication_error
-            .to_string()
-            .contains("state v32 requires a singleton begin receipt"),
-        "unexpected plural publication error: {publication_error}"
+    let mut reconciliation_cursor = UnavailablePgReconciliationCursor::start();
+    let begun_work = authority
+        .poll_unavailable_pg_reconciliation_batch(&mut reconciliation_cursor, begin_at_ms)
+        .unwrap();
+    assert!(begun_work.rejected.is_empty());
+    assert_eq!(
+        begun_work
+            .work
+            .iter()
+            .map(UnavailablePgReconciliationWork::pg_id)
+            .collect::<Vec<_>>(),
+        pg_ids
     );
-    let decode_error = parse_snapshot(&format_snapshot(&recorded)).unwrap_err();
+    let recorded = authority.snapshot().clone();
+    assert_eq!(recorded, expected_recorded);
+    recorded.validate_current_state_invariants().unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(&recorded)).unwrap(),
+        recorded
+    );
+
+    let exact_replay = ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
+        transitions: requests.clone(),
+        expected_transition_epoch: target_epoch,
+        begin_at_ms,
+    };
+    let replayed = recorded.apply_control_plane_command(exact_replay).unwrap();
+    assert!(!replayed.changed());
+    assert_eq!(replayed.snapshot(), &recorded);
+
+    let subset_replay = ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
+        transitions: vec![requests[0].clone()],
+        expected_transition_epoch: target_epoch,
+        begin_at_ms,
+    };
+    let subset_error = recorded
+        .apply_control_plane_command(subset_replay)
+        .unwrap_err();
     assert!(
-        decode_error
+        subset_error
             .to_string()
-            .contains("state v32 requires a singleton begin receipt"),
-        "unexpected plural snapshot error: {decode_error}"
+            .contains("does not consume the active transition tip"),
+        "unexpected subset replay error: {subset_error}"
     );
 
     let duplicate = vec![requests[0].clone(), requests[0].clone()];
     assert!(source
         .validate_unavailable_pg_transition_begin_batch(duplicate, target_epoch, begin_at_ms)
+        .unwrap_err()
+        .to_string()
+        .contains("strictly increasing"));
+
+    for pg_id in pg_ids {
+        let transition = authority
+            .snapshot()
+            .unavailable_pg_placement_transition(pg_id)
+            .unwrap();
+        let work = UnavailablePgReconciliationWork::from_transition(
+            transition,
+            UnavailablePgReconciliationStage::MetadataTransfer,
+        );
+        let transfer =
+            PgMetadataTransferProof::new(authority.snapshot().cluster_epoch(), active_proof);
+        let destination_epoch = next_epoch(authority.snapshot().cluster_epoch()).unwrap();
+        authority
+            .install_unavailable_pg_transition_metadata_transfer(
+                work.mutation_binding().clone(),
+                transfer,
+                destination_epoch,
+            )
+            .unwrap();
+    }
+    let readiness_at_ms = authority.snapshot().max_committed_timestamp_ms().unwrap() + 1;
+    for node_id in [4, 2, 3] {
+        heartbeat_with_pg_proofs_and_lease_duration(
+            &mut authority,
+            node_id,
+            &pg_ids,
+            PgState::Peering,
+            active_proof,
+            readiness_at_ms + u64::from(node_id),
+            10_000,
+        );
+    }
+    let ready_at_ms = (authority.snapshot().max_committed_timestamp_ms().unwrap() + 1)
+        .max(failed_deadline + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1);
+    let completion_work = pg_ids
+        .into_iter()
+        .map(|pg_id| {
+            UnavailablePgReconciliationWork::from_transition(
+                authority
+                    .snapshot()
+                    .unavailable_pg_placement_transition(pg_id)
+                    .unwrap(),
+                UnavailablePgReconciliationStage::PayloadReadiness,
+            )
+        })
+        .collect::<Vec<_>>();
+    let stale_second = UnavailablePgReconciliationWork::new(
+        completion_work[1].pg_id(),
+        completion_work[1].source_epoch(),
+        completion_work[1].source_epoch(),
+        completion_work[1].source_acting_set().to_vec(),
+        completion_work[1].destination_acting_set().to_vec(),
+        UnavailablePgReconciliationStage::PayloadReadiness,
+    );
+    let prepared_with_stale_member = authority
+        .snapshot()
+        .prepare_unavailable_pg_placement_completion_batch(
+            &[completion_work[0].clone(), stale_second],
+            ready_at_ms,
+        )
+        .unwrap();
+    assert_eq!(
+        prepared_with_stale_member
+            .included
+            .iter()
+            .map(UnavailablePgReconciliationWork::pg_id)
+            .collect::<Vec<_>>(),
+        vec![completion_work[0].pg_id()]
+    );
+    assert_eq!(prepared_with_stale_member.rejected.len(), 1);
+
+    let mut large_completion_source = authority.snapshot().clone();
+    for node_id in [2, 3, 4] {
+        large_completion_source
+            .nodes
+            .get_mut(&NodeId::new(node_id))
+            .unwrap()
+            .endpoint = "x".repeat(25_000);
+    }
+    let oversized_completion = large_completion_source
+        .complete_unavailable_pg_placement_transition_batch_command(&completion_work, ready_at_ms)
+        .unwrap();
+    assert!(
+        crate::control_plane_raft::control_plane_command_replication_encoded_len(
+            &oversized_completion
+        )
+        .unwrap()
+            > crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+    );
+    let split_completion = large_completion_source
+        .prepare_unavailable_pg_placement_completion_batch(&completion_work, ready_at_ms)
+        .unwrap();
+    assert_eq!(split_completion.included.len(), 1);
+    assert!(split_completion.rejected.is_empty());
+    assert!(
+        crate::control_plane_raft::control_plane_command_replication_encoded_len(
+            split_completion.command.as_ref().unwrap()
+        )
+        .unwrap()
+            <= crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+    );
+    let completion_command = authority
+        .snapshot()
+        .complete_unavailable_pg_placement_transition_batch_command(&completion_work, ready_at_ms)
+        .unwrap();
+    let ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
+        ready_at_ms: completion_ready_at_ms,
+        transitions: completion_requests,
+    } = completion_command.clone()
+    else {
+        unreachable!("completion batch builder returned the wrong command kind");
+    };
+    assert_eq!(completion_ready_at_ms, ready_at_ms);
+    assert_eq!(completion_requests.len(), 2);
+
+    let mut invalid_completion = completion_requests.clone();
+    invalid_completion[1].completion.pg_id = pg_ids[0];
+    let before_invalid_completion = authority.snapshot().clone();
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
+                ready_at_ms,
+                transitions: invalid_completion,
+            },
+        )
+        .is_err());
+    assert_eq!(authority.snapshot(), &before_invalid_completion);
+
+    authority
+        .complete_unavailable_pg_placement_transition_batch(&completion_work, ready_at_ms)
+        .unwrap();
+    let completed = authority.snapshot().clone();
+    completed.validate_current_state_invariants().unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(&completed)).unwrap(),
+        completed
+    );
+    for pg_id in pg_ids {
+        assert_eq!(completed.pg(pg_id).unwrap().state(), PgState::Active);
+        assert!(completed
+            .unavailable_pg_placement_transition(pg_id)
+            .is_none());
+    }
+
+    let exact_completion_replay = completed
+        .apply_control_plane_command(completion_command)
+        .unwrap();
+    assert!(!exact_completion_replay.changed());
+    assert_eq!(exact_completion_replay.snapshot(), &completed);
+
+    let subset_completion = completed
+        .apply_control_plane_command(
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
+                ready_at_ms,
+                transitions: vec![completion_requests[0].clone()],
+            },
+        )
+        .unwrap_err();
+    assert!(
+        subset_completion
+            .to_string()
+            .contains("no matching active unavailable placement transition"),
+        "unexpected completion subset replay error: {subset_completion}"
+    );
+
+    let mut reordered_completion = completion_requests;
+    reordered_completion.reverse();
+    assert!(completed
+        .apply_control_plane_command(
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
+                ready_at_ms,
+                transitions: reordered_completion,
+            },
+        )
         .unwrap_err()
         .to_string()
         .contains("strictly increasing"));
@@ -505,38 +730,34 @@ fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
         .begin_unavailable_pg_placement_transition_command(pg_id, NodeId::new(1), begin_at_ms)
         .unwrap();
     let mut wrong_topology = stale_proposal.clone();
-    let ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
-        topology_digest, ..
-    } = &mut wrong_topology
+    let ControlPlaneCommand::BeginUnavailablePgPlacementTransitions { transitions, .. } =
+        &mut wrong_topology
     else {
         unreachable!("builder returned the wrong command kind");
     };
-    topology_digest[0] ^= 1;
+    transitions[0].topology_digest[0] ^= 1;
     assert!(authority
         .snapshot()
         .apply_control_plane_command(wrong_topology)
         .is_err());
     let mut wrong_destination = stale_proposal.clone();
-    let ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
-        destination_acting_set,
-        ..
-    } = &mut wrong_destination
+    let ControlPlaneCommand::BeginUnavailablePgPlacementTransitions { transitions, .. } =
+        &mut wrong_destination
     else {
         unreachable!("builder returned the wrong command kind");
     };
-    destination_acting_set.swap(0, 1);
+    transitions[0].destination_acting_set.swap(0, 1);
     assert!(authority
         .snapshot()
         .apply_control_plane_command(wrong_destination)
         .is_err());
     let mut shortened_grace = stale_proposal.clone();
-    let ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
-        grace_cutoff_ms, ..
-    } = &mut shortened_grace
+    let ControlPlaneCommand::BeginUnavailablePgPlacementTransitions { transitions, .. } =
+        &mut shortened_grace
     else {
         unreachable!("builder returned the wrong command kind");
     };
-    *grace_cutoff_ms -= 1;
+    transitions[0].grace_cutoff_ms -= 1;
     assert!(authority
         .snapshot()
         .apply_control_plane_command(shortened_grace)
@@ -755,14 +976,9 @@ fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
         .snapshot()
         .complete_unavailable_pg_placement_transition_command(&dispatched_work, complete_at_ms)
         .unwrap();
-    let ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
-        transition_epoch: completion_transition_epoch,
-        destination_epoch: completion_destination_epoch,
-        topology_generation: completion_topology_generation,
-        topology_digest: completion_topology_digest,
+    let ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
         ready_at_ms: completion_ready_at_ms,
-        destinations: completion_destinations,
-        ..
+        transitions,
     } = &completion_command
     else {
         unreachable!("unavailable placement completion builder returned the wrong command kind");
@@ -774,12 +990,12 @@ fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
         .unwrap()
         .payload_readiness = Some(UnavailablePgPayloadReadiness {
         pg_id,
-        transition_epoch: *completion_transition_epoch,
-        destination_epoch: *completion_destination_epoch,
-        topology_generation: *completion_topology_generation,
-        topology_digest: *completion_topology_digest,
+        transition_epoch: transitions[0].transition_epoch,
+        destination_epoch: transitions[0].destination_epoch,
+        topology_generation: transitions[0].topology_generation,
+        topology_digest: transitions[0].topology_digest,
         ready_at_ms: *completion_ready_at_ms,
-        destinations: completion_destinations.clone(),
+        destinations: transitions[0].destinations.clone(),
     });
     assert!(forged_standalone_readiness
         .validate_current_state_invariants()

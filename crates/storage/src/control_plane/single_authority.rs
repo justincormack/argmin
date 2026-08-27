@@ -2788,13 +2788,20 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         unavailable_node_id: NodeId,
         begin_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.begin_unavailable_pg_placement_transition_batch(
+            &[(pg_id, unavailable_node_id)],
+            begin_at_ms,
+        )
+    }
+
+    pub(crate) fn begin_unavailable_pg_placement_transition_batch(
+        &mut self,
+        candidates: &[(PgId, NodeId)],
+        begin_at_ms: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         let command = self
             .snapshot
-            .begin_unavailable_pg_placement_transition_command(
-                pg_id,
-                unavailable_node_id,
-                begin_at_ms,
-            )?;
+            .begin_unavailable_pg_placement_transition_batch_command(candidates, begin_at_ms)?;
         self.apply_and_commit_command(command)?;
         Ok(self.snapshot.clone())
     }
@@ -2804,9 +2811,20 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         work: &UnavailablePgReconciliationWork,
         ready_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.complete_unavailable_pg_placement_transition_batch(
+            std::slice::from_ref(work),
+            ready_at_ms,
+        )
+    }
+
+    pub(crate) fn complete_unavailable_pg_placement_transition_batch(
+        &mut self,
+        work: &[UnavailablePgReconciliationWork],
+        ready_at_ms: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         let command = self
             .snapshot
-            .complete_unavailable_pg_placement_transition_command(work, ready_at_ms)?;
+            .complete_unavailable_pg_placement_transition_batch_command(work, ready_at_ms)?;
         self.apply_and_commit_command(command)?;
         Ok(self.snapshot.clone())
     }
@@ -2851,6 +2869,68 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         }
     }
 
+    pub(crate) fn poll_unavailable_pg_reconciliation_batch(
+        &mut self,
+        cursor: &mut UnavailablePgReconciliationCursor,
+        now_ms: u64,
+    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
+        let scan = self
+            .snapshot
+            .scan_unavailable_pg_reconciliation_batch(*cursor, now_ms);
+        *cursor = scan.next_cursor;
+        let begin_candidates = scan
+            .candidates
+            .iter()
+            .filter_map(|candidate| match candidate {
+                UnavailablePgReconciliationCandidate::Begin {
+                    pg_id,
+                    unavailable_node_id,
+                } => Some((*pg_id, *unavailable_node_id)),
+                UnavailablePgReconciliationCandidate::Resume(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut begun = Vec::new();
+        let mut rejected = Vec::new();
+        if !begin_candidates.is_empty() {
+            let prepared = self
+                .snapshot
+                .prepare_unavailable_pg_placement_transition_batch(
+                    &begin_candidates,
+                    now_ms,
+                )?;
+            let included = prepared.included;
+            rejected.extend(prepared.rejected);
+            if let Some(command) = prepared.command {
+                self.apply_and_commit_command(command)?;
+                begun.extend(included.into_iter().map(|(pg_id, _)| pg_id));
+            }
+        }
+        let mut work = scan
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| match candidate {
+                UnavailablePgReconciliationCandidate::Resume(work) => Some(work),
+                UnavailablePgReconciliationCandidate::Begin { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        for pg_id in begun {
+            let transition = self
+                .snapshot
+                .unavailable_pg_placement_transition(pg_id)
+                .ok_or_else(|| {
+                    ControlPlaneError::invariant_failure(
+                        "committed unavailable PG transition is absent from current state",
+                    )
+                })?;
+            work.push(UnavailablePgReconciliationWork::from_transition(
+                transition,
+                UnavailablePgReconciliationStage::MetadataTransfer,
+            ));
+        }
+        work.sort_by_key(UnavailablePgReconciliationWork::pg_id);
+        Ok(UnavailablePgReconciliationPollBatch { work, rejected })
+    }
+
     pub fn complete_unavailable_pg_reconciliation(
         &mut self,
         work: &UnavailablePgReconciliationWork,
@@ -2870,6 +2950,42 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             .complete_unavailable_pg_placement_transition_command(work, now_ms)?;
         self.apply_and_commit_command(command)?;
         Ok(true)
+    }
+
+    pub(crate) fn complete_unavailable_pg_reconciliation_batch(
+        &mut self,
+        work: &[UnavailablePgReconciliationWork],
+        now_ms: u64,
+    ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
+        let prepared = self
+            .snapshot
+            .prepare_unavailable_pg_placement_completion_batch(work, now_ms)?;
+        if let Some(command) = prepared.command {
+            self.apply_and_commit_command(command)?;
+        }
+        let included_pg_ids = prepared
+            .included
+            .iter()
+            .map(UnavailablePgReconciliationWork::pg_id)
+            .collect::<BTreeSet<_>>();
+        let rejected_pg_ids = prepared
+            .rejected
+            .iter()
+            .map(|(work, _)| work.pg_id())
+            .collect::<BTreeSet<_>>();
+        let rederive = work
+            .iter()
+            .filter(|work| {
+                !included_pg_ids.contains(&work.pg_id())
+                    && !rejected_pg_ids.contains(&work.pg_id())
+            })
+            .cloned()
+            .collect();
+        Ok(UnavailablePgReconciliationCompletionBatch {
+            completed: prepared.included,
+            rejected: prepared.rejected,
+            rederive,
+        })
     }
 
     pub fn set_pg_acting_set_with_metadata_transfer(

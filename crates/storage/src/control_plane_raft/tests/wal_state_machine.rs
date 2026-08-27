@@ -138,27 +138,22 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
         ),
         (
             714,
-            "b0a257dd2fbc71b54f67ab2d7bcd3b43ea0a2ff40ae7d4be93ba885dcd49e57f".to_owned()
+            "7667eb007e6cbb26656b54d4922782351c9394602325c394d42f697ff721f0a4".to_owned()
         )
     );
 }
 
 #[test]
-fn control_plane_raft_wal_v2_rejects_nested_command_v16() {
+fn control_plane_raft_wal_v2_rejects_noncurrent_nested_command_versions() {
     let command = ControlPlaneCommand::SetNodeMembership {
         node_id: NodeId::new(7),
         membership: NodeMembershipState::Active,
     };
     let current = encode_control_plane_command(&command).unwrap();
-    let previous =
-        crate::control_plane_command::encode_control_plane_command_with_version_for_test(
-            &command, 16,
-        )
-        .unwrap();
-    let mut frame = ControlPlaneRaftWalFrame::new(
+    let frame = ControlPlaneRaftWalFrame::new(
         "nested-command-version-wal",
         1,
-        ControlPlaneRaftWalRecord::Append(vec![normal_entry(3, 1, 1, command)]),
+        ControlPlaneRaftWalRecord::Append(vec![normal_entry(3, 1, 1, command.clone())]),
     )
     .encode_frame()
     .unwrap();
@@ -168,16 +163,25 @@ fn control_plane_raft_wal_v2_rejects_nested_command_v16() {
         .filter_map(|(offset, candidate)| (candidate == current.as_slice()).then_some(offset))
         .collect::<Vec<_>>();
     assert_eq!(offsets.len(), 1);
-    let offset = offsets[0];
-    frame[offset..offset + previous.len()].copy_from_slice(&previous);
-    refresh_raft_wal_frame_checksum(&mut frame);
+    for version in [16, 20] {
+        let previous =
+            crate::control_plane_command::encode_control_plane_command_with_version_for_test(
+                &command, version,
+            )
+            .unwrap();
+        assert_eq!(previous.len(), current.len());
+        let mut unsupported = frame.clone();
+        let offset = offsets[0];
+        unsupported[offset..offset + previous.len()].copy_from_slice(&previous);
+        refresh_raft_wal_frame_checksum(&mut unsupported);
 
-    let error = ControlPlaneRaftWalFrame::decode_frame(&frame).unwrap_err();
-    assert!(matches!(
-        error,
-        ControlPlaneError::CommandDecode { message }
-            if message == "unsupported control-plane command version 16"
-    ));
+        let error = ControlPlaneRaftWalFrame::decode_frame(&unsupported).unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::CommandDecode { message }
+                if message == format!("unsupported control-plane command version {version}")
+        ));
+    }
 }
 
 #[test]
@@ -565,7 +569,7 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         (
             75,
             236,
-            "1c25ff408d56918031cfd4e3eacb15fc4839e60781dc4a827a29975db5114412".to_owned(),
+            "997a88bca412e61924f1f71012f6b7bf8004cbffef7f3da7d29e9876bbadb71f".to_owned(),
             112,
             "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62".to_owned()
         )

@@ -1579,15 +1579,15 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         require_current_control_plane_state_version(None),
         Err(ControlPlaneStateVersionError::Missing)
     );
-    for version in [28, 29, 30, 31, 33] {
+    for version in [28, 29, 30, 31, 32, 34] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
             Err(ControlPlaneStateVersionError::Unsupported(version))
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(32)),
-        Ok(32)
+        require_current_control_plane_state_version(Some(33)),
+        Ok(33)
     );
 
     assert!(matches!(
@@ -1766,11 +1766,29 @@ fn canonical_control_plane_state_v31_text_remains_rejected_evidence() {
 }
 
 #[test]
-fn canonical_control_plane_state_v32_text_is_exact() {
+fn canonical_control_plane_state_v32_text_remains_rejected_evidence() {
+    const V32: &str = concat!(
+        "version=32\n",
+        "authority_incarnation=1\n",
+        "cluster_epoch=1\n",
+        "initial_topology=-\n",
+        "max_committed_timestamp_ms=123\n",
+        "lease_grant_horizon=-\n",
+        "node=1,active,1,healthy,11,1,100,200,-,6e6f64652d312e736f636b\n",
+    );
+    assert!(matches!(
+        parse_snapshot(V32),
+        Err(ControlPlaneError::Parse { line: 1, message })
+            if message == "unsupported control-plane state version 32"
+    ));
+}
+
+#[test]
+fn canonical_control_plane_state_v33_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=32\n",
+            "version=33\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -1844,7 +1862,38 @@ fn canonical_control_plane_state_v31_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v32_representative_aggregate_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("testdata/state_v32_representative.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            11_535,
+            "5cd2fa31798c17a4d55e337ee457171c19b432517274e1b2b2a0b1e430ad0999".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0;
+    while !remaining.is_empty() {
+        let (length, tail) = remaining.split_at(8);
+        let length = usize::try_from(u64::from_be_bytes(length.try_into().unwrap())).unwrap();
+        let (snapshot, tail) = tail.split_at(length);
+        let snapshot = std::str::from_utf8(snapshot).unwrap();
+        assert!(matches!(
+            parse_snapshot(snapshot),
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 32"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > 1, "v32 aggregate must contain a corpus");
+}
+
+#[test]
+fn canonical_control_plane_state_v33_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -2352,7 +2401,7 @@ fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
         aggregate_text.push_str(&formatted);
     }
     for required_record in [
-        "version=32\n",
+        "version=33\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -2380,7 +2429,7 @@ fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
         ),
         (
             11_535,
-            "5cd2fa31798c17a4d55e337ee457171c19b432517274e1b2b2a0b1e430ad0999".to_owned()
+            "d45b799299bbaa0ec21f95aa7f8191c46f8b38682aaa57b57c0baaf625660360".to_owned()
         )
     );
 }

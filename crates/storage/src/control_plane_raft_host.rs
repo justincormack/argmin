@@ -1,6 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -18,7 +19,8 @@ use crate::control_plane::{
     ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapSource,
     ControlPlaneRuntimeMapStatus, FencedPgMetadataTransferSnapshot, LeaseHorizonAuthorityBinding,
     NodeHeartbeat, PgMetadataTransferProof, UnavailablePgReconciliationCandidate,
-    UnavailablePgReconciliationCursor, UnavailablePgReconciliationStage,
+    UnavailablePgReconciliationCompletionBatch, UnavailablePgReconciliationCursor,
+    UnavailablePgReconciliationPollBatch, UnavailablePgReconciliationStage,
     UnavailablePgReconciliationWork,
 };
 use crate::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
@@ -440,9 +442,8 @@ impl ControlPlaneRaftAuthorityHost {
                 let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
                 self.submit_raft_command_derived(|current| {
                     let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
-                    let command = current.begin_unavailable_pg_placement_transition_command(
-                        pg_id,
-                        unavailable_node_id,
+                    let command = current.begin_unavailable_pg_placement_transition_batch_command(
+                        &[(pg_id, unavailable_node_id)],
                         command_now_ms,
                     )?;
                     #[cfg(test)]
@@ -467,6 +468,97 @@ impl ControlPlaneRaftAuthorityHost {
         }
     }
 
+    pub(crate) fn poll_unavailable_pg_reconciliation_batch(
+        &mut self,
+        cursor: &mut UnavailablePgReconciliationCursor,
+        supplied_now_ms: u64,
+    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
+        let now_ms = self.authority_now_ms(supplied_now_ms)?;
+        let snapshot = self.current_snapshot()?;
+        let scan = snapshot.scan_unavailable_pg_reconciliation_batch(*cursor, now_ms);
+        *cursor = scan.next_cursor;
+        let begin_candidates = scan
+            .candidates
+            .iter()
+            .filter_map(|candidate| match candidate {
+                UnavailablePgReconciliationCandidate::Begin {
+                    pg_id,
+                    unavailable_node_id,
+                } => Some((*pg_id, *unavailable_node_id)),
+                UnavailablePgReconciliationCandidate::Resume(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut begun = Vec::new();
+        let mut rejected = Vec::new();
+        if !begin_candidates.is_empty() {
+            #[cfg(test)]
+            self.run_after_unavailable_reconciliation_time_sampled_hook(now_ms);
+        }
+        #[cfg(test)]
+        let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
+        if !begin_candidates.is_empty() {
+            let mut prepared_slot = None;
+            let submit_result = self.submit_raft_command_derived(|current| {
+                let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
+                let prepared = current.prepare_unavailable_pg_placement_transition_batch(
+                    &begin_candidates,
+                    command_now_ms,
+                )?;
+                let command = prepared.command.clone();
+                prepared_slot = Some(prepared);
+                #[cfg(test)]
+                if command.is_some() {
+                    if let Some(after_derived) = after_derived {
+                        after_derived();
+                    }
+                }
+                command.ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: "unavailable transition begin page has no valid member".to_owned(),
+                })
+            });
+            let (prepared, submit_result) = resolve_derived_preparation(
+                prepared_slot,
+                submit_result,
+                "unavailable transition begin derivation returned without preparation state",
+            )?;
+            let included_pg_ids = prepared
+                .included
+                .iter()
+                .map(|(pg_id, _)| *pg_id)
+                .collect::<BTreeSet<_>>();
+            let submitted = prepared.command.is_some();
+            if submitted {
+                submit_result?;
+                begun.extend(included_pg_ids.iter().copied());
+            }
+            rejected.extend(prepared.rejected);
+        }
+        let current = self.current_snapshot()?;
+        let mut work = scan
+            .candidates
+            .into_iter()
+            .filter_map(|candidate| match candidate {
+                UnavailablePgReconciliationCandidate::Resume(work) => Some(work),
+                UnavailablePgReconciliationCandidate::Begin { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        for pg_id in begun {
+            let transition = current
+                .unavailable_pg_placement_transition(pg_id)
+                .ok_or_else(|| {
+                    ControlPlaneError::invariant_failure(
+                        "committed unavailable PG transition is absent from current state",
+                    )
+                })?;
+            work.push(UnavailablePgReconciliationWork::from_transition(
+                transition,
+                UnavailablePgReconciliationStage::MetadataTransfer,
+            ));
+        }
+        work.sort_by_key(UnavailablePgReconciliationWork::pg_id);
+        Ok(UnavailablePgReconciliationPollBatch { work, rejected })
+    }
+
     pub fn complete_unavailable_pg_reconciliation(
         &mut self,
         work: &UnavailablePgReconciliationWork,
@@ -486,8 +578,10 @@ impl ControlPlaneRaftAuthorityHost {
         let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
         self.submit_raft_command_derived(|current| {
             let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
-            let command = current
-                .complete_unavailable_pg_placement_transition_command(work, command_now_ms)?;
+            let command = current.complete_unavailable_pg_placement_transition_batch_command(
+                std::slice::from_ref(work),
+                command_now_ms,
+            )?;
             #[cfg(test)]
             if let Some(after_derived) = after_derived {
                 after_derived();
@@ -495,6 +589,65 @@ impl ControlPlaneRaftAuthorityHost {
             Ok(command)
         })?;
         Ok(true)
+    }
+
+    pub(crate) fn complete_unavailable_pg_reconciliation_batch(
+        &mut self,
+        work: &[UnavailablePgReconciliationWork],
+        supplied_now_ms: u64,
+    ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
+        let now_ms = self.authority_now_ms(supplied_now_ms)?;
+        #[cfg(test)]
+        self.run_after_unavailable_reconciliation_time_sampled_hook(now_ms);
+        #[cfg(test)]
+        let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
+        let mut prepared_slot = None;
+        let submit_result = self.submit_raft_command_derived(|current| {
+            let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
+            let prepared =
+                current.prepare_unavailable_pg_placement_completion_batch(work, command_now_ms)?;
+            let command = prepared.command.clone();
+            prepared_slot = Some(prepared);
+            #[cfg(test)]
+            if command.is_some() {
+                if let Some(after_derived) = after_derived {
+                    after_derived();
+                }
+            }
+            command.ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "unavailable transition completion batch has no valid member".to_owned(),
+            })
+        });
+        let (prepared, submit_result) = resolve_derived_preparation(
+            prepared_slot,
+            submit_result,
+            "unavailable transition completion derivation returned without preparation state",
+        )?;
+        if prepared.command.is_some() {
+            submit_result?;
+        }
+        let included_pg_ids = prepared
+            .included
+            .iter()
+            .map(UnavailablePgReconciliationWork::pg_id)
+            .collect::<BTreeSet<_>>();
+        let rejected_pg_ids = prepared
+            .rejected
+            .iter()
+            .map(|(work, _)| work.pg_id())
+            .collect::<BTreeSet<_>>();
+        let rederive = work
+            .iter()
+            .filter(|work| {
+                !included_pg_ids.contains(&work.pg_id()) && !rejected_pg_ids.contains(&work.pg_id())
+            })
+            .cloned()
+            .collect();
+        Ok(UnavailablePgReconciliationCompletionBatch {
+            completed: prepared.included,
+            rejected: prepared.rejected,
+            rederive,
+        })
     }
 
     fn block_on<F: Future>(&self, future: F) -> F::Output {
@@ -1243,6 +1396,22 @@ fn authority_time_not_before_snapshot(
         .map_or(sampled_now_ms, |committed| committed.max(sampled_now_ms))
 }
 
+fn resolve_derived_preparation<T, R>(
+    prepared: Option<T>,
+    submit_result: Result<R, ControlPlaneError>,
+    missing_preparation_diagnostic: &'static str,
+) -> Result<(T, Result<R, ControlPlaneError>), ControlPlaneError> {
+    match prepared {
+        Some(prepared) => Ok((prepared, submit_result)),
+        None => match submit_result {
+            Err(error) => Err(error),
+            Ok(_) => Err(ControlPlaneError::invariant_failure(
+                missing_preparation_diagnostic,
+            )),
+        },
+    }
+}
+
 fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Output {
     if Handle::try_current().is_ok() {
         tokio::task::block_in_place(|| runtime.block_on(future))
@@ -1259,6 +1428,27 @@ mod tests {
     use std::thread;
 
     struct ReconciliationCommandRelease(Option<mpsc::SyncSender<()>>);
+
+    #[test]
+    fn pre_derivation_reconciliation_submission_error_is_preserved() {
+        let error = resolve_derived_preparation::<(), ()>(
+            None,
+            Err(ControlPlaneError::AuthorityClockLeadershipChanged {
+                established_term: Some(7),
+                current_term: 8,
+            }),
+            "missing preparation",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::AuthorityClockLeadershipChanged {
+                established_term: Some(7),
+                current_term: 8,
+            }
+        ));
+    }
 
     impl ReconciliationCommandRelease {
         fn release(&mut self) {
@@ -1438,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_raft_host_poll_commits_grace_expired_unavailable_pg_transition() {
+    fn durable_raft_host_poll_batches_grace_expired_unavailable_pg_transitions() {
         let tmp = test_util::tempdir();
         let artifact_path = tmp.path().join("authority.state");
         let runtime = runtime();
@@ -1659,16 +1849,51 @@ mod tests {
         let work = run_reconciliation_across_durable_heartbeat_races(
             &mut host,
             |host| {
-                host.poll_unavailable_pg_reconciliation(
+                host.poll_unavailable_pg_reconciliation_batch(
                     &mut cursor,
                     crate::clock::current_time_millis(),
                 )
                 .unwrap()
-                .expect("grace-expired unavailable actor should atomically produce Raft work")
             },
-            |host, now_ms| heartbeat(host, 3, 10_000, Some(PgState::Peering), now_ms, &[pg_id]),
-            |host, now_ms| heartbeat(host, 3, 10_000, Some(PgState::Peering), now_ms, &[pg_id]),
+            |host, now_ms| {
+                heartbeat(
+                    host,
+                    3,
+                    10_000,
+                    Some(PgState::Peering),
+                    now_ms,
+                    &[pg_id, admin_pg_id],
+                )
+            },
+            |host, now_ms| {
+                heartbeat(
+                    host,
+                    3,
+                    10_000,
+                    Some(PgState::Peering),
+                    now_ms,
+                    &[pg_id, admin_pg_id],
+                )
+            },
         );
+        assert!(work.rejected.is_empty());
+        assert_eq!(work.work.len(), 2);
+        assert_eq!(
+            work.work
+                .iter()
+                .map(UnavailablePgReconciliationWork::pg_id)
+                .collect::<Vec<_>>(),
+            vec![pg_id, admin_pg_id]
+        );
+        assert_eq!(
+            work.work[0].transition_epoch(),
+            work.work[1].transition_epoch()
+        );
+        let work = work
+            .work
+            .into_iter()
+            .find(|work| work.pg_id() == pg_id)
+            .expect("batch must contain the data PG transition");
         assert_eq!(
             host.current_snapshot_for_test()
                 .unwrap()
