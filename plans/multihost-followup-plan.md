@@ -402,6 +402,17 @@ destination-install/staging protocol and concurrent artifact-transfer workers
 remain later slices. State v33
 retains immutable command-v20/state-v32 rejection evidence in addition to the
 older command-v19/state-v31 evidence.
+The live metadata-transfer implementation now has an explicit protocol-neutral
+`prepare`/`install`/`import` lifecycle. Preparation owns the exact transition
+binding, source route and runtime-map generation, and exported artifact;
+installation consumes that opaque state and produces a distinct installed
+state containing the destination route and imported proof; only that installed
+state can enter import. Preparation is regression-tested to leave the
+destination acting set and transfer marker unchanged until the explicit install
+boundary. The existing reconciliation worker still invokes the sequential
+wrapper, so this refactor changes neither durable grammar nor epoch count and
+requires no version advance. It is the internal ownership boundary on which
+durable staging and plural destination installation will be built.
 Command v19 additionally sealed the
 post-grace completion fence that prevents survivor heartbeats from indefinitely
 reactivating the old acting set; immutable command v18 remains rejection
