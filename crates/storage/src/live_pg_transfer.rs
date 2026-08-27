@@ -1182,15 +1182,19 @@ impl LivePgMetadataTransferAdmin {
                 export_epoch: expected_source_route.cluster_epoch(),
             },
         )?;
+        let install_member = prepare_live_pg_metadata_transfer_install_member(
+            pg_id,
+            acting_set,
+            unavailable_transition.cloned(),
+            &source_runtime,
+            &artifact,
+        )?;
         Ok(LivePgMetadataTransferPreparation::Prepared(Box::new(
             PreparedLivePgMetadataTransfer {
-                pg_id,
-                acting_set,
                 source_node_id,
                 source_route: source_route.clone(),
-                source_runtime,
                 artifact,
-                unavailable_transition: unavailable_transition.cloned(),
+                install_member,
             },
         )))
     }
@@ -1200,24 +1204,17 @@ impl LivePgMetadataTransferAdmin {
         prepared: Box<PreparedLivePgMetadataTransfer>,
     ) -> Result<LivePgMetadataTransferInstallation, LivePgMetadataTransferFailure> {
         let PreparedLivePgMetadataTransfer {
-            pg_id,
-            acting_set,
             source_node_id,
             source_route,
-            source_runtime,
             artifact,
-            unavailable_transition,
+            install_member,
         } = *prepared;
-        let install = self.install_transfer_retrying_epoch(
-            pg_id,
-            &acting_set,
-            &source_route,
-            source_runtime,
-            &artifact,
-            unavailable_transition.as_ref(),
-        )?;
+        let install =
+            self.install_transfer_retrying_epoch(&source_route, &artifact, install_member)?;
         Ok(match install {
             TransferInstallOutcome::Ready {
+                pg_id,
+                acting_set,
                 destination_runtime,
                 destination_epoch,
                 imported_proof,
@@ -1343,39 +1340,23 @@ impl LivePgMetadataTransferAdmin {
 
     fn install_transfer_retrying_epoch(
         &self,
-        pg_id: PgId,
-        acting_set: &[NodeId],
         source_route: &PgRouteSnapshot,
-        mut source_runtime: ClusterRuntimeMapSnapshot,
         artifact: &PgMetadataTransferArtifact,
-        unavailable_transition: Option<
-            &crate::control_plane::UnavailablePgTransitionMutationBinding,
-        >,
+        mut install_member: PreparedLivePgMetadataTransferInstallMember,
     ) -> Result<TransferInstallOutcome, LivePgMetadataTransferFailure> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let destination_epoch = source_runtime
-                .cluster_epoch()
-                .get()
-                .checked_add(1)
-                .and_then(ClusterEpoch::new)
-                .ok_or_else(|| "destination cluster epoch overflowed".to_owned())?;
-            let imported_proof = StorageCluster::metadata_transfer_imported_proof_at_epoch(
-                artifact,
-                destination_epoch,
-            )
-            .map_err(|error| format!("failed to compute imported PG metadata proof: {error}"))?;
-            let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
-                artifact.cluster_epoch(),
-                artifact.source_metadata_proof(),
-                imported_proof,
-            );
+            install_member.validate_epoch_binding()?;
+            let pg_id = install_member.pg_id;
+            let destination_epoch = install_member.expected_destination_epoch;
+            let transfer = install_member.transfer;
+            let imported_proof = transfer.metadata_proof();
             match self.control_plane.install_transfer(
                 pg_id,
-                acting_set.to_vec(),
+                install_member.acting_set.clone(),
                 transfer,
                 destination_epoch,
-                unavailable_transition,
+                install_member.unavailable_transition.as_ref(),
             ) {
                 Ok(runtime) => {
                     if runtime.cluster_epoch() < destination_epoch {
@@ -1420,14 +1401,23 @@ impl LivePgMetadataTransferAdmin {
                         )
                         .into());
                     }
-                    if active_route_matches(&serving_runtime, pg_id, acting_set, imported_proof)? {
+                    if active_route_matches(
+                        &serving_runtime,
+                        pg_id,
+                        &install_member.acting_set,
+                        imported_proof,
+                    )? {
                         return Ok(TransferInstallOutcome::Completed {
                             destination_epoch,
                             imported_proof,
                         });
                     }
                     let destination_runtime = serving_runtime
-                        .metadata_transfer_destination_runtime_map(pg_id, acting_set, transfer)
+                        .metadata_transfer_destination_runtime_map(
+                            pg_id,
+                            &install_member.acting_set,
+                            transfer,
+                        )
                         .map_err(|error| {
                             format!(
                                 "failed to authorize confirmed PG {} metadata transfer destination route: {}",
@@ -1436,6 +1426,8 @@ impl LivePgMetadataTransferAdmin {
                             )
                         })?;
                     return Ok(TransferInstallOutcome::Ready {
+                        pg_id,
+                        acting_set: install_member.acting_set,
                         destination_runtime,
                         destination_epoch,
                         imported_proof,
@@ -1453,7 +1445,7 @@ impl LivePgMetadataTransferAdmin {
                             "failed to install transfer-backed live PG acting set before the destination-epoch retry deadline".to_owned(),
                         ));
                     }
-                    source_runtime = loop {
+                    let source_runtime = loop {
                         match self.control_plane.serving_pg_runtime_map_snapshot(
                             pg_id,
                             crate::clock::current_time_millis(),
@@ -1481,6 +1473,7 @@ impl LivePgMetadataTransferAdmin {
                         )
                         .into());
                     }
+                    install_member.rebase(&source_runtime, artifact)?;
                 }
                 Err(error) => {
                     return Err(control_plane_transfer_failure(
@@ -1862,13 +1855,87 @@ enum LivePgMetadataTransferPreparation {
 }
 
 struct PreparedLivePgMetadataTransfer {
-    pg_id: PgId,
-    acting_set: Vec<NodeId>,
     source_node_id: NodeId,
     source_route: PgRouteSnapshot,
-    source_runtime: ClusterRuntimeMapSnapshot,
     artifact: PgMetadataTransferArtifact,
+    install_member: PreparedLivePgMetadataTransferInstallMember,
+}
+
+struct PreparedLivePgMetadataTransferInstallMember {
+    pg_id: PgId,
+    acting_set: Vec<NodeId>,
     unavailable_transition: Option<crate::control_plane::UnavailablePgTransitionMutationBinding>,
+    source_runtime_epoch: ClusterEpoch,
+    expected_destination_epoch: ClusterEpoch,
+    transfer: PgMetadataTransferProof,
+}
+
+fn prepare_live_pg_metadata_transfer_install_member(
+    pg_id: PgId,
+    acting_set: Vec<NodeId>,
+    unavailable_transition: Option<crate::control_plane::UnavailablePgTransitionMutationBinding>,
+    source_runtime: &ClusterRuntimeMapSnapshot,
+    artifact: &PgMetadataTransferArtifact,
+) -> Result<PreparedLivePgMetadataTransferInstallMember, LivePgMetadataTransferFailure> {
+    let expected_destination_epoch = source_runtime
+        .cluster_epoch()
+        .get()
+        .checked_add(1)
+        .and_then(ClusterEpoch::new)
+        .ok_or_else(|| "destination cluster epoch overflowed".to_owned())?;
+    let imported_proof = StorageCluster::metadata_transfer_imported_proof_at_epoch(
+        artifact,
+        expected_destination_epoch,
+    )
+    .map_err(|error| format!("failed to compute imported PG metadata proof: {error}"))?;
+    Ok(PreparedLivePgMetadataTransferInstallMember {
+        pg_id,
+        acting_set,
+        unavailable_transition,
+        source_runtime_epoch: source_runtime.cluster_epoch(),
+        expected_destination_epoch,
+        transfer: PgMetadataTransferProof::new_with_imported_metadata_proof(
+            artifact.cluster_epoch(),
+            artifact.source_metadata_proof(),
+            imported_proof,
+        ),
+    })
+}
+
+impl PreparedLivePgMetadataTransferInstallMember {
+    fn validate_epoch_binding(&self) -> Result<(), LivePgMetadataTransferFailure> {
+        let expected_destination_epoch = self
+            .source_runtime_epoch
+            .get()
+            .checked_add(1)
+            .and_then(ClusterEpoch::new)
+            .ok_or_else(|| "destination cluster epoch overflowed".to_owned())?;
+        if self.expected_destination_epoch != expected_destination_epoch {
+            return Err(format!(
+                "prepared metadata transfer destination epoch {} does not follow source runtime epoch {}",
+                self.expected_destination_epoch.get(),
+                self.source_runtime_epoch.get()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn rebase(
+        &mut self,
+        source_runtime: &ClusterRuntimeMapSnapshot,
+        artifact: &PgMetadataTransferArtifact,
+    ) -> Result<(), LivePgMetadataTransferFailure> {
+        let rebased = prepare_live_pg_metadata_transfer_install_member(
+            self.pg_id,
+            self.acting_set.clone(),
+            self.unavailable_transition.clone(),
+            source_runtime,
+            artifact,
+        )?;
+        *self = rebased;
+        Ok(())
+    }
 }
 
 enum LivePgMetadataTransferInstallation {
@@ -1902,6 +1969,8 @@ enum ImportRouteRefresh {
 
 enum TransferInstallOutcome {
     Ready {
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
         destination_runtime: ClusterRuntimeMapSnapshot,
         destination_epoch: ClusterEpoch,
         imported_proof: PgMetadataProof,
@@ -2350,13 +2419,6 @@ mod tests {
         pg_id: PgId,
         source_epoch: ClusterEpoch,
     ) -> (PgMetadataProof, MetadataCommandEnvelope) {
-        let node = SharedStorageNode::open_with_default_ec_shape_and_epoch(
-            data_dir,
-            &[pg_id.get()],
-            EcShape { k: 1, m: 0 },
-            source_epoch,
-        )
-        .unwrap();
         let owner = OwnerIdentity::from_principal("composed-transfer-owner");
         let grants = AclGrants::default();
         let command = MetadataCommandEnvelope::new(
@@ -2386,18 +2448,39 @@ mod tests {
                 .unwrap(),
             ),
         );
+        let proof = apply_composed_transfer_source_command(
+            data_dir,
+            node_id,
+            pg_id,
+            source_epoch,
+            &command,
+        );
+        (proof, command)
+    }
+
+    fn apply_composed_transfer_source_command(
+        data_dir: &std::path::Path,
+        node_id: NodeId,
+        pg_id: PgId,
+        source_epoch: ClusterEpoch,
+        command: &MetadataCommandEnvelope,
+    ) -> PgMetadataProof {
+        let node = SharedStorageNode::open_with_default_ec_shape_and_epoch(
+            data_dir,
+            &[pg_id.get()],
+            EcShape { k: 1, m: 0 },
+            source_epoch,
+        )
+        .unwrap();
         let state = node
             .get_pg(pg_id.get())
             .unwrap()
-            .apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .apply_metadata_command_and_record(node_id.as_u32(), command)
             .unwrap();
-        (
-            PgMetadataProof::current(
-                state.applied_log_index,
-                state.applied_log_hash,
-                state.state_digest,
-            ),
-            command,
+        PgMetadataProof::current(
+            state.applied_log_index,
+            state.applied_log_hash,
+            state.state_digest,
         )
     }
 
@@ -2811,18 +2894,27 @@ mod tests {
             )
             .unwrap()
             .into_snapshot();
+        let source_epoch = snapshot.cluster_epoch();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         store.checkpoint(None, &snapshot).unwrap();
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
-        let proof_store =
-            crate::pg_store::PgStore::open(&tmp.path().join("certified-empty-proof"), pg_id.get())
-                .unwrap();
-        let proof_state = proof_store.metadata_command_replica_state().unwrap();
-        let proof = PgMetadataProof {
-            applied_log_index: proof_state.applied_log_index,
-            applied_log_hash: proof_state.applied_log_hash,
-            state_digest: proof_state.state_digest,
-        };
+        let source_data_root = tmp.path().join("storage").join("cluster-0");
+        let (proof, source_command) = seed_composed_transfer_source(
+            &source_data_root.join("node-1"),
+            NodeId::new(1),
+            pg_id,
+            source_epoch,
+        );
+        for node_id in 2..=3 {
+            let node_proof = apply_composed_transfer_source_command(
+                &source_data_root.join(format!("node-{node_id}")),
+                NodeId::new(node_id),
+                pg_id,
+                source_epoch,
+                &source_command,
+            );
+            assert_eq!(node_proof, proof);
+        }
         let now_ms = crate::clock::current_time_millis();
         for node_id in 1..=4 {
             submit_heartbeat_until_serving(
@@ -2944,21 +3036,81 @@ mod tests {
         let server = spawn_live_transfer_control_plane(
             &socket_path,
             Arc::clone(&authority),
-            (1..=6).map(|offset| begin_at_ms + offset).collect(),
+            (1..=8).map(|offset| begin_at_ms + offset).collect(),
         );
         let _time = crate::clock::test_time_override_guard(begin_at_ms + 10);
-        let summary = LivePgMetadataTransferAdmin::with_in_process_storage_nodes(
+        let admin = LivePgMetadataTransferAdmin::with_in_process_storage_nodes(
             bound_plain_control_plane(&socket_path),
             EcShape { k: 2, m: 1 },
             tmp.path().join("storage"),
-        )
-        .transfer_unavailable_pg_reconciliation(&work)
-        .unwrap_or_else(|error| {
-            panic!(
-                "unavailable PG metadata transfer failed: {}",
-                error._diagnostic
+        );
+        let mut stage = LivePgMetadataTransferStage::Preflight;
+        let preparation = admin
+            .prepare_transfer_typed(
+                work.pg_id(),
+                work.destination_acting_set().to_vec(),
+                Some(work.mutation_binding()),
+                &mut stage,
             )
-        });
+            .unwrap_or_else(|error| {
+                panic!(
+                    "unavailable PG metadata transfer preparation failed: {}",
+                    error.diagnostic
+                )
+            });
+        let LivePgMetadataTransferPreparation::Prepared(prepared) = preparation else {
+            panic!("fresh unavailable PG transfer must produce an uninstalled artifact");
+        };
+        assert_eq!(
+            prepared.install_member.unavailable_transition.as_ref(),
+            Some(work.mutation_binding())
+        );
+        let initially_prepared_destination_epoch =
+            prepared.install_member.expected_destination_epoch;
+        let initially_prepared_proof = prepared.install_member.transfer.metadata_proof();
+        assert_eq!(
+            initially_prepared_proof,
+            composed_transfer_imported_proof(
+                &source_command,
+                initially_prepared_destination_epoch,
+                proof
+            )
+        );
+
+        authority
+            .lock()
+            .unwrap()
+            .set_pg_acting_set(
+                PgId::new(pg_id.get() + 100),
+                vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
+            )
+            .unwrap();
+
+        let installation = admin
+            .install_prepared_transfer(prepared)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "unavailable PG metadata transfer installation failed: {}",
+                    error.diagnostic
+                )
+            });
+        let LivePgMetadataTransferInstallation::Installed(installed) = installation else {
+            panic!("fresh unavailable PG transfer must require destination import");
+        };
+        assert!(installed.destination_epoch > initially_prepared_destination_epoch);
+        assert_ne!(installed.imported_proof, initially_prepared_proof);
+        assert_eq!(
+            installed.imported_proof,
+            composed_transfer_imported_proof(&source_command, installed.destination_epoch, proof)
+        );
+        let summary = admin
+            .import_installed_transfer(installed)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "unavailable PG metadata transfer import failed: {}",
+                    error.diagnostic
+                )
+            });
         server.join().unwrap();
 
         let imported_proof = PgMetadataProof::current(
@@ -3696,6 +3848,18 @@ mod tests {
             panic!("fresh live transfer must produce an uninstalled artifact");
         };
         assert_eq!(stage, LivePgMetadataTransferStage::Export);
+        assert_eq!(
+            prepared.install_member.expected_destination_epoch.get(),
+            prepared.install_member.source_runtime_epoch.get() + 1
+        );
+        assert_eq!(
+            prepared.install_member.transfer.metadata_proof(),
+            StorageCluster::metadata_transfer_imported_proof_at_epoch(
+                &prepared.artifact,
+                prepared.install_member.expected_destination_epoch,
+            )
+            .unwrap()
+        );
         let prepared_route = authority
             .lock()
             .unwrap()
@@ -3719,6 +3883,14 @@ mod tests {
         let LivePgMetadataTransferInstallation::Installed(installed) = installation else {
             panic!("fresh prepared transfer must require destination import");
         };
+        assert_eq!(
+            installed.imported_proof,
+            StorageCluster::metadata_transfer_imported_proof_at_epoch(
+                &installed.artifact,
+                installed.destination_epoch,
+            )
+            .unwrap()
+        );
         let installed_route = authority
             .lock()
             .unwrap()

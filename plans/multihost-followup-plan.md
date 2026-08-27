@@ -413,6 +413,12 @@ boundary. The existing reconciliation worker still invokes the sequential
 wrapper, so this refactor changes neither durable grammar nor epoch count and
 requires no version advance. It is the internal ownership boundary on which
 durable staging and plural destination installation will be built.
+Preparation now also computes and owns the imported metadata proof for the
+expected next destination epoch. A destination-epoch conflict refreshes the
+source runtime map and replaces that compact prepared binding before retrying;
+artifact command rebasing therefore remains outside control-plane command
+derivation. This is still protocol-neutral and does not authorize staging or
+route installation by itself.
 Command v19 additionally sealed the
 post-grace completion fence that prevents survivor heartbeats from indefinitely
 reactivating the old acting set; immutable command v18 remains rejection
