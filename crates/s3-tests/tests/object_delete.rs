@@ -102,7 +102,7 @@ type PutObjectCallResult = Result<
     aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
 >;
 
-const CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS: usize = 3;
+const CONDITIONAL_DELETE_OBJECTS_RACE_MAX_ATTEMPTS: usize = 2;
 
 #[derive(Debug)]
 enum ConditionalDeleteObjectsEntryOutcome {

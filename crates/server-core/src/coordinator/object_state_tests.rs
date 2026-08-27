@@ -6052,48 +6052,6 @@ fn delete_object_retrying_operation_contention(
     }
 }
 
-fn upload_part_copy_retrying_operation_contention(
-    coord: &Coordinator,
-    req: &UploadPartCopyRequest<'_>,
-) -> Result<UploadPartCopyResult, ServerError> {
-    const MAX_ATTEMPTS: usize = 2;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        match coord.upload_part_copy(req) {
-            Ok(result) => return Ok(result),
-            Err(error)
-                if server_error_is_retryable_operation_contention(&error)
-                    && attempt + 1 < MAX_ATTEMPTS =>
-            {
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("retry loop must return on its final attempt")
-}
-
-fn copy_object_retrying_operation_contention(
-    coord: &Coordinator,
-    req: &CopyObjectRequest<'_>,
-) -> Result<CopyObjectResult, ServerError> {
-    const MAX_ATTEMPTS: usize = 2;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        match coord.copy_object(req) {
-            Ok(result) => return Ok(result),
-            Err(error)
-                if server_error_is_retryable_operation_contention(&error)
-                    && attempt + 1 < MAX_ATTEMPTS =>
-            {
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("retry loop must return on its final attempt")
-}
-
 #[test]
 fn get_object_is_consistent_during_concurrent_overwrite() {
     let tmp = test_util::tempdir();
@@ -6272,28 +6230,25 @@ fn copy_object_is_consistent_during_concurrent_overwrite() {
         });
         let t_copy = thread::spawn(move || {
             b2.wait();
-            copy_object_retrying_operation_contention(
-                &copier,
-                &CopyObjectRequest {
-                    source: copy_source("src-bucket", "src", None),
-                    destination: object_request_with_expected_owner(
-                        "dst-bucket",
-                        &dst_key_for_copy,
-                        test_requester(),
-                        None,
-                    ),
-                    dst_condition: NO_WRITE,
-                    directive: MetadataDirective::Copy,
-                    website_redirect_location: None,
-                    tagging: TaggingDirective::Copy,
+            copier.copy_object(&CopyObjectRequest {
+                source: copy_source("src-bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "dst-bucket",
+                    &dst_key_for_copy,
+                    test_requester(),
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                website_redirect_location: None,
+                tagging: TaggingDirective::Copy,
 
-                    acl: NO_PUT_OBJECT_ACL.into(),
-                    policy_context: PutObjectPolicyContext::default(),
-                    source_sse_customer: None,
-                    destination_encryption: WriteEncryptionRequest::none(),
-                    object_lock: ObjectLockState::default(),
-                },
-            )
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            })
         });
 
         barrier.wait();
@@ -6724,26 +6679,23 @@ fn upload_part_copy_is_consistent_during_concurrent_overwrite() {
         });
         let t_copy = thread::spawn(move || {
             b2.wait();
-            upload_part_copy_retrying_operation_contention(
-                &copier,
-                &UploadPartCopyRequest {
-                    source: copy_source("bucket", "src", None),
-                    upload: multipart_object_request_with_expected_owner(
-                        "bucket",
-                        &dst_key_for_copy,
-                        &upload_id_for_copy,
-                        test_requester(),
-                        None,
-                    ),
-                    part_number: 1,
-                    copy_source_range: None,
+            copier.upload_part_copy(&UploadPartCopyRequest {
+                source: copy_source("bucket", "src", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    &dst_key_for_copy,
+                    &upload_id_for_copy,
+                    test_requester(),
+                    None,
+                ),
+                part_number: 1,
+                copy_source_range: None,
 
-                    policy_context: PutObjectPolicyContext::default(),
+                policy_context: PutObjectPolicyContext::default(),
 
-                    source_sse_customer: None,
-                    sse_customer: None,
-                },
-            )
+                source_sse_customer: None,
+                sse_customer: None,
+            })
         });
 
         barrier.wait();

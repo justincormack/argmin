@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 const DIRECT_CONDITIONAL_PUT_BYTES: usize = 64 * 1024;
 const STREAMED_CONDITIONAL_PUT_BYTES: usize = 4 * 1024 * 1024;
 const CONDITIONAL_PUT_STREAM_CHUNK_BYTES: usize = 64 * 1024;
-const CONDITIONAL_RACE_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Default)]
 struct ConditionalPutStartGateState {
@@ -291,45 +290,6 @@ fn assert_one_conditional_put_winner(
         assert_s3_err_code(loser, "PreconditionFailed");
     }
     (winner_byte, winner_state, winner_etag, loser_status)
-}
-
-fn conditional_put_race_saw_slow_down(
-    left: &PutObjectCallResult,
-    right: &PutObjectCallResult,
-    context: &str,
-) -> bool {
-    let is_slow_down = |result: &PutObjectCallResult| {
-        result
-            .as_ref()
-            .err()
-            .and_then(|error| error.as_service_error())
-            .and_then(ProvideErrorMetadata::code)
-            == Some("SlowDown")
-    };
-    let left_slow_down = is_slow_down(left);
-    let right_slow_down = is_slow_down(right);
-    if !left_slow_down && !right_slow_down {
-        return false;
-    }
-
-    for (side, result, slow_down) in [
-        ("left", left, left_slow_down),
-        ("right", right, right_slow_down),
-    ] {
-        if slow_down {
-            assert_eq!(
-                err_status(result),
-                503,
-                "{context}: {side} SlowDown used the wrong HTTP status: {result:?}"
-            );
-        } else {
-            assert!(
-                result.is_ok(),
-                "{context}: SlowDown accompanied an unrelated {side} failure: {result:?}"
-            );
-        }
-    }
-    true
 }
 
 async fn assert_conditional_put_winner_visible(
@@ -1397,47 +1357,21 @@ fn test_simultaneous_if_none_match_puts_publish_one_complete_object() {
             ),
         ];
 
-        for (name, base_key, body_size, delay) in cases {
-            let mut completed = None;
-            for attempt in 0..CONDITIONAL_RACE_MAX_ATTEMPTS {
-                let key = if attempt == 0 {
-                    base_key.to_string()
-                } else {
-                    format!("{base_key}-retry-{attempt}")
-                };
-                let (left, right) = send_coordinated_conditional_puts(
-                    &bucket,
-                    &key,
-                    RacingPutCondition::IfNoneMatchStar,
-                    body_size,
-                    delay,
-                )
-                .await;
-                if conditional_put_race_saw_slow_down(&left, &right, name) {
-                    assert!(
-                        attempt + 1 < CONDITIONAL_RACE_MAX_ATTEMPTS,
-                        "{name}: conditional race returned SlowDown on all \
-                         {CONDITIONAL_RACE_MAX_ATTEMPTS} attempts"
-                    );
-                    let _ = s3_tests::delete_object_retrying_operation_aborted(
-                        CTX.client(),
-                        &bucket,
-                        &key,
-                    )
-                    .await;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-                completed = Some((key, left, right));
-                break;
-            }
-            let (key, left, right) = completed.expect("conditional race must complete");
+        for (name, key, body_size, delay) in cases {
+            let (left, right) = send_coordinated_conditional_puts(
+                &bucket,
+                key,
+                RacingPutCondition::IfNoneMatchStar,
+                body_size,
+                delay,
+            )
+            .await;
             let (winner_byte, winner_state, winner_etag, loser_status) =
                 assert_one_conditional_put_winner(&left, &right, name);
             println!("simultaneous If-None-Match {name} loser status: {loser_status}");
             assert_conditional_put_winner_visible(
                 &bucket,
-                &key,
+                key,
                 winner_byte,
                 winner_state,
                 &winner_etag,
@@ -1454,7 +1388,7 @@ fn test_simultaneous_if_none_match_puts_publish_one_complete_object() {
                 .client()
                 .put_object()
                 .bucket(&bucket)
-                .key(&key)
+                .key(key)
                 .if_none_match("*")
                 .metadata("writer", loser_state)
                 .body(ByteStream::from_static(b"loser retry"))
@@ -1464,14 +1398,14 @@ fn test_simultaneous_if_none_match_puts_publish_one_complete_object() {
             assert_s3_err_code(&retry, "PreconditionFailed");
             assert_conditional_put_winner_visible(
                 &bucket,
-                &key,
+                key,
                 winner_byte,
                 winner_state,
                 &winner_etag,
                 body_size,
             )
             .await;
-            s3_tests::delete_object_retrying_operation_aborted(CTX.client(), &bucket, &key)
+            s3_tests::delete_object_retrying_operation_aborted(CTX.client(), &bucket, key)
                 .await
                 .unwrap();
         }
@@ -1499,51 +1433,24 @@ fn test_simultaneous_if_match_puts_publish_one_complete_object() {
             ),
         ];
 
-        for (name, base_key, body_size, delay) in cases {
-            let mut completed = None;
-            for attempt in 0..CONDITIONAL_RACE_MAX_ATTEMPTS {
-                let key = if attempt == 0 {
-                    base_key.to_string()
-                } else {
-                    format!("{base_key}-retry-{attempt}")
-                };
-                let original_etag = put_object(&bucket, &key, b"original").await;
-                let condition = RacingPutCondition::IfMatch(original_etag.clone());
-                let (left, right) = send_coordinated_conditional_puts(
-                    &bucket,
-                    &key,
-                    condition.clone(),
-                    body_size,
-                    delay,
-                )
-                .await;
-                if conditional_put_race_saw_slow_down(&left, &right, name) {
-                    assert!(
-                        attempt + 1 < CONDITIONAL_RACE_MAX_ATTEMPTS,
-                        "{name}: conditional race returned SlowDown on all \
-                         {CONDITIONAL_RACE_MAX_ATTEMPTS} attempts"
-                    );
-                    let _ = s3_tests::delete_object_retrying_operation_aborted(
-                        CTX.client(),
-                        &bucket,
-                        &key,
-                    )
-                    .await;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-                completed = Some((key, original_etag, condition, left, right));
-                break;
-            }
-            let (key, original_etag, condition, left, right) =
-                completed.expect("conditional race must complete");
+        for (name, key, body_size, delay) in cases {
+            let original_etag = put_object(&bucket, key, b"original").await;
+            let condition = RacingPutCondition::IfMatch(original_etag.clone());
+            let (left, right) = send_coordinated_conditional_puts(
+                &bucket,
+                key,
+                condition.clone(),
+                body_size,
+                delay,
+            )
+            .await;
             let (winner_byte, winner_state, winner_etag, loser_status) =
                 assert_one_conditional_put_winner(&left, &right, name);
             println!("simultaneous If-Match {name} loser status: {loser_status}");
             assert_ne!(winner_etag, original_etag);
             assert_conditional_put_winner_visible(
                 &bucket,
-                &key,
+                key,
                 winner_byte,
                 winner_state,
                 &winner_etag,
@@ -1560,7 +1467,7 @@ fn test_simultaneous_if_match_puts_publish_one_complete_object() {
                 CTX.client()
                     .put_object()
                     .bucket(&bucket)
-                    .key(&key)
+                    .key(key)
                     .metadata("writer", loser_state)
                     .body(ByteStream::from_static(b"loser retry")),
                 &condition,
@@ -1571,14 +1478,14 @@ fn test_simultaneous_if_match_puts_publish_one_complete_object() {
             assert_s3_err_code(&retry, "PreconditionFailed");
             assert_conditional_put_winner_visible(
                 &bucket,
-                &key,
+                key,
                 winner_byte,
                 winner_state,
                 &winner_etag,
                 body_size,
             )
             .await;
-            s3_tests::delete_object_retrying_operation_aborted(CTX.client(), &bucket, &key)
+            s3_tests::delete_object_retrying_operation_aborted(CTX.client(), &bucket, key)
                 .await
                 .unwrap();
         }
