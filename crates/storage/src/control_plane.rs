@@ -56,6 +56,7 @@ const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 pub const DEFAULT_UNAVAILABLE_PLACEMENT_GRACE_MS: u64 = 30_000;
 pub const UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE: usize = 16;
+pub const MAX_UNAVAILABLE_PG_TRANSITION_BATCH: usize = 16;
 pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
@@ -72,7 +73,9 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 31;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 32;
+const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
+    b"argmin-unavailable-pg-transition-batch-receipt-v1";
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
 const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
@@ -900,6 +903,324 @@ pub struct UnavailablePgPlacementTransition {
     destination_epoch: Option<ClusterEpoch>,
     destination_route: Option<HistoricalPgRouteRecord>,
     payload_readiness: Option<UnavailablePgPayloadReadiness>,
+    completion: Option<ReadyPgPeeringCompletion>,
+    begin_batch_receipt: UnavailablePgTransitionBatchReceipt,
+    completion_batch_receipt: Option<UnavailablePgTransitionBatchReceipt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum UnavailablePgTransitionBatchStage {
+    Begin,
+    Completion,
+}
+
+impl UnavailablePgTransitionBatchStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Begin => "begin",
+            Self::Completion => "completion",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "begin" => Ok(Self::Begin),
+            "completion" => Ok(Self::Completion),
+            _ => Err(format!(
+                "unknown unavailable PG transition batch stage {value:?}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UnavailablePgTransitionBatchReceiptIdentity {
+    stage: UnavailablePgTransitionBatchStage,
+    member_pg_ids: Vec<PgId>,
+    members_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UnavailablePgTransitionBatchReceipt {
+    identity: UnavailablePgTransitionBatchReceiptIdentity,
+    source_epoch: ClusterEpoch,
+    target_epoch: ClusterEpoch,
+}
+
+#[derive(Debug, Clone)]
+struct UnavailablePgTransitionBeginRequest {
+    pg_id: PgId,
+    predecessor_transition_epoch: Option<ClusterEpoch>,
+    source_epoch: ClusterEpoch,
+    source_acting_set: Vec<NodeId>,
+    source_node_id: NodeId,
+    begin_authorization: UnavailablePgTransitionBeginAuthorization,
+    unavailable_node: NodeUnavailableObservation,
+    grace_cutoff_ms: u64,
+    topology_generation: u64,
+    topology_digest: [u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+    destination_acting_set: Vec<NodeId>,
+}
+
+#[derive(Debug)]
+enum ValidatedUnavailablePgTransitionBegin {
+    ExactReplay {
+        pg_id: PgId,
+    },
+    Apply {
+        requested: Box<UnavailablePgPlacementTransition>,
+        previous_primary_lease: Option<PreviousPrimaryLease>,
+        fenced_primary_lease_deadline_ms: u64,
+    },
+}
+
+impl ValidatedUnavailablePgTransitionBegin {
+    fn pg_id(&self) -> PgId {
+        match self {
+            Self::ExactReplay { pg_id } => *pg_id,
+            Self::Apply { requested, .. } => requested.pg_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UnavailablePgTransitionCompletionRequest {
+    unavailable_transition: UnavailablePgTransitionMutationBinding,
+    pg_id: PgId,
+    transition_epoch: ClusterEpoch,
+    destination_epoch: ClusterEpoch,
+    topology_generation: u64,
+    topology_digest: [u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+    destinations: Vec<UnavailablePgPayloadDestinationReadiness>,
+    completion: ReadyPgPeeringCompletion,
+}
+
+#[derive(Debug)]
+enum ValidatedUnavailablePgTransitionCompletion {
+    ExactReplay {
+        pg_id: PgId,
+    },
+    Apply {
+        readiness: Box<UnavailablePgPayloadReadiness>,
+        completion: ReadyPgPeeringCompletion,
+        batch_identity: UnavailablePgTransitionBatchReceiptIdentity,
+    },
+}
+
+impl ValidatedUnavailablePgTransitionCompletion {
+    fn pg_id(&self) -> PgId {
+        match self {
+            Self::ExactReplay { pg_id } => *pg_id,
+            Self::Apply { readiness, .. } => readiness.pg_id,
+        }
+    }
+}
+
+fn validate_canonical_unavailable_pg_batch(
+    kind: &str,
+    pg_ids: impl IntoIterator<Item = PgId>,
+) -> Result<(), ControlPlaneError> {
+    let mut previous = None;
+    let mut count = 0_usize;
+    for pg_id in pg_ids {
+        count = count.saturating_add(1);
+        if count > MAX_UNAVAILABLE_PG_TRANSITION_BATCH {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "unavailable placement {kind} batch exceeds the {} member limit",
+                    MAX_UNAVAILABLE_PG_TRANSITION_BATCH
+                ),
+            });
+        }
+        if previous.is_some_and(|previous_pg_id| previous_pg_id >= pg_id) {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "unavailable placement {kind} batch PG IDs are not strictly increasing"
+                ),
+            });
+        }
+        previous = Some(pg_id);
+    }
+    if count == 0 {
+        return Err(ControlPlaneError::CommandDecode {
+            message: format!("unavailable placement {kind} batch is empty"),
+        });
+    }
+    Ok(())
+}
+
+fn unavailable_pg_transition_begin_batch_identity(
+    requests: &[UnavailablePgTransitionBeginRequest],
+    expected_transition_epoch: ClusterEpoch,
+    begin_at_ms: u64,
+) -> UnavailablePgTransitionBatchReceiptIdentity {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(
+        &mut hasher,
+        UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN,
+    );
+    digest_u8(&mut hasher, 1);
+    digest_u64(&mut hasher, expected_transition_epoch.get());
+    digest_u64(&mut hasher, begin_at_ms);
+    digest_len(&mut hasher, requests.len());
+    for request in requests {
+        digest_u32(&mut hasher, request.pg_id.get());
+        digest_option_u64(
+            &mut hasher,
+            request.predecessor_transition_epoch.map(ClusterEpoch::get),
+        );
+        digest_u64(&mut hasher, request.source_epoch.get());
+        digest_node_ids(&mut hasher, &request.source_acting_set);
+        digest_u32(&mut hasher, request.source_node_id.as_u32());
+        digest_bytes(
+            &mut hasher,
+            format_unavailable_pg_transition_begin_authorization(&request.begin_authorization)
+                .as_bytes(),
+        );
+        digest_unavailable_node_observation(&mut hasher, &request.unavailable_node);
+        digest_u64(&mut hasher, request.grace_cutoff_ms);
+        digest_u64(&mut hasher, request.topology_generation);
+        digest_bytes(&mut hasher, &request.topology_digest);
+        digest_node_ids(&mut hasher, &request.destination_acting_set);
+    }
+    UnavailablePgTransitionBatchReceiptIdentity {
+        stage: UnavailablePgTransitionBatchStage::Begin,
+        member_pg_ids: requests.iter().map(|request| request.pg_id).collect(),
+        members_digest: hasher
+            .finalize()
+            .bytes()
+            .try_into()
+            .expect("SHA-256 unavailable transition batch digest must contain 32 bytes"),
+    }
+}
+
+fn unavailable_pg_transition_completion_batch_identity(
+    requests: &[UnavailablePgTransitionCompletionRequest],
+    ready_at_ms: u64,
+) -> UnavailablePgTransitionBatchReceiptIdentity {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(
+        &mut hasher,
+        UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN,
+    );
+    digest_u8(&mut hasher, 2);
+    digest_u64(&mut hasher, ready_at_ms);
+    digest_len(&mut hasher, requests.len());
+    for request in requests {
+        digest_unavailable_pg_transition_binding(&mut hasher, &request.unavailable_transition);
+        digest_u32(&mut hasher, request.pg_id.get());
+        digest_u64(&mut hasher, request.transition_epoch.get());
+        digest_u64(&mut hasher, request.destination_epoch.get());
+        digest_u64(&mut hasher, request.topology_generation);
+        digest_bytes(&mut hasher, &request.topology_digest);
+        digest_len(&mut hasher, request.destinations.len());
+        for destination in &request.destinations {
+            digest_u32(&mut hasher, destination.node_id.as_u32());
+            digest_u64(&mut hasher, destination.node_incarnation);
+            digest_bytes(&mut hasher, destination.endpoint.as_bytes());
+            digest_u64(&mut hasher, destination.lease_deadline_ms);
+        }
+        digest_u32(&mut hasher, request.completion.pg_id.get());
+        digest_u32(&mut hasher, request.completion.primary.as_u32());
+        digest_u64(&mut hasher, request.completion.node_incarnation);
+        digest_pg_metadata_proof(&mut hasher, request.completion.active_metadata_proof);
+        digest_u64(
+            &mut hasher,
+            request.completion.active_metadata_proof_epoch.get(),
+        );
+    }
+    UnavailablePgTransitionBatchReceiptIdentity {
+        stage: UnavailablePgTransitionBatchStage::Completion,
+        member_pg_ids: requests.iter().map(|request| request.pg_id).collect(),
+        members_digest: hasher
+            .finalize()
+            .bytes()
+            .try_into()
+            .expect("SHA-256 unavailable transition batch digest must contain 32 bytes"),
+    }
+}
+
+fn unavailable_pg_transition_begin_request_from_durable(
+    transition: &UnavailablePgPlacementTransition,
+) -> UnavailablePgTransitionBeginRequest {
+    UnavailablePgTransitionBeginRequest {
+        pg_id: transition.pg_id,
+        predecessor_transition_epoch: transition.predecessor_transition_epoch,
+        source_epoch: transition.source_epoch,
+        source_acting_set: transition.source_acting_set.clone(),
+        source_node_id: transition.source_node_id,
+        begin_authorization: transition.begin_authorization.clone(),
+        unavailable_node: transition.unavailable_node.clone(),
+        grace_cutoff_ms: transition.grace_cutoff_ms,
+        topology_generation: transition.topology_generation,
+        topology_digest: transition.topology_digest,
+        destination_acting_set: transition.destination_acting_set.clone(),
+    }
+}
+
+fn unavailable_pg_transition_completion_request_from_durable(
+    transition: &UnavailablePgPlacementTransition,
+) -> Result<(UnavailablePgTransitionCompletionRequest, u64), String> {
+    let readiness = transition.payload_readiness.as_ref().ok_or_else(|| {
+        format!(
+            "unavailable PG transition {} has a completion receipt without payload readiness",
+            transition.pg_id.get()
+        )
+    })?;
+    let completion = transition.completion.ok_or_else(|| {
+        format!(
+            "unavailable PG transition {} has a completion receipt without completion evidence",
+            transition.pg_id.get()
+        )
+    })?;
+    Ok((
+        UnavailablePgTransitionCompletionRequest {
+            unavailable_transition: UnavailablePgTransitionMutationBinding::new(
+                transition.pg_id,
+                transition.transition_epoch,
+                transition.source_epoch,
+                transition.source_acting_set.clone(),
+                transition.destination_acting_set.clone(),
+            ),
+            pg_id: transition.pg_id,
+            transition_epoch: transition.transition_epoch,
+            destination_epoch: readiness.destination_epoch,
+            topology_generation: transition.topology_generation,
+            topology_digest: transition.topology_digest,
+            destinations: readiness.destinations.clone(),
+            completion,
+        },
+        readiness.ready_at_ms,
+    ))
+}
+
+fn digest_node_ids(hasher: &mut ChecksumHasher, node_ids: &[NodeId]) {
+    digest_len(hasher, node_ids.len());
+    for node_id in node_ids {
+        digest_u32(hasher, node_id.as_u32());
+    }
+}
+
+fn digest_unavailable_node_observation(
+    hasher: &mut ChecksumHasher,
+    observation: &NodeUnavailableObservation,
+) {
+    digest_u32(hasher, observation.node_id.as_u32());
+    digest_u64(hasher, observation.node_incarnation);
+    digest_bytes(hasher, observation.endpoint.as_bytes());
+    digest_u64(hasher, observation.lease_deadline_ms);
+    digest_u64(hasher, observation.observed_at_ms);
+}
+
+fn digest_unavailable_pg_transition_binding(
+    hasher: &mut ChecksumHasher,
+    binding: &UnavailablePgTransitionMutationBinding,
+) {
+    digest_u32(hasher, binding.pg_id.get());
+    digest_u64(hasher, binding.transition_epoch.get());
+    digest_u64(hasher, binding.source_epoch.get());
+    digest_node_ids(hasher, &binding.source_acting_set);
+    digest_node_ids(hasher, &binding.destination_acting_set);
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1470,6 +1791,336 @@ impl ClusterControlSnapshot {
         })
     }
 
+    fn validate_unavailable_pg_transition_begin(
+        &self,
+        request: UnavailablePgTransitionBeginRequest,
+        expected_transition_epoch: ClusterEpoch,
+        begin_at_ms: u64,
+        batch_receipt: &UnavailablePgTransitionBatchReceipt,
+    ) -> Result<ValidatedUnavailablePgTransitionBegin, ControlPlaneError> {
+        let pg_id = request.pg_id;
+        let requested = UnavailablePgPlacementTransition {
+            pg_id,
+            transition_epoch: expected_transition_epoch,
+            predecessor_transition_epoch: request.predecessor_transition_epoch,
+            topology_generation: request.topology_generation,
+            topology_digest: request.topology_digest,
+            source_epoch: request.source_epoch,
+            source_acting_set: request.source_acting_set.clone(),
+            source_node_id: request.source_node_id,
+            begin_authorization: request.begin_authorization.clone(),
+            unavailable_node: request.unavailable_node.clone(),
+            grace_cutoff_ms: request.grace_cutoff_ms,
+            destination_acting_set: request.destination_acting_set.clone(),
+            destination_epoch: None,
+            destination_route: None,
+            payload_readiness: None,
+            completion: None,
+            begin_batch_receipt: batch_receipt.clone(),
+            completion_batch_receipt: None,
+        };
+        if let Some(existing) = self
+            .retained_unavailable_pg_placement_transitions
+            .get(&(pg_id, expected_transition_epoch))
+        {
+            let mut original_request = existing.clone();
+            original_request.destination_epoch = None;
+            original_request.destination_route = None;
+            original_request.payload_readiness = None;
+            original_request.completion = None;
+            original_request.completion_batch_receipt = None;
+            if original_request == requested {
+                return Ok(ValidatedUnavailablePgTransitionBegin::ExactReplay { pg_id });
+            }
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} retained transition epoch belongs to a different request",
+                    pg_id.get()
+                ),
+            });
+        }
+        if let Some(existing) = self.unavailable_pg_placement_transitions.get(&pg_id) {
+            let mut original_request = existing.clone();
+            original_request.destination_epoch = None;
+            original_request.destination_route = None;
+            original_request.payload_readiness = None;
+            original_request.completion = None;
+            original_request.completion_batch_receipt = None;
+            if original_request == requested {
+                return Ok(ValidatedUnavailablePgTransitionBegin::ExactReplay { pg_id });
+            }
+            if request.predecessor_transition_epoch != Some(existing.transition_epoch) {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} successor transition does not consume the active transition tip",
+                        pg_id.get()
+                    ),
+                });
+            }
+        } else {
+            let retained_tip = self
+                .retained_unavailable_pg_placement_transitions
+                .range((pg_id, ClusterEpoch::INITIAL)..=(pg_id, self.cluster_epoch))
+                .next_back()
+                .map(|(_, transition)| transition.transition_epoch);
+            if request.predecessor_transition_epoch != retained_tip {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} successor transition does not consume the retained lineage tip",
+                        pg_id.get()
+                    ),
+                });
+            }
+        }
+        self.validate_serving_timestamp(begin_at_ms)?;
+        if request.source_epoch != self.cluster_epoch {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} unavailable placement source epoch {} does not match current epoch {}",
+                    pg_id.get(),
+                    request.source_epoch,
+                    self.cluster_epoch
+                ),
+            });
+        }
+        if expected_transition_epoch != next_epoch(self.cluster_epoch)? {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} unavailable placement transition epoch is not the next cluster epoch",
+                    pg_id.get()
+                ),
+            });
+        }
+        let topology =
+            self.initial_topology
+                .as_ref()
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: "unavailable placement transition requires certified topology"
+                        .to_string(),
+                })?;
+        if topology.topology_generation() != request.topology_generation
+            || topology.topology_digest() != &request.topology_digest
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "unavailable placement transition topology changed".to_string(),
+            });
+        }
+        let observation = self
+            .unavailable_node_observations
+            .get(&request.unavailable_node.node_id)
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: format!(
+                    "node {} has no durable unavailable lease observation",
+                    request.unavailable_node.node_id.as_u32()
+                ),
+            })?;
+        if observation != &request.unavailable_node {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "node {} unavailable lease observation changed",
+                    request.unavailable_node.node_id.as_u32()
+                ),
+            });
+        }
+        let expected_grace_cutoff_ms = request
+            .unavailable_node
+            .observed_at_ms
+            .checked_add(
+                topology
+                    .placement_policy()
+                    .unavailable_replacement_grace_ms(),
+            )
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "unavailable placement grace cutoff overflows".to_string(),
+            })?;
+        if request.grace_cutoff_ms != expected_grace_cutoff_ms
+            || begin_at_ms < request.grace_cutoff_ms
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} unavailable placement grace has not elapsed",
+                    pg_id.get()
+                ),
+            });
+        }
+        let record = self
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if !matches!(record.state, PgState::Active | PgState::Peering)
+            || record.acting_set != request.source_acting_set
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!("PG {} unavailable placement source changed", pg_id.get()),
+            });
+        }
+        let expected_destination = deterministic_unavailable_pg_destination(
+            self,
+            pg_id,
+            &request.source_acting_set,
+            request.unavailable_node.node_id,
+            begin_at_ms,
+        )?;
+        if request.destination_acting_set != expected_destination {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} unavailable placement destination is not the deterministic eligible replacement",
+                    pg_id.get()
+                ),
+            });
+        }
+        let expected_begin_authorization = unavailable_pg_transition_begin_authorization(
+            self,
+            record,
+            &request.destination_acting_set,
+            &request.unavailable_node,
+            begin_at_ms,
+        )?;
+        if request.begin_authorization != expected_begin_authorization
+            || request.source_node_id != request.begin_authorization.source_node_id
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} unavailable placement begin authorization changed",
+                    pg_id.get()
+                ),
+            });
+        }
+        let previous_primary_lease = active_primary_lease(self, record)
+            .or_else(|| record.previous_primary_lease.clone())
+            .map(PreviousPrimaryLease::without_reactivation_preference);
+        let fenced_primary_lease_deadline_ms = previous_primary_lease
+            .as_ref()
+            .map_or(request.unavailable_node.lease_deadline_ms, |lease| {
+                lease.lease_deadline_ms
+            });
+        Ok(ValidatedUnavailablePgTransitionBegin::Apply {
+            requested: Box::new(requested),
+            previous_primary_lease,
+            fenced_primary_lease_deadline_ms,
+        })
+    }
+
+    fn validate_unavailable_pg_transition_begin_batch(
+        &self,
+        requests: Vec<UnavailablePgTransitionBeginRequest>,
+        expected_transition_epoch: ClusterEpoch,
+        begin_at_ms: u64,
+    ) -> Result<Vec<ValidatedUnavailablePgTransitionBegin>, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "begin",
+            requests.iter().map(|request| request.pg_id),
+        )?;
+        let batch_receipt = UnavailablePgTransitionBatchReceipt {
+            identity: unavailable_pg_transition_begin_batch_identity(
+                &requests,
+                expected_transition_epoch,
+                begin_at_ms,
+            ),
+            source_epoch: requests[0].source_epoch,
+            target_epoch: expected_transition_epoch,
+        };
+        requests
+            .into_iter()
+            .map(|request| {
+                self.validate_unavailable_pg_transition_begin(
+                    request,
+                    expected_transition_epoch,
+                    begin_at_ms,
+                    &batch_receipt,
+                )
+            })
+            .collect()
+    }
+
+    fn apply_validated_unavailable_pg_transition_begins(
+        &self,
+        validated: Vec<ValidatedUnavailablePgTransitionBegin>,
+        expected_transition_epoch: ClusterEpoch,
+        begin_at_ms: u64,
+    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "begin",
+            validated
+                .iter()
+                .map(ValidatedUnavailablePgTransitionBegin::pg_id),
+        )?;
+        if validated.iter().all(|entry| {
+            matches!(
+                entry,
+                ValidatedUnavailablePgTransitionBegin::ExactReplay { .. }
+            )
+        }) {
+            return Ok(None);
+        }
+        if validated.iter().any(|entry| {
+            matches!(
+                entry,
+                ValidatedUnavailablePgTransitionBegin::ExactReplay { .. }
+            )
+        }) {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "unavailable placement begin batch mixes replayed and new members"
+                    .to_string(),
+            });
+        }
+        let mut next_snapshot = self.clone();
+        next_snapshot.record_committed_timestamp(begin_at_ms);
+        for entry in validated {
+            let ValidatedUnavailablePgTransitionBegin::Apply {
+                requested,
+                previous_primary_lease,
+                fenced_primary_lease_deadline_ms,
+            } = entry
+            else {
+                unreachable!("mixed replay was rejected before batch mutation");
+            };
+            let pg_id = requested.pg_id;
+            if let Some(previous) = next_snapshot
+                .unavailable_pg_placement_transitions
+                .remove(&pg_id)
+            {
+                next_snapshot
+                    .retained_unavailable_pg_placement_transitions
+                    .insert((pg_id, previous.transition_epoch), previous);
+            }
+            let source_acting_set = requested.source_acting_set.clone();
+            let source_node_id = requested.source_node_id;
+            let source_metadata_floor = requested.begin_authorization.source_metadata_floor;
+            let source_metadata_floor_epoch =
+                requested.begin_authorization.source_metadata_floor_epoch;
+            let source_metadata_floor_imported =
+                requested.begin_authorization.source_metadata_floor_imported;
+            next_snapshot
+                .unavailable_pg_placement_transitions
+                .insert(pg_id, *requested);
+            let record = next_snapshot
+                .pgs
+                .get_mut(&pg_id)
+                .expect("unavailable transition PG was validated");
+            record.acting_set =
+                unavailable_transition_source_route_acting_set(&source_acting_set, source_node_id);
+            record.state = PgState::Peering;
+            record.active_primary = None;
+            record.active_metadata_proof = None;
+            record.active_metadata_proof_epoch = None;
+            record.active_metadata_transfer_imported = false;
+            record.previous_primary_lease = previous_primary_lease;
+            record.peering_metadata_proof_floor = Some(source_metadata_floor);
+            record.peering_metadata_proof_floor_epoch = source_metadata_floor_epoch;
+            record.peering_metadata_proof_floor_imported = source_metadata_floor_imported;
+            record.peering_metadata_transfer = None;
+            record.peering_metadata_transfer_source_route_epoch = None;
+            record.peering_metadata_transfer_source_node_id = None;
+            record.metadata_transfer_fenced = true;
+            record.metadata_transfer_fence_source_lease_deadline_ms =
+                Some(fenced_primary_lease_deadline_ms);
+            record.metadata_transfer_fence_source_imported = source_metadata_floor_imported;
+            record.metadata_transfer_fence_epoch = Some(expected_transition_epoch);
+        }
+        next_snapshot.bump_epoch()?;
+        Ok(Some(next_snapshot))
+    }
+
     pub(crate) fn complete_unavailable_pg_placement_transition_command(
         &self,
         work: &UnavailablePgReconciliationWork,
@@ -1559,6 +2210,216 @@ impl ClusterControlSnapshot {
                 completion,
             },
         )
+    }
+
+    fn validate_unavailable_pg_transition_completion(
+        &self,
+        request: UnavailablePgTransitionCompletionRequest,
+        ready_at_ms: u64,
+        batch_identity: &UnavailablePgTransitionBatchReceiptIdentity,
+    ) -> Result<ValidatedUnavailablePgTransitionCompletion, ControlPlaneError> {
+        let pg_id = request.pg_id;
+        if request.completion.pg_id != pg_id {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} completion carries nested PG subject {}",
+                    pg_id.get(),
+                    request.completion.pg_id.get()
+                ),
+            });
+        }
+        let readiness = UnavailablePgPayloadReadiness {
+            pg_id,
+            transition_epoch: request.transition_epoch,
+            destination_epoch: request.destination_epoch,
+            topology_generation: request.topology_generation,
+            topology_digest: request.topology_digest,
+            ready_at_ms,
+            destinations: request.destinations,
+        };
+        let Some(transition) = self.unavailable_pg_placement_transitions.get(&pg_id) else {
+            let exact_retained_transition = self
+                .retained_unavailable_pg_placement_transitions
+                .get(&(pg_id, request.unavailable_transition.transition_epoch()))
+                .is_some_and(|retained| {
+                    request.unavailable_transition.matches_transition(retained)
+                        && retained.payload_readiness.as_ref() == Some(&readiness)
+                        && retained.completion.as_ref() == Some(&request.completion)
+                        && retained
+                            .completion_batch_receipt
+                            .as_ref()
+                            .is_some_and(|receipt| receipt.identity == *batch_identity)
+                });
+            if exact_retained_transition {
+                return Ok(ValidatedUnavailablePgTransitionCompletion::ExactReplay { pg_id });
+            }
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} has no matching active unavailable placement transition",
+                    pg_id.get()
+                ),
+            });
+        };
+        if !request
+            .unavailable_transition
+            .matches_transition(transition)
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} completion does not match its active unavailable placement transition",
+                    pg_id.get()
+                ),
+            });
+        }
+        validate_unavailable_pg_payload_readiness(self, transition, &readiness)?;
+        Ok(ValidatedUnavailablePgTransitionCompletion::Apply {
+            readiness: Box::new(readiness),
+            completion: request.completion,
+            batch_identity: batch_identity.clone(),
+        })
+    }
+
+    fn validate_unavailable_pg_transition_completion_batch(
+        &self,
+        requests: Vec<UnavailablePgTransitionCompletionRequest>,
+        ready_at_ms: u64,
+    ) -> Result<Vec<ValidatedUnavailablePgTransitionCompletion>, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "completion",
+            requests.iter().map(|request| request.pg_id),
+        )?;
+        let batch_identity =
+            unavailable_pg_transition_completion_batch_identity(&requests, ready_at_ms);
+        requests
+            .into_iter()
+            .map(|request| {
+                self.validate_unavailable_pg_transition_completion(
+                    request,
+                    ready_at_ms,
+                    &batch_identity,
+                )
+            })
+            .collect()
+    }
+
+    fn apply_validated_unavailable_pg_transition_completions(
+        &self,
+        validated: Vec<ValidatedUnavailablePgTransitionCompletion>,
+        ready_at_ms: u64,
+    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "completion",
+            validated
+                .iter()
+                .map(ValidatedUnavailablePgTransitionCompletion::pg_id),
+        )?;
+        if validated.iter().all(|entry| {
+            matches!(
+                entry,
+                ValidatedUnavailablePgTransitionCompletion::ExactReplay { .. }
+            )
+        }) {
+            return Ok(None);
+        }
+        if validated.iter().any(|entry| {
+            matches!(
+                entry,
+                ValidatedUnavailablePgTransitionCompletion::ExactReplay { .. }
+            )
+        }) {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "unavailable placement completion batch mixes replayed and new members"
+                    .to_string(),
+            });
+        }
+        self.validate_serving_timestamp(ready_at_ms)?;
+        let mut ready_snapshot = self.clone();
+        for entry in &validated {
+            let ValidatedUnavailablePgTransitionCompletion::Apply { readiness, .. } = entry else {
+                unreachable!("mixed replay was rejected before batch validation");
+            };
+            ready_snapshot
+                .unavailable_pg_placement_transitions
+                .get_mut(&readiness.pg_id)
+                .expect("payload-readiness transition was validated")
+                .payload_readiness = Some((**readiness).clone());
+        }
+        for entry in &validated {
+            let ValidatedUnavailablePgTransitionCompletion::Apply {
+                readiness,
+                completion,
+                ..
+            } = entry
+            else {
+                unreachable!("mixed replay was rejected before batch validation");
+            };
+            validate_pg_peering_completion(PgPeeringCompletionValidation {
+                snapshot: &ready_snapshot,
+                pg_id: readiness.pg_id,
+                primary: completion.primary,
+                node_incarnation: completion.node_incarnation,
+                completed_at_ms: ready_at_ms,
+                expected: Some(ExpectedPgPeeringCompletion {
+                    active_metadata_proof: completion.active_metadata_proof,
+                    active_metadata_proof_epoch: completion.active_metadata_proof_epoch,
+                }),
+            })?;
+        }
+        ready_snapshot.record_committed_timestamp(ready_at_ms);
+        let mut completed = Vec::with_capacity(validated.len());
+        for entry in validated {
+            let ValidatedUnavailablePgTransitionCompletion::Apply {
+                readiness,
+                completion,
+                batch_identity,
+            } = entry
+            else {
+                unreachable!("mixed replay was rejected before batch mutation");
+            };
+            let pg_id = readiness.pg_id;
+            let record = ready_snapshot
+                .pgs
+                .get_mut(&pg_id)
+                .expect("unavailable placement completion PG was validated");
+            record.state = PgState::Active;
+            record.active_primary = Some(completion.primary);
+            record.active_metadata_proof = Some(completion.active_metadata_proof);
+            record.active_metadata_transfer_imported = record.peering_metadata_transfer.is_some();
+            record.previous_primary_lease = None;
+            record.peering_metadata_proof_floor = None;
+            record.peering_metadata_proof_floor_epoch = None;
+            record.peering_metadata_proof_floor_imported = false;
+            record.peering_metadata_transfer = None;
+            record.peering_metadata_transfer_source_route_epoch = None;
+            record.peering_metadata_transfer_source_node_id = None;
+            record.metadata_transfer_fenced = false;
+            record.metadata_transfer_fence_source_lease_deadline_ms = None;
+            record.metadata_transfer_fence_source_imported = false;
+            record.metadata_transfer_fence_epoch = None;
+            let mut transition = ready_snapshot
+                .unavailable_pg_placement_transitions
+                .remove(&pg_id)
+                .expect("completed unavailable transition was validated");
+            transition.completion = Some(completion);
+            transition.completion_batch_receipt = Some(UnavailablePgTransitionBatchReceipt {
+                identity: batch_identity,
+                source_epoch: self.cluster_epoch,
+                target_epoch: next_epoch(self.cluster_epoch)?,
+            });
+            ready_snapshot
+                .retained_unavailable_pg_placement_transitions
+                .insert((pg_id, transition.transition_epoch), transition);
+            completed.push((pg_id, completion.active_metadata_proof_epoch));
+        }
+        ready_snapshot.bump_epoch()?;
+        for (pg_id, proof_epoch) in completed {
+            ready_snapshot
+                .pgs
+                .get_mut(&pg_id)
+                .expect("unavailable placement PG activated before epoch bump")
+                .active_metadata_proof_epoch = Some(proof_epoch);
+        }
+        Ok(Some(ready_snapshot))
     }
 
     pub fn cluster_map_history(&self) -> &[ClusterMapHistoryRecord] {
@@ -2772,6 +3633,12 @@ impl ClusterControlSnapshot {
                     pg_id.get()
                 ));
             }
+            if transition.completion.is_some() || transition.completion_batch_receipt.is_some() {
+                return Err(format!(
+                    "active unavailable PG transition {} retains completion evidence",
+                    pg_id.get()
+                ));
+            }
             validate_unavailable_pg_transition_invariant(self, transition)?;
             let pg = self.pgs.get(pg_id).ok_or_else(|| {
                 format!(
@@ -2800,6 +3667,7 @@ impl ClusterControlSnapshot {
             }
         }
         validate_unavailable_pg_transition_lineages(self)?;
+        validate_unavailable_pg_transition_batch_receipts(self)?;
         for pg in self.pgs.values() {
             if pg.acting_set.is_empty() {
                 return Err(format!("PG {} has an empty acting set", pg.pg_id.get()));
@@ -4215,252 +5083,41 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 expected_transition_epoch,
                 begin_at_ms,
             } => {
-                let supplied_observation = NodeUnavailableObservation {
-                    node_id: unavailable_node_id,
-                    node_incarnation: unavailable_node_incarnation,
-                    endpoint: unavailable_endpoint,
-                    lease_deadline_ms: unavailable_lease_deadline_ms,
-                    observed_at_ms: unavailable_observed_at_ms,
-                };
-                let requested = UnavailablePgPlacementTransition {
+                let request = UnavailablePgTransitionBeginRequest {
                     pg_id,
-                    transition_epoch: expected_transition_epoch,
                     predecessor_transition_epoch,
                     topology_generation,
                     topology_digest,
                     source_epoch,
-                    source_acting_set: source_acting_set.clone(),
+                    source_acting_set,
                     source_node_id,
-                    begin_authorization: (*begin_authorization).clone(),
-                    unavailable_node: supplied_observation.clone(),
+                    begin_authorization: *begin_authorization,
+                    unavailable_node: NodeUnavailableObservation {
+                        node_id: unavailable_node_id,
+                        node_incarnation: unavailable_node_incarnation,
+                        endpoint: unavailable_endpoint,
+                        lease_deadline_ms: unavailable_lease_deadline_ms,
+                        observed_at_ms: unavailable_observed_at_ms,
+                    },
                     grace_cutoff_ms,
-                    destination_acting_set: destination_acting_set.clone(),
-                    destination_epoch: None,
-                    destination_route: None,
-                    payload_readiness: None,
+                    destination_acting_set,
                 };
-                if let Some(existing) = self
-                    .retained_unavailable_pg_placement_transitions
-                    .get(&(pg_id, expected_transition_epoch))
-                {
-                    let mut original_request = existing.clone();
-                    original_request.destination_epoch = None;
-                    original_request.destination_route = None;
-                    original_request.payload_readiness = None;
-                    if original_request == requested {
-                        return Ok(applied_control_plane_command(
-                            self,
-                            self.clone(),
-                            ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransition,
-                            false,
-                        ));
-                    }
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} retained transition epoch belongs to a different request",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                if let Some(existing) = self.unavailable_pg_placement_transitions.get(&pg_id) {
-                    let mut original_request = existing.clone();
-                    original_request.destination_epoch = None;
-                    original_request.destination_route = None;
-                    original_request.payload_readiness = None;
-                    if original_request == requested {
-                        return Ok(applied_control_plane_command(
-                            self,
-                            self.clone(),
-                            ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransition,
-                            false,
-                        ));
-                    }
-                    if predecessor_transition_epoch != Some(existing.transition_epoch) {
-                        return Err(ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} successor transition does not consume the active transition tip",
-                                pg_id.get()
-                            ),
-                        });
-                    }
-                } else {
-                    let retained_tip = self
-                        .retained_unavailable_pg_placement_transitions
-                        .range((pg_id, ClusterEpoch::INITIAL)..=(pg_id, self.cluster_epoch))
-                        .next_back()
-                        .map(|(_, transition)| transition.transition_epoch);
-                    if predecessor_transition_epoch != retained_tip {
-                        return Err(ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} successor transition does not consume the retained lineage tip",
-                                pg_id.get()
-                            ),
-                        });
-                    }
-                }
-                self.validate_serving_timestamp(begin_at_ms)?;
-                if source_epoch != self.cluster_epoch {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} unavailable placement source epoch {} does not match current epoch {}",
-                            pg_id.get(),
-                            source_epoch,
-                            self.cluster_epoch
-                        ),
-                    });
-                }
-                if expected_transition_epoch != next_epoch(self.cluster_epoch)? {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} unavailable placement transition epoch is not the next cluster epoch",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                let topology = self.initial_topology.as_ref().ok_or_else(|| {
-                    ControlPlaneError::CommandDecode {
-                        message: "unavailable placement transition requires certified topology"
-                            .to_string(),
-                    }
-                })?;
-                if topology.topology_generation() != topology_generation
-                    || topology.topology_digest() != &topology_digest
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: "unavailable placement transition topology changed".to_string(),
-                    });
-                }
-                let observation = self
-                    .unavailable_node_observations
-                    .get(&unavailable_node_id)
-                    .ok_or_else(|| ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "node {} has no durable unavailable lease observation",
-                            unavailable_node_id.as_u32()
-                        ),
-                    })?;
-                if observation != &supplied_observation {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "node {} unavailable lease observation changed",
-                            unavailable_node_id.as_u32()
-                        ),
-                    });
-                }
-                let expected_grace_cutoff_ms = unavailable_observed_at_ms
-                    .checked_add(
-                        topology
-                            .placement_policy()
-                            .unavailable_replacement_grace_ms(),
-                    )
-                    .ok_or_else(|| ControlPlaneError::CommandDecode {
-                        message: "unavailable placement grace cutoff overflows".to_string(),
-                    })?;
-                if grace_cutoff_ms != expected_grace_cutoff_ms || begin_at_ms < grace_cutoff_ms {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} unavailable placement grace has not elapsed",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                let record = self
-                    .pg(pg_id)
-                    .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-                if !matches!(record.state, PgState::Active | PgState::Peering)
-                    || record.acting_set != source_acting_set
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!("PG {} unavailable placement source changed", pg_id.get()),
-                    });
-                }
-                let expected_destination = deterministic_unavailable_pg_destination(
-                    self,
-                    pg_id,
-                    &source_acting_set,
-                    unavailable_node_id,
+                let validated = self.validate_unavailable_pg_transition_begin_batch(
+                    vec![request],
+                    expected_transition_epoch,
                     begin_at_ms,
                 )?;
-                if destination_acting_set != expected_destination {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} unavailable placement destination is not the deterministic eligible replacement",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                let expected_begin_authorization = unavailable_pg_transition_begin_authorization(
-                    self,
-                    record,
-                    &destination_acting_set,
-                    &supplied_observation,
+                let next_snapshot = self.apply_validated_unavailable_pg_transition_begins(
+                    validated,
+                    expected_transition_epoch,
                     begin_at_ms,
                 )?;
-                if begin_authorization.as_ref() != &expected_begin_authorization
-                    || source_node_id != begin_authorization.source_node_id
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} unavailable placement begin authorization changed",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                let mut next_snapshot = self.clone();
-                next_snapshot.record_committed_timestamp(begin_at_ms);
-                if let Some(previous) = next_snapshot
-                    .unavailable_pg_placement_transitions
-                    .remove(&pg_id)
-                {
-                    next_snapshot
-                        .retained_unavailable_pg_placement_transitions
-                        .insert((pg_id, previous.transition_epoch), previous);
-                }
-                next_snapshot
-                    .unavailable_pg_placement_transitions
-                    .insert(pg_id, requested);
-                let previous_primary_lease = active_primary_lease(self, record)
-                    .or_else(|| record.previous_primary_lease.clone())
-                    .map(PreviousPrimaryLease::without_reactivation_preference);
-                let fenced_primary_lease_deadline_ms = previous_primary_lease
-                    .as_ref()
-                    .map(|lease| lease.lease_deadline_ms)
-                    .unwrap_or(supplied_observation.lease_deadline_ms);
-                let record = next_snapshot
-                    .pgs
-                    .get_mut(&pg_id)
-                    .expect("unavailable transition PG was validated");
-                record.acting_set = unavailable_transition_source_route_acting_set(
-                    &source_acting_set,
-                    source_node_id,
-                );
-                record.state = PgState::Peering;
-                record.active_primary = None;
-                record.active_metadata_proof = None;
-                record.active_metadata_proof_epoch = None;
-                record.active_metadata_transfer_imported = false;
-                record.previous_primary_lease = previous_primary_lease;
-                record.peering_metadata_proof_floor =
-                    Some(begin_authorization.source_metadata_floor);
-                record.peering_metadata_proof_floor_epoch =
-                    begin_authorization.source_metadata_floor_epoch;
-                record.peering_metadata_proof_floor_imported =
-                    begin_authorization.source_metadata_floor_imported;
-                record.peering_metadata_transfer = None;
-                record.peering_metadata_transfer_source_route_epoch = None;
-                record.peering_metadata_transfer_source_node_id = None;
-                record.metadata_transfer_fenced = true;
-                record.metadata_transfer_fence_source_lease_deadline_ms =
-                    Some(fenced_primary_lease_deadline_ms);
-                record.metadata_transfer_fence_source_imported =
-                    begin_authorization.source_metadata_floor_imported;
-                record.metadata_transfer_fence_epoch = Some(expected_transition_epoch);
-                next_snapshot.bump_epoch()?;
+                let changed = next_snapshot.is_some();
                 Ok(applied_control_plane_command(
                     self,
-                    next_snapshot,
+                    next_snapshot.unwrap_or_else(|| self.clone()),
                     ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransition,
-                    true,
+                    changed,
                 ))
             }
             ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
@@ -4474,105 +5131,30 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 destinations,
                 completion,
             } => {
-                self.validate_serving_timestamp(ready_at_ms)?;
-                let Some(transition) = self.unavailable_pg_placement_transitions.get(&pg_id) else {
-                    if self
-                        .retained_unavailable_pg_placement_transitions
-                        .get(&(pg_id, unavailable_transition.transition_epoch()))
-                        .is_some_and(|retained| unavailable_transition.matches_transition(retained))
-                        && self.pg(pg_id).is_some_and(|pg| {
-                            pg.state == PgState::Active
-                                && pg.acting_set == unavailable_transition.destination_acting_set
-                        })
-                    {
-                        return Ok(applied_control_plane_command(
-                            self,
-                            self.clone(),
-                            ControlPlaneCommandResponse::CompleteUnavailablePgPlacementTransition,
-                            false,
-                        ));
-                    }
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} has no matching active unavailable placement transition",
-                            pg_id.get()
-                        ),
-                    });
-                };
-                if !unavailable_transition.matches_transition(transition) {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} completion does not match its active unavailable placement transition",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                let readiness = UnavailablePgPayloadReadiness {
+                let request = UnavailablePgTransitionCompletionRequest {
+                    unavailable_transition,
                     pg_id,
                     transition_epoch,
                     destination_epoch,
                     topology_generation,
                     topology_digest,
-                    ready_at_ms,
                     destinations,
+                    completion,
                 };
-                validate_unavailable_pg_payload_readiness(self, transition, &readiness)?;
-                let mut ready_snapshot = self.clone();
-                ready_snapshot
-                    .unavailable_pg_placement_transitions
-                    .get_mut(&pg_id)
-                    .expect("payload-readiness transition was validated")
-                    .payload_readiness = Some(readiness);
-                validate_pg_peering_completion(PgPeeringCompletionValidation {
-                    snapshot: &ready_snapshot,
-                    pg_id,
-                    primary: completion.primary,
-                    node_incarnation: completion.node_incarnation,
-                    completed_at_ms: ready_at_ms,
-                    expected: Some(ExpectedPgPeeringCompletion {
-                        active_metadata_proof: completion.active_metadata_proof,
-                        active_metadata_proof_epoch: completion.active_metadata_proof_epoch,
-                    }),
-                })?;
-                ready_snapshot.record_committed_timestamp(ready_at_ms);
-                let record = ready_snapshot
-                    .pgs
-                    .get_mut(&pg_id)
-                    .expect("unavailable placement completion PG was validated");
-                record.state = PgState::Active;
-                record.active_primary = Some(completion.primary);
-                record.active_metadata_proof = Some(completion.active_metadata_proof);
-                record.active_metadata_transfer_imported =
-                    record.peering_metadata_transfer.is_some();
-                record.previous_primary_lease = None;
-                record.peering_metadata_proof_floor = None;
-                record.peering_metadata_proof_floor_epoch = None;
-                record.peering_metadata_proof_floor_imported = false;
-                record.peering_metadata_transfer = None;
-                record.peering_metadata_transfer_source_route_epoch = None;
-                record.peering_metadata_transfer_source_node_id = None;
-                record.metadata_transfer_fenced = false;
-                record.metadata_transfer_fence_source_lease_deadline_ms = None;
-                record.metadata_transfer_fence_source_imported = false;
-                record.metadata_transfer_fence_epoch = None;
-                let transition = ready_snapshot
-                    .unavailable_pg_placement_transitions
-                    .remove(&pg_id)
-                    .expect("completed unavailable transition was validated");
-                ready_snapshot
-                    .retained_unavailable_pg_placement_transitions
-                    .insert((pg_id, transition.transition_epoch), transition);
-                ready_snapshot.bump_epoch()?;
-                ready_snapshot
-                    .pgs
-                    .get_mut(&pg_id)
-                    .expect("unavailable placement PG activated before epoch bump")
-                    .active_metadata_proof_epoch = Some(completion.active_metadata_proof_epoch);
+                let validated = self.validate_unavailable_pg_transition_completion_batch(
+                    vec![request],
+                    ready_at_ms,
+                )?;
+                let ready_snapshot = self.apply_validated_unavailable_pg_transition_completions(
+                    validated,
+                    ready_at_ms,
+                )?;
+                let changed = ready_snapshot.is_some();
                 Ok(applied_control_plane_command(
                     self,
-                    ready_snapshot,
+                    ready_snapshot.unwrap_or_else(|| self.clone()),
                     ControlPlaneCommandResponse::CompleteUnavailablePgPlacementTransition,
-                    true,
+                    changed,
                 ))
             }
             ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => {
@@ -6048,6 +6630,262 @@ fn validate_unavailable_pg_transition_invariant(
                     transition.pg_id.get()
                 ));
             }
+        }
+    }
+    validate_unavailable_pg_transition_batch_receipt(
+        transition,
+        &transition.begin_batch_receipt,
+        UnavailablePgTransitionBatchStage::Begin,
+    )?;
+    if transition.completion.is_some() != transition.completion_batch_receipt.is_some() {
+        return Err(format!(
+            "unavailable PG transition {} has incomplete completion receipt evidence",
+            transition.pg_id.get()
+        ));
+    }
+    if let Some(receipt) = &transition.completion_batch_receipt {
+        validate_unavailable_pg_transition_batch_receipt(
+            transition,
+            receipt,
+            UnavailablePgTransitionBatchStage::Completion,
+        )?;
+        validate_unavailable_pg_transition_completion_evidence(snapshot, transition, receipt)?;
+    }
+    Ok(())
+}
+
+fn validate_unavailable_pg_transition_completion_evidence(
+    snapshot: &ClusterControlSnapshot,
+    transition: &UnavailablePgPlacementTransition,
+    receipt: &UnavailablePgTransitionBatchReceipt,
+) -> Result<(), String> {
+    let target_epoch = next_epoch(receipt.source_epoch).map_err(|error| error.to_string())?;
+    if receipt.target_epoch != target_epoch || receipt.target_epoch > snapshot.cluster_epoch {
+        return Err(format!(
+            "unavailable PG transition {} has invalid completion activation epochs",
+            transition.pg_id.get()
+        ));
+    }
+    let readiness = transition.payload_readiness.as_ref().ok_or_else(|| {
+        format!(
+            "unavailable PG transition {} has a completion receipt without payload readiness",
+            transition.pg_id.get()
+        )
+    })?;
+    let completion = transition.completion.as_ref().ok_or_else(|| {
+        format!(
+            "unavailable PG transition {} has a completion receipt without completion evidence",
+            transition.pg_id.get()
+        )
+    })?;
+    let destination_epoch = transition.destination_epoch.ok_or_else(|| {
+        format!(
+            "unavailable PG transition {} completed without a destination epoch",
+            transition.pg_id.get()
+        )
+    })?;
+    let destination_route = transition.destination_route.as_ref().ok_or_else(|| {
+        format!(
+            "unavailable PG transition {} completed without destination-route evidence",
+            transition.pg_id.get()
+        )
+    })?;
+    let destination_proof = destination_route
+        .peering_metadata_transfer
+        .ok_or_else(|| {
+            format!(
+                "unavailable PG transition {} completion has no imported metadata proof",
+                transition.pg_id.get()
+            )
+        })?
+        .metadata_proof();
+    let primary_readiness = readiness
+        .destinations
+        .iter()
+        .find(|destination| destination.node_id == completion.primary);
+    if receipt.source_epoch < destination_epoch
+        || completion.pg_id != transition.pg_id
+        || completion.active_metadata_proof_epoch != receipt.source_epoch
+        || completion.active_metadata_proof != destination_proof
+        || primary_readiness
+            .is_none_or(|destination| destination.node_incarnation != completion.node_incarnation)
+    {
+        return Err(format!(
+            "unavailable PG transition {} has invalid completion evidence",
+            transition.pg_id.get()
+        ));
+    }
+    let source_route = snapshot
+        .reconstructed_pg_route_at_epoch(transition.pg_id, receipt.source_epoch)
+        .map_err(|error| {
+            format!(
+                "unavailable PG transition {} completion source route is unavailable: {error}",
+                transition.pg_id.get()
+            )
+        })?;
+    if source_route.state() != PgState::Peering
+        || source_route.acting_set() != transition.destination_acting_set
+        || source_route.peering_metadata_transfer() != destination_route.peering_metadata_transfer
+    {
+        return Err(format!(
+            "unavailable PG transition {} completion source route does not match its destination",
+            transition.pg_id.get()
+        ));
+    }
+    let target_route = snapshot
+        .reconstructed_pg_route_at_epoch(transition.pg_id, receipt.target_epoch)
+        .map_err(|error| {
+            format!(
+                "unavailable PG transition {} completion target route is unavailable: {error}",
+                transition.pg_id.get()
+            )
+        })?;
+    if target_route.state() != PgState::Active
+        || target_route.acting_set() != transition.destination_acting_set
+        || target_route.primary_node_id() != completion.primary
+    {
+        return Err(format!(
+            "unavailable PG transition {} completion target route does not match its activation",
+            transition.pg_id.get()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unavailable_pg_transition_batch_receipt(
+    transition: &UnavailablePgPlacementTransition,
+    receipt: &UnavailablePgTransitionBatchReceipt,
+    expected_stage: UnavailablePgTransitionBatchStage,
+) -> Result<(), String> {
+    if receipt.identity.member_pg_ids.len() != 1 {
+        return Err(format!(
+            "control-plane state v32 requires a singleton {} receipt for unavailable PG transition {}",
+            expected_stage.as_str(),
+            transition.pg_id.get()
+        ));
+    }
+    if receipt.identity.stage != expected_stage
+        || receipt
+            .identity
+            .member_pg_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || receipt
+            .identity
+            .member_pg_ids
+            .binary_search(&transition.pg_id)
+            .is_err()
+        || receipt.source_epoch >= receipt.target_epoch
+        || (expected_stage == UnavailablePgTransitionBatchStage::Begin
+            && (receipt.source_epoch != transition.source_epoch
+                || receipt.target_epoch != transition.transition_epoch))
+    {
+        return Err(format!(
+            "unavailable PG transition {} has an invalid {} batch receipt",
+            transition.pg_id.get(),
+            expected_stage.as_str()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unavailable_pg_transition_batch_receipts(
+    snapshot: &ClusterControlSnapshot,
+) -> Result<(), String> {
+    let transitions = snapshot
+        .retained_unavailable_pg_placement_transitions
+        .values()
+        .chain(snapshot.unavailable_pg_placement_transitions.values())
+        .collect::<Vec<_>>();
+    let mut retained_members = BTreeMap::<
+        UnavailablePgTransitionBatchReceipt,
+        BTreeMap<PgId, Vec<&UnavailablePgPlacementTransition>>,
+    >::new();
+    for transition in &transitions {
+        for receipt in std::iter::once(&transition.begin_batch_receipt)
+            .chain(transition.completion_batch_receipt.as_ref())
+        {
+            retained_members
+                .entry(receipt.clone())
+                .or_default()
+                .entry(transition.pg_id)
+                .or_default()
+                .push(transition);
+        }
+    }
+    for (receipt, actual_members) in retained_members {
+        if actual_members.len() != receipt.identity.member_pg_ids.len()
+            || actual_members
+                .iter()
+                .any(|(_, transitions)| transitions.len() != 1)
+            || !actual_members
+                .keys()
+                .copied()
+                .eq(receipt.identity.member_pg_ids.iter().copied())
+        {
+            return Err(format!(
+                "unavailable PG {} batch receipt retained members do not match its canonical vector",
+                receipt.identity.stage.as_str()
+            ));
+        }
+        let member_transitions = receipt
+            .identity
+            .member_pg_ids
+            .iter()
+            .map(|pg_id| actual_members[pg_id][0])
+            .collect::<Vec<_>>();
+        let expected_identity = match receipt.identity.stage {
+            UnavailablePgTransitionBatchStage::Begin => {
+                let begin_at_ms = member_transitions[0].begin_authorization.begin_at_ms;
+                if member_transitions
+                    .iter()
+                    .any(|transition| transition.begin_authorization.begin_at_ms != begin_at_ms)
+                {
+                    return Err(
+                        "unavailable PG begin batch members have different commit times".into(),
+                    );
+                }
+                let requests = member_transitions
+                    .iter()
+                    .map(|transition| {
+                        unavailable_pg_transition_begin_request_from_durable(transition)
+                    })
+                    .collect::<Vec<_>>();
+                unavailable_pg_transition_begin_batch_identity(
+                    &requests,
+                    receipt.target_epoch,
+                    begin_at_ms,
+                )
+            }
+            UnavailablePgTransitionBatchStage::Completion => {
+                let requests_and_times = member_transitions
+                    .iter()
+                    .map(|transition| {
+                        unavailable_pg_transition_completion_request_from_durable(transition)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let ready_at_ms = requests_and_times[0].1;
+                if requests_and_times
+                    .iter()
+                    .any(|(_, member_ready_at_ms)| *member_ready_at_ms != ready_at_ms)
+                {
+                    return Err(
+                        "unavailable PG completion batch members have different commit times"
+                            .into(),
+                    );
+                }
+                let requests = requests_and_times
+                    .into_iter()
+                    .map(|(request, _)| request)
+                    .collect::<Vec<_>>();
+                unavailable_pg_transition_completion_batch_identity(&requests, ready_at_ms)
+            }
+        };
+        if receipt.identity != expected_identity {
+            return Err(format!(
+                "unavailable PG {} batch receipt digest does not match its durable member evidence",
+                receipt.identity.stage.as_str()
+            ));
         }
     }
     Ok(())
@@ -9548,7 +10386,7 @@ fn format_unavailable_pg_placement_transition(
     transition: &UnavailablePgPlacementTransition,
 ) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         transition.pg_id.get(),
         transition.transition_epoch.get(),
         option_u64(
@@ -9577,7 +10415,50 @@ fn format_unavailable_pg_placement_transition(
             || "-".to_string(),
             |route| hex_encode(format_historical_pg_route_record(route).as_bytes())
         ),
-        format_unavailable_pg_payload_readiness(transition.payload_readiness.as_ref())
+        format_unavailable_pg_payload_readiness(transition.payload_readiness.as_ref()),
+        transition.completion.as_ref().map_or_else(
+            || "-".to_string(),
+            |completion| hex_encode(format_ready_pg_peering_completion(completion).as_bytes())
+        ),
+        hex_encode(
+            format_unavailable_pg_transition_batch_receipt(&transition.begin_batch_receipt)
+                .as_bytes()
+        ),
+        transition.completion_batch_receipt.as_ref().map_or_else(
+            || "-".to_string(),
+            |receipt| hex_encode(
+                format_unavailable_pg_transition_batch_receipt(receipt).as_bytes()
+            )
+        )
+    )
+}
+
+fn format_ready_pg_peering_completion(completion: &ReadyPgPeeringCompletion) -> String {
+    let proof = completion.active_metadata_proof;
+    format!(
+        "{},{},{},{},{},{},{},{},{}",
+        completion.pg_id.get(),
+        completion.primary.as_u32(),
+        completion.node_incarnation,
+        proof.applied_log_index,
+        proof.applied_log_hash.encoding_version(),
+        proof.applied_log_hash.value(),
+        proof.state_digest.encoding_version(),
+        proof.state_digest.value(),
+        completion.active_metadata_proof_epoch.get(),
+    )
+}
+
+fn format_unavailable_pg_transition_batch_receipt(
+    receipt: &UnavailablePgTransitionBatchReceipt,
+) -> String {
+    format!(
+        "{},{},{},{},{}",
+        receipt.identity.stage.as_str(),
+        receipt.source_epoch.get(),
+        receipt.target_epoch.get(),
+        format_pg_list(&receipt.identity.member_pg_ids),
+        hex_encode(&receipt.identity.members_digest)
     )
 }
 
@@ -11214,10 +12095,10 @@ fn parse_unavailable_pg_placement_transition(
     value: &str,
 ) -> Result<UnavailablePgPlacementTransition, ControlPlaneError> {
     let fields: Vec<_> = value.split(',').collect();
-    if fields.len() != 19 {
+    if fields.len() != 22 {
         return Err(parse_error(
             line,
-            "unavailable PG placement transition must have nineteen fields",
+            "unavailable PG placement transition must have twenty-two fields",
         ));
     }
     let topology_digest = hex_decode(line, fields[4])?
@@ -11270,6 +12151,88 @@ fn parse_unavailable_pg_placement_transition(
             Some(parse_historical_pg_route_record(line, &encoded)?)
         },
         payload_readiness: parse_unavailable_pg_payload_readiness(line, fields[18])?,
+        completion: parse_ready_pg_peering_completion(line, fields[19])?,
+        begin_batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[20])?,
+        completion_batch_receipt: if fields[21] == "-" {
+            None
+        } else {
+            Some(parse_unavailable_pg_transition_batch_receipt(
+                line, fields[21],
+            )?)
+        },
+    })
+}
+
+fn parse_ready_pg_peering_completion(
+    line: usize,
+    value: &str,
+) -> Result<Option<ReadyPgPeeringCompletion>, ControlPlaneError> {
+    if value == "-" {
+        return Ok(None);
+    }
+    let encoded = String::from_utf8(hex_decode(line, value)?)
+        .map_err(|_| parse_error(line, "transition completion evidence is not UTF-8"))?;
+    let fields = encoded.split(',').collect::<Vec<_>>();
+    if fields.len() != 9 {
+        return Err(parse_error(
+            line,
+            "transition completion evidence must have nine fields",
+        ));
+    }
+    let active_metadata_proof =
+        parse_optional_metadata_proof(line, &fields[3..8], "transition completion metadata proof")?
+            .ok_or_else(|| parse_error(line, "transition completion metadata proof is required"))?;
+    Ok(Some(ReadyPgPeeringCompletion {
+        pg_id: PgId::new(parse_u32(line, fields[0], "transition completion PG id")?),
+        primary: NodeId::new(parse_u32(
+            line,
+            fields[1],
+            "transition completion primary node id",
+        )?),
+        node_incarnation: parse_u64(line, fields[2], "transition completion node incarnation")?,
+        active_metadata_proof,
+        active_metadata_proof_epoch: parse_required_cluster_epoch(
+            line,
+            fields[8],
+            "transition completion metadata proof epoch",
+        )?,
+    }))
+}
+
+fn parse_unavailable_pg_transition_batch_receipt(
+    line: usize,
+    value: &str,
+) -> Result<UnavailablePgTransitionBatchReceipt, ControlPlaneError> {
+    let encoded = String::from_utf8(hex_decode(line, value)?)
+        .map_err(|_| parse_error(line, "transition batch receipt is not UTF-8"))?;
+    let fields = encoded.split(',').collect::<Vec<_>>();
+    if fields.len() != 5 {
+        return Err(parse_error(
+            line,
+            "transition batch receipt must have five fields",
+        ));
+    }
+    let stage = UnavailablePgTransitionBatchStage::from_str(fields[0])
+        .map_err(|message| parse_error(line, &message))?;
+    let members_digest = hex_decode(line, fields[4])?
+        .try_into()
+        .map_err(|_| parse_error(line, "transition batch digest must contain 32 bytes"))?;
+    Ok(UnavailablePgTransitionBatchReceipt {
+        identity: UnavailablePgTransitionBatchReceiptIdentity {
+            stage,
+            member_pg_ids: parse_pg_list(line, fields[3])?,
+            members_digest,
+        },
+        source_epoch: parse_required_cluster_epoch(
+            line,
+            fields[1],
+            "transition batch source epoch",
+        )?,
+        target_epoch: parse_required_cluster_epoch(
+            line,
+            fields[2],
+            "transition batch target epoch",
+        )?,
     })
 }
 
@@ -12949,6 +13912,10 @@ fn required_cluster_map_history_protection<'a, 'b>(
         if let Some(destination_epoch) = transition.destination_epoch {
             exact_routes.insert((destination_epoch, transition.pg_id));
         }
+        if let Some(receipt) = &transition.completion_batch_receipt {
+            exact_routes.insert((receipt.source_epoch, transition.pg_id));
+            exact_routes.insert((receipt.target_epoch, transition.pg_id));
+        }
     }
     ClusterMapHistoryProtection { exact_routes }
 }
@@ -13184,6 +14151,13 @@ fn format_node_list(nodes: &[NodeId]) -> String {
         .join(":")
 }
 
+fn format_pg_list(pgs: &[PgId]) -> String {
+    pgs.iter()
+        .map(|pg_id| pg_id.get().to_string())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 fn parse_node_list(line: usize, value: &str) -> Result<Vec<NodeId>, ControlPlaneError> {
     if value.is_empty() {
         return Ok(Vec::new());
@@ -13191,6 +14165,16 @@ fn parse_node_list(line: usize, value: &str) -> Result<Vec<NodeId>, ControlPlane
     value
         .split(':')
         .map(|value| parse_u32(line, value, "node id").map(NodeId::new))
+        .collect()
+}
+
+fn parse_pg_list(line: usize, value: &str) -> Result<Vec<PgId>, ControlPlaneError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(':')
+        .map(|value| parse_u32(line, value, "PG id").map(PgId::new))
         .collect()
 }
 

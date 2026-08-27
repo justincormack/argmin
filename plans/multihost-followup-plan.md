@@ -375,9 +375,16 @@ history, and rejects coordinated transition evidence that no command could
 produce.
 Activation archives the completed tip into retained historical
 dependency state; it no longer blocks a later ordinary placement change or a
-CAS-bound successor transition. State v31 and command v19 seal the active and
-retained lineage, readiness, certified placement policy, and immutable state-v30
-and command-v18 rejection evidence. Command v19 additionally seals the
+CAS-bound successor transition. State v31 and command v19 sealed the active and
+retained lineage, readiness, and certified placement policy. State v32 and
+command v20 additionally seal immutable canonical singleton begin/completion
+replay receipts. State v32 retains the exact completion
+evidence and protected source/activation routes needed to recompute each
+receipt digest and reject command-unreachable completion epochs during snapshot
+validation. State-v32 publication and decoding require exactly one receipt
+member; durable multi-member receipts remain reserved for plural command v21
+and state v33. State v32 retains state-v31 and command-v19 rejection evidence.
+Command v19 additionally sealed the
 post-grace completion fence that prevents survivor heartbeats from indefinitely
 reactivating the old acting set; immutable command v18 remains rejection
 evidence. A control-plane RPC v17 adds exact transition-bound fence and install
@@ -521,7 +528,7 @@ as disjoint command domains; a generic metadata-transfer command must reject a
 PG owned by an unavailable-placement transition rather than accepting an
 optional transition binding.
 
-Command v20 removes the singular
+Command v21 removes the singular
 `BeginUnavailablePgPlacementTransition` and
 `CompleteUnavailablePgPlacementTransition` variants and removes the optional
 unavailable-transition branch from `SetPgActingSetWithMetadataTransfer`.
@@ -530,7 +537,7 @@ install command; the ordinary transfer command rejects an active transition.
 Likewise, use a dedicated exact-transition fence operation rather than an
 optional transition field on the generic fence command. Worker, direct-admin,
 test, and recovery entry points submit plural commands, wrapping one entry when
-only one PG is available. State-v32 validation requires every active and
+only one PG is available. State-v33 validation requires every active and
 retained unavailable transition to carry the applicable batch receipts and
 staging generation, so no singular command or decoded legacy state can bypass
 batch accounting.
@@ -780,8 +787,10 @@ the stale command and requires rederivation; it never relaxes exact lease
 equality.
 
 This slice changes both command grammar and command-reachable durable state.
-Advance the control-plane command version from v19 to v20 and state version
-from v31 to v32, retaining immutable v19/v31 rejection evidence and updating
+The receipt prerequisite advanced the control-plane command version from v19
+to v20 and state version from v31 to v32. Advance the plural command grammar
+from v20 to v21 and its complete durable state from v32 to v33, retaining
+immutable v19/v31 and v20/v32 rejection evidence and updating
 the nested journal, Raft WAL, snapshot, aggregate, and retained batch-receipt
 vectors. The new transition-scoped artifact staging operations cross the
 storage RPC boundary and therefore require the corresponding storage-RPC
@@ -834,7 +843,7 @@ Required deterministic and generated coverage includes:
   maximum acting sets and endpoint lengths;
 - identical count and encoded-byte splitting, decoder rejection, and legal
   single-entry fit coverage for staging-intent authorization batches;
-- v20 rejection of every singular unavailable-transition command path and
+- v21 rejection of every singular unavailable-transition command path and
   singleton operation through each plural worker/admin entry point;
 - multiple PGs sharing transition and destination epochs;
 - heartbeat renewal between batch preparation and gated derivation;

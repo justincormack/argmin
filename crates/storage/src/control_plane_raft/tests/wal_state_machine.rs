@@ -138,7 +138,7 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
         ),
         (
             714,
-            "7bb1df32b867390ab02c7dbef273b241afae699d82987eb8f91afa4573258bf1".to_owned()
+            "b0a257dd2fbc71b54f67ab2d7bcd3b43ea0a2ff40ae7d4be93ba885dcd49e57f".to_owned()
         )
     );
 }
@@ -565,7 +565,7 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         (
             75,
             236,
-            "5731190a2fcb5a6c0fa9cbcdf55fde1cff9256190c4cdbb5bf5fb55ff77ac1fb".to_owned(),
+            "1c25ff408d56918031cfd4e3eacb15fc4839e60781dc4a827a29975db5114412".to_owned(),
             112,
             "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62".to_owned()
         )
