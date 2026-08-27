@@ -646,7 +646,12 @@ impl super::StorageCluster {
                 Ok(prepared) => prepared,
                 Err(error) => return Ok(Err(error)),
             };
-            same_object_publication_already_projected = projected_same_object_command;
+            if let Some(projected_same_object_command) = projected_same_object_command {
+                // Keep the winner identity across later command-log contention. Its pending
+                // slot can remain visible on one replica after reinspection has stopped seeing
+                // it elsewhere; that must wait for cleanup, not project the same winner again.
+                same_object_publication_already_projected = Some(projected_same_object_command);
+            }
 
             let (command, new_pending_command) = match pending_command {
                 Some(command) => (command, false),
@@ -727,8 +732,15 @@ impl super::StorageCluster {
                             match drain {
                                 Ok(()) => {}
                                 Err(error)
-                                    if object_pg_action_error_is_retryable_pending_drain(&error) =>
+                                    if matches!(
+                                        error,
+                                        ObjectPgActionError::MetadataCommandRecoveryTransferred
+                                    ) || object_pg_action_error_is_retryable_pending_drain(&error) =>
                                 {
+                                    // An authorized recovery can own the command that caused the
+                                    // late log conflict. Wait within this request's work budget;
+                                    // exposing that internal handoff would turn ordinary PUT
+                                    // contention into a public SlowDown response.
                                     finalization_work_budget
                                         .sleep_after_contention(
                                             "stream PUT finalization late pending drain retry budget exhausted",
@@ -758,7 +770,7 @@ impl super::StorageCluster {
                             matches!(
                                 pending.payload(),
                                 MetadataCommandPayload::CommitDirectPutObject(commit)
-                                    if commit.matches_stream_session(bucket, key, session_id)
+                                if commit.matches_stream_session(bucket, key, session_id)
                             )
                         },
                     )? {

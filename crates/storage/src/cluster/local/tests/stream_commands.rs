@@ -3876,6 +3876,8 @@ fn stream_put_finalize_terminal_cleanup_handoff_projects_same_object_once() {
 
         let successful_action_calls = Arc::new(AtomicUsize::new(0));
         let successful_action_calls_for_action = Arc::clone(&successful_action_calls);
+        let successful_projection_calls = Arc::new(AtomicUsize::new(0));
+        let successful_projection_calls_for_action = Arc::clone(&successful_projection_calls);
         let (first_successful_action_tx, first_successful_action_rx) =
             std::sync::mpsc::sync_channel(1);
         let (successful_result_tx, successful_result_rx) = std::sync::mpsc::sync_channel(1);
@@ -3892,18 +3894,27 @@ fn stream_put_finalize_terminal_cleanup_handoff_projects_same_object_once() {
                     successful_session,
                     0,
                     |_| {
+                        let retained_winner = pending_metadata_command_for_test(
+                            successful_map,
+                            pg_id,
+                            successful_bucket,
+                        )
+                        .is_some();
+                        if retained_winner {
+                            successful_projection_calls_for_action
+                                .fetch_add(1, Ordering::SeqCst);
+                        }
                         let call = successful_action_calls_for_action
                             .fetch_add(1, Ordering::SeqCst);
                         if call == 0 {
+                            assert!(
+                                retained_winner,
+                                "first successful-contender action must project the retained winner"
+                            );
                             first_successful_action_tx.send(()).unwrap();
                         } else {
                             assert!(
-                                pending_metadata_command_for_test(
-                                    successful_map,
-                                    pg_id,
-                                    successful_bucket,
-                                )
-                                .is_none(),
+                                !retained_winner,
                                 "successful contender re-projected a winner whose terminal slot was still retained"
                             );
                         }
@@ -3978,10 +3989,14 @@ fn stream_put_finalize_terminal_cleanup_handoff_projects_same_object_once() {
             .expect("successful contender did not publish after winner cleanup")
             .unwrap()
             .unwrap();
+        assert!(
+            successful_action_calls.load(Ordering::SeqCst) >= 2,
+            "successful contender must revalidate after the winner slot is drained"
+        );
         assert_eq!(
-            successful_action_calls.load(Ordering::SeqCst),
-            2,
-            "successful contender must revalidate once after the winner slot is drained"
+            successful_projection_calls.load(Ordering::SeqCst),
+            1,
+            "successful contender must project the retained winner exactly once"
         );
         (
             winner_outcome,
@@ -4124,7 +4139,8 @@ fn assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
     assert!(injected.load(Ordering::SeqCst));
     match injected_action {
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
-        | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure => {
+        | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure
+        | crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred => {
             result
                 .expect("transient unrelated-command drain failure must be retried")
                 .expect("stream PUT preparation should succeed");

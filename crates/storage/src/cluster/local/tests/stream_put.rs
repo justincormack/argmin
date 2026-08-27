@@ -874,6 +874,7 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
                     injected_action,
                     crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
                         | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure
+                        | crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred
                 ) {
                     drop(recovery_owner_for_timeout.lock().unwrap().take());
                 }
@@ -1000,6 +1001,13 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
 fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
     assert_stream_put_finalize_command_id_race(StreamPutFinalizeCommandIdRace::PendingDrain(
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure,
+    ));
+}
+
+#[test]
+fn stream_put_finalize_late_recovery_transfer_retries() {
+    assert_stream_put_finalize_command_id_race(StreamPutFinalizeCommandIdRace::PendingDrain(
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred,
     ));
 }
 

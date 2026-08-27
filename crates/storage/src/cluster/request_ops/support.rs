@@ -715,6 +715,7 @@ pub(crate) enum StreamPutPendingDrainTestAction {
     Continue,
     RetryableFailure,
     IrrevocableFailure,
+    RecoveryTransferred,
     ExpireOuterBudget,
 }
 
@@ -1996,6 +1997,9 @@ fn maybe_run_stream_put_pending_drain_hook(
                 log_index: 1,
             },
         )),
+        StreamPutPendingDrainTestAction::RecoveryTransferred => {
+            Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
+        }
         StreamPutPendingDrainTestAction::ExpireOuterBudget => {
             work_budget.expire_for_test();
             Ok(())
