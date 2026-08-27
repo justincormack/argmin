@@ -263,6 +263,10 @@ impl SnapshotSensitiveRetryPhase {
         matches!(self, Self::PendingDrainAllowed)
     }
 
+    fn require_snapshot_reinspection(&mut self) {
+        *self = Self::ReinspectBeforePendingDrain;
+    }
+
     fn snapshot_evaluated(&mut self) -> SnapshotSensitiveEvaluatedAttempt<'_> {
         *self = Self::PendingDrainAllowed;
         SnapshotSensitiveEvaluatedAttempt { retry_phase: self }
@@ -275,7 +279,7 @@ struct SnapshotSensitiveEvaluatedAttempt<'a> {
 
 impl SnapshotSensitiveEvaluatedAttempt<'_> {
     fn require_snapshot_reinspection(&mut self) {
-        *self.retry_phase = SnapshotSensitiveRetryPhase::ReinspectBeforePendingDrain;
+        self.retry_phase.require_snapshot_reinspection();
     }
 }
 

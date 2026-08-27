@@ -4463,7 +4463,7 @@ fn direct_put_retries_irreversible_uncertainty_on_the_active_route() {
 }
 
 #[test]
-fn direct_put_terminal_cleanup_handoff_does_not_block_unrelated_reservation() {
+fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelated() {
     struct CleanupGateRelease(Option<std::sync::mpsc::SyncSender<()>>);
 
     impl CleanupGateRelease {
@@ -4536,6 +4536,35 @@ fn direct_put_terminal_cleanup_handoff_does_not_block_unrelated_reservation() {
         },
     );
 
+    let contender_reservation_id = crate::tests::stream_session_id("cleanup-contendr");
+    let contender_generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &contender_reservation_id)
+        .unwrap();
+    let contender_payload = b"same-object direct PUT contender";
+    let contender_segment_okh = [0x50; 16];
+    let contender_written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            contender_generation_id,
+            0,
+            &contender_segment_okh,
+            contender_payload,
+        )
+        .unwrap();
+    let contender_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: contender_reservation_id.clone(),
+            generation_id: contender_generation_id,
+            payload: contender_payload,
+            segment_okh: contender_segment_okh,
+            written: &contender_written,
+        },
+    );
+
     let cleanup_attempts = Arc::new(AtomicUsize::new(0));
     let cleanup_attempts_for_hook = Arc::clone(&cleanup_attempts);
     let (cleanup_reached_tx, cleanup_reached_rx) = std::sync::mpsc::sync_channel(1);
@@ -4589,6 +4618,37 @@ fn direct_put_terminal_cleanup_handoff_does_not_block_unrelated_reservation() {
         let pg_id = PgId::new(object_pg);
         let command = pending_metadata_command_for_test(&map, pg_id, &bucket)
             .expect("deferred terminal cleanup must retain the direct PUT command");
+
+        let contender_action_calls = Arc::new(AtomicUsize::new(0));
+        let (contender_action_tx, contender_action_rx) = std::sync::mpsc::channel();
+        let (contender_result_tx, contender_result_rx) = std::sync::mpsc::sync_channel(1);
+        let contender_cluster = &cluster;
+        let contender_request = &contender_req;
+        let contender_shards = &contender_written.written_shards;
+        let contender_action_calls_for_thread = Arc::clone(&contender_action_calls);
+        scope.spawn(move || {
+            contender_result_tx
+                .send(
+                    contender_cluster.commit_direct_put_object_from_payload_shards(
+                        contender_request,
+                        contender_shards,
+                        |snapshot| {
+                            contender_action_calls_for_thread.fetch_add(1, Ordering::SeqCst);
+                            contender_action_tx.send(()).unwrap();
+                            if snapshot.existing_etag.is_some() {
+                                Err("object already exists")
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    ),
+                )
+                .unwrap();
+        });
+        contender_action_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("same-object contender did not inspect the published winner");
+
         let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::sync_channel(1);
         let waiter_cluster = &cluster;
         let waiter_bucket = &bucket;
@@ -4618,12 +4678,37 @@ fn direct_put_terminal_cleanup_handoff_does_not_block_unrelated_reservation() {
             .recv_timeout(Duration::from_secs(5))
             .expect("unrelated reservation waiter remained blocked by terminal cleanup")
             .unwrap_err();
+        assert!(matches!(
+            cluster.reserve_put_object_generation(&bucket, &other_key, &other_reservation_id),
+            Err(crate::ObjectPgActionError::MetadataCommandRecoveryTransferred)
+        ));
+        assert_eq!(
+            cleanup_attempts.load(Ordering::SeqCst),
+            1,
+            "an unrelated request must not retry terminal cleanup on its request budget"
+        );
+
         cleanup_release.release();
         let outcome = owner_result_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("direct PUT owner did not finish after cleanup release")
             .unwrap()
             .unwrap();
+        drop(cleanup_hook);
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        let contender_result = contender_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("same-object contender did not finish cleanup after recovery")
+            .expect("same-object contender must project the published winner");
+        assert!(matches!(contender_result, Err("object already exists")));
+        assert_eq!(contender_action_calls.load(Ordering::SeqCst), 1);
         (outcome, waiter_error, command)
     });
     assert_eq!(outcome.live_size, payload.len() as u64);
@@ -4639,28 +4724,21 @@ fn direct_put_terminal_cleanup_handoff_does_not_block_unrelated_reservation() {
         MetadataCommandPayload::CommitDirectPutObject(commit)
             if commit.object.key == key && commit.object.generation_id == generation_id
     ));
-    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
-
-    assert!(matches!(
-        cluster.reserve_put_object_generation(&bucket, &other_key, &other_reservation_id),
-        Err(crate::ObjectPgActionError::MetadataCommandRecoveryTransferred)
-    ));
-    assert_eq!(
-        cleanup_attempts.load(Ordering::SeqCst),
-        1,
-        "an unrelated request must not retry terminal cleanup on its request budget"
-    );
-
-    drop(cleanup_hook);
-    assert_eq!(
-        cluster
-            .drain_pending_metadata_command_with_authorized_recovery_route(
-                pg_id, &command, &cluster,
-            )
-            .unwrap(),
-        PendingMetadataCommandOutcome::Applied
-    );
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+
+    assert_direct_payload_staging_cleaned(
+        &map,
+        &cluster,
+        &bucket,
+        &key,
+        &contender_reservation_id,
+        DirectPayloadTestIdentity {
+            data_pg_id: contender_written.data_pg_id,
+            ec: contender_written.ec,
+            segment_okh: contender_segment_okh,
+            segment_vid: contender_generation_id,
+        },
+    );
 }
 
 #[test]

@@ -70,6 +70,12 @@ impl StreamPutFinalizationRoute for storage::ActivePutObjectRoute<'_> {
 
 impl Coordinator {
     pub(super) fn map_direct_put_failure(error: storage::DirectPutFailure) -> ServerError {
+        let diagnostic_label = error.diagnostic_cause_label();
+        let _ = observability::event(
+            TRACE_TARGET,
+            "direct_put_error",
+            Some(format_args!("cause_label={diagnostic_label}")),
+        );
         match error.kind() {
             storage::DirectPutFailureKind::SnapshotReinspectionConflict
             | storage::DirectPutFailureKind::ResourceExhausted

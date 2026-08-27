@@ -433,8 +433,11 @@ impl super::StorageCluster {
             super::RequestWorkBudget::new(super::STREAM_PUT_FINALIZE_RETRY_BUDGET, None)
                 .for_operation("finalize_stream_put")
                 .for_pg(pg_id);
+        let mut same_object_publication_to_project = None;
+        let mut same_object_publication_already_projected = None;
 
         let (command, new_pending_command, prepared) = loop {
+            let mut projected_same_object_command = None;
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             finalization_work_budget
                 .check("stream PUT finalization pending retry budget exhausted")
@@ -445,33 +448,29 @@ impl super::StorageCluster {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.matches_stream_session(bucket, key, session_id)
                 );
-                if !is_matching_stream_commit {
+                let is_same_object_commit = matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket == *bucket && commit.object.key == *key
+                );
+                let project_same_object_publication = is_same_object_commit
+                    && same_object_publication_to_project == Some(command.id());
+                if project_same_object_publication {
+                    // The other PUT is logically applied, but its terminal cleanup may still
+                    // retain the pending slot. Read through that slot once so the action can
+                    // derive its conditional outcome from the winner's published object.
+                    same_object_publication_to_project = None;
+                    projected_same_object_command = Some(command.id());
+                } else if !is_matching_stream_commit {
                     #[cfg(test)]
-                    let drain = match maybe_run_stream_put_pending_drain_hook(
+                    let pending_drain_hook = maybe_run_stream_put_pending_drain_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
                         StreamPutPendingDrainTestEvent::Initial,
                         &mut finalization_work_budget,
-                    ) {
-                        Ok(()) => self.drain_pending_object_metadata_command_with_work_budget(
-                            publisher,
-                            pg_id,
-                            &command,
-                            &mut finalization_work_budget,
-                        ),
-                        Err(error) => Err(error),
-                    };
-                    #[cfg(not(test))]
-                    let drain = self.drain_pending_object_metadata_command_with_work_budget(
-                        publisher,
-                        pg_id,
-                        &command,
-                        &mut finalization_work_budget,
                     );
-                    match drain {
-                        Ok(_) => {}
-                        Err(error)
-                            if object_pg_action_error_is_retryable_pending_drain(&error) =>
-                        {
+                    #[cfg(test)]
+                    if let Err(error) = pending_drain_hook {
+                        if object_pg_action_error_is_retryable_pending_drain(&error) {
                             finalization_work_budget
                                 .sleep_after_contention(
                                     "stream PUT finalization pending drain retry budget exhausted",
@@ -479,7 +478,109 @@ impl super::StorageCluster {
                                 .map_err(ObjectPgActionError::Store)?;
                             continue;
                         }
-                        Err(error) => return Err(error),
+                        return Err(error);
+                    }
+
+                    if is_same_object_commit {
+                        let publication_state = self
+                            .metadata_command_publication_state_on_acting_set_until(
+                                pg_id,
+                                &command,
+                                super::MetadataCommandRouteMode::Normal,
+                                finalization_work_budget.deadline(),
+                            )
+                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                        if publication_state == super::MetadataCommandPublicationState::Published
+                            && same_object_publication_already_projected != Some(command.id())
+                        {
+                            same_object_publication_to_project = Some(command.id());
+                            continue;
+                        }
+                        match self
+                            .drain_pending_object_metadata_command_outcome_for_semantic_projection_with_work_budget(
+                                publisher,
+                                pg_id,
+                                &command,
+                                &mut finalization_work_budget,
+                            )
+                        {
+                            Ok(PendingMetadataCommandOutcome::Applied) => continue,
+                            Ok(
+                                PendingMetadataCommandOutcome::PublishedPendingRecovery
+                                | PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                    applied: true,
+                                },
+                            )
+                            | Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
+                                if same_object_publication_already_projected
+                                    == Some(command.id()) =>
+                            {
+                                finalization_work_budget
+                                    .sleep_after_contention(
+                                        "projected stream PUT winner cleanup retry budget exhausted",
+                                    )
+                                    .map_err(ObjectPgActionError::Store)?;
+                                continue;
+                            }
+                            Ok(
+                                PendingMetadataCommandOutcome::PublishedPendingRecovery
+                                | PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                    applied: true,
+                                },
+                            )
+                            | Err(ObjectPgActionError::MetadataCommandRecoveryTransferred) => {
+                                same_object_publication_to_project = Some(command.id());
+                                continue;
+                            }
+                            Ok(PendingMetadataCommandOutcome::Abandoned) => {}
+                            Ok(PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                applied: false,
+                            }) => {
+                                return Err(
+                                    ObjectPgActionError::MetadataCommandRecoveryTransferred,
+                                );
+                            }
+                            Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
+                                finalization_work_budget
+                                    .sleep_after_contention(
+                                        "same-object stream PUT partial command retry budget exhausted",
+                                    )
+                                    .map_err(ObjectPgActionError::Store)?;
+                                continue;
+                            }
+                            Err(error)
+                                if object_pg_action_error_is_retryable_pending_drain(&error) =>
+                            {
+                                finalization_work_budget
+                                    .sleep_after_contention(
+                                        "same-object stream PUT pending drain retry budget exhausted",
+                                    )
+                                    .map_err(ObjectPgActionError::Store)?;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        let drain = self.drain_pending_object_metadata_command_with_work_budget(
+                            publisher,
+                            pg_id,
+                            &command,
+                            &mut finalization_work_budget,
+                        );
+                        match drain {
+                            Ok(_) => {}
+                            Err(error)
+                                if object_pg_action_error_is_retryable_pending_drain(&error) =>
+                            {
+                                finalization_work_budget
+                                    .sleep_after_contention(
+                                        "stream PUT finalization pending drain retry budget exhausted",
+                                    )
+                                    .map_err(ObjectPgActionError::Store)?;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     finalization_work_budget
                         .sleep_after_contention(
@@ -545,6 +646,7 @@ impl super::StorageCluster {
                 Ok(prepared) => prepared,
                 Err(error) => return Ok(Err(error)),
             };
+            same_object_publication_already_projected = projected_same_object_command;
 
             let (command, new_pending_command) = match pending_command {
                 Some(command) => (command, false),

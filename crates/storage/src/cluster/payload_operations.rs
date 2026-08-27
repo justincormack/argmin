@@ -3932,20 +3932,72 @@ impl StorageCluster {
         let _ = self.release_object_generation_reservation(bucket, key, reservation_id);
     }
 
+    fn release_object_generation_reservation_after_same_object_projection(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        loop {
+            match self.release_object_generation_reservation_with_work_budget(
+                bucket,
+                key,
+                reservation_id,
+                work_budget,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if matches!(
+                        error,
+                        ObjectPgActionError::MetadataCommandRecoveryTransferred
+                    ) || request_ops::object_pg_action_error_is_retryable_pending_drain(&error) =>
+                {
+                    if work_budget
+                        .sleep_after_contention(
+                            "same-object direct PUT loser cleanup retry budget exhausted",
+                        )
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(crate) fn release_object_generation_reservation(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        let publisher = crate::metadata_command::metadata_command_publisher!(
-            ReleaseObjectGenerationReservation
-        );
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mut work_budget =
             RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
                 .for_operation("release_object_generation")
                 .for_pg(pg_id);
+        self.release_object_generation_reservation_with_work_budget(
+            bucket,
+            key,
+            reservation_id,
+            &mut work_budget,
+        )
+    }
+
+    fn release_object_generation_reservation_with_work_budget(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        reservation_id: &SessionId,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        let publisher = crate::metadata_command::metadata_command_publisher!(
+            ReleaseObjectGenerationReservation
+        );
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         loop {
             work_budget
                 .check("object generation release retry budget exhausted")
@@ -4430,6 +4482,7 @@ impl StorageCluster {
         }
 
         let mut snapshot_retry_phase = SnapshotSensitiveRetryPhase::default();
+        let mut same_object_publication_observed = false;
         let (command, new_pending_command) = loop {
             require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
@@ -4508,6 +4561,19 @@ impl StorageCluster {
                             reject_expired_direct_put_snapshot_before_command_ownership!();
                         }
                         Err(error) => {
+                            if same_object_publication_observed {
+                                if let Err(cleanup_error) = self
+                                    .release_object_generation_reservation_after_same_object_projection(
+                                        &req.bucket,
+                                        &req.key,
+                                        &req.generation_reservation_id,
+                                        &mut work_budget,
+                                    )
+                                {
+                                    cleanup_direct_put_attempt_before_command_ownership!();
+                                    return Err(cleanup_error);
+                                }
+                            }
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Ok(Err(error));
                         }
@@ -4639,6 +4705,11 @@ impl StorageCluster {
                     _ => None,
                 };
                 let is_matching_direct_put = matching_direct_put.is_some();
+                let is_same_object_direct_put = matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket == req.bucket && commit.object.key == req.key
+                );
                 if let Some(commit) = matching_direct_put {
                     bucket_write_proof_command_owned = true;
                     if Self::direct_put_command_owns_request_payload(commit, req) {
@@ -4703,6 +4774,17 @@ impl StorageCluster {
                         return self
                             .direct_put_outcome_from_published_command(&command)
                             .map(Ok);
+                    }
+                    Ok(
+                        request_ops::MetadataCommandAbandonmentObservation::PublishedPendingRecovery,
+                    ) if is_same_object_direct_put => {
+                        // A different direct PUT for this object has crossed its publication
+                        // boundary. Reinspect the object even while that command retains the
+                        // bucket's pending slot so conditional requests project the winner's
+                        // state instead of exposing an internal recovery handoff as SlowDown.
+                        same_object_publication_observed = true;
+                        snapshot_retry_phase.require_snapshot_reinspection();
+                        continue;
                     }
                     Ok(
                         request_ops::MetadataCommandAbandonmentObservation::PublishedPendingRecovery,
@@ -4788,12 +4870,61 @@ impl StorageCluster {
                 if is_matching_direct_put {
                     break (command, false, false, None);
                 }
-                if let Err(error) = self.drain_pending_object_metadata_command_with_work_budget(
-                    publisher,
-                    pg_id,
-                    &command,
-                    &mut work_budget,
-                ) {
+                if is_same_object_direct_put {
+                    match self
+                        .drain_pending_object_metadata_command_outcome_for_semantic_projection_with_work_budget(
+                            publisher,
+                            pg_id,
+                            &command,
+                            &mut work_budget,
+                        )
+                    {
+                        Ok(
+                            PendingMetadataCommandOutcome::Applied
+                            | PendingMetadataCommandOutcome::PublishedPendingRecovery
+                            | PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                applied: true,
+                            },
+                        )
+                        | Err(ObjectPgActionError::MetadataCommandRecoveryTransferred) => {
+                            same_object_publication_observed = true;
+                            snapshot_retry_phase.require_snapshot_reinspection();
+                            continue;
+                        }
+                        Ok(PendingMetadataCommandOutcome::Abandoned) => {}
+                        Ok(PendingMetadataCommandOutcome::TerminalCleanupPending {
+                            applied: false,
+                        }) => {
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(ObjectPgActionError::MetadataCommandRecoveryTransferred);
+                        }
+                        Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
+                            sleep_direct_put_before_command_ownership_after_contention!(
+                                "same-object direct PUT partial command retry budget exhausted"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            if request_ops::object_pg_action_error_is_retryable_pending_drain(
+                                &error,
+                            ) {
+                                retry_direct_put_pending_drain_error!(
+                                    error,
+                                    "same-object direct PUT pending drain retry budget exhausted"
+                                );
+                            }
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(error);
+                        }
+                    }
+                } else if let Err(error) = self
+                    .drain_pending_object_metadata_command_with_work_budget(
+                        publisher,
+                        pg_id,
+                        &command,
+                        &mut work_budget,
+                    )
+                {
                     if request_ops::object_pg_action_error_is_retryable_pending_drain(&error) {
                         retry_direct_put_pending_drain_error!(
                             error,

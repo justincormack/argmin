@@ -194,6 +194,12 @@ fn composite_checksum_value_from_complete_parts(
 
 impl Coordinator {
     pub(super) fn map_stream_upload_failure(error: storage::StreamUploadFailure) -> ServerError {
+        let diagnostic_label = error.diagnostic_cause_label();
+        let _ = observability::event(
+            TRACE_TARGET,
+            "stream_upload_error",
+            Some(format_args!("cause_label={diagnostic_label}")),
+        );
         match error.kind() {
             storage::StreamUploadFailureKind::SnapshotReinspectionConflict
             | storage::StreamUploadFailureKind::ResourceExhausted

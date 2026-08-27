@@ -3719,6 +3719,305 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
     }
 }
 
+#[test]
+fn stream_put_finalize_terminal_cleanup_handoff_projects_same_object_once() {
+    struct CleanupGateRelease(Option<std::sync::mpsc::SyncSender<()>>);
+
+    impl CleanupGateRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for CleanupGateRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let winner_session_id = crate::SessionId::try_from("4b".repeat(16)).unwrap();
+    let rejecting_contender_session_id = crate::SessionId::try_from("4c".repeat(16)).unwrap();
+    let successful_contender_session_id = crate::SessionId::try_from("4d".repeat(16)).unwrap();
+    for session_id in [
+        &winner_session_id,
+        &rejecting_contender_session_id,
+        &successful_contender_session_id,
+    ] {
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+    }
+
+    let cleanup_attempts = Arc::new(AtomicUsize::new(0));
+    let cleanup_attempts_for_hook = Arc::clone(&cleanup_attempts);
+    let (cleanup_reached_tx, cleanup_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::sync_channel(1);
+    let cleanup_release_rx = Arc::new(Mutex::new(cleanup_release_rx));
+    let cleanup_release_rx_for_hook = Arc::clone(&cleanup_release_rx);
+    let hook_session_id = winner_session_id.clone();
+    let cleanup_hook = cluster.test_install_global_metadata_command_terminal_slot_removal_hook(
+        Arc::new(move |command| {
+            let matches = matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.generation_reservation_id == hook_session_id
+            );
+            if matches {
+                let attempt = cleanup_attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    cleanup_reached_tx.send(()).unwrap();
+                    cleanup_release_rx_for_hook
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("stream PUT terminal cleanup gate was not released");
+                }
+            }
+            matches
+        }),
+    );
+
+    let empty_etag = checksum::crc64::checksum(&[]);
+    let mut cleanup_release = CleanupGateRelease(Some(cleanup_release_tx));
+    let (winner_outcome, successful_contender_outcome, pending_command) = thread::scope(|scope| {
+        let (winner_result_tx, winner_result_rx) = std::sync::mpsc::sync_channel(1);
+        let winner_cluster = &cluster;
+        let winner_bucket = &bucket;
+        let winner_key = &key;
+        let winner_session = &winner_session_id;
+        scope.spawn(move || {
+            winner_result_tx
+                .send(winner_cluster.finalize_put_object_stream(
+                    winner_bucket,
+                    winner_key,
+                    winner_session,
+                    0,
+                    |_| {
+                        Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                            value: "winner",
+                            versioning: crate::BucketVersioningState::Disabled,
+                            owner: crate::OwnerIdentity::from_principal("owner"),
+                            acl_grants: crate::AclGrants::default(),
+                            public_read: false,
+                            etag_crc64: empty_etag,
+                            tags: None,
+                            metadata_blob: crate::SerializedMetadataBlob::default(),
+                            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                            object_lock: crate::ObjectLockState::default(),
+                            encryption: crate::ObjectEncryption::None,
+                        })
+                    },
+                ))
+                .unwrap();
+        });
+        cleanup_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream PUT winner did not reach terminal cleanup");
+
+        let pg_id = PgId::new(object_pg);
+        let pending_command = pending_metadata_command_for_test(&map, pg_id, &bucket)
+            .expect("deferred terminal cleanup must retain the stream PUT command");
+        let contender_action_calls = Arc::new(AtomicUsize::new(0));
+        let contender_action_calls_for_action = Arc::clone(&contender_action_calls);
+        let contender_result = cluster.finalize_put_object_stream(
+            &bucket,
+            &key,
+            &rejecting_contender_session_id,
+            0,
+            |snapshot| {
+                contender_action_calls_for_action.fetch_add(1, Ordering::SeqCst);
+                if snapshot.existing_etag.is_some() {
+                    Err("object already exists")
+                } else {
+                    Ok(crate::PreparedStreamPutCommit {
+                        value: "contender",
+                        versioning: crate::BucketVersioningState::Disabled,
+                        owner: crate::OwnerIdentity::from_principal("owner"),
+                        acl_grants: crate::AclGrants::default(),
+                        public_read: false,
+                        etag_crc64: empty_etag,
+                        tags: None,
+                        metadata_blob: crate::SerializedMetadataBlob::default(),
+                        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                        object_lock: crate::ObjectLockState::default(),
+                        encryption: crate::ObjectEncryption::None,
+                    })
+                }
+            },
+        );
+        assert!(matches!(contender_result, Ok(Err("object already exists"))));
+        assert_eq!(contender_action_calls.load(Ordering::SeqCst), 1);
+
+        let successful_action_calls = Arc::new(AtomicUsize::new(0));
+        let successful_action_calls_for_action = Arc::clone(&successful_action_calls);
+        let (first_successful_action_tx, first_successful_action_rx) =
+            std::sync::mpsc::sync_channel(1);
+        let (successful_result_tx, successful_result_rx) = std::sync::mpsc::sync_channel(1);
+        let successful_cluster = &cluster;
+        let successful_bucket = &bucket;
+        let successful_key = &key;
+        let successful_session = &successful_contender_session_id;
+        let successful_map = &map;
+        scope.spawn(move || {
+            successful_result_tx
+                .send(successful_cluster.finalize_put_object_stream(
+                    successful_bucket,
+                    successful_key,
+                    successful_session,
+                    0,
+                    |_| {
+                        let call = successful_action_calls_for_action
+                            .fetch_add(1, Ordering::SeqCst);
+                        if call == 0 {
+                            first_successful_action_tx.send(()).unwrap();
+                        } else {
+                            assert!(
+                                pending_metadata_command_for_test(
+                                    successful_map,
+                                    pg_id,
+                                    successful_bucket,
+                                )
+                                .is_none(),
+                                "successful contender re-projected a winner whose terminal slot was still retained"
+                            );
+                        }
+                        Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                            value: "successful contender",
+                            versioning: crate::BucketVersioningState::Disabled,
+                            owner: crate::OwnerIdentity::from_principal("owner"),
+                            acl_grants: crate::AclGrants::default(),
+                            public_read: false,
+                            etag_crc64: empty_etag,
+                            tags: None,
+                            metadata_blob: crate::SerializedMetadataBlob::default(),
+                            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                            object_lock: crate::ObjectLockState::default(),
+                            encryption: crate::ObjectEncryption::None,
+                        })
+                    },
+                ))
+                .unwrap();
+        });
+        first_successful_action_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("successful contender did not project the published winner");
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !map
+            .runtime_state()
+            .test_metadata_command_recovery_handoff_requested(pg_id, &pending_command)
+        {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "successful contender did not request recovery of the retained winner slot"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            successful_action_calls.load(Ordering::SeqCst),
+            1,
+            "successful contender must not re-project the retained winner"
+        );
+
+        cleanup_release.release();
+        let winner_outcome = winner_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream PUT winner did not finish after cleanup release")
+            .unwrap()
+            .unwrap();
+        drop(cleanup_hook);
+        let recovery_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match cluster.drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id,
+                &pending_command,
+                &cluster,
+            ) {
+                Ok(PendingMetadataCommandOutcome::Applied) => break,
+                Ok(
+                    PendingMetadataCommandOutcome::PublishedPendingRecovery
+                    | PendingMetadataCommandOutcome::TerminalCleanupPending { applied: true },
+                )
+                | Err(crate::ObjectPgActionError::MetadataCommandRecoveryTransferred) => {
+                    assert!(
+                        Instant::now() < recovery_deadline,
+                        "winner terminal cleanup did not converge after removing the test gate"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                outcome => panic!("unexpected winner recovery outcome: {outcome:?}"),
+            }
+        }
+        let successful_contender_outcome = successful_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("successful contender did not publish after winner cleanup")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            successful_action_calls.load(Ordering::SeqCst),
+            2,
+            "successful contender must revalidate once after the winner slot is drained"
+        );
+        (
+            winner_outcome,
+            successful_contender_outcome,
+            pending_command,
+        )
+    });
+
+    assert_eq!(winner_outcome.value, "winner");
+    assert_eq!(successful_contender_outcome.value, "successful contender");
+    assert!(matches!(
+        pending_command.payload(),
+        MetadataCommandPayload::CommitDirectPutObject(commit)
+            if commit.generation_reservation_id == winner_session_id
+    ));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert!(matches!(
+        cluster
+            .load_stream_upload_session(&bucket, &key, &winner_session_id)
+            .map_err(|error| error.kind()),
+        Err(crate::StreamUploadFailureKind::SessionNotFound)
+    ));
+    assert!(
+        cluster
+            .load_stream_upload_session(&bucket, &key, &rejecting_contender_session_id)
+            .is_ok(),
+        "conditional failure must preserve the contender's live stream session"
+    );
+    assert!(matches!(
+        cluster
+            .load_stream_upload_session(&bucket, &key, &successful_contender_session_id)
+            .map_err(|error| error.kind()),
+        Err(crate::StreamUploadFailureKind::SessionNotFound)
+    ));
+}
+
 fn assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
     mark_publication_started: bool,
     injected_action: crate::cluster::request_ops::StreamPutPendingDrainTestAction,
