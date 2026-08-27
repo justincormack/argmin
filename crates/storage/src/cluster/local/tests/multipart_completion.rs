@@ -705,9 +705,10 @@ fn object_generation_reservation_transfers_pending_direct_put_commit_to_recovery
         "partial direct PUT metadata command must remain pending"
     );
 
+    let unrelated_key = crate::ObjectKey::try_from(format!("{key}-unrelated")).unwrap();
     let next_reservation_id = crate::SessionId::try_from("23".repeat(16)).unwrap();
     let error = cluster
-        .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
+        .reserve_put_object_generation(&bucket, &unrelated_key, &next_reservation_id)
         .expect_err("unrelated reservation must leave published trailing work to recovery");
     assert!(matches!(
         error,
@@ -730,9 +731,9 @@ fn object_generation_reservation_transfers_pending_direct_put_commit_to_recovery
         PendingMetadataCommandOutcome::Applied
     );
     let next_generation_id = cluster
-        .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
+        .reserve_put_object_generation(&bucket, &unrelated_key, &next_reservation_id)
         .unwrap();
-    assert!(next_generation_id.get() > generation_id.get());
+    assert_eq!(next_generation_id.get(), generation_id.get());
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
     for node_id in node_ids {
@@ -744,7 +745,7 @@ fn object_generation_reservation_transfers_pending_direct_put_commit_to_recovery
             crate::PgMetadataStore::get_object_generation_reservation(
                 &*pg,
                 &bucket,
-                &key,
+                &unrelated_key,
                 &next_reservation_id,
             )
             .unwrap(),

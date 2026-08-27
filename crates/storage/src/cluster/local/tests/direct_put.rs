@@ -4624,8 +4624,9 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
     );
 
     let other_reservation_id = crate::tests::stream_session_id("cleanup-other");
+    let same_object_reservation_id = crate::tests::stream_session_id("cleanup-same");
     let mut cleanup_release = CleanupGateRelease(Some(cleanup_release_tx));
-    let (outcome, waiter_error, command) = thread::scope(|scope| {
+    let (outcome, waiter_error, same_object_generation_id, command) = thread::scope(|scope| {
         let (owner_result_tx, owner_result_rx) = std::sync::mpsc::sync_channel(1);
         let owner_cluster = &cluster;
         let owner_request = &commit_req;
@@ -4722,6 +4723,48 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
             .expect("direct PUT owner did not finish after cleanup release")
             .unwrap()
             .unwrap();
+        let retry_observed = Arc::new(AtomicBool::new(false));
+        let retry_observed_for_hook = Arc::clone(&retry_observed);
+        let retry_command_id = command.id();
+        let _retry_hook = cluster
+            .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+                move |candidate| {
+                    if candidate.id() == retry_command_id {
+                        retry_observed_for_hook.store(true, Ordering::SeqCst);
+                    }
+                },
+            ));
+        let (same_object_result_tx, same_object_result_rx) = std::sync::mpsc::sync_channel(1);
+        let same_object_cluster = &cluster;
+        let same_object_bucket = &bucket;
+        let same_object_key = &key;
+        let same_object_reservation_id = &same_object_reservation_id;
+        scope.spawn(move || {
+            same_object_result_tx
+                .send(same_object_cluster.reserve_put_object_generation(
+                    same_object_bucket,
+                    same_object_key,
+                    same_object_reservation_id,
+                ))
+                .unwrap();
+        });
+        let retry_deadline = Instant::now() + Duration::from_secs(5);
+        while !retry_observed.load(Ordering::SeqCst) {
+            match same_object_result_rx.try_recv() {
+                Ok(result) => panic!(
+                    "same-object reservation returned before reobserving authorized recovery: {result:?}"
+                ),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("same-object reservation result channel disconnected")
+                }
+            }
+            assert!(
+                Instant::now() < retry_deadline,
+                "same-object reservation did not reobserve authorized recovery"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         drop(cleanup_hook);
         assert_eq!(
             cluster
@@ -4731,19 +4774,24 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
                 .unwrap(),
             PendingMetadataCommandOutcome::Applied
         );
+        let same_object_generation_id = same_object_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("same-object reservation did not finish after recovery")
+            .expect("same-object reservation must retry the published direct PUT");
         let contender_result = contender_result_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("same-object contender did not finish cleanup after recovery")
             .expect("same-object contender must project the published winner");
         assert!(matches!(contender_result, Err("object already exists")));
         assert_eq!(contender_action_calls.load(Ordering::SeqCst), 1);
-        (outcome, waiter_error, command)
+        (outcome, waiter_error, same_object_generation_id, command)
     });
     assert_eq!(outcome.live_size, payload.len() as u64);
     assert!(matches!(
         waiter_error,
         crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
     ));
+    assert!(same_object_generation_id.get() > contender_generation_id.get());
     assert_eq!(cleanup_attempts.load(Ordering::SeqCst), 1);
 
     let pg_id = PgId::new(object_pg);

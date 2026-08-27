@@ -770,6 +770,14 @@ impl StorageCluster {
                 .check("object generation reservation retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                // Same-object requests must reobserve a published direct PUT so their
+                // conditions see its result. An unrelated direct PUT remains an authorized
+                // recovery handoff that this foreground request must not take over.
+                let unrelated_direct_put = matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket != *bucket || commit.object.key != *key
+                );
                 match command.payload() {
                     MetadataCommandPayload::ReserveObjectGeneration(reservation)
                         if reservation.matches_request(bucket, key, reservation_id) =>
@@ -822,10 +830,7 @@ impl StorageCluster {
                 {
                     Ok(()) => {}
                     Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery)
-                        if !matches!(
-                            command.payload(),
-                            MetadataCommandPayload::CommitDirectPutObject(_)
-                        ) =>
+                        if !unrelated_direct_put =>
                     {
                         #[cfg(test)]
                         request_ops::maybe_run_pending_object_metadata_command_recovery_transferred_hook(
