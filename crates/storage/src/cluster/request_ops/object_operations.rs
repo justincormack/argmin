@@ -178,6 +178,34 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_install_pending_object_metadata_command_recovery_transferred_hook(
+        &self,
+        hook: PendingObjectMetadataCommandRecoveryTransferredTestHook,
+    ) -> PendingObjectMetadataCommandRecoveryTransferredTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = PENDING_OBJECT_METADATA_COMMAND_RECOVERY_TRANSFERRED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        PendingObjectMetadataCommandRecoveryTransferredTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_object_generation_pending_drain_hook(
+        &self,
+        hook: ObjectGenerationPendingDrainTestHook,
+    ) -> ObjectGenerationPendingDrainTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot =
+            OBJECT_GENERATION_PENDING_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        ObjectGenerationPendingDrainTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_install_before_object_metadata_command_reissue_hook(
         &self,
         hook: BeforeObjectMetadataCommandReissueTestHook,

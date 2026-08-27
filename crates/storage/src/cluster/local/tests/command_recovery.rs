@@ -2040,10 +2040,10 @@ fn reissued_object_command_transfers_owner_and_stale_waiter_lineage() {
 }
 
 #[test]
-fn exact_object_drain_honors_concurrent_terminal_cleanup_handoff() {
-    struct CleanupGateRelease(Option<std::sync::mpsc::SyncSender<()>>);
+fn unrelated_object_operation_converges_after_authorized_recovery_handoff() {
+    struct GateRelease(Option<std::sync::mpsc::SyncSender<()>>);
 
-    impl CleanupGateRelease {
+    impl GateRelease {
         fn release(&mut self) {
             if let Some(release) = self.0.take() {
                 let _ = release.send(());
@@ -2051,7 +2051,7 @@ fn exact_object_drain_honors_concurrent_terminal_cleanup_handoff() {
         }
     }
 
-    impl Drop for CleanupGateRelease {
+    impl Drop for GateRelease {
         fn drop(&mut self) {
             self.release();
         }
@@ -2077,7 +2077,7 @@ fn exact_object_drain_honors_concurrent_terminal_cleanup_handoff() {
             .pg_topology(),
         &bucket,
         object_pg,
-        "cleanup-handoff-other-",
+        "authorized-handoff-other-",
     );
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     let map = Arc::new(map);
@@ -2118,9 +2118,33 @@ fn exact_object_drain_honors_concurrent_terminal_cleanup_handoff() {
         }),
     );
 
-    let mut cleanup_release = CleanupGateRelease(Some(cleanup_release_tx));
-    let other_reservation_id = crate::tests::stream_session_id("exact-cleanup");
-    let (owner_outcome, waiter_error) = thread::scope(|scope| {
+    let transfer_observed = Arc::new(AtomicBool::new(false));
+    let (transfer_reached_tx, transfer_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (transfer_release_tx, transfer_release_rx) = std::sync::mpsc::sync_channel(1);
+    let transfer_release_rx = Arc::new(Mutex::new(transfer_release_rx));
+    let transfer_observed_for_hook = Arc::clone(&transfer_observed);
+    let transfer_release_rx_for_hook = Arc::clone(&transfer_release_rx);
+    let transfer_hook = cluster
+        .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+            move |candidate| {
+                if candidate.checksum_crc64() != checksum
+                    || transfer_observed_for_hook.swap(true, Ordering::SeqCst)
+                {
+                    return;
+                }
+                transfer_reached_tx.send(()).unwrap();
+                transfer_release_rx_for_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("recovery-transfer gate was not released");
+            },
+        ));
+
+    let mut cleanup_release = GateRelease(Some(cleanup_release_tx));
+    let mut transfer_release = GateRelease(Some(transfer_release_tx));
+    let other_reservation_id = crate::tests::stream_session_id("auth-handoff");
+    let (owner_outcome, waiter_result) = thread::scope(|scope| {
         let (owner_tx, owner_rx) = std::sync::mpsc::sync_channel(1);
         let owner_cluster = &cluster;
         let owner_command = &command;
@@ -2150,38 +2174,203 @@ fn exact_object_drain_honors_concurrent_terminal_cleanup_handoff() {
                 ))
                 .unwrap();
         });
-        let waiter_error = waiter_rx
+        transfer_reached_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("unrelated waiter remained blocked by exact-owner terminal cleanup")
-            .unwrap_err();
+            .expect("unrelated operation did not observe the authorized-recovery handoff");
+
         cleanup_release.release();
         let owner_outcome = owner_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("exact object-command owner did not finish after cleanup release")
             .unwrap();
-        (owner_outcome, waiter_error)
+        assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+        drop(cleanup_hook);
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+
+        transfer_release.release();
+        let waiter_result = waiter_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unrelated operation did not finish after authorized recovery");
+        (owner_outcome, waiter_result)
     });
+
     assert_eq!(
         owner_outcome,
         PendingMetadataCommandOutcome::TerminalCleanupPending { applied: true }
     );
+    assert_eq!(
+        waiter_result.expect(
+            "an unrelated operation must retry after authorized recovery instead of surfacing contention",
+        ),
+        crate::GenerationId::new(1).unwrap()
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    drop(transfer_hook);
+}
+
+#[test]
+fn object_generation_pending_drain_cannot_outlive_reservation_budget() {
+    struct GateRelease(Option<std::sync::mpsc::SyncSender<()>>);
+
+    impl GateRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for GateRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::VersionId::from_u64(1),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let checksum = command.checksum_crc64();
+    let pending_drain_blocked = Arc::new(AtomicBool::new(false));
+    let (pending_drain_reached_tx, pending_drain_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (pending_drain_release_tx, pending_drain_release_rx) = std::sync::mpsc::sync_channel(1);
+    let pending_drain_release_rx = Arc::new(Mutex::new(pending_drain_release_rx));
+    let pending_drain_blocked_for_hook = Arc::clone(&pending_drain_blocked);
+    let pending_drain_release_rx_for_hook = Arc::clone(&pending_drain_release_rx);
+    let _pending_drain_hook = cluster.test_install_object_generation_pending_drain_hook(Arc::new(
+        move |candidate, work_budget| {
+            if candidate.checksum_crc64() != checksum
+                || pending_drain_blocked_for_hook.swap(true, Ordering::SeqCst)
+            {
+                return;
+            }
+            work_budget.expire_for_test();
+            pending_drain_reached_tx.send(()).unwrap();
+            pending_drain_release_rx_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(Duration::from_secs(5))
+                .expect("pending-drain gate was not released");
+        },
+    ));
+
+    let recovery_blocked = Arc::new(AtomicBool::new(false));
+    let (recovery_reached_tx, recovery_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (recovery_release_tx, recovery_release_rx) = std::sync::mpsc::sync_channel(1);
+    let recovery_release_rx = Arc::new(Mutex::new(recovery_release_rx));
+    let recovery_blocked_for_hook = Arc::clone(&recovery_blocked);
+    let recovery_release_rx_for_hook = Arc::clone(&recovery_release_rx);
+    let _recovery_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate.checksum_crc64() != checksum
+                || recovery_blocked_for_hook.swap(true, Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+            recovery_reached_tx.send(()).unwrap();
+            recovery_release_rx_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(Duration::from_secs(5))
+                .expect("authorized-recovery gate was not released");
+            Ok(())
+        }));
+
+    let mut pending_drain_release = GateRelease(Some(pending_drain_release_tx));
+    let mut recovery_release = GateRelease(Some(recovery_release_tx));
+    let reservation_id = crate::tests::stream_session_id("expired-drain");
+    let (reservation_result, recovery_outcome) = thread::scope(|scope| {
+        let (reservation_tx, reservation_rx) = std::sync::mpsc::sync_channel(1);
+        let reservation_cluster = &cluster;
+        let reservation_bucket = &bucket;
+        let reservation_key = &key;
+        let reservation_id = &reservation_id;
+        scope.spawn(move || {
+            reservation_tx
+                .send(reservation_cluster.reserve_put_object_generation(
+                    reservation_bucket,
+                    reservation_key,
+                    reservation_id,
+                ))
+                .unwrap();
+        });
+        pending_drain_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("generation reservation did not reach the pending drain");
+
+        let (recovery_tx, recovery_rx) = std::sync::mpsc::sync_channel(1);
+        let recovery_cluster = &cluster;
+        let recovery_command = &command;
+        scope.spawn(move || {
+            recovery_tx
+                .send(
+                    recovery_cluster.drain_pending_metadata_command_with_authorized_recovery_route(
+                        pg_id,
+                        recovery_command,
+                        recovery_cluster,
+                    ),
+                )
+                .unwrap();
+        });
+        recovery_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("authorized recovery did not reach its blocked apply");
+
+        pending_drain_release.release();
+        let reservation_result = reservation_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expired reservation waited for authorized recovery to finish");
+
+        recovery_release.release();
+        let recovery_outcome = recovery_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("authorized recovery did not finish after release");
+        (reservation_result, recovery_outcome)
+    });
+
     assert!(matches!(
-        waiter_error,
-        ObjectPgActionError::MetadataCommandRecoveryTransferred
+        reservation_result,
+        Err(ObjectPgActionError::Store(
+            StoreError::MetadataCommandContention { .. }
+        ))
     ));
     assert_eq!(
-        pending_metadata_command_for_test(&map, pg_id, &bucket),
-        Some(command.clone())
-    );
-    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
-
-    drop(cleanup_hook);
-    assert_eq!(
-        cluster
-            .drain_pending_metadata_command_with_authorized_recovery_route(
-                pg_id, &command, &cluster,
-            )
-            .unwrap(),
+        recovery_outcome.unwrap(),
         PendingMetadataCommandOutcome::Applied
     );
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());

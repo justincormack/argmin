@@ -794,7 +794,42 @@ impl StorageCluster {
                     }
                     _ => {}
                 }
-                self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
+                #[cfg(test)]
+                request_ops::maybe_run_object_generation_pending_drain_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    &command,
+                    &mut work_budget,
+                );
+                match self
+                    .drain_pending_object_metadata_command_with_work_budget(
+                        publisher,
+                        pg_id,
+                        &command,
+                        &mut work_budget,
+                    )
+                    .map(|_| ())
+                {
+                    Ok(()) => {}
+                    Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
+                        if !matches!(
+                            command.payload(),
+                            MetadataCommandPayload::CommitDirectPutObject(_)
+                        ) =>
+                    {
+                        #[cfg(test)]
+                        request_ops::maybe_run_pending_object_metadata_command_recovery_transferred_hook(
+                            self.metadata_command_apply_test_hook_scope_id(),
+                            &command,
+                        );
+                        work_budget
+                            .sleep_after_contention(
+                                "object generation reservation authorized recovery budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 work_budget
                     .sleep_after_contention(
                         "object generation reservation pending drain retry budget exhausted",
