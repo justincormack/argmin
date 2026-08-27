@@ -732,10 +732,7 @@ impl super::StorageCluster {
                             match drain {
                                 Ok(()) => {}
                                 Err(error)
-                                    if matches!(
-                                        error,
-                                        ObjectPgActionError::MetadataCommandRecoveryTransferred
-                                    ) || object_pg_action_error_is_retryable_pending_drain(&error) =>
+                                    if object_pg_action_error_is_retryable_pending_drain(&error) =>
                                 {
                                     // An authorized recovery can own the command that caused the
                                     // late log conflict. Wait within this request's work budget;

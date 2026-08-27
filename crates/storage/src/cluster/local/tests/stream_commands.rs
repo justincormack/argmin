@@ -1309,7 +1309,8 @@ fn stream_append_publish_validation_fails_closed_when_acknowledged_shard_file_is
 }
 
 #[test]
-fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
+fn stream_put_append_command_id_race_retries_recovery_owner_before_ack_publish() {
+    let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1396,6 +1397,20 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
         );
         insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
     }));
+    let awaiting_once = Arc::new(AtomicBool::new(true));
+    let awaiting_once_for_hook = Arc::clone(&awaiting_once);
+    let _drain_guard = cluster.test_install_pending_object_metadata_command_drain_attempt_hook(
+        Arc::new(move |command, _work_budget| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::AppendStreamSegment(_)
+            ) && awaiting_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                return Err(crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery);
+            }
+            Ok(())
+        }),
+    );
 
     cluster
         .commit_stream_segment_append(
@@ -1409,11 +1424,163 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
         .unwrap();
 
     assert!(!hook_once.load(Ordering::SeqCst));
+    assert!(!awaiting_once.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     assert_clean_metadata_command_stream(&map, &[object_pg]);
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
         let pg = node.get_pg(object_pg).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
+            vec![segment.clone()]
+        );
+    }
+}
+
+#[test]
+fn stream_append_preparation_retries_awaiting_authorized_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("73".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+
+    let pg_id = PgId::new(object_pg);
+    let pending = pending_release_command(&cluster, &map, pg_id, &bucket, &key, "74");
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending);
+    let pending_id = pending.id();
+    let inject_once = Arc::new(AtomicBool::new(true));
+    let inject_once_for_hook = Arc::clone(&inject_once);
+    let _drain_hook = cluster.test_install_pending_object_metadata_command_drain_attempt_hook(
+        Arc::new(move |command, _work_budget| {
+            if command.id() == pending_id && inject_once_for_hook.swap(false, Ordering::SeqCst) {
+                return Err(crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery);
+            }
+            Ok(())
+        }),
+    );
+
+    let payload = b"stream append preparation recovery handoff";
+    cluster
+        .test_append_stream_segment_with_after_prepare(
+            &bucket,
+            &key,
+            crate::StreamSegmentAppendInput {
+                session_id: &session_id,
+                segment_index: 0,
+                payload_crc64: checksum::crc64::checksum(payload),
+                storage_bytes: payload,
+            },
+            || {},
+        )
+        .expect("stream append preparation must reobserve authorized recovery");
+    assert!(!inject_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
+fn stream_append_commit_retries_awaiting_authorized_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("75".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"stream append commit recovery handoff";
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+
+    let pg_id = PgId::new(object_pg);
+    let pending = pending_release_command(&cluster, &map, pg_id, &bucket, &key, "76");
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending);
+    let pending_id = pending.id();
+    let inject_once = Arc::new(AtomicBool::new(true));
+    let inject_once_for_hook = Arc::clone(&inject_once);
+    let _drain_hook = cluster.test_install_pending_object_metadata_command_drain_attempt_hook(
+        Arc::new(move |command, _work_budget| {
+            if command.id() == pending_id && inject_once_for_hook.swap(false, Ordering::SeqCst) {
+                return Err(crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery);
+            }
+            Ok(())
+        }),
+    );
+
+    cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .expect("stream append commit must reobserve authorized recovery");
+    assert!(!inject_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
         assert_eq!(
             crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
             vec![segment.clone()]
@@ -1506,12 +1673,15 @@ fn stream_append_yields_after_one_pending_drain_before_budget_recheck() {
             1,
         )
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
-            context: "stream append pending drain retry budget exhausted"
-        })
-    ));
+    assert!(
+        matches!(
+            error,
+            crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                context: "stream append pending drain retry budget exhausted"
+            })
+        ),
+        "expected the append budget recheck after one drained contender, got {error:?}"
+    );
     let inserted = inserted.lock().unwrap().clone().unwrap();
     assert_eq!(
         pending_metadata_command_for_test(&map, pg_id, &bucket),
@@ -4033,7 +4203,7 @@ fn stream_put_finalize_terminal_cleanup_handoff_projects_same_object_once() {
     ));
 }
 
-fn assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
+fn assert_stream_put_finalize_pending_drain_failure_policy(
     mark_publication_started: bool,
     injected_action: crate::cluster::request_ops::StreamPutPendingDrainTestAction,
 ) {
@@ -4109,6 +4279,7 @@ fn assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
                 injected_action,
                 crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
                     | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure
+                    | crate::cluster::request_ops::StreamPutPendingDrainTestAction::AwaitingAuthorizedRecovery
             ) {
                 drop(owner_for_hook.lock().unwrap().take());
             }
@@ -4140,7 +4311,7 @@ fn assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
     match injected_action {
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
         | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure
-        | crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred => {
+        | crate::cluster::request_ops::StreamPutPendingDrainTestAction::AwaitingAuthorizedRecovery => {
             result
                 .expect("transient unrelated-command drain failure must be retried")
                 .expect("stream PUT preparation should succeed");
@@ -4158,6 +4329,14 @@ fn assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
             ));
             assert_eq!(action_calls.load(Ordering::SeqCst), 0);
         }
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred => {
+            let error = result.expect_err("relinquished recovery must stop finalization");
+            assert!(matches!(
+                error,
+                crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+            ));
+            assert_eq!(action_calls.load(Ordering::SeqCst), 0);
+        }
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::Continue => {
             unreachable!("test helper requires an injected stream drain action")
         }
@@ -4166,7 +4345,7 @@ fn assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
 
 #[test]
 fn stream_put_finalize_retries_transient_unrelated_pending_drain_failure() {
-    assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
+    assert_stream_put_finalize_pending_drain_failure_policy(
         false,
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure,
     );
@@ -4174,15 +4353,31 @@ fn stream_put_finalize_retries_transient_unrelated_pending_drain_failure() {
 
 #[test]
 fn stream_put_finalize_retries_publication_started_pending_drain_failure() {
-    assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
+    assert_stream_put_finalize_pending_drain_failure_policy(
         true,
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure,
     );
 }
 
 #[test]
+fn stream_put_finalize_retries_awaiting_authorized_recovery() {
+    assert_stream_put_finalize_pending_drain_failure_policy(
+        false,
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::AwaitingAuthorizedRecovery,
+    );
+}
+
+#[test]
+fn stream_put_finalize_does_not_retry_relinquished_recovery() {
+    assert_stream_put_finalize_pending_drain_failure_policy(
+        false,
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred,
+    );
+}
+
+#[test]
 fn stream_put_finalize_initial_pending_drain_honors_outer_budget() {
-    assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
+    assert_stream_put_finalize_pending_drain_failure_policy(
         false,
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::ExpireOuterBudget,
     );

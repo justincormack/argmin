@@ -874,6 +874,7 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
                     injected_action,
                     crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
                         | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure
+                        | crate::cluster::request_ops::StreamPutPendingDrainTestAction::AwaitingAuthorizedRecovery
                         | crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred
                 ) {
                     drop(recovery_owner_for_timeout.lock().unwrap().take());
@@ -956,6 +957,20 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
         assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_some());
         return;
     }
+    if mode
+        == StreamPutFinalizeCommandIdRace::PendingDrain(
+            crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred,
+        )
+    {
+        let error = result.expect_err("relinquished recovery must stop late finalization");
+        assert!(matches!(
+            error,
+            crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+        ));
+        assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_some());
+        return;
+    }
     let result = result.unwrap().unwrap();
     assert_eq!(
         action_calls.load(Ordering::SeqCst),
@@ -1005,7 +1020,14 @@ fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
 }
 
 #[test]
-fn stream_put_finalize_late_recovery_transfer_retries() {
+fn stream_put_finalize_late_awaiting_authorized_recovery_retries() {
+    assert_stream_put_finalize_command_id_race(StreamPutFinalizeCommandIdRace::PendingDrain(
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::AwaitingAuthorizedRecovery,
+    ));
+}
+
+#[test]
+fn stream_put_finalize_late_relinquished_recovery_does_not_retry() {
     assert_stream_put_finalize_command_id_race(StreamPutFinalizeCommandIdRace::PendingDrain(
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred,
     ));

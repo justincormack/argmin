@@ -1020,6 +1020,11 @@ fn object_pg_action_error_to_bucket_snapshot_error(
                 source: std::io::Error::other("multipart prepublication barrier exhausted"),
             })
         }
+        ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery => {
+            BucketSnapshotLoadError::Store(StoreError::MetadataCommandContention {
+                context: "metadata command awaiting authorized recovery",
+            })
+        }
         ObjectPgActionError::MetadataCommandRecoveryTransferred => {
             BucketSnapshotLoadError::Store(StoreError::MetadataCommandContention {
                 context: "metadata command transferred to recovery",

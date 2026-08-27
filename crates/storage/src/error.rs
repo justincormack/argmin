@@ -2357,7 +2357,9 @@ impl std::error::Error for BucketWriteDrainFailure {}
 pub(crate) enum ObjectPgActionError {
     Store(StoreError),
     Metadata(MetadataError),
-    InvalidRequest { reason: String },
+    InvalidRequest {
+        reason: String,
+    },
     StaleObjectReadSubject,
     StaleDirectPutCommitSnapshot,
     StaleStreamFinalizeSnapshot,
@@ -2365,6 +2367,11 @@ pub(crate) enum ObjectPgActionError {
     StaleMultipartCompletionSnapshot,
     MultipartConditionalRequestConflict,
     MultipartPrepublicationBarrierExhausted,
+    /// This request observed a command already handed to authorized recovery.
+    /// Foreground drain loops may reobserve it within their existing work budget.
+    MetadataCommandAwaitingAuthorizedRecovery,
+    /// This request relinquished recovery after it could not safely continue.
+    /// Foreground drain loops must not immediately reacquire the same work.
     MetadataCommandRecoveryTransferred,
 }
 
@@ -2390,6 +2397,9 @@ impl ObjectPgActionError {
             Self::MultipartPrepublicationBarrierExhausted => {
                 "multipart_prepublication_barrier_exhausted"
             }
+            Self::MetadataCommandAwaitingAuthorizedRecovery => {
+                "metadata_command_awaiting_authorized_recovery"
+            }
             Self::MetadataCommandRecoveryTransferred => "metadata_command_recovery_transferred",
         }
     }
@@ -2413,6 +2423,7 @@ impl ObjectPgActionError {
             | Self::StaleMultipartCompletionSnapshot
             | Self::MultipartConditionalRequestConflict
             | Self::MultipartPrepublicationBarrierExhausted
+            | Self::MetadataCommandAwaitingAuthorizedRecovery
             | Self::MetadataCommandRecoveryTransferred => false,
         }
     }
@@ -2470,6 +2481,7 @@ enum ObjectOperationFailureDiagnosticCategory {
     MultipartConditionalRequestConflict,
     SnapshotReinspectionConflict,
     MultipartPrepublicationBarrierExhausted,
+    MetadataCommandAwaitingAuthorizedRecovery,
     MetadataCommandRecoveryTransferred,
     UnexpectedObjectOperationOutcome,
 }
@@ -2485,6 +2497,9 @@ impl ObjectOperationFailureDiagnosticCategory {
             Self::SnapshotReinspectionConflict => "snapshot_reinspection_conflict",
             Self::MultipartPrepublicationBarrierExhausted => {
                 "multipart_prepublication_barrier_exhausted"
+            }
+            Self::MetadataCommandAwaitingAuthorizedRecovery => {
+                "metadata_command_awaiting_authorized_recovery"
             }
             Self::MetadataCommandRecoveryTransferred => "metadata_command_recovery_transferred",
             Self::UnexpectedObjectOperationOutcome => "unexpected_object_operation_outcome",
@@ -2521,6 +2536,9 @@ fn object_pg_action_diagnostic_category(
         }
         ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
             ObjectOperationFailureDiagnosticCategory::MultipartPrepublicationBarrierExhausted
+        }
+        ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery => {
+            ObjectOperationFailureDiagnosticCategory::MetadataCommandAwaitingAuthorizedRecovery
         }
         ObjectPgActionError::MetadataCommandRecoveryTransferred => {
             ObjectOperationFailureDiagnosticCategory::MetadataCommandRecoveryTransferred
@@ -2567,7 +2585,8 @@ fn classify_object_pg_action(
         ObjectPgActionError::Metadata(error) if error.is_command_contention() => {
             ObjectOperationFailureKind::MetadataCommandContention
         }
-        ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+        ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+        | ObjectPgActionError::MetadataCommandRecoveryTransferred => {
             ObjectOperationFailureKind::MetadataCommandContention
         }
         ObjectPgActionError::Metadata(_)
@@ -3359,7 +3378,8 @@ impl MultipartManagementFailure {
             ObjectPgActionError::Metadata(error) if error.is_command_contention() => {
                 MultipartManagementFailureKind::MetadataCommandContention
             }
-            ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+            ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+            | ObjectPgActionError::MetadataCommandRecoveryTransferred => {
                 MultipartManagementFailureKind::MetadataCommandContention
             }
             ObjectPgActionError::Metadata(_)
@@ -3542,7 +3562,8 @@ impl MultipartCompletionFailure {
             ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
                 MultipartCompletionFailureOutcome::PrepublicationBarrierExhausted
             }
-            ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+            ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+            | ObjectPgActionError::MetadataCommandRecoveryTransferred => {
                 MultipartCompletionFailureOutcome::MetadataCommandContention
             }
             ObjectPgActionError::Metadata(_)
@@ -3756,6 +3777,9 @@ impl StreamUploadFailure {
             ObjectPgActionError::SnapshotReinspectionConflict => {
                 ObjectOperationFailureDiagnosticCategory::SnapshotReinspectionConflict
             }
+            ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery => {
+                ObjectOperationFailureDiagnosticCategory::MetadataCommandAwaitingAuthorizedRecovery
+            }
             ObjectPgActionError::MetadataCommandRecoveryTransferred => {
                 ObjectOperationFailureDiagnosticCategory::MetadataCommandRecoveryTransferred
             }
@@ -3794,7 +3818,8 @@ impl StreamUploadFailure {
             ObjectPgActionError::SnapshotReinspectionConflict => {
                 StreamUploadFailureOutcome::SnapshotReinspectionConflict
             }
-            ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+            ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+            | ObjectPgActionError::MetadataCommandRecoveryTransferred => {
                 StreamUploadFailureOutcome::MetadataCommandContention
             }
             ObjectPgActionError::Metadata(_)

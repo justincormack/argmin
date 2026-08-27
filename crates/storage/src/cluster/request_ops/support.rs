@@ -192,6 +192,7 @@ pub(super) fn object_pg_action_error_is_retryable_command_observation(
         | ObjectPgActionError::StaleMultipartCompletionSnapshot
         | ObjectPgActionError::MultipartConditionalRequestConflict
         | ObjectPgActionError::MultipartPrepublicationBarrierExhausted
+        | ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
         | ObjectPgActionError::MetadataCommandRecoveryTransferred => false,
     }
 }
@@ -262,6 +263,7 @@ pub(super) fn object_pg_action_error_requires_metadata_command_recovery_route(
         | ObjectPgActionError::StaleMultipartCompletionSnapshot
         | ObjectPgActionError::MultipartConditionalRequestConflict
         | ObjectPgActionError::MultipartPrepublicationBarrierExhausted
+        | ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
         | ObjectPgActionError::MetadataCommandRecoveryTransferred => false,
     }
 }
@@ -275,6 +277,7 @@ pub(super) fn object_pg_action_error_is_retryable_pending_drain(
             | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
             | StoreError::MetadataCommandDependencyConvergencePending { .. },
         ) => true,
+        ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery => true,
         ObjectPgActionError::Store(error) => matches!(
             error.operation_failure_class(),
             StoreOperationFailureClass::ResourceExhausted
@@ -715,6 +718,7 @@ pub(crate) enum StreamPutPendingDrainTestAction {
     Continue,
     RetryableFailure,
     IrrevocableFailure,
+    AwaitingAuthorizedRecovery,
     RecoveryTransferred,
     ExpireOuterBudget,
 }
@@ -2049,6 +2053,9 @@ fn maybe_run_stream_put_pending_drain_hook(
                 log_index: 1,
             },
         )),
+        StreamPutPendingDrainTestAction::AwaitingAuthorizedRecovery => {
+            Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery)
+        }
         StreamPutPendingDrainTestAction::RecoveryTransferred => {
             Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
         }

@@ -711,7 +711,7 @@ fn object_generation_reservation_transfers_pending_direct_put_commit_to_recovery
         .expect_err("unrelated reservation must leave published trailing work to recovery");
     assert!(matches!(
         error,
-        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
     ));
     let pending_command = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
         .expect("transferred direct PUT command must remain pending");
@@ -861,7 +861,7 @@ fn object_delete_transfers_pending_direct_put_commit_to_recovery_before_delete()
         .expect_err("unrelated delete must leave published trailing work to recovery");
     assert!(matches!(
         error,
-        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
     ));
     let pending_command = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
         .expect("transferred direct PUT command must remain pending");

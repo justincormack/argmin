@@ -4182,8 +4182,15 @@ fn direct_put_does_not_evaluate_condition_after_local_snapshot_crosses_deadline(
     ));
 }
 
-#[test]
-fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
+#[derive(Clone, Copy)]
+enum DirectPutCommandIdRaceDrainFailure {
+    Contention,
+    AwaitingAuthorizedRecovery,
+}
+
+fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_action(
+    injected_failure: DirectPutCommandIdRaceDrainFailure,
+) {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4324,11 +4331,18 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
                         if commit.object.generation_id == winner_generation_id
                 ) && transient_drain_failure_for_hook.swap(false, Ordering::SeqCst)
                 {
-                    return Err(crate::ObjectPgActionError::Store(
-                        StoreError::MetadataCommandContention {
-                            context: "injected direct PUT contender drain contention",
-                        },
-                    ));
+                    return Err(match injected_failure {
+                        DirectPutCommandIdRaceDrainFailure::Contention => {
+                            crate::ObjectPgActionError::Store(
+                                StoreError::MetadataCommandContention {
+                                    context: "injected direct PUT contender drain contention",
+                                },
+                            )
+                        }
+                        DirectPutCommandIdRaceDrainFailure::AwaitingAuthorizedRecovery => {
+                            crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+                        }
+                    });
                 }
                 Ok(())
             },
@@ -4371,6 +4385,20 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
         assert_eq!(live.generation_id, winner_generation_id);
         assert_eq!(live.size, winner_payload.len() as u64);
     }
+}
+
+#[test]
+fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
+    assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_action(
+        DirectPutCommandIdRaceDrainFailure::Contention,
+    );
+}
+
+#[test]
+fn direct_put_command_id_race_retries_awaiting_authorized_recovery() {
+    assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_action(
+        DirectPutCommandIdRaceDrainFailure::AwaitingAuthorizedRecovery,
+    );
 }
 
 #[test]
@@ -4680,7 +4708,7 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
             .unwrap_err();
         assert!(matches!(
             cluster.reserve_put_object_generation(&bucket, &other_key, &other_reservation_id),
-            Err(crate::ObjectPgActionError::MetadataCommandRecoveryTransferred)
+            Err(crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery)
         ));
         assert_eq!(
             cleanup_attempts.load(Ordering::SeqCst),
@@ -4714,7 +4742,7 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
     assert_eq!(outcome.live_size, payload.len() as u64);
     assert!(matches!(
         waiter_error,
-        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
     ));
     assert_eq!(cleanup_attempts.load(Ordering::SeqCst), 1);
 
@@ -5233,7 +5261,7 @@ fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
         .unwrap_err();
     assert!(matches!(
         error,
-        crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
+        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
     ));
     assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
     assert!(pending_installed.load(Ordering::SeqCst));

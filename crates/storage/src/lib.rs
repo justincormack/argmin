@@ -3479,6 +3479,11 @@ pub mod test_support {
                         operation: "observe payload reclaim test outcome",
                     })
                 }
+                ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery => {
+                    StoreFailure::from(StoreError::MetadataCommandContention {
+                        context: "metadata command awaiting authorized recovery",
+                    })
+                }
                 ObjectPgActionError::MetadataCommandRecoveryTransferred => {
                     StoreFailure::from(StoreError::MetadataCommandContention {
                         context: "metadata command transferred to recovery",
