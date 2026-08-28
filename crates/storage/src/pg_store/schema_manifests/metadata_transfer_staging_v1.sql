@@ -26,6 +26,13 @@ CREATE TABLE staging_finalized_floors (
     staging_generation          INTEGER NOT NULL CHECK (staging_generation > 0)
 ) STRICT;
 
+CREATE TABLE staging_evidence_actor (
+    singleton                    INTEGER PRIMARY KEY CHECK (singleton = 1),
+    node_id                      INTEGER NOT NULL CHECK (node_id >= 0 AND node_id <= 4294967295),
+    node_incarnation             INTEGER NOT NULL CHECK (node_incarnation > 0),
+    endpoint                     TEXT NOT NULL CHECK (length(endpoint) BETWEEN 1 AND 2048)
+) STRICT;
+
 CREATE TABLE staging_evidence_deltas (
     sequence                    INTEGER PRIMARY KEY AUTOINCREMENT,
     pg_id                       INTEGER NOT NULL CHECK (pg_id >= 0),
@@ -38,6 +45,19 @@ CREATE TABLE staging_evidence_deltas (
     acknowledged                INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1)),
     UNIQUE (pg_id, staging_generation, evidence_kind)
 ) STRICT;
+
+CREATE TRIGGER staging_evidence_actor_insert
+BEFORE INSERT ON staging_evidence_deltas
+WHEN NOT EXISTS (
+    SELECT 1 FROM staging_evidence_actor
+    WHERE singleton = 1
+      AND node_id = NEW.actor_node_id
+      AND node_incarnation = NEW.actor_node_incarnation
+      AND endpoint = NEW.actor_endpoint
+)
+BEGIN
+    SELECT RAISE(ABORT, 'staging evidence actor is stale');
+END;
 
 CREATE TABLE staging_evidence_inflight_page (
     singleton                   INTEGER PRIMARY KEY CHECK (singleton = 1),

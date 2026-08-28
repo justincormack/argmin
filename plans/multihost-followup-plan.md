@@ -437,6 +437,23 @@ aggregates and nested container vectors remain rejection evidence. This
 authorization command is still leader-internal and protocol-isolated: no
 production caller opens the staging store or sends destination staging RPCs
 until durable evidence publication and acknowledgement exist.
+Command v23 and state v35 now provide the replicated half of durable staging
+evidence publication while keeping that protocol isolation. The new
+`ApplyMetadataTransferStagingEvidencePage` command carries the exact
+storage-owned canonical operation payload and page digest. Command decoding
+revalidates the page before dispatch; application binds the actor to its
+current node incarnation and endpoint, validates every publication or
+tombstone member against the exact transition staging authorization, retains
+the canonical evidence and authority-neutral apply receipt, and leaves the
+cluster-map epoch unchanged. Exact current-page replay returns the same
+receipt without mutation; conflicting generations, gaps, foreign actors,
+divergent evidence, and missing snapshot members fail closed. Snapshot
+validation treats the receipt actor as historical after admission, so a later
+node incarnation cannot invalidate already accepted evidence. Immutable
+command-v22/state-v34 aggregates remain rejection evidence. Control-plane RPC
+v18, storage outbox publication, finalized-floor cleanup, and isolated
+low-priority admission remain the next protocol slice; no production path can
+submit this command yet.
 The storage-owned durable staging foundation is also complete but remains
 protocol-isolated. Staging-store format v1 has a fixed root manifest and exact
 initialization-complete marker, exact SQLite catalogue,
@@ -695,25 +712,51 @@ RPC authentication envelope. Every transmission and retry wraps the identical
 canonical operation payload in a newly generated request ID, timestamp,
 expiry, and authenticator; replaying stale authentication material is
 prohibited. It sends no later generation while one page is unacknowledged.
-Response loss, process restart, newly queued deltas, or expiry of the prior
-authentication window cause byte-for-byte retransmission of the retained
+Response loss, a same-actor store reopen, newly queued deltas, or expiry of the
+prior authentication window cause byte-for-byte retransmission of the retained
 operation payload under a fresh envelope, never reconstruction with different
 members.
+
+Node-incarnation rollover is a distinct durable boundary. The staging catalogue
+persists one singleton evidence actor, and every delta, in-flight page, and
+apply receipt must bind that exact actor. After startup has validated the full
+catalogue and artifact inventory, reopening the store for a newer incarnation
+of the same node runs one immediate transaction that re-encodes every retained
+publication and tombstone fact for the new actor, updates publication receipts,
+marks every delta unacknowledged, removes the old in-flight page/apply receipt,
+and advances the singleton actor. The new incarnation therefore starts at the
+genesis page pair and never appends new-actor evidence to the old actor's page
+chain. A different node ID, a non-advancing incarnation, or an endpoint change
+without an incarnation advance fails closed before startup reconciliation can
+mutate files or catalogue state. Every filesystem or catalogue mutation first
+holds an immediate catalogue transaction, validates the singleton actor, and
+retains that cross-handle serialization through its durable commit. If the old page committed but its
+response was lost, the control plane may retain both actor chains; evidence is
+keyed by the complete node/incarnation identity, and installation selects the
+currently authorized actor's exact receipt. This duplication is safe and is
+removed only by the ordinary finalized-floor cleanup protocol.
 
 Applying a page creates a canonical, authority-backend-neutral apply receipt
 bound to node identity and incarnation, previous generation, previous
 apply-receipt digest, generation, page digest, and the resulting accepted
-evidence generation. The control-plane state persists that receipt together
-with the highest accepted generation.
+evidence generation. While detailed evidence remains retained, control-plane
+state persists every contributing canonical page and receipt in that actor's
+contiguous chain. This makes page membership independently reconstructible
+during snapshot validation; actor identity alone is not evidence provenance.
 The control plane cannot observe the node's durable recording from the response
 it sends. It therefore retains the highest accepted page and apply receipt
-across finalized-floor advancement, detailed evidence pruning, snapshots,
-journal compaction, Raft compaction, and authority failover. That receipt is
-replaced only when the control plane accepts the exact successor page whose
+as the chain tip across finalized-floor advancement, snapshots, journal
+compaction, Raft compaction, and authority failover. The tip advances only when
+the control plane accepts the exact successor page whose
 `previous_generation` and previous apply-receipt digest cite it. Because the
 node may construct that successor only after durably recording the cited
 receipt, acceptance is the observable acknowledgement boundary. This retains
-at most one such replay receipt per node incarnation rather than one per page.
+the contributor pages under the current state-v35 representation. State v35
+does not permit per-PG detailed-evidence or page pruning: pages may mix PGs, and
+removing either one member or an interior page would destroy snapshot-verifiable
+provenance. Finalized-floor cleanup remains gated until the compact actor-chain
+checkpoint segments below are implemented in a coordinated later state/command
+version.
 
 A Raft log ID or standalone journal position may accompany the apply receipt
 as diagnostic metadata, but is not part of receipt identity or required for
@@ -721,7 +764,7 @@ replay. The response uses a fresh authenticated envelope carrying the
 canonical receipt. Only after the node durably records the exact receipt does
 it retire the page's deltas, advance its acknowledged generation, and build
 the next page. Exact replay lookup precedes finalized-floor and pruned-evidence
-rejection: replay of the retained page returns the same canonical apply receipt
+rejection: replay of any retained contributing page returns the same canonical apply receipt
 under a fresh response envelope without recreating evidence, while any
 different payload at that generation is rejected. For a new generation,
 server admission requires both predecessor fields and compares them with the
@@ -729,6 +772,78 @@ retained receipt before changing evidence or replacing that receipt. An
 omitted, malformed, genesis-on-successor, or incorrect predecessor digest is a
 protocol error that leaves the retained receipt and all evidence unchanged. A
 conflicting digest for an assigned generation is fatal protocol evidence.
+
+Before enabling finalized-floor pruning, add canonical compact actor-chain
+checkpoint segments. A segment replaces an exact contiguous range of complete
+accepted pages atomically and contains the exact actor tuple, predecessor
+anchor, range-tip generation, canonical tip apply receipt and digest, plus a
+sorted fixed-width commitment for every distinct evidence identity in that
+range: the complete evidence key and SHA-256 digest of its canonical bytes. A
+segment contains at most 64 commitments and its production-encoded command and
+state representations must each fit the 120 KiB evidence-operation ceiling and
+the replication-safe Raft-entry ceiling. The builder adds only whole pages and
+stops before either limit; the format must prove that the commitments derived
+from one maximum-sized source page always fit one segment. Count, encoded-byte,
+single-page-fit, and over-limit rejection are state-machine invariants rather
+than scheduler policy.
+
+The checkpoint operation validates the source pages, receipts, predecessor
+links, member set, and both bounds before removing those page payloads. The
+first later segment or retained page must cite the preceding segment's exact
+tip receipt. Snapshot validation reconstructs every boundary and rejects gaps,
+overlap, reordered or duplicate commitments, altered member digests, an
+oversized segment, and a segment or page that does not cite its predecessor.
+Later complete page ranges may become separate checkpoint segments even while
+an earlier segment retains an unresolved PG commitment; an unresolved member
+therefore pins at most one bounded segment rather than the actor's later page
+history.
+
+Per-PG cleanup then advances the durable finalized floor and removes detailed
+bytes independently, but retains the fixed-width commitment until its key is
+provably covered by that floor. Snapshot validation requires exact detailed
+bytes and digest for every uncovered commitment and requires covered members to
+be absent. Once every commitment in one segment is covered, a second exact CAS
+collapses that segment to a tip-only chain anchor without waiting for any other
+segment. A separate coalescing CAS consumes at most 64 adjacent covered
+tip-only anchors beneath the same 120 KiB and Raft-entry ceilings. It validates
+their contiguous predecessor chain, atomically replaces them with one canonical
+anchor carrying the lowest predecessor, newest tip receipt, and cumulative
+digest of the consumed anchors, and leaves the immediate later segment or page
+valid because it already cites that newest tip. Repeated bounded coalescing can
+therefore retire arbitrarily long fully covered history without constructing an
+unbounded command. Snapshot validation checks the coalescing receipt, cumulative
+digest, boundary generations, and the first later citation. This keeps both
+unresolved state and fully covered chain history bounded while preserving the
+predecessor link needed by later segments.
+
+A page is not eligible for checkpointing, floor-driven detail removal, or
+receipt pruning while it is the actor's current accepted tip. If its apply
+response is lost, the control plane retains the complete page, evidence, and
+canonical receipt; the node must replay that page, durably record the returned
+receipt, and submit a successor citing it. Only acceptance of that successor is
+the observable proof that permits the former tip to enter a checkpoint segment.
+Until a successor exists, finalized-floor cleanup may record that its cleanup
+conditions are satisfied but must reject any CAS that would prune the tip's
+detailed evidence. A compacted historical page is no longer an exact-replay
+target. The new current tip remains fully retained and replayable across
+response loss.
+
+An actor-incarnation rollover cannot submit an old-actor successor, so the
+later checkpoint slice must add one separately versioned actor-chain closure
+path rather than treating new-actor genesis as implicit acknowledgement. The
+storage rollover transaction durably records a canonical closure candidate
+containing the old actor tuple, old tip generation and page digest, and a digest
+of the complete semantic evidence set rebound into the new actor. The new
+genesis page cites that candidate. After accepting the genesis page, an exact
+control-plane CAS verifies the retained old page and receipt, the current node
+incarnation and endpoint, complete old-to-new evidence rebinding, and durable
+fencing of the old actor, then records a canonical closure certificate bound to
+both chains. That certificate makes the old tip eligible for a checkpoint
+segment without claiming that the old response was received. Missing,
+incomplete, or conflicting closure evidence leaves the old page fully retained
+and replayable. Adding the closure candidate advances the storage-owned page
+and staging-store formats together with the control-plane command/state
+versions; it cannot be inferred from the current v1 genesis grammar.
 
 Receipt evidence has bounded low-priority admission independent of lease
 renewal. It uses a separate connection/session allowance, request-worker
@@ -743,9 +858,14 @@ the global epoch, changing a PG route, invalidating a serving runtime map, or
 requesting fresh PG observations.
 
 Applying a receipt-evidence page records durable evidence keyed by transition,
-staging generation, and node rather than dropping it when a later heartbeat or
-page omits the entry. The control plane retains each node incarnation's highest
-accepted evidence-page generation and a per-PG finalized staging-generation
+staging generation, node, and incarnation rather than dropping it when a later
+heartbeat or page omits the entry. Every page member must carry the page's exact
+actor, and every retained detailed evidence record must resolve to that actor's
+retained page chain. Snapshot validation reconstructs every actor/incarnation
+page chain, requires its current node incarnation to be no older than the page
+actor (with an exact endpoint match at equal incarnation), and requires the
+detailed map to equal the exact union of retained page members. The control
+plane retains each node incarnation's accepted evidence-page chain and a per-PG finalized staging-generation
 floor. Receipt evidence at or below that floor is rejected even if carried in
 a later authenticated page; retransmission of a pre-cleanup page therefore
 cannot resurrect tombstoned state after detailed evidence is pruned. The
@@ -770,8 +890,11 @@ for that generation. Installation requires a complete receipt set for that
 same authorized destination set, so post-install cleanup retains, rather than
 narrows, the original obligation set.
 
-The global per-PG finalized floor advances only through an exact replicated,
-cluster-map-epoch-neutral cleanup CAS. Every obligated destination must have
+After that checkpoint representation lands, the global per-PG finalized floor
+advances only through an exact replicated, cluster-map-epoch-neutral cleanup
+CAS. The CAS rejects pruning any detailed member that still belongs to an
+actor's current accepted page tip or to a historical page range not yet covered
+by a validated checkpoint segment. Every obligated destination must have
 committed a canonical cleanup receipt for the same transition, staging
 generation, artifact tuple, and tombstoned local generation; partial cleanup
 cannot advance the floor or prune staging authorization. Per-node tombstone
@@ -887,8 +1010,10 @@ from v32 to v33, retaining immutable v19/v31 and v20/v32 rejection evidence
 and updating the nested journal, Raft WAL, snapshot, aggregate, and retained
 batch-receipt vectors. The epoch-neutral staging-authorization boundary
 advances command v21 to v22 and state v33 to v34, retaining immutable v21/v33
-aggregates and exact nested-container rejection evidence. The destination
-install slice advances both versions again when it removes the remaining
+aggregates and exact nested-container rejection evidence. The evidence-apply
+prerequisite advances command v22 to v23 and state v34 to v35, retaining
+immutable v22/v34 evidence. The destination install slice advances both
+versions again when it removes the remaining
 generic optional transition branches and makes installed staging evidence
 mandatory. The new transition-scoped artifact staging operations cross the
 storage RPC boundary and therefore require the corresponding storage-RPC
@@ -909,7 +1034,8 @@ control-plane RPC operation beyond that receipt protocol.
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Introduce staging-store format v1 with a
 versioned root manifest, initialization-complete marker, outer establishment
-marker in the storage data directory, generation catalogue,
+marker in the storage data directory, generation catalogue, durable singleton
+evidence actor,
 content-addressed artifact files, published receipts, import status, tombstones, and per-PG finalized
 generation floors. The catalogue also persists pending receipt/tombstone
 deltas, the exact assigned in-flight evidence operation-payload bytes and
@@ -922,7 +1048,10 @@ issuing a receipt. Existing-file retry and startup recovery repeat the artifact
 and directory durability fence before committing a recovered receipt. Receipt
 evidence independently retains the producing node ID, incarnation, and
 endpoint so restart validation does not trust identity fields copied only
-inside the receipt. Startup opens an existing catalogue nonblocking with
+inside the receipt. A newer same-node incarnation atomically rebinds all
+retained evidence and resets the page chain only after this validation; stale
+store handles and same-incarnation endpoint changes are rejected. Startup opens
+an existing catalogue nonblocking with
 `O_NOFOLLOW`, requires a regular file before SQLite admission, and validates
 the manifest and complete catalogue/file
 inventory before serving staging RPCs: unknown versions, digest or length
@@ -961,9 +1090,23 @@ Required deterministic and generated coverage includes:
   with source and destination loss at every staging boundary;
 - independently verified committed staging receipts, forged receipt fields,
   stale incarnation/endpoint evidence, and incomplete fsync scope;
+- queued-delta, assigned-page, and acknowledged-page restarts across an actor
+  incarnation advance, proving atomic evidence rebinding, genesis reset,
+  successful control-plane application, stale-handle fencing, and retention of
+  independently attributable old/new actor chains;
+- two-actor snapshot forgeries where a page contains another actor's evidence,
+  same-actor detailed evidence is absent from every retained page, a page actor
+  is from a future incarnation, or an equal incarnation has a different endpoint;
 - receipt-page count and encoded-byte limits, generation gaps, page replay,
-  backlog isolation from lease renewal, and old-page rejection after the
-  control-plane finalized-generation floor advances;
+  backlog isolation from lease renewal, and compacted historical-page rejection
+  after the control-plane finalized-generation floor advances;
+- segmented mixed-PG page checkpointing with exact count and production-encoded
+  byte boundaries, mandatory single-page fit, independent compaction of a later
+  segment while an earlier segment retains an unresolved member, independent
+  floor advancement for one member, retained proof for the other member,
+  segment-to-segment and segment-to-page successor validation, per-segment
+  collapse, and incrementally bounded coalescing of adjacent covered tip-only
+  anchors at exact count and encoded-byte boundaries;
 - genesis and successor predecessor-receipt fields, authentication failure
   after digest tampering, and admission rejection for omitted, malformed,
   genesis-on-successor, or incorrect digests without evidence mutation or
@@ -976,12 +1119,18 @@ Required deterministic and generated coverage includes:
   beyond the original authentication freshness window;
 - exact apply-receipt replay after Raft snapshot and log compaction and after a
   standalone journal restart, with backend log positions changed or absent;
-- a cleanup-evidence page committed with its response lost, followed by
-  finalized-floor advancement, detailed-evidence pruning, snapshot or journal
-  compaction, and authority restart; exact replay must return the retained
-  apply receipt, permit durable outbox retirement, and a successor page citing
-  that receipt must become the new bounded replay receipt in both Raft and
-  standalone modes;
+- a cleanup-evidence page committed with its response lost, followed by an
+  attempted finalized-floor CAS that proves the current tip and its detailed
+  evidence remain unpruned across snapshot or journal compaction and authority
+  restart; exact replay must return the retained apply receipt and permit
+  durable outbox retirement, after which a successor page citing that receipt
+  is accepted and only then may the former tip be checkpointed and its covered
+  detail pruned in both Raft and standalone modes; a no-successor branch must
+  remain bounded to the one complete replayable tip and reject pruning;
+- response loss followed by actor-incarnation rollover, proving the old tip
+  remains unpruned until a new-format genesis and exact actor-chain closure CAS
+  bind complete semantic evidence rebinding and old-actor fencing; malformed,
+  partial, or absent closure evidence must retain the replayable old chain;
 - blocked and saturated evidence connections, workers, and Raft proposals while
   lease deadlines continue to advance and the global cluster-map epoch remains
   unchanged;

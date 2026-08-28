@@ -504,11 +504,22 @@ pub(super) mod pg_store_facade {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) use super::pg_store::PgStore;
     pub(crate) use super::pg_store::{
-        canonical_empty_metadata_state_digest, MetadataCommandStartupDisposition,
-        MetadataProofStorageIssuer, PendingMetadataCommandSlotInsertError,
+        canonical_empty_metadata_state_digest, decode_staging_evidence,
+        decode_staging_evidence_apply_receipt, decode_staging_evidence_page_payload,
+        MetadataCommandStartupDisposition, MetadataProofStorageIssuer,
+        MetadataTransferStagingEvidence, MetadataTransferStagingEvidenceApplyReceipt,
+        MetadataTransferStagingEvidenceKind, PendingMetadataCommandSlotInsertError,
         PendingMetadataCommandSlotReplaceError, ScavengerShardFile, ScavengerShardFileScan,
         ScavengerShardRow, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
         METADATA_COMMAND_CHECKPOINT_MAGIC, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    };
+    #[cfg(test)]
+    pub(crate) use super::pg_store::{
+        metadata_transfer_staging_evidence_page_for_test,
+        metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
+        metadata_transfer_staging_evidence_page_with_member_actor_for_test,
+        MetadataTransferStagingIntent, MetadataTransferStagingLimits,
+        MetadataTransferStagingNodeIdentity, MetadataTransferStagingStore,
     };
     pub use super::pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,

@@ -39,9 +39,9 @@ const INITIALIZATION_MARKER_LEN: usize = INITIALIZATION_MARKER_BODY_LEN + 8;
 const ESTABLISHMENT_MARKER_BODY_LEN: usize = STAGING_ESTABLISHMENT_MAGIC.len() + 2 + DIGEST_LEN;
 const ESTABLISHMENT_MARKER_LEN: usize = ESTABLISHMENT_MARKER_BODY_LEN + 8;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
-const MAX_STAGING_EVIDENCE_BYTES: usize = 4_096;
-const MAX_STAGING_EVIDENCE_PAGE_ENTRIES: usize = 64;
-const MAX_STAGING_EVIDENCE_PAGE_BYTES: usize = 120 * 1_024;
+pub(crate) const MAX_STAGING_EVIDENCE_BYTES: usize = 4_096;
+pub(crate) const MAX_STAGING_EVIDENCE_PAGE_ENTRIES: usize = 64;
+pub(crate) const MAX_STAGING_EVIDENCE_PAGE_BYTES: usize = 120 * 1_024;
 const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V1\0";
 const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V1\0";
 pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 1;
@@ -138,6 +138,18 @@ impl MetadataTransferStagingNodeIdentity {
             endpoint,
         })
     }
+
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    pub(crate) fn node_incarnation(&self) -> u64 {
+        self.node_incarnation
+    }
+
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +195,42 @@ impl MetadataTransferStagingIntent {
             self.staging_generation,
             hex(&self.artifact_digest)
         )
+    }
+
+    pub(crate) fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    pub(crate) fn transition_epoch(&self) -> ClusterEpoch {
+        self.transition_epoch
+    }
+
+    pub(crate) fn source_epoch(&self) -> ClusterEpoch {
+        self.source_epoch
+    }
+
+    pub(crate) fn source_acting_set(&self) -> &[NodeId] {
+        &self.source_acting_set
+    }
+
+    pub(crate) fn destination_acting_set(&self) -> &[NodeId] {
+        &self.destination_acting_set
+    }
+
+    pub(crate) fn staging_generation(&self) -> u64 {
+        self.staging_generation
+    }
+
+    pub(crate) fn artifact_digest(&self) -> [u8; DIGEST_LEN] {
+        self.artifact_digest
+    }
+
+    pub(crate) fn artifact_length(&self) -> u64 {
+        self.artifact_length
+    }
+
+    pub(crate) fn artifact_format_version(&self) -> u16 {
+        self.artifact_format_version
     }
 }
 
@@ -239,9 +287,56 @@ struct StagingEvidenceDelta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingEvidencePageEntry {
+pub(crate) struct MetadataTransferStagingEvidencePageEntry {
     sequence: u64,
     evidence: Vec<u8>,
+}
+
+impl MetadataTransferStagingEvidencePageEntry {
+    pub(crate) fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn evidence(&self) -> &[u8] {
+        &self.evidence
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum MetadataTransferStagingEvidenceKind {
+    Publication = 0,
+    Tombstone = 1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataTransferStagingEvidence {
+    actor: MetadataTransferStagingNodeIdentity,
+    intent: MetadataTransferStagingIntent,
+    kind: MetadataTransferStagingEvidenceKind,
+    fsync_scope: u8,
+    bytes: Vec<u8>,
+}
+
+impl MetadataTransferStagingEvidence {
+    pub(crate) fn actor(&self) -> &MetadataTransferStagingNodeIdentity {
+        &self.actor
+    }
+
+    pub(crate) fn intent(&self) -> &MetadataTransferStagingIntent {
+        &self.intent
+    }
+
+    pub(crate) fn kind(&self) -> MetadataTransferStagingEvidenceKind {
+        self.kind
+    }
+
+    pub(crate) fn fsync_scope(&self) -> u8 {
+        self.fsync_scope
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 struct StagingInflightEvidencePage {
@@ -272,6 +367,22 @@ impl MetadataTransferStagingEvidencePage {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
+
+    pub(crate) fn actor(&self) -> &MetadataTransferStagingNodeIdentity {
+        &self.actor
+    }
+
+    pub(crate) fn previous_generation(&self) -> u64 {
+        self.previous_generation
+    }
+
+    pub(crate) fn previous_apply_receipt_digest(&self) -> [u8; DIGEST_LEN] {
+        self.previous_apply_receipt_digest
+    }
+
+    pub(crate) fn entries(&self) -> &[MetadataTransferStagingEvidencePageEntry] {
+        &self.entries
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,7 +397,6 @@ pub(crate) struct MetadataTransferStagingEvidenceApplyReceipt {
 }
 
 impl MetadataTransferStagingEvidenceApplyReceipt {
-    #[cfg(test)]
     pub(crate) fn for_page(page: &MetadataTransferStagingEvidencePage) -> Self {
         let mut receipt = Self {
             actor: page.actor.clone(),
@@ -303,6 +413,18 @@ impl MetadataTransferStagingEvidenceApplyReceipt {
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn actor(&self) -> &MetadataTransferStagingNodeIdentity {
+        &self.actor
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn page_digest(&self) -> [u8; DIGEST_LEN] {
+        self.page_digest
     }
 }
 
@@ -455,9 +577,18 @@ impl MetadataTransferStagingStore {
         } else {
             configure_catalogue(&connection)?;
             initialize_or_validate_unmarked_catalogue(&connection)?;
+            if load_staging_evidence_actor(&connection)?.is_none() {
+                insert_staging_evidence_actor(&connection, &identity)?;
+            }
             sync_directory(&root, "sync initialized staging catalogue")?;
             publish_initialization_marker(&root)?;
         }
+        let durable_identity = load_staging_evidence_actor(&connection)?.ok_or_else(|| {
+            MetadataTransferStagingError::Invariant(
+                "initialized staging store has no durable evidence actor".to_owned(),
+            )
+        })?;
+        validate_staging_evidence_actor_open(&durable_identity, &identity)?;
         if !established {
             publish_establishment_marker(data_dir, parent_directory_sync.as_ref())?;
         }
@@ -465,7 +596,7 @@ impl MetadataTransferStagingStore {
         let mut store = Self {
             artifacts_dir,
             quarantine_dir,
-            identity,
+            identity: durable_identity,
             limits,
             state: Mutex::new(MetadataTransferStagingState {
                 connection,
@@ -476,7 +607,165 @@ impl MetadataTransferStagingStore {
             evidence_page_assignment_observer,
         };
         store.reconcile_startup_inventory()?;
+        store.rebind_staging_evidence_actor(identity)?;
         Ok(store)
+    }
+
+    fn rebind_staging_evidence_actor(
+        &mut self,
+        identity: MetadataTransferStagingNodeIdentity,
+    ) -> Result<(), MetadataTransferStagingError> {
+        if self.identity == identity {
+            return Ok(());
+        }
+        validate_staging_evidence_actor_open(&self.identity, &identity)?;
+
+        let mut state = self.lock_state()?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staging evidence actor rollover", source)
+            })?;
+        let durable_identity = load_staging_evidence_actor(&transaction)?.ok_or_else(|| {
+            MetadataTransferStagingError::Invariant(
+                "staging evidence actor disappeared during rollover".to_owned(),
+            )
+        })?;
+        if durable_identity != self.identity {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence actor changed through another store handle".to_owned(),
+            ));
+        }
+
+        let rows = load_all_staging_rows(&transaction, self.limits.max_entries + 1)?;
+        if rows.len() > self.limits.max_entries {
+            return Err(MetadataTransferStagingError::Capacity(format!(
+                "staging inventory exceeds configured entry limit {}",
+                self.limits.max_entries
+            )));
+        }
+        let mut statement = transaction
+            .prepare(
+                "SELECT sequence, pg_id, staging_generation, evidence_kind, evidence_bytes \
+                 FROM staging_evidence_deltas ORDER BY sequence",
+            )
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("prepare staging evidence actor rollover", source)
+            })?;
+        let deltas = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("query staging evidence actor rollover", source)
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("read staging evidence actor rollover", source)
+            })?;
+        drop(statement);
+
+        for (sequence, pg_id, generation, kind, old_bytes) in deltas {
+            let row = rows
+                .iter()
+                .find(|row| {
+                    row.intent.pg_id == PgId::new(pg_id)
+                        && row.intent.staging_generation == generation
+                })
+                .ok_or_else(|| {
+                    MetadataTransferStagingError::Invariant(
+                        "staging evidence rollover found no exact intent".to_owned(),
+                    )
+                })?;
+            let kind = u8::try_from(kind).map_err(|_| {
+                MetadataTransferStagingError::Invariant(
+                    "staging evidence rollover found an invalid kind".to_owned(),
+                )
+            })?;
+            validate_staging_evidence(&old_bytes, &row.intent, kind, &self.identity)?;
+            let rebound = encode_staging_evidence(&identity, &row.intent, kind);
+            let changed = transaction
+                .execute(
+                    "UPDATE staging_evidence_deltas SET actor_node_id = ?1, \
+                        actor_node_incarnation = ?2, actor_endpoint = ?3, evidence_bytes = ?4, \
+                        acknowledged = 0 WHERE sequence = ?5 AND evidence_bytes = ?6",
+                    params![
+                        i64::from(identity.node_id.as_u32()),
+                        to_sql_u64(identity.node_incarnation)?,
+                        &identity.endpoint,
+                        &rebound,
+                        to_sql_u64(sequence)?,
+                        &old_bytes,
+                    ],
+                )
+                .map_err(|source| {
+                    MetadataTransferStagingError::sql("rebind staging evidence delta actor", source)
+                })?;
+            if changed != 1 {
+                return Err(MetadataTransferStagingError::Invariant(
+                    "staging evidence changed during actor rollover".to_owned(),
+                ));
+            }
+            if kind == 0 {
+                let changed = transaction
+                    .execute(
+                        "UPDATE staging_intents SET publication_receipt = ?1 \
+                         WHERE pg_id = ?2 AND staging_generation = ?3 \
+                           AND publication_receipt = ?4",
+                        params![
+                            &rebound,
+                            i64::from(pg_id),
+                            to_sql_u64(generation)?,
+                            &old_bytes,
+                        ],
+                    )
+                    .map_err(|source| {
+                        MetadataTransferStagingError::sql(
+                            "rebind staging publication receipt actor",
+                            source,
+                        )
+                    })?;
+                if changed != 1 {
+                    return Err(MetadataTransferStagingError::Invariant(
+                        "staging publication receipt changed during actor rollover".to_owned(),
+                    ));
+                }
+            }
+        }
+        transaction
+            .execute("DELETE FROM staging_evidence_inflight_page", [])
+            .map_err(|source| {
+                MetadataTransferStagingError::sql(
+                    "reset staging evidence page chain for actor rollover",
+                    source,
+                )
+            })?;
+        update_staging_evidence_actor(&transaction, &self.identity, &identity)?;
+        transaction.commit().map_err(|source| {
+            MetadataTransferStagingError::sql("commit staging evidence actor rollover", source)
+        })?;
+        drop(state);
+        self.identity = identity;
+        Ok(())
+    }
+
+    fn require_current_evidence_actor(
+        &self,
+        connection: &Connection,
+    ) -> Result<(), MetadataTransferStagingError> {
+        if load_staging_evidence_actor(connection)?.as_ref() != Some(&self.identity) {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging-store handle has a stale evidence actor".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn create_intent(
@@ -484,12 +773,20 @@ impl MetadataTransferStagingStore {
         intent: &MetadataTransferStagingIntent,
     ) -> Result<MetadataTransferStagingIntentOutcome, MetadataTransferStagingError> {
         self.validate_intent_limits(intent)?;
-        let state = self.lock_state()?;
-        if finalized_floor(&state.connection, intent.pg_id)? >= intent.staging_generation {
+        let mut state = self.lock_state()?;
+        let quarantined_bytes = state.quarantined_bytes;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staging intent creation", source)
+            })?;
+        self.require_current_evidence_actor(&transaction)?;
+        if finalized_floor(&transaction, intent.pg_id)? >= intent.staging_generation {
             return Err(MetadataTransferStagingError::GenerationRetired);
         }
         if let Some(existing) =
-            load_staging_row(&state.connection, intent.pg_id, intent.staging_generation)?
+            load_staging_row(&transaction, intent.pg_id, intent.staging_generation)?
         {
             require_exact_intent(&existing.intent, intent)?;
             if existing.state == StagingState::Tombstoned {
@@ -497,7 +794,7 @@ impl MetadataTransferStagingStore {
             }
             return Ok(MetadataTransferStagingIntentOutcome::ExactReplay);
         }
-        let (entry_count, reserved_bytes) = staging_capacity(&state.connection)?;
+        let (entry_count, reserved_bytes) = staging_capacity(&transaction)?;
         if entry_count >= self.limits.max_entries {
             return Err(MetadataTransferStagingError::Capacity(format!(
                 "entry limit {} reached",
@@ -505,7 +802,7 @@ impl MetadataTransferStagingStore {
             )));
         }
         let total = reserved_bytes
-            .checked_add(state.quarantined_bytes)
+            .checked_add(quarantined_bytes)
             .and_then(|value| value.checked_add(intent.artifact_length))
             .ok_or_else(|| {
                 MetadataTransferStagingError::Capacity("byte accounting overflowed".to_owned())
@@ -516,7 +813,10 @@ impl MetadataTransferStagingStore {
                 self.limits.max_total_bytes
             )));
         }
-        insert_intent(&state.connection, intent, StagingState::Intent, None)?;
+        insert_intent(&transaction, intent, StagingState::Intent, None)?;
+        transaction.commit().map_err(|source| {
+            MetadataTransferStagingError::sql("commit staging intent creation", source)
+        })?;
         Ok(MetadataTransferStagingIntentOutcome::Created)
     }
 
@@ -532,13 +832,19 @@ impl MetadataTransferStagingStore {
             return Err(MetadataTransferStagingError::ArtifactMismatch);
         }
         let mut state = self.lock_state()?;
-        let existing =
-            load_staging_row(&state.connection, intent.pg_id, intent.staging_generation)?
-                .ok_or_else(|| {
-                    MetadataTransferStagingError::IntentConflict(
-                        "artifact publication has no durable intent".to_owned(),
-                    )
-                })?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staging publication", source)
+            })?;
+        self.require_current_evidence_actor(&transaction)?;
+        let existing = load_staging_row(&transaction, intent.pg_id, intent.staging_generation)?
+            .ok_or_else(|| {
+                MetadataTransferStagingError::IntentConflict(
+                    "artifact publication has no durable intent".to_owned(),
+                )
+            })?;
         require_exact_intent(&existing.intent, intent)?;
         match existing.state {
             StagingState::Tombstoned => {
@@ -551,17 +857,13 @@ impl MetadataTransferStagingStore {
                         "published staging row has no receipt".to_owned(),
                     )
                 })?;
-                let delta = load_evidence_delta(
-                    &state.connection,
-                    intent.pg_id,
-                    intent.staging_generation,
-                    0,
-                )?
-                .ok_or_else(|| {
-                    MetadataTransferStagingError::Invariant(
-                        "published staging row has no durable evidence delta".to_owned(),
-                    )
-                })?;
+                let delta =
+                    load_evidence_delta(&transaction, intent.pg_id, intent.staging_generation, 0)?
+                        .ok_or_else(|| {
+                            MetadataTransferStagingError::Invariant(
+                                "published staging row has no durable evidence delta".to_owned(),
+                            )
+                        })?;
                 validate_staging_evidence(&receipt, intent, 0, &delta.actor)?;
                 if delta.bytes != receipt {
                     return Err(MetadataTransferStagingError::Invariant(
@@ -575,12 +877,6 @@ impl MetadataTransferStagingStore {
 
         self.publish_artifact_file(intent, artifact)?;
         let receipt = encode_staging_evidence(&self.identity, intent, 0);
-        let transaction = state
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| {
-                MetadataTransferStagingError::sql("begin staging publication", source)
-            })?;
         let changed = transaction
             .execute(
                 "UPDATE staging_intents SET state = 1, publication_receipt = ?1 \
@@ -610,21 +906,26 @@ impl MetadataTransferStagingStore {
         &self,
         intent: &MetadataTransferStagingIntent,
     ) -> Result<(), MetadataTransferStagingError> {
-        let state = self.lock_state()?;
-        let existing =
-            load_staging_row(&state.connection, intent.pg_id, intent.staging_generation)?
-                .ok_or_else(|| {
-                    MetadataTransferStagingError::IntentConflict(
-                        "import completion has no durable staged artifact".to_owned(),
-                    )
-                })?;
+        let mut state = self.lock_state()?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staged artifact import", source)
+            })?;
+        self.require_current_evidence_actor(&transaction)?;
+        let existing = load_staging_row(&transaction, intent.pg_id, intent.staging_generation)?
+            .ok_or_else(|| {
+                MetadataTransferStagingError::IntentConflict(
+                    "import completion has no durable staged artifact".to_owned(),
+                )
+            })?;
         require_exact_intent(&existing.intent, intent)?;
         match existing.state {
             StagingState::Imported => Ok(()),
             StagingState::Published => {
                 validate_artifact_file(&self.artifact_path(intent), intent)?;
-                let changed = state
-                    .connection
+                let changed = transaction
                     .execute(
                         "UPDATE staging_intents SET state = 2 \
                          WHERE pg_id = ?1 AND staging_generation = ?2 AND state = 1",
@@ -641,6 +942,9 @@ impl MetadataTransferStagingStore {
                         "staging import lost its published artifact".to_owned(),
                     ));
                 }
+                transaction.commit().map_err(|source| {
+                    MetadataTransferStagingError::sql("commit staged artifact import", source)
+                })?;
                 Ok(())
             }
             StagingState::Intent => Err(MetadataTransferStagingError::IntentConflict(
@@ -684,25 +988,28 @@ impl MetadataTransferStagingStore {
     ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
         self.validate_intent_limits(intent)?;
         let mut state = self.lock_state()?;
-        if finalized_floor(&state.connection, intent.pg_id)? >= intent.staging_generation {
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staging tombstone", source)
+            })?;
+        self.require_current_evidence_actor(&transaction)?;
+        if finalized_floor(&transaction, intent.pg_id)? >= intent.staging_generation {
             return Err(MetadataTransferStagingError::GenerationRetired);
         }
         if let Some(existing) =
-            load_staging_row(&state.connection, intent.pg_id, intent.staging_generation)?
+            load_staging_row(&transaction, intent.pg_id, intent.staging_generation)?
         {
             require_exact_intent(&existing.intent, intent)?;
             if existing.state == StagingState::Tombstoned {
-                let receipt = load_evidence_delta(
-                    &state.connection,
-                    intent.pg_id,
-                    intent.staging_generation,
-                    1,
-                )?
-                .ok_or_else(|| {
-                    MetadataTransferStagingError::Invariant(
-                        "tombstoned staging row has no durable evidence".to_owned(),
-                    )
-                })?;
+                let receipt =
+                    load_evidence_delta(&transaction, intent.pg_id, intent.staging_generation, 1)?
+                        .ok_or_else(|| {
+                            MetadataTransferStagingError::Invariant(
+                                "tombstoned staging row has no durable evidence".to_owned(),
+                            )
+                        })?;
                 validate_staging_evidence(&receipt.bytes, intent, 1, &receipt.actor)?;
                 remove_artifact_if_present(&self.artifact_path(intent))?;
                 sync_directory(&self.artifacts_dir, "sync replayed staging tombstone")?;
@@ -711,7 +1018,7 @@ impl MetadataTransferStagingStore {
                 });
             }
         } else {
-            let (entry_count, _) = staging_capacity(&state.connection)?;
+            let (entry_count, _) = staging_capacity(&transaction)?;
             if entry_count >= self.limits.max_entries {
                 return Err(MetadataTransferStagingError::Capacity(format!(
                     "entry limit {} reached",
@@ -720,12 +1027,6 @@ impl MetadataTransferStagingStore {
             }
         }
         let receipt = encode_staging_evidence(&self.identity, intent, 1);
-        let transaction = state
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| {
-                MetadataTransferStagingError::sql("begin staging tombstone", source)
-            })?;
         transaction
             .execute(
                 "INSERT INTO staging_intents (\
@@ -768,15 +1069,21 @@ impl MetadataTransferStagingStore {
                 "staging finalized floor must be nonzero".to_owned(),
             ));
         }
-        let state = self.lock_state()?;
-        let current = finalized_floor(&state.connection, pg_id)?;
+        let mut state = self.lock_state()?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staging finalized-floor advance", source)
+            })?;
+        self.require_current_evidence_actor(&transaction)?;
+        let current = finalized_floor(&transaction, pg_id)?;
         if staging_generation < current {
             return Err(MetadataTransferStagingError::Invariant(format!(
                 "staging finalized floor regressed from {current} to {staging_generation}"
             )));
         }
-        let live: i64 = state
-            .connection
+        let live: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM staging_intents \
                  WHERE pg_id = ?1 AND staging_generation <= ?2 AND state != 3",
@@ -791,8 +1098,7 @@ impl MetadataTransferStagingStore {
                 "finalized floor crosses a non-tombstoned staging generation".to_owned(),
             ));
         }
-        state
-            .connection
+        transaction
             .execute(
                 "INSERT INTO staging_finalized_floors (pg_id, staging_generation) VALUES (?1, ?2)\
                  ON CONFLICT(pg_id) DO UPDATE SET staging_generation = excluded.staging_generation",
@@ -801,6 +1107,9 @@ impl MetadataTransferStagingStore {
             .map_err(|source| {
                 MetadataTransferStagingError::sql("advance staging finalized floor", source)
             })?;
+        transaction.commit().map_err(|source| {
+            MetadataTransferStagingError::sql("commit staging finalized-floor advance", source)
+        })?;
         Ok(())
     }
 
@@ -814,6 +1123,7 @@ impl MetadataTransferStagingStore {
             .map_err(|source| {
                 MetadataTransferStagingError::sql("begin staging evidence page assignment", source)
             })?;
+        self.require_current_evidence_actor(&transaction)?;
         let result = if let Some(inflight) = load_inflight_evidence_page(&transaction)? {
             let page = inflight.page;
             let apply_receipt = inflight.apply_receipt;
@@ -876,6 +1186,7 @@ impl MetadataTransferStagingStore {
             .map_err(|source| {
                 MetadataTransferStagingError::sql("begin staging evidence acknowledgement", source)
             })?;
+        self.require_current_evidence_actor(&transaction)?;
         let current = load_inflight_evidence_page(&transaction)?.ok_or_else(|| {
             MetadataTransferStagingError::IntentConflict(
                 "staging evidence acknowledgement has no in-flight page".to_owned(),
@@ -1088,7 +1399,14 @@ impl MetadataTransferStagingStore {
 
     fn reconcile_startup_inventory(&mut self) -> Result<(), MetadataTransferStagingError> {
         let mut state = self.lock_state()?;
-        let rows = load_all_staging_rows(&state.connection, self.limits.max_entries + 1)?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staging startup reconciliation", source)
+            })?;
+        self.require_current_evidence_actor(&transaction)?;
+        let rows = load_all_staging_rows(&transaction, self.limits.max_entries + 1)?;
         if rows.len() > self.limits.max_entries {
             return Err(MetadataTransferStagingError::Capacity(format!(
                 "catalogue has {} entries, limit is {}",
@@ -1111,7 +1429,7 @@ impl MetadataTransferStagingStore {
             }
             known.insert(row.intent.artifact_file_name(), row);
         }
-        validate_auxiliary_catalogue(&state.connection, &rows, self.limits.max_entries)?;
+        validate_auxiliary_catalogue(&transaction, &rows, self.limits.max_entries)?;
 
         let mut interrupted = Vec::new();
         let mut unexplained = Vec::new();
@@ -1231,12 +1549,6 @@ impl MetadataTransferStagingStore {
         }
         for row in recovered_publications {
             let receipt = encode_staging_evidence(&self.identity, &row.intent, 0);
-            let transaction = state
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|source| {
-                    MetadataTransferStagingError::sql("begin recovered staging publication", source)
-                })?;
             let changed = transaction
                 .execute(
                     "UPDATE staging_intents SET state = 1, publication_receipt = ?1 \
@@ -1256,9 +1568,6 @@ impl MetadataTransferStagingStore {
                 ));
             }
             insert_evidence_delta(&transaction, &self.identity, &row.intent, 0, &receipt)?;
-            transaction.commit().map_err(|source| {
-                MetadataTransferStagingError::sql("commit recovered staging publication", source)
-            })?;
         }
         for path in tombstoned_artifacts {
             fs::remove_file(path).map_err(|source| {
@@ -1272,9 +1581,105 @@ impl MetadataTransferStagingStore {
             sync_directory(&self.artifacts_dir, "sync reconciled staging artifacts")?;
             sync_directory(&self.quarantine_dir, "sync staging quarantine")?;
         }
+        transaction.commit().map_err(|source| {
+            MetadataTransferStagingError::sql("commit staging startup reconciliation", source)
+        })?;
         state.quarantined_bytes = quarantined_bytes;
         Ok(())
     }
+}
+
+fn load_staging_evidence_actor(
+    connection: &Connection,
+) -> Result<Option<MetadataTransferStagingNodeIdentity>, MetadataTransferStagingError> {
+    connection
+        .query_row(
+            "SELECT node_id, node_incarnation, endpoint FROM staging_evidence_actor \
+             WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| MetadataTransferStagingError::sql("load staging evidence actor", source))?
+        .map(|(node_id, incarnation, endpoint)| {
+            MetadataTransferStagingNodeIdentity::new(NodeId::new(node_id), incarnation, endpoint)
+        })
+        .transpose()
+}
+
+fn validate_staging_evidence_actor_open(
+    durable: &MetadataTransferStagingNodeIdentity,
+    requested: &MetadataTransferStagingNodeIdentity,
+) -> Result<(), MetadataTransferStagingError> {
+    if durable == requested {
+        return Ok(());
+    }
+    if durable.node_id != requested.node_id {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence actor cannot move between node identities".to_owned(),
+        ));
+    }
+    if requested.node_incarnation <= durable.node_incarnation {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence actor incarnation did not advance".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn insert_staging_evidence_actor(
+    connection: &Connection,
+    identity: &MetadataTransferStagingNodeIdentity,
+) -> Result<(), MetadataTransferStagingError> {
+    connection
+        .execute(
+            "INSERT INTO staging_evidence_actor (singleton, node_id, node_incarnation, endpoint) \
+             VALUES (1, ?1, ?2, ?3)",
+            params![
+                i64::from(identity.node_id.as_u32()),
+                to_sql_u64(identity.node_incarnation)?,
+                &identity.endpoint,
+            ],
+        )
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("initialize staging evidence actor", source)
+        })?;
+    Ok(())
+}
+
+fn update_staging_evidence_actor(
+    connection: &Connection,
+    previous: &MetadataTransferStagingNodeIdentity,
+    next: &MetadataTransferStagingNodeIdentity,
+) -> Result<(), MetadataTransferStagingError> {
+    let changed = connection
+        .execute(
+            "UPDATE staging_evidence_actor SET node_id = ?1, node_incarnation = ?2, endpoint = ?3 \
+             WHERE singleton = 1 AND node_id = ?4 AND node_incarnation = ?5 AND endpoint = ?6",
+            params![
+                i64::from(next.node_id.as_u32()),
+                to_sql_u64(next.node_incarnation)?,
+                &next.endpoint,
+                i64::from(previous.node_id.as_u32()),
+                to_sql_u64(previous.node_incarnation)?,
+                &previous.endpoint,
+            ],
+        )
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("update staging evidence actor", source)
+        })?;
+    if changed != 1 {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence actor changed during rollover".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn configure_catalogue(connection: &Connection) -> Result<(), MetadataTransferStagingError> {
@@ -1912,6 +2317,11 @@ fn validate_auxiliary_catalogue(
     rows: &[StagingRow],
     max_entries: usize,
 ) -> Result<(), MetadataTransferStagingError> {
+    let durable_actor = load_staging_evidence_actor(connection)?.ok_or_else(|| {
+        MetadataTransferStagingError::Invariant(
+            "staging catalogue has no durable evidence actor".to_owned(),
+        )
+    })?;
     let integrity: String = connection
         .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
         .map_err(|source| {
@@ -1998,6 +2408,11 @@ fn validate_auxiliary_catalogue(
             actor_node_incarnation,
             actor_endpoint,
         )?;
+        if actor != durable_actor {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence delta does not match the durable actor".to_owned(),
+            ));
+        }
         validate_staging_evidence(&bytes, &row.intent, expected_kind, &actor)?;
         match kind {
             0 if matches!(
@@ -2103,6 +2518,11 @@ fn validate_auxiliary_catalogue(
 
     if let Some(inflight) = load_inflight_evidence_page(connection)? {
         let page = inflight.page;
+        if page.actor != durable_actor {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging in-flight page does not match the durable actor".to_owned(),
+            ));
+        }
         let apply_receipt = inflight.apply_receipt;
         let has_apply_receipt = apply_receipt.is_some();
         let expected_acknowledged = i64::from(has_apply_receipt);
@@ -2240,42 +2660,123 @@ fn validate_staging_evidence(
     expected_kind: u8,
     expected_actor: &MetadataTransferStagingNodeIdentity,
 ) -> Result<(), MetadataTransferStagingError> {
-    const MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-V1\0";
-    let mut offset = MAGIC.len();
-    if bytes.get(..offset) != Some(MAGIC) || bytes.get(offset) != Some(&expected_kind) {
+    let evidence = decode_staging_evidence(bytes)?;
+    let expected_kind = match expected_kind {
+        0 => MetadataTransferStagingEvidenceKind::Publication,
+        1 => MetadataTransferStagingEvidenceKind::Tombstone,
+        _ => {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence has invalid expected kind".to_owned(),
+            ))
+        }
+    };
+    if evidence.kind != expected_kind {
         return Err(MetadataTransferStagingError::Invariant(
-            "staging evidence has invalid magic or kind".to_owned(),
+            "staging evidence does not match its expected kind".to_owned(),
         ));
     }
-    offset += 1;
-    let node_id = u32::from_be_bytes(take(bytes, &mut offset, 4)?.try_into().unwrap());
-    let incarnation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
-    let endpoint_len = usize::try_from(u32::from_be_bytes(
-        take(bytes, &mut offset, 4)?.try_into().unwrap(),
-    ))
-    .unwrap();
-    let endpoint = std::str::from_utf8(take(bytes, &mut offset, endpoint_len)?).map_err(|_| {
-        MetadataTransferStagingError::Invariant(
-            "staging evidence has invalid node identity".to_owned(),
-        )
-    })?;
-    if node_id != expected_actor.node_id.as_u32()
-        || incarnation != expected_actor.node_incarnation
-        || endpoint != expected_actor.endpoint
-    {
+    if &evidence.actor != expected_actor {
         return Err(MetadataTransferStagingError::Invariant(
             "staging evidence does not match its durable actor identity".to_owned(),
         ));
     }
-    let mut expected = Vec::new();
-    encode_staging_intent_evidence(&mut expected, intent);
-    expected.push(0b0000_0111);
-    if bytes.get(offset..) != Some(expected.as_slice()) {
+    if &evidence.intent != intent {
         return Err(MetadataTransferStagingError::Invariant(
             "staging evidence does not bind the exact intent and fsync scope".to_owned(),
         ));
     }
     Ok(())
+}
+
+pub(crate) fn decode_staging_evidence(
+    bytes: &[u8],
+) -> Result<MetadataTransferStagingEvidence, MetadataTransferStagingError> {
+    const MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-V1\0";
+    if bytes.is_empty() || bytes.len() > MAX_STAGING_EVIDENCE_BYTES {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence has invalid length".to_owned(),
+        ));
+    }
+    let mut offset = MAGIC.len();
+    if bytes.get(..offset) != Some(MAGIC) {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence has invalid magic".to_owned(),
+        ));
+    }
+    let kind = match *take(bytes, &mut offset, 1)?.first().unwrap() {
+        0 => MetadataTransferStagingEvidenceKind::Publication,
+        1 => MetadataTransferStagingEvidenceKind::Tombstone,
+        _ => {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence has invalid kind".to_owned(),
+            ))
+        }
+    };
+    let actor = decode_staging_evidence_actor(bytes, &mut offset)?;
+    let pg_id = PgId::new(u32::from_be_bytes(
+        take(bytes, &mut offset, 4)?.try_into().unwrap(),
+    ));
+    let transition_epoch = ClusterEpoch::new(u64::from_be_bytes(
+        take(bytes, &mut offset, 8)?.try_into().unwrap(),
+    ))
+    .ok_or_else(|| {
+        MetadataTransferStagingError::Invariant(
+            "staging evidence transition epoch must be nonzero".to_owned(),
+        )
+    })?;
+    let source_epoch = ClusterEpoch::new(u64::from_be_bytes(
+        take(bytes, &mut offset, 8)?.try_into().unwrap(),
+    ))
+    .ok_or_else(|| {
+        MetadataTransferStagingError::Invariant(
+            "staging evidence source epoch must be nonzero".to_owned(),
+        )
+    })?;
+    let source_acting_set_len = usize::try_from(u32::from_be_bytes(
+        take(bytes, &mut offset, 4)?.try_into().unwrap(),
+    ))
+    .unwrap();
+    let source_acting_set = decode_acting_set(take(bytes, &mut offset, source_acting_set_len)?)?;
+    let destination_acting_set_len = usize::try_from(u32::from_be_bytes(
+        take(bytes, &mut offset, 4)?.try_into().unwrap(),
+    ))
+    .unwrap();
+    let destination_acting_set =
+        decode_acting_set(take(bytes, &mut offset, destination_acting_set_len)?)?;
+    let staging_generation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+    let artifact_digest = take(bytes, &mut offset, DIGEST_LEN)?.try_into().unwrap();
+    let artifact_length = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+    let artifact_format_version =
+        u16::from_be_bytes(take(bytes, &mut offset, 2)?.try_into().unwrap());
+    let fsync_scope = *take(bytes, &mut offset, 1)?.first().unwrap();
+    let intent = MetadataTransferStagingIntent {
+        pg_id,
+        transition_epoch,
+        source_epoch,
+        source_acting_set,
+        destination_acting_set,
+        staging_generation,
+        artifact_digest,
+        artifact_length,
+        artifact_format_version,
+    };
+    validate_staging_intent_shape(&intent)?;
+    let evidence = MetadataTransferStagingEvidence {
+        actor,
+        intent,
+        kind,
+        fsync_scope,
+        bytes: bytes.to_vec(),
+    };
+    if offset != bytes.len()
+        || fsync_scope != 0b0000_0111
+        || encode_staging_evidence(&evidence.actor, &evidence.intent, evidence.kind as u8) != bytes
+    {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence is not canonical or fsync-complete".to_owned(),
+        ));
+    }
+    Ok(evidence)
 }
 
 fn encode_staging_evidence_page_payload(
@@ -2299,7 +2800,7 @@ fn encode_staging_evidence_page_payload(
     out
 }
 
-fn decode_staging_evidence_page_payload(
+pub(crate) fn decode_staging_evidence_page_payload(
     bytes: &[u8],
     expected_digest: [u8; DIGEST_LEN],
 ) -> Result<MetadataTransferStagingEvidencePage, MetadataTransferStagingError> {
@@ -2397,7 +2898,7 @@ fn encode_staging_evidence_apply_receipt(
     out
 }
 
-fn decode_staging_evidence_apply_receipt(
+pub(crate) fn decode_staging_evidence_apply_receipt(
     bytes: &[u8],
 ) -> Result<MetadataTransferStagingEvidenceApplyReceipt, MetadataTransferStagingError> {
     if bytes.is_empty() || bytes.len() > MAX_STAGING_EVIDENCE_BYTES {
@@ -2438,6 +2939,101 @@ fn decode_staging_evidence_apply_receipt(
         ));
     }
     Ok(receipt)
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_transfer_staging_evidence_page_for_test(
+    actor: MetadataTransferStagingNodeIdentity,
+    binding: &UnavailablePgTransitionMutationBinding,
+    artifact_digest: [u8; DIGEST_LEN],
+    artifact_length: u64,
+    artifact_format_version: u16,
+    kind: MetadataTransferStagingEvidenceKind,
+    previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
+) -> MetadataTransferStagingEvidencePage {
+    let intent = MetadataTransferStagingIntent::for_unavailable_transition(
+        binding,
+        artifact_digest,
+        artifact_length,
+        artifact_format_version,
+    )
+    .unwrap();
+    metadata_transfer_staging_evidence_page_with_member_actor_for_test(
+        actor.clone(),
+        actor,
+        &intent,
+        kind,
+        previous_receipt,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_transfer_staging_evidence_page_with_member_actor_for_test(
+    page_actor: MetadataTransferStagingNodeIdentity,
+    evidence_actor: MetadataTransferStagingNodeIdentity,
+    intent: &MetadataTransferStagingIntent,
+    kind: MetadataTransferStagingEvidenceKind,
+    previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
+) -> MetadataTransferStagingEvidencePage {
+    let evidence = encode_staging_evidence(&evidence_actor, intent, kind as u8);
+    let (previous_generation, previous_apply_receipt_digest) =
+        previous_receipt.map_or((0, [0; DIGEST_LEN]), |receipt| {
+            (
+                receipt.generation(),
+                checksum::sha256::digest(receipt.as_bytes()),
+            )
+        });
+    let generation = previous_generation.checked_add(1).unwrap();
+    let entries = vec![MetadataTransferStagingEvidencePageEntry {
+        sequence: generation,
+        evidence,
+    }];
+    let operation_payload = encode_staging_evidence_page_payload(
+        &page_actor,
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
+        &entries,
+    );
+    let page_digest = checksum::sha256::digest(&operation_payload);
+    decode_staging_evidence_page_payload(&operation_payload, page_digest).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_transfer_staging_evidence_page_with_duplicate_member_for_test(
+    actor: MetadataTransferStagingNodeIdentity,
+    intent: &MetadataTransferStagingIntent,
+    kind: MetadataTransferStagingEvidenceKind,
+    previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
+) -> MetadataTransferStagingEvidencePage {
+    let evidence = encode_staging_evidence(&actor, intent, kind as u8);
+    let (previous_generation, previous_apply_receipt_digest) =
+        previous_receipt.map_or((0, [0; DIGEST_LEN]), |receipt| {
+            (
+                receipt.generation(),
+                checksum::sha256::digest(receipt.as_bytes()),
+            )
+        });
+    let generation = previous_generation.checked_add(1).unwrap();
+    let entries = vec![
+        MetadataTransferStagingEvidencePageEntry {
+            sequence: generation,
+            evidence: evidence.clone(),
+        },
+        MetadataTransferStagingEvidencePageEntry {
+            sequence: generation.checked_add(1).unwrap(),
+            evidence,
+        },
+    ];
+    let operation_payload = encode_staging_evidence_page_payload(
+        &actor,
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
+        &entries,
+    );
+    let page_digest = checksum::sha256::digest(&operation_payload);
+    decode_staging_evidence_page_payload(&operation_payload, page_digest).unwrap()
 }
 
 fn encode_staging_evidence_actor(out: &mut Vec<u8>, actor: &MetadataTransferStagingNodeIdentity) {
@@ -3250,7 +3846,7 @@ mod tests {
     ) {
         assert_eq!(
             hex(&current_manifest_bytes()),
-            "4152474d535447000001493cbd07edce4ea79738076b97b6858db1cc6103f29b358c9775f48a0259f116ef1ccc40564fe60a"
+            "4152474d5354470000013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed7b6fa66472b5374b"
         );
         let tmp = test_util::tempdir();
         let store = open(tmp.path());
@@ -3267,7 +3863,7 @@ mod tests {
     fn initialization_marker_v1_encoding_is_fixed() {
         assert_eq!(
             hex(&current_initialization_marker_bytes()),
-            "4152474d535447490001493cbd07edce4ea79738076b97b6858db1cc6103f29b358c9775f48a0259f116f8eae3a04c26a75c"
+            "4152474d5354474900013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed6c99898468dc761d"
         );
     }
 
@@ -3275,7 +3871,7 @@ mod tests {
     fn establishment_marker_v1_encoding_is_fixed() {
         assert_eq!(
             hex(&current_establishment_marker_bytes()),
-            "4152474d535447450001f3c0bb1bae15166121d7680bfa15de6744e1ff314428f24ee88440bf018a5785f7312e6cf3c0586f"
+            "4152474d535447450001a7221d66ea51b3a38deafc1868ce6a6b0bb884463dd56626720658a445cc29bcb4fd5b0300c7b553"
         );
     }
 
@@ -3701,11 +4297,20 @@ mod tests {
         )
         .unwrap();
         let reopened =
-            MetadataTransferStagingStore::open(tmp.path(), replacement_identity, limits()).unwrap();
+            MetadataTransferStagingStore::open(tmp.path(), replacement_identity.clone(), limits())
+                .unwrap();
         assert_eq!(reopened.read_artifact(&intent).unwrap(), artifact);
+        let rebound_receipt = reopened.publish_artifact(&intent, artifact).unwrap();
+        assert_ne!(rebound_receipt, receipt);
+        assert_eq!(
+            decode_staging_evidence(rebound_receipt.as_bytes())
+                .unwrap()
+                .actor(),
+            &replacement_identity
+        );
         assert_eq!(
             reopened.publish_artifact(&intent, artifact).unwrap(),
-            receipt
+            rebound_receipt
         );
         reopened.mark_imported(&intent).unwrap();
         reopened.mark_imported(&intent).unwrap();
@@ -3788,6 +4393,64 @@ mod tests {
     }
 
     #[test]
+    fn invalid_open_identity_is_rejected_before_startup_reconciliation_mutates_state() {
+        let invalid_identities = [
+            MetadataTransferStagingNodeIdentity::new(
+                NodeId::new(5),
+                8,
+                "tcp://storage-5.example:9000".to_owned(),
+            )
+            .unwrap(),
+            MetadataTransferStagingNodeIdentity::new(
+                NodeId::new(4),
+                6,
+                "unix:///run/argmin/storage-4.sock".to_owned(),
+            )
+            .unwrap(),
+            MetadataTransferStagingNodeIdentity::new(
+                NodeId::new(4),
+                7,
+                "tcp://storage-4.example:9001".to_owned(),
+            )
+            .unwrap(),
+        ];
+        for invalid_identity in invalid_identities {
+            let tmp = test_util::tempdir();
+            let artifact = b"unreconciled publication";
+            let intent = intent(artifact);
+            let store = open(tmp.path());
+            store.create_intent(&intent).unwrap();
+            let artifact_path = store.artifact_path(&intent);
+            fs::write(&artifact_path, artifact).unwrap();
+            File::open(&artifact_path).unwrap().sync_all().unwrap();
+            let unknown_path = store.artifacts_dir.join("unknown.artifact");
+            fs::write(&unknown_path, b"unexplained").unwrap();
+            drop(store);
+
+            assert!(
+                MetadataTransferStagingStore::open(tmp.path(), invalid_identity, limits(),)
+                    .is_err()
+            );
+            assert!(artifact_path.exists());
+            assert!(unknown_path.exists());
+            assert!(!tmp
+                .path()
+                .join(STAGING_STORE_DIR)
+                .join(QUARANTINE_DIR)
+                .join("unknown.artifact")
+                .exists());
+            let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
+            assert_eq!(
+                load_staging_row(&connection, intent.pg_id, intent.staging_generation)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                StagingState::Intent
+            );
+        }
+    }
+
+    #[test]
     fn mismatched_artifact_and_intent_fail_without_publication() {
         let tmp = test_util::tempdir();
         let artifact = b"expected artifact";
@@ -3834,7 +4497,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_before_intent_rejects_delayed_stage_and_replays_original_receipt() {
+    fn tombstone_before_intent_rejects_delayed_stage_and_rebinds_receipt_on_restart() {
         let tmp = test_util::tempdir();
         let artifact = b"cancelled before destination stage";
         let intent = intent(artifact);
@@ -3855,10 +4518,18 @@ mod tests {
         )
         .unwrap();
         let reopened =
-            MetadataTransferStagingStore::open(tmp.path(), replacement_identity, limits()).unwrap();
+            MetadataTransferStagingStore::open(tmp.path(), replacement_identity.clone(), limits())
+                .unwrap();
         assert!(!delayed_path.exists());
         fs::write(&delayed_path, artifact).unwrap();
-        assert_eq!(reopened.tombstone(&intent).unwrap(), receipt);
+        let rebound_receipt = reopened.tombstone(&intent).unwrap();
+        assert_ne!(rebound_receipt, receipt);
+        assert_eq!(
+            decode_staging_evidence(rebound_receipt.as_bytes())
+                .unwrap()
+                .actor(),
+            &replacement_identity
+        );
         assert!(!delayed_path.exists());
         assert!(matches!(
             reopened.publish_artifact(&intent, artifact),
@@ -4225,7 +4896,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_page_replays_exact_payload_across_new_deltas_and_restart() {
+    fn evidence_page_replays_within_an_incarnation_and_rebinds_on_restart() {
         let tmp = test_util::tempdir();
         let first_artifact = b"first evidence page artifact";
         let first = intent(first_artifact);
@@ -4255,12 +4926,137 @@ mod tests {
         )
         .unwrap();
         let restarted =
-            MetadataTransferStagingStore::open(tmp.path(), restarted_identity, limits()).unwrap();
+            MetadataTransferStagingStore::open(tmp.path(), restarted_identity.clone(), limits())
+                .unwrap();
         let replay = restarted.next_evidence_page().unwrap().unwrap();
-        assert_eq!(replay.operation_payload(), first_payload);
-        assert_eq!(replay.page_digest(), first_digest);
-        assert_eq!(replay.actor, first_page.actor);
+        assert_ne!(replay.operation_payload(), first_payload);
+        assert_ne!(replay.page_digest(), first_digest);
+        assert_eq!(replay.actor(), &restarted_identity);
+        assert_eq!(replay.previous_generation(), 0);
+        assert_eq!(replay.generation(), 1);
+        assert_eq!(replay.entries.len(), 2);
+        for entry in replay.entries() {
+            assert_eq!(
+                decode_staging_evidence(entry.evidence()).unwrap().actor(),
+                &restarted_identity
+            );
+        }
         assert_eq!(restarted.unacknowledged_evidence_count(), 2);
+    }
+
+    #[test]
+    fn evidence_actor_rollover_fences_stale_handles_and_same_incarnation_endpoint_changes() {
+        let tmp = test_util::tempdir();
+        let old = open(tmp.path());
+        old.tombstone(&intent(b"actor rollover fence")).unwrap();
+        let next_identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            8,
+            "tcp://storage-4.example:9000".to_owned(),
+        )
+        .unwrap();
+        let next = MetadataTransferStagingStore::open(tmp.path(), next_identity.clone(), limits())
+            .unwrap();
+        assert!(old
+            .next_evidence_page()
+            .unwrap_err()
+            .to_string()
+            .contains("stale evidence actor"));
+        assert_eq!(
+            next.next_evidence_page().unwrap().unwrap().actor(),
+            &next_identity
+        );
+
+        let changed_endpoint = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            8,
+            "tcp://storage-4.example:9001".to_owned(),
+        )
+        .unwrap();
+        assert!(
+            MetadataTransferStagingStore::open(tmp.path(), changed_endpoint, limits())
+                .err()
+                .expect("same-incarnation endpoint change must fail")
+                .to_string()
+                .contains("incarnation did not advance")
+        );
+    }
+
+    #[test]
+    fn evidence_actor_rollover_fences_every_stale_filesystem_and_catalogue_mutation() {
+        let tmp = test_util::tempdir();
+        let old = open(tmp.path());
+
+        let unpublished_bytes = b"stale publication";
+        let unpublished = intent(unpublished_bytes);
+        old.create_intent(&unpublished).unwrap();
+
+        let mut published = intent(b"stale import");
+        published.pg_id = PgId::new(20);
+        old.create_intent(&published).unwrap();
+        old.publish_artifact(&published, b"stale import").unwrap();
+
+        let mut retained_artifact = intent(b"stale tombstone");
+        retained_artifact.pg_id = PgId::new(21);
+        old.create_intent(&retained_artifact).unwrap();
+        old.publish_artifact(&retained_artifact, b"stale tombstone")
+            .unwrap();
+        let retained_artifact_path = old.artifact_path(&retained_artifact);
+
+        let mut retired = intent(b"stale finalized floor");
+        retired.pg_id = PgId::new(22);
+        old.tombstone(&retired).unwrap();
+
+        let next_identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            8,
+            "tcp://storage-4.example:9000".to_owned(),
+        )
+        .unwrap();
+        let next = MetadataTransferStagingStore::open(tmp.path(), next_identity, limits()).unwrap();
+
+        let stale = |error: MetadataTransferStagingError| {
+            assert!(error.to_string().contains("stale evidence actor"));
+        };
+        stale(
+            old.publish_artifact(&unpublished, unpublished_bytes)
+                .unwrap_err(),
+        );
+        assert!(!old.artifact_path(&unpublished).exists());
+        stale(old.mark_imported(&published).unwrap_err());
+        stale(old.tombstone(&retained_artifact).unwrap_err());
+        assert!(retained_artifact_path.exists());
+        stale(
+            old.advance_finalized_floor(retired.pg_id, retired.staging_generation)
+                .unwrap_err(),
+        );
+        let mut stale_intent = intent(b"stale intent creation");
+        stale_intent.pg_id = PgId::new(23);
+        stale(old.create_intent(&stale_intent).unwrap_err());
+
+        let state = next.state.lock().unwrap();
+        assert_eq!(
+            load_staging_row(
+                &state.connection,
+                published.pg_id,
+                published.staging_generation,
+            )
+            .unwrap()
+            .unwrap()
+            .state,
+            StagingState::Published
+        );
+        assert_eq!(
+            finalized_floor(&state.connection, retired.pg_id).unwrap(),
+            0
+        );
+        assert!(load_staging_row(
+            &state.connection,
+            stale_intent.pg_id,
+            stale_intent.staging_generation,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

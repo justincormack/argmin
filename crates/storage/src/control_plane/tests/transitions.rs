@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::control_plane_command::ReplicatedControlPlaneStateMachine;
 
 fn certified_spare_authority() -> (
     test_util::TempDir,
@@ -575,6 +576,600 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         .unwrap();
     assert!(!staging_replay.changed());
     assert_eq!(staging_replay.snapshot(), staged.snapshot());
+
+    let evidence_request = &staging_requests[0];
+    let evidence_actor_id = evidence_request
+        .unavailable_transition
+        .destination_acting_set()[0];
+    let evidence_actor_record = staged.snapshot().node(evidence_actor_id).unwrap();
+    let evidence_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        evidence_actor_id,
+        evidence_actor_record.node_incarnation(),
+        evidence_actor_record.endpoint().to_owned(),
+    )
+    .unwrap();
+    assert!(evidence_actor.node_incarnation() > 1);
+    for rollover_boundary in 0..3 {
+        let staging_tmp = test_util::tempdir();
+        let old_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+            evidence_actor_id,
+            evidence_actor.node_incarnation() - 1,
+            format!("/tmp/old-staging-actor-{rollover_boundary}.sock"),
+        )
+        .unwrap();
+        let limits =
+            crate::pg_store::MetadataTransferStagingLimits::new(8, 1 << 20, 8 << 20).unwrap();
+        let store = crate::pg_store::MetadataTransferStagingStore::open(
+            staging_tmp.path(),
+            old_actor.clone(),
+            limits,
+        )
+        .unwrap();
+        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &evidence_request.unavailable_transition,
+            evidence_request.artifact_digest,
+            evidence_request.artifact_length,
+            evidence_request.artifact_format_version,
+        )
+        .unwrap();
+        store.tombstone(&intent).unwrap();
+        if rollover_boundary != 0 {
+            let old_page = store.next_evidence_page().unwrap().unwrap();
+            assert_eq!(old_page.actor(), &old_actor);
+            if rollover_boundary == 2 {
+                let old_receipt =
+                    crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(
+                        &old_page,
+                    );
+                store
+                    .record_evidence_apply_receipt(&old_page, &old_receipt)
+                    .unwrap();
+            }
+        }
+        drop(store);
+
+        let reopened = crate::pg_store::MetadataTransferStagingStore::open(
+            staging_tmp.path(),
+            evidence_actor.clone(),
+            limits,
+        )
+        .unwrap();
+        let rebound_page = reopened.next_evidence_page().unwrap().unwrap();
+        assert_eq!(rebound_page.actor(), &evidence_actor);
+        assert_eq!(rebound_page.previous_generation(), 0);
+        assert_eq!(rebound_page.generation(), 1);
+        let rebound_evidence =
+            crate::pg_store::decode_staging_evidence(rebound_page.entries()[0].evidence()).unwrap();
+        assert_eq!(rebound_evidence.actor(), &evidence_actor);
+        assert!(staged
+            .snapshot()
+            .apply_control_plane_command(
+                ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                    operation_payload: rebound_page.operation_payload().to_vec(),
+                    page_digest: rebound_page.page_digest(),
+                }
+            )
+            .unwrap()
+            .changed());
+    }
+    let response_loss_tmp = test_util::tempdir();
+    let response_loss_old_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        evidence_actor_id,
+        evidence_actor.node_incarnation() - 1,
+        "/tmp/response-loss-old-staging-actor.sock".to_owned(),
+    )
+    .unwrap();
+    let response_loss_store = crate::pg_store::MetadataTransferStagingStore::open(
+        response_loss_tmp.path(),
+        response_loss_old_actor.clone(),
+        crate::pg_store::MetadataTransferStagingLimits::new(8, 1 << 20, 8 << 20).unwrap(),
+    )
+    .unwrap();
+    let response_loss_intent =
+        crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &evidence_request.unavailable_transition,
+            evidence_request.artifact_digest,
+            evidence_request.artifact_length,
+            evidence_request.artifact_format_version,
+        )
+        .unwrap();
+    response_loss_store
+        .tombstone(&response_loss_intent)
+        .unwrap();
+    let response_loss_old_page = response_loss_store.next_evidence_page().unwrap().unwrap();
+    let response_loss_old_receipt =
+        crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(
+            &response_loss_old_page,
+        );
+    let mut old_actor_snapshot = staged.snapshot().clone();
+    let old_actor_node = old_actor_snapshot
+        .nodes
+        .get_mut(&evidence_actor_id)
+        .unwrap();
+    old_actor_node.node_incarnation = response_loss_old_actor.node_incarnation();
+    old_actor_node.endpoint = response_loss_old_actor.endpoint().to_owned();
+    let old_page_committed = old_actor_snapshot
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: response_loss_old_page.operation_payload().to_vec(),
+                page_digest: response_loss_old_page.page_digest(),
+            },
+        )
+        .unwrap();
+    assert!(old_page_committed.changed());
+    // Simulate loss of the apply response: the old store never records the receipt.
+    drop(response_loss_store);
+
+    let heartbeat_at_ms = old_page_committed
+        .snapshot()
+        .node(evidence_actor_id)
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap_or(0)
+        .max(
+            old_page_committed
+                .snapshot()
+                .max_committed_timestamp_ms()
+                .unwrap_or(0),
+        )
+        + 1;
+    let requested_lease_duration_ms = 10_000;
+    let mut reincarnation_heartbeat = heartbeat_from_snapshot(
+        old_page_committed.snapshot(),
+        evidence_actor_id.as_u32(),
+        old_page_committed.snapshot().cluster_epoch(),
+        heartbeat_at_ms,
+    );
+    reincarnation_heartbeat.node_incarnation = evidence_actor.node_incarnation();
+    reincarnation_heartbeat.endpoint = evidence_actor.endpoint().to_owned();
+    reincarnation_heartbeat.requested_lease_duration_ms = requested_lease_duration_ms;
+    let actor_advanced = old_page_committed
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat: reincarnation_heartbeat,
+            heartbeat_at_ms,
+            lease_deadline_ms: heartbeat_at_ms + requested_lease_duration_ms,
+            lease_horizon_authority: None,
+        })
+        .unwrap();
+    assert_eq!(
+        actor_advanced
+            .snapshot()
+            .node(evidence_actor_id)
+            .unwrap()
+            .node_incarnation(),
+        evidence_actor.node_incarnation()
+    );
+
+    let response_loss_reopened = crate::pg_store::MetadataTransferStagingStore::open(
+        response_loss_tmp.path(),
+        evidence_actor.clone(),
+        crate::pg_store::MetadataTransferStagingLimits::new(8, 1 << 20, 8 << 20).unwrap(),
+    )
+    .unwrap();
+    let response_loss_rebound_page = response_loss_reopened
+        .next_evidence_page()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response_loss_rebound_page.actor(), &evidence_actor);
+    assert_eq!(response_loss_rebound_page.previous_generation(), 0);
+    let rebound_page_committed = actor_advanced
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: response_loss_rebound_page.operation_payload().to_vec(),
+                page_digest: response_loss_rebound_page.page_digest(),
+            },
+        )
+        .unwrap();
+    assert!(rebound_page_committed.changed());
+    let old_page_replay = rebound_page_committed
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: response_loss_old_page.operation_payload().to_vec(),
+                page_digest: response_loss_old_page.page_digest(),
+            },
+        )
+        .unwrap();
+    assert!(!old_page_replay.changed());
+    assert!(matches!(
+        old_page_replay.response(),
+        ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
+            apply_receipt
+        } if apply_receipt == response_loss_old_receipt.as_bytes()
+    ));
+    for actor in [&response_loss_old_actor, &evidence_actor] {
+        assert!(rebound_page_committed
+            .snapshot()
+            .metadata_transfer_staging_evidence_pages
+            .contains_key(&(actor.node_id(), actor.node_incarnation(), 1)));
+        assert!(rebound_page_committed
+            .snapshot()
+            .metadata_transfer_staging_evidence
+            .contains_key(&MetadataTransferStagingEvidenceKey {
+                pg_id: response_loss_intent.pg_id(),
+                staging_generation: response_loss_intent.staging_generation(),
+                actor_node_id: actor.node_id(),
+                actor_node_incarnation: actor.node_incarnation(),
+                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+            }));
+    }
+    rebound_page_committed
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(rebound_page_committed.snapshot())).unwrap(),
+        *rebound_page_committed.snapshot()
+    );
+    let evidence_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        evidence_actor.clone(),
+        &evidence_request.unavailable_transition,
+        evidence_request.artifact_digest,
+        evidence_request.artifact_length,
+        evidence_request.artifact_format_version,
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+        None,
+    );
+    let duplicate_member_intent =
+        crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &evidence_request.unavailable_transition,
+            evidence_request.artifact_digest,
+            evidence_request.artifact_length,
+            evidence_request.artifact_format_version,
+        )
+        .unwrap();
+    let duplicate_member_page =
+        crate::pg_store::metadata_transfer_staging_evidence_page_with_duplicate_member_for_test(
+            evidence_actor.clone(),
+            &duplicate_member_intent,
+            crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+            None,
+        );
+    let duplicate_member_command = ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+        operation_payload: duplicate_member_page.operation_payload().to_vec(),
+        page_digest: duplicate_member_page.page_digest(),
+    };
+    assert!(matches!(
+        staged
+            .snapshot()
+            .apply_control_plane_command(duplicate_member_command.clone()),
+        Err(ControlPlaneError::CommandDecode { message })
+            if message.contains("identity is duplicated or already retained")
+    ));
+    let mut replicated =
+        ReplicatedControlPlaneStateMachine::new(staged.snapshot().clone(), None).unwrap();
+    let committed_duplicate = replicated
+        .apply_committed_command(
+            ControlPlaneLogId::new(1, 1).unwrap(),
+            duplicate_member_command,
+        )
+        .unwrap();
+    assert!(matches!(
+        committed_duplicate.rejection(),
+        Some(ControlPlaneError::CommandDecode { message })
+            if message.contains("identity is duplicated or already retained")
+    ));
+    assert_eq!(replicated.snapshot(), staged.snapshot());
+    let evidence_command = ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+        operation_payload: evidence_page.operation_payload().to_vec(),
+        page_digest: evidence_page.page_digest(),
+    };
+    let evidence_applied = staged
+        .snapshot()
+        .apply_control_plane_command(evidence_command.clone())
+        .unwrap();
+    assert!(evidence_applied.changed());
+    assert_eq!(
+        evidence_applied.snapshot().cluster_epoch(),
+        staged.snapshot().cluster_epoch(),
+        "staging evidence application must be epoch-neutral"
+    );
+    let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt } =
+        evidence_applied.response()
+    else {
+        panic!("staging evidence returned the wrong response kind");
+    };
+    let apply_receipt =
+        crate::pg_store::decode_staging_evidence_apply_receipt(apply_receipt).unwrap();
+    let retained_duplicate_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        evidence_actor.clone(),
+        &evidence_request.unavailable_transition,
+        evidence_request.artifact_digest,
+        evidence_request.artifact_length,
+        evidence_request.artifact_format_version,
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+        Some(&apply_receipt),
+    );
+    assert!(matches!(
+        evidence_applied
+            .snapshot()
+            .apply_control_plane_command(
+                ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                    operation_payload: retained_duplicate_page.operation_payload().to_vec(),
+                    page_digest: retained_duplicate_page.page_digest(),
+                }
+            ),
+        Err(ControlPlaneError::CommandDecode { message })
+            if message.contains("identity is duplicated or already retained")
+    ));
+    let evidence_replay = evidence_applied
+        .snapshot()
+        .apply_control_plane_command(evidence_command.clone())
+        .unwrap();
+    assert!(!evidence_replay.changed());
+    assert_eq!(evidence_replay.response(), evidence_applied.response());
+    assert_eq!(
+        parse_snapshot(&format_snapshot(evidence_applied.snapshot())).unwrap(),
+        *evidence_applied.snapshot()
+    );
+
+    let same_actor_unpaged_request = &staging_requests[1];
+    let same_actor_unpaged = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        evidence_actor.clone(),
+        &same_actor_unpaged_request.unavailable_transition,
+        same_actor_unpaged_request.artifact_digest,
+        same_actor_unpaged_request.artifact_length,
+        same_actor_unpaged_request.artifact_format_version,
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+        None,
+    );
+    let same_actor_unpaged_evidence =
+        crate::pg_store::decode_staging_evidence(same_actor_unpaged.entries()[0].evidence())
+            .unwrap();
+    let mut same_actor_unpaged_snapshot = evidence_applied.snapshot().clone();
+    same_actor_unpaged_snapshot
+        .metadata_transfer_staging_evidence
+        .insert(
+            MetadataTransferStagingEvidenceKey {
+                pg_id: same_actor_unpaged_evidence.intent().pg_id(),
+                staging_generation: same_actor_unpaged_evidence.intent().staging_generation(),
+                actor_node_id: evidence_actor_id,
+                actor_node_incarnation: evidence_actor.node_incarnation(),
+                kind: same_actor_unpaged_evidence.kind(),
+            },
+            same_actor_unpaged_evidence.as_bytes().to_vec(),
+        );
+    assert!(
+        parse_snapshot(&format_snapshot(&same_actor_unpaged_snapshot))
+            .unwrap_err()
+            .to_string()
+            .contains("does not exactly match retained page membership")
+    );
+
+    let mut future_actor_snapshot = evidence_applied.snapshot().clone();
+    future_actor_snapshot
+        .nodes
+        .get_mut(&evidence_actor_id)
+        .unwrap()
+        .node_incarnation = evidence_actor.node_incarnation() - 1;
+    assert!(parse_snapshot(&format_snapshot(&future_actor_snapshot))
+        .unwrap_err()
+        .to_string()
+        .contains("page actor is incompatible with current node identity"));
+
+    let mut same_incarnation_endpoint_snapshot = evidence_applied.snapshot().clone();
+    same_incarnation_endpoint_snapshot
+        .nodes
+        .get_mut(&evidence_actor_id)
+        .unwrap()
+        .endpoint = "/tmp/forged-same-incarnation-endpoint.sock".to_owned();
+    assert!(
+        parse_snapshot(&format_snapshot(&same_incarnation_endpoint_snapshot))
+            .unwrap_err()
+            .to_string()
+            .contains("page actor is incompatible with current node identity")
+    );
+
+    let second_actor_id = evidence_request
+        .unavailable_transition
+        .destination_acting_set()
+        .iter()
+        .copied()
+        .find(|node_id| *node_id != evidence_actor_id)
+        .unwrap();
+    let second_actor_record = staged.snapshot().node(second_actor_id).unwrap();
+    let second_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        second_actor_id,
+        second_actor_record.node_incarnation(),
+        second_actor_record.endpoint().to_owned(),
+    )
+    .unwrap();
+    let foreign_intent =
+        crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &evidence_request.unavailable_transition,
+            evidence_request.artifact_digest,
+            evidence_request.artifact_length,
+            evidence_request.artifact_format_version,
+        )
+        .unwrap();
+    let foreign_member_page =
+        crate::pg_store::metadata_transfer_staging_evidence_page_with_member_actor_for_test(
+            evidence_actor.clone(),
+            second_actor.clone(),
+            &foreign_intent,
+            crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+            None,
+        );
+    let foreign_evidence = foreign_member_page.entries()[0].evidence().to_vec();
+    let mut foreign_member_snapshot = evidence_applied.snapshot().clone();
+    foreign_member_snapshot
+        .metadata_transfer_staging_evidence_pages
+        .insert(
+            (
+                evidence_actor.node_id(),
+                evidence_actor.node_incarnation(),
+                foreign_member_page.generation(),
+            ),
+            MetadataTransferStagingEvidencePageRecord {
+                operation_payload: foreign_member_page.operation_payload().to_vec(),
+                page_digest: foreign_member_page.page_digest(),
+                apply_receipt:
+                    crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(
+                        &foreign_member_page,
+                    )
+                    .as_bytes()
+                    .to_vec(),
+            },
+        );
+    foreign_member_snapshot
+        .metadata_transfer_staging_evidence
+        .insert(
+            MetadataTransferStagingEvidenceKey {
+                pg_id: evidence_request.unavailable_transition.pg_id(),
+                staging_generation: evidence_request.staging_generation,
+                actor_node_id: second_actor_id,
+                actor_node_incarnation: second_actor.node_incarnation(),
+                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+            },
+            foreign_evidence.clone(),
+        );
+    assert!(parse_snapshot(&format_snapshot(&foreign_member_snapshot))
+        .unwrap_err()
+        .to_string()
+        .contains("page contains foreign actor evidence"));
+
+    let mut orphan_actor_snapshot = evidence_applied.snapshot().clone();
+    orphan_actor_snapshot
+        .metadata_transfer_staging_evidence
+        .insert(
+            MetadataTransferStagingEvidenceKey {
+                pg_id: evidence_request.unavailable_transition.pg_id(),
+                staging_generation: evidence_request.staging_generation,
+                actor_node_id: second_actor_id,
+                actor_node_incarnation: second_actor.node_incarnation(),
+                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+            },
+            foreign_evidence,
+        );
+    assert!(parse_snapshot(&format_snapshot(&orphan_actor_snapshot))
+        .unwrap_err()
+        .to_string()
+        .contains("does not exactly match retained page membership"));
+
+    let mut changed_actor_snapshot = evidence_applied.snapshot().clone();
+    let changed_endpoint = "/tmp/reincarnated-evidence-actor.sock".to_owned();
+    changed_actor_snapshot
+        .nodes
+        .get_mut(&evidence_actor_id)
+        .unwrap()
+        .endpoint = changed_endpoint.clone();
+    let changed_actor_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+            evidence_actor_id,
+            evidence_actor.node_incarnation(),
+            changed_endpoint,
+        )
+        .unwrap(),
+        &evidence_request.unavailable_transition,
+        evidence_request.artifact_digest,
+        evidence_request.artifact_length,
+        evidence_request.artifact_format_version,
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+        Some(&apply_receipt),
+    );
+    assert!(changed_actor_snapshot
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: changed_actor_page.operation_payload().to_vec(),
+                page_digest: changed_actor_page.page_digest(),
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not extend the retained generation"));
+
+    let successor_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        evidence_actor.clone(),
+        &evidence_request.unavailable_transition,
+        evidence_request.artifact_digest,
+        evidence_request.artifact_length,
+        evidence_request.artifact_format_version,
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+        Some(&apply_receipt),
+    );
+    let successor_applied = evidence_applied
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: successor_page.operation_payload().to_vec(),
+                page_digest: successor_page.page_digest(),
+            },
+        )
+        .unwrap();
+    assert!(successor_applied.changed());
+    assert_eq!(
+        parse_snapshot(&format_snapshot(successor_applied.snapshot())).unwrap(),
+        *successor_applied.snapshot()
+    );
+    let predecessor_replay = successor_applied
+        .snapshot()
+        .apply_control_plane_command(evidence_command.clone())
+        .unwrap();
+    assert!(!predecessor_replay.changed());
+    assert_eq!(predecessor_replay.response(), evidence_applied.response());
+    let mut missing_predecessor_page = successor_applied.snapshot().clone();
+    missing_predecessor_page
+        .metadata_transfer_staging_evidence_pages
+        .remove(&(
+            evidence_actor_id,
+            evidence_actor.node_incarnation(),
+            evidence_page.generation(),
+        ));
+    assert!(parse_snapshot(&format_snapshot(&missing_predecessor_page))
+        .unwrap_err()
+        .to_string()
+        .contains("page chain has a generation gap"));
+    let mut missing_member = successor_applied.snapshot().clone();
+    missing_member
+        .metadata_transfer_staging_evidence
+        .remove(&MetadataTransferStagingEvidenceKey {
+            pg_id: evidence_request.unavailable_transition.pg_id(),
+            staging_generation: evidence_request.staging_generation,
+            actor_node_id: evidence_actor_id,
+            actor_node_incarnation: evidence_actor.node_incarnation(),
+            kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+        });
+    assert!(missing_member
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .contains("does not exactly match retained page membership"));
+
+    let unauthorized_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(1),
+            staged
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .node_incarnation(),
+            staged
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .endpoint()
+                .to_owned(),
+        )
+        .unwrap(),
+        &evidence_request.unavailable_transition,
+        evidence_request.artifact_digest,
+        evidence_request.artifact_length,
+        evidence_request.artifact_format_version,
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+        None,
+    );
+    assert!(staged
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: unauthorized_page.operation_payload().to_vec(),
+                page_digest: unauthorized_page.page_digest(),
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not match its authorization"));
 
     let later_epoch = staged
         .snapshot()

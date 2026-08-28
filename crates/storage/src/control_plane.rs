@@ -74,7 +74,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 34;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 35;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
@@ -845,7 +845,26 @@ pub struct ClusterControlSnapshot {
     unavailable_pg_placement_transitions: BTreeMap<PgId, UnavailablePgPlacementTransition>,
     retained_unavailable_pg_placement_transitions:
         BTreeMap<(PgId, ClusterEpoch), UnavailablePgPlacementTransition>,
+    metadata_transfer_staging_evidence_pages:
+        BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidencePageRecord>,
+    metadata_transfer_staging_evidence: BTreeMap<MetadataTransferStagingEvidenceKey, Vec<u8>>,
     history: Vec<ClusterMapHistoryRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataTransferStagingEvidencePageRecord {
+    operation_payload: Vec<u8>,
+    page_digest: [u8; 32],
+    apply_receipt: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MetadataTransferStagingEvidenceKey {
+    pg_id: PgId,
+    staging_generation: u64,
+    actor_node_id: NodeId,
+    actor_node_incarnation: u64,
+    kind: crate::pg_store::MetadataTransferStagingEvidenceKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1550,6 +1569,8 @@ impl ClusterControlSnapshot {
             unavailable_node_observations: BTreeMap::new(),
             unavailable_pg_placement_transitions: BTreeMap::new(),
             retained_unavailable_pg_placement_transitions: BTreeMap::new(),
+            metadata_transfer_staging_evidence_pages: BTreeMap::new(),
+            metadata_transfer_staging_evidence: BTreeMap::new(),
             history: Vec::new(),
         }
     }
@@ -2515,6 +2536,345 @@ impl ClusterControlSnapshot {
                 .staging_authorization = Some(authorization);
         }
         Ok(Some(next_snapshot))
+    }
+
+    fn validate_metadata_transfer_staging_evidence_authority(
+        &self,
+        evidence: &crate::pg_store::MetadataTransferStagingEvidence,
+        require_current_actor: bool,
+    ) -> Result<(), ControlPlaneError> {
+        let actor = evidence.actor();
+        if require_current_actor {
+            let node = self.nodes.get(&actor.node_id()).ok_or_else(|| {
+                ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "metadata-transfer staging evidence references unknown node {}",
+                        actor.node_id().as_u32()
+                    ),
+                }
+            })?;
+            if node.node_incarnation != actor.node_incarnation()
+                || node.endpoint != actor.endpoint()
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "metadata-transfer staging evidence actor {} does not match current node identity",
+                        actor.node_id().as_u32()
+                    ),
+                });
+            }
+        }
+
+        let intent = evidence.intent();
+        let transition = self
+            .retained_unavailable_pg_placement_transitions
+            .get(&(intent.pg_id(), intent.transition_epoch()))
+            .or_else(|| {
+                self.unavailable_pg_placement_transitions
+                    .get(&intent.pg_id())
+                    .filter(|transition| transition.transition_epoch == intent.transition_epoch())
+            })
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} has no matching transition for metadata-transfer staging evidence",
+                    intent.pg_id().get()
+                ),
+            })?;
+        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
+            ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} has no staging authorization for metadata-transfer evidence",
+                    intent.pg_id().get()
+                ),
+            }
+        })?;
+        if transition.source_epoch != intent.source_epoch()
+            || transition.source_acting_set != intent.source_acting_set()
+            || transition.destination_acting_set != intent.destination_acting_set()
+            || authorization.staging_generation != intent.staging_generation()
+            || authorization.artifact_digest != intent.artifact_digest()
+            || authorization.artifact_length != intent.artifact_length()
+            || authorization.artifact_format_version != intent.artifact_format_version()
+            || !transition.destination_acting_set.contains(&actor.node_id())
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging evidence does not match its authorization",
+                    intent.pg_id().get()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_metadata_transfer_staging_evidence_invariants(&self) -> Result<(), String> {
+        let mut page_members = BTreeMap::new();
+        for (key, record) in &self.metadata_transfer_staging_evidence_pages {
+            let page = crate::pg_store::decode_staging_evidence_page_payload(
+                &record.operation_payload,
+                record.page_digest,
+            )
+            .map_err(|error| error.to_string())?;
+            if *key
+                != (
+                    page.actor().node_id(),
+                    page.actor().node_incarnation(),
+                    page.generation(),
+                )
+            {
+                return Err(
+                    "metadata-transfer staging page key does not match its actor and generation"
+                        .to_owned(),
+                );
+            }
+            let node = self.nodes.get(&page.actor().node_id()).ok_or_else(|| {
+                "metadata-transfer staging page references an unknown actor".to_owned()
+            })?;
+            if node.node_incarnation < page.actor().node_incarnation()
+                || (node.node_incarnation == page.actor().node_incarnation()
+                    && node.endpoint != page.actor().endpoint())
+            {
+                return Err(
+                    "metadata-transfer staging page actor is incompatible with current node identity"
+                        .to_owned(),
+                );
+            }
+            let receipt =
+                crate::pg_store::decode_staging_evidence_apply_receipt(&record.apply_receipt)
+                    .map_err(|error| error.to_string())?;
+            let expected =
+                crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+            if receipt.as_bytes() != expected.as_bytes() {
+                return Err(
+                    "metadata-transfer staging page has a mismatched apply receipt".to_owned(),
+                );
+            }
+            if page.generation() == 1 {
+                if page.previous_generation() != 0
+                    || page.previous_apply_receipt_digest() != [0; 32]
+                {
+                    return Err(
+                        "metadata-transfer staging actor page chain has an invalid genesis"
+                            .to_owned(),
+                    );
+                }
+            } else {
+                let predecessor = self
+                    .metadata_transfer_staging_evidence_pages
+                    .get(&(
+                        page.actor().node_id(),
+                        page.actor().node_incarnation(),
+                        page.generation() - 1,
+                    ))
+                    .ok_or_else(|| {
+                        "metadata-transfer staging actor page chain has a generation gap".to_owned()
+                    })?;
+                let predecessor_page = crate::pg_store::decode_staging_evidence_page_payload(
+                    &predecessor.operation_payload,
+                    predecessor.page_digest,
+                )
+                .map_err(|error| error.to_string())?;
+                if predecessor_page.actor() != page.actor()
+                    || page.previous_generation() != predecessor_page.generation()
+                    || page.previous_apply_receipt_digest()
+                        != checksum::sha256::digest(&predecessor.apply_receipt)
+                {
+                    return Err(
+                        "metadata-transfer staging actor page does not extend its exact predecessor"
+                            .to_owned(),
+                    );
+                }
+            }
+            for entry in page.entries() {
+                let evidence = crate::pg_store::decode_staging_evidence(entry.evidence())
+                    .map_err(|error| error.to_string())?;
+                if evidence.actor() != page.actor() {
+                    return Err(
+                        "metadata-transfer staging page contains foreign actor evidence".to_owned(),
+                    );
+                }
+                let evidence_key = MetadataTransferStagingEvidenceKey {
+                    pg_id: evidence.intent().pg_id(),
+                    staging_generation: evidence.intent().staging_generation(),
+                    actor_node_id: evidence.actor().node_id(),
+                    actor_node_incarnation: evidence.actor().node_incarnation(),
+                    kind: evidence.kind(),
+                };
+                if page_members
+                    .insert(evidence_key, entry.evidence().to_vec())
+                    .is_some()
+                {
+                    return Err(
+                        "metadata-transfer staging evidence appears in more than one retained page"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        if page_members != self.metadata_transfer_staging_evidence {
+            return Err(
+                "metadata-transfer staging detailed evidence does not exactly match retained page membership"
+                    .to_owned(),
+            );
+        }
+        for (key, bytes) in &self.metadata_transfer_staging_evidence {
+            let evidence = crate::pg_store::decode_staging_evidence(bytes)
+                .map_err(|error| error.to_string())?;
+            let decoded_key = MetadataTransferStagingEvidenceKey {
+                pg_id: evidence.intent().pg_id(),
+                staging_generation: evidence.intent().staging_generation(),
+                actor_node_id: evidence.actor().node_id(),
+                actor_node_incarnation: evidence.actor().node_incarnation(),
+                kind: evidence.kind(),
+            };
+            if *key != decoded_key || evidence.as_bytes() != bytes {
+                return Err(
+                    "metadata-transfer staging evidence key does not match its payload".to_owned(),
+                );
+            }
+            self.validate_metadata_transfer_staging_evidence_authority(&evidence, false)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn apply_metadata_transfer_staging_evidence_page(
+        &self,
+        operation_payload: Vec<u8>,
+        page_digest: [u8; 32],
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        let page =
+            crate::pg_store::decode_staging_evidence_page_payload(&operation_payload, page_digest)
+                .map_err(|error| ControlPlaneError::CommandDecode {
+                    message: format!("invalid metadata-transfer staging evidence page: {error}"),
+                })?;
+        let actor_key = (page.actor().node_id(), page.actor().node_incarnation());
+        let page_key = (actor_key.0, actor_key.1, page.generation());
+        if let Some(existing) = self.metadata_transfer_staging_evidence_pages.get(&page_key) {
+            let existing_page = crate::pg_store::decode_staging_evidence_page_payload(
+                &existing.operation_payload,
+                existing.page_digest,
+            )
+            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
+                context: "retained metadata-transfer staging evidence page is invalid",
+                message: error.to_string(),
+            })?;
+            if page.actor() == existing_page.actor()
+                && existing.operation_payload == operation_payload
+                && existing.page_digest == page_digest
+            {
+                return Ok(AppliedControlPlaneCommand::new(
+                    self.clone(),
+                    ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
+                        apply_receipt: existing.apply_receipt.clone(),
+                    },
+                    false,
+                ));
+            }
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "node {} staging evidence generation {} conflicts with its retained page",
+                    page.actor().node_id().as_u32(),
+                    page.generation()
+                ),
+            });
+        }
+        let latest = self
+            .metadata_transfer_staging_evidence_pages
+            .range((actor_key.0, actor_key.1, 0)..=(actor_key.0, actor_key.1, u64::MAX))
+            .next_back();
+        if let Some((_, existing)) = latest {
+            let existing_page = crate::pg_store::decode_staging_evidence_page_payload(
+                &existing.operation_payload,
+                existing.page_digest,
+            )
+            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
+                context: "retained metadata-transfer staging evidence page is invalid",
+                message: error.to_string(),
+            })?;
+            let expected_previous_digest = checksum::sha256::digest(&existing.apply_receipt);
+            if page.actor() != existing_page.actor()
+                || page.generation() != existing_page.generation().checked_add(1).unwrap_or(0)
+                || page.previous_generation() != existing_page.generation()
+                || page.previous_apply_receipt_digest() != expected_previous_digest
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "node {} staging evidence page does not extend the retained generation",
+                        page.actor().node_id().as_u32()
+                    ),
+                });
+            }
+        } else if page.previous_generation() != 0 || page.previous_apply_receipt_digest() != [0; 32]
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "node {} first staging evidence page is not the genesis generation",
+                    page.actor().node_id().as_u32()
+                ),
+            });
+        }
+
+        let mut decoded_entries = Vec::with_capacity(page.entries().len());
+        let mut page_evidence_keys = BTreeSet::new();
+        for entry in page.entries() {
+            let evidence =
+                crate::pg_store::decode_staging_evidence(entry.evidence()).map_err(|error| {
+                    ControlPlaneError::CommandDecode {
+                        message: format!("invalid metadata-transfer staging evidence: {error}"),
+                    }
+                })?;
+            if evidence.actor() != page.actor() {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: "metadata-transfer staging page contains foreign actor evidence"
+                        .to_owned(),
+                });
+            }
+            self.validate_metadata_transfer_staging_evidence_authority(&evidence, true)?;
+            let key = MetadataTransferStagingEvidenceKey {
+                pg_id: evidence.intent().pg_id(),
+                staging_generation: evidence.intent().staging_generation(),
+                actor_node_id: evidence.actor().node_id(),
+                actor_node_incarnation: evidence.actor().node_incarnation(),
+                kind: evidence.kind(),
+            };
+            if self.metadata_transfer_staging_evidence.contains_key(&key)
+                || !page_evidence_keys.insert(key.clone())
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} staging evidence identity is duplicated or already retained",
+                        key.pg_id.get()
+                    ),
+                });
+            }
+            decoded_entries.push((key, evidence.as_bytes().to_vec()));
+        }
+
+        let receipt = crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+        let mut next_snapshot = self.clone();
+        for (key, evidence) in decoded_entries {
+            next_snapshot
+                .metadata_transfer_staging_evidence
+                .insert(key, evidence);
+        }
+        next_snapshot
+            .metadata_transfer_staging_evidence_pages
+            .insert(
+                page_key,
+                MetadataTransferStagingEvidencePageRecord {
+                    operation_payload,
+                    page_digest,
+                    apply_receipt: receipt.as_bytes().to_vec(),
+                },
+            );
+        Ok(AppliedControlPlaneCommand::new(
+            next_snapshot,
+            ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
+                apply_receipt: receipt.as_bytes().to_vec(),
+            },
+            true,
+        ))
     }
 
     pub(crate) fn complete_unavailable_pg_placement_transition_command(
@@ -4081,6 +4441,7 @@ impl ClusterControlSnapshot {
             }
         }
         self.validate_lease_grant_horizon_invariant()?;
+        self.validate_metadata_transfer_staging_evidence_invariants()?;
         for (node_id, observation) in &self.unavailable_node_observations {
             if *node_id != observation.node_id {
                 return Err("unavailable node observation key does not match its subject".into());
@@ -5614,6 +5975,10 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     changed,
                 ))
             }
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload,
+                page_digest,
+            } => self.apply_metadata_transfer_staging_evidence_page(operation_payload, page_digest),
             ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
                 ready_at_ms,
                 transitions,
@@ -10904,6 +11269,20 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             format_unavailable_pg_placement_transition(transition)
         ));
     }
+    for record in snapshot.metadata_transfer_staging_evidence_pages.values() {
+        out.push_str(&format!(
+            "metadata_transfer_staging_evidence_page={},{},{}\n",
+            hex_encode(&record.operation_payload),
+            hex_encode(&record.page_digest),
+            hex_encode(&record.apply_receipt)
+        ));
+    }
+    for evidence in snapshot.metadata_transfer_staging_evidence.values() {
+        out.push_str(&format!(
+            "metadata_transfer_staging_evidence={}\n",
+            hex_encode(evidence)
+        ));
+    }
     for record in snapshot.pgs.values() {
         out.push_str(&format!("pg={}\n", format_pg_record(record)));
     }
@@ -11538,6 +11917,8 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut unavailable_node_observations = BTreeMap::new();
     let mut unavailable_pg_placement_transitions = BTreeMap::new();
     let mut retained_unavailable_pg_placement_transitions = BTreeMap::new();
+    let mut metadata_transfer_staging_evidence_pages = BTreeMap::new();
+    let mut metadata_transfer_staging_evidence = BTreeMap::new();
     let mut pg_lines = BTreeMap::new();
     let mut node_pg_lines = BTreeMap::<(NodeId, PgId), usize>::new();
     let mut history = BTreeMap::<ClusterEpoch, ParsedHistoryRecord>::new();
@@ -11736,6 +12117,70 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                     "duplicate retained unavailable PG placement transition",
                 ));
             }
+        } else if let Some(value) = line.strip_prefix("metadata_transfer_staging_evidence_page=") {
+            let fields: Vec<_> = value.split(',').collect();
+            if fields.len() != 3 {
+                return Err(parse_error(
+                    line_number,
+                    "metadata-transfer staging evidence page must have three fields",
+                ));
+            }
+            let operation_payload = hex_decode(line_number, fields[0])?;
+            let page_digest = hex_decode(line_number, fields[1])?
+                .try_into()
+                .map_err(|_| {
+                    parse_error(
+                        line_number,
+                        "metadata-transfer staging page digest must contain 32 bytes",
+                    )
+                })?;
+            let apply_receipt = hex_decode(line_number, fields[2])?;
+            let page = crate::pg_store::decode_staging_evidence_page_payload(
+                &operation_payload,
+                page_digest,
+            )
+            .map_err(|error| parse_error(line_number, &error.to_string()))?;
+            let key = (
+                page.actor().node_id(),
+                page.actor().node_incarnation(),
+                page.generation(),
+            );
+            if metadata_transfer_staging_evidence_pages
+                .insert(
+                    key,
+                    MetadataTransferStagingEvidencePageRecord {
+                        operation_payload,
+                        page_digest,
+                        apply_receipt,
+                    },
+                )
+                .is_some()
+            {
+                return Err(parse_error(
+                    line_number,
+                    "duplicate metadata-transfer staging evidence page actor",
+                ));
+            }
+        } else if let Some(value) = line.strip_prefix("metadata_transfer_staging_evidence=") {
+            let bytes = hex_decode(line_number, value)?;
+            let evidence = crate::pg_store::decode_staging_evidence(&bytes)
+                .map_err(|error| parse_error(line_number, &error.to_string()))?;
+            let key = MetadataTransferStagingEvidenceKey {
+                pg_id: evidence.intent().pg_id(),
+                staging_generation: evidence.intent().staging_generation(),
+                actor_node_id: evidence.actor().node_id(),
+                actor_node_incarnation: evidence.actor().node_incarnation(),
+                kind: evidence.kind(),
+            };
+            if metadata_transfer_staging_evidence
+                .insert(key, bytes)
+                .is_some()
+            {
+                return Err(parse_error(
+                    line_number,
+                    "duplicate metadata-transfer staging evidence identity",
+                ));
+            }
         } else if let Some(value) = line.strip_prefix("pg=") {
             version.ok_or_else(|| parse_error(line_number, "version must precede PG records"))?;
             let record = parse_pg_record(line_number, value)?;
@@ -11804,6 +12249,8 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         unavailable_node_observations,
         unavailable_pg_placement_transitions,
         retained_unavailable_pg_placement_transitions,
+        metadata_transfer_staging_evidence_pages,
+        metadata_transfer_staging_evidence,
         max_committed_timestamp_ms,
         lease_grant_horizon,
         history,
