@@ -508,7 +508,7 @@ pub(super) mod pg_store_facade {
         MetadataProofStorageIssuer, PendingMetadataCommandSlotInsertError,
         PendingMetadataCommandSlotReplaceError, ScavengerShardFile, ScavengerShardFileScan,
         ScavengerShardRow, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
-        METADATA_COMMAND_CHECKPOINT_MAGIC,
+        METADATA_COMMAND_CHECKPOINT_MAGIC, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
     };
     pub use super::pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,

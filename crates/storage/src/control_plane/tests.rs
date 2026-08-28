@@ -1579,15 +1579,15 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         require_current_control_plane_state_version(None),
         Err(ControlPlaneStateVersionError::Missing)
     );
-    for version in [28, 29, 30, 31, 32, 34] {
+    for version in [28, 29, 30, 31, 32, 33, 35] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
             Err(ControlPlaneStateVersionError::Unsupported(version))
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(33)),
-        Ok(33)
+        require_current_control_plane_state_version(Some(34)),
+        Ok(34)
     );
 
     assert!(matches!(
@@ -1784,11 +1784,11 @@ fn canonical_control_plane_state_v32_text_remains_rejected_evidence() {
 }
 
 #[test]
-fn canonical_control_plane_state_v33_text_is_exact() {
+fn canonical_control_plane_state_v34_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=33\n",
+            "version=34\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -1893,7 +1893,38 @@ fn canonical_control_plane_state_v32_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v33_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v33_representative_aggregate_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("testdata/state_v33_representative.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            11_535,
+            "d45b799299bbaa0ec21f95aa7f8191c46f8b38682aaa57b57c0baaf625660360".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0;
+    while !remaining.is_empty() {
+        let (length, tail) = remaining.split_at(8);
+        let length = usize::try_from(u64::from_be_bytes(length.try_into().unwrap())).unwrap();
+        let (snapshot, tail) = tail.split_at(length);
+        let snapshot = std::str::from_utf8(snapshot).unwrap();
+        assert!(matches!(
+            parse_snapshot(snapshot),
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 33"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > 1, "v33 aggregate must contain a corpus");
+}
+
+#[test]
+fn canonical_control_plane_state_v34_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -2041,6 +2072,21 @@ fn canonical_control_plane_state_v33_representative_aggregate_is_stable() {
         .unwrap()
         .expect("new unavailable transition remains recoverable");
     snapshots.push(unavailable_authority.snapshot().clone());
+    let staged_snapshot = unavailable_authority
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: vec![UnavailablePgStagingIntentAuthorizationRequest {
+                unavailable_transition: work.mutation_binding().clone(),
+                staging_generation: work.transition_epoch().get(),
+                artifact_digest: [0x7a; 32],
+                artifact_length: 8_192,
+                artifact_format_version:
+                    crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+            }],
+        })
+        .unwrap()
+        .into_snapshot();
+    snapshots.push(staged_snapshot);
     unavailable_authority
         .install_unavailable_pg_transition_metadata_transfer(
             work.mutation_binding().clone(),
@@ -2401,7 +2447,7 @@ fn canonical_control_plane_state_v33_representative_aggregate_is_stable() {
         aggregate_text.push_str(&formatted);
     }
     for required_record in [
-        "version=33\n",
+        "version=34\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -2428,8 +2474,8 @@ fn canonical_control_plane_state_v33_representative_aggregate_is_stable() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            11_535,
-            "d45b799299bbaa0ec21f95aa7f8191c46f8b38682aaa57b57c0baaf625660360".to_owned()
+            14_715,
+            "e444f6b8b05fe347c6d600484845747e11f18dbd78947974234c7aacf98426a7".to_owned()
         )
     );
 }

@@ -41,7 +41,7 @@ const ESTABLISHMENT_MARKER_LEN: usize = ESTABLISHMENT_MARKER_BODY_LEN + 8;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_STAGING_EVIDENCE_BYTES: usize = 4_096;
 const MAX_STAGING_EVIDENCE_PAGE_BYTES: usize = 120 * 1_024;
-const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 1;
+pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MetadataTransferStagingError {

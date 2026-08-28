@@ -29,8 +29,8 @@ use crate::control_plane_command::{
     decode_control_plane_command, encode_control_plane_command, AppliedControlPlaneCommand,
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneCommandStateMachine,
     ControlPlaneLogId, ExpiredNodeHeartbeatLease, PromotedNodeHeartbeatLease,
-    ReadyPgPeeringCompletion, UnavailablePgTransitionBeginRequest,
-    UnavailablePgTransitionCompletionRequest,
+    ReadyPgPeeringCompletion, UnavailablePgStagingIntentAuthorizationRequest,
+    UnavailablePgTransitionBeginRequest, UnavailablePgTransitionCompletionRequest,
 };
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::control_plane_lease::{
@@ -74,7 +74,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 33;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 34;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
@@ -906,12 +906,23 @@ pub struct UnavailablePgPlacementTransition {
     payload_readiness: Option<UnavailablePgPayloadReadiness>,
     completion: Option<ReadyPgPeeringCompletion>,
     begin_batch_receipt: UnavailablePgTransitionBatchReceipt,
+    staging_authorization: Option<UnavailablePgStagingIntentAuthorization>,
     completion_batch_receipt: Option<UnavailablePgTransitionBatchReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailablePgStagingIntentAuthorization {
+    staging_generation: u64,
+    artifact_digest: [u8; 32],
+    artifact_length: u64,
+    artifact_format_version: u16,
+    batch_receipt: UnavailablePgTransitionBatchReceipt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum UnavailablePgTransitionBatchStage {
     Begin,
+    StagingAuthorization,
     Completion,
 }
 
@@ -919,6 +930,7 @@ impl UnavailablePgTransitionBatchStage {
     fn as_str(self) -> &'static str {
         match self {
             Self::Begin => "begin",
+            Self::StagingAuthorization => "staging-authorization",
             Self::Completion => "completion",
         }
     }
@@ -926,6 +938,7 @@ impl UnavailablePgTransitionBatchStage {
     fn from_str(value: &str) -> Result<Self, String> {
         match value {
             "begin" => Ok(Self::Begin),
+            "staging-authorization" => Ok(Self::StagingAuthorization),
             "completion" => Ok(Self::Completion),
             _ => Err(format!(
                 "unknown unavailable PG transition batch stage {value:?}"
@@ -979,6 +992,25 @@ enum ValidatedUnavailablePgTransitionCompletion {
         completion: ReadyPgPeeringCompletion,
         batch_identity: UnavailablePgTransitionBatchReceiptIdentity,
     },
+}
+
+#[derive(Debug)]
+enum ValidatedUnavailablePgStagingIntentAuthorization {
+    ExactReplay {
+        pg_id: PgId,
+    },
+    Apply {
+        pg_id: PgId,
+        authorization: UnavailablePgStagingIntentAuthorization,
+    },
+}
+
+impl ValidatedUnavailablePgStagingIntentAuthorization {
+    fn pg_id(&self) -> PgId {
+        match self {
+            Self::ExactReplay { pg_id } | Self::Apply { pg_id, .. } => *pg_id,
+        }
+    }
 }
 
 impl ValidatedUnavailablePgTransitionCompletion {
@@ -1077,7 +1109,7 @@ fn unavailable_pg_transition_completion_batch_identity(
         &mut hasher,
         UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN,
     );
-    digest_u8(&mut hasher, 2);
+    digest_u8(&mut hasher, 3);
     digest_u64(&mut hasher, ready_at_ms);
     digest_len(&mut hasher, requests.len());
     for request in requests {
@@ -1112,6 +1144,56 @@ fn unavailable_pg_transition_completion_batch_identity(
             .try_into()
             .expect("SHA-256 unavailable transition batch digest must contain 32 bytes"),
     }
+}
+
+fn unavailable_pg_staging_authorization_batch_identity(
+    requests: &[UnavailablePgStagingIntentAuthorizationRequest],
+) -> UnavailablePgTransitionBatchReceiptIdentity {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(
+        &mut hasher,
+        UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN,
+    );
+    digest_u8(&mut hasher, 2);
+    digest_len(&mut hasher, requests.len());
+    for request in requests {
+        digest_unavailable_pg_transition_binding(&mut hasher, &request.unavailable_transition);
+        digest_u64(&mut hasher, request.staging_generation);
+        digest_bytes(&mut hasher, &request.artifact_digest);
+        digest_u64(&mut hasher, request.artifact_length);
+        digest_u16(&mut hasher, request.artifact_format_version);
+    }
+    UnavailablePgTransitionBatchReceiptIdentity {
+        stage: UnavailablePgTransitionBatchStage::StagingAuthorization,
+        member_pg_ids: requests
+            .iter()
+            .map(|request| request.unavailable_transition.pg_id())
+            .collect(),
+        members_digest: hasher
+            .finalize()
+            .bytes()
+            .try_into()
+            .expect("SHA-256 staging authorization batch digest must contain 32 bytes"),
+    }
+}
+
+fn unavailable_pg_staging_authorization_request_from_durable(
+    transition: &UnavailablePgPlacementTransition,
+) -> Option<UnavailablePgStagingIntentAuthorizationRequest> {
+    let authorization = transition.staging_authorization.as_ref()?;
+    Some(UnavailablePgStagingIntentAuthorizationRequest {
+        unavailable_transition: UnavailablePgTransitionMutationBinding::new(
+            transition.pg_id,
+            transition.transition_epoch,
+            transition.source_epoch,
+            transition.source_acting_set.clone(),
+            transition.destination_acting_set.clone(),
+        ),
+        staging_generation: authorization.staging_generation,
+        artifact_digest: authorization.artifact_digest,
+        artifact_length: authorization.artifact_length,
+        artifact_format_version: authorization.artifact_format_version,
+    })
 }
 
 fn unavailable_pg_transition_begin_request_from_durable(
@@ -1861,6 +1943,7 @@ impl ClusterControlSnapshot {
             payload_readiness: None,
             completion: None,
             begin_batch_receipt: batch_receipt.clone(),
+            staging_authorization: None,
             completion_batch_receipt: None,
         };
         if let Some(existing) = self
@@ -1872,6 +1955,7 @@ impl ClusterControlSnapshot {
             original_request.destination_route = None;
             original_request.payload_readiness = None;
             original_request.completion = None;
+            original_request.staging_authorization = None;
             original_request.completion_batch_receipt = None;
             if original_request == requested {
                 return Ok(ValidatedUnavailablePgTransitionBegin::ExactReplay { pg_id });
@@ -1889,6 +1973,7 @@ impl ClusterControlSnapshot {
             original_request.destination_route = None;
             original_request.payload_readiness = None;
             original_request.completion = None;
+            original_request.staging_authorization = None;
             original_request.completion_batch_receipt = None;
             if original_request == requested {
                 return Ok(ValidatedUnavailablePgTransitionBegin::ExactReplay { pg_id });
@@ -2282,6 +2367,153 @@ impl ClusterControlSnapshot {
             record.metadata_transfer_fence_epoch = Some(expected_transition_epoch);
         }
         next_snapshot.bump_epoch()?;
+        Ok(Some(next_snapshot))
+    }
+
+    fn validate_unavailable_pg_staging_authorization_batch(
+        &self,
+        requests: Vec<UnavailablePgStagingIntentAuthorizationRequest>,
+    ) -> Result<Vec<ValidatedUnavailablePgStagingIntentAuthorization>, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "staging authorization",
+            requests
+                .iter()
+                .map(|request| request.unavailable_transition.pg_id()),
+        )?;
+        let batch_identity = unavailable_pg_staging_authorization_batch_identity(&requests);
+        requests
+            .into_iter()
+            .map(|request| {
+                let pg_id = request.unavailable_transition.pg_id();
+                if request.staging_generation
+                    != request.unavailable_transition.transition_epoch().get()
+                    || request.artifact_length == 0
+                    || request.artifact_format_version
+                        != crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging authorization has invalid generation, artifact length, or storage format",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                let transition_epoch = request.unavailable_transition.transition_epoch();
+                let active_transition = self
+                    .unavailable_pg_placement_transitions
+                    .get(&pg_id)
+                    .filter(|transition| transition.transition_epoch == transition_epoch);
+                let transition = self
+                    .retained_unavailable_pg_placement_transitions
+                    .get(&(pg_id, transition_epoch))
+                    .or(active_transition)
+                    .ok_or_else(|| ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} has no matching unavailable transition for staging authorization",
+                            pg_id.get()
+                        ),
+                    })?;
+                if !request.unavailable_transition.matches_transition(transition) {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging authorization does not match its unavailable transition",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                if let Some(existing) = &transition.staging_authorization {
+                    if existing.staging_generation == request.staging_generation
+                        && existing.artifact_digest == request.artifact_digest
+                        && existing.artifact_length == request.artifact_length
+                        && existing.artifact_format_version == request.artifact_format_version
+                        && existing.batch_receipt.identity == batch_identity
+                    {
+                        return Ok(
+                            ValidatedUnavailablePgStagingIntentAuthorization::ExactReplay {
+                                pg_id,
+                            },
+                        );
+                    }
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging authorization conflicts with durable artifact identity",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                if active_transition.is_none() || transition.destination_epoch.is_some()
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging authorization is not before destination installation",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                let authorization = UnavailablePgStagingIntentAuthorization {
+                    staging_generation: request.staging_generation,
+                    artifact_digest: request.artifact_digest,
+                    artifact_length: request.artifact_length,
+                    artifact_format_version: request.artifact_format_version,
+                    batch_receipt: UnavailablePgTransitionBatchReceipt {
+                        identity: batch_identity.clone(),
+                        source_epoch: self.cluster_epoch,
+                        target_epoch: self.cluster_epoch,
+                    },
+                };
+                Ok(ValidatedUnavailablePgStagingIntentAuthorization::Apply {
+                    pg_id,
+                    authorization,
+                })
+            })
+            .collect()
+    }
+
+    fn apply_validated_unavailable_pg_staging_authorizations(
+        &self,
+        validated: Vec<ValidatedUnavailablePgStagingIntentAuthorization>,
+    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "staging authorization",
+            validated
+                .iter()
+                .map(ValidatedUnavailablePgStagingIntentAuthorization::pg_id),
+        )?;
+        if validated.iter().all(|entry| {
+            matches!(
+                entry,
+                ValidatedUnavailablePgStagingIntentAuthorization::ExactReplay { .. }
+            )
+        }) {
+            return Ok(None);
+        }
+        if validated.iter().any(|entry| {
+            matches!(
+                entry,
+                ValidatedUnavailablePgStagingIntentAuthorization::ExactReplay { .. }
+            )
+        }) {
+            return Err(ControlPlaneError::CommandDecode {
+                message:
+                    "unavailable placement staging authorization batch mixes replayed and new members"
+                        .to_owned(),
+            });
+        }
+        let mut next_snapshot = self.clone();
+        for entry in validated {
+            let ValidatedUnavailablePgStagingIntentAuthorization::Apply {
+                pg_id,
+                authorization,
+            } = entry
+            else {
+                unreachable!("mixed replay was rejected before staging authorization mutation");
+            };
+            next_snapshot
+                .unavailable_pg_placement_transitions
+                .get_mut(&pg_id)
+                .expect("staging authorization transition was validated")
+                .staging_authorization = Some(authorization);
+        }
         Ok(Some(next_snapshot))
     }
 
@@ -3884,6 +4116,8 @@ impl ClusterControlSnapshot {
                 ));
             }
         }
+        let unavailable_pg_transition_successors =
+            validate_unavailable_pg_transition_lineages(self)?;
         for ((pg_id, transition_epoch), transition) in
             &self.retained_unavailable_pg_placement_transitions
         {
@@ -3892,7 +4126,11 @@ impl ClusterControlSnapshot {
                     "retained unavailable PG transition key does not match its subject".into(),
                 );
             }
-            validate_unavailable_pg_transition_invariant(self, transition)?;
+            validate_unavailable_pg_transition_invariant(
+                self,
+                transition,
+                &unavailable_pg_transition_successors,
+            )?;
         }
         for (pg_id, transition) in &self.unavailable_pg_placement_transitions {
             if *pg_id != transition.pg_id {
@@ -3912,7 +4150,11 @@ impl ClusterControlSnapshot {
                     pg_id.get()
                 ));
             }
-            validate_unavailable_pg_transition_invariant(self, transition)?;
+            validate_unavailable_pg_transition_invariant(
+                self,
+                transition,
+                &unavailable_pg_transition_successors,
+            )?;
             let pg = self.pgs.get(pg_id).ok_or_else(|| {
                 format!(
                     "unavailable transition references unknown PG {}",
@@ -3939,7 +4181,6 @@ impl ClusterControlSnapshot {
                 }
             }
         }
-        validate_unavailable_pg_transition_lineages(self)?;
         validate_unavailable_pg_transition_batch_receipts(self)?;
         for pg in self.pgs.values() {
             if pg.acting_set.is_empty() {
@@ -5360,6 +5601,19 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     changed,
                 ))
             }
+            ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents { authorizations } => {
+                let validated =
+                    self.validate_unavailable_pg_staging_authorization_batch(authorizations)?;
+                let next_snapshot =
+                    self.apply_validated_unavailable_pg_staging_authorizations(validated)?;
+                let changed = next_snapshot.is_some();
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot.unwrap_or_else(|| self.clone()),
+                    ControlPlaneCommandResponse::AuthorizeUnavailablePgStagingIntents,
+                    changed,
+                ))
+            }
             ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
                 ready_at_ms,
                 transitions,
@@ -6617,6 +6871,7 @@ fn validate_unavailable_pg_payload_readiness_at(
 fn validate_unavailable_pg_transition_invariant(
     snapshot: &ClusterControlSnapshot,
     transition: &UnavailablePgPlacementTransition,
+    transition_successors: &BTreeMap<(PgId, ClusterEpoch), ClusterEpoch>,
 ) -> Result<(), String> {
     let topology = snapshot.initial_topology.as_ref().ok_or_else(|| {
         format!(
@@ -6860,6 +7115,31 @@ fn validate_unavailable_pg_transition_invariant(
         &transition.begin_batch_receipt,
         UnavailablePgTransitionBatchStage::Begin,
     )?;
+    if let Some(authorization) = &transition.staging_authorization {
+        let staging_authorization_boundary = transition.destination_epoch.or_else(|| {
+            transition_successors
+                .get(&(transition.pg_id, transition.transition_epoch))
+                .copied()
+        });
+        if authorization.staging_generation != transition.transition_epoch.get()
+            || authorization.artifact_length == 0
+            || authorization.artifact_format_version
+                != crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION
+            || authorization.batch_receipt.source_epoch > snapshot.cluster_epoch
+            || staging_authorization_boundary
+                .is_some_and(|boundary| authorization.batch_receipt.source_epoch >= boundary)
+        {
+            return Err(format!(
+                "unavailable PG transition {} has invalid staging authorization",
+                transition.pg_id.get()
+            ));
+        }
+        validate_unavailable_pg_transition_batch_receipt(
+            transition,
+            &authorization.batch_receipt,
+            UnavailablePgTransitionBatchStage::StagingAuthorization,
+        )?;
+    }
     if transition.completion.is_some() != transition.completion_batch_receipt.is_some() {
         return Err(format!(
             "unavailable PG transition {} has incomplete completion receipt evidence",
@@ -6993,7 +7273,16 @@ fn validate_unavailable_pg_transition_batch_receipt(
             .member_pg_ids
             .binary_search(&transition.pg_id)
             .is_err()
-        || receipt.source_epoch >= receipt.target_epoch
+        || match expected_stage {
+            UnavailablePgTransitionBatchStage::StagingAuthorization => {
+                receipt.source_epoch != receipt.target_epoch
+                    || receipt.source_epoch < transition.transition_epoch
+            }
+            UnavailablePgTransitionBatchStage::Begin
+            | UnavailablePgTransitionBatchStage::Completion => {
+                receipt.source_epoch >= receipt.target_epoch
+            }
+        }
         || (expected_stage == UnavailablePgTransitionBatchStage::Begin
             && (receipt.source_epoch != transition.source_epoch
                 || receipt.target_epoch != transition.transition_epoch))
@@ -7021,6 +7310,12 @@ fn validate_unavailable_pg_transition_batch_receipts(
     >::new();
     for transition in &transitions {
         for receipt in std::iter::once(&transition.begin_batch_receipt)
+            .chain(
+                transition
+                    .staging_authorization
+                    .as_ref()
+                    .map(|authorization| &authorization.batch_receipt),
+            )
             .chain(transition.completion_batch_receipt.as_ref())
         {
             retained_members
@@ -7075,6 +7370,21 @@ fn validate_unavailable_pg_transition_batch_receipts(
                     begin_at_ms,
                 )
             }
+            UnavailablePgTransitionBatchStage::StagingAuthorization => {
+                let requests = member_transitions
+                    .iter()
+                    .map(|transition| {
+                        unavailable_pg_staging_authorization_request_from_durable(transition)
+                            .ok_or_else(|| {
+                                format!(
+                                    "unavailable PG transition {} has a staging receipt without authorization evidence",
+                                    transition.pg_id.get()
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                unavailable_pg_staging_authorization_batch_identity(&requests)
+            }
             UnavailablePgTransitionBatchStage::Completion => {
                 let requests_and_times = member_transitions
                     .iter()
@@ -7111,8 +7421,9 @@ fn validate_unavailable_pg_transition_batch_receipts(
 
 fn validate_unavailable_pg_transition_lineages(
     snapshot: &ClusterControlSnapshot,
-) -> Result<(), String> {
+) -> Result<BTreeMap<(PgId, ClusterEpoch), ClusterEpoch>, String> {
     let mut lineage_tips = BTreeMap::new();
+    let mut successors = BTreeMap::new();
     for transition in snapshot
         .retained_unavailable_pg_placement_transitions
         .values()
@@ -7124,6 +7435,9 @@ fn validate_unavailable_pg_transition_lineages(
                 transition.transition_epoch.get()
             ));
         }
+        if let Some(predecessor) = transition.predecessor_transition_epoch {
+            successors.insert((transition.pg_id, predecessor), transition.transition_epoch);
+        }
         lineage_tips.insert(transition.pg_id, transition.transition_epoch);
     }
     for transition in snapshot.unavailable_pg_placement_transitions.values() {
@@ -7134,8 +7448,11 @@ fn validate_unavailable_pg_transition_lineages(
                 transition.transition_epoch.get()
             ));
         }
+        if let Some(predecessor) = transition.predecessor_transition_epoch {
+            successors.insert((transition.pg_id, predecessor), transition.transition_epoch);
+        }
     }
-    Ok(())
+    Ok(successors)
 }
 
 fn unavailable_transition_source_route_acting_set(
@@ -8191,6 +8508,10 @@ fn digest_u64(hasher: &mut ChecksumHasher, value: u64) {
 }
 
 fn digest_u32(hasher: &mut ChecksumHasher, value: u32) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn digest_u16(hasher: &mut ChecksumHasher, value: u16) {
     hasher.update(&value.to_be_bytes());
 }
 
@@ -10604,7 +10925,7 @@ fn format_unavailable_pg_placement_transition(
     transition: &UnavailablePgPlacementTransition,
 ) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         transition.pg_id.get(),
         transition.transition_epoch.get(),
         option_u64(
@@ -10642,11 +10963,32 @@ fn format_unavailable_pg_placement_transition(
             format_unavailable_pg_transition_batch_receipt(&transition.begin_batch_receipt)
                 .as_bytes()
         ),
+        transition.staging_authorization.as_ref().map_or_else(
+            || "-".to_string(),
+            |authorization| hex_encode(
+                format_unavailable_pg_staging_authorization(authorization).as_bytes()
+            )
+        ),
         transition.completion_batch_receipt.as_ref().map_or_else(
             || "-".to_string(),
             |receipt| hex_encode(
                 format_unavailable_pg_transition_batch_receipt(receipt).as_bytes()
             )
+        )
+    )
+}
+
+fn format_unavailable_pg_staging_authorization(
+    authorization: &UnavailablePgStagingIntentAuthorization,
+) -> String {
+    format!(
+        "{},{},{},{},{}",
+        authorization.staging_generation,
+        hex_encode(&authorization.artifact_digest),
+        authorization.artifact_length,
+        authorization.artifact_format_version,
+        hex_encode(
+            format_unavailable_pg_transition_batch_receipt(&authorization.batch_receipt).as_bytes()
         )
     )
 }
@@ -12313,10 +12655,10 @@ fn parse_unavailable_pg_placement_transition(
     value: &str,
 ) -> Result<UnavailablePgPlacementTransition, ControlPlaneError> {
     let fields: Vec<_> = value.split(',').collect();
-    if fields.len() != 22 {
+    if fields.len() != 23 {
         return Err(parse_error(
             line,
-            "unavailable PG placement transition must have twenty-two fields",
+            "unavailable PG placement transition must have twenty-three fields",
         ));
     }
     let topology_digest = hex_decode(line, fields[4])?
@@ -12371,14 +12713,43 @@ fn parse_unavailable_pg_placement_transition(
         payload_readiness: parse_unavailable_pg_payload_readiness(line, fields[18])?,
         completion: parse_ready_pg_peering_completion(line, fields[19])?,
         begin_batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[20])?,
-        completion_batch_receipt: if fields[21] == "-" {
+        staging_authorization: parse_unavailable_pg_staging_authorization(line, fields[21])?,
+        completion_batch_receipt: if fields[22] == "-" {
             None
         } else {
             Some(parse_unavailable_pg_transition_batch_receipt(
-                line, fields[21],
+                line, fields[22],
             )?)
         },
     })
+}
+
+fn parse_unavailable_pg_staging_authorization(
+    line: usize,
+    value: &str,
+) -> Result<Option<UnavailablePgStagingIntentAuthorization>, ControlPlaneError> {
+    if value == "-" {
+        return Ok(None);
+    }
+    let encoded = String::from_utf8(hex_decode(line, value)?)
+        .map_err(|_| parse_error(line, "staging authorization is not UTF-8"))?;
+    let fields = encoded.split(',').collect::<Vec<_>>();
+    if fields.len() != 5 {
+        return Err(parse_error(
+            line,
+            "staging authorization must have five fields",
+        ));
+    }
+    let artifact_digest = hex_decode(line, fields[1])?
+        .try_into()
+        .map_err(|_| parse_error(line, "staging artifact digest must contain 32 bytes"))?;
+    Ok(Some(UnavailablePgStagingIntentAuthorization {
+        staging_generation: parse_u64(line, fields[0], "staging generation")?,
+        artifact_digest,
+        artifact_length: parse_u64(line, fields[2], "staging artifact length")?,
+        artifact_format_version: parse_u16(line, fields[3], "staging artifact format version")?,
+        batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[4])?,
+    }))
 }
 
 fn parse_ready_pg_peering_completion(
@@ -14406,6 +14777,15 @@ fn parse_u8(line: usize, value: &str, field: &'static str) -> Result<u8, Control
     value
         .parse::<u8>()
         .map_err(|_| parse_error(line, &format!("invalid {field}")))
+}
+
+fn parse_u16(line: usize, value: &str, field: &'static str) -> Result<u16, ControlPlaneError> {
+    value
+        .parse::<u16>()
+        .map_err(|source| ControlPlaneError::Parse {
+            line,
+            message: format!("invalid {field}: {source}"),
+        })
 }
 
 fn parse_u64(line: usize, value: &str, field: &'static str) -> Result<u64, ControlPlaneError> {

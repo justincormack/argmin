@@ -62,7 +62,7 @@ fn control_plane_raft_peer_rpc_rejects_noncurrent_nested_command_versions() {
     ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded).unwrap();
 
     let mut unsupported_frames = Vec::new();
-    for version in [14, 15, 16, 17, 18, 19, 20, 22] {
+    for version in [14, 15, 16, 17, 18, 19, 20, 21, 23] {
         let unsupported_command =
             crate::control_plane_command::encode_control_plane_command_with_version_for_test(
                 &command, version,
@@ -868,7 +868,7 @@ fn control_plane_raft_peer_server_rejects_noncurrent_nested_snapshot_versions_be
 #[test]
 fn control_plane_raft_peer_server_rejects_noncurrent_nested_state_versions_before_publication() {
     let current = current_peer_snapshot_payload();
-    for version in [28, 29, 30, 31, 32, 34] {
+    for version in [28, 29, 30, 31, 32, 33, 35] {
         let unsupported =
             crate::control_plane_command::reseal_control_plane_snapshot_state_version_for_test(
                 &current, version,
@@ -1718,7 +1718,7 @@ fn control_plane_raft_peer_rpc_v3_catalogue_is_exact() {
         ),
         (
             2_402,
-            "afc103f24d76de87f57d96d7e1b1eb272746bbbe3bc3c5bac7a4673f787805c5".to_owned()
+            "197d4450ece9df529abfa0248b1d217a8e244cd3bd54e40d26059c8748446d9c".to_owned()
         )
     );
 }

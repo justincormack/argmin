@@ -419,6 +419,24 @@ source runtime map and replaces that compact prepared binding before retrying;
 artifact command rebasing therefore remains outside control-plane command
 derivation. This is still protocol-neutral and does not authorize staging or
 route installation by itself.
+Command v22 and state v34 now add the fourth homogeneous batch boundary,
+`AuthorizeUnavailablePgStagingIntents`. Each canonical member binds the exact
+active unavailable transition, transition-derived staging generation,
+artifact SHA-256 digest and byte length, and storage-owned staging format
+version. The state machine validates the complete vector against one immutable
+snapshot, commits every member or none, records a recomputable whole-batch
+receipt on every transition, and leaves the global cluster-map epoch
+unchanged. Exact whole-batch replay remains valid after unrelated epoch
+advances; subset, regrouped, divergent, mixed replay/new, post-install, and
+future-receipt states fail closed. Snapshot validation requires the receipt
+epoch to precede destination installation, or the direct successor transition
+when an uninstalled transition has already been retained. The same independent
+16-member and 131,042-byte command ceilings apply at encoder, decoder, state-machine,
+standalone, and Raft proposal boundaries. Immutable command-v21/state-v33
+aggregates and nested container vectors remain rejection evidence. This
+authorization command is still leader-internal and protocol-isolated: no
+production caller opens the staging store or sends destination staging RPCs
+until durable evidence publication and acknowledgement exist.
 The storage-owned durable staging foundation is also complete but remains
 protocol-isolated. Staging-store format v1 has a fixed root manifest and exact
 initialization-complete marker, exact SQLite catalogue,
@@ -855,11 +873,14 @@ This slice changes both command grammar and command-reachable durable state.
 The receipt prerequisite advanced the control-plane command version from v19
 to v20 and state version from v31 to v32. The first plural protocol boundary
 advances begin/completion commands from v20 to v21 and durable receipt state
-from v32 to v33, retaining immutable v19/v31 and v20/v32 rejection evidence and updating
-the nested journal, Raft WAL, snapshot, aggregate, and retained batch-receipt
-vectors. The destination-install/staging slice advances both versions again
-when it removes the remaining generic optional transition branches and makes
-staging generation mandatory. The new transition-scoped artifact staging operations cross the
+from v32 to v33, retaining immutable v19/v31 and v20/v32 rejection evidence
+and updating the nested journal, Raft WAL, snapshot, aggregate, and retained
+batch-receipt vectors. The epoch-neutral staging-authorization boundary
+advances command v21 to v22 and state v33 to v34, retaining immutable v21/v33
+aggregates and exact nested-container rejection evidence. The destination
+install slice advances both versions again when it removes the remaining
+generic optional transition branches and makes installed staging evidence
+mandatory. The new transition-scoped artifact staging operations cross the
 storage RPC boundary and therefore require the corresponding storage-RPC
 version advance, fixed old/new frame evidence, authenticated Unix/TLS coverage,
 and explicit exclusion from ordinary frontend capabilities. Receipt-evidence

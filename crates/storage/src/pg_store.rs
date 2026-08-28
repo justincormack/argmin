@@ -145,6 +145,7 @@ mod metadata;
 #[allow(dead_code)]
 #[path = "pg_store/metadata_transfer_staging.rs"]
 mod metadata_transfer_staging;
+pub(crate) use metadata_transfer_staging::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION;
 #[path = "pg_store/rows.rs"]
 mod rows;
 #[path = "pg_store/scavenger.rs"]

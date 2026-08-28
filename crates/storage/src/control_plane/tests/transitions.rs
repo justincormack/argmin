@@ -98,6 +98,75 @@ fn heartbeat_spare_node(
     authority.heartbeat(request, now_ms + 1).unwrap();
 }
 
+fn forge_staging_authorization_at_epoch(
+    snapshot: &mut ClusterControlSnapshot,
+    transitions: &[(PgId, ClusterEpoch)],
+    receipt_epoch: ClusterEpoch,
+) {
+    let requests = transitions
+        .iter()
+        .copied()
+        .map(|(pg_id, transition_epoch)| {
+            let transition = snapshot
+                .unavailable_pg_placement_transition(pg_id)
+                .filter(|transition| transition.transition_epoch() == transition_epoch)
+                .or_else(|| {
+                    snapshot
+                        .retained_unavailable_pg_placement_transitions()
+                        .find(|transition| {
+                            transition.pg_id() == pg_id
+                                && transition.transition_epoch() == transition_epoch
+                        })
+                })
+                .unwrap();
+            UnavailablePgStagingIntentAuthorizationRequest {
+                unavailable_transition: UnavailablePgTransitionMutationBinding::new(
+                    transition.pg_id,
+                    transition.transition_epoch,
+                    transition.source_epoch,
+                    transition.source_acting_set.clone(),
+                    transition.destination_acting_set.clone(),
+                ),
+                staging_generation: transition.transition_epoch.get(),
+                artifact_digest: [u8::try_from(pg_id.get()).unwrap(); 32],
+                artifact_length: 4_096 + u64::from(pg_id.get()),
+                artifact_format_version:
+                    crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+            }
+        })
+        .collect::<Vec<_>>();
+    let receipt = UnavailablePgTransitionBatchReceipt {
+        identity: unavailable_pg_staging_authorization_batch_identity(&requests),
+        source_epoch: receipt_epoch,
+        target_epoch: receipt_epoch,
+    };
+    for request in requests {
+        let pg_id = request.unavailable_transition.pg_id();
+        let transition_epoch = request.unavailable_transition.transition_epoch();
+        let is_active = snapshot
+            .unavailable_pg_placement_transitions
+            .contains_key(&pg_id);
+        let transition = if is_active {
+            snapshot
+                .unavailable_pg_placement_transitions
+                .get_mut(&pg_id)
+                .unwrap()
+        } else {
+            snapshot
+                .retained_unavailable_pg_placement_transitions
+                .get_mut(&(pg_id, transition_epoch))
+                .unwrap()
+        };
+        transition.staging_authorization = Some(UnavailablePgStagingIntentAuthorization {
+            staging_generation: request.staging_generation,
+            artifact_digest: request.artifact_digest,
+            artifact_length: request.artifact_length,
+            artifact_format_version: request.artifact_format_version,
+            batch_receipt: receipt.clone(),
+        });
+    }
+}
+
 fn heartbeat_with_pg_proofs_and_lease_duration(
     authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
     node_id: u32,
@@ -445,6 +514,157 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         .to_string()
         .contains("strictly increasing"));
 
+    let staging_requests = pg_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, pg_id)| {
+            let transition = recorded.unavailable_pg_placement_transition(pg_id).unwrap();
+            UnavailablePgStagingIntentAuthorizationRequest {
+                unavailable_transition: UnavailablePgTransitionMutationBinding::new(
+                    transition.pg_id,
+                    transition.transition_epoch,
+                    transition.source_epoch,
+                    transition.source_acting_set.clone(),
+                    transition.destination_acting_set.clone(),
+                ),
+                staging_generation: transition.transition_epoch.get(),
+                artifact_digest: [u8::try_from(index + 1).unwrap(); 32],
+                artifact_length: 4_096 + u64::try_from(index).unwrap(),
+                artifact_format_version:
+                    crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+            }
+        })
+        .collect::<Vec<_>>();
+    let staging_command = ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+        authorizations: staging_requests.clone(),
+    };
+    let mut invalid_artifact = staging_requests.clone();
+    invalid_artifact[1].artifact_length = 0;
+    assert!(recorded
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: invalid_artifact,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("invalid generation, artifact length, or storage format"));
+    let mut invalid_format = staging_requests.clone();
+    invalid_format[1].artifact_format_version += 1;
+    assert!(recorded
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: invalid_format,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("invalid generation, artifact length, or storage format"));
+    let staged = recorded
+        .apply_control_plane_command(staging_command.clone())
+        .unwrap();
+    assert!(staged.changed());
+    assert_eq!(staged.snapshot().cluster_epoch(), recorded.cluster_epoch());
+    staged
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(staged.snapshot())).unwrap(),
+        *staged.snapshot()
+    );
+    let staging_replay = staged
+        .snapshot()
+        .apply_control_plane_command(staging_command.clone())
+        .unwrap();
+    assert!(!staging_replay.changed());
+    assert_eq!(staging_replay.snapshot(), staged.snapshot());
+
+    let later_epoch = staged
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::SetPgActingSet {
+            pg_id: PgId::new(99),
+            acting_set: vec![NodeId::new(2), NodeId::new(3), NodeId::new(4)],
+        })
+        .unwrap();
+    assert!(later_epoch.changed());
+    let later_epoch_replay = later_epoch
+        .snapshot()
+        .apply_control_plane_command(staging_command.clone())
+        .unwrap();
+    assert!(!later_epoch_replay.changed());
+    assert_eq!(later_epoch_replay.snapshot(), later_epoch.snapshot());
+
+    let subset_error = staged
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: vec![staging_requests[0].clone()],
+        })
+        .unwrap_err();
+    assert!(
+        subset_error
+            .to_string()
+            .contains("conflicts with durable artifact identity"),
+        "unexpected staging subset replay error: {subset_error}"
+    );
+    let mut divergent_requests = staging_requests.clone();
+    divergent_requests[1].artifact_digest[0] ^= 1;
+    assert!(recorded
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: divergent_requests,
+        })
+        .is_ok());
+    assert_eq!(
+        recorded
+            .unavailable_pg_placement_transition(pg_ids[0])
+            .unwrap()
+            .staging_authorization,
+        None,
+        "validation must not mutate its source snapshot"
+    );
+    let mut invalid_requests = staging_requests.clone();
+    invalid_requests[1].staging_generation += 1;
+    assert!(recorded
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: invalid_requests,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("invalid generation"));
+    let mut forged = staged.snapshot().clone();
+    forged
+        .unavailable_pg_placement_transitions
+        .get_mut(&pg_ids[0])
+        .unwrap()
+        .staging_authorization
+        .as_mut()
+        .unwrap()
+        .artifact_digest[0] ^= 1;
+    assert!(forged
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .to_string()
+        .contains("receipt digest"));
+    let mut future_receipt = staged.snapshot().clone();
+    let future_epoch = next_epoch(future_receipt.cluster_epoch()).unwrap();
+    let authorization = future_receipt
+        .unavailable_pg_placement_transitions
+        .get_mut(&pg_ids[0])
+        .unwrap()
+        .staging_authorization
+        .as_mut()
+        .unwrap();
+    authorization.batch_receipt.source_epoch = future_epoch;
+    authorization.batch_receipt.target_epoch = future_epoch;
+    assert!(future_receipt
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .to_string()
+        .contains("invalid staging authorization"));
+
+    let authorized = ControlPlaneLinearizedCommandSink::submit_control_plane_command(
+        &mut authority,
+        staging_command.clone(),
+    )
+    .unwrap();
+    assert!(authorized.changed());
+
     for pg_id in pg_ids {
         let transition = authority
             .snapshot()
@@ -465,6 +685,55 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
             )
             .unwrap();
     }
+    let installed_authorized = authority.snapshot().clone();
+    installed_authorized
+        .validate_current_state_invariants()
+        .unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(&installed_authorized)).unwrap(),
+        installed_authorized
+    );
+    assert!(pg_ids.iter().all(|pg_id| authority
+        .snapshot()
+        .unavailable_pg_placement_transition(*pg_id)
+        .unwrap()
+        .staging_authorization
+        .is_some()));
+    let mut post_install_forgery = authority.snapshot().clone();
+    let forged_receipt_epoch = post_install_forgery.cluster_epoch();
+    let installed_transitions = pg_ids
+        .iter()
+        .copied()
+        .map(|pg_id| {
+            (
+                pg_id,
+                post_install_forgery
+                    .unavailable_pg_placement_transition(pg_id)
+                    .unwrap()
+                    .transition_epoch(),
+            )
+        })
+        .collect::<Vec<_>>();
+    forge_staging_authorization_at_epoch(
+        &mut post_install_forgery,
+        &installed_transitions,
+        forged_receipt_epoch,
+    );
+    let post_install_error = parse_snapshot(&format_snapshot(&post_install_forgery)).unwrap_err();
+    assert!(
+        post_install_error
+            .to_string()
+            .contains("invalid staging authorization"),
+        "unexpected post-install staging authorization error: {post_install_error}"
+    );
+    let post_install_replay = authority
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: staging_requests.clone(),
+        })
+        .unwrap();
+    assert!(!post_install_replay.changed());
+    assert_eq!(post_install_replay.snapshot(), authority.snapshot());
     let readiness_at_ms = authority.snapshot().max_committed_timestamp_ms().unwrap() + 1;
     for node_id in [4, 2, 3] {
         heartbeat_with_pg_proofs_and_lease_duration(
@@ -588,6 +857,12 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         assert!(completed
             .unavailable_pg_placement_transition(pg_id)
             .is_none());
+        assert!(completed
+            .retained_unavailable_pg_placement_transitions()
+            .find(|transition| transition.pg_id() == pg_id)
+            .unwrap()
+            .staging_authorization
+            .is_some());
     }
 
     let exact_completion_replay = completed
@@ -1581,6 +1856,120 @@ fn unavailable_pg_transition_successor_consumes_retained_lineage_tip() {
         .unavailable_pg_placement_transition(pg_id)
         .unwrap()
         .transition_epoch();
+    let first_transition = authority
+        .snapshot()
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap();
+    let first_staging_request = UnavailablePgStagingIntentAuthorizationRequest {
+        unavailable_transition: UnavailablePgTransitionMutationBinding::new(
+            first_transition.pg_id,
+            first_transition.transition_epoch,
+            first_transition.source_epoch,
+            first_transition.source_acting_set.clone(),
+            first_transition.destination_acting_set.clone(),
+        ),
+        staging_generation: first_transition.transition_epoch.get(),
+        artifact_digest: [0x71; 32],
+        artifact_length: 4_096,
+        artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    };
+    ControlPlaneLinearizedCommandSink::submit_control_plane_command(
+        &mut authority,
+        ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: vec![first_staging_request.clone()],
+        },
+    )
+    .unwrap();
+
+    let superseded_tmp = test_util::tempdir();
+    let superseded_store =
+        FileControlPlaneStore::new(superseded_tmp.path().join("superseded-control-plane.state"));
+    superseded_store
+        .checkpoint(None, authority.snapshot())
+        .unwrap();
+    let mut superseded = SingleAuthorityControlPlane::open(superseded_store).unwrap();
+    let first_replacement_deadline = superseded
+        .snapshot()
+        .node(NodeId::new(4))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    superseded
+        .expire_heartbeat_leases(first_replacement_deadline)
+        .unwrap();
+    for round in 0..2 {
+        for node_id in [2, 3, 5] {
+            heartbeat_spare_node(
+                &mut superseded,
+                node_id,
+                first_replacement_deadline + round * 10 + u64::from(node_id),
+            );
+        }
+    }
+    let superseded_proof_at = superseded.snapshot().max_committed_timestamp_ms().unwrap() + 1;
+    for node_id in [2, 3] {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut superseded,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            (superseded_proof_at + u64::from(node_id), 10_000),
+        );
+    }
+    let superseding_begin_at = (superseded
+        .snapshot()
+        .unavailable_node_observation(NodeId::new(1))
+        .unwrap()
+        .observed_at_ms()
+        + 10)
+        .max(superseded.snapshot().max_committed_timestamp_ms().unwrap());
+    superseded
+        .begin_unavailable_pg_placement_transition(pg_id, NodeId::new(1), superseding_begin_at)
+        .unwrap();
+    let superseding_transition_epoch = superseded
+        .snapshot()
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap()
+        .transition_epoch();
+    let retained_uninstalled = superseded
+        .snapshot()
+        .retained_unavailable_pg_placement_transitions()
+        .find(|transition| transition.transition_epoch() == first_transition_epoch)
+        .unwrap();
+    assert_eq!(retained_uninstalled.destination_epoch(), None);
+    assert!(retained_uninstalled.staging_authorization.is_some());
+    superseded
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(superseded.snapshot())).unwrap(),
+        *superseded.snapshot()
+    );
+    let superseded_replay = superseded
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: vec![first_staging_request],
+        })
+        .unwrap();
+    assert!(!superseded_replay.changed());
+    assert_eq!(superseded_replay.snapshot(), superseded.snapshot());
+    let mut superseded_forgery = superseded.snapshot().clone();
+    forge_staging_authorization_at_epoch(
+        &mut superseded_forgery,
+        &[(pg_id, first_transition_epoch)],
+        superseding_transition_epoch,
+    );
+    let superseded_error = parse_snapshot(&format_snapshot(&superseded_forgery)).unwrap_err();
+    assert!(
+        superseded_error
+            .to_string()
+            .contains("invalid staging authorization"),
+        "unexpected superseded staging authorization error: {superseded_error}"
+    );
+
     authority
         .install_unavailable_pg_transition_metadata_transfer(
             first_work.mutation_binding().clone(),
