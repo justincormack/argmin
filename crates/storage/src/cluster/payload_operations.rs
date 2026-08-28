@@ -835,7 +835,7 @@ impl StorageCluster {
                         // This request selected the recovery flight and then relinquished it.
                         // Do not rejoin the drain, but do wait for authorized recovery to
                         // advance that exact command before reobserving generation state.
-                        self.wait_for_transferred_object_metadata_command_with_work_budget(
+                        self.wait_for_transferred_metadata_command_with_work_budget(
                             pg_id,
                             &command,
                             &mut work_budget,
@@ -2594,7 +2594,7 @@ impl StorageCluster {
         }
     }
 
-    pub(super) fn wait_for_transferred_object_metadata_command_with_work_budget(
+    pub(super) fn wait_for_transferred_metadata_command_with_work_budget(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
@@ -4806,7 +4806,7 @@ impl StorageCluster {
                                         &mut work_budget,
                                     );
                                     if let Err(error) = self
-                                        .wait_for_transferred_object_metadata_command_with_work_budget(
+                                        .wait_for_transferred_metadata_command_with_work_budget(
                                             pg_id,
                                             late_conflict_command
                                                 .as_ref()

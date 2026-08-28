@@ -7798,3 +7798,160 @@ fn pending_delete_finalized_bucket_recovery_uses_expired_active_route() {
         );
     }
 }
+
+#[test]
+fn create_bucket_waits_for_delete_finalizer_authorized_recovery_handoff() {
+    struct CleanupRelease(Option<std::sync::mpsc::SyncSender<()>>);
+
+    impl CleanupRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for CleanupRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], EcShape { k: 2, m: 1 }).unwrap();
+    let pg_id = PgId::new(1);
+    let bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        pg_id.get(),
+        "create-after-finalizer-handoff-",
+    );
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
+
+    let (cleanup_reached_tx, cleanup_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::sync_channel(1);
+    let cleanup_release_rx = Arc::new(Mutex::new(cleanup_release_rx));
+    let cleanup_release_rx_for_hook = Arc::clone(&cleanup_release_rx);
+    let cleanup_deferred = Arc::new(AtomicBool::new(false));
+    let cleanup_deferred_for_hook = Arc::clone(&cleanup_deferred);
+    let hook_bucket = bucket.clone();
+    let cleanup_hook = cluster.test_install_global_metadata_command_terminal_slot_removal_hook(
+        Arc::new(move |candidate| {
+            if !matches!(
+                candidate.payload(),
+                MetadataCommandPayload::DeleteFinalizedBucket(delete)
+                    if delete.bucket == hook_bucket
+            ) || cleanup_deferred_for_hook.swap(true, Ordering::SeqCst)
+            {
+                return false;
+            }
+            cleanup_reached_tx.send(candidate.clone()).unwrap();
+            cleanup_release_rx_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(Duration::from_secs(5))
+                .expect("delete finalizer cleanup gate was not released");
+            true
+        }),
+    );
+
+    let (owner_result, create_returned_early, create_result) = thread::scope(|scope| {
+        let mut cleanup_release = CleanupRelease(Some(cleanup_release_tx));
+        let (owner_tx, owner_rx) = std::sync::mpsc::sync_channel(1);
+        let owner_cluster = &cluster;
+        let owner_bucket = &bucket;
+        scope.spawn(move || {
+            owner_tx
+                .send(owner_cluster.try_finalize_bucket_delete(owner_bucket))
+                .unwrap();
+        });
+        let command = cleanup_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delete finalizer did not reach terminal slot cleanup");
+
+        let (create_tx, create_rx) = std::sync::mpsc::sync_channel(1);
+        let create_cluster = &cluster;
+        let create_bucket = &bucket;
+        scope.spawn(move || {
+            let owner = crate::CanonicalUserId::from_principal("owner");
+            let acl_grants = crate::AclGrants::default();
+            create_tx
+                .send(create_cluster.create_bucket_with_config_and_load_info(
+                    &crate::CreateBucketConfig {
+                        name: create_bucket.as_str(),
+                        owner_principal: "owner",
+                        owner_canonical_id: &owner,
+                        acl_grants: &acl_grants,
+                        public_read: false,
+                        public_write: false,
+                        versioning: crate::BucketVersioningState::Disabled,
+                        object_lock: crate::BucketObjectLockConfig::default(),
+                        ownership_controls: crate::BucketOwnershipControls {
+                            object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                        },
+                    },
+                ))
+                .unwrap();
+        });
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !map
+            .runtime_state()
+            .test_metadata_command_recovery_handoff_requested(pg_id, &command)
+        {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "bucket recreation did not request the finalizer recovery handoff"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        cleanup_release.release();
+        let owner_result = owner_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delete finalizer owner did not finish after cleanup release");
+        let early_create_result = create_rx.recv_timeout(Duration::from_millis(50)).ok();
+        let create_returned_early = early_create_result.is_some();
+
+        drop(cleanup_hook);
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        let create_result = match early_create_result {
+            Some(result) => result,
+            None => create_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bucket recreation did not finish after authorized recovery"),
+        };
+        (owner_result, create_returned_early, create_result)
+    });
+
+    assert_eq!(
+        owner_result.unwrap(),
+        crate::BucketDeleteFinalizeOutcome::Finalized
+    );
+    assert!(
+        !create_returned_early,
+        "bucket recreation returned before authorized recovery"
+    );
+    assert!(matches!(
+        create_result.unwrap(),
+        crate::BucketCreateAttemptOutcome::Created(_)
+    ));
+    assert!(cleanup_deferred.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}

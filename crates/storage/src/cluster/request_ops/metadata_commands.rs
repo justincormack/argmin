@@ -8,9 +8,21 @@ enum MetadataCommandRecoveryAdmissionPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferredMetadataCommandPolicy {
+    /// Preserve retryable contention for an operation that has no causal dependency on the
+    /// transferred command, or when that command's outcome is still unknown.
+    ReturnContention,
+    /// A bucket recreation cannot proceed until the previous bucket command's retained slot is
+    /// retired. Once its logical outcome is known, wait without taking recovery ownership.
+    WaitForObservedOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CoordinatedMetadataCommandFinishDisposition {
     Finished(FinishPendingMetadataCommandResult),
-    TransferredToAuthorizedRecovery,
+    TransferredToAuthorizedRecovery {
+        observed_outcome: Option<FinishPendingMetadataCommandResult>,
+    },
 }
 
 impl CoordinatedMetadataCommandFinishDisposition {
@@ -25,7 +37,9 @@ impl CoordinatedMetadataCommandFinishDisposition {
                     | FinishPendingMetadataCommandResult::TerminalCleanupPending { .. }
             )
         {
-            Self::TransferredToAuthorizedRecovery
+            Self::TransferredToAuthorizedRecovery {
+                observed_outcome: Some(outcome),
+            }
         } else {
             Self::Finished(outcome)
         }
@@ -36,9 +50,11 @@ impl CoordinatedMetadataCommandFinishDisposition {
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
         match self {
             Self::Finished(outcome) => Ok(outcome),
-            Self::TransferredToAuthorizedRecovery => Err(conflicting_pending_metadata_command(
-                "exact metadata command transferred to authorized recovery",
-            )),
+            Self::TransferredToAuthorizedRecovery { .. } => {
+                Err(conflicting_pending_metadata_command(
+                    "exact metadata command transferred to authorized recovery",
+                ))
+            }
         }
     }
 }
@@ -778,7 +794,7 @@ impl super::StorageCluster {
                             (command, false)
                         }
                         _ => {
-                            self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                            self.drain_pending_metadata_command_pg_slot_for_create_with_work_budget(
                                 pg_id,
                                 &bucket,
                                 &command,
@@ -2552,7 +2568,9 @@ impl super::StorageCluster {
                             if admission_policy
                                 == MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
                             {
-                                return Ok(CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery);
+                                return Ok(CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery {
+                                    observed_outcome: None,
+                                });
                             }
                             continue;
                         }
@@ -2567,7 +2585,9 @@ impl super::StorageCluster {
                             if admission_policy
                                 == MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
                             {
-                                return Ok(CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery);
+                                return Ok(CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery {
+                                    observed_outcome: None,
+                                });
                             }
                             return Err(error);
                         }
@@ -2632,8 +2652,17 @@ impl super::StorageCluster {
                             });
                         }
                     }
+                    let observed_outcome = resolution.and_then(|resolution| {
+                        metadata_command_finish_result_from_recovery_resolution(
+                            &command,
+                            resolution,
+                        )
+                        .ok()
+                    });
                     return Ok(
-                        CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery,
+                        CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery {
+                            observed_outcome,
+                        },
                     );
                 }
                 MetadataCommandRecoveryAdmission::Waited {
@@ -3292,7 +3321,9 @@ impl super::StorageCluster {
             CoordinatedMetadataCommandFinishDisposition::Finished(outcome) => {
                 Ok(metadata_command_recovery_outcome_from_finish_result(outcome))
             }
-            CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery => {
+            CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery {
+                ..
+            } => {
                 Err(conflicting_pending_metadata_command(
                     "bucket metadata command transferred to authorized recovery",
                 ))
@@ -3360,11 +3391,44 @@ impl super::StorageCluster {
         Ok(())
     }
 
+    fn drain_pending_metadata_command_pg_slot_for_create_with_work_budget(
+        &self,
+        pg_id: PgId,
+        pending_bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.drain_pending_metadata_command_pg_slot_with_transferred_policy(
+            pg_id,
+            pending_bucket,
+            command,
+            TransferredMetadataCommandPolicy::WaitForObservedOutcome,
+            work_budget,
+        )
+    }
+
     fn drain_pending_metadata_command_pg_slot_with_work_budget(
+        &self,
+        pg_id: PgId,
+        pending_bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.drain_pending_metadata_command_pg_slot_with_transferred_policy(
+            pg_id,
+            pending_bucket,
+            command,
+            TransferredMetadataCommandPolicy::ReturnContention,
+            work_budget,
+        )
+    }
+
+    fn drain_pending_metadata_command_pg_slot_with_transferred_policy(
         &self,
         pg_id: PgId,
         _pending_bucket: &BucketName,
         command: &MetadataCommandEnvelope,
+        transferred_policy: TransferredMetadataCommandPolicy,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketSnapshotLoadError> {
         if Self::metadata_command_is_bucket_pg_command(command) {
@@ -3385,7 +3449,25 @@ impl super::StorageCluster {
                 };
             let outcome = match outcome {
                 CoordinatedMetadataCommandFinishDisposition::Finished(outcome) => outcome,
-                CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery => {
+                CoordinatedMetadataCommandFinishDisposition::TransferredToAuthorizedRecovery {
+                    observed_outcome,
+                } => {
+                    if transferred_policy
+                        == TransferredMetadataCommandPolicy::WaitForObservedOutcome
+                        && observed_outcome.is_some()
+                    {
+                        // The recovery flight has published a logical result but deliberately
+                        // retained the exact command for an authorized worker. Rejoining that
+                        // flight here would violate its ownership; observe it until the worker
+                        // advances or retires the slot, then let CreateBucket reload state.
+                        self.wait_for_transferred_metadata_command_with_work_budget(
+                            pg_id,
+                            command,
+                            work_budget,
+                        )
+                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                        return Ok(());
+                    }
                     return Err(conflicting_pending_metadata_command(
                         "bucket metadata command transferred to authorized recovery",
                     ));

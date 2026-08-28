@@ -755,7 +755,7 @@ impl super::StorageCluster {
                                     // winner, then relinquished its recovery flight. Wait only
                                     // for authorized recovery to advance that exact command;
                                     // rejoining its drain here would violate recovery ownership.
-                                    self.wait_for_transferred_object_metadata_command_with_work_budget(
+                                    self.wait_for_transferred_metadata_command_with_work_budget(
                                         pg_id,
                                         late_conflict_command.as_ref().expect("guard requires command"),
                                         &mut finalization_work_budget,
