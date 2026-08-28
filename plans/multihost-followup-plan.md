@@ -923,7 +923,7 @@ sync, and quarantines unexplained final files rather than authorizing them.
 Store admission accounts for temporary, published, and tombstoned cleanup
 bytes. Add immutable v0/v2 rejection fixtures and a fixed v1 manifest,
 initialization and establishment markers, catalogue, receipt, and crash-state corpus to the
-storage format ledger; no
+[storage format ledger](../guides/storage-format-ledger.md); no
 upgrade decoder is required while the repository supports one format at a
 time.
 

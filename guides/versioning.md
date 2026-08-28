@@ -4,8 +4,9 @@
 # Versioned Formats And Compatibility
 
 This guide defines how Argmin owns and changes durable and cross-process
-formats. The completed current-format inventory and evidence record is archived
-in
+formats. The normative current-format inventory and evidence record is maintained in
+[`storage-format-ledger.md`](storage-format-ledger.md). The work that established its ownership and
+containment boundaries is archived in
 [`storage-format-baseline-and-containment-plan.md`](../plans/completed/storage-format-baseline-and-containment-plan.md).
 Future migration and mixed-version implementation work is tracked in
 [`storage-upgrade-versioning-plan.md`](../plans/storage-upgrade-versioning-plan.md).

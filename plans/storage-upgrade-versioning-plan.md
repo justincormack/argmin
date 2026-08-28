@@ -7,8 +7,10 @@ internal formats and homogeneous protocol versions.
 
 - [`guides/versioning.md`](../guides/versioning.md) defines the rules for changing and evidencing
   current formats.
+- [`guides/storage-format-ledger.md`](../guides/storage-format-ledger.md) is the normative current
+  format vector, ownership, dependency, and exact-current evidence record.
 - [`storage-format-baseline-and-containment-plan.md`](completed/storage-format-baseline-and-containment-plan.md)
-  is the completed ownership, containment, format inventory, and exact-current evidence record.
+  is the completed ownership, containment, and baseline implementation record.
 - [`multihost-transition-plan.md`](completed/multihost-transition-plan.md#phase-12-replicated-control-plane)
   records the completed Phase 12 replicated-control-plane work that the old plan referenced
   without a link.
