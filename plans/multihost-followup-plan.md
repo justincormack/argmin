@@ -463,10 +463,20 @@ initialization. The complete v1 manifest, inner initialization marker, outer
 establishment marker, and publication receipt bytes are frozen in
 storage-owned tests; v0/v2 format,
 catalogue, and artifact versions are rejection-only evidence. The catalogue
-reserves the exact in-flight evidence-page state required below, but no
-production startup path or RPC opens the store yet. Finalized floors therefore
-do not prune tombstones or evidence until durable page acknowledgement is
-implemented; exposing staging before that boundary remains prohibited.
+now owns the local durable evidence-page protocol required below. It selects at
+most 64 deltas beneath the 120 KiB operation-payload ceiling, persists the exact
+canonical payload and digest before transmission, and replays those bytes
+unchanged across newly queued deltas, process restart, and authentication-window
+expiry. A canonical authority-neutral apply receipt atomically acknowledges
+exactly those page members. The next page is assigned only after that receipt
+is durable and binds its predecessor generation and receipt digest; malformed
+receipts, altered members, and coordinated catalogue corruption fail closed
+during operation or startup validation. Page bytes deliberately exclude
+request IDs, timestamps, expiry, and authenticators. No production startup
+path or RPC opens the store yet. Control-plane RPC v18, replicated evidence
+application, low-priority admission, and production publication workers remain
+later slices, and finalized floors do not prune tombstones or evidence before
+those boundaries are complete.
 Command v19 additionally sealed the
 post-grace completion fence that prevents survivor heartbeats from indefinitely
 reactivating the old acting set; immutable command v18 remains rejection

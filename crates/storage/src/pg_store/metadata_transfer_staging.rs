@@ -40,7 +40,10 @@ const ESTABLISHMENT_MARKER_BODY_LEN: usize = STAGING_ESTABLISHMENT_MAGIC.len() +
 const ESTABLISHMENT_MARKER_LEN: usize = ESTABLISHMENT_MARKER_BODY_LEN + 8;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
 const MAX_STAGING_EVIDENCE_BYTES: usize = 4_096;
+const MAX_STAGING_EVIDENCE_PAGE_ENTRIES: usize = 64;
 const MAX_STAGING_EVIDENCE_PAGE_BYTES: usize = 120 * 1_024;
+const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V1\0";
+const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V1\0";
 pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 1;
 
 #[derive(Debug, thiserror::Error)]
@@ -235,6 +238,74 @@ struct StagingEvidenceDelta {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataTransferStagingEvidencePageEntry {
+    sequence: u64,
+    evidence: Vec<u8>,
+}
+
+struct StagingInflightEvidencePage {
+    page: MetadataTransferStagingEvidencePage,
+    apply_receipt: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataTransferStagingEvidencePage {
+    actor: MetadataTransferStagingNodeIdentity,
+    previous_generation: u64,
+    previous_apply_receipt_digest: [u8; DIGEST_LEN],
+    generation: u64,
+    entries: Vec<MetadataTransferStagingEvidencePageEntry>,
+    operation_payload: Vec<u8>,
+    page_digest: [u8; DIGEST_LEN],
+}
+
+impl MetadataTransferStagingEvidencePage {
+    pub(crate) fn operation_payload(&self) -> &[u8] {
+        &self.operation_payload
+    }
+
+    pub(crate) fn page_digest(&self) -> [u8; DIGEST_LEN] {
+        self.page_digest
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataTransferStagingEvidenceApplyReceipt {
+    actor: MetadataTransferStagingNodeIdentity,
+    previous_generation: u64,
+    previous_apply_receipt_digest: [u8; DIGEST_LEN],
+    generation: u64,
+    page_digest: [u8; DIGEST_LEN],
+    accepted_generation: u64,
+    bytes: Vec<u8>,
+}
+
+impl MetadataTransferStagingEvidenceApplyReceipt {
+    #[cfg(test)]
+    pub(crate) fn for_page(page: &MetadataTransferStagingEvidencePage) -> Self {
+        let mut receipt = Self {
+            actor: page.actor.clone(),
+            previous_generation: page.previous_generation,
+            previous_apply_receipt_digest: page.previous_apply_receipt_digest,
+            generation: page.generation,
+            page_digest: page.page_digest,
+            accepted_generation: page.generation,
+            bytes: Vec::new(),
+        };
+        receipt.bytes = encode_staging_evidence_apply_receipt(&receipt);
+        receipt
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 type StagingDurabilityObserver = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +337,7 @@ pub(crate) struct MetadataTransferStagingStore {
     state: Mutex<MetadataTransferStagingState>,
     temp_sequence: AtomicU64,
     publication_durability_observer: Option<StagingDurabilityObserver>,
+    evidence_page_assignment_observer: Option<StagingDurabilityObserver>,
 }
 
 impl MetadataTransferStagingStore {
@@ -274,7 +346,7 @@ impl MetadataTransferStagingStore {
         identity: MetadataTransferStagingNodeIdentity,
         limits: MetadataTransferStagingLimits,
     ) -> Result<Self, MetadataTransferStagingError> {
-        Self::open_inner(data_dir, identity, limits, None, None)
+        Self::open_inner(data_dir, identity, limits, None, None, None)
     }
 
     #[cfg(test)]
@@ -284,7 +356,7 @@ impl MetadataTransferStagingStore {
         limits: MetadataTransferStagingLimits,
         observer: StagingDurabilityObserver,
     ) -> Result<Self, MetadataTransferStagingError> {
-        Self::open_inner(data_dir, identity, limits, None, Some(observer))
+        Self::open_inner(data_dir, identity, limits, None, Some(observer), None)
     }
 
     #[cfg(test)]
@@ -300,7 +372,18 @@ impl MetadataTransferStagingStore {
             limits,
             Some(parent_directory_sync),
             None,
+            None,
         )
+    }
+
+    #[cfg(test)]
+    fn open_with_evidence_page_assignment_observer(
+        data_dir: &Path,
+        identity: MetadataTransferStagingNodeIdentity,
+        limits: MetadataTransferStagingLimits,
+        observer: StagingDurabilityObserver,
+    ) -> Result<Self, MetadataTransferStagingError> {
+        Self::open_inner(data_dir, identity, limits, None, None, Some(observer))
     }
 
     fn open_inner(
@@ -309,6 +392,7 @@ impl MetadataTransferStagingStore {
         limits: MetadataTransferStagingLimits,
         parent_directory_sync: Option<StagingParentDirectorySync>,
         publication_durability_observer: Option<StagingDurabilityObserver>,
+        evidence_page_assignment_observer: Option<StagingDurabilityObserver>,
     ) -> Result<Self, MetadataTransferStagingError> {
         prepare_secure_directory(data_dir, "prepare staging-store data directory")?;
         let root = data_dir.join(STAGING_STORE_DIR);
@@ -389,6 +473,7 @@ impl MetadataTransferStagingStore {
             }),
             temp_sequence: AtomicU64::new(0),
             publication_durability_observer,
+            evidence_page_assignment_observer,
         };
         store.reconcile_startup_inventory()?;
         Ok(store)
@@ -717,6 +802,179 @@ impl MetadataTransferStagingStore {
                 MetadataTransferStagingError::sql("advance staging finalized floor", source)
             })?;
         Ok(())
+    }
+
+    pub(crate) fn next_evidence_page(
+        &self,
+    ) -> Result<Option<MetadataTransferStagingEvidencePage>, MetadataTransferStagingError> {
+        let mut state = self.lock_state()?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staging evidence page assignment", source)
+            })?;
+        let result = if let Some(inflight) = load_inflight_evidence_page(&transaction)? {
+            let page = inflight.page;
+            let apply_receipt = inflight.apply_receipt;
+            if apply_receipt.is_none() {
+                Some(page)
+            } else if unacknowledged_evidence_exists(&transaction)? {
+                let receipt =
+                    decode_staging_evidence_apply_receipt(apply_receipt.as_deref().unwrap())?;
+                require_apply_receipt_for_page(&receipt, &page)?;
+                let predecessor_digest = checksum::sha256::digest(receipt.as_bytes());
+                let successor = build_staging_evidence_page(
+                    &transaction,
+                    &self.identity,
+                    page.generation,
+                    predecessor_digest,
+                )?
+                .ok_or_else(|| {
+                    MetadataTransferStagingError::Invariant(
+                        "staging evidence disappeared while assigning its successor page"
+                            .to_owned(),
+                    )
+                })?;
+                if let Some(observer) = &self.evidence_page_assignment_observer {
+                    observer();
+                }
+                persist_inflight_evidence_page(&transaction, &successor)?;
+                Some(successor)
+            } else {
+                None
+            }
+        } else {
+            let page =
+                build_staging_evidence_page(&transaction, &self.identity, 0, [0; DIGEST_LEN])?;
+            if let Some(page) = page {
+                if let Some(observer) = &self.evidence_page_assignment_observer {
+                    observer();
+                }
+                persist_inflight_evidence_page(&transaction, &page)?;
+                Some(page)
+            } else {
+                None
+            }
+        };
+        transaction.commit().map_err(|source| {
+            MetadataTransferStagingError::sql("commit staging evidence page assignment", source)
+        })?;
+        Ok(result)
+    }
+
+    pub(crate) fn record_evidence_apply_receipt(
+        &self,
+        page: &MetadataTransferStagingEvidencePage,
+        receipt: &MetadataTransferStagingEvidenceApplyReceipt,
+    ) -> Result<(), MetadataTransferStagingError> {
+        require_apply_receipt_for_page(receipt, page)?;
+        let mut state = self.lock_state()?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staging evidence acknowledgement", source)
+            })?;
+        let current = load_inflight_evidence_page(&transaction)?.ok_or_else(|| {
+            MetadataTransferStagingError::IntentConflict(
+                "staging evidence acknowledgement has no in-flight page".to_owned(),
+            )
+        })?;
+        require_exact_evidence_page(&current.page, page)?;
+
+        if let Some(current_receipt) = current.apply_receipt {
+            if current_receipt != receipt.as_bytes() {
+                return Err(MetadataTransferStagingError::IntentConflict(
+                    "staging evidence acknowledgement differs from the durable receipt".to_owned(),
+                ));
+            }
+            for entry in &page.entries {
+                let member: Option<(Vec<u8>, i64)> = transaction
+                    .query_row(
+                        "SELECT evidence_bytes, acknowledged FROM staging_evidence_deltas \
+                         WHERE sequence = ?1",
+                        [to_sql_u64(entry.sequence)?],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|source| {
+                        MetadataTransferStagingError::sql(
+                            "validate replayed staging evidence acknowledgement",
+                            source,
+                        )
+                    })?;
+                if member.as_ref().is_none_or(|(evidence, acknowledged)| {
+                    evidence != &entry.evidence || *acknowledged != 1
+                }) {
+                    return Err(MetadataTransferStagingError::Invariant(
+                        "replayed staging evidence acknowledgement lost a durable member"
+                            .to_owned(),
+                    ));
+                }
+            }
+        } else {
+            for entry in &page.entries {
+                let (evidence, acknowledged): (Vec<u8>, i64) = transaction
+                    .query_row(
+                        "SELECT evidence_bytes, acknowledged FROM staging_evidence_deltas \
+                         WHERE sequence = ?1",
+                        [to_sql_u64(entry.sequence)?],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|source| {
+                        MetadataTransferStagingError::sql(
+                            "load staging evidence acknowledgement member",
+                            source,
+                        )
+                    })?;
+                if evidence != entry.evidence || acknowledged != 0 {
+                    return Err(MetadataTransferStagingError::Invariant(
+                        "staging evidence acknowledgement does not match its durable member"
+                            .to_owned(),
+                    ));
+                }
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE staging_evidence_inflight_page SET apply_receipt = ?1 \
+                     WHERE singleton = 1 AND apply_receipt IS NULL",
+                    params![receipt.as_bytes()],
+                )
+                .map_err(|source| {
+                    MetadataTransferStagingError::sql(
+                        "record staging evidence apply receipt",
+                        source,
+                    )
+                })?;
+            if changed != 1 {
+                return Err(MetadataTransferStagingError::Invariant(
+                    "staging evidence acknowledgement lost its in-flight page".to_owned(),
+                ));
+            }
+            for entry in &page.entries {
+                let changed = transaction
+                    .execute(
+                        "UPDATE staging_evidence_deltas SET acknowledged = 1 \
+                         WHERE sequence = ?1 AND evidence_bytes = ?2 AND acknowledged = 0",
+                        params![to_sql_u64(entry.sequence)?, &entry.evidence],
+                    )
+                    .map_err(|source| {
+                        MetadataTransferStagingError::sql(
+                            "acknowledge staging evidence member",
+                            source,
+                        )
+                    })?;
+                if changed != 1 {
+                    return Err(MetadataTransferStagingError::Invariant(
+                        "staging evidence acknowledgement lost a page member".to_owned(),
+                    ));
+                }
+            }
+        }
+        transaction.commit().map_err(|source| {
+            MetadataTransferStagingError::sql("commit staging evidence acknowledgement", source)
+        })
     }
 
     #[cfg(test)]
@@ -1394,6 +1652,261 @@ fn load_evidence_delta(
         .transpose()
 }
 
+fn unacknowledged_evidence_exists(
+    connection: &Connection,
+) -> Result<bool, MetadataTransferStagingError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM staging_evidence_deltas WHERE acknowledged = 0)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("check unacknowledged staging evidence", source)
+        })
+}
+
+fn build_staging_evidence_page(
+    connection: &Connection,
+    actor: &MetadataTransferStagingNodeIdentity,
+    previous_generation: u64,
+    previous_apply_receipt_digest: [u8; DIGEST_LEN],
+) -> Result<Option<MetadataTransferStagingEvidencePage>, MetadataTransferStagingError> {
+    if (previous_generation == 0) != (previous_apply_receipt_digest == [0; DIGEST_LEN]) {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence page has an invalid predecessor".to_owned(),
+        ));
+    }
+    let generation = previous_generation.checked_add(1).ok_or_else(|| {
+        MetadataTransferStagingError::Invariant(
+            "staging evidence page generation overflowed".to_owned(),
+        )
+    })?;
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, evidence_bytes FROM staging_evidence_deltas \
+             WHERE acknowledged = 0 ORDER BY sequence \
+             LIMIT ?1",
+        )
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("prepare staging evidence page", source)
+        })?;
+    let candidates = statement
+        .query_map(
+            [i64::try_from(MAX_STAGING_EVIDENCE_PAGE_ENTRIES).unwrap()],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .map_err(|source| MetadataTransferStagingError::sql("query staging evidence page", source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("read staging evidence page", source)
+        })?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut entries = Vec::with_capacity(candidates.len());
+    for (sequence, evidence) in candidates {
+        if evidence.is_empty() || evidence.len() > MAX_STAGING_EVIDENCE_BYTES {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence page member has an invalid length".to_owned(),
+            ));
+        }
+        let candidate = MetadataTransferStagingEvidencePageEntry { sequence, evidence };
+        entries.push(candidate);
+        let payload = encode_staging_evidence_page_payload(
+            actor,
+            previous_generation,
+            previous_apply_receipt_digest,
+            generation,
+            &entries,
+        );
+        if payload.len() > MAX_STAGING_EVIDENCE_PAGE_BYTES {
+            entries.pop();
+            break;
+        }
+    }
+    if entries.is_empty() {
+        return Err(MetadataTransferStagingError::Capacity(
+            "one staging evidence member does not fit the page byte limit".to_owned(),
+        ));
+    }
+    let operation_payload = encode_staging_evidence_page_payload(
+        actor,
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
+        &entries,
+    );
+    let page_digest = checksum::sha256::digest(&operation_payload);
+    Ok(Some(MetadataTransferStagingEvidencePage {
+        actor: actor.clone(),
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
+        entries,
+        operation_payload,
+        page_digest,
+    }))
+}
+
+fn persist_inflight_evidence_page(
+    connection: &Connection,
+    page: &MetadataTransferStagingEvidencePage,
+) -> Result<(), MetadataTransferStagingError> {
+    connection
+        .execute(
+            "INSERT INTO staging_evidence_inflight_page (\
+                singleton, previous_generation, previous_apply_receipt_digest, generation, \
+                operation_payload, page_digest, apply_receipt\
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, NULL) \
+             ON CONFLICT(singleton) DO UPDATE SET \
+                previous_generation = excluded.previous_generation, \
+                previous_apply_receipt_digest = excluded.previous_apply_receipt_digest, \
+                generation = excluded.generation, \
+                operation_payload = excluded.operation_payload, \
+                page_digest = excluded.page_digest, \
+                apply_receipt = NULL",
+            params![
+                to_sql_u64(page.previous_generation)?,
+                &page.previous_apply_receipt_digest[..],
+                to_sql_u64(page.generation)?,
+                &page.operation_payload,
+                &page.page_digest[..],
+            ],
+        )
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("persist staging evidence page", source)
+        })?;
+    Ok(())
+}
+
+fn load_inflight_evidence_page(
+    connection: &Connection,
+) -> Result<Option<StagingInflightEvidencePage>, MetadataTransferStagingError> {
+    let row = connection
+        .query_row(
+            "SELECT previous_generation, previous_apply_receipt_digest, generation, \
+                    operation_payload, page_digest, apply_receipt \
+             FROM staging_evidence_inflight_page WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("load staging in-flight evidence page", source)
+        })?;
+    row.map(
+        |(previous_generation, previous_digest, generation, payload, digest, receipt)| {
+            let previous_apply_receipt_digest: [u8; DIGEST_LEN] =
+                previous_digest.try_into().map_err(|_| {
+                    MetadataTransferStagingError::Invariant(
+                        "staging in-flight predecessor digest has invalid length".to_owned(),
+                    )
+                })?;
+            let page_digest: [u8; DIGEST_LEN] = digest.try_into().map_err(|_| {
+                MetadataTransferStagingError::Invariant(
+                    "staging in-flight page digest has invalid length".to_owned(),
+                )
+            })?;
+            let page = decode_staging_evidence_page_payload(&payload, page_digest)?;
+            if page.previous_generation != previous_generation
+                || page.previous_apply_receipt_digest != previous_apply_receipt_digest
+                || page.generation != generation
+            {
+                return Err(MetadataTransferStagingError::Invariant(
+                    "staging in-flight row differs from its canonical operation payload".to_owned(),
+                ));
+            }
+            Ok(StagingInflightEvidencePage {
+                page,
+                apply_receipt: receipt,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn require_exact_evidence_page(
+    current: &MetadataTransferStagingEvidencePage,
+    supplied: &MetadataTransferStagingEvidencePage,
+) -> Result<(), MetadataTransferStagingError> {
+    if current != supplied {
+        return Err(MetadataTransferStagingError::IntentConflict(
+            "staging evidence operation does not match the durable in-flight page".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_apply_receipt_for_page(
+    receipt: &MetadataTransferStagingEvidenceApplyReceipt,
+    page: &MetadataTransferStagingEvidencePage,
+) -> Result<(), MetadataTransferStagingError> {
+    if receipt.actor != page.actor
+        || receipt.previous_generation != page.previous_generation
+        || receipt.previous_apply_receipt_digest != page.previous_apply_receipt_digest
+        || receipt.generation != page.generation
+        || receipt.page_digest != page.page_digest
+        || receipt.accepted_generation != page.generation
+        || receipt.bytes != encode_staging_evidence_apply_receipt(receipt)
+    {
+        return Err(MetadataTransferStagingError::IntentConflict(
+            "staging evidence apply receipt does not bind the exact in-flight page".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_acknowledgement_edge(
+    connection: &Connection,
+    acknowledged: bool,
+    count: usize,
+) -> Result<Vec<MetadataTransferStagingEvidencePageEntry>, MetadataTransferStagingError> {
+    let order = if acknowledged { "DESC" } else { "ASC" };
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT sequence, evidence_bytes FROM staging_evidence_deltas \
+             WHERE acknowledged = ?1 ORDER BY sequence {order} LIMIT ?2"
+        ))
+        .map_err(|source| {
+            MetadataTransferStagingError::sql(
+                "prepare staging evidence acknowledgement edge",
+                source,
+            )
+        })?;
+    let mut entries = statement
+        .query_map(
+            params![i64::from(acknowledged), i64::try_from(count).unwrap()],
+            |row| {
+                Ok(MetadataTransferStagingEvidencePageEntry {
+                    sequence: row.get(0)?,
+                    evidence: row.get(1)?,
+                })
+            },
+        )
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("query staging evidence acknowledgement edge", source)
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("read staging evidence acknowledgement edge", source)
+        })?;
+    if acknowledged {
+        entries.reverse();
+    }
+    Ok(entries)
+}
+
 fn validate_auxiliary_catalogue(
     connection: &Connection,
     rows: &[StagingRow],
@@ -1560,52 +2073,99 @@ fn validate_auxiliary_catalogue(
         ));
     }
 
-    let inflight = connection
+    let (acknowledged_count, maximum_acknowledged, minimum_unacknowledged): (
+        i64,
+        Option<u64>,
+        Option<u64>,
+    ) = connection
         .query_row(
-            "SELECT previous_generation, previous_apply_receipt_digest, generation, \
-                    operation_payload, page_digest, apply_receipt \
-             FROM staging_evidence_inflight_page WHERE singleton = 1",
+            "SELECT COALESCE(SUM(acknowledged), 0), \
+                    MAX(CASE WHEN acknowledged = 1 THEN sequence END), \
+                    MIN(CASE WHEN acknowledged = 0 THEN sequence END) \
+             FROM staging_evidence_deltas",
             [],
-            |row| {
-                Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, Option<Vec<u8>>>(5)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .optional()
         .map_err(|source| {
-            MetadataTransferStagingError::sql("read staging in-flight evidence page", source)
+            MetadataTransferStagingError::sql(
+                "validate staging evidence acknowledgement prefix",
+                source,
+            )
         })?;
-    if let Some((previous, previous_digest, generation, payload, digest, apply_receipt)) = inflight
+    if maximum_acknowledged
+        .zip(minimum_unacknowledged)
+        .is_some_and(|(acknowledged, unacknowledged)| acknowledged >= unacknowledged)
     {
-        let previous_digest: [u8; DIGEST_LEN] = previous_digest.try_into().map_err(|_| {
-            MetadataTransferStagingError::Invariant(
-                "staging in-flight predecessor digest has invalid length".to_owned(),
-            )
-        })?;
-        let digest: [u8; DIGEST_LEN] = digest.try_into().map_err(|_| {
-            MetadataTransferStagingError::Invariant(
-                "staging in-flight page digest has invalid length".to_owned(),
-            )
-        })?;
-        if generation != previous.checked_add(1).unwrap_or(0)
-            || payload.is_empty()
-            || payload.len() > MAX_STAGING_EVIDENCE_PAGE_BYTES
-            || checksum::sha256::digest(&payload) != digest
-            || (previous == 0) != (previous_digest == [0; DIGEST_LEN])
-            || apply_receipt.as_ref().is_some_and(|receipt| {
-                receipt.is_empty() || receipt.len() > MAX_STAGING_EVIDENCE_BYTES
-            })
-        {
+        return Err(MetadataTransferStagingError::Invariant(
+            "acknowledged staging evidence is not an ordered catalogue prefix".to_owned(),
+        ));
+    }
+
+    if let Some(inflight) = load_inflight_evidence_page(connection)? {
+        let page = inflight.page;
+        let apply_receipt = inflight.apply_receipt;
+        let has_apply_receipt = apply_receipt.is_some();
+        let expected_acknowledged = i64::from(has_apply_receipt);
+        if let Some(apply_receipt) = apply_receipt.as_deref() {
+            let receipt = decode_staging_evidence_apply_receipt(apply_receipt)?;
+            require_apply_receipt_for_page(&receipt, &page).map_err(|_| {
+                MetadataTransferStagingError::Invariant(
+                    "staging in-flight apply receipt does not bind its durable page".to_owned(),
+                )
+            })?;
+        }
+        let current_page_acknowledged_count = if has_apply_receipt {
+            i64::try_from(page.entries.len()).unwrap()
+        } else {
+            0
+        };
+        let predecessor_acknowledged_count = acknowledged_count
+            .checked_sub(current_page_acknowledged_count)
+            .filter(|count| *count >= 0)
+            .ok_or_else(|| {
+                MetadataTransferStagingError::Invariant(
+                    "staging evidence acknowledgement count is smaller than its retained page"
+                        .to_owned(),
+                )
+            })?;
+        if (page.previous_generation == 0) != (predecessor_acknowledged_count == 0) {
             return Err(MetadataTransferStagingError::Invariant(
-                "staging in-flight evidence page is not canonical".to_owned(),
+                "staging evidence predecessor does not match acknowledged history".to_owned(),
             ));
         }
+        let edge = load_acknowledgement_edge(connection, has_apply_receipt, page.entries.len())?;
+        if edge != page.entries {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging in-flight page is not the exact acknowledgement frontier".to_owned(),
+            ));
+        }
+        for entry in &page.entries {
+            let member = connection
+                .query_row(
+                    "SELECT evidence_bytes, acknowledged FROM staging_evidence_deltas \
+                     WHERE sequence = ?1",
+                    [to_sql_u64(entry.sequence)?],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(|source| {
+                    MetadataTransferStagingError::sql(
+                        "validate staging in-flight evidence member",
+                        source,
+                    )
+                })?;
+            if member.as_ref().is_none_or(|(evidence, acknowledged)| {
+                evidence != &entry.evidence || *acknowledged != expected_acknowledged
+            }) {
+                return Err(MetadataTransferStagingError::Invariant(
+                    "staging in-flight page does not match its durable evidence members".to_owned(),
+                ));
+            }
+        }
+    } else if acknowledged_count != 0 {
+        return Err(MetadataTransferStagingError::Invariant(
+            "acknowledged staging evidence has no durable page and apply receipt".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1716,6 +2276,196 @@ fn validate_staging_evidence(
         ));
     }
     Ok(())
+}
+
+fn encode_staging_evidence_page_payload(
+    actor: &MetadataTransferStagingNodeIdentity,
+    previous_generation: u64,
+    previous_apply_receipt_digest: [u8; DIGEST_LEN],
+    generation: u64,
+    entries: &[MetadataTransferStagingEvidencePageEntry],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(STAGING_EVIDENCE_PAGE_MAGIC);
+    encode_staging_evidence_actor(&mut out, actor);
+    out.extend_from_slice(&previous_generation.to_be_bytes());
+    out.extend_from_slice(&previous_apply_receipt_digest);
+    out.extend_from_slice(&generation.to_be_bytes());
+    out.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_be_bytes());
+    for entry in entries {
+        out.extend_from_slice(&entry.sequence.to_be_bytes());
+        put_bytes(&mut out, &entry.evidence);
+    }
+    out
+}
+
+fn decode_staging_evidence_page_payload(
+    bytes: &[u8],
+    expected_digest: [u8; DIGEST_LEN],
+) -> Result<MetadataTransferStagingEvidencePage, MetadataTransferStagingError> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_STAGING_EVIDENCE_PAGE_BYTES
+        || checksum::sha256::digest(bytes) != expected_digest
+    {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence page has invalid length or digest".to_owned(),
+        ));
+    }
+    let mut offset = STAGING_EVIDENCE_PAGE_MAGIC.len();
+    if bytes.get(..offset) != Some(STAGING_EVIDENCE_PAGE_MAGIC) {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence page has unknown magic".to_owned(),
+        ));
+    }
+    let actor = decode_staging_evidence_actor(bytes, &mut offset)?;
+    let previous_generation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+    let previous_apply_receipt_digest = take(bytes, &mut offset, DIGEST_LEN)?.try_into().unwrap();
+    let generation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+    let count = usize::try_from(u32::from_be_bytes(
+        take(bytes, &mut offset, 4)?.try_into().unwrap(),
+    ))
+    .unwrap();
+    if count == 0
+        || count > MAX_STAGING_EVIDENCE_PAGE_ENTRIES
+        || generation != previous_generation.checked_add(1).unwrap_or(0)
+        || (previous_generation == 0) != (previous_apply_receipt_digest == [0; DIGEST_LEN])
+    {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence page has invalid count, generation, or predecessor".to_owned(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut last_sequence = None;
+    for _ in 0..count {
+        let sequence = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+        let evidence_len = usize::try_from(u32::from_be_bytes(
+            take(bytes, &mut offset, 4)?.try_into().unwrap(),
+        ))
+        .unwrap();
+        if sequence == 0
+            || last_sequence.is_some_and(|last| sequence <= last)
+            || evidence_len == 0
+            || evidence_len > MAX_STAGING_EVIDENCE_BYTES
+        {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence page has a noncanonical member".to_owned(),
+            ));
+        }
+        let evidence = take(bytes, &mut offset, evidence_len)?.to_vec();
+        entries.push(MetadataTransferStagingEvidencePageEntry { sequence, evidence });
+        last_sequence = Some(sequence);
+    }
+    if offset != bytes.len() {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence page has trailing bytes".to_owned(),
+        ));
+    }
+    let canonical = encode_staging_evidence_page_payload(
+        &actor,
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
+        &entries,
+    );
+    if canonical != bytes {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence page is not canonical".to_owned(),
+        ));
+    }
+    Ok(MetadataTransferStagingEvidencePage {
+        actor,
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
+        entries,
+        operation_payload: bytes.to_vec(),
+        page_digest: expected_digest,
+    })
+}
+
+fn encode_staging_evidence_apply_receipt(
+    receipt: &MetadataTransferStagingEvidenceApplyReceipt,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC);
+    encode_staging_evidence_actor(&mut out, &receipt.actor);
+    out.extend_from_slice(&receipt.previous_generation.to_be_bytes());
+    out.extend_from_slice(&receipt.previous_apply_receipt_digest);
+    out.extend_from_slice(&receipt.generation.to_be_bytes());
+    out.extend_from_slice(&receipt.page_digest);
+    out.extend_from_slice(&receipt.accepted_generation.to_be_bytes());
+    out
+}
+
+fn decode_staging_evidence_apply_receipt(
+    bytes: &[u8],
+) -> Result<MetadataTransferStagingEvidenceApplyReceipt, MetadataTransferStagingError> {
+    if bytes.is_empty() || bytes.len() > MAX_STAGING_EVIDENCE_BYTES {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence apply receipt has invalid length".to_owned(),
+        ));
+    }
+    let mut offset = STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC.len();
+    if bytes.get(..offset) != Some(STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC) {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence apply receipt has unknown magic".to_owned(),
+        ));
+    }
+    let actor = decode_staging_evidence_actor(bytes, &mut offset)?;
+    let previous_generation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+    let previous_apply_receipt_digest = take(bytes, &mut offset, DIGEST_LEN)?.try_into().unwrap();
+    let generation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+    let page_digest = take(bytes, &mut offset, DIGEST_LEN)?.try_into().unwrap();
+    let accepted_generation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+    let receipt = MetadataTransferStagingEvidenceApplyReceipt {
+        actor,
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
+        page_digest,
+        accepted_generation,
+        bytes: bytes.to_vec(),
+    };
+    if offset != bytes.len()
+        || generation == 0
+        || generation != previous_generation.checked_add(1).unwrap_or(0)
+        || accepted_generation != generation
+        || (previous_generation == 0) != (previous_apply_receipt_digest == [0; DIGEST_LEN])
+        || encode_staging_evidence_apply_receipt(&receipt) != bytes
+    {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence apply receipt is not canonical".to_owned(),
+        ));
+    }
+    Ok(receipt)
+}
+
+fn encode_staging_evidence_actor(out: &mut Vec<u8>, actor: &MetadataTransferStagingNodeIdentity) {
+    out.extend_from_slice(&actor.node_id.as_u32().to_be_bytes());
+    out.extend_from_slice(&actor.node_incarnation.to_be_bytes());
+    put_bytes(out, actor.endpoint.as_bytes());
+}
+
+fn decode_staging_evidence_actor(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<MetadataTransferStagingNodeIdentity, MetadataTransferStagingError> {
+    let node_id = NodeId::new(u32::from_be_bytes(
+        take(bytes, offset, 4)?.try_into().unwrap(),
+    ));
+    let incarnation = u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap());
+    let endpoint_len = usize::try_from(u32::from_be_bytes(
+        take(bytes, offset, 4)?.try_into().unwrap(),
+    ))
+    .unwrap();
+    let endpoint = std::str::from_utf8(take(bytes, offset, endpoint_len)?)
+        .map_err(|_| {
+            MetadataTransferStagingError::Invariant(
+                "staging evidence actor endpoint is not UTF-8".to_owned(),
+            )
+        })?
+        .to_owned();
+    MetadataTransferStagingNodeIdentity::new(node_id, incarnation, endpoint)
 }
 
 fn take<'a>(
@@ -2421,8 +3171,26 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, FileTypeExt};
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::*;
+
+    struct AssignmentGateRelease(Option<mpsc::SyncSender<()>>);
+
+    impl AssignmentGateRelease {
+        fn release(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for AssignmentGateRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     fn identity() -> MetadataTransferStagingNodeIdentity {
         MetadataTransferStagingNodeIdentity::new(
@@ -3453,6 +4221,436 @@ mod tests {
         let error = MetadataTransferStagingStore::open(tmp.path(), identity(), limits())
             .err()
             .expect("noncanonical in-flight page must fail startup");
+        assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
+    }
+
+    #[test]
+    fn evidence_page_replays_exact_payload_across_new_deltas_and_restart() {
+        let tmp = test_util::tempdir();
+        let first_artifact = b"first evidence page artifact";
+        let first = intent(first_artifact);
+        let store = open(tmp.path());
+        store.create_intent(&first).unwrap();
+        store.publish_artifact(&first, first_artifact).unwrap();
+
+        let first_page = store.next_evidence_page().unwrap().unwrap();
+        assert_eq!(first_page.generation(), 1);
+        assert_eq!(first_page.entries.len(), 1);
+        let first_payload = first_page.operation_payload().to_vec();
+        let first_digest = first_page.page_digest();
+
+        let mut second = intent(b"second evidence page artifact");
+        second.pg_id = PgId::new(20);
+        store.tombstone(&second).unwrap();
+        let replay = store.next_evidence_page().unwrap().unwrap();
+        assert_eq!(replay.operation_payload(), first_payload);
+        assert_eq!(replay.page_digest(), first_digest);
+        assert_eq!(replay.entries, first_page.entries);
+        drop(store);
+
+        let restarted_identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            8,
+            "tcp://storage-4.example:9000".to_owned(),
+        )
+        .unwrap();
+        let restarted =
+            MetadataTransferStagingStore::open(tmp.path(), restarted_identity, limits()).unwrap();
+        let replay = restarted.next_evidence_page().unwrap().unwrap();
+        assert_eq!(replay.operation_payload(), first_payload);
+        assert_eq!(replay.page_digest(), first_digest);
+        assert_eq!(replay.actor, first_page.actor);
+        assert_eq!(restarted.unacknowledged_evidence_count(), 2);
+    }
+
+    #[test]
+    fn evidence_page_assignment_is_atomic_across_independent_store_handles() {
+        let tmp = test_util::tempdir();
+        let artifact = b"two-handle evidence assignment";
+        let intent = intent(artifact);
+        let setup = open(tmp.path());
+        setup.create_intent(&intent).unwrap();
+        setup.publish_artifact(&intent, artifact).unwrap();
+        drop(setup);
+
+        let (selected_tx, selected_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let observer_release = Arc::clone(&release_rx);
+        let first = MetadataTransferStagingStore::open_with_evidence_page_assignment_observer(
+            tmp.path(),
+            identity(),
+            limits(),
+            Arc::new(move || {
+                selected_tx.send(()).unwrap();
+                observer_release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }),
+        )
+        .unwrap();
+        let second = MetadataTransferStagingStore::open(tmp.path(), identity(), limits()).unwrap();
+        second
+            .state
+            .lock()
+            .unwrap()
+            .connection
+            .busy_timeout(Duration::ZERO)
+            .unwrap();
+        let first_thread = std::thread::spawn(move || first.next_evidence_page());
+        selected_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut release = AssignmentGateRelease(Some(release_tx));
+
+        let (second_result_tx, second_result_rx) = mpsc::sync_channel(0);
+        let second_thread = std::thread::spawn(move || {
+            let result = second.next_evidence_page();
+            second_result_tx.send((second, result)).unwrap();
+        });
+        let (second, competing_result) = second_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("competing evidence assignment must fail without waiting for the first handle");
+        let competing_error = competing_result.unwrap_err();
+        assert!(matches!(
+            competing_error,
+            MetadataTransferStagingError::Sql { source, .. }
+                if source.sqlite_error_code()
+                    == Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
+        ));
+        second_thread.join().unwrap();
+
+        release.release();
+        let assigned = first_thread.join().unwrap().unwrap().unwrap();
+        let replay = second.next_evidence_page().unwrap().unwrap();
+        assert_eq!(replay, assigned);
+    }
+
+    #[test]
+    fn staging_evidence_page_and_apply_receipt_v1_encodings_are_fixed() {
+        let tmp = test_util::tempdir();
+        let artifact = b"fixed evidence page artifact";
+        let intent = intent(artifact);
+        let store = open(tmp.path());
+        store.create_intent(&intent).unwrap();
+        store.publish_artifact(&intent, artifact).unwrap();
+        let page = store.next_evidence_page().unwrap().unwrap();
+        let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+
+        assert_eq!(
+            hex(page.operation_payload()),
+            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56310000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000000bc4152474d494e2d53544147494e472d45564944454e43452d5631000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0bf51475e8b2d3cf459b84790992ceb689fd3261ab949c76545228fd3cf39381000000000000001c000107"
+        );
+        assert_eq!(
+            hex(receipt.as_bytes()),
+            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56310000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001b97e8570c0ac86e556b72d83542c0aafea95e3908882344ac802537b5e55a57e0000000000000001"
+        );
+    }
+
+    #[test]
+    fn evidence_acknowledgement_is_atomic_and_chains_the_successor_page() {
+        let tmp = test_util::tempdir();
+        let first_artifact = b"acknowledged evidence page artifact";
+        let first = intent(first_artifact);
+        let store = open(tmp.path());
+        store.create_intent(&first).unwrap();
+        store.publish_artifact(&first, first_artifact).unwrap();
+        let first_page = store.next_evidence_page().unwrap().unwrap();
+
+        let mut second = intent(b"successor evidence page artifact");
+        second.pg_id = PgId::new(20);
+        store.tombstone(&second).unwrap();
+        let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&first_page);
+        store
+            .record_evidence_apply_receipt(&first_page, &receipt)
+            .unwrap();
+        store
+            .record_evidence_apply_receipt(&first_page, &receipt)
+            .unwrap();
+        assert_eq!(store.unacknowledged_evidence_count(), 1);
+
+        let successor = store.next_evidence_page().unwrap().unwrap();
+        assert_eq!(successor.generation(), 2);
+        assert_eq!(successor.previous_generation, 1);
+        assert_eq!(
+            successor.previous_apply_receipt_digest,
+            checksum::sha256::digest(receipt.as_bytes())
+        );
+        assert_eq!(successor.entries.len(), 1);
+        assert_ne!(successor.entries, first_page.entries);
+        let successor_payload = successor.operation_payload().to_vec();
+        drop(store);
+
+        let restarted = open(tmp.path());
+        let replay = restarted.next_evidence_page().unwrap().unwrap();
+        assert_eq!(replay.operation_payload(), successor_payload);
+        assert_eq!(replay, successor);
+        assert_eq!(restarted.unacknowledged_evidence_count(), 1);
+    }
+
+    #[test]
+    fn invalid_apply_receipt_cannot_acknowledge_or_replace_the_inflight_page() {
+        let tmp = test_util::tempdir();
+        let artifact = b"receipt rejection artifact";
+        let intent = intent(artifact);
+        let store = open(tmp.path());
+        store.create_intent(&intent).unwrap();
+        store.publish_artifact(&intent, artifact).unwrap();
+        let page = store.next_evidence_page().unwrap().unwrap();
+        let mut receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+        receipt.page_digest[0] ^= 0x80;
+        receipt.bytes = encode_staging_evidence_apply_receipt(&receipt);
+
+        assert!(matches!(
+            store.record_evidence_apply_receipt(&page, &receipt),
+            Err(MetadataTransferStagingError::IntentConflict(_))
+        ));
+        assert_eq!(store.unacknowledged_evidence_count(), 1);
+        assert_eq!(store.next_evidence_page().unwrap().unwrap(), page);
+    }
+
+    #[test]
+    fn evidence_pages_are_bounded_and_ordered() {
+        let tmp = test_util::tempdir();
+        let page_limits = MetadataTransferStagingLimits::new(
+            MAX_STAGING_EVIDENCE_PAGE_ENTRIES + 1,
+            1024,
+            u64::try_from(MAX_STAGING_EVIDENCE_PAGE_ENTRIES + 1).unwrap() * 1024,
+        )
+        .unwrap();
+        let store =
+            MetadataTransferStagingStore::open(tmp.path(), identity(), page_limits).unwrap();
+        for pg in 1..=u32::try_from(MAX_STAGING_EVIDENCE_PAGE_ENTRIES + 1).unwrap() {
+            let mut cancelled = intent(b"bounded evidence page");
+            cancelled.pg_id = PgId::new(pg);
+            store.tombstone(&cancelled).unwrap();
+        }
+
+        let page = store.next_evidence_page().unwrap().unwrap();
+        assert_eq!(page.entries.len(), MAX_STAGING_EVIDENCE_PAGE_ENTRIES);
+        assert!(page.operation_payload().len() <= MAX_STAGING_EVIDENCE_PAGE_BYTES);
+        assert!(page
+            .entries
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
+    }
+
+    #[test]
+    fn evidence_page_builder_enforces_the_encoded_byte_ceiling() {
+        let tmp = test_util::tempdir();
+        let page_limits = MetadataTransferStagingLimits::new(
+            MAX_STAGING_EVIDENCE_PAGE_ENTRIES,
+            1024,
+            u64::try_from(MAX_STAGING_EVIDENCE_PAGE_ENTRIES).unwrap() * 1024,
+        )
+        .unwrap();
+        let long_identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            7,
+            "x".repeat(MAX_ENDPOINT_BYTES),
+        )
+        .unwrap();
+        let store =
+            MetadataTransferStagingStore::open(tmp.path(), long_identity, page_limits).unwrap();
+        for pg in 1..=u32::try_from(MAX_STAGING_EVIDENCE_PAGE_ENTRIES).unwrap() {
+            let mut cancelled = intent(b"byte-bounded evidence page");
+            cancelled.pg_id = PgId::new(pg);
+            store.tombstone(&cancelled).unwrap();
+        }
+
+        let page = store.next_evidence_page().unwrap().unwrap();
+        assert!(page.entries.len() < MAX_STAGING_EVIDENCE_PAGE_ENTRIES);
+        assert!(page.operation_payload().len() <= MAX_STAGING_EVIDENCE_PAGE_BYTES);
+        let mut oversized = page.entries.clone();
+        let next_sequence = oversized.last().unwrap().sequence + 1;
+        oversized.push(MetadataTransferStagingEvidencePageEntry {
+            sequence: next_sequence,
+            evidence: encode_staging_evidence(&store.identity, &intent(b"next evidence"), 1),
+        });
+        assert!(
+            encode_staging_evidence_page_payload(
+                &page.actor,
+                page.previous_generation,
+                page.previous_apply_receipt_digest,
+                page.generation,
+                &oversized,
+            )
+            .len()
+                > MAX_STAGING_EVIDENCE_PAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn startup_rejects_partial_evidence_acknowledgement_transactions() {
+        for receipt_without_members in [false, true] {
+            let tmp = test_util::tempdir();
+            let artifact = b"partial evidence acknowledgement";
+            let intent = intent(artifact);
+            let store = open(tmp.path());
+            store.create_intent(&intent).unwrap();
+            store.publish_artifact(&intent, artifact).unwrap();
+            let page = store.next_evidence_page().unwrap().unwrap();
+            let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+            drop(store);
+
+            let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
+            if receipt_without_members {
+                connection
+                    .execute(
+                        "UPDATE staging_evidence_inflight_page SET apply_receipt = ?1",
+                        params![receipt.as_bytes()],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute("UPDATE staging_evidence_deltas SET acknowledged = 1", [])
+                    .unwrap();
+            }
+            drop(connection);
+
+            let error = MetadataTransferStagingStore::open(tmp.path(), identity(), limits())
+                .err()
+                .expect("partial evidence acknowledgement must fail startup");
+            assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
+        }
+    }
+
+    #[test]
+    fn startup_rejects_acknowledged_evidence_without_its_retained_page() {
+        let tmp = test_util::tempdir();
+        let artifact = b"missing acknowledged evidence page";
+        let intent = intent(artifact);
+        let store = open(tmp.path());
+        store.create_intent(&intent).unwrap();
+        store.publish_artifact(&intent, artifact).unwrap();
+        let page = store.next_evidence_page().unwrap().unwrap();
+        let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+        store
+            .record_evidence_apply_receipt(&page, &receipt)
+            .unwrap();
+        drop(store);
+        drop(open(tmp.path()));
+
+        let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
+        connection
+            .execute("DELETE FROM staging_evidence_inflight_page", [])
+            .unwrap();
+        drop(connection);
+
+        let error = MetadataTransferStagingStore::open(tmp.path(), identity(), limits())
+            .err()
+            .expect("acknowledged evidence without its page must fail startup");
+        assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
+    }
+
+    #[test]
+    fn startup_rejects_acknowledged_evidence_outside_the_retained_page_chain() {
+        let tmp = test_util::tempdir();
+        let first_artifact = b"retained acknowledged evidence page";
+        let first = intent(first_artifact);
+        let store = open(tmp.path());
+        store.create_intent(&first).unwrap();
+        store.publish_artifact(&first, first_artifact).unwrap();
+        let page = store.next_evidence_page().unwrap().unwrap();
+        let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+        store
+            .record_evidence_apply_receipt(&page, &receipt)
+            .unwrap();
+        let mut unrelated = intent(b"unassigned evidence");
+        unrelated.pg_id = PgId::new(20);
+        store.tombstone(&unrelated).unwrap();
+        drop(store);
+        drop(open(tmp.path()));
+
+        let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
+        connection
+            .execute(
+                "UPDATE staging_evidence_deltas SET acknowledged = 1 \
+                 WHERE pg_id = ?1 AND staging_generation = ?2",
+                params![
+                    i64::from(unrelated.pg_id.get()),
+                    to_sql_u64(unrelated.staging_generation).unwrap()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = MetadataTransferStagingStore::open(tmp.path(), identity(), limits())
+            .err()
+            .expect("acknowledged nonmember evidence must fail startup");
+        assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
+    }
+
+    #[test]
+    fn acknowledged_genesis_page_reopens_before_successor_assignment() {
+        for queue_successor_delta in [false, true] {
+            let tmp = test_util::tempdir();
+            let artifact = b"acknowledged genesis restart";
+            let first = intent(artifact);
+            let store = open(tmp.path());
+            store.create_intent(&first).unwrap();
+            store.publish_artifact(&first, artifact).unwrap();
+            let first_page = store.next_evidence_page().unwrap().unwrap();
+            let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&first_page);
+            store
+                .record_evidence_apply_receipt(&first_page, &receipt)
+                .unwrap();
+
+            if queue_successor_delta {
+                let mut second = intent(b"queued after genesis acknowledgement");
+                second.pg_id = PgId::new(20);
+                store.tombstone(&second).unwrap();
+            }
+            drop(store);
+
+            let restarted = open(tmp.path());
+            if queue_successor_delta {
+                let successor = restarted.next_evidence_page().unwrap().unwrap();
+                assert_eq!(successor.previous_generation, first_page.generation());
+                assert_eq!(
+                    successor.previous_apply_receipt_digest,
+                    checksum::sha256::digest(receipt.as_bytes())
+                );
+                assert_ne!(successor.entries, first_page.entries);
+            } else {
+                assert!(restarted.next_evidence_page().unwrap().is_none());
+                restarted
+                    .record_evidence_apply_receipt(&first_page, &receipt)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn startup_rejects_apply_receipt_not_bound_to_the_durable_page() {
+        let tmp = test_util::tempdir();
+        let artifact = b"startup apply receipt validation";
+        let intent = intent(artifact);
+        let store = open(tmp.path());
+        store.create_intent(&intent).unwrap();
+        store.publish_artifact(&intent, artifact).unwrap();
+        let page = store.next_evidence_page().unwrap().unwrap();
+        let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+        store
+            .record_evidence_apply_receipt(&page, &receipt)
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
+        let mut forged = receipt.clone();
+        forged.page_digest[0] ^= 1;
+        forged.bytes = encode_staging_evidence_apply_receipt(&forged);
+        connection
+            .execute(
+                "UPDATE staging_evidence_inflight_page SET apply_receipt = ?1",
+                params![forged.as_bytes()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = MetadataTransferStagingStore::open(tmp.path(), identity(), limits())
+            .err()
+            .expect("misbound staging evidence receipt must fail startup");
         assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
     }
 }
