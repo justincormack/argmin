@@ -140,6 +140,11 @@ impl crate::error::DatabaseError {
 mod command_log;
 #[path = "pg_store/metadata.rs"]
 mod metadata;
+// The durable staging owner is landed before its authenticated RPC exposure so
+// the later protocol slice can depend on a fixed, restart-safe storage format.
+#[allow(dead_code)]
+#[path = "pg_store/metadata_transfer_staging.rs"]
+mod metadata_transfer_staging;
 #[path = "pg_store/rows.rs"]
 mod rows;
 #[path = "pg_store/scavenger.rs"]

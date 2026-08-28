@@ -419,6 +419,36 @@ source runtime map and replaces that compact prepared binding before retrying;
 artifact command rebasing therefore remains outside control-plane command
 derivation. This is still protocol-neutral and does not authorize staging or
 route installation by itself.
+The storage-owned durable staging foundation is also complete but remains
+protocol-isolated. Staging-store format v1 has a fixed root manifest and exact
+initialization-complete marker, exact SQLite catalogue,
+exact transition/generation/artifact intent CAS, bounded
+capacity and startup inventory, content-addressed fsync/rename/directory-sync
+publication, import state, tombstone-before-unlink ordering, per-PG finalized
+floors, and durable receipt/tombstone evidence deltas. Startup completes an
+exact renamed-but-uncommitted publication transactionally, removes interrupted
+temporary files, quarantines unexplained regular artifacts, and rejects
+symlinks and special catalogue files, unsupported versions, changed schema,
+missing or corrupt published artifacts, and coordinated receipt corruption.
+Each evidence delta independently persists its historical actor tuple and
+validates the canonical receipt against it across process-incarnation changes.
+Recovered publication syncs both the artifact and its containing directory
+before committing the receipt-bearing catalogue transaction. First
+initialization publishes its fixed marker only after the exact v1 catalogue
+and its directory entries are durable. Before that can complete, creation of
+the staging root is synced through the parent storage data directory. A second
+fixed establishment marker is then atomically published in that parent; its
+presence requires the existing initialized root and exact v1 catalogue without
+create/repair authority, so whole-root deletion, catalogue deletion, or
+truncation cannot erase tombstones or finalized floors by becoming fresh
+initialization. The complete v1 manifest, inner initialization marker, outer
+establishment marker, and publication receipt bytes are frozen in
+storage-owned tests; v0/v2 format,
+catalogue, and artifact versions are rejection-only evidence. The catalogue
+reserves the exact in-flight evidence-page state required below, but no
+production startup path or RPC opens the store yet. Finalized floors therefore
+do not prune tombstones or evidence until durable page acknowledgement is
+implemented; exposing staging before that boundary remains prohibited.
 Command v19 additionally sealed the
 post-grace completion fence that prevents survivor heartbeats from indefinitely
 reactivating the old acting set; immutable command v18 remains rejection
@@ -847,8 +877,9 @@ control-plane RPC operation beyond that receipt protocol.
 
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Introduce staging-store format v1 with a
-versioned root manifest, generation catalogue, content-addressed artifact
-files, published receipts, import status, tombstones, and per-PG finalized
+versioned root manifest, initialization-complete marker, outer establishment
+marker in the storage data directory, generation catalogue,
+content-addressed artifact files, published receipts, import status, tombstones, and per-PG finalized
 generation floors. The catalogue also persists pending receipt/tombstone
 deltas, the exact assigned in-flight evidence operation-payload bytes and
 digest, and the canonical authority-neutral apply receipt through atomic delta
@@ -856,7 +887,13 @@ retirement. Fresh RPC authentication envelopes are never persisted as replay
 material. Publication writes a generation-scoped temporary file,
 fsyncs and validates its exact length and digest, atomically renames it, fsyncs
 the containing directory, then commits and syncs the catalogue state before
-issuing a receipt. Startup validates the manifest and complete catalogue/file
+issuing a receipt. Existing-file retry and startup recovery repeat the artifact
+and directory durability fence before committing a recovered receipt. Receipt
+evidence independently retains the producing node ID, incarnation, and
+endpoint so restart validation does not trust identity fields copied only
+inside the receipt. Startup opens an existing catalogue nonblocking with
+`O_NOFOLLOW`, requires a regular file before SQLite admission, and validates
+the manifest and complete catalogue/file
 inventory before serving staging RPCs: unknown versions, digest or length
 mismatch, missing published files, generation regression, and contradictory
 receipt/tombstone state fail closed. Bounded startup reconciliation removes
@@ -864,7 +901,8 @@ unpublished temporary files, completes tombstone-directed unlink and directory
 sync, and quarantines unexplained final files rather than authorizing them.
 Store admission accounts for temporary, published, and tombstoned cleanup
 bytes. Add immutable v0/v2 rejection fixtures and a fixed v1 manifest,
-catalogue, receipt, and crash-state corpus to the storage format ledger; no
+initialization and establishment markers, catalogue, receipt, and crash-state corpus to the
+storage format ledger; no
 upgrade decoder is required while the repository supports one format at a
 time.
 
@@ -935,6 +973,15 @@ Required deterministic and generated coverage includes:
   reuse, tombstone restart, and finalized-generation-floor rejection;
 - staging-store publication crashes before and after file fsync, rename,
   directory fsync, catalogue commit, and receipt issuance;
+- existing-file and startup publication recovery preserve the same directory
+  fsync-before-catalogue ordering, special catalogue files fail before SQLite,
+  and same-length node/incarnation/endpoint receipt mutations disagree with
+  independently persisted historical actor identity;
+- first initialization resumes before catalogue creation and after exact v1
+  catalogue commit; root creation is parent-directory-synced before either
+  marker or any receipt, and an outer established marker makes missing root,
+  missing/truncated catalogue, or version-zero catalogue state rejection-only
+  without recreating the root or losing retirement state;
 - restart and leader failover before and after every batch boundary;
 - stale batch rejection after a successor transition;
 - normalized equivalence between sequential single-PG model transitions and
