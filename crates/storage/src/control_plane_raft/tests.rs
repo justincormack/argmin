@@ -1985,53 +1985,17 @@ fn control_plane_raft_linearized_authority_readiness_from_flags_is_ordered() {
 }
 
 #[test]
-fn control_plane_raft_restart_capture_retry_uses_elapsed_time_budget() {
-    let started = Instant::now();
-    let deadline = started + CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_BUDGET;
-    assert_eq!(
-        control_plane_raft_restart_capture_retry_delay(started, deadline),
-        Some(CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY)
-    );
-    assert_eq!(
-        control_plane_raft_restart_capture_retry_delay(
-            started + Duration::from_millis(16),
-            deadline
-        ),
-        Some(CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY),
-        "the former 16-attempt boundary must not exhaust the retry budget"
-    );
-    assert_eq!(
-        control_plane_raft_restart_capture_retry_delay(
-            deadline - Duration::from_micros(500),
-            deadline
-        ),
-        Some(Duration::from_micros(500)),
-        "the final retry sleep must not exceed the remaining budget"
-    );
-    assert_eq!(
-        control_plane_raft_restart_capture_retry_delay(deadline, deadline),
-        None
-    );
-    assert_eq!(
-        control_plane_raft_restart_capture_retry_delay(
-            deadline + Duration::from_millis(1),
-            deadline
-        ),
-        None
-    );
+fn control_plane_raft_restart_capture_retry_counts_completed_attempts() {
+    assert!(control_plane_raft_restart_capture_attempt_allowed(0));
     assert!(control_plane_raft_restart_capture_attempt_allowed(
-        0,
-        deadline + Duration::from_millis(1),
-        deadline
+        CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS - 1
     ));
-    assert!(
-        !control_plane_raft_restart_capture_attempt_allowed(
-            1,
-            deadline + Duration::from_millis(1),
-            deadline
-        ),
-        "an overslept final delay must not admit another capture attempt"
-    );
+    assert!(!control_plane_raft_restart_capture_attempt_allowed(
+        CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS
+    ));
+    assert!(!control_plane_raft_restart_capture_attempt_allowed(
+        u64::MAX
+    ));
 }
 
 fn test_authority_status(

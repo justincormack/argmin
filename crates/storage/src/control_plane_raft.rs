@@ -5260,22 +5260,16 @@ impl ControlPlaneRaftAuthority {
         })?;
 
         let capture_started = Instant::now();
-        let capture_deadline = capture_started
-            .checked_add(CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_BUDGET)
-            .expect("constant OpenRaft restart capture retry budget should fit Instant");
         let mut attempts = 0_u64;
         let mut last_validation_error = None;
         loop {
-            let now = Instant::now();
-            if !control_plane_raft_restart_capture_attempt_allowed(attempts, now, capture_deadline)
-            {
+            if !control_plane_raft_restart_capture_attempt_allowed(attempts) {
                 let elapsed = capture_started.elapsed();
                 let validation_error = last_validation_error.expect(
                     "a denied OpenRaft restart capture retry must follow a validation failure",
                 );
                 return Err(ControlPlaneError::io("capture consistent control-plane OpenRaft durable restart artifact", raft_log_store_error(format!(
-                        "control-plane OpenRaft restart artifact capture exhausted its {:?} retry budget after {attempts} attempts and {elapsed:?}: {validation_error}",
-                        CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_BUDGET
+                        "control-plane OpenRaft restart artifact capture exhausted its {attempts}-attempt retry budget after {elapsed:?}: {validation_error}",
                     ))));
             }
             attempts = attempts.saturating_add(1);
@@ -5308,12 +5302,10 @@ impl ControlPlaneRaftAuthority {
                 Err(error) => error,
             };
             last_validation_error = Some(validation_error);
-            let Some(retry_delay) =
-                control_plane_raft_restart_capture_retry_delay(Instant::now(), capture_deadline)
-            else {
-                continue;
-            };
-            ControlPlaneRaftTypeConfig::sleep(retry_delay).await;
+            if control_plane_raft_restart_capture_attempt_allowed(attempts) {
+                ControlPlaneRaftTypeConfig::sleep(CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY)
+                    .await;
+            }
         }
     }
 
@@ -6620,7 +6612,9 @@ const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 5;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC: &[u8] = b"ARGMINCPRAFTSEEN";
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION: u16 = 1;
-const CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_BUDGET: Duration = Duration::from_secs(1);
+// Bound actual inconsistent captures rather than elapsed time. A process may be descheduled after
+// one failed capture; that must not turn a still-untried second capture into a durability failure.
+const CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS: u64 = 1_024;
 const CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const CONTROL_PLANE_RAFT_WAL_MAGIC: &[u8] = b"ARGMINCPRAFTWAL";
 const CONTROL_PLANE_RAFT_WAL_VERSION: u16 = 1;
@@ -6665,22 +6659,8 @@ const CONTROL_PLANE_RAFT_WAL_IO_CONTEXTS: DurableJournalIoContexts = DurableJour
     read_file_header: "read control-plane OpenRaft WAL header",
 };
 
-fn control_plane_raft_restart_capture_attempt_allowed(
-    completed_attempts: u64,
-    now: Instant,
-    deadline: Instant,
-) -> bool {
-    completed_attempts == 0 || now < deadline
-}
-
-fn control_plane_raft_restart_capture_retry_delay(
-    now: Instant,
-    deadline: Instant,
-) -> Option<Duration> {
-    deadline
-        .checked_duration_since(now)
-        .filter(|remaining| !remaining.is_zero())
-        .map(|remaining| CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY.min(remaining))
+fn control_plane_raft_restart_capture_attempt_allowed(completed_attempts: u64) -> bool {
+    completed_attempts < CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
