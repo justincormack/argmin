@@ -121,6 +121,11 @@ impl Fixture {
         drain_pending_object_metadata_commands_for_publisher();
     }
 
+    fn release_object_generation_reservation_with_work_budget() {
+        crate::metadata_command::metadata_command_publisher!(CanonicalizedReleasePublisher);
+        install_allocator_cleanup_pending_command_or_drain();
+    }
+
     fn raw_generic_drain_from_publisher_is_rejected() {
         crate::metadata_command::metadata_command_publisher!(RawGenericDrainPublisher);
         drain_pending_object_metadata_commands_for_bucket();

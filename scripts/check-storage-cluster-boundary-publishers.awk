@@ -9,6 +9,9 @@ function canonicalize_function(name) {
     if (name == "reserve_next_object_version_with_completion_admission") {
         return "reserve_next_object_version"
     }
+    if (name == "release_object_generation_reservation_with_work_budget") {
+        return "release_object_generation_reservation"
+    }
     if (name == "create_multipart_upload_inner") {
         return "create_multipart_upload"
     }
