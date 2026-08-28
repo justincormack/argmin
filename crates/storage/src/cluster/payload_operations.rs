@@ -4753,14 +4753,14 @@ impl StorageCluster {
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            let pending_visible = match self
+                            let late_conflict_command = match self
                                 .pending_metadata_command_for_bucket_until(
                                     pg_id,
                                     &req.bucket,
                                     work_budget.deadline(),
                                 )
                             {
-                                Ok(pending) => pending.is_some(),
+                                Ok(pending) => pending,
                                 Err(error) => {
                                     retry_direct_put_observation_before_command_ownership!(
                                         ObjectPgActionError::Store(error),
@@ -4773,25 +4773,68 @@ impl StorageCluster {
                                 self.metadata_command_apply_test_hook_scope_id(),
                                 &mut work_budget,
                             );
-                            let drain_result =
-                                self.drain_after_object_pg_log_conflict_with_work_budget(
-                                    publisher,
-                                    pg_id,
-                                    &req.bucket,
-                                    pending_visible,
-                                    &mut work_budget,
-                                );
-                            if let Err(error) = drain_result {
-                                if request_ops::object_pg_action_error_is_retryable_pending_drain(
-                                    &error,
-                                ) {
+                            let drain_result = match late_conflict_command.as_ref() {
+                                Some(command) => self
+                                    .drain_pending_object_metadata_command_with_work_budget(
+                                        publisher,
+                                        pg_id,
+                                        command,
+                                        &mut work_budget,
+                                    )
+                                    .map(|_| ()),
+                                None => Ok(()),
+                            };
+                            match drain_result {
+                                Ok(()) => {}
+                                Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
+                                    if late_conflict_command.as_ref().is_some_and(|command| {
+                                        matches!(
+                                            command.payload(),
+                                            MetadataCommandPayload::CommitDirectPutObject(commit)
+                                                if commit.object.bucket == req.bucket
+                                                    && commit.object.key == req.key
+                                        )
+                                    }) =>
+                                {
+                                    // The competing direct PUT targets this object. This request
+                                    // relinquished recovery for its exact command, so wait without
+                                    // rejoining that recovery flight and then rerun the condition
+                                    // against the resulting object state.
+                                    #[cfg(test)]
+                                    request_ops::maybe_run_direct_put_pending_drain_hook(
+                                        self.metadata_command_apply_test_hook_scope_id(),
+                                        &mut work_budget,
+                                    );
+                                    if let Err(error) = self
+                                        .wait_for_transferred_object_metadata_command_with_work_budget(
+                                            pg_id,
+                                            late_conflict_command
+                                                .as_ref()
+                                                .expect("guard requires a pending command"),
+                                            &mut work_budget,
+                                        )
+                                    {
+                                        cleanup_direct_put_attempt_before_command_ownership!();
+                                        return Err(error);
+                                    }
+                                    same_object_publication_observed = true;
+                                    snapshot_retry_phase.require_snapshot_reinspection();
+                                    continue;
+                                }
+                                Err(error)
+                                    if request_ops::object_pg_action_error_is_retryable_pending_drain(
+                                        &error,
+                                    ) =>
+                                {
                                     retry_direct_put_pending_drain_error!(
                                         error,
                                         "direct PUT command log conflict drain retry budget exhausted"
                                     );
                                 }
-                                cleanup_direct_put_attempt_before_command_ownership!();
-                                return Err(error);
+                                Err(error) => {
+                                    cleanup_direct_put_attempt_before_command_ownership!();
+                                    return Err(error);
+                                }
                             }
                             sleep_direct_put_before_command_ownership_after_contention!(
                                 "direct PUT command log conflict retry budget exhausted"

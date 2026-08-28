@@ -4401,6 +4401,317 @@ fn direct_put_command_id_race_retries_awaiting_authorized_recovery() {
     );
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectPutLateConflictHandoff {
+    Complete,
+    ExpireWaitBudget,
+}
+
+#[test]
+fn direct_put_late_log_conflict_waits_for_same_object_recovery_handoff() {
+    assert_direct_put_late_log_conflict_recovery_handoff(DirectPutLateConflictHandoff::Complete);
+}
+
+#[test]
+fn direct_put_late_log_conflict_wait_failure_cleans_contender() {
+    assert_direct_put_late_log_conflict_recovery_handoff(
+        DirectPutLateConflictHandoff::ExpireWaitBudget,
+    );
+}
+
+fn assert_direct_put_late_log_conflict_recovery_handoff(handoff: DirectPutLateConflictHandoff) {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut first_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = first_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "direct-put-late-handoff-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut first_map, 1, NodeId::new(1));
+    set_route_primary(&mut first_map, 2, NodeId::new(1));
+
+    let mut second_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    set_route_primary(&mut second_map, 1, NodeId::new(1));
+    set_route_primary(&mut second_map, 2, NodeId::new(1));
+
+    let first_map = Arc::new(first_map);
+    let second_map = Arc::new(second_map);
+    let first_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
+    let second_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&second_map)).unwrap();
+    create_test_bucket(&first_cluster, &bucket);
+
+    let loser_payload = b"loser direct PUT late handoff";
+    let loser_reservation_id = crate::tests::stream_session_id("late-handoff-los");
+    let loser_generation_id = first_cluster
+        .reserve_put_object_generation(&bucket, &key, &loser_reservation_id)
+        .unwrap();
+    let loser_segment_okh = [0xd1; 16];
+    let loser_written = first_cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            loser_generation_id,
+            0,
+            &loser_segment_okh,
+            loser_payload,
+        )
+        .unwrap();
+    let loser_req = direct_put_commit_req(
+        &first_cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: loser_reservation_id,
+            generation_id: loser_generation_id,
+            payload: loser_payload,
+            segment_okh: loser_segment_okh,
+            written: &loser_written,
+        },
+    );
+
+    let winner_payload = b"winner direct PUT late handoff";
+    let winner_reservation_id = crate::tests::stream_session_id("late-handoff-win");
+    let winner_generation_id = second_cluster
+        .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
+        .unwrap();
+    let winner_segment_okh = [0xd2; 16];
+    let winner_written = second_cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            winner_generation_id,
+            0,
+            &winner_segment_okh,
+            winner_payload,
+        )
+        .unwrap();
+    let winner_req = direct_put_commit_req(
+        &first_cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: winner_reservation_id,
+            generation_id: winner_generation_id,
+            payload: winner_payload,
+            segment_okh: winner_segment_okh,
+            written: &winner_written,
+        },
+    );
+
+    let pending_winner = Arc::new(Mutex::new(None));
+    let pending_winner_for_hook = Arc::clone(&pending_winner);
+    let hook_cluster = Arc::clone(&second_cluster);
+    let hook_map = Arc::clone(&second_map);
+    let hook_bucket = bucket.clone();
+    let hook_req = winner_req.clone();
+    let hook_written_shards = winner_written.written_shards.clone();
+    let install_ran = Arc::new(AtomicBool::new(false));
+    let install_ran_for_hook = Arc::clone(&install_ran);
+    let _command_id_hook =
+        first_cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
+            if install_ran_for_hook.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_written_shards
+                .iter()
+                .map(|written| (&written.key, written.ack))
+                .collect();
+            hook_cluster
+                .register_payload_shard_acks(hook_req.data_pg_id, &shard_batch)
+                .unwrap();
+            let pg_id = PgId::new(2);
+            let primary = hook_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            let command = hook_cluster
+                .prepare_commit_direct_put_object_command(
+                    pg_id,
+                    &pg,
+                    &hook_req,
+                    crate::VersionId::Null,
+                    hook_req.bucket_write_reservation.clone(),
+                )
+                .unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                primary.node_id().as_u32(),
+                &command,
+                Some(&hook_bucket),
+            )
+            .unwrap();
+            *pending_winner_for_hook.lock().unwrap() = Some(command);
+            Ok(())
+        }));
+
+    let transfer_once = Arc::new(AtomicBool::new(true));
+    let transfer_once_for_hook = Arc::clone(&transfer_once);
+    let (transfer_reached_tx, transfer_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let _apply_hook =
+        first_cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.object.generation_id == winner_generation_id
+            ) && transfer_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                transfer_reached_tx.send(()).unwrap();
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: command.id().cluster_epoch(),
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                });
+            }
+            Ok(())
+        }));
+
+    let transferred_wait_hook_calls = Arc::new(AtomicUsize::new(0));
+    let transferred_wait_recovery_applied = Arc::new(AtomicBool::new(false));
+    let _transferred_wait_budget_hook = (handoff == DirectPutLateConflictHandoff::ExpireWaitBudget)
+        .then(|| {
+            let transferred_wait_hook_calls = Arc::clone(&transferred_wait_hook_calls);
+            let transferred_wait_recovery_applied = Arc::clone(&transferred_wait_recovery_applied);
+            let recovery_cluster = Arc::clone(&first_cluster);
+            let pending_winner = Arc::clone(&pending_winner);
+            first_cluster.test_install_direct_put_pending_drain_hook(Arc::new(move || {
+                if transferred_wait_hook_calls.fetch_add(1, Ordering::SeqCst) != 1 {
+                    return false;
+                }
+                let command = pending_winner
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("transferred wait must retain the winner command");
+                assert_eq!(
+                    recovery_cluster
+                        .drain_pending_metadata_command_with_authorized_recovery_route(
+                            PgId::new(2),
+                            &command,
+                            &recovery_cluster,
+                        )
+                        .unwrap(),
+                    PendingMetadataCommandOutcome::Applied
+                );
+                transferred_wait_recovery_applied.store(true, Ordering::SeqCst);
+                true
+            }))
+        });
+
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let result = thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let action_calls_for_thread = Arc::clone(&action_calls);
+        let commit_cluster = &first_cluster;
+        let commit_req = &loser_req;
+        let commit_shards = &loser_written.written_shards;
+        scope.spawn(move || {
+            result_tx
+                .send(commit_cluster.commit_direct_put_object_from_payload_shards(
+                    commit_req,
+                    commit_shards,
+                    move |snapshot| {
+                        action_calls_for_thread.fetch_add(1, Ordering::SeqCst);
+                        if snapshot.existing_etag.is_some() {
+                            Err("object already exists")
+                        } else {
+                            Ok(())
+                        }
+                    },
+                ))
+                .unwrap();
+        });
+
+        transfer_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("late log-conflict drain did not relinquish recovery");
+        let command = pending_winner
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("late conflict did not retain the winner command");
+        let pg_id = PgId::new(2);
+        match handoff {
+            DirectPutLateConflictHandoff::Complete => {
+                let handoff_deadline = Instant::now() + Duration::from_secs(5);
+                while !first_cluster
+                    .test_metadata_command_recovery_awaiting_authorized(pg_id, &command)
+                {
+                    assert!(
+                        Instant::now() < handoff_deadline,
+                        "late log-conflict drain did not request authorized recovery"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(
+                    result_rx.try_recv().is_err(),
+                    "same-object late conflict returned before authorized recovery"
+                );
+                assert_eq!(
+                    first_cluster
+                        .drain_pending_metadata_command_with_authorized_recovery_route(
+                            pg_id,
+                            &command,
+                            &first_cluster,
+                        )
+                        .unwrap(),
+                    PendingMetadataCommandOutcome::Applied
+                );
+                result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("same-object direct PUT did not finish after authorized recovery")
+            }
+            DirectPutLateConflictHandoff::ExpireWaitBudget => result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("expired transferred-recovery wait did not return"),
+        }
+    });
+
+    match handoff {
+        DirectPutLateConflictHandoff::Complete => {
+            assert!(matches!(result, Ok(Err("object already exists"))));
+            assert_eq!(action_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(transferred_wait_hook_calls.load(Ordering::SeqCst), 0);
+        }
+        DirectPutLateConflictHandoff::ExpireWaitBudget => {
+            assert!(matches!(
+                result,
+                Err(crate::ObjectPgActionError::Store(
+                    StoreError::MetadataCommandContention {
+                        context: "transferred metadata command recovery wait budget exhausted"
+                    }
+                ))
+            ));
+            assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(transferred_wait_hook_calls.load(Ordering::SeqCst), 2);
+            assert!(transferred_wait_recovery_applied.load(Ordering::SeqCst));
+        }
+    }
+    assert!(install_ran.load(Ordering::SeqCst));
+    assert!(!transfer_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+    assert_direct_payload_staging_cleaned(
+        &first_map,
+        &first_cluster,
+        &bucket,
+        &key,
+        &loser_req.generation_reservation_id,
+        DirectPayloadTestIdentity {
+            data_pg_id: loser_written.data_pg_id,
+            ec: loser_written.ec,
+            segment_okh: loser_segment_okh,
+            segment_vid: loser_generation_id,
+        },
+    );
+    assert_bucket_write_reservations_released(&first_map, &bucket);
+}
+
 #[test]
 fn direct_put_retries_irreversible_uncertainty_on_the_active_route() {
     let _serial = lock_metadata_command_apply_hook_test();
