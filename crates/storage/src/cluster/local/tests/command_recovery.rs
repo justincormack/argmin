@@ -2216,6 +2216,253 @@ fn unrelated_object_operation_converges_after_authorized_recovery_handoff() {
 }
 
 #[test]
+fn object_generation_reservation_waits_after_transferring_authorized_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::VersionId::from_u64(1),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let checksum = command.checksum_crc64();
+    let inject_transfer = Arc::new(AtomicBool::new(true));
+    let inject_transfer_for_hook = Arc::clone(&inject_transfer);
+    let (transfer_reached_tx, transfer_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let _apply_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate.checksum_crc64() == checksum
+                && inject_transfer_for_hook.swap(false, Ordering::SeqCst)
+            {
+                transfer_reached_tx.send(()).unwrap();
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: candidate.id().cluster_epoch(),
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                });
+            }
+            Ok(())
+        }));
+
+    let reservation_id = crate::tests::stream_session_id("transfer-wait");
+    let reservation_result = thread::scope(|scope| {
+        let (reservation_tx, reservation_rx) = std::sync::mpsc::sync_channel(1);
+        let reservation_cluster = &cluster;
+        let reservation_bucket = &bucket;
+        let reservation_key = &key;
+        let reservation_id = &reservation_id;
+        scope.spawn(move || {
+            reservation_tx
+                .send(reservation_cluster.reserve_put_object_generation(
+                    reservation_bucket,
+                    reservation_key,
+                    reservation_id,
+                ))
+                .unwrap();
+        });
+
+        transfer_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("generation reservation did not transfer the pending command");
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "generation reservation did not relinquish recovery authority"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        reservation_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("generation reservation did not finish after authorized recovery")
+    });
+
+    assert_eq!(
+        reservation_result.expect(
+            "generation reservation must observe authorized recovery instead of exposing contention",
+        ),
+        crate::GenerationId::new(1).unwrap()
+    );
+    assert!(!inject_transfer.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
+fn object_generation_reservation_preserves_unrelated_direct_put_transfer() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let other_key = key_for_object_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        &bucket,
+        object_pg,
+        "unrelated-direct-put-transfer-",
+    );
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id = crate::tests::stream_session_id("pending-direct");
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"unrelated pending direct PUT";
+    let segment_okh = [0x8d; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+    let shard_batch: Vec<(&ShardKey, WriteAck)> = written
+        .written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect();
+    cluster
+        .register_payload_shard_acks(commit_req.data_pg_id, &shard_batch)
+        .unwrap();
+    let pg_id = PgId::new(object_pg);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let command = cluster
+        .prepare_commit_direct_put_object_command(
+            pg_id,
+            &pg,
+            &commit_req,
+            crate::VersionId::Null,
+            commit_req.bucket_write_reservation.clone(),
+        )
+        .unwrap();
+    drop(pg);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let checksum = command.checksum_crc64();
+    let inject_transfer = Arc::new(AtomicBool::new(true));
+    let inject_transfer_for_hook = Arc::clone(&inject_transfer);
+    let (transfer_reached_tx, transfer_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let _apply_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate.checksum_crc64() == checksum
+                && inject_transfer_for_hook.swap(false, Ordering::SeqCst)
+            {
+                transfer_reached_tx.send(()).unwrap();
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: candidate.id().cluster_epoch(),
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                });
+            }
+            Ok(())
+        }));
+
+    let other_reservation_id = crate::tests::stream_session_id("unrelated-wait");
+    let reservation_result = thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let reservation_cluster = &cluster;
+        let reservation_bucket = &bucket;
+        let reservation_key = &other_key;
+        let reservation_id = &other_reservation_id;
+        scope.spawn(move || {
+            result_tx
+                .send(reservation_cluster.reserve_put_object_generation(
+                    reservation_bucket,
+                    reservation_key,
+                    reservation_id,
+                ))
+                .unwrap();
+        });
+        transfer_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unrelated reservation did not transfer the direct PUT command");
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unrelated direct PUT transfer must remain terminal")
+    });
+
+    assert!(matches!(
+        reservation_result,
+        Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
+    ));
+    assert!(!inject_transfer.load(Ordering::SeqCst));
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id, &command, &cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
 fn object_generation_pending_drain_cannot_outlive_reservation_budget() {
     struct GateRelease(Option<std::sync::mpsc::SyncSender<()>>);
 

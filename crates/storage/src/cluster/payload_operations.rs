@@ -829,6 +829,19 @@ impl StorageCluster {
                     .map(|_| ())
                 {
                     Ok(()) => {}
+                    Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
+                        if !unrelated_direct_put =>
+                    {
+                        // This request selected the recovery flight and then relinquished it.
+                        // Do not rejoin the drain, but do wait for authorized recovery to
+                        // advance that exact command before reobserving generation state.
+                        self.wait_for_transferred_object_metadata_command_with_work_budget(
+                            pg_id,
+                            &command,
+                            &mut work_budget,
+                        )?;
+                        continue;
+                    }
                     Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery)
                         if !unrelated_direct_put =>
                     {
