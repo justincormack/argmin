@@ -706,31 +706,62 @@ impl super::StorageCluster {
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
+                            let late_conflict_command =
+                                self.pending_metadata_command_for_bucket_until(
+                                    pg_id,
+                                    bucket,
+                                    finalization_work_budget.deadline(),
+                                )?;
                             #[cfg(test)]
                             let drain = match maybe_run_stream_put_pending_drain_hook(
                                 self.metadata_command_apply_test_hook_scope_id(),
                                 StreamPutPendingDrainTestEvent::LateConflict,
                                 &mut finalization_work_budget,
                             ) {
-                                Ok(()) => self
-                                    .drain_one_pending_object_metadata_command_with_work_budget(
+                                Ok(()) => match late_conflict_command.as_ref() {
+                                    Some(command) => self
+                                        .drain_pending_object_metadata_command_with_work_budget(
                                         publisher,
                                         pg_id,
-                                        bucket,
+                                        command,
                                         &mut finalization_work_budget,
-                                    ),
+                                    )
+                                        .map(|_| ()),
+                                    None => Ok(()),
+                                },
                                 Err(error) => Err(error),
                             };
                             #[cfg(not(test))]
-                            let drain = self
-                                .drain_one_pending_object_metadata_command_with_work_budget(
-                                    publisher,
-                                    pg_id,
-                                    bucket,
-                                    &mut finalization_work_budget,
-                                );
+                            let drain = match late_conflict_command.as_ref() {
+                                Some(command) => self
+                                    .drain_pending_object_metadata_command_with_work_budget(
+                                        publisher,
+                                        pg_id,
+                                        command,
+                                        &mut finalization_work_budget,
+                                    )
+                                    .map(|_| ()),
+                                None => Ok(()),
+                            };
                             match drain {
                                 Ok(()) => {}
+                                Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
+                                    if late_conflict_command.as_ref().is_some_and(|command| {
+                                        same_object_publication_already_projected
+                                            == Some(command.id())
+                                    }) =>
+                                {
+                                    // This request already projected the logically published
+                                    // winner, then relinquished its recovery flight. Wait only
+                                    // for authorized recovery to advance that exact command;
+                                    // rejoining its drain here would violate recovery ownership.
+                                    self.wait_for_transferred_object_metadata_command_with_work_budget(
+                                        pg_id,
+                                        late_conflict_command.as_ref().expect("guard requires command"),
+                                        &mut finalization_work_budget,
+                                    )?;
+                                    continue;
+                                }
                                 Err(error)
                                     if object_pg_action_error_is_retryable_pending_drain(&error) =>
                                 {

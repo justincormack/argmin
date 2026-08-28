@@ -4791,7 +4791,7 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
         waiter_error,
         crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
     ));
-    assert!(same_object_generation_id.get() > contender_generation_id.get());
+    assert!(same_object_generation_id.get() > generation_id.get());
     assert_eq!(cleanup_attempts.load(Ordering::SeqCst), 1);
 
     let pg_id = PgId::new(object_pg);

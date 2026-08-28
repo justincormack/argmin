@@ -1653,6 +1653,25 @@ mod tests {
                 "unavailable-PG reconciliation test authority startup",
             ))
             .unwrap();
+        runtime.block_on(async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match authority.confirmed_linearized_authority_status().await {
+                    Ok(_) => break,
+                    Err(error)
+                        if error.is_control_plane_leader_routing_rejection()
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => {
+                        panic!(
+                            "unavailable-PG reconciliation test authority did not become serving: {error:?}"
+                        );
+                    }
+                }
+            }
+        });
         let mut host = ControlPlaneRaftAuthorityHost::start_durable(
             runtime.handle().clone(),
             Arc::clone(&authority),

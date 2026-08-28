@@ -2581,6 +2581,58 @@ impl StorageCluster {
         }
     }
 
+    pub(super) fn wait_for_transferred_object_metadata_command_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        loop {
+            work_budget
+                .check("transferred metadata command recovery wait budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
+            let outcome = match self
+                .pending_command_recovery_waiter_outcome_with_route_mode_until(
+                    pg_id,
+                    command,
+                    MetadataCommandRouteMode::Normal,
+                    work_budget.deadline(),
+                ) {
+                Ok(outcome) => outcome,
+                Err(error)
+                    if request_ops::object_pg_action_error_is_retryable_command_observation(
+                        &error,
+                    ) =>
+                {
+                    work_budget
+                        .sleep_after_contention(
+                            "transferred metadata command recovery observation budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            self.emit_metadata_command_recovery_outcome_for_command(
+                pg_id,
+                command,
+                outcome.metric_label(),
+            );
+            match outcome {
+                MetadataCommandRecoveryWaiterOutcome::StillPending => {
+                    work_budget
+                        .sleep_after_contention(
+                            "transferred metadata command recovery wait budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                }
+                MetadataCommandRecoveryWaiterOutcome::Applied
+                | MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+                | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => return Ok(()),
+            }
+        }
+    }
+
     fn metadata_command_recovery_applied_collectable_object_command(
         command: &MetadataCommandEnvelope,
         outcome: PendingMetadataCommandOutcome,
