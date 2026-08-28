@@ -5576,7 +5576,7 @@ mod tests {
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
             })
-            .unwrap();
+            .unwrap_or_else(|error| panic!("create test bucket {name:?} failed: {error:?}"));
     }
 
     #[test]
@@ -8918,7 +8918,7 @@ mod tests {
                     encryption: server_core::coordinator::WriteEncryptionRequest::none(),
                 },
             )
-            .unwrap();
+            .unwrap_or_else(|error| panic!("put cleanup object {key:?} failed: {error:?}"));
         }
 
         let page1 = coord
@@ -8930,10 +8930,23 @@ mod tests {
                 max_keys: 2,
                 requested_max_keys: Some(2),
             })
-            .unwrap();
-        assert_eq!(page1.objects.len(), 2);
-        assert!(page1.is_truncated);
-        let token = page1.next_continuation_token.clone().unwrap();
+            .unwrap_or_else(|error| panic!("list cleanup page 1 failed: {error:?}"));
+        let page1_keys = page1
+            .objects
+            .iter()
+            .map(|object| object.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(page1_keys, ["key-00", "key-01"]);
+        assert!(page1.is_truncated, "page 1 was not truncated: {page1:#?}");
+        assert_eq!(
+            page1.next_continuation_token.as_deref(),
+            Some("key-01"),
+            "page 1 returned the wrong continuation token: {page1:#?}"
+        );
+        let token = page1
+            .next_continuation_token
+            .clone()
+            .expect("page 1 continuation token checked above");
 
         let page2 = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -8944,9 +8957,23 @@ mod tests {
                 max_keys: 2,
                 requested_max_keys: Some(2),
             })
-            .unwrap();
-        assert_eq!(page2.objects.len(), 2);
-        let token2 = page2.next_continuation_token.clone().unwrap();
+            .unwrap_or_else(|error| panic!("list cleanup page 2 failed: {error:?}"));
+        let page2_keys = page2
+            .objects
+            .iter()
+            .map(|object| object.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(page2_keys, ["key-02", "key-03"]);
+        assert!(page2.is_truncated, "page 2 was not truncated: {page2:#?}");
+        assert_eq!(
+            page2.next_continuation_token.as_deref(),
+            Some("key-03"),
+            "page 2 returned the wrong continuation token: {page2:#?}"
+        );
+        let token2 = page2
+            .next_continuation_token
+            .clone()
+            .expect("page 2 continuation token checked above");
 
         let page3 = coord
             .list_objects_v2(&ListObjectsV2Request {
@@ -8957,9 +8984,18 @@ mod tests {
                 max_keys: 2,
                 requested_max_keys: Some(2),
             })
-            .unwrap();
-        assert_eq!(page3.objects.len(), 1);
-        assert!(!page3.is_truncated);
+            .unwrap_or_else(|error| panic!("list cleanup page 3 failed: {error:?}"));
+        let page3_keys = page3
+            .objects
+            .iter()
+            .map(|object| object.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(page3_keys, ["key-04"]);
+        assert!(!page3.is_truncated, "page 3 was truncated: {page3:#?}");
+        assert_eq!(
+            page3.next_continuation_token, None,
+            "final page returned a continuation token: {page3:#?}"
+        );
 
         let all_keys: Vec<String> = page1
             .objects
@@ -8968,7 +9004,7 @@ mod tests {
             .chain(page3.objects.iter())
             .map(|o| o.key.clone())
             .collect();
-        assert_eq!(all_keys.len(), 5);
+        assert_eq!(all_keys, ["key-00", "key-01", "key-02", "key-03", "key-04"]);
 
         let mut delete_xml = String::from("<Delete><Quiet>true</Quiet>");
         for key in &all_keys {
@@ -8976,7 +9012,8 @@ mod tests {
         }
         delete_xml.push_str("</Delete>");
 
-        let (xml_entries, quiet) = parse_delete_objects_xml(delete_xml.as_bytes()).unwrap();
+        let (xml_entries, quiet) = parse_delete_objects_xml(delete_xml.as_bytes())
+            .unwrap_or_else(|error| panic!("parse cleanup delete XML failed: {error:?}"));
         assert_eq!(xml_entries.len(), 5);
         assert!(quiet);
         let entries: Vec<DeleteEntry> = xml_entries
@@ -8994,14 +9031,33 @@ mod tests {
                 entries: &entries,
                 bypass_governance: false,
             })
-            .unwrap();
-        assert_eq!(delete_result.deleted.len(), 5);
-        assert!(delete_result.errors.is_empty());
+            .unwrap_or_else(|error| panic!("cleanup batch delete failed: {error:?}"));
+        assert!(
+            delete_result.errors.is_empty(),
+            "cleanup batch delete returned per-object errors: {:#?}",
+            delete_result.errors
+        );
+        let deleted_keys = delete_result
+            .deleted
+            .iter()
+            .map(|deleted| deleted.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deleted_keys,
+            ["key-00", "key-01", "key-02", "key-03", "key-04"],
+            "cleanup batch delete returned unexpected entries: {delete_result:#?}"
+        );
 
         let result_xml =
             delete_objects_result_xml(&delete_result.deleted, &delete_result.errors, quiet);
-        assert!(!result_xml.contains("<Deleted>"));
-        assert!(result_xml.contains("DeleteResult"));
+        assert!(
+            !result_xml.contains("<Deleted>"),
+            "quiet cleanup response contained a Deleted element: {result_xml}"
+        );
+        assert!(
+            result_xml.contains("DeleteResult"),
+            "quiet cleanup response omitted DeleteResult: {result_xml}"
+        );
 
         coord
             .delete_bucket(&crate::coordinator::BucketRequest::new(
@@ -9009,7 +9065,7 @@ mod tests {
                 test_requester(),
                 None,
             ))
-            .unwrap();
+            .unwrap_or_else(|error| panic!("delete cleaned-up bucket failed: {error:?}"));
     }
 
     #[test]
