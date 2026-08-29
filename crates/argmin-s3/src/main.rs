@@ -69,7 +69,7 @@ use storage::{
     ControlPlaneRpcServerListenerInput, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgState,
     RouteMapValidity, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
-    UnavailablePgReconciliationWorker,
+    StorageNodeMetadataTransferStagingOutbox, UnavailablePgReconciliationWorker,
 };
 #[cfg(test)]
 use storage::{
@@ -3054,7 +3054,7 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
     server: Arc<StorageNodeServer>,
     config: &ServerConfig,
     initial_node_incarnation: Option<u64>,
-) -> Option<StorageNodeControlPlaneRefreshLoop> {
+) -> Option<StorageNodeControlPlaneWorkers> {
     let socket_path = config.control_plane_socket_path.as_deref()?;
     let node_incarnation = match initial_node_incarnation {
         Some(node_incarnation) => node_incarnation,
@@ -3081,7 +3081,15 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
                 eprintln!("failed to configure storage-node control-plane auth client: {error}");
                 std::process::exit(1);
             });
-    let loop_handle = server
+    let staging_evidence_client =
+        build_storage_node_control_plane_client(config, socket_path, node_id, node_incarnation)
+            .unwrap_or_else(|error| {
+                eprintln!(
+            "failed to configure storage-node staging evidence control-plane client: {error}"
+        );
+                std::process::exit(1);
+            });
+    let refresh = Arc::clone(&server)
         .spawn_control_plane_refresh_loop(
             control_plane_client,
             node_incarnation,
@@ -3092,6 +3100,19 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
             eprintln!("failed to start storage-node control-plane refresh loop: {error}");
             std::process::exit(1);
         });
+    let staging_evidence = server
+        .spawn_metadata_transfer_staging_outbox(
+            staging_evidence_client,
+            storage::clock::current_time_millis,
+            |error| {
+                eprintln!("storage-node metadata-transfer staging outbox failed: {error}");
+                std::process::exit(1);
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to start storage-node staging evidence outbox: {error}");
+            std::process::exit(1);
+        });
     process_info!(
         "argmin-s3 storage-node control-plane refresh using {} (incarnation {}, lease-derived jittered renewal capped at {} ms, lease {} ms)",
         socket_path,
@@ -3099,7 +3120,15 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
         storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS,
         config.control_plane_heartbeat_lease_duration.as_millis()
     );
-    Some(loop_handle)
+    Some(StorageNodeControlPlaneWorkers {
+        _staging_evidence: staging_evidence,
+        _refresh: refresh,
+    })
+}
+
+struct StorageNodeControlPlaneWorkers {
+    _staging_evidence: StorageNodeMetadataTransferStagingOutbox,
+    _refresh: StorageNodeControlPlaneRefreshLoop,
 }
 
 fn build_storage_node_process_config(
@@ -3316,7 +3345,8 @@ where
     let (_lease, runtime_map) = refresh.into_parts();
     let mut prepared_server = bootstrap
         .prepare(&runtime_map)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .with_metadata_transfer_staging_node_incarnation(node_incarnation);
     match config.storage_rpc_server_auth.clone() {
         Some(rpc_auth) => prepared_server = prepared_server.with_rpc_auth(rpc_auth),
         None if config.allow_unauthenticated_internal_rpc_for_tests => {}

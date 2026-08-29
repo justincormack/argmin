@@ -281,7 +281,22 @@ fn control_plane_rpc_v17_frame_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v18_frame_encoding_is_exact() {
+fn control_plane_rpc_v18_frame_remains_rejected_evidence() {
+    const FRAME: &[u8] = &[
+        97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97, 110,
+        101, 45, 114, 112, 99, 0, 18, 0, 12, 0, 0, 0, 3, 12, 61, 255, 12, 156, 154, 11, 93, 1, 2,
+        3,
+    ];
+    let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(FRAME)).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str() == "unsupported control-plane RPC version 18"
+    ));
+}
+
+#[test]
+fn control_plane_rpc_v19_frame_encoding_is_exact() {
     let frame =
         encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
             .unwrap();
@@ -290,8 +305,8 @@ fn control_plane_rpc_v18_frame_encoding_is_exact() {
         frame,
         [
             97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
-            110, 101, 45, 114, 112, 99, 0, 18, 0, 12, 0, 0, 0, 3, 12, 61, 255, 12, 156, 154, 11,
-            93, 1, 2, 3,
+            110, 101, 45, 114, 112, 99, 0, 19, 0, 12, 0, 0, 0, 3, 94, 78, 177, 175, 123, 188, 247,
+            9, 1, 2, 3,
         ]
     );
 }
@@ -992,7 +1007,7 @@ fn invalid_control_plane_auth_precedes_authority_confirmation() {
     );
 
     assert!(matches!(
-        authenticate_and_admit_control_plane_rpc(request, &policy, false, 2_500),
+        authenticate_and_admit_control_plane_rpc(request, &policy, false, true, 2_500),
         Err(ControlPlaneRpcAdmissionFailure::Unauthenticated(_))
     ));
     assert_eq!(confirmation_calls.load(Ordering::Acquire), 0);

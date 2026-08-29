@@ -1,6 +1,10 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+const METADATA_TRANSFER_STAGING_MAX_ENTRIES: usize = 256;
+const METADATA_TRANSFER_STAGING_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const METADATA_TRANSFER_STAGING_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 #[derive(Clone)]
 struct StorageNodeRuntimeRouteState {
     config: Arc<StorageNodeProcessConfig>,
@@ -145,6 +149,7 @@ pub struct StorageNodeServer {
     _data_dir_lock: StorageNodeDataDirLock,
     control_plane_incarnation_lock: Mutex<()>,
     _node: Arc<SharedStorageNode>,
+    metadata_transfer_staging_store: Option<Arc<MetadataTransferStagingStore>>,
     listeners: Vec<StorageNodeRpcListener>,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     active_sessions: Arc<StorageNodeActiveSessions>,
@@ -482,6 +487,7 @@ pub struct PreparedStorageNodeServer {
     data_dir_guard: Option<StorageNodeDataDirGuard>,
     rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
     rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
+    metadata_transfer_staging_node_incarnation: Option<u64>,
 }
 
 impl PreparedStorageNodeServer {
@@ -492,6 +498,7 @@ impl PreparedStorageNodeServer {
             data_dir_guard: None,
             rpc_auth: None,
             rpc_listeners: None,
+            metadata_transfer_staging_node_incarnation: None,
         }
     }
 
@@ -504,6 +511,7 @@ impl PreparedStorageNodeServer {
             data_dir_guard: Some(data_dir_guard),
             rpc_auth: None,
             rpc_listeners: None,
+            metadata_transfer_staging_node_incarnation: None,
         }
     }
 
@@ -520,6 +528,15 @@ impl PreparedStorageNodeServer {
     }
 
     #[must_use]
+    pub fn with_metadata_transfer_staging_node_incarnation(
+        mut self,
+        node_incarnation: u64,
+    ) -> Self {
+        self.metadata_transfer_staging_node_incarnation = Some(node_incarnation);
+        self
+    }
+
+    #[must_use]
     pub fn config(&self) -> &StorageNodeProcessConfig {
         &self.config
     }
@@ -531,11 +548,13 @@ impl PreparedStorageNodeServer {
                 data_dir_guard,
                 self.rpc_auth,
                 self.rpc_listeners,
+                self.metadata_transfer_staging_node_incarnation,
             ),
             None => StorageNodeServer::bind_with_rpc_auth(
                 self.config,
                 self.rpc_auth,
                 self.rpc_listeners,
+                self.metadata_transfer_staging_node_incarnation,
             ),
         }
     }
@@ -830,7 +849,7 @@ fn bind_storage_node_rpc_listeners(
 
 impl StorageNodeServer {
     pub fn bind(config: StorageNodeProcessConfig) -> Result<Self, StorageNodeServerError> {
-        Self::bind_with_rpc_auth(config, None, None)
+        Self::bind_with_rpc_auth(config, None, None, None)
     }
 
     #[cfg(test)]
@@ -842,9 +861,16 @@ impl StorageNodeServer {
         config: StorageNodeProcessConfig,
         rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
         rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
+        metadata_transfer_staging_node_incarnation: Option<u64>,
     ) -> Result<Self, StorageNodeServerError> {
         let data_dir_guard = StorageNodeDataDirGuard::acquire(&config.data_dir)?;
-        Self::bind_with_data_dir_guard(config, data_dir_guard, rpc_auth, rpc_listeners)
+        Self::bind_with_data_dir_guard(
+            config,
+            data_dir_guard,
+            rpc_auth,
+            rpc_listeners,
+            metadata_transfer_staging_node_incarnation,
+        )
     }
 
     fn bind_with_data_dir_guard(
@@ -852,6 +878,7 @@ impl StorageNodeServer {
         data_dir_guard: StorageNodeDataDirGuard,
         rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
         rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
+        metadata_transfer_staging_node_incarnation: Option<u64>,
     ) -> Result<Self, StorageNodeServerError> {
         validate_process_config_route_table(&config)?;
         let data_dir_lock = data_dir_guard.into_lock_for(&config.data_dir)?;
@@ -862,6 +889,36 @@ impl StorageNodeServer {
             config.default_ec_shape,
         )?;
         node.recover_pg_metadata_command_state(config.node_id)?;
+        let metadata_transfer_staging_store = metadata_transfer_staging_node_incarnation
+            .map(|node_incarnation| {
+                let endpoint = config.socket_path.to_str().ok_or_else(|| {
+                    StorageNodeServerError::SocketPathNotUtf8 {
+                        path: config.socket_path.clone(),
+                    }
+                })?;
+                let identity = MetadataTransferStagingNodeIdentity::new(
+                    config.node_id,
+                    node_incarnation,
+                    endpoint.to_owned(),
+                )
+                .map_err(|error| StorageNodeServerError::MetadataTransferStaging {
+                    message: error.to_string(),
+                })?;
+                let limits = MetadataTransferStagingLimits::new(
+                    METADATA_TRANSFER_STAGING_MAX_ENTRIES,
+                    METADATA_TRANSFER_STAGING_MAX_ARTIFACT_BYTES,
+                    METADATA_TRANSFER_STAGING_MAX_TOTAL_BYTES,
+                )
+                .map_err(|error| StorageNodeServerError::MetadataTransferStaging {
+                    message: error.to_string(),
+                })?;
+                MetadataTransferStagingStore::open(&config.data_dir, identity, limits)
+                    .map(Arc::new)
+                    .map_err(|error| StorageNodeServerError::MetadataTransferStaging {
+                        message: error.to_string(),
+                    })
+            })
+            .transpose()?;
         let rpc_listeners = rpc_listeners
             .unwrap_or_else(|| vec![StorageNodeRpcListenerConfig::unix(&config.socket_path)]);
         let listeners = bind_storage_node_rpc_listeners(rpc_listeners, rpc_auth.as_deref())?;
@@ -876,6 +933,7 @@ impl StorageNodeServer {
             _data_dir_lock: data_dir_lock,
             control_plane_incarnation_lock: Mutex::new(()),
             _node: Arc::new(node),
+            metadata_transfer_staging_store,
             listeners,
             read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
             active_sessions: Arc::new(StorageNodeActiveSessions::default()),
@@ -908,6 +966,29 @@ impl StorageNodeServer {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         advance_storage_node_incarnation(&self.config_snapshot().data_dir)
+    }
+
+    pub fn spawn_metadata_transfer_staging_outbox<F, E>(
+        &self,
+        control_plane: ControlPlaneStorageNodeClient,
+        authority_now_ms: F,
+        on_fatal: E,
+    ) -> Result<StorageNodeMetadataTransferStagingOutbox, StorageNodeServerError>
+    where
+        F: Fn() -> u64 + Send + 'static,
+        E: Fn(String) + Send + 'static,
+    {
+        let store = self
+            .metadata_transfer_staging_store
+            .as_ref()
+            .ok_or(StorageNodeServerError::MetadataTransferStagingNotConfigured)?;
+        StorageNodeMetadataTransferStagingOutbox::spawn(
+            Arc::clone(store),
+            control_plane,
+            authority_now_ms,
+            on_fatal,
+        )
+        .map_err(|source| StorageNodeServerError::MetadataTransferStagingOutboxSpawn { source })
     }
 
     pub fn accept_one(&self) -> Result<(), StorageNodeServerError> {

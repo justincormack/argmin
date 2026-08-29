@@ -16,6 +16,9 @@ use crate::control_plane::{
     PendingMetadataCommandRecoveryListing, UnixControlPlaneClient,
 };
 use crate::control_plane_auth::ControlPlaneScopedCredential;
+use crate::pg_store::{
+    MetadataTransferStagingEvidenceApplyReceipt, MetadataTransferStagingEvidencePage,
+};
 use crate::{NodeId, PgId};
 
 enum ControlPlaneServiceClientDispatch {
@@ -320,6 +323,25 @@ impl ControlPlaneStorageNodeClient {
             self.dispatch,
             ControlPlaneServiceClientDispatch::Authenticated(_)
         )
+    }
+
+    pub(crate) fn publish_metadata_transfer_staging_evidence_page(
+        &self,
+        page: &MetadataTransferStagingEvidencePage,
+        authority_now_ms: u64,
+    ) -> Result<MetadataTransferStagingEvidenceApplyReceipt, crate::control_plane::ControlPlaneError>
+    {
+        match &self.dispatch {
+            ControlPlaneServiceClientDispatch::Authenticated(client) => {
+                client.publish_metadata_transfer_staging_evidence_page(page, authority_now_ms)
+            }
+            ControlPlaneServiceClientDispatch::Plain(_) => {
+                Err(crate::control_plane::ControlPlaneError::rpc_protocol(
+                    "staging evidence publication requires authenticated storage-node credentials"
+                        .to_owned(),
+                ))
+            }
+        }
     }
 }
 

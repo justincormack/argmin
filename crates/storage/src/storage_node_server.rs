@@ -47,6 +47,7 @@ use crate::metadata_command::{
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
+use crate::metadata_transfer_staging_outbox::StorageNodeMetadataTransferStagingOutbox;
 #[cfg(test)]
 use crate::node_client::MetadataCommandNodeClient;
 use crate::node_client::{
@@ -70,7 +71,9 @@ use crate::node_client::{
 use crate::node_runtime::pg_store::{
     decode_metadata_command_checkpoint_candidate_rows, initialize_pg_durable_identity,
     inspect_pg_shard_inventory, sync_initialized_pg_store_layout, verify_pg_durable_identity,
-    MetadataCommandCheckpoint, MetadataCommandCheckpointCandidateRow, PgStore,
+    MetadataCommandCheckpoint, MetadataCommandCheckpointCandidateRow,
+    MetadataTransferStagingLimits, MetadataTransferStagingNodeIdentity,
+    MetadataTransferStagingStore, PgStore,
 };
 use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, PgMetadataStore, ShardStore,
@@ -360,6 +363,7 @@ use crate::types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
 };
+use crate::ControlPlaneStorageNodeClient;
 use crate::DataPgId;
 use crate::{
     BucketDeleteBeginRoot, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketInfo,

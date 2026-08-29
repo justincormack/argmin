@@ -340,7 +340,7 @@ fn control_plane_rpc_catalogue_staging_page() -> MetadataTransferStagingEvidence
 }
 
 #[test]
-fn control_plane_rpc_v18_staging_evidence_frames_are_exact() {
+fn control_plane_rpc_v19_staging_evidence_frames_are_exact() {
     let genesis = control_plane_rpc_catalogue_staging_page();
     let genesis_receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&genesis);
     let successor = metadata_transfer_staging_evidence_page_for_test(
@@ -380,15 +380,15 @@ fn control_plane_rpc_v18_staging_evidence_frames_are_exact() {
         [
             (
                 399,
-                "652f29904c420cc4186c3f601693330ddb35cada8b9ca4dd51d7f4b7fbe125cc".to_owned(),
+                "87273c299e0f59383af9db57f2facf8fa4f7bdd46754596f15557d0224c36a64".to_owned(),
                 214,
-                "d67047c97f95cc52d425d534be59884450db2d87e224c35c36a8634a5d73f4d5".to_owned(),
+                "b210fca00ee74f1f7bc048f6c7532da724d8a883eef2a7c387005ebf719a9266".to_owned(),
             ),
             (
                 399,
-                "4bfecc7d9d326a10434348434d3459474a2c2b983bdfe7604d79637ecf8be532".to_owned(),
+                "28fe22f2b91ca95849115c3a7f937d5794119fb790ed5c04149b44c63c9a75ed".to_owned(),
                 214,
-                "e9e31ba22091916b99a513c48f84f25990c84f3b718e2ecad261274466845510".to_owned(),
+                "ae16925689c4b0ec0bc4151938064235dc450a3bcc1d6906b1ba17686be46ecd".to_owned(),
             ),
         ]
     );
@@ -976,6 +976,10 @@ fn control_plane_rpc_catalogue_errors() -> Vec<ControlPlaneError> {
             narrowest_window_ms: 36,
             max_window_ms: 37,
         },
+        ControlPlaneError::StagingEvidencePublicationDeferred,
+        ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed {
+            message: "catalogue staging evidence publication uncertainty".to_owned(),
+        },
     ];
     errors.extend(
         CONTROL_PLANE_RPC_CATALOGUE_OPENRAFT_ERROR_KINDS
@@ -1064,6 +1068,8 @@ enum ControlPlaneRpcCatalogueRejection {
         narrowest_window_ms: u64,
         max_window_ms: u64,
     },
+    StagingEvidencePublicationDeferred,
+    StagingEvidencePublicationOutcomeUnconfirmed(String),
 }
 
 #[derive(Clone, Copy)]
@@ -1253,6 +1259,14 @@ fn control_plane_rpc_catalogue_rejection(
             narrowest_window_ms: *narrowest_window_ms,
             max_window_ms: *max_window_ms,
         },
+        (_, ControlPlaneError::StagingEvidencePublicationDeferred) => {
+            ControlPlaneRpcCatalogueRejection::StagingEvidencePublicationDeferred
+        }
+        (_, ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed { message }) => {
+            ControlPlaneRpcCatalogueRejection::StagingEvidencePublicationOutcomeUnconfirmed(
+                message.clone(),
+            )
+        }
         (side, error) => panic!(
             "unexpected {side} control-plane RPC catalogue rejection: {error:?}",
             side = match side {
@@ -1504,7 +1518,39 @@ fn control_plane_rpc_v17_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v18_operation_catalogue_is_exact() {
+fn control_plane_rpc_v18_operation_catalogue_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v18_operation.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            14_902,
+            "4d88aaa66c8c1428ace65d34b78a558f16fef921d3ae64150365da5ee2a32d13".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0_usize;
+    while !remaining.is_empty() {
+        let (_section, tail) = remaining.split_first().unwrap();
+        let (raw_len, tail) = tail.split_at(4);
+        let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+        let (frame, tail) = tail.split_at(len);
+        let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)).unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { diagnostic }
+                if diagnostic.as_str() == "unsupported control-plane RPC version 18"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > ControlPlaneRpcKind::ALL.len());
+}
+
+#[test]
+fn control_plane_rpc_v19_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -1717,8 +1763,8 @@ fn control_plane_rpc_v18_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            14_902,
-            "4d88aaa66c8c1428ace65d34b78a558f16fef921d3ae64150365da5ee2a32d13".to_owned()
+            15_048,
+            "4f85af2454a93c36cd1b42f4664f8fe6ff044c3ece91da30dbd57e0fc617852f".to_owned()
         )
     );
 }
@@ -1803,8 +1849,41 @@ fn authenticated_control_plane_rpc_v14_through_v17_auth_v1_payload_bindings_rema
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v18_auth_v2_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 18);
+fn authenticated_control_plane_rpc_v18_auth_v2_payload_binding_remains_rejected_evidence() {
+    let kind = ControlPlaneRpcKind::RuntimeMapStatus;
+    let credential = frontend_auth_credential("auth-cluster", "frontend-1");
+    let request = signed_frontend_runtime_map_request(
+        kind,
+        &credential,
+        Vec::new(),
+        Some(1_000),
+        Some(6_000),
+    );
+    let response = signed_runtime_map_response_payload(kind, &credential, vec![0xa5, 0x5a], 1_001);
+    let request_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 18).unwrap();
+    let response_frame = encode_control_plane_rpc_frame_with_version(kind, &response, 18).unwrap();
+    assert_eq!(
+        (
+            request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&request_frame)),
+            response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&response_frame)),
+        ),
+        (
+            182,
+            "b64adac57bae0595adc3830fc68116a51db21174ee298a25e806fbb77ea32931".to_owned(),
+            190,
+            "1c01eb88c30a8f4326f2c02fda21658f1831bc7d2c9c9f67347daba5714b3098".to_owned(),
+        )
+    );
+    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(request_frame)).is_err());
+    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(response_frame)).is_err());
+}
+
+#[test]
+fn authenticated_control_plane_rpc_v19_auth_v2_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 19);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -1850,9 +1929,9 @@ fn authenticated_control_plane_rpc_v18_auth_v2_payload_bindings_are_exact() {
         ),
         (
             182,
-            "b64adac57bae0595adc3830fc68116a51db21174ee298a25e806fbb77ea32931".to_owned(),
+            "7f0f26416b3d44b483263180346bf4216fc79f539df75aecbc45ea46750e7160".to_owned(),
             190,
-            "1c01eb88c30a8f4326f2c02fda21658f1831bc7d2c9c9f67347daba5714b3098".to_owned(),
+            "6a35ac60562ceb3bc41f153ddcc46481ae41bf6823861684ec1be536bc4cbd77".to_owned(),
         )
     );
 }
@@ -6313,7 +6392,7 @@ fn authenticated_unix_staging_evidence_publication_returns_exact_receipt() {
 }
 
 #[test]
-fn evidence_confirmation_saturation_does_not_consume_heartbeat_workers() {
+fn global_evidence_saturation_returns_typed_deferral_without_consuming_heartbeat_workers() {
     struct ConfirmationGate {
         state: Mutex<(usize, bool)>,
         changed: std::sync::Condvar,
@@ -6375,23 +6454,40 @@ fn evidence_confirmation_saturation_does_not_consume_heartbeat_workers() {
         changed: std::sync::Condvar::new(),
     });
     let release = ConfirmationRelease(Arc::clone(&gate));
+    let saturation_gate = Arc::new(ConfirmationGate {
+        state: Mutex::new((0, false)),
+        changed: std::sync::Condvar::new(),
+    });
+    let saturation_release = ConfirmationRelease(Arc::clone(&saturation_gate));
     let gate_for_hook = Arc::clone(&gate);
+    let saturation_gate_for_hook = Arc::clone(&saturation_gate);
+    let authority_confirmations = Arc::new(AtomicUsize::new(0));
+    let authority_confirmations_for_hook = Arc::clone(&authority_confirmations);
     let policy = ControlPlaneRpcServerPolicy::new(
         ControlPlaneRpcServerRole::Ordinary,
-        2,
+        4,
         CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
     )
     .unwrap()
     .with_auth_verifier(Arc::new(storage_node_auth_verifier(
         "auth-cluster",
-        vec![storage_node_auth_node_credential(3)],
+        vec![
+            storage_node_auth_node_credential(3),
+            storage_node_auth_node_credential(4),
+            storage_node_auth_node_credential(5),
+        ],
     )))
-    .with_authority_confirmation(Arc::new(|| Ok(())))
-    .with_before_authority_confirmation(Arc::new(move |kind| {
-        if kind == ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage {
-            gate_for_hook.block_evidence();
-        }
+    .with_authority_confirmation(Arc::new(move || {
+        authority_confirmations_for_hook.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }))
+    .with_after_staging_evidence_actor_admission(Arc::new(move || {
+        gate_for_hook.block_evidence();
+    }))
+    .with_after_staging_evidence_saturation_responder_admission(Arc::new(move || {
+        saturation_gate_for_hook.block_evidence();
     }));
+    let policy_for_assert = policy.clone();
     let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
         tmp.path().join("control-plane.state"),
     ))
@@ -6412,9 +6508,27 @@ fn evidence_confirmation_saturation_does_not_consume_heartbeat_workers() {
             .serve_shared_until_stop_for_test(authority_for_server, policy, 2_000, &stop_for_server)
             .unwrap();
     });
-    let page = control_plane_rpc_catalogue_staging_page();
+    let page_for_actor = |node_id: u32, artifact_digest: [u8; 32]| {
+        metadata_transfer_staging_evidence_page_for_test(
+            MetadataTransferStagingNodeIdentity::new(
+                NodeId::new(node_id),
+                4,
+                format!("unix:///catalogue/storage-{node_id}.sock"),
+            )
+            .unwrap(),
+            &control_plane_rpc_catalogue_transition_binding(),
+            artifact_digest,
+            12_345 + u64::from(node_id),
+            METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+            MetadataTransferStagingEvidenceKind::Publication,
+            None,
+        )
+    };
+    let first_page = page_for_actor(3, [0x31; 32]);
+    let second_page = page_for_actor(4, [0x42; 32]);
+    let saturated_page = page_for_actor(5, [0x53; 32]);
+    let overflow_page = saturated_page.clone();
     let first_socket = socket_path.clone();
-    let first_page = page.clone();
     let first = std::thread::spawn(move || {
         AuthenticatedUnixControlPlaneClient::new(
             UnixControlPlaneClient::new(first_socket),
@@ -6422,66 +6536,117 @@ fn evidence_confirmation_saturation_does_not_consume_heartbeat_workers() {
         )
         .publish_metadata_transfer_staging_evidence_page(&first_page, 2_000)
     });
-    gate.wait_for_arrivals(1);
 
     let second_socket = socket_path.clone();
-    let (second_tx, second_rx) = std::sync::mpsc::sync_channel(1);
     let second = std::thread::spawn(move || {
-        let result = AuthenticatedUnixControlPlaneClient::new(
+        AuthenticatedUnixControlPlaneClient::new(
             UnixControlPlaneClient::new(second_socket),
-            storage_node_auth_credential("auth-cluster", 3, 4),
+            storage_node_auth_credential("auth-cluster", 4, 4),
         )
-        .publish_metadata_transfer_staging_evidence_page(&page, 2_000);
-        second_tx.send(result).unwrap();
+        .publish_metadata_transfer_staging_evidence_page(&second_page, 2_000)
     });
-    let second_result = second_rx.recv_timeout(Duration::from_secs(2));
+    gate.wait_for_arrivals(2);
 
-    let heartbeat_result = if second_result.is_ok() {
-        let heartbeat_socket = socket_path.clone();
-        let (heartbeat_tx, heartbeat_rx) = std::sync::mpsc::sync_channel(1);
-        let heartbeat = std::thread::spawn(move || {
-            let mut client = AuthenticatedUnixControlPlaneClient::new(
-                UnixControlPlaneClient::new(heartbeat_socket),
-                storage_node_auth_credential("auth-cluster", 3, 4),
-            );
-            let result = client.refresh_node_heartbeat_with_clock(
-                NodeHeartbeat {
-                    node_id: NodeId::new(3),
-                    node_incarnation: 4,
-                    endpoint: "unix:///node-3".to_owned(),
-                    observed_epoch: heartbeat_epoch,
-                    requested_lease_duration_ms: 5_000,
-                    cluster_map_history_route_scan_generation: NonZeroU64::new(1).unwrap(),
-                    cluster_map_history_route_references: Default::default(),
-                    pg_observations: Vec::new(),
-                },
-                || Ok(2_000),
-            );
-            heartbeat_tx.send(result).unwrap();
-        });
-        let result = heartbeat_rx.recv_timeout(Duration::from_secs(2));
-        heartbeat.join().unwrap();
-        result
-    } else {
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-    };
+    let saturated_socket = socket_path.clone();
+    let (saturated_tx, saturated_rx) = std::sync::mpsc::sync_channel(1);
+    let saturated = std::thread::spawn(move || {
+        let result = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(saturated_socket),
+            storage_node_auth_credential("auth-cluster", 5, 4),
+        )
+        .publish_metadata_transfer_staging_evidence_page(&saturated_page, 2_000);
+        saturated_tx.send(result).unwrap();
+    });
+    saturation_gate.wait_for_arrivals(1);
+    assert_eq!(
+        policy_for_assert.active_evidence_saturation_responders(),
+        1,
+        "global saturation admitted more than one responder"
+    );
 
+    let overflow_socket = socket_path.clone();
+    let (overflow_tx, overflow_rx) = std::sync::mpsc::sync_channel(1);
+    let overflow = std::thread::spawn(move || {
+        let result = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(overflow_socket),
+            storage_node_auth_credential("auth-cluster", 5, 4),
+        )
+        .publish_metadata_transfer_staging_evidence_page(&overflow_page, 2_000);
+        overflow_tx.send(result).unwrap();
+    });
+    let overflow_result = overflow_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("overflow evidence request queued behind saturation responder");
+    assert!(
+        overflow_result.is_err(),
+        "unadmitted overflow evidence request unexpectedly reached dispatch"
+    );
+    assert_eq!(
+        policy_for_assert.active_evidence_saturation_responders(),
+        1,
+        "overflow evidence request acquired an unbounded responder"
+    );
+    let evidence_authority_confirmations = authority_confirmations.load(Ordering::Acquire);
+
+    let heartbeat_socket = socket_path.clone();
+    let (heartbeat_tx, heartbeat_rx) = std::sync::mpsc::sync_channel(1);
+    let heartbeat = std::thread::spawn(move || {
+        let mut client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(heartbeat_socket),
+            storage_node_auth_credential("auth-cluster", 3, 4),
+        );
+        let result = client.refresh_node_heartbeat_with_clock(
+            NodeHeartbeat {
+                node_id: NodeId::new(3),
+                node_incarnation: 4,
+                endpoint: "unix:///node-3".to_owned(),
+                observed_epoch: heartbeat_epoch,
+                requested_lease_duration_ms: 5_000,
+                cluster_map_history_route_scan_generation: NonZeroU64::new(1).unwrap(),
+                cluster_map_history_route_references: Default::default(),
+                pg_observations: Vec::new(),
+            },
+            || Ok(2_000),
+        );
+        heartbeat_tx.send(result).unwrap();
+    });
+    let heartbeat_result = heartbeat_rx.recv_timeout(Duration::from_secs(2));
+    heartbeat.join().unwrap();
+
+    saturation_release.0.release();
+    drop(saturation_release);
+    let saturated_result = saturated_rx.recv_timeout(Duration::from_secs(2));
     release.0.release();
     drop(release);
     let _ = first.join().unwrap();
-    second.join().unwrap();
+    let _ = second.join().unwrap();
+    saturated.join().unwrap();
+    overflow.join().unwrap();
     stop.store(true, Ordering::Release);
     drop(UnixStream::connect(&socket_path).unwrap());
     server.join().unwrap();
+    assert_eq!(
+        policy_for_assert.active_evidence_saturation_responders(),
+        0,
+        "saturation responder permit leaked"
+    );
 
     assert!(
-        second_result.is_ok(),
+        saturated_result.is_ok(),
         "saturated evidence request retained an ordinary worker"
     );
+    assert!(matches!(
+        saturated_result,
+        Ok(Err(ControlPlaneError::StagingEvidencePublicationDeferred))
+    ));
     assert_eq!(
         gate.arrivals(),
-        1,
-        "second evidence request reached confirmation"
+        2,
+        "globally saturated evidence request reached actor admission"
+    );
+    assert_eq!(
+        evidence_authority_confirmations, 2,
+        "globally saturated evidence request reached authority confirmation"
     );
     let heartbeat_refresh = heartbeat_result.expect("heartbeat was blocked by evidence admission");
     let heartbeat_refresh = heartbeat_refresh.unwrap_or_else(|error| {
@@ -6491,6 +6656,191 @@ fn evidence_confirmation_saturation_does_not_consume_heartbeat_workers() {
         )
     });
     assert_eq!(heartbeat_refresh.lease().node_id(), NodeId::new(3));
+}
+
+#[test]
+fn authenticated_saturation_defers_the_durable_staging_outbox() {
+    struct ConfirmationGate {
+        state: Mutex<(usize, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl ConfirmationGate {
+        fn block(&self) {
+            let mut state = self.state.lock().expect("confirmation gate poisoned");
+            state.0 += 1;
+            self.changed.notify_all();
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.1)
+                .expect("confirmation gate poisoned while waiting");
+            assert!(state.1, "confirmation gate timed out");
+            assert!(!timeout.timed_out(), "confirmation gate timed out");
+        }
+
+        fn wait_for_first_arrival(&self) {
+            let state = self.state.lock().expect("confirmation gate poisoned");
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(state, Duration::from_secs(2), |state| state.0 == 0)
+                .expect("confirmation gate poisoned while observing arrival");
+            assert_eq!(state.0, 1, "unexpected confirmation arrivals");
+            assert!(!timeout.timed_out(), "confirmation arrival timed out");
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().expect("confirmation gate poisoned");
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct ConfirmationRelease(Arc<ConfirmationGate>);
+
+    impl Drop for ConfirmationRelease {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("staging-evidence-outbox-admission.sock");
+    let identity = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        NodeId::new(3),
+        4,
+        "unix:///node-3".to_owned(),
+    )
+    .unwrap();
+    let store = Arc::new(
+        crate::pg_store::MetadataTransferStagingStore::open(
+            tmp.path(),
+            identity,
+            crate::pg_store::MetadataTransferStagingLimits::new(8, 1024 * 1024, 4 * 1024 * 1024)
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+    let artifact = b"authenticated staging outbox saturation artifact";
+    let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+        &control_plane_rpc_catalogue_transition_binding(),
+        checksum::sha256::digest(artifact),
+        u64::try_from(artifact.len()).unwrap(),
+        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    )
+    .unwrap();
+    store.create_intent(&intent).unwrap();
+    store.publish_artifact(&intent, artifact).unwrap();
+    let page = store.next_evidence_page().unwrap().unwrap();
+
+    let listener = ControlPlaneRpcServerListener::unix(
+        UnixListener::bind(&socket_path).unwrap(),
+        4,
+        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let gate = Arc::new(ConfirmationGate {
+        state: Mutex::new((0, false)),
+        changed: std::sync::Condvar::new(),
+    });
+    let release = ConfirmationRelease(Arc::clone(&gate));
+    let gate_for_hook = Arc::clone(&gate);
+    let policy = ControlPlaneRpcServerPolicy::new(
+        ControlPlaneRpcServerRole::Ordinary,
+        4,
+        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+    )
+    .unwrap()
+    .with_auth_verifier(Arc::new(storage_node_auth_verifier(
+        "auth-cluster",
+        vec![storage_node_auth_node_credential(3)],
+    )))
+    .with_authority_confirmation(Arc::new(|| Ok(())))
+    .with_after_staging_evidence_actor_admission(Arc::new(move || {
+        gate_for_hook.block();
+    }));
+    let authority = Arc::new(Mutex::new(RecordingRaftAdminAuthority::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let authority_for_server = Arc::clone(&authority);
+    let stop_for_server = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        listener
+            .serve_shared_until_stop_for_test(authority_for_server, policy, 2_000, &stop_for_server)
+            .unwrap();
+    });
+
+    let first_socket = socket_path.clone();
+    let first_page = page.clone();
+    let first = std::thread::spawn(move || {
+        AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(first_socket),
+            storage_node_auth_credential("auth-cluster", 3, 4),
+        )
+        .publish_metadata_transfer_staging_evidence_page(&first_page, 2_000)
+    });
+    gate.wait_for_first_arrival();
+
+    let control_plane = crate::ControlPlaneStorageNodeClient::with_socket_paths(
+        [socket_path.clone()],
+        Some("auth-cluster"),
+        3,
+        4,
+        vec![ControlPlaneStorageNodeAuthCredentialInput {
+            node_id: NodeId::new(3),
+            credential_id: "storage-node-3".to_owned(),
+            credential_version: 1,
+            secret: b"storage-node-3-secret".to_vec(),
+        }],
+        Some(("storage-node-3".to_owned(), 1)),
+    )
+    .unwrap();
+    let (fatal_tx, fatal_rx) = std::sync::mpsc::sync_channel(1);
+    let mut outbox = crate::StorageNodeMetadataTransferStagingOutbox::spawn(
+        Arc::clone(&store),
+        control_plane,
+        || 2_000,
+        move |error| fatal_tx.send(error).unwrap(),
+    )
+    .unwrap();
+    let deferred_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = outbox.status();
+        if status.publication_failures != 0 {
+            assert!(!status.failed, "typed saturation became fatal: {status:?}");
+            break;
+        }
+        assert!(
+            Instant::now() < deferred_deadline,
+            "outbox did not observe typed saturation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(
+        fatal_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+
+    release.0.release();
+    drop(release);
+    first.join().unwrap().unwrap();
+    let success_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = outbox.status();
+        assert!(!status.failed, "outbox failed after saturation: {status:?}");
+        if status.publication_successes != 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < success_deadline,
+            "outbox did not retry after saturation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(store.next_evidence_page().unwrap().is_none());
+    outbox.stop();
+    stop.store(true, Ordering::Release);
+    drop(UnixStream::connect(&socket_path).unwrap());
+    server.join().unwrap();
 }
 
 #[derive(Clone, Copy)]
@@ -6560,6 +6910,57 @@ fn staging_evidence_client_error_for_signed_response(
     error
 }
 
+#[derive(Clone, Copy)]
+enum StagingEvidenceOuterResponseFailure {
+    CorruptChecksum,
+    WrongKind,
+}
+
+fn staging_evidence_client_error_for_outer_response_failure(
+    socket_name: &str,
+    failure: StagingEvidenceOuterResponseFailure,
+) -> ControlPlaneError {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join(socket_name);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let page = control_plane_rpc_catalogue_staging_page();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _addr) = listener.accept().unwrap();
+        let (kind, _request) = read_control_plane_rpc_frame(&mut stream).unwrap();
+        assert_eq!(
+            kind,
+            ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage
+        );
+        match failure {
+            StagingEvidenceOuterResponseFailure::CorruptChecksum => {
+                let mut frame = encode_control_plane_rpc_frame(kind, &[]).unwrap();
+                let checksum_offset = CONTROL_PLANE_RPC_MAGIC.len() + 2 + 2 + 4;
+                frame[checksum_offset] ^= 1;
+                stream.write_all(&frame).unwrap();
+            }
+            StagingEvidenceOuterResponseFailure::WrongKind => {
+                write_control_plane_rpc_frame(
+                    &mut stream,
+                    ControlPlaneRpcKind::RuntimeMapStatus,
+                    &[],
+                )
+                .unwrap();
+            }
+        }
+    });
+    let client = AuthenticatedUnixControlPlaneClient::new(
+        UnixControlPlaneClient::new(&socket_path),
+        storage_node_auth_credential("auth-cluster", 3, 4),
+    );
+
+    let error = client
+        .publish_metadata_transfer_staging_evidence_page(&page, 2_000)
+        .unwrap_err();
+
+    server.join().unwrap();
+    error
+}
+
 #[test]
 fn authenticated_staging_evidence_client_rejects_wrong_response_operation() {
     let error = staging_evidence_client_error_for_signed_response(
@@ -6568,11 +6969,8 @@ fn authenticated_staging_evidence_client_rejects_wrong_response_operation() {
         ControlPlaneAuthOperation::RuntimeMapResponse,
     );
 
-    assert!(
-        matches!(error, ControlPlaneError::RpcUnconfirmed { ref message }
-            if message.contains("staging evidence may have been accepted")),
-        "unexpected error: {error}"
-    );
+    assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
+    assert!(!error.is_retryable_staging_evidence_publication_error());
 }
 
 #[test]
@@ -6583,11 +6981,64 @@ fn authenticated_staging_evidence_client_rejects_runtime_map_response_capability
         ControlPlaneAuthOperation::RuntimeMapResponse,
     );
 
-    assert!(
-        matches!(error, ControlPlaneError::RpcUnconfirmed { ref message }
-            if message.contains("staging evidence may have been accepted")),
-        "unexpected error: {error}"
-    );
+    assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
+    assert!(!error.is_retryable_staging_evidence_publication_error());
+}
+
+#[test]
+fn authenticated_staging_evidence_client_fails_closed_on_outer_response_protocol_errors() {
+    for (socket_name, failure) in [
+        (
+            "staging-evidence-corrupt-outer-checksum.sock",
+            StagingEvidenceOuterResponseFailure::CorruptChecksum,
+        ),
+        (
+            "staging-evidence-wrong-outer-kind.sock",
+            StagingEvidenceOuterResponseFailure::WrongKind,
+        ),
+    ] {
+        let error = staging_evidence_client_error_for_outer_response_failure(socket_name, failure);
+        assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
+        assert!(!error.is_retryable_staging_evidence_publication_error());
+    }
+}
+
+#[test]
+fn staging_evidence_post_send_io_uncertainty_is_bounded_to_transport_loss() {
+    for (context, kind) in [
+        ("write control-plane RPC frame", ErrorKind::BrokenPipe),
+        (
+            "write control-plane TLS/TCP request frame",
+            ErrorKind::ConnectionReset,
+        ),
+        ("read control-plane RPC magic", ErrorKind::UnexpectedEof),
+        ("read control-plane RPC header", ErrorKind::TimedOut),
+    ] {
+        let error = ControlPlaneRpcFrameExchangeError::after_request_started(
+            ControlPlaneError::io(context, std::io::Error::from(kind)),
+        );
+        assert!(
+            error.request_outcome_may_be_unconfirmed(),
+            "transient {context} {kind:?} was not classified as uncertain"
+        );
+    }
+
+    for (context, kind) in [
+        ("write control-plane RPC frame", ErrorKind::InvalidData),
+        ("read control-plane RPC payload", ErrorKind::InvalidData),
+        (
+            "complete control-plane TLS client handshake",
+            ErrorKind::ConnectionReset,
+        ),
+    ] {
+        let error = ControlPlaneRpcFrameExchangeError::after_request_started(
+            ControlPlaneError::io(context, std::io::Error::from(kind)),
+        );
+        assert!(
+            !error.request_outcome_may_be_unconfirmed(),
+            "fatal {context} {kind:?} was classified as response loss"
+        );
+    }
 }
 
 #[test]
@@ -6645,11 +7096,8 @@ fn authenticated_staging_evidence_client_rejects_signed_receipt_for_another_page
         .unwrap_err();
 
     server.join().unwrap();
-    assert!(
-        matches!(error, ControlPlaneError::RpcUnconfirmed { ref message }
-            if message.contains("staging evidence may have been accepted")),
-        "unexpected error: {error}"
-    );
+    assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
+    assert!(!error.is_retryable_staging_evidence_publication_error());
     assert_eq!(
         authority
             .lock()

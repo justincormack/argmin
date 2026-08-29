@@ -3278,6 +3278,37 @@
 
         let mode = fs::metadata(&config.data_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+        assert!(!config
+            .data_dir
+            .join("metadata-transfer-staging.established")
+            .exists());
+    }
+
+    #[test]
+    fn control_plane_managed_storage_node_opens_and_rebinds_the_staging_store() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+
+        {
+            let _server = PreparedStorageNodeServer::new(config.clone())
+                .with_metadata_transfer_staging_node_incarnation(11)
+                .bind()
+                .unwrap();
+            assert!(config
+                .data_dir
+                .join("metadata-transfer-staging.established")
+                .is_file());
+            assert!(config
+                .data_dir
+                .join("metadata-transfer-staging")
+                .is_dir());
+        }
+
+        let _restarted = PreparedStorageNodeServer::new(config)
+            .with_metadata_transfer_staging_node_incarnation(12)
+            .bind()
+            .unwrap();
     }
 
     #[test]

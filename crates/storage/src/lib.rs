@@ -52,6 +52,7 @@ mod internal_tls_protocol;
 mod live_pg_transfer;
 mod maintenance;
 pub(crate) mod metadata_command;
+mod metadata_transfer_staging_outbox;
 mod node_runtime;
 pub(crate) mod peering;
 pub mod pg_topology;
@@ -175,6 +176,9 @@ pub use maintenance::{
     StorageMaintenanceAdmission, StorageMaintenancePermit, StorageMaintenanceStartError,
     StorageReclaimSweeper, StorageShardBackfillSweeper, StorageShardRepairSweeper,
     StorageShardScavengerSweeper, StorageStreamSessionSweeper,
+};
+pub use metadata_transfer_staging_outbox::{
+    StorageNodeMetadataTransferStagingOutbox, StorageNodeMetadataTransferStagingOutboxStatus,
 };
 pub use unavailable_pg_reconciliation::UnavailablePgReconciliationWorker;
 

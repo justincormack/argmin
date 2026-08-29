@@ -19,15 +19,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use futures_util::future::{select, Either};
 use futures_util::{Stream, StreamExt};
 use openraft::errors::{
     ClientWriteError, InitializeError, LinearizableReadError, NetworkError, RPCError, RaftError,
     ReplicationClosed, StreamingError, Unreachable,
 };
 use openraft::impls::leader_id_adv::LeaderId;
-use openraft::impls::BasicNode;
 use openraft::impls::Entry;
 use openraft::impls::Vote;
+use openraft::impls::{BasicNode, ProgressResponder};
 use openraft::metrics::WaitError;
 use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
 use openraft::raft::{
@@ -421,6 +422,7 @@ pub struct ControlPlaneRaftAuthority {
     log_store: Option<ControlPlaneRaftLogStore>,
     static_peer_policy: Option<ControlPlaneRaftPeerTransportPolicy>,
     volatile_heartbeat_update_gate: tokio::sync::Mutex<()>,
+    evidence_submission_admission: ControlPlaneRaftEvidenceSubmissionAdmission,
     volatile_heartbeat_overlay: Mutex<Option<ControlPlaneRaftVolatileHeartbeatOverlay>>,
     runtime_map_content_certificate: Mutex<
         Option<(
@@ -468,6 +470,253 @@ pub struct ControlPlaneRaftAuthority {
     linearized_state_machine_response_ready_notify: Mutex<Option<Arc<tokio::sync::Notify>>>,
     #[cfg(test)]
     before_heartbeat_update_gate_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    low_priority_after_update_gate: Mutex<Option<Arc<ControlPlaneRaftLowPriorityTestGate>>>,
+    #[cfg(test)]
+    ordinary_durable_after_update_gate: Mutex<Option<Arc<ControlPlaneRaftLowPriorityTestGate>>>,
+    #[cfg(test)]
+    low_priority_before_dispatch: Mutex<Option<Arc<ControlPlaneRaftLowPriorityTestGate>>>,
+    #[cfg(test)]
+    low_priority_after_dispatch: Mutex<Option<Arc<ControlPlaneRaftLowPriorityTestGate>>>,
+    #[cfg(test)]
+    low_priority_during_retry_certification:
+        Mutex<Option<Arc<ControlPlaneRaftLowPriorityTestGate>>>,
+    #[cfg(test)]
+    low_priority_after_proven_unappended_retry:
+        Mutex<Option<Arc<ControlPlaneRaftLowPriorityTestGate>>>,
+}
+
+#[cfg(test)]
+struct ControlPlaneRaftLowPriorityTestGate {
+    arrived: AtomicBool,
+    arrived_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ControlPlaneRaftLowPriorityTestGate {
+    fn new() -> Self {
+        Self {
+            arrived: AtomicBool::new(false),
+            arrived_notify: tokio::sync::Notify::new(),
+            release_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn block(&self) {
+        let release = self.release_notify.notified();
+        self.arrived.store(true, Ordering::Release);
+        self.arrived_notify.notify_waiters();
+        release.await;
+    }
+
+    async fn wait_for_arrival(&self) {
+        while !self.arrived.load(Ordering::Acquire) {
+            let arrived = self.arrived_notify.notified();
+            if !self.arrived.load(Ordering::Acquire) {
+                arrived.await;
+            }
+        }
+    }
+
+    fn release(&self) {
+        self.release_notify.notify_waiters();
+    }
+}
+
+#[derive(Default)]
+struct ControlPlaneRaftEvidenceSubmissionAdmission {
+    ordinary_waiters: AtomicUsize,
+    volatile_waiters: AtomicUsize,
+    ordinary_waiter_registered: tokio::sync::Notify,
+    ordinary_waiter_completed: tokio::sync::Notify,
+    durable_submission_serialization: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    evidence_waiting_for_update_gate: AtomicBool,
+    #[cfg(test)]
+    evidence_waiting_for_ordinary: AtomicUsize,
+}
+
+struct ControlPlaneRaftOrdinarySubmissionWaiter<'a> {
+    admission: &'a ControlPlaneRaftEvidenceSubmissionAdmission,
+    volatile: bool,
+}
+
+struct ControlPlaneRaftOrdinaryDurableUpdateGuard<'a> {
+    _serialization: tokio::sync::MutexGuard<'a, ()>,
+    update: tokio::sync::MutexGuard<'a, ()>,
+}
+
+#[cfg(test)]
+struct ControlPlaneRaftEvidenceOrdinaryWait<'a> {
+    waiting: &'a AtomicUsize,
+}
+
+#[cfg(test)]
+impl<'a> ControlPlaneRaftEvidenceOrdinaryWait<'a> {
+    fn new(waiting: &'a AtomicUsize) -> Self {
+        waiting.fetch_add(1, Ordering::AcqRel);
+        Self { waiting }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ControlPlaneRaftEvidenceOrdinaryWait<'_> {
+    fn drop(&mut self) {
+        let previous = self.waiting.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous, 0);
+    }
+}
+
+impl ControlPlaneRaftEvidenceSubmissionAdmission {
+    fn register_ordinary_waiter(
+        &self,
+        volatile: bool,
+    ) -> ControlPlaneRaftOrdinarySubmissionWaiter<'_> {
+        self.ordinary_waiters.fetch_add(1, Ordering::AcqRel);
+        if volatile {
+            self.volatile_waiters.fetch_add(1, Ordering::AcqRel);
+        }
+        self.ordinary_waiter_registered.notify_waiters();
+        ControlPlaneRaftOrdinarySubmissionWaiter {
+            admission: self,
+            volatile,
+        }
+    }
+
+    async fn acquire_volatile_update_gate<'a>(
+        &'a self,
+        update_gate: &'a tokio::sync::Mutex<()>,
+    ) -> tokio::sync::MutexGuard<'a, ()> {
+        let waiter = self.register_ordinary_waiter(true);
+        let update = update_gate.lock().await;
+        drop(waiter);
+        update
+    }
+
+    async fn acquire_ordinary_durable_update_gate<'a>(
+        &'a self,
+        update_gate: &'a tokio::sync::Mutex<()>,
+    ) -> ControlPlaneRaftOrdinaryDurableUpdateGuard<'a> {
+        let waiter = self.register_ordinary_waiter(false);
+        let serialization = self.durable_submission_serialization.lock().await;
+        let update = update_gate.lock().await;
+        drop(waiter);
+        ControlPlaneRaftOrdinaryDurableUpdateGuard {
+            _serialization: serialization,
+            update,
+        }
+    }
+
+    fn ensure_evidence_may_continue(&self) -> Result<(), ControlPlaneError> {
+        if self.ordinary_waiters.load(Ordering::Acquire) == 0 {
+            Ok(())
+        } else {
+            Err(ControlPlaneError::StagingEvidencePublicationDeferred)
+        }
+    }
+
+    async fn run_evidence_preappend<F, T>(&self, future: F) -> Result<T, ControlPlaneError>
+    where
+        F: Future<Output = Result<T, ControlPlaneError>>,
+    {
+        let waiter_registered = Box::pin(self.ordinary_waiter_registered.notified());
+        let future = Box::pin(future);
+        self.ensure_evidence_may_continue()?;
+        match select(waiter_registered, future).await {
+            Either::Left(((), _)) => Err(ControlPlaneError::StagingEvidencePublicationDeferred),
+            Either::Right((result, _)) => result,
+        }
+    }
+
+    async fn acquire_evidence_update_gate<'a>(
+        &'a self,
+        update_gate: &'a tokio::sync::Mutex<()>,
+    ) -> ControlPlaneRaftEvidenceUpdateGuard<'a> {
+        loop {
+            while self.ordinary_waiters.load(Ordering::Acquire) != 0 {
+                let completed = self.ordinary_waiter_completed.notified();
+                if self.ordinary_waiters.load(Ordering::Acquire) != 0 {
+                    #[cfg(test)]
+                    let _waiting = ControlPlaneRaftEvidenceOrdinaryWait::new(
+                        &self.evidence_waiting_for_ordinary,
+                    );
+                    completed.await;
+                }
+            }
+            let serialization = self.durable_submission_serialization.lock().await;
+            if self.ordinary_waiters.load(Ordering::Acquire) != 0 {
+                drop(serialization);
+                continue;
+            }
+            #[cfg(test)]
+            self.evidence_waiting_for_update_gate
+                .store(true, Ordering::Release);
+            let update = update_gate.lock().await;
+            #[cfg(test)]
+            self.evidence_waiting_for_update_gate
+                .store(false, Ordering::Release);
+            if self.ordinary_waiters.load(Ordering::Acquire) == 0 {
+                return ControlPlaneRaftEvidenceUpdateGuard {
+                    _serialization: serialization,
+                    update_gate,
+                    update: Some(update),
+                    admission: self,
+                };
+            }
+            drop(update);
+            drop(serialization);
+        }
+    }
+}
+
+impl Drop for ControlPlaneRaftOrdinarySubmissionWaiter<'_> {
+    fn drop(&mut self) {
+        if self.volatile {
+            let previous = self
+                .admission
+                .volatile_waiters
+                .fetch_sub(1, Ordering::AcqRel);
+            debug_assert_ne!(previous, 0);
+        }
+        let previous = self
+            .admission
+            .ordinary_waiters
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous, 0);
+        self.admission.ordinary_waiter_completed.notify_waiters();
+    }
+}
+
+struct ControlPlaneRaftEvidenceUpdateGuard<'a> {
+    _serialization: tokio::sync::MutexGuard<'a, ()>,
+    update_gate: &'a tokio::sync::Mutex<()>,
+    update: Option<tokio::sync::MutexGuard<'a, ()>>,
+    admission: &'a ControlPlaneRaftEvidenceSubmissionAdmission,
+}
+
+impl<'a> ControlPlaneRaftEvidenceUpdateGuard<'a> {
+    fn release_update_after_dispatch(&mut self) {
+        self.update.take();
+    }
+
+    async fn reacquire_update_after_dispatch(&mut self) {
+        debug_assert!(self.update.is_none());
+        loop {
+            while self.admission.volatile_waiters.load(Ordering::Acquire) != 0 {
+                let completed = self.admission.ordinary_waiter_completed.notified();
+                if self.admission.volatile_waiters.load(Ordering::Acquire) != 0 {
+                    completed.await;
+                }
+            }
+            let update = self.update_gate.lock().await;
+            if self.admission.volatile_waiters.load(Ordering::Acquire) == 0 {
+                self.update = Some(update);
+                return;
+            }
+            drop(update);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2894,6 +3143,7 @@ impl ControlPlaneRaftAuthority {
             log_store: Some(log_store),
             static_peer_policy: None,
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
+            evidence_submission_admission: ControlPlaneRaftEvidenceSubmissionAdmission::default(),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
             runtime_map_overlay_content_certificate: Mutex::new(None),
@@ -2928,6 +3178,18 @@ impl ControlPlaneRaftAuthority {
             linearized_state_machine_response_ready_notify: Mutex::new(None),
             #[cfg(test)]
             before_heartbeat_update_gate_hook: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_after_update_gate: Mutex::new(None),
+            #[cfg(test)]
+            ordinary_durable_after_update_gate: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_before_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_after_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_during_retry_certification: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_after_proven_unappended_retry: Mutex::new(None),
         }
     }
 
@@ -2946,6 +3208,7 @@ impl ControlPlaneRaftAuthority {
             log_store: Some(log_store),
             static_peer_policy: Some(peer_policy),
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
+            evidence_submission_admission: ControlPlaneRaftEvidenceSubmissionAdmission::default(),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
             runtime_map_overlay_content_certificate: Mutex::new(None),
@@ -2980,6 +3243,18 @@ impl ControlPlaneRaftAuthority {
             linearized_state_machine_response_ready_notify: Mutex::new(None),
             #[cfg(test)]
             before_heartbeat_update_gate_hook: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_after_update_gate: Mutex::new(None),
+            #[cfg(test)]
+            ordinary_durable_after_update_gate: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_before_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_after_dispatch: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_during_retry_certification: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_after_proven_unappended_retry: Mutex::new(None),
         }
     }
 
@@ -3421,6 +3696,171 @@ impl ControlPlaneRaftAuthority {
         }
     }
 
+    #[cfg(test)]
+    fn set_low_priority_after_update_gate_for_test(
+        &self,
+        gate: Arc<ControlPlaneRaftLowPriorityTestGate>,
+    ) {
+        let previous = self
+            .low_priority_after_update_gate
+            .lock()
+            .expect("low-priority update-gate test hook should not be poisoned")
+            .replace(gate);
+        assert!(previous.is_none(), "low-priority test hook already set");
+    }
+
+    #[cfg(test)]
+    async fn block_low_priority_after_update_gate_for_test(&self) {
+        let gate = self
+            .low_priority_after_update_gate
+            .lock()
+            .expect("low-priority update-gate test hook should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.block().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_ordinary_durable_after_update_gate_for_test(
+        &self,
+        gate: Arc<ControlPlaneRaftLowPriorityTestGate>,
+    ) {
+        let previous = self
+            .ordinary_durable_after_update_gate
+            .lock()
+            .expect("ordinary durable update-gate test hook should not be poisoned")
+            .replace(gate);
+        assert!(
+            previous.is_none(),
+            "ordinary durable update-gate test hook already set"
+        );
+    }
+
+    #[cfg(test)]
+    async fn block_ordinary_durable_after_update_gate_for_test(&self) {
+        let gate = self
+            .ordinary_durable_after_update_gate
+            .lock()
+            .expect("ordinary durable update-gate test hook should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.block().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_low_priority_before_dispatch_for_test(
+        &self,
+        gate: Arc<ControlPlaneRaftLowPriorityTestGate>,
+    ) {
+        let previous = self
+            .low_priority_before_dispatch
+            .lock()
+            .expect("low-priority pre-dispatch test hook should not be poisoned")
+            .replace(gate);
+        assert!(
+            previous.is_none(),
+            "low-priority pre-dispatch test hook already set"
+        );
+    }
+
+    #[cfg(test)]
+    async fn block_low_priority_before_dispatch_for_test(&self) {
+        let gate = self
+            .low_priority_before_dispatch
+            .lock()
+            .expect("low-priority pre-dispatch test hook should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.block().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_low_priority_after_dispatch_for_test(
+        &self,
+        gate: Arc<ControlPlaneRaftLowPriorityTestGate>,
+    ) {
+        let previous = self
+            .low_priority_after_dispatch
+            .lock()
+            .expect("low-priority dispatch test hook should not be poisoned")
+            .replace(gate);
+        assert!(
+            previous.is_none(),
+            "low-priority dispatch test hook already set"
+        );
+    }
+
+    #[cfg(test)]
+    async fn block_low_priority_after_dispatch_for_test(&self) {
+        let gate = self
+            .low_priority_after_dispatch
+            .lock()
+            .expect("low-priority dispatch test hook should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.block().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_low_priority_after_proven_unappended_retry_for_test(
+        &self,
+        gate: Arc<ControlPlaneRaftLowPriorityTestGate>,
+    ) {
+        let previous = self
+            .low_priority_after_proven_unappended_retry
+            .lock()
+            .expect("low-priority retry test hook should not be poisoned")
+            .replace(gate);
+        assert!(
+            previous.is_none(),
+            "low-priority retry test hook already set"
+        );
+    }
+
+    #[cfg(test)]
+    fn set_low_priority_during_retry_certification_for_test(
+        &self,
+        gate: Arc<ControlPlaneRaftLowPriorityTestGate>,
+    ) {
+        let previous = self
+            .low_priority_during_retry_certification
+            .lock()
+            .expect("low-priority retry certification test hook should not be poisoned")
+            .replace(gate);
+        assert!(
+            previous.is_none(),
+            "low-priority retry certification test hook already set"
+        );
+    }
+
+    #[cfg(test)]
+    async fn block_low_priority_during_retry_certification_for_test(&self) {
+        let gate = self
+            .low_priority_during_retry_certification
+            .lock()
+            .expect("low-priority retry certification test hook should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.block().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn block_low_priority_after_proven_unappended_retry_for_test(&self) {
+        let gate = self
+            .low_priority_after_proven_unappended_retry
+            .lock()
+            .expect("low-priority retry test hook should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.block().await;
+        }
+    }
+
     fn retained_snapshot_generation(
         &self,
         snapshot: Arc<ClusterControlSnapshot>,
@@ -3481,7 +3921,10 @@ impl ControlPlaneRaftAuthority {
         retain_removed_voters_as_learners: bool,
     ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
         self.reject_static_peer_reconfiguration("change-membership")?;
-        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let _submission_guard = self
+            .evidence_submission_admission
+            .acquire_ordinary_durable_update_gate(&self.volatile_heartbeat_update_gate)
+            .await;
         let overlay_rebase = self.current_volatile_heartbeat_overlay().await?;
         let retry_deadline = self.writable_proposal_retry_deadline();
         let response = loop {
@@ -3525,7 +3968,10 @@ impl ControlPlaneRaftAuthority {
         wait_for_catch_up: bool,
     ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
         self.reject_static_peer_reconfiguration("add-learner")?;
-        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let _submission_guard = self
+            .evidence_submission_admission
+            .acquire_ordinary_durable_update_gate(&self.volatile_heartbeat_update_gate)
+            .await;
         let overlay_rebase = self.current_volatile_heartbeat_overlay().await?;
         let retry_deadline = self.writable_proposal_retry_deadline();
         let response = loop {
@@ -3886,6 +4332,35 @@ impl ControlPlaneRaftAuthority {
             .await
     }
 
+    pub(crate) async fn submit_low_priority_control_plane_command(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+        let queue_started = Instant::now();
+        let mut update_guard = self
+            .evidence_submission_admission
+            .acquire_evidence_update_gate(&self.volatile_heartbeat_update_gate)
+            .await;
+        #[cfg(test)]
+        self.block_low_priority_after_update_gate_for_test().await;
+        let queue_wait = queue_started.elapsed();
+        let operation_started = Instant::now();
+        let result = self
+            .submit_control_plane_command_derived_locked(None, Some(&mut update_guard), move |_| {
+                Ok(command)
+            })
+            .await;
+        let operation = operation_started.elapsed();
+        observability::record_control_plane_raft_command_submission(
+            queue_wait,
+            operation,
+            result.is_ok(),
+        );
+        self.command_metrics
+            .record_submission(queue_wait, operation, result.is_ok());
+        result
+    }
+
     pub(crate) async fn submit_control_plane_command_derived<F>(
         &self,
         derive_command: F,
@@ -3896,11 +4371,21 @@ impl ControlPlaneRaftAuthority {
         let queue_started = Instant::now();
         #[cfg(test)]
         self.run_before_heartbeat_update_gate_hook_for_test();
-        let update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let submission_guard = self
+            .evidence_submission_admission
+            .acquire_ordinary_durable_update_gate(&self.volatile_heartbeat_update_gate)
+            .await;
+        #[cfg(test)]
+        self.block_ordinary_durable_after_update_gate_for_test()
+            .await;
         let queue_wait = queue_started.elapsed();
         let operation_started = Instant::now();
         let result = self
-            .submit_control_plane_command_derived_locked(&update_guard, derive_command)
+            .submit_control_plane_command_derived_locked(
+                Some(&submission_guard.update),
+                None,
+                derive_command,
+            )
             .await;
         let operation = operation_started.elapsed();
         observability::record_control_plane_raft_command_submission(
@@ -4438,25 +4923,125 @@ impl ControlPlaneRaftAuthority {
 
     async fn submit_control_plane_command_with_proposal_retry(
         &self,
-        // Keep heartbeat publication excluded through every proposal attempt.
-        _update_guard: &tokio::sync::MutexGuard<'_, ()>,
+        // Ordinary proposals retain this guard through completion. Evidence
+        // proposals retain durable serialization but release the update guard
+        // after RaftCore accepts the request, then reacquire it before
+        // inspecting or rebasing state.
+        ordinary_update_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
+        mut evidence_update_guard: Option<&mut ControlPlaneRaftEvidenceUpdateGuard<'_>>,
         command: ControlPlaneCommand,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+        debug_assert_eq!(
+            ordinary_update_guard.is_some(),
+            evidence_update_guard.is_none()
+        );
         validate_control_plane_command_replication_size_detailed(&command)?;
         let retry_deadline = self.writable_proposal_retry_deadline();
         loop {
-            let attempt = self.prepare_writable_proposal(retry_deadline).await?;
+            let attempt = match evidence_update_guard.as_deref() {
+                Some(evidence) => {
+                    let admission = evidence.admission;
+                    admission
+                        .run_evidence_preappend(self.prepare_writable_proposal(retry_deadline))
+                        .await?
+                }
+                None => self.prepare_writable_proposal(retry_deadline).await?,
+            };
             self.ensure_writable_proposal_time_remaining(retry_deadline, "client-write dispatch")?;
-            match self.raft.client_write(command.clone()).await {
+            if let Some(evidence) = evidence_update_guard.as_deref() {
+                evidence.admission.ensure_evidence_may_continue()?;
+            }
+            let response = if let Some(evidence) = evidence_update_guard.as_deref_mut() {
+                #[cfg(test)]
+                self.block_low_priority_before_dispatch_for_test().await;
+                let (responder, response) = ProgressResponder::complete_only();
+                let admission = evidence.admission;
+                // client_write_ff completes at bounded-channel acceptance;
+                // cancelling its Tokio send leaves the proposal unaccepted.
+                admission
+                    .run_evidence_preappend(async {
+                        self.raft
+                            .client_write_ff(command.clone(), Some(responder))
+                            .await
+                            .map_err(|error| ControlPlaneError::OpenRaftOperation {
+                                kind: ControlPlaneRaftOperationErrorKind::Fatal,
+                                message: format!(
+                                    "OpenRaft client-write dispatch failed before acceptance: {error}"
+                                ),
+                            })
+                    })
+                    .await?;
+                evidence.release_update_after_dispatch();
+                #[cfg(test)]
+                self.block_low_priority_after_dispatch_for_test().await;
+                let response =
+                    response
+                        .await
+                        .map_err(|error| ControlPlaneError::OpenRaftOperation {
+                            kind: ControlPlaneRaftOperationErrorKind::Fatal,
+                            message: format!(
+                            "OpenRaft client-write response channel closed after dispatch: {error}"
+                        ),
+                        });
+                evidence.reacquire_update_after_dispatch().await;
+                response?
+            } else {
+                debug_assert!(ordinary_update_guard.is_some());
+                match self.raft.client_write(command.clone()).await {
+                    Ok(response) => Ok(response),
+                    Err(RaftError::APIError(error)) => Err(error),
+                    Err(RaftError::Fatal(error)) => {
+                        return Err(ControlPlaneError::OpenRaftOperation {
+                            kind: ControlPlaneRaftOperationErrorKind::Fatal,
+                            message: format!("OpenRaft client-write failed: {error}"),
+                        });
+                    }
+                }
+            };
+            match response {
                 Ok(response) => return submitted_control_plane_command(response),
                 Err(error) => {
-                    if self
-                        .writable_proposal_may_retry(&attempt, &error, retry_deadline)
-                        .await?
-                    {
+                    let raft_error = RaftError::APIError(error);
+                    let may_retry = match evidence_update_guard.as_deref() {
+                        Some(evidence) => {
+                            let admission = evidence.admission;
+                            let certification = async {
+                                #[cfg(test)]
+                                self.block_low_priority_during_retry_certification_for_test()
+                                    .await;
+                                self.writable_proposal_may_retry(
+                                    &attempt,
+                                    &raft_error,
+                                    retry_deadline,
+                                )
+                                .await
+                            };
+                            match admission.run_evidence_preappend(certification).await {
+                                Err(ControlPlaneError::StagingEvidencePublicationDeferred) => {
+                                    return Err(ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed {
+                                        message: "ordinary control-plane work interrupted post-dispatch retry certification".to_owned(),
+                                    });
+                                }
+                                result => result?,
+                            }
+                        }
+                        None => {
+                            self.writable_proposal_may_retry(&attempt, &raft_error, retry_deadline)
+                                .await?
+                        }
+                    };
+                    if may_retry {
+                        #[cfg(test)]
+                        if evidence_update_guard.is_some() {
+                            self.block_low_priority_after_proven_unappended_retry_for_test()
+                                .await;
+                        }
+                        if let Some(evidence) = evidence_update_guard.as_deref() {
+                            evidence.admission.ensure_evidence_may_continue()?;
+                        }
                         continue;
                     }
-                    return Err(openraft_client_write_error("client-write", error));
+                    return Err(openraft_client_write_error("client-write", raft_error));
                 }
             }
         }
@@ -4486,37 +5071,77 @@ impl ControlPlaneRaftAuthority {
 
     async fn submit_control_plane_command_derived_locked<F>(
         &self,
-        update_guard: &tokio::sync::MutexGuard<'_, ()>,
+        ordinary_update_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
+        mut evidence_update_guard: Option<&mut ControlPlaneRaftEvidenceUpdateGuard<'_>>,
         derive_command: F,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>
     where
         F: FnOnce(&ClusterControlSnapshot) -> Result<ControlPlaneCommand, ControlPlaneError>,
     {
-        let status = self.confirmed_linearized_authority_status().await?;
+        debug_assert_eq!(
+            ordinary_update_guard.is_some(),
+            evidence_update_guard.is_none()
+        );
+        let status = match evidence_update_guard.as_deref() {
+            Some(evidence) => {
+                let admission = evidence.admission;
+                admission
+                    .run_evidence_preappend(self.confirmed_linearized_authority_status())
+                    .await?
+            }
+            None => self.confirmed_linearized_authority_status().await?,
+        };
         let authority_term = status.current_term();
-        let (mut durable_snapshot, durable_applied) = self.durable_snapshot_and_applied().await?;
+        let (mut durable_snapshot, durable_applied) = match evidence_update_guard.as_deref() {
+            Some(evidence) => {
+                let admission = evidence.admission;
+                admission
+                    .run_evidence_preappend(self.durable_snapshot_and_applied())
+                    .await?
+            }
+            None => self.durable_snapshot_and_applied().await?,
+        };
         let mut overlay_snapshot = match (authority_term, status.applied(), durable_applied) {
             (Some(authority_term), Some(status_applied), Some(durable_applied))
                 if status_applied == durable_applied =>
             {
                 self.volatile_heartbeat_overlay_snapshot(authority_term, durable_applied)?
-                    .map(|snapshot| (authority_term, snapshot))
+                    .map(|snapshot| (authority_term, durable_applied, snapshot))
             }
             _ => None,
         };
-        if let Some((overlay_authority_term, live_snapshot)) = overlay_snapshot.take() {
+        let mut evidence_overlay_base = evidence_update_guard
+            .is_some()
+            .then(|| {
+                authority_term.zip(durable_applied).ok_or_else(|| {
+                    ControlPlaneError::SnapshotInvariantViolation {
+                        context: "low-priority control-plane proposal overlay binding",
+                        message: "serving evidence submission has no exact authority term and applied log"
+                            .to_owned(),
+                    }
+                })
+            })
+            .transpose()?;
+        if let Some((overlay_authority_term, overlay_base_applied, live_snapshot)) =
+            overlay_snapshot.take()
+        {
             if let Some(promotion) =
                 live_snapshot.promote_volatile_heartbeat_leases_command(&durable_snapshot)?
             {
+                if let Some(evidence) = evidence_update_guard.as_deref() {
+                    evidence.admission.ensure_evidence_may_continue()?;
+                }
                 let promoted_durable = durable_snapshot
                     .apply_control_plane_command(promotion.clone())?
                     .into_snapshot();
-                let promoted_live = live_snapshot
-                    .apply_control_plane_command(promotion.clone())?
-                    .into_snapshot();
                 let submitted_promotion = self
-                    .submit_control_plane_command_with_proposal_retry(update_guard, promotion)
+                    .submit_control_plane_command_with_proposal_retry(
+                        ordinary_update_guard,
+                        evidence_update_guard.as_deref_mut(),
+                        promotion.clone(),
+                    )
                     .await?;
+                let promotion_log_id = submitted_promotion.log_id();
                 match submitted_promotion.into_outcome() {
                     ControlPlaneRaftCommandOutcome::Applied(
                         ControlPlaneCommandResponse::PromoteNodeHeartbeatLeases,
@@ -4529,20 +5154,46 @@ impl ControlPlaneRaftAuthority {
                     }
                     ControlPlaneRaftCommandOutcome::Rejected(error) => return Err(error),
                 }
+                let latest_live = match self.volatile_heartbeat_overlay_snapshot(
+                    overlay_authority_term,
+                    overlay_base_applied,
+                )? {
+                    Some(snapshot) => snapshot,
+                    None => self
+                        .volatile_heartbeat_overlay_snapshot(
+                            overlay_authority_term,
+                            promotion_log_id,
+                        )?
+                        .unwrap_or(live_snapshot),
+                };
+                // The live snapshot already contains every promoted deadline;
+                // reapplying the older promotion could regress a later renewal.
+                latest_live.promote_volatile_heartbeat_leases_command(&promoted_durable)?;
+                let promoted_live = latest_live;
+                self.publish_rebased_volatile_heartbeat_overlay(
+                    overlay_authority_term,
+                    promotion_log_id,
+                    promoted_live.clone(),
+                )
+                .await?;
                 durable_snapshot = promoted_durable;
-                overlay_snapshot = Some((overlay_authority_term, promoted_live));
+                evidence_overlay_base = evidence_update_guard
+                    .is_some()
+                    .then_some((overlay_authority_term, promotion_log_id));
+                overlay_snapshot = Some((overlay_authority_term, promotion_log_id, promoted_live));
             } else {
-                overlay_snapshot = Some((overlay_authority_term, live_snapshot));
+                overlay_snapshot =
+                    Some((overlay_authority_term, overlay_base_applied, live_snapshot));
             }
         }
         let effective_snapshot = overlay_snapshot
             .as_ref()
-            .map_or(&durable_snapshot, |(_, snapshot)| snapshot);
+            .map_or(&durable_snapshot, |(_, _, snapshot)| snapshot);
         let command = derive_command(effective_snapshot)?;
         let command =
             effective_snapshot.bind_metadata_transfer_fence_command(&durable_snapshot, command)?;
         let overlay_rebase = overlay_snapshot
-            .map(|(authority_term, snapshot)| {
+            .map(|(authority_term, base_applied, snapshot)| {
                 let durable_would_apply = durable_snapshot
                     .apply_control_plane_command(command.clone())
                     .is_ok();
@@ -4555,23 +5206,38 @@ impl ControlPlaneRaftAuthority {
                         message: "command applies to committed state but rejects against acknowledged live heartbeat state".to_string(),
                     });
                 }
-                Ok((authority_term, snapshot, applied_snapshot.ok()))
+                Ok((authority_term, base_applied, snapshot))
             })
             .transpose()?;
 
         let submitted = self
-            .submit_control_plane_command_with_proposal_retry(update_guard, command)
+            .submit_control_plane_command_with_proposal_retry(
+                ordinary_update_guard,
+                evidence_update_guard,
+                command.clone(),
+            )
             .await?;
-        if let Some((authority_term, previous_snapshot, applied_snapshot)) = overlay_rebase {
+        let overlay_rebase = match evidence_overlay_base {
+            Some((authority_term, base_applied)) => self
+                .volatile_heartbeat_overlay_snapshot(authority_term, base_applied)?
+                .map(|snapshot| (authority_term, base_applied, snapshot)),
+            None => overlay_rebase,
+        };
+        if let Some((authority_term, _base_applied, latest_snapshot)) = overlay_rebase {
+            let applied_snapshot = latest_snapshot
+                .apply_control_plane_command(command)
+                .map(|applied| applied.into_snapshot());
             let snapshot = match submitted.outcome() {
-                ControlPlaneRaftCommandOutcome::Applied(_) => applied_snapshot.ok_or_else(|| {
-                    ControlPlaneError::SnapshotInvariantViolation {
-                        context: "volatile heartbeat overlay command rebase",
-                        message: "committed command outcome differed from prevalidated state-machine outcome"
-                            .to_string(),
-                    }
-                })?,
-                ControlPlaneRaftCommandOutcome::Rejected(_) => previous_snapshot,
+                ControlPlaneRaftCommandOutcome::Applied(_) => {
+                    applied_snapshot.ok().ok_or_else(|| {
+                        ControlPlaneError::SnapshotInvariantViolation {
+                            context: "volatile heartbeat overlay command rebase",
+                            message: "committed command outcome differed from the latest acknowledged live heartbeat state"
+                                .to_string(),
+                        }
+                    })?
+                }
+                ControlPlaneRaftCommandOutcome::Rejected(_) => latest_snapshot,
             };
             self.publish_rebased_volatile_heartbeat_overlay(
                 authority_term,
@@ -4595,7 +5261,10 @@ impl ControlPlaneRaftAuthority {
     ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
         #[cfg(test)]
         self.run_before_heartbeat_update_gate_hook_for_test();
-        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let _update_guard = self
+            .evidence_submission_admission
+            .acquire_volatile_update_gate(&self.volatile_heartbeat_update_gate)
+            .await;
         let status = self.status().await?;
         let Some(authority_term) = status
             .linearized_authority_serving()

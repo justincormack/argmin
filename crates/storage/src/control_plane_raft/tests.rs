@@ -41,6 +41,121 @@ use crate::types::PgId;
 const IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
+fn low_priority_evidence_submission_yields_to_an_ordinary_waiter() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let admission = Arc::new(ControlPlaneRaftEvidenceSubmissionAdmission::default());
+        let update_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let held = update_gate.lock().await;
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let evidence_admission = Arc::clone(&admission);
+        let evidence_gate = Arc::clone(&update_gate);
+        let evidence_order = order_tx.clone();
+        let evidence = tokio::spawn(async move {
+            let _guard = evidence_admission
+                .acquire_evidence_update_gate(&evidence_gate)
+                .await;
+            evidence_order.send("evidence").unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !admission
+                .evidence_waiting_for_update_gate
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("evidence submission did not queue for the update gate");
+
+        let ordinary_admission = Arc::clone(&admission);
+        let ordinary_gate = Arc::clone(&update_gate);
+        let ordinary_order = order_tx.clone();
+        let (ordinary_queued_tx, ordinary_queued_rx) = tokio::sync::oneshot::channel();
+        let ordinary = tokio::spawn(async move {
+            let waiter = ordinary_admission.register_ordinary_waiter(true);
+            ordinary_queued_tx.send(()).unwrap();
+            let _guard = ordinary_gate.lock().await;
+            drop(waiter);
+            ordinary_order.send("ordinary").unwrap();
+        });
+        ordinary_queued_rx.await.unwrap();
+        drop(held);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+                .await
+                .unwrap(),
+            Some("ordinary")
+        );
+        ordinary.await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), order_rx.recv())
+                .await
+                .unwrap(),
+            Some("evidence")
+        );
+        evidence.await.unwrap();
+    });
+}
+
+#[test]
+fn all_evidence_callers_wake_after_the_final_ordinary_waiter_completes() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let admission = Arc::new(ControlPlaneRaftEvidenceSubmissionAdmission::default());
+        let update_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let ordinary = admission.register_ordinary_waiter(false);
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut evidence_callers = Vec::new();
+        for caller in 0..2 {
+            let caller_admission = Arc::clone(&admission);
+            let caller_update_gate = Arc::clone(&update_gate);
+            let caller_completed = completed_tx.clone();
+            evidence_callers.push(tokio::spawn(async move {
+                let _guard = caller_admission
+                    .acquire_evidence_update_gate(&caller_update_gate)
+                    .await;
+                caller_completed.send(caller).unwrap();
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admission
+                .evidence_waiting_for_ordinary
+                .load(Ordering::Acquire)
+                != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both evidence callers did not wait behind the ordinary caller");
+
+        drop(ordinary);
+        let mut completed = BTreeSet::new();
+        for _ in 0..2 {
+            completed.insert(
+                tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
+                    .await
+                    .expect("an evidence caller remained asleep after the final ordinary wake")
+                    .expect("evidence completion channel closed"),
+            );
+        }
+        assert_eq!(completed, BTreeSet::from([0, 1]));
+        for caller in evidence_callers {
+            caller.await.unwrap();
+        }
+    });
+}
+
+#[test]
 fn control_plane_raft_companion_paths_preserve_non_utf8_artifact_names() {
     let directory = test_util::tempdir();
     let first = directory
@@ -1653,6 +1768,20 @@ async fn initialized_two_node_authorities(
     node1: ControlPlaneRaftNodeId,
     node2: ControlPlaneRaftNodeId,
 ) -> (ControlPlaneRaftAuthority, ControlPlaneRaftAuthority) {
+    let (authority1, authority2, _) =
+        initialized_two_node_authorities_with_network(cluster_name, node1, node2).await;
+    (authority1, authority2)
+}
+
+async fn initialized_two_node_authorities_with_network(
+    cluster_name: &'static str,
+    node1: ControlPlaneRaftNodeId,
+    node2: ControlPlaneRaftNodeId,
+) -> (
+    ControlPlaneRaftAuthority,
+    ControlPlaneRaftAuthority,
+    InMemoryRaftNetworkFactory,
+) {
     let network = InMemoryRaftNetworkFactory::default();
     let config = test_raft_config(cluster_name);
     let log_store1 = ControlPlaneRaftLogStore::empty();
@@ -1696,7 +1825,7 @@ async fn initialized_two_node_authorities(
     )
     .await;
 
-    (authority1, authority2)
+    (authority1, authority2, network)
 }
 
 async fn initialized_two_node_checkpoint_authorities(

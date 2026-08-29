@@ -279,6 +279,7 @@ struct ControlPlaneRpcServerResources {
     active_evidence_workers: Arc<AtomicUsize>,
     evidence_worker_limit: usize,
     active_evidence_nodes: Arc<Mutex<BTreeSet<NodeId>>>,
+    active_evidence_saturation_responders: Arc<AtomicUsize>,
     pre_auth_byte_budget: Arc<ControlPlaneRpcPreAuthByteBudget>,
 }
 
@@ -296,8 +297,9 @@ pub(crate) struct ControlPlaneRpcServerPolicy {
     authority_clock_checkpoint_target: Option<Arc<ControlPlaneAuthorityClockCheckpointTarget>>,
     authority_confirmation: Option<Arc<dyn Fn() -> Result<(), ControlPlaneError> + Send + Sync>>,
     #[cfg(test)]
-    before_authority_confirmation:
-        Option<Arc<dyn Fn(ControlPlaneRpcKind) + Send + Sync>>,
+    after_staging_evidence_actor_admission: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    after_staging_evidence_saturation_responder_admission: Option<Arc<dyn Fn() + Send + Sync>>,
     response_publication: Option<Arc<dyn ControlPlaneRpcResponsePublication>>,
     fatal_error_handler: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -342,6 +344,7 @@ impl ControlPlaneRpcServerPolicy {
                 active_evidence_workers: Arc::new(AtomicUsize::new(0)),
                 evidence_worker_limit: worker_limit.saturating_sub(1).min(2),
                 active_evidence_nodes: Arc::new(Mutex::new(BTreeSet::new())),
+                active_evidence_saturation_responders: Arc::new(AtomicUsize::new(0)),
                 pre_auth_byte_budget: Arc::new(ControlPlaneRpcPreAuthByteBudget::new(
                     pre_auth_byte_budget,
                 )),
@@ -352,7 +355,9 @@ impl ControlPlaneRpcServerPolicy {
             authority_clock_checkpoint_target: None,
             authority_confirmation: None,
             #[cfg(test)]
-            before_authority_confirmation: None,
+            after_staging_evidence_actor_admission: None,
+            #[cfg(test)]
+            after_staging_evidence_saturation_responder_admission: None,
             response_publication: None,
             fatal_error_handler: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -409,11 +414,21 @@ impl ControlPlaneRpcServerPolicy {
 
     #[cfg(test)]
     #[must_use]
-    fn with_before_authority_confirmation(
+    fn with_after_staging_evidence_actor_admission(
         mut self,
-        before_authority_confirmation: Arc<dyn Fn(ControlPlaneRpcKind) + Send + Sync>,
+        hook: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
-        self.before_authority_confirmation = Some(before_authority_confirmation);
+        self.after_staging_evidence_actor_admission = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn with_after_staging_evidence_saturation_responder_admission(
+        mut self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.after_staging_evidence_saturation_responder_admission = Some(hook);
         self
     }
 
@@ -445,6 +460,17 @@ impl ControlPlaneRpcServerPolicy {
                 .resources
                 .active_evidence_workers
                 .load(Ordering::Acquire)
+            + self
+                .resources
+                .active_evidence_saturation_responders
+                .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn active_evidence_saturation_responders(&self) -> usize {
+        self.resources
+            .active_evidence_saturation_responders
+            .load(Ordering::Acquire)
     }
 
     fn authority_now_ms(&self) -> u64 {
@@ -710,6 +736,34 @@ impl ControlPlaneRpcFrameExchangeError {
     #[must_use]
     fn request_may_have_been_sent(&self) -> bool {
         self.request_may_have_been_sent
+    }
+
+    #[must_use]
+    fn request_outcome_may_be_unconfirmed(&self) -> bool {
+        self.request_may_have_been_sent
+            && (self
+                .error
+                .is_maybe_applied_control_plane_rpc_response_loss()
+                || self.request_write_may_have_been_partial())
+    }
+
+    fn request_write_may_have_been_partial(&self) -> bool {
+        let ControlPlaneError::Io { diagnostic } = self.error.as_ref() else {
+            return false;
+        };
+        matches!(
+            diagnostic.context(),
+            "write control-plane RPC frame" | "write control-plane TLS/TCP request frame"
+        ) && matches!(
+            diagnostic.kind(),
+            ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::Interrupted
+                | ErrorKind::NotConnected
+        )
     }
 
     #[must_use]
@@ -1249,6 +1303,7 @@ pub(crate) fn connect_unix_stream_until(
 }
 
 const CONTROL_PLANE_RPC_DEADLINE_EXPIRED: &str = "control-plane RPC operation deadline expired";
+const CONTROL_PLANE_RPC_EVIDENCE_SATURATION_RESPONDER_LIMIT: usize = 1;
 pub(crate) type DeadlineUnixStream<'a> = DeadlineStream<&'a mut UnixStream>;
 type ControlPlaneDeadlineTcpSocket = DeadlineStream<TcpStream>;
 type ControlPlaneDeadlineUnixSocket = DeadlineStream<UnixStream>;
@@ -2653,7 +2708,6 @@ impl AuthenticatedUnixControlPlaneClient {
         envelope.encode_frame()
     }
 
-    #[allow(dead_code)] // Enabled by the storage outbox worker in the next batching slice.
     fn sign_staging_evidence_request(
         &self,
         authority_now_ms: u64,
@@ -3951,7 +4005,6 @@ impl AuthenticatedUnixControlPlaneClient {
         }
     }
 
-    #[allow(dead_code)] // Enabled by the storage outbox worker in the next batching slice.
     fn verify_staging_evidence_response(
         &self,
         authority_now_ms: u64,
@@ -3989,7 +4042,6 @@ impl AuthenticatedUnixControlPlaneClient {
         }
     }
 
-    #[allow(dead_code)] // Enabled by the storage outbox worker in the next batching slice.
     pub(crate) fn publish_metadata_transfer_staging_evidence_page(
         &self,
         page: &MetadataTransferStagingEvidencePage,
@@ -4025,17 +4077,14 @@ impl AuthenticatedUnixControlPlaneClient {
                     &mut endpoint_pass,
                 ) {
                 Ok(response) => response,
-                Err(error) if error.request_may_have_been_sent() => {
+                Err(error) if error.request_outcome_may_be_unconfirmed() => {
                     return Err(unconfirmed_staging_evidence_publication(error.into_error()));
                 }
                 Err(error) => return Err(error.into_error()),
             };
-            let response = self
-                .verify_staging_evidence_response(retry_clock.now_ms(), &response)
-                .map_err(unconfirmed_staging_evidence_publication)?;
-            match decode_control_plane_rpc_response_frame(response)
-                .map_err(unconfirmed_staging_evidence_publication)?
-            {
+            let response =
+                self.verify_staging_evidence_response(retry_clock.now_ms(), &response)?;
+            match decode_control_plane_rpc_response_frame(response)? {
                 DecodedControlPlaneRpcResponse::Rejection(error)
                     if error.is_control_plane_leader_routing_rejection() =>
                 {
@@ -4049,15 +4098,13 @@ impl AuthenticatedUnixControlPlaneClient {
             }
         };
         let receipt = decode_staging_evidence_apply_receipt(&response).map_err(|error| {
-            unconfirmed_staging_evidence_publication(ControlPlaneError::rpc_protocol(format!(
+            ControlPlaneError::rpc_protocol(format!(
                 "invalid staging evidence apply receipt: {error}"
-            )))
+            ))
         })?;
         if !receipt.is_for_page(page) {
-            return Err(unconfirmed_staging_evidence_publication(
-                ControlPlaneError::rpc_protocol(
-                    "staging evidence apply receipt does not match the published page".to_owned(),
-                ),
+            return Err(ControlPlaneError::rpc_protocol(
+                "staging evidence apply receipt does not match the published page".to_owned(),
             ));
         }
         self.inner.prefer_successful_endpoint(&endpoint_pass);
@@ -5324,9 +5371,8 @@ fn unconfirmed_authenticated_admin_mutation_response(
     }
 }
 
-#[allow(dead_code)] // Enabled by the storage outbox worker in the next batching slice.
 fn unconfirmed_staging_evidence_publication(error: ControlPlaneError) -> ControlPlaneError {
-    ControlPlaneError::RpcUnconfirmed {
+    ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed {
         message: format!(
             "metadata-transfer staging evidence may have been accepted, but no valid authenticated apply receipt was received: {error}"
         ),
@@ -6941,6 +6987,7 @@ fn authenticate_and_admit_control_plane_rpc(
     request: ControlPlaneRpcRequest,
     policy: &ControlPlaneRpcServerPolicy,
     require_authentication: bool,
+    confirm_authority: bool,
     authority_now_ms: u64,
 ) -> Result<VerifiedControlPlaneRpcRequest, ControlPlaneRpcAdmissionFailure> {
     let verify = if require_authentication {
@@ -6965,11 +7012,7 @@ fn authenticate_and_admit_control_plane_rpc(
             error: Box::new(error),
         });
     }
-    if request.requires_raft_authority_confirmation() {
-        #[cfg(test)]
-        if let Some(before_confirmation) = &policy.before_authority_confirmation {
-            before_confirmation(request.kind);
-        }
+    if confirm_authority && request.requires_raft_authority_confirmation() {
         if let Some(confirm) = &policy.authority_confirmation {
             if let Err(error) = confirm() {
                 return Err(ControlPlaneRpcAdmissionFailure::Authenticated {
@@ -7020,6 +7063,24 @@ struct ControlPlaneRpcEvidenceWorkerGuard {
     node_id: Option<NodeId>,
 }
 
+struct ControlPlaneRpcEvidenceSaturationResponderGuard {
+    active_responders: Arc<AtomicUsize>,
+}
+
+impl ControlPlaneRpcEvidenceSaturationResponderGuard {
+    fn try_reserve(resources: &ControlPlaneRpcServerResources) -> Option<Self> {
+        if !reserve_control_plane_rpc_worker(
+            &resources.active_evidence_saturation_responders,
+            CONTROL_PLANE_RPC_EVIDENCE_SATURATION_RESPONDER_LIMIT,
+        ) {
+            return None;
+        }
+        Some(Self {
+            active_responders: Arc::clone(&resources.active_evidence_saturation_responders),
+        })
+    }
+}
+
 impl ControlPlaneRpcEvidenceWorkerGuard {
     fn try_reserve(resources: &ControlPlaneRpcServerResources) -> Option<Self> {
         if !reserve_control_plane_rpc_worker(
@@ -7065,6 +7126,12 @@ impl Drop for ControlPlaneRpcEvidenceWorkerGuard {
 impl Drop for ControlPlaneRpcWorkerGuard {
     fn drop(&mut self) {
         self.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for ControlPlaneRpcEvidenceSaturationResponderGuard {
+    fn drop(&mut self) {
+        self.active_responders.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -7419,6 +7486,8 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
         };
         let (request, _pre_auth_byte_reservation) = request;
         let metrics_kind = request.metrics_kind();
+        let mut evidence_saturation_responder = None;
+        let mut evidence_saturated = false;
         let mut evidence_worker = if request.kind
             == ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage
         {
@@ -7428,10 +7497,23 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
                     Some(guard)
                 }
                 None => {
-                    eprintln!(
-                        "control-plane staging evidence RPC rejected: evidence worker limit reached"
-                    );
-                    return;
+                    let Some(responder) =
+                        ControlPlaneRpcEvidenceSaturationResponderGuard::try_reserve(
+                            &policy.resources,
+                        )
+                    else {
+                        return;
+                    };
+                    evidence_saturation_responder = Some(responder);
+                    evidence_saturated = true;
+                    drop(ordinary_worker.take());
+                    #[cfg(test)]
+                    if let Some(hook) =
+                        &policy.after_staging_evidence_saturation_responder_admission
+                    {
+                        hook();
+                    }
+                    None
                 }
             }
         } else {
@@ -7441,6 +7523,7 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
             request,
             &policy,
             require_authentication,
+            !evidence_saturated,
             policy.authority_now_ms(),
         ) {
             Ok(request) => request,
@@ -7462,6 +7545,20 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
                 return;
             }
         };
+        if evidence_saturated {
+            let response = build_control_plane_unix_admission_error_response(
+                request,
+                ControlPlaneError::StagingEvidencePublicationDeferred,
+                policy.authority_now_ms(),
+            );
+            stream.begin_response(io_timeout);
+            write_control_plane_rpc_admission_response(&mut stream, metrics_kind, response);
+            if let Err(error) = stream.finish_response() {
+                eprintln!("control-plane RPC response finalization failed: {error}");
+            }
+            drop(evidence_saturation_responder.take());
+            return;
+        }
         if request.is_staging_evidence_publication() {
             let actor = request
                 .staging_evidence_actor
@@ -7472,9 +7569,7 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
             if !guard.try_bind_actor(actor) {
                 let response = build_control_plane_unix_admission_error_response(
                     request,
-                    ControlPlaneError::rpc_remote(
-                        "staging evidence publication admission is saturated".to_owned(),
-                    ),
+                    ControlPlaneError::StagingEvidencePublicationDeferred,
                     policy.authority_now_ms(),
                 );
                 stream.begin_response(io_timeout);
@@ -7483,6 +7578,10 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
                     eprintln!("control-plane RPC response finalization failed: {error}");
                 }
                 return;
+            }
+            #[cfg(test)]
+            if let Some(hook) = &policy.after_staging_evidence_actor_admission {
+                hook();
             }
         }
         let response = (|| {
@@ -7883,11 +7982,13 @@ enum ControlPlaneRpcResponseStatus {
     AuthorityClockSourceUnavailable = 19,
     AuthorityClockNotEstablished = 20,
     AuthorityClockSampleWindowTooWide = 21,
+    StagingEvidencePublicationDeferred = 22,
+    StagingEvidencePublicationOutcomeUnconfirmed = 23,
 }
 
 impl ControlPlaneRpcResponseStatus {
     #[cfg(test)]
-    const ALL: [Self; 22] = [
+    const ALL: [Self; 24] = [
         Self::Success,
         Self::RemoteFailure,
         Self::PgPeeringPendingMetadataCommand,
@@ -7910,6 +8011,8 @@ impl ControlPlaneRpcResponseStatus {
         Self::AuthorityClockSourceUnavailable,
         Self::AuthorityClockNotEstablished,
         Self::AuthorityClockSampleWindowTooWide,
+        Self::StagingEvidencePublicationDeferred,
+        Self::StagingEvidencePublicationOutcomeUnconfirmed,
     ];
 
     const fn as_u8(self) -> u8 {
@@ -7940,6 +8043,8 @@ impl ControlPlaneRpcResponseStatus {
             19 => Ok(Self::AuthorityClockSourceUnavailable),
             20 => Ok(Self::AuthorityClockNotEstablished),
             21 => Ok(Self::AuthorityClockSampleWindowTooWide),
+            22 => Ok(Self::StagingEvidencePublicationDeferred),
+            23 => Ok(Self::StagingEvidencePublicationOutcomeUnconfirmed),
             _ => Err(ControlPlaneError::rpc_protocol(format!(
                 "invalid control-plane RPC response status {status}"
             ))),
@@ -8163,6 +8268,20 @@ fn encode_control_plane_rpc_response(
             );
             write_u64(&mut payload, narrowest_window_ms);
             write_u64(&mut payload, max_window_ms);
+        }
+        Err(ControlPlaneError::StagingEvidencePublicationDeferred) => {
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::StagingEvidencePublicationDeferred.as_u8(),
+            );
+        }
+        Err(ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed { message }) => {
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::StagingEvidencePublicationOutcomeUnconfirmed
+                    .as_u8(),
+            );
+            write_string(&mut payload, &message)?;
         }
         Err(error) => {
             write_u8(
@@ -8424,6 +8543,19 @@ fn decode_control_plane_rpc_response_frame(
                     narrowest_window_ms,
                     max_window_ms,
                 },
+            ))
+        }
+        ControlPlaneRpcResponseStatus::StagingEvidencePublicationDeferred => {
+            reader.finish()?;
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::StagingEvidencePublicationDeferred,
+            ))
+        }
+        ControlPlaneRpcResponseStatus::StagingEvidencePublicationOutcomeUnconfirmed => {
+            let message = reader.read_string()?.to_owned();
+            reader.finish()?;
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed { message },
             ))
         }
     }
@@ -10414,7 +10546,6 @@ fn write_bytes(out: &mut Vec<u8>, value: &[u8]) -> Result<(), ControlPlaneError>
     Ok(())
 }
 
-#[allow(dead_code)] // Enabled by the storage outbox worker in the next batching slice.
 fn write_staging_evidence_publication_request(
     out: &mut Vec<u8>,
     page: &MetadataTransferStagingEvidencePage,

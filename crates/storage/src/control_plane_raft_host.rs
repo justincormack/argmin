@@ -759,6 +759,18 @@ impl ControlPlaneRaftAuthorityHost {
         self.submit_raft_command_with_checkpoint_policy(command, true)
     }
 
+    fn submit_low_priority_raft_command(
+        &mut self,
+        command: ControlPlaneCommand,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        let submitted = self.block_on(
+            self.authority
+                .submit_low_priority_control_plane_command(command),
+        )?;
+        self.finish_submitted_raft_command(submitted, true)
+    }
+
     fn submit_raft_command_derived<F>(
         &mut self,
         derive_command: F,
@@ -1252,7 +1264,7 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
         operation_payload: Vec<u8>,
         page_digest: [u8; 32],
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let response = self.submit_raft_command(
+        let response = self.submit_low_priority_raft_command(
             ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
                 operation_payload,
                 page_digest,

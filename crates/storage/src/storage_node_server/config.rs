@@ -1689,6 +1689,15 @@ pub enum StorageNodeServerError {
         #[source]
         source: io::Error,
     },
+    #[error("metadata-transfer staging store failed to open: {message}")]
+    MetadataTransferStaging { message: String },
+    #[error("metadata-transfer staging outbox is not configured for this storage node")]
+    MetadataTransferStagingNotConfigured,
+    #[error("spawn metadata-transfer staging evidence outbox")]
+    MetadataTransferStagingOutboxSpawn {
+        #[source]
+        source: io::Error,
+    },
     #[error("duplicate storage-node id {id}")]
     DuplicateNodeId { id: u32 },
     #[error(

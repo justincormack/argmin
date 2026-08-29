@@ -1,6 +1,14 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+struct LowPriorityGateRelease(Arc<ControlPlaneRaftLowPriorityTestGate>);
+
+impl Drop for LowPriorityGateRelease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 #[test]
 fn control_plane_openraft_single_node_initialize_uses_bootstrap_membership() {
     ControlPlaneRaftTypeConfig::run(async {
@@ -35,6 +43,679 @@ fn control_plane_openraft_single_node_initialize_uses_bootstrap_membership() {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].log_id, bootstrap_log_id);
         assert!(matches!(entries[0].payload, EntryPayload::Membership(_)));
+
+        authority.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let (authority, follower) = initialized_two_node_authorities(
+            "control-plane-raft-evidence-uncertainty-rpc-test",
+            501,
+            502,
+        )
+        .await;
+        let authority = Arc::new(authority);
+        let follower = Arc::new(follower);
+        authority
+            .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(NodeId::new(501), "node-501".to_owned())],
+                pg_ids: vec![PgId::new(0)],
+            })
+            .await
+            .unwrap();
+
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("staging-evidence-uncertainty.sock");
+        let store = Arc::new(
+            crate::pg_store::MetadataTransferStagingStore::open(
+                tmp.path(),
+                crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+                    NodeId::new(501),
+                    4,
+                    "unix:///catalogue/storage-501.sock".to_owned(),
+                )
+                .unwrap(),
+                crate::pg_store::MetadataTransferStagingLimits::new(
+                    8,
+                    1024 * 1024,
+                    4 * 1024 * 1024,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let artifact = b"Raft host post-dispatch staging uncertainty";
+        let binding = crate::control_plane::UnavailablePgTransitionMutationBinding::new(
+            PgId::new(19),
+            ClusterEpoch::new(12).unwrap(),
+            ClusterEpoch::new(11).unwrap(),
+            vec![NodeId::new(501), NodeId::new(502), NodeId::new(503)],
+            vec![NodeId::new(504), NodeId::new(502), NodeId::new(503)],
+        );
+        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &binding,
+            checksum::sha256::digest(artifact),
+            u64::try_from(artifact.len()).unwrap(),
+            crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        )
+        .unwrap();
+        store.create_intent(&intent).unwrap();
+        store.publish_artifact(&intent, artifact).unwrap();
+        let retained_page = store.next_evidence_page().unwrap().unwrap();
+
+        let credential_input =
+            crate::control_plane::ControlPlaneStorageNodeAuthCredentialInput {
+                node_id: NodeId::new(501),
+                credential_id: "storage-node-501".to_owned(),
+                credential_version: 1,
+                secret: b"storage-node-501-secret".to_vec(),
+            };
+        let verifier = crate::control_plane::ControlPlaneUnixAuthVerifier::new(
+            "raft-evidence-uncertainty-cluster",
+            vec![
+                crate::control_plane::ControlPlaneStorageNodeAuthCredential::new(
+                    credential_input.clone(),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let listener = crate::control_plane::ControlPlaneRpcServerListener::unix(
+            UnixListener::bind(&socket_path).unwrap(),
+            4,
+            crate::control_plane::CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let host = crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost::new_for_test(
+            tokio::runtime::Handle::current(),
+            Arc::clone(&authority),
+            false,
+        )
+        .unwrap();
+        let confirmation_host = host.clone();
+        let policy = crate::control_plane::ControlPlaneRpcServerPolicy::new(
+            crate::control_plane::ControlPlaneRpcServerRole::Ordinary,
+            4,
+            crate::control_plane::CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap()
+        .with_auth_verifier(Arc::new(verifier))
+        .with_authority_confirmation(Arc::new(move || {
+            confirmation_host
+                .block_on_for_test(
+                    confirmation_host
+                        .authority_for_test()
+                        .confirmed_linearized_authority_status(),
+                )
+                .map(|_| ())
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_server = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            listener
+                .serve_shared_until_stop_for_test(
+                    Arc::new(Mutex::new(host)),
+                    policy,
+                    2_000,
+                    &stop_for_server,
+                )
+                .unwrap();
+        });
+
+        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(350)).await;
+        authority.pause_next_proposal_after_lease_confirmation_for_test(Duration::from_millis(
+            350,
+        ));
+        let certification_gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority.set_low_priority_during_retry_certification_for_test(Arc::clone(
+            &certification_gate,
+        ));
+        let certification_release = LowPriorityGateRelease(Arc::clone(&certification_gate));
+
+        let control_plane = crate::ControlPlaneStorageNodeClient::with_socket_paths(
+            [socket_path.clone()],
+            Some("raft-evidence-uncertainty-cluster"),
+            501,
+            4,
+            vec![credential_input],
+            Some(("storage-node-501".to_owned(), 1)),
+        )
+        .unwrap();
+        let (fatal_tx, fatal_rx) = std::sync::mpsc::sync_channel(1);
+        let mut outbox = crate::StorageNodeMetadataTransferStagingOutbox::spawn(
+            Arc::clone(&store),
+            control_plane,
+            || 2_000,
+            move |error| fatal_tx.send(error).unwrap(),
+        )
+        .unwrap();
+        ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(2),
+            certification_gate.wait_for_arrival(),
+        )
+        .await
+        .expect("outbox evidence did not enter Raft retry certification");
+
+        let ordinary_authority = Arc::clone(&authority);
+        let ordinary = ControlPlaneRaftTypeConfig::spawn(async move {
+            ordinary_authority
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(501),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(2), ordinary)
+            .await
+            .expect("ordinary command did not proceed after evidence yielded")
+            .expect("ordinary command task failed")
+            .unwrap();
+
+        let status_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let status = outbox.status();
+            if status.publication_failures != 0 {
+                assert!(
+                    !status.failed,
+                    "Raft uncertainty became fatal after RPC: {status:?}"
+                );
+                assert!(status
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("outcome is unconfirmed")));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < status_deadline,
+                "outbox did not observe Raft uncertainty"
+            );
+            ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            fatal_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(store.next_evidence_page().unwrap().unwrap(), retained_page);
+
+        certification_release.0.release();
+        drop(certification_release);
+        outbox.stop();
+        stop.store(true, Ordering::Release);
+        drop(UnixStream::connect(&socket_path).unwrap());
+        server.join().unwrap();
+        authority.shutdown().await.unwrap();
+        follower.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn dispatched_low_priority_proposal_releases_heartbeat_gate_until_completion() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let (authority, follower, network) = initialized_two_node_authorities_with_network(
+            "control-plane-raft-dispatched-evidence-heartbeat-test",
+            511,
+            512,
+        )
+        .await;
+        let authority = Arc::new(authority);
+        let follower = Arc::new(follower);
+        authority
+            .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![
+                    (NodeId::new(511), "node-511".to_owned()),
+                    (NodeId::new(512), "node-512".to_owned()),
+                ],
+                pg_ids: vec![PgId::new(0)],
+            })
+            .await
+            .unwrap();
+
+        let status = authority.status().await.unwrap();
+        let authority_binding = LeaseHorizonAuthorityBinding::new(
+            1,
+            Some(
+                status
+                    .current_term()
+                    .expect("initialized authority should have a serving term"),
+            ),
+        );
+        let observed_epoch = status.current_cluster_epoch();
+        authority
+            .submit_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat: NodeHeartbeat {
+                    node_id: NodeId::new(511),
+                    node_incarnation: 1,
+                    endpoint: "node-511".to_owned(),
+                    observed_epoch,
+                    requested_lease_duration_ms: 2_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                        .unwrap(),
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                heartbeat_at_ms: 70_000,
+                lease_deadline_ms: 72_000,
+                lease_horizon_authority: Some(authority_binding),
+            })
+            .await
+            .unwrap();
+
+        let existing_overlay_deadline_ms = 72_250;
+        let existing_overlay = authority
+            .try_apply_volatile_heartbeat(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat: NodeHeartbeat {
+                    node_id: NodeId::new(511),
+                    node_incarnation: 1,
+                    endpoint: "node-511".to_owned(),
+                    observed_epoch,
+                    requested_lease_duration_ms: 2_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                        .unwrap(),
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                heartbeat_at_ms: 70_250,
+                lease_deadline_ms: existing_overlay_deadline_ms,
+                lease_horizon_authority: Some(authority_binding),
+            })
+            .await
+            .unwrap()
+            .expect("covered heartbeat should establish a volatile overlay before dispatch");
+        assert_eq!(
+            existing_overlay
+                .node(NodeId::new(511))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(existing_overlay_deadline_ms)
+        );
+        authority
+            .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(512),
+                availability: NodeAvailabilityState::Healthy,
+            })
+            .await
+            .expect("ordinary command should promote the existing volatile overlay");
+        assert_eq!(
+            authority
+                .current_control_plane_snapshot()
+                .await
+                .unwrap()
+                .node(NodeId::new(511))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(existing_overlay_deadline_ms)
+        );
+
+        let before_dispatch_gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority.set_low_priority_before_dispatch_for_test(Arc::clone(&before_dispatch_gate));
+        let before_dispatch_release =
+            LowPriorityGateRelease(Arc::clone(&before_dispatch_gate));
+        let dispatch_gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority.set_low_priority_after_dispatch_for_test(Arc::clone(&dispatch_gate));
+        let dispatch_release = LowPriorityGateRelease(Arc::clone(&dispatch_gate));
+        let command = ControlPlaneCommand::MarkNodeAvailability {
+            node_id: NodeId::new(512),
+            availability: NodeAvailabilityState::Unavailable,
+        };
+        let submitting_authority = Arc::clone(&authority);
+        let submitted_command = command.clone();
+        let submission = ControlPlaneRaftTypeConfig::spawn(async move {
+            submitting_authority
+                .submit_low_priority_control_plane_command(submitted_command)
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(2),
+            before_dispatch_gate.wait_for_arrival(),
+        )
+        .await
+        .expect("low-priority proposal did not finish pre-dispatch certification");
+        network.unregister(512);
+        before_dispatch_release.0.release();
+        drop(before_dispatch_release);
+        ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(2),
+            dispatch_gate.wait_for_arrival(),
+        )
+        .await
+        .expect("low-priority proposal was not accepted by RaftCore");
+
+        let renewed_deadline_ms = 72_500;
+        let renewed = ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(1),
+            authority.try_apply_volatile_heartbeat(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat: NodeHeartbeat {
+                    node_id: NodeId::new(511),
+                    node_incarnation: 1,
+                    endpoint: "node-511".to_owned(),
+                    observed_epoch,
+                    requested_lease_duration_ms: 2_000,
+                    cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                        .unwrap(),
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                heartbeat_at_ms: 70_500,
+                lease_deadline_ms: renewed_deadline_ms,
+                lease_horizon_authority: Some(authority_binding),
+            }),
+        )
+        .await
+        .expect("heartbeat remained blocked behind the dispatched evidence proposal")
+        .unwrap()
+        .expect("covered heartbeat should renew through the volatile overlay");
+        assert_eq!(
+            renewed
+                .node(NodeId::new(511))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(renewed_deadline_ms)
+        );
+
+        let ordinary_gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority.set_ordinary_durable_after_update_gate_for_test(Arc::clone(&ordinary_gate));
+        let ordinary_release = LowPriorityGateRelease(Arc::clone(&ordinary_gate));
+        let ordinary_authority = Arc::clone(&authority);
+        let ordinary = ControlPlaneRaftTypeConfig::spawn(async move {
+            ordinary_authority
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(511),
+                    availability: NodeAvailabilityState::Healthy,
+                })
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(1), async {
+            while authority
+                .evidence_submission_admission
+                .ordinary_waiters
+                .load(Ordering::Acquire)
+                == 0
+            {
+                ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("ordinary durable command did not queue behind accepted evidence");
+
+        network.register(512, follower.raft().clone());
+        dispatch_release.0.release();
+        drop(dispatch_release);
+        let first = ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(2), submission)
+            .await
+            .expect("low-priority proposal did not complete after quorum returned")
+            .expect("low-priority proposal task failed")
+            .unwrap();
+        assert!(matches!(
+            first.outcome(),
+            ControlPlaneRaftCommandOutcome::Applied(
+                ControlPlaneCommandResponse::MarkNodeAvailability
+            )
+        ));
+        ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(2),
+            ordinary_gate.wait_for_arrival(),
+        )
+        .await
+        .expect("ordinary durable command did not run after evidence completion");
+        ordinary_release.0.release();
+        drop(ordinary_release);
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(2), ordinary)
+            .await
+            .expect("ordinary durable command did not complete after evidence")
+            .expect("ordinary durable command task failed")
+            .unwrap();
+        let after_first = authority.current_control_plane_snapshot().await.unwrap();
+        assert_eq!(
+            after_first
+                .node(NodeId::new(512))
+                .unwrap()
+                .observed_availability(),
+            NodeAvailabilityState::Unavailable,
+            "successor durable proposal must retain the accepted evidence mutation"
+        );
+        assert_eq!(
+            after_first
+                .node(NodeId::new(511))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(renewed_deadline_ms),
+            "proposal completion must rebase the renewal that arrived while it was pending"
+        );
+
+        let replay = authority
+            .submit_low_priority_control_plane_command(command)
+            .await
+            .unwrap();
+        assert!(matches!(
+            replay.outcome(),
+            ControlPlaneRaftCommandOutcome::Applied(
+                ControlPlaneCommandResponse::MarkNodeAvailability
+            )
+        ));
+        assert_eq!(
+            authority.current_control_plane_snapshot().await.unwrap(),
+            after_first,
+            "exact low-priority replay must not mutate control-plane state twice"
+        );
+
+        authority.shutdown().await.unwrap();
+        follower.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn low_priority_dispatch_yields_to_waiter_before_raft_core_acceptance() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let (authority, follower) = initialized_two_node_authorities(
+            "control-plane-raft-evidence-preaccept-priority-test",
+            521,
+            522,
+        )
+        .await;
+        let authority = Arc::new(authority);
+        let follower = Arc::new(follower);
+        authority
+            .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![
+                    (NodeId::new(521), "node-521".to_owned()),
+                    (NodeId::new(522), "node-522".to_owned()),
+                ],
+                pg_ids: vec![PgId::new(0)],
+            })
+            .await
+            .unwrap();
+        let before_log_id = authority.status().await.unwrap().last_log_id();
+        let before_target_availability = authority
+            .current_control_plane_snapshot()
+            .await
+            .unwrap()
+            .node(NodeId::new(522))
+            .unwrap()
+            .observed_availability();
+
+        let before_dispatch_gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority.set_low_priority_before_dispatch_for_test(Arc::clone(&before_dispatch_gate));
+        let before_dispatch_release =
+            LowPriorityGateRelease(Arc::clone(&before_dispatch_gate));
+        let evidence_authority = Arc::clone(&authority);
+        let evidence = ControlPlaneRaftTypeConfig::spawn(async move {
+            evidence_authority
+                .submit_low_priority_control_plane_command(
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(522),
+                        availability: NodeAvailabilityState::Unavailable,
+                    },
+                )
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(2),
+            before_dispatch_gate.wait_for_arrival(),
+        )
+        .await
+        .expect("evidence did not pause immediately before RaftCore dispatch");
+
+        let ordinary_gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority.set_ordinary_durable_after_update_gate_for_test(Arc::clone(&ordinary_gate));
+        let ordinary_release = LowPriorityGateRelease(Arc::clone(&ordinary_gate));
+        let ordinary_authority = Arc::clone(&authority);
+        let ordinary = ControlPlaneRaftTypeConfig::spawn(async move {
+            ordinary_authority
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(521),
+                    availability: NodeAvailabilityState::Healthy,
+                })
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(1), async {
+            while authority
+                .evidence_submission_admission
+                .ordinary_waiters
+                .load(Ordering::Acquire)
+                == 0
+            {
+                ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("ordinary command did not register before evidence dispatch");
+
+        before_dispatch_release.0.release();
+        drop(before_dispatch_release);
+        let evidence_error = ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(1), evidence)
+            .await
+            .expect("evidence did not yield before RaftCore acceptance")
+            .expect("evidence task failed")
+            .unwrap_err();
+        assert!(matches!(
+            evidence_error,
+            ControlPlaneError::StagingEvidencePublicationDeferred
+        ));
+        ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(2),
+            ordinary_gate.wait_for_arrival(),
+        )
+        .await
+        .expect("ordinary command did not acquire admission after evidence yielded");
+        assert_eq!(
+            authority.status().await.unwrap().last_log_id(),
+            before_log_id,
+            "yielded evidence must not append before the ordinary successor dispatches"
+        );
+
+        ordinary_release.0.release();
+        drop(ordinary_release);
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(2), ordinary)
+            .await
+            .expect("ordinary successor did not complete")
+            .expect("ordinary successor task failed")
+            .unwrap();
+        assert_eq!(
+            authority
+                .current_control_plane_snapshot()
+                .await
+                .unwrap()
+                .node(NodeId::new(522))
+                .unwrap()
+                .observed_availability(),
+            before_target_availability,
+            "yielded evidence must leave the target state unchanged"
+        );
+
+        authority.shutdown().await.unwrap();
+        follower.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn low_priority_evidence_yields_when_membership_queues_after_gate_acquisition() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let log_store = ControlPlaneRaftLogStore::empty();
+        let state_machine = ControlPlaneRaftStateMachine::empty();
+        let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            1,
+            test_raft_config("control-plane-raft-evidence-membership-priority-test"),
+            UnreachableRaftNetworkFactory,
+            log_store.clone(),
+            state_machine,
+        )
+        .await
+        .unwrap();
+        let authority = Arc::new(ControlPlaneRaftAuthority::new_with_log_store(
+            raft,
+            log_store,
+            "test-cluster",
+        ));
+        authority
+            .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+            .await
+            .unwrap();
+        wait_for_local_leader(authority.raft(), "evidence priority leadership").await;
+        wait_for_authority_status_matching(
+            &authority,
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            "evidence priority authority serving",
+            ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+        )
+        .await;
+
+        let gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority.set_low_priority_after_update_gate_for_test(Arc::clone(&gate));
+        let release = LowPriorityGateRelease(Arc::clone(&gate));
+        let evidence_authority = Arc::clone(&authority);
+        let evidence = ControlPlaneRaftTypeConfig::spawn(async move {
+            evidence_authority
+                .submit_low_priority_control_plane_command(
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(99),
+                        availability: NodeAvailabilityState::Healthy,
+                    },
+                )
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(1), gate.wait_for_arrival())
+            .await
+            .expect("evidence did not acquire the update gate");
+
+        let membership_authority = Arc::clone(&authority);
+        let membership = ControlPlaneRaftTypeConfig::spawn(async move {
+            membership_authority
+                .replace_voters(BTreeSet::from([1]), true)
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(1), async {
+            while authority
+                .evidence_submission_admission
+                .ordinary_waiters
+                .load(Ordering::Acquire)
+                == 0
+            {
+                ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("membership mutation did not register ordinary priority");
+        release.0.release();
+        drop(release);
+
+        let evidence_error = ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(1), evidence)
+            .await
+            .expect("evidence did not yield to membership")
+            .expect("evidence task failed")
+            .unwrap_err();
+        assert!(matches!(
+            evidence_error,
+            ControlPlaneError::StagingEvidencePublicationDeferred
+        ));
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(2), membership)
+            .await
+            .expect("membership did not proceed after evidence yielded")
+            .expect("membership task failed")
+            .unwrap();
 
         authority.shutdown().await.unwrap();
     });
@@ -661,6 +1342,169 @@ fn control_plane_openraft_explicit_handles_manage_membership_and_leadership() {
             1,
             "ordinary proposal should safely retry after its confirmed lease expires before dispatch"
         );
+
+        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(350)).await;
+        authority2.pause_next_proposal_after_lease_confirmation_for_test(Duration::from_millis(
+            350,
+        ));
+        let certification_gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority2.set_low_priority_during_retry_certification_for_test(Arc::clone(
+            &certification_gate,
+        ));
+        let certification_release = LowPriorityGateRelease(Arc::clone(&certification_gate));
+        let certifying_evidence_authority = Arc::clone(&authority2);
+        let certifying_evidence = ControlPlaneRaftTypeConfig::spawn(async move {
+            certifying_evidence_authority
+                .submit_low_priority_control_plane_command(
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(401),
+                        availability: NodeAvailabilityState::Unavailable,
+                    },
+                )
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(2),
+            certification_gate.wait_for_arrival(),
+        )
+        .await
+        .expect("evidence did not enter post-dispatch retry certification");
+
+        let certification_status = authority2.status().await.unwrap();
+        let certification_heartbeat_binding = LeaseHorizonAuthorityBinding::new(
+            1,
+            Some(
+                certification_status
+                    .current_term()
+                    .expect("serving transferred authority should have a term"),
+            ),
+        );
+        let certification_heartbeat_authority = Arc::clone(&authority2);
+        let certification_heartbeat = ControlPlaneRaftTypeConfig::spawn(async move {
+            certification_heartbeat_authority
+                .submit_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat: NodeHeartbeat {
+                        node_id: NodeId::new(402),
+                        node_incarnation: 1,
+                        endpoint: "node-402".to_owned(),
+                        observed_epoch: certification_status.current_cluster_epoch(),
+                        requested_lease_duration_ms: 2_000,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                            .unwrap(),
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms: 49_000,
+                    lease_deadline_ms: 51_000,
+                    lease_horizon_authority: Some(certification_heartbeat_binding),
+                })
+                .await
+        });
+        let certification_error = ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(1),
+            certifying_evidence,
+        )
+        .await
+        .expect("evidence certification did not yield to heartbeat")
+        .expect("certifying evidence task failed")
+        .unwrap_err();
+        assert!(matches!(
+            certification_error,
+            ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed { .. }
+        ));
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(2), certification_heartbeat)
+            .await
+            .expect("heartbeat did not proceed after evidence certification yielded")
+            .expect("certification heartbeat task failed")
+            .unwrap();
+        certification_release.0.release();
+        drop(certification_release);
+
+        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(350)).await;
+        authority2.pause_next_proposal_after_lease_confirmation_for_test(Duration::from_millis(
+            350,
+        ));
+        let retry_gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority2
+            .set_low_priority_after_proven_unappended_retry_for_test(Arc::clone(&retry_gate));
+        let retry_release = LowPriorityGateRelease(Arc::clone(&retry_gate));
+        let retry_evidence_authority = Arc::clone(&authority2);
+        let retrying_evidence = ControlPlaneRaftTypeConfig::spawn(async move {
+            retry_evidence_authority
+                .submit_low_priority_control_plane_command(
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(401),
+                        availability: NodeAvailabilityState::Unavailable,
+                    },
+                )
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(2), retry_gate.wait_for_arrival())
+            .await
+            .expect("evidence did not reach the proven-unappended retry boundary");
+
+        let status = authority2.status().await.unwrap();
+        let heartbeat_authority_binding = LeaseHorizonAuthorityBinding::new(
+            1,
+            Some(
+                status
+                    .current_term()
+                    .expect("serving transferred authority should have a term"),
+            ),
+        );
+        let heartbeat_authority = Arc::clone(&authority2);
+        let heartbeat = ControlPlaneRaftTypeConfig::spawn(async move {
+            heartbeat_authority
+                .submit_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat: NodeHeartbeat {
+                        node_id: NodeId::new(402),
+                        node_incarnation: 1,
+                        endpoint: "node-402".to_owned(),
+                        observed_epoch: status.current_cluster_epoch(),
+                        requested_lease_duration_ms: 2_000,
+                        cluster_map_history_route_scan_generation: std::num::NonZeroU64::new(1)
+                            .unwrap(),
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms: 50_000,
+                    lease_deadline_ms: 52_000,
+                    lease_horizon_authority: Some(heartbeat_authority_binding),
+                })
+                .await
+        });
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(1), async {
+            while authority2
+                .evidence_submission_admission
+                .ordinary_waiters
+                .load(Ordering::Acquire)
+                == 0
+            {
+                ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("heartbeat renewal did not register ordinary priority");
+        retry_release.0.release();
+        drop(retry_release);
+
+        let retry_error = ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(1),
+            retrying_evidence,
+        )
+        .await
+        .expect("evidence retry did not yield to heartbeat")
+        .expect("retrying evidence task failed")
+        .unwrap_err();
+        assert!(matches!(
+            retry_error,
+            ControlPlaneError::StagingEvidencePublicationDeferred
+        ));
+        ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(2), heartbeat)
+            .await
+            .expect("heartbeat did not proceed after evidence retry yielded")
+            .expect("heartbeat task failed")
+            .unwrap();
 
         let before_expired_dispatch = authority2.status().await.unwrap().last_log_id();
         authority2.pause_next_proposal_after_lease_confirmation_for_test(Duration::from_millis(

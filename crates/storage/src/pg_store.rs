@@ -149,15 +149,16 @@ pub(crate) use metadata_transfer_staging::{
     decode_staging_evidence, decode_staging_evidence_apply_receipt,
     decode_staging_evidence_page_payload, MetadataTransferStagingEvidence,
     MetadataTransferStagingEvidenceApplyReceipt, MetadataTransferStagingEvidenceKind,
-    MetadataTransferStagingEvidencePage, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    MetadataTransferStagingEvidencePage, MetadataTransferStagingLimits,
+    MetadataTransferStagingNodeIdentity, MetadataTransferStagingStore,
+    METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
 };
 #[cfg(test)]
 pub(crate) use metadata_transfer_staging::{
     metadata_transfer_staging_evidence_page_for_test,
     metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
     metadata_transfer_staging_evidence_page_with_member_actor_for_test,
-    MetadataTransferStagingIntent, MetadataTransferStagingLimits,
-    MetadataTransferStagingNodeIdentity, MetadataTransferStagingStore,
+    MetadataTransferStagingIntent,
 };
 #[path = "pg_store/rows.rs"]
 mod rows;

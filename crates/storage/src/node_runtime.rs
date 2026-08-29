@@ -509,10 +509,10 @@ pub(super) mod pg_store_facade {
         MetadataCommandStartupDisposition, MetadataProofStorageIssuer,
         MetadataTransferStagingEvidence, MetadataTransferStagingEvidenceApplyReceipt,
         MetadataTransferStagingEvidenceKind, MetadataTransferStagingEvidencePage,
-        PendingMetadataCommandSlotInsertError, PendingMetadataCommandSlotReplaceError,
-        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,
-        METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, METADATA_COMMAND_CHECKPOINT_MAGIC,
-        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        MetadataTransferStagingStore, PendingMetadataCommandSlotInsertError,
+        PendingMetadataCommandSlotReplaceError, ScavengerShardFile, ScavengerShardFileScan,
+        ScavengerShardRow, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
+        METADATA_COMMAND_CHECKPOINT_MAGIC, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
     };
     #[cfg(test)]
     pub(crate) use super::pg_store::{
@@ -520,7 +520,7 @@ pub(super) mod pg_store_facade {
         metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
         metadata_transfer_staging_evidence_page_with_member_actor_for_test,
         MetadataTransferStagingIntent, MetadataTransferStagingLimits,
-        MetadataTransferStagingNodeIdentity, MetadataTransferStagingStore,
+        MetadataTransferStagingNodeIdentity,
     };
     pub use super::pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,

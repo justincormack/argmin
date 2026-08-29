@@ -451,9 +451,10 @@ divergent evidence, and missing snapshot members fail closed. Snapshot
 validation treats the receipt actor as historical after admission, so a later
 node incarnation cannot invalidate already accepted evidence. Immutable
 command-v22/state-v34 aggregates remain rejection evidence. Control-plane RPC
-v18, storage outbox publication, finalized-floor cleanup, and isolated
-low-priority admission remain the next protocol slice; no production path can
-submit this command yet.
+v19 and the production storage outbox now submit this command through isolated
+low-priority admission. Finalized-floor cleanup and destination staging remain
+later protocol slices; no production path creates staging publication or
+tombstone evidence yet.
 The storage-owned durable staging foundation is also complete but remains
 protocol-isolated. Staging-store format v1 has a fixed root manifest and exact
 initialization-complete marker, exact SQLite catalogue,
@@ -489,15 +490,44 @@ exactly those page members. The next page is assigned only after that receipt
 is durable and binds its predecessor generation and receipt digest; malformed
 receipts, altered members, and coordinated catalogue corruption fail closed
 during operation or startup validation. Page bytes deliberately exclude
-request IDs, timestamps, expiry, and authenticators. No production startup
-path opens the store yet. The control-plane RPC v18/authentication-envelope-v2
+request IDs, timestamps, expiry, and authenticators. Control-plane-managed
+storage-node startup now opens the established store before listeners and
+starts one independently paced outbox worker with its own authenticated
+control-plane client. The worker loads or replays one exact durable page,
+wraps each attempt in a fresh authentication envelope, records only the exact
+matching apply receipt, and fail-stops the process on local durability,
+protocol, or integrity failure. Retryable transport, leadership, response-loss,
+and bounded evidence-admission failures retain the page and use a one-second
+backoff. Standalone storage nodes do not create this protocol state. The
+control-plane RPC v19/authentication-envelope-v2
 slice now exposes a dedicated storage-node-only evidence operation over
 authenticated Unix and TLS, dispatches the existing replicated evidence
 command, validates the exact canonical apply receipt, and separates its bounded
-request-worker allowance from ordinary control-plane traffic. Production store
-opening, outbox publication, Raft-host low-priority proposal scheduling, and
-finalized-floor pruning remain later slices; no production caller can publish
-staging evidence before those boundaries are complete.
+request-worker allowance from ordinary control-plane traffic. Raft submission
+also serializes evidence proposals separately, yields the heartbeat update
+gate to already-queued ordinary, membership, or lease-renewal mutations, and
+defers at every pre-append preparation, dispatch, and proven-unappended retry
+boundary when a new ordinary waiter appears. The bounded RaftCore enqueue is
+itself raced against waiter registration and is accepted only when its
+cancellation-safe send completes. The final ordinary waiter broadcasts its
+completion so every admitted evidence caller can continue to durable
+serialization. Authenticated evidence saturation is a typed v19 response;
+response loss remains retryable, while observed
+authentication, framing, protocol, and receipt-integrity failures fail-stop.
+After RaftCore accepts a proposal, the evidence lane retains its own
+durable-proposal serialization ownership but releases the heartbeat update
+gate while awaiting commit and application. Volatile heartbeat renewals may
+pass during that interval; ordinary commands and membership changes remain
+queued behind the accepted evidence log entry. Completion waits for queued
+volatile renewals, reacquires the update gate, and always reloads the latest
+volatile overlay for the exact pre-dispatch term and
+applied log before publishing the new overlay base; it never republishes a
+stale overlay captured before dispatch. Promotion completion also preserves an
+overlay that a renewal has already rebound to the promotion log. At most one
+evidence proposal runs at a time, and evidence publication never shares the
+storage node's heartbeat client or submission mutex. Finalized-floor pruning,
+compact actor-chain checkpoints, and destination staging operations remain
+later slices.
 Command v19 additionally sealed the
 post-grace completion fence that prevents survivor heartbeats from indefinitely
 reactivating the old acting set; immutable command v18 remains rejection
@@ -685,7 +715,7 @@ endpoint identity, exact transition binding, artifact digest and byte length,
 staging generation, storage-format version, and an
 explicit fsync scope covering the artifact, catalogue record, and parent
 directory publication. Transport authentication alone is not replicated proof.
-Receipt evidence uses a mandatory control-plane RPC v18 operation separate
+Receipt evidence uses a mandatory control-plane RPC v19 operation separate
 from lease heartbeat renewal. Each authenticated storage node maintains a
 durable outbox of receipt and tombstone deltas. A page binds node identity and
 incarnation, required `previous_generation` and
