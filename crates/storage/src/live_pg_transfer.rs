@@ -2106,7 +2106,7 @@ fn wait_for_source_lease_to_expire(lease_deadline_ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpStream;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2550,21 +2550,15 @@ mod tests {
         let source_socket = tmp.path().join("source.sock");
         let destination_socket = tmp.path().join("destination.sock");
         let control_plane_socket = tmp.path().join("control-plane.sock");
-        let source_tcp_address = tcp.then(|| {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        });
-        let destination_tcp_address = tcp.then(|| {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        });
-        let source_advertised_endpoint = source_tcp_address.map_or_else(
+        let source_tcp_bind_address = tcp.then(|| "127.0.0.1:0".parse().unwrap());
+        let destination_tcp_bind_address = tcp.then(|| "127.0.0.1:0".parse().unwrap());
+        let source_advertised_endpoint = source_tcp_bind_address.map_or_else(
             || source_socket.display().to_string(),
-            |address| format!("tcp://localhost:{}", address.port()),
+            |_| "tcp://source.storage.test:7701".to_owned(),
         );
-        let destination_advertised_endpoint = destination_tcp_address.map_or_else(
+        let destination_advertised_endpoint = destination_tcp_bind_address.map_or_else(
             || destination_socket.display().to_string(),
-            |address| format!("tcp://localhost:{}", address.port()),
+            |_| "tcp://destination.storage.test:7701".to_owned(),
         );
         let now_ms = crate::clock::current_time_millis();
         let _time = crate::clock::test_time_override_guard(now_ms);
@@ -2717,13 +2711,13 @@ mod tests {
         if tcp {
             source_prepared =
                 source_prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp(
-                    source_tcp_address.unwrap(),
+                    source_tcp_bind_address.unwrap(),
                     composed_transfer_tls_certified_key(),
                 )
                 .unwrap()]);
             destination_prepared = destination_prepared.with_rpc_listeners(vec![
                 StorageNodeRpcListenerConfig::tls_tcp(
-                    destination_tcp_address.unwrap(),
+                    destination_tcp_bind_address.unwrap(),
                     composed_transfer_tls_certified_key(),
                 )
                 .unwrap(),
