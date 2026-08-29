@@ -44,6 +44,10 @@ use crate::durable_journal::{
     DurableJournalObserver,
 };
 use crate::internal_tls_protocol::InternalTlsProtocol;
+use crate::pg_store::{
+    decode_staging_evidence_apply_receipt, decode_staging_evidence_page_payload,
+    MetadataTransferStagingEvidenceApplyReceipt, MetadataTransferStagingEvidencePage,
+};
 use crate::static_topology::UncertifiedInitialControlPlaneTopology;
 use crate::{
     ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
@@ -62,7 +66,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 17;
+const CONTROL_PLANE_RPC_VERSION: u16 = 18;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -10932,6 +10936,18 @@ pub trait ControlPlaneAdmin {
         let _ = (work, ready_at_ms);
         Err(ControlPlaneError::rpc_remote(
             "unavailable PG placement completion is not supported by this authority".to_owned(),
+        ))
+    }
+
+    fn apply_metadata_transfer_staging_evidence_page(
+        &mut self,
+        operation_payload: Vec<u8>,
+        page_digest: [u8; 32],
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let _ = (operation_payload, page_digest);
+        Err(ControlPlaneError::rpc_remote(
+            "metadata-transfer staging evidence publication is not supported by this authority"
+                .to_owned(),
         ))
     }
 

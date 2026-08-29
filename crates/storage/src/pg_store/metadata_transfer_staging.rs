@@ -426,6 +426,15 @@ impl MetadataTransferStagingEvidenceApplyReceipt {
     pub(crate) fn page_digest(&self) -> [u8; DIGEST_LEN] {
         self.page_digest
     }
+
+    pub(crate) fn is_for_page(&self, page: &MetadataTransferStagingEvidencePage) -> bool {
+        self.actor == page.actor
+            && self.previous_generation == page.previous_generation
+            && self.previous_apply_receipt_digest == page.previous_apply_receipt_digest
+            && self.generation == page.generation
+            && self.page_digest == page.page_digest
+            && self.accepted_generation == page.generation
+    }
 }
 
 type StagingDurabilityObserver = Arc<dyn Fn() + Send + Sync>;

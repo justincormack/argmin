@@ -371,12 +371,13 @@ pub enum ControlPlaneRpcMetricKind {
     ReestablishAuthorityClock,
     RuntimeMapDiagnostics,
     ServingPgRuntimeMapSnapshot,
+    ApplyMetadataTransferStagingEvidencePage,
     #[default]
     Unknown,
 }
 
 impl ControlPlaneRpcMetricKind {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 18] = [
         Self::RuntimeMapSnapshot,
         Self::RefreshNodeHeartbeat,
         Self::SetPgActingSet,
@@ -393,6 +394,7 @@ impl ControlPlaneRpcMetricKind {
         Self::ReestablishAuthorityClock,
         Self::RuntimeMapDiagnostics,
         Self::ServingPgRuntimeMapSnapshot,
+        Self::ApplyMetadataTransferStagingEvidencePage,
         Self::Unknown,
     ];
 
@@ -421,6 +423,9 @@ impl ControlPlaneRpcMetricKind {
             Self::ReestablishAuthorityClock => "reestablish_authority_clock",
             Self::RuntimeMapDiagnostics => "runtime_map_diagnostics",
             Self::ServingPgRuntimeMapSnapshot => "serving_pg_runtime_map_snapshot",
+            Self::ApplyMetadataTransferStagingEvidencePage => {
+                "apply_metadata_transfer_staging_evidence_page"
+            }
             Self::Unknown => "unknown",
         }
     }

@@ -3839,6 +3839,26 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         )
     }
 
+    fn apply_metadata_transfer_staging_evidence_page(
+        &mut self,
+        operation_payload: Vec<u8>,
+        page_digest: [u8; 32],
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let applied = self.apply_and_commit_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload,
+                page_digest,
+            },
+        )?;
+        let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
+            apply_receipt,
+        } = applied.response()
+        else {
+            unreachable!("staging evidence command returned the wrong response");
+        };
+        Ok(apply_receipt.clone())
+    }
+
     fn fence_pg_for_metadata_transfer(
         &mut self,
         pg_id: PgId,

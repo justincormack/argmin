@@ -490,10 +490,14 @@ is durable and binds its predecessor generation and receipt digest; malformed
 receipts, altered members, and coordinated catalogue corruption fail closed
 during operation or startup validation. Page bytes deliberately exclude
 request IDs, timestamps, expiry, and authenticators. No production startup
-path or RPC opens the store yet. Control-plane RPC v18, replicated evidence
-application, low-priority admission, and production publication workers remain
-later slices, and finalized floors do not prune tombstones or evidence before
-those boundaries are complete.
+path opens the store yet. The control-plane RPC v18/authentication-envelope-v2
+slice now exposes a dedicated storage-node-only evidence operation over
+authenticated Unix and TLS, dispatches the existing replicated evidence
+command, validates the exact canonical apply receipt, and separates its bounded
+request-worker allowance from ordinary control-plane traffic. Production store
+opening, outbox publication, Raft-host low-priority proposal scheduling, and
+finalized-floor pruning remain later slices; no production caller can publish
+staging evidence before those boundaries are complete.
 Command v19 additionally sealed the
 post-grace completion fence that prevents survivor heartbeats from indefinitely
 reactivating the old acting set; immutable command v18 remains rejection
@@ -1020,14 +1024,17 @@ storage RPC boundary and therefore require the corresponding storage-RPC
 version advance, fixed old/new frame evidence, authenticated Unix/TLS coverage,
 and explicit exclusion from ordinary frontend capabilities. Receipt-evidence
 publication crosses the control-plane RPC boundary, so advance control-plane
-RPC v17 to v18 unconditionally. Preserve complete v17 rejection evidence and
-add fixed v18 frames for a genesis page, a successor carrying a non-genesis
+RPC v17 to v18 and the shared authentication envelope from v1 to v2
+unconditionally. Preserve complete v17/v1 rejection evidence and add fixed v18
+frames for a genesis page, a successor carrying a non-genesis
 `previous_apply_receipt_digest`, minimum, maximum-count, maximum-byte,
 multipage, generation-gap, exact-replay, and tombstone/finalized-floor
 evidence. Frame-limit constants and exact-boundary fixtures include the full
 predecessor digest. Omitted, truncated, genesis-on-successor, and incorrect
 digest fixtures must fail before dispatch without replacing the retained apply
-receipt or mutating evidence. Batch transition commands remain leader-internal
+receipt or mutating evidence. Authentication envelope v2 adds distinct
+storage-node request and control-plane response operations so neither side can
+reuse a generic heartbeat or runtime-map capability. Batch transition commands remain leader-internal
 and require no additional
 control-plane RPC operation beyond that receipt protocol.
 

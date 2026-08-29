@@ -1247,6 +1247,25 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
         self.current_snapshot()
     }
 
+    fn apply_metadata_transfer_staging_evidence_page(
+        &mut self,
+        operation_payload: Vec<u8>,
+        page_digest: [u8; 32],
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let response = self.submit_raft_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload,
+                page_digest,
+            },
+        )?;
+        let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt } =
+            response
+        else {
+            unreachable!("staging evidence command returned the wrong response");
+        };
+        Ok(apply_receipt)
+    }
+
     fn fence_pg_for_metadata_transfer(
         &mut self,
         pg_id: PgId,

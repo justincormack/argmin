@@ -5598,7 +5598,7 @@
 
     #[test]
     fn authenticated_storage_rpc_rejects_unsupported_auth_envelope_before_mutation_dispatch() {
-        for unsupported_version in [0_u16, 2] {
+        for unsupported_version in [0_u16, 1, 3] {
             assert_authenticated_transport_rejected_before_mutation_dispatch(
                 &format!("authenticator-valid auth envelope v{unsupported_version}"),
                 "storage RPC stream I/O error: storage RPC authentication rejected: Envelope(UnsupportedVersion)",

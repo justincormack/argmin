@@ -2389,7 +2389,7 @@ fn control_plane_raft_peer_server_poison_after_validation_prevents_dispatch() {
 
 #[test]
 fn control_plane_raft_peer_server_rejects_resigned_auth_versions_before_dispatch() {
-    for auth_version in [0_u16, 2] {
+    for auth_version in [0_u16, 1, 3] {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()

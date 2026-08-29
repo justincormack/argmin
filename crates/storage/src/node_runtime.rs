@@ -508,10 +508,11 @@ pub(super) mod pg_store_facade {
         decode_staging_evidence_apply_receipt, decode_staging_evidence_page_payload,
         MetadataCommandStartupDisposition, MetadataProofStorageIssuer,
         MetadataTransferStagingEvidence, MetadataTransferStagingEvidenceApplyReceipt,
-        MetadataTransferStagingEvidenceKind, PendingMetadataCommandSlotInsertError,
-        PendingMetadataCommandSlotReplaceError, ScavengerShardFile, ScavengerShardFileScan,
-        ScavengerShardRow, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
-        METADATA_COMMAND_CHECKPOINT_MAGIC, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        MetadataTransferStagingEvidenceKind, MetadataTransferStagingEvidencePage,
+        PendingMetadataCommandSlotInsertError, PendingMetadataCommandSlotReplaceError,
+        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,
+        METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, METADATA_COMMAND_CHECKPOINT_MAGIC,
+        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
     };
     #[cfg(test)]
     pub(crate) use super::pg_store::{

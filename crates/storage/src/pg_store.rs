@@ -149,7 +149,7 @@ pub(crate) use metadata_transfer_staging::{
     decode_staging_evidence, decode_staging_evidence_apply_receipt,
     decode_staging_evidence_page_payload, MetadataTransferStagingEvidence,
     MetadataTransferStagingEvidenceApplyReceipt, MetadataTransferStagingEvidenceKind,
-    METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    MetadataTransferStagingEvidencePage, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
 };
 #[cfg(test)]
 pub(crate) use metadata_transfer_staging::{

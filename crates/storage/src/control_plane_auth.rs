@@ -7,7 +7,7 @@ use placement::NodeId;
 use std::fmt;
 
 const CONTROL_PLANE_AUTH_MAGIC: &[u8; 8] = b"ARGCPAUT";
-const CONTROL_PLANE_AUTH_VERSION: u16 = 1;
+const CONTROL_PLANE_AUTH_VERSION: u16 = 2;
 const CONTROL_PLANE_AUTH_MAX_CLUSTER_ID_LEN: usize = 256;
 const CONTROL_PLANE_AUTH_MAX_CREDENTIAL_ID_LEN: usize = 128;
 const CONTROL_PLANE_AUTH_MAX_INSTANCE_ID_LEN: usize = 128;
@@ -178,10 +178,12 @@ pub enum ControlPlaneAuthOperation {
     RaftPreVote,
     RaftSnapshot,
     RaftTransferLeader,
+    StorageStagingEvidencePublish,
     StorageRuntimeMapRefresh,
     FrontendRuntimeMapRead,
     AdminControlPlaneCommand,
     RuntimeMapResponse,
+    StagingEvidenceResponse,
     AdminControlPlaneResponse,
     StorageRpcRequest { message_kind: u16 },
     StorageRpcResponse { message_kind: u16 },
@@ -350,6 +352,28 @@ impl ControlPlaneScopedCredential {
             credential_version: self.credential_version,
             principal: ControlPlaneAuthPrincipal::Service {
                 service: ControlPlaneAuthService::RuntimeMap,
+            },
+            secret: self.secret.clone(),
+        })
+    }
+
+    pub(crate) fn staging_evidence_response_credential_for_storage_node(
+        &self,
+    ) -> Result<Self, ControlPlaneError> {
+        if !matches!(
+            self.principal,
+            ControlPlaneAuthPrincipal::StorageNode { .. }
+        ) {
+            return Err(auth_protocol_error(
+                "staging-evidence response credential requires a storage-node scoped credential",
+            ));
+        }
+        Self::new(ControlPlaneScopedCredentialInput {
+            cluster_id: self.cluster_id.clone(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            principal: ControlPlaneAuthPrincipal::Service {
+                service: ControlPlaneAuthService::ControlPlane,
             },
             secret: self.secret.clone(),
         })
@@ -1255,6 +1279,7 @@ enum ControlPlaneAuthOperationTag {
     RaftPreVote = 3,
     RaftSnapshot = 4,
     RaftTransferLeader = 5,
+    StorageStagingEvidencePublish = 6,
     StorageRuntimeMapRefresh = 7,
     FrontendRuntimeMapRead = 8,
     AdminControlPlaneCommand = 9,
@@ -1262,16 +1287,18 @@ enum ControlPlaneAuthOperationTag {
     AdminControlPlaneResponse = 11,
     StorageRpcRequest = 12,
     StorageRpcResponse = 13,
+    StagingEvidenceResponse = 14,
 }
 
 impl ControlPlaneAuthOperationTag {
     #[cfg(test)]
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 14] = [
         Self::RaftAppendEntries,
         Self::RaftVote,
         Self::RaftPreVote,
         Self::RaftSnapshot,
         Self::RaftTransferLeader,
+        Self::StorageStagingEvidencePublish,
         Self::StorageRuntimeMapRefresh,
         Self::FrontendRuntimeMapRead,
         Self::AdminControlPlaneCommand,
@@ -1279,6 +1306,7 @@ impl ControlPlaneAuthOperationTag {
         Self::AdminControlPlaneResponse,
         Self::StorageRpcRequest,
         Self::StorageRpcResponse,
+        Self::StagingEvidenceResponse,
     ];
 
     fn from_u8(tag: u8) -> Result<Self, ControlPlaneError> {
@@ -1288,6 +1316,7 @@ impl ControlPlaneAuthOperationTag {
             3 => Ok(Self::RaftPreVote),
             4 => Ok(Self::RaftSnapshot),
             5 => Ok(Self::RaftTransferLeader),
+            6 => Ok(Self::StorageStagingEvidencePublish),
             7 => Ok(Self::StorageRuntimeMapRefresh),
             8 => Ok(Self::FrontendRuntimeMapRead),
             9 => Ok(Self::AdminControlPlaneCommand),
@@ -1295,6 +1324,7 @@ impl ControlPlaneAuthOperationTag {
             11 => Ok(Self::AdminControlPlaneResponse),
             12 => Ok(Self::StorageRpcRequest),
             13 => Ok(Self::StorageRpcResponse),
+            14 => Ok(Self::StagingEvidenceResponse),
             _ => Err(auth_protocol_error(format!(
                 "unknown control-plane auth operation tag {tag}"
             ))),
@@ -1315,6 +1345,9 @@ fn control_plane_auth_operation_tag(
         ControlPlaneAuthOperation::RaftTransferLeader => {
             ControlPlaneAuthOperationTag::RaftTransferLeader
         }
+        ControlPlaneAuthOperation::StorageStagingEvidencePublish => {
+            ControlPlaneAuthOperationTag::StorageStagingEvidencePublish
+        }
         ControlPlaneAuthOperation::StorageRuntimeMapRefresh => {
             ControlPlaneAuthOperationTag::StorageRuntimeMapRefresh
         }
@@ -1326,6 +1359,9 @@ fn control_plane_auth_operation_tag(
         }
         ControlPlaneAuthOperation::RuntimeMapResponse => {
             ControlPlaneAuthOperationTag::RuntimeMapResponse
+        }
+        ControlPlaneAuthOperation::StagingEvidenceResponse => {
+            ControlPlaneAuthOperationTag::StagingEvidenceResponse
         }
         ControlPlaneAuthOperation::AdminControlPlaneResponse => {
             ControlPlaneAuthOperationTag::AdminControlPlaneResponse
@@ -1361,6 +1397,9 @@ fn read_operation(
         ControlPlaneAuthOperationTag::RaftTransferLeader => {
             Ok(ControlPlaneAuthOperation::RaftTransferLeader)
         }
+        ControlPlaneAuthOperationTag::StorageStagingEvidencePublish => {
+            Ok(ControlPlaneAuthOperation::StorageStagingEvidencePublish)
+        }
         ControlPlaneAuthOperationTag::StorageRuntimeMapRefresh => {
             Ok(ControlPlaneAuthOperation::StorageRuntimeMapRefresh)
         }
@@ -1372,6 +1411,9 @@ fn read_operation(
         }
         ControlPlaneAuthOperationTag::RuntimeMapResponse => {
             Ok(ControlPlaneAuthOperation::RuntimeMapResponse)
+        }
+        ControlPlaneAuthOperationTag::StagingEvidenceResponse => {
+            Ok(ControlPlaneAuthOperation::StagingEvidenceResponse)
         }
         ControlPlaneAuthOperationTag::AdminControlPlaneResponse => {
             Ok(ControlPlaneAuthOperation::AdminControlPlaneResponse)
@@ -1673,7 +1715,30 @@ mod tests {
         targets
     }
 
-    fn auth_catalogue_operations() -> [ControlPlaneAuthOperation; 12] {
+    fn auth_catalogue_operations() -> [ControlPlaneAuthOperation; 14] {
+        [
+            ControlPlaneAuthOperation::RaftAppendEntries,
+            ControlPlaneAuthOperation::RaftVote,
+            ControlPlaneAuthOperation::RaftPreVote,
+            ControlPlaneAuthOperation::RaftSnapshot,
+            ControlPlaneAuthOperation::RaftTransferLeader,
+            ControlPlaneAuthOperation::StorageStagingEvidencePublish,
+            ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+            ControlPlaneAuthOperation::FrontendRuntimeMapRead,
+            ControlPlaneAuthOperation::AdminControlPlaneCommand,
+            ControlPlaneAuthOperation::RuntimeMapResponse,
+            ControlPlaneAuthOperation::AdminControlPlaneResponse,
+            ControlPlaneAuthOperation::StorageRpcRequest {
+                message_kind: 0x1234,
+            },
+            ControlPlaneAuthOperation::StorageRpcResponse {
+                message_kind: 0xabcd,
+            },
+            ControlPlaneAuthOperation::StagingEvidenceResponse,
+        ]
+    }
+
+    fn auth_v1_catalogue_operations() -> [ControlPlaneAuthOperation; 12] {
         [
             ControlPlaneAuthOperation::RaftAppendEntries,
             ControlPlaneAuthOperation::RaftVote,
@@ -1710,6 +1775,7 @@ mod tests {
         target: ControlPlaneAuthTarget,
         operation: ControlPlaneAuthOperation,
         present_options: bool,
+        version: u16,
     ) {
         let credential_id = format!("catalogue-credential-{case_index}");
         let secret = format!("catalogue-secret-{case_index}").into_bytes();
@@ -1732,41 +1798,50 @@ mod tests {
         } else {
             (None, None, None, Vec::new(), Vec::new())
         };
-        let envelope = credential
-            .sign_envelope(ControlPlaneAuthSignInput {
-                target: target.clone(),
-                operation,
-                issued_at_ms,
-                expires_at_ms,
-                sequence,
-                nonce,
-                payload,
-            })
+        let sign_input = ControlPlaneAuthSignInput {
+            target: target.clone(),
+            operation,
+            issued_at_ms,
+            expires_at_ms,
+            sequence,
+            nonce,
+            payload,
+        };
+        let encoded = credential
+            .sign_envelope_frame_with_version_for_test(sign_input, version)
             .unwrap();
-        let covered = envelope
-            .header()
-            .encode_covered_bytes(envelope.payload())
-            .unwrap();
-        let encoded = envelope.encode_frame().unwrap();
-        assert!(encoded.starts_with(&covered));
-        assert_eq!(envelope.authenticator().len(), 32);
-        let decoded = ControlPlaneAuthEnvelope::decode_frame_classified(&encoded, 1024).unwrap();
-        assert_eq!(decoded, envelope);
-        let verifier = ControlPlaneScopedCredentialStore::new(vec![credential]).unwrap();
-        assert_eq!(
-            verifier.verify_envelope(ControlPlaneAuthVerificationInput {
-                envelope: &decoded,
-                expected_cluster_id: "catalogue-cluster",
-                expected_source: &source,
-                expected_target: &target,
-                expected_operation: operation,
-                replay_policy: ControlPlaneAuthReplayPolicy::FencedByPayloadSemantics,
-            }),
-            ControlPlaneAuthDecision::Accepted {
-                credential_id,
-                credential_version: 9,
-            }
-        );
+        if version == CONTROL_PLANE_AUTH_VERSION {
+            let decoded =
+                ControlPlaneAuthEnvelope::decode_frame_classified(&encoded, 1024).unwrap();
+            assert_eq!(decoded.authenticator().len(), 32);
+            let covered = decoded
+                .header()
+                .encode_covered_bytes(decoded.payload())
+                .unwrap();
+            assert!(encoded.starts_with(&covered));
+            let verifier = ControlPlaneScopedCredentialStore::new(vec![credential]).unwrap();
+            assert_eq!(
+                verifier.verify_envelope(ControlPlaneAuthVerificationInput {
+                    envelope: &decoded,
+                    expected_cluster_id: "catalogue-cluster",
+                    expected_source: &source,
+                    expected_target: &target,
+                    expected_operation: operation,
+                    replay_policy: ControlPlaneAuthReplayPolicy::FencedByPayloadSemantics,
+                }),
+                ControlPlaneAuthDecision::Accepted {
+                    credential_id,
+                    credential_version: 9,
+                }
+            );
+        } else {
+            assert!(matches!(
+                ControlPlaneAuthEnvelope::decode_frame_classified(&encoded, 1024),
+                Err(ControlPlaneAuthEnvelopeDecodeError::Format(
+                    ControlPlaneAuthEnvelopeFormatError::UnsupportedVersion(actual)
+                )) if actual == version
+            ));
+        }
         write_u32(aggregate, case_index);
         write_u32(aggregate, u32::try_from(encoded.len()).unwrap());
         aggregate.extend_from_slice(&encoded);
@@ -1847,8 +1922,8 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_auth_envelope_v1_catalogue_is_exact() {
-        assert_eq!(CONTROL_PLANE_AUTH_VERSION, 1);
+    fn control_plane_auth_envelope_v2_catalogue_is_exact() {
+        assert_eq!(CONTROL_PLANE_AUTH_VERSION, 2);
         assert_eq!(
             (0..=u8::MAX)
                 .filter_map(|tag| ControlPlaneAuthPrincipalTag::from_u8(tag).ok())
@@ -1933,6 +2008,7 @@ mod tests {
                 ControlPlaneAuthTarget::Service(ControlPlaneAuthService::ControlPlane),
                 ControlPlaneAuthOperation::RaftAppendEntries,
                 !case_index.is_multiple_of(2),
+                CONTROL_PLANE_AUTH_VERSION,
             );
             case_index += 1;
         }
@@ -1944,6 +2020,7 @@ mod tests {
                 target,
                 ControlPlaneAuthOperation::RaftVote,
                 !case_index.is_multiple_of(2),
+                CONTROL_PLANE_AUTH_VERSION,
             );
             case_index += 1;
         }
@@ -1957,6 +2034,65 @@ mod tests {
                 }),
                 operation,
                 !case_index.is_multiple_of(2),
+                CONTROL_PLANE_AUTH_VERSION,
+            );
+            case_index += 1;
+        }
+        assert_eq!(case_index, 29);
+        assert_eq!(
+            (
+                aggregate.len(),
+                auth_catalogue_hex(&checksum::sha256::digest(&aggregate))
+            ),
+            (
+                4_405,
+                "05473b69584b9b20fd6a9afdef2017b8d34f487a7d6e1b1c98e701bd09b640ed".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn control_plane_auth_envelope_v1_catalogue_remains_rejected_evidence() {
+        let principals = auth_catalogue_principals();
+        let targets = auth_catalogue_targets();
+        let operations = auth_v1_catalogue_operations();
+        let mut aggregate = Vec::new();
+        let mut case_index = 0_u32;
+        for source in principals {
+            append_signed_auth_catalogue_case(
+                &mut aggregate,
+                case_index,
+                source,
+                ControlPlaneAuthTarget::Service(ControlPlaneAuthService::ControlPlane),
+                ControlPlaneAuthOperation::RaftAppendEntries,
+                !case_index.is_multiple_of(2),
+                1,
+            );
+            case_index += 1;
+        }
+        for target in targets {
+            append_signed_auth_catalogue_case(
+                &mut aggregate,
+                case_index,
+                ControlPlaneAuthPrincipal::RaftPeer { node_id: 31 },
+                target,
+                ControlPlaneAuthOperation::RaftVote,
+                !case_index.is_multiple_of(2),
+                1,
+            );
+            case_index += 1;
+        }
+        for operation in operations {
+            append_signed_auth_catalogue_case(
+                &mut aggregate,
+                case_index,
+                ControlPlaneAuthPrincipal::RaftPeer { node_id: 41 },
+                ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 42,
+                }),
+                operation,
+                !case_index.is_multiple_of(2),
+                1,
             );
             case_index += 1;
         }
@@ -1992,7 +2128,7 @@ mod tests {
             ))
         ));
 
-        for version in [0_u16, 2] {
+        for version in [0_u16, 1, 3] {
             let mut unsupported = encoded.clone();
             unsupported[CONTROL_PLANE_AUTH_MAGIC.len()
                 ..CONTROL_PLANE_AUTH_MAGIC.len() + std::mem::size_of::<u16>()]
@@ -2073,7 +2209,7 @@ mod tests {
         assert!(ControlPlaneAuthEnvelope::decode_frame(&bad_magic, 1024).is_err());
 
         let mut bad_version = encoded.clone();
-        bad_version[9] = 2;
+        bad_version[9] = 3;
         assert!(ControlPlaneAuthEnvelope::decode_frame(&bad_version, 1024).is_err());
 
         let mut trailing = encoded;
@@ -2099,14 +2235,14 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_auth_rejects_retired_wire_tags() {
+    fn control_plane_auth_rejects_retired_and_unassigned_wire_tags() {
         for tag in [2, 4] {
             let payload = [tag];
             let mut reader = AuthPayloadReader::new(&payload);
             assert!(read_service(&mut reader).is_err());
         }
 
-        let payload = [6];
+        let payload = [15];
         let mut reader = AuthPayloadReader::new(&payload);
         assert!(read_operation(&mut reader).is_err());
     }
