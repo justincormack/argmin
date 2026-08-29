@@ -681,6 +681,7 @@ fn stream_put_create_command_id_race_releases_reservation_and_retries() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamPutFinalizeCommandIdRace {
     PendingDrain(crate::cluster::request_ops::StreamPutPendingDrainTestAction),
+    AbandonedTerminalCleanup,
     StaleSnapshotPastLegacyBudget,
 }
 
@@ -804,6 +805,7 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
     let hook_ran_for_closure = Arc::clone(&hook_ran);
     let recovery_owner = Arc::new(Mutex::new(None));
     let recovery_owner_for_hook = Arc::clone(&recovery_owner);
+    let (recovery_transferred_tx, recovery_transferred_rx) = std::sync::mpsc::sync_channel(1);
     let _hook_guard = first_cluster.test_install_before_stream_put_finalize_command_id_hook(
         Arc::new(move || {
             if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
@@ -848,14 +850,16 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
                 Some(&hook_bucket),
             )
             .unwrap();
-            let owner = match recovery_map
-                .runtime_state()
-                .join_metadata_command_recovery(pg_id, &command)
-            {
-                crate::cluster::MetadataCommandRecoveryAdmission::Leader(owner) => owner,
-                _ => panic!("late stream PUT contender must acquire the recovery flight"),
-            };
-            *recovery_owner_for_hook.lock().unwrap() = Some(owner);
+            if matches!(mode, StreamPutFinalizeCommandIdRace::PendingDrain(_)) {
+                let owner = match recovery_map
+                    .runtime_state()
+                    .join_metadata_command_recovery(pg_id, &command)
+                {
+                    crate::cluster::MetadataCommandRecoveryAdmission::Leader(owner) => owner,
+                    _ => panic!("late stream PUT contender must acquire the recovery flight"),
+                };
+                *recovery_owner_for_hook.lock().unwrap() = Some(owner);
+            }
         }),
     );
 
@@ -879,40 +883,173 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
                 ) {
                     drop(recovery_owner_for_timeout.lock().unwrap().take());
                 }
+                if injected_action
+                    == crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred
+                {
+                    recovery_transferred_tx.send(()).unwrap();
+                }
                 injected_action
             } else {
                 crate::cluster::request_ops::StreamPutPendingDrainTestAction::Continue
             }
         }));
 
+    let abandoned_drain_pending = Arc::new(AtomicBool::new(
+        mode == StreamPutFinalizeCommandIdRace::AbandonedTerminalCleanup,
+    ));
+    let abandoned_drain_pending_for_hook = Arc::clone(&abandoned_drain_pending);
+    let abandoned_recovery_cluster = Arc::clone(&first_cluster);
+    let _abandoned_drain_hook = first_cluster
+        .test_install_pending_object_metadata_command_drain_attempt_hook(Arc::new(
+            move |command, _work_budget| {
+                if matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.generation_id == winner_generation_id
+                ) && abandoned_drain_pending_for_hook.swap(false, Ordering::SeqCst)
+                {
+                    abandoned_recovery_cluster
+                        .test_record_abandoned_metadata_command_to_acting_set_until(
+                            command,
+                            Instant::now() + Duration::from_secs(5),
+                        )
+                        .unwrap();
+                }
+                Ok(())
+            },
+        ));
+    let terminal_cleanup_blocked = Arc::new(AtomicBool::new(
+        mode == StreamPutFinalizeCommandIdRace::AbandonedTerminalCleanup,
+    ));
+    let terminal_cleanup_blocked_for_hook = Arc::clone(&terminal_cleanup_blocked);
+    let _terminal_cleanup_hook = first_cluster
+        .test_install_global_metadata_command_terminal_slot_removal_hook(Arc::new(
+            move |command| {
+                matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.generation_id == winner_generation_id
+                ) && terminal_cleanup_blocked_for_hook.load(Ordering::SeqCst)
+            },
+        ));
+
     let calls_for_action = Arc::clone(&action_calls);
-    let result = first_cluster.finalize_put_object_stream(
-        &bucket,
-        &key,
-        &session_id,
-        stream_payload.len() as u64,
-        move |snapshot| {
-            calls_for_action.fetch_add(1, Ordering::SeqCst);
-            if mode == StreamPutFinalizeCommandIdRace::StaleSnapshotPastLegacyBudget
-                && snapshot.existing_etag.is_some()
-            {
-                return Err("if-none-match failed");
+    let finalize = || {
+        first_cluster.finalize_put_object_stream(
+            &bucket,
+            &key,
+            &session_id,
+            stream_payload.len() as u64,
+            move |snapshot| {
+                calls_for_action.fetch_add(1, Ordering::SeqCst);
+                if mode == StreamPutFinalizeCommandIdRace::StaleSnapshotPastLegacyBudget
+                    && snapshot.existing_etag.is_some()
+                {
+                    return Err("if-none-match failed");
+                }
+                Ok::<_, &'static str>(crate::PreparedStreamPutCommit {
+                    value: snapshot.existing_etag,
+                    versioning: crate::BucketVersioningState::Disabled,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: crate::AclGrants::default(),
+                    public_read: false,
+                    etag_crc64: stream_crc64,
+                    tags: None,
+                    metadata_blob: crate::SerializedMetadataBlob::default(),
+                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::ObjectEncryption::None,
+                })
+            },
+        )
+    };
+    let result = match mode {
+        StreamPutFinalizeCommandIdRace::PendingDrain(
+            crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred,
+        ) => thread::scope(|scope| {
+            let recovery_cluster = &first_cluster;
+            let recovery_map = &first_map;
+            let recovery_bucket = &bucket;
+            let recovery = scope.spawn(move || {
+                recovery_transferred_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("late stream finalizer did not relinquish recovery");
+                let command =
+                    pending_metadata_command_for_test(recovery_map, PgId::new(2), recovery_bucket)
+                        .expect("late stream finalization recovery command must remain pending");
+                assert_eq!(
+                    recovery_cluster
+                        .drain_pending_metadata_command_with_authorized_recovery_route(
+                            PgId::new(2),
+                            &command,
+                            recovery_cluster,
+                        )
+                        .unwrap(),
+                    PendingMetadataCommandOutcome::Applied
+                );
+            });
+            let result = finalize();
+            recovery.join().unwrap();
+            result
+        }),
+        StreamPutFinalizeCommandIdRace::AbandonedTerminalCleanup => thread::scope(|scope| {
+            let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || result_tx.send(finalize()).unwrap());
+
+            let pg_id = PgId::new(2);
+            let handoff_deadline = Instant::now() + Duration::from_secs(5);
+            while abandoned_drain_pending.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < handoff_deadline,
+                    "stream finalizer did not enter abandoned-command recovery"
+                );
+                thread::sleep(Duration::from_millis(1));
             }
-            Ok::<_, &'static str>(crate::PreparedStreamPutCommit {
-                value: snapshot.existing_etag,
-                versioning: crate::BucketVersioningState::Disabled,
-                owner: crate::OwnerIdentity::from_principal("owner"),
-                acl_grants: crate::AclGrants::default(),
-                public_read: false,
-                etag_crc64: stream_crc64,
-                tags: None,
-                metadata_blob: crate::SerializedMetadataBlob::default(),
-                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
-            })
-        },
-    );
+            let command = pending_metadata_command_for_test(&first_map, pg_id, &bucket)
+                .expect("deferred abandoned cleanup must retain the pending command");
+            while !first_map
+                .runtime_state()
+                .test_metadata_command_recovery_handoff_requested(pg_id, &command)
+            {
+                assert!(
+                    Instant::now() < handoff_deadline,
+                    "abandoned stream cleanup did not relinquish to authorized recovery"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(matches!(
+                result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+
+            terminal_cleanup_blocked.store(false, Ordering::SeqCst);
+            let recovery_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match first_cluster
+                    .drain_pending_metadata_command_with_authorized_recovery_route(
+                        pg_id,
+                        &command,
+                        &first_cluster,
+                    )
+                    .unwrap()
+                {
+                    PendingMetadataCommandOutcome::Abandoned => break,
+                    PendingMetadataCommandOutcome::TerminalCleanupPending { applied: false } => {
+                        assert!(
+                            Instant::now() < recovery_deadline,
+                            "authorized recovery did not remove the abandoned stream terminal slot"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    outcome => panic!("unexpected authorized recovery outcome: {outcome:?}"),
+                }
+            }
+            result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("stream finalizer did not finish after authorized terminal cleanup")
+        }),
+        _ => finalize(),
+    };
     assert!(hook_ran.load(Ordering::SeqCst));
     if mode == StreamPutFinalizeCommandIdRace::StaleSnapshotPastLegacyBudget {
         assert!(!recovery_timeout_observed.load(Ordering::SeqCst));
@@ -962,14 +1099,10 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
             crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred,
         )
     {
-        let error = result.expect_err("relinquished recovery must stop late finalization");
-        assert!(matches!(
-            error,
-            crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
-        ));
-        assert_eq!(action_calls.load(Ordering::SeqCst), 1);
-        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_some());
-        return;
+        assert!(
+            result.is_ok(),
+            "late finalization must await authorized recovery: {result:?}"
+        );
     }
     let result = result.unwrap().unwrap();
     assert_eq!(
@@ -977,10 +1110,19 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
         2,
         "stream PUT finalization must rerun after command-id contention"
     );
-    assert!(
-        result.value.is_some(),
-        "retry should observe the drained winner as the stale payload"
-    );
+    if mode == StreamPutFinalizeCommandIdRace::AbandonedTerminalCleanup {
+        assert!(
+            result.value.is_none(),
+            "retry must not project an abandoned winner"
+        );
+        assert!(!abandoned_drain_pending.load(Ordering::SeqCst));
+        assert!(!terminal_cleanup_blocked.load(Ordering::SeqCst));
+    } else {
+        assert!(
+            result.value.is_some(),
+            "retry should observe the drained winner as the stale payload"
+        );
+    }
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
 
     for node_id in node_ids {
@@ -1027,10 +1169,17 @@ fn stream_put_finalize_late_awaiting_authorized_recovery_retries() {
 }
 
 #[test]
-fn stream_put_finalize_late_relinquished_recovery_does_not_retry() {
+fn stream_put_finalize_late_relinquished_recovery_waits_for_authorized_recovery() {
     assert_stream_put_finalize_command_id_race(StreamPutFinalizeCommandIdRace::PendingDrain(
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred,
     ));
+}
+
+#[test]
+fn stream_put_finalize_waits_for_abandoned_terminal_cleanup() {
+    assert_stream_put_finalize_command_id_race(
+        StreamPutFinalizeCommandIdRace::AbandonedTerminalCleanup,
+    );
 }
 
 #[test]

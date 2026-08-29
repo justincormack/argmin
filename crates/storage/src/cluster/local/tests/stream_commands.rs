@@ -3388,7 +3388,7 @@ fn stream_abort_matching_pending_install_race_returns_success() {
 }
 
 #[test]
-fn stream_put_maps_unrelated_abort_convergence_to_contention() {
+fn stream_put_waits_for_unrelated_abort_authorized_recovery() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -3465,9 +3465,11 @@ fn stream_put_maps_unrelated_abort_convergence_to_contention() {
     let hook_command = command.clone();
     let hook_calls = Arc::new(AtomicUsize::new(0));
     let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = Arc::clone(&fail_once);
     let _hook =
         cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
-            if candidate == &hook_command {
+            if candidate == &hook_command && fail_once_for_hook.swap(false, Ordering::SeqCst) {
                 hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
                 let id = candidate.id();
                 return Err(StoreError::MetadataCommandIrrevocableConvergencePending {
@@ -3479,41 +3481,69 @@ fn stream_put_maps_unrelated_abort_convergence_to_contention() {
             Ok(())
         }));
 
-    let error = cluster
-        .finalize_put_object_stream(&bucket, &waiter_key, &waiter_session_id, 0, |_| {
-            Ok::<_, ()>(crate::PreparedStreamPutCommit {
-                value: (),
-                versioning: crate::BucketVersioningState::Disabled,
-                owner: crate::OwnerIdentity::from_principal("owner"),
-                acl_grants: crate::AclGrants::default(),
-                public_read: false,
-                etag_crc64: checksum::crc64::checksum(&[]),
-                tags: None,
-                metadata_blob: crate::SerializedMetadataBlob::default(),
-                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
-            })
-        })
-        .expect_err("an unrelated abort awaiting recovery must be retryable contention");
+    let outcome = thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let waiter_cluster = &cluster;
+        let waiter_bucket = &bucket;
+        let waiter_key = &waiter_key;
+        let waiter_session_id = &waiter_session_id;
+        scope.spawn(move || {
+            result_tx
+                .send(waiter_cluster.finalize_put_object_stream(
+                    waiter_bucket,
+                    waiter_key,
+                    waiter_session_id,
+                    0,
+                    |_| {
+                        Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                            value: (),
+                            versioning: crate::BucketVersioningState::Disabled,
+                            owner: crate::OwnerIdentity::from_principal("owner"),
+                            acl_grants: crate::AclGrants::default(),
+                            public_read: false,
+                            etag_crc64: checksum::crc64::checksum(&[]),
+                            tags: None,
+                            metadata_blob: crate::SerializedMetadataBlob::default(),
+                            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                            object_lock: crate::ObjectLockState::default(),
+                            encryption: crate::ObjectEncryption::None,
+                        })
+                    },
+                ))
+                .unwrap();
+        });
 
-    assert!(
-        matches!(
-            &error,
-            crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
-        ),
-        "unexpected stream PUT drain error: {error:?}"
-    );
-    assert_eq!(
-        crate::StreamUploadFailure::from_object_pg_action(error).kind(),
-        crate::StreamUploadFailureKind::MetadataCommandContention
-    );
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "stream PUT did not relinquish the unrelated abort to authorized recovery"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream PUT did not resume after authorized abort recovery")
+            .unwrap()
+            .unwrap()
+    });
+
+    assert_eq!(outcome.value, ());
     assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        pending_metadata_command_for_test(&map, pg_id, &bucket),
-        Some(command.clone())
-    );
-    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
 }
 
 #[test]
@@ -4269,6 +4299,7 @@ fn assert_stream_put_finalize_pending_drain_failure_policy(
     };
     let owner = Arc::new(Mutex::new(Some(owner)));
     let owner_for_hook = Arc::clone(&owner);
+    let (recovery_transferred_tx, recovery_transferred_rx) = std::sync::mpsc::sync_channel(1);
     let injected = Arc::new(AtomicBool::new(false));
     let injected_for_hook = Arc::clone(&injected);
     let hook = cluster.test_install_stream_put_pending_drain_hook(Arc::new(move |event| {
@@ -4280,8 +4311,14 @@ fn assert_stream_put_finalize_pending_drain_failure_policy(
                 crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
                     | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure
                     | crate::cluster::request_ops::StreamPutPendingDrainTestAction::AwaitingAuthorizedRecovery
+                    | crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred
             ) {
                 drop(owner_for_hook.lock().unwrap().take());
+            }
+            if injected_action
+                == crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred
+            {
+                recovery_transferred_tx.send(()).unwrap();
             }
             injected_action
         } else {
@@ -4290,22 +4327,52 @@ fn assert_stream_put_finalize_pending_drain_failure_policy(
     }));
 
     let action_calls = Arc::new(AtomicUsize::new(0));
-    let result = cluster.finalize_put_object_stream(&bucket, &key, &session_id, 0, |_| {
-        action_calls.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, ()>(crate::PreparedStreamPutCommit {
-            value: (),
-            versioning: crate::BucketVersioningState::Disabled,
-            owner: crate::OwnerIdentity::from_principal("owner"),
-            acl_grants: crate::AclGrants::default(),
-            public_read: false,
-            etag_crc64: checksum::crc64::checksum(&[]),
-            tags: None,
-            metadata_blob: crate::SerializedMetadataBlob::default(),
-            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-            object_lock: crate::ObjectLockState::default(),
-            encryption: crate::ObjectEncryption::None,
+    let finalize = || {
+        cluster.finalize_put_object_stream(&bucket, &key, &session_id, 0, |_| {
+            action_calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: checksum::crc64::checksum(&[]),
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
         })
-    });
+    };
+    let result = if injected_action
+        == crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred
+    {
+        thread::scope(|scope| {
+            let recovery_cluster = &cluster;
+            let recovery_command = &unrelated;
+            let recovery = scope.spawn(move || {
+                recovery_transferred_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("stream PUT finalizer did not relinquish unrelated recovery");
+                assert_eq!(
+                    recovery_cluster
+                        .drain_pending_metadata_command_with_authorized_recovery_route(
+                            pg_id,
+                            recovery_command,
+                            recovery_cluster,
+                        )
+                        .unwrap(),
+                    PendingMetadataCommandOutcome::Applied
+                );
+            });
+            let result = finalize();
+            recovery.join().unwrap();
+            result
+        })
+    } else {
+        finalize()
+    };
     drop(hook);
     assert!(injected.load(Ordering::SeqCst));
     match injected_action {
@@ -4330,12 +4397,12 @@ fn assert_stream_put_finalize_pending_drain_failure_policy(
             assert_eq!(action_calls.load(Ordering::SeqCst), 0);
         }
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred => {
-            let error = result.expect_err("relinquished recovery must stop finalization");
-            assert!(matches!(
-                error,
-                crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
-            ));
-            assert_eq!(action_calls.load(Ordering::SeqCst), 0);
+            result
+                .expect("relinquished unrelated recovery must be awaited")
+                .expect("stream PUT preparation should succeed after authorized recovery");
+            assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+            assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+            assert_bucket_write_reservations_released(&map, &bucket);
         }
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::Continue => {
             unreachable!("test helper requires an injected stream drain action")
@@ -4368,7 +4435,7 @@ fn stream_put_finalize_retries_awaiting_authorized_recovery() {
 }
 
 #[test]
-fn stream_put_finalize_does_not_retry_relinquished_recovery() {
+fn stream_put_finalize_waits_for_relinquished_unrelated_recovery() {
     assert_stream_put_finalize_pending_drain_failure_policy(
         false,
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::RecoveryTransferred,

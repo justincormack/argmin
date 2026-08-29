@@ -470,6 +470,17 @@ impl super::StorageCluster {
                     );
                     #[cfg(test)]
                     if let Err(error) = pending_drain_hook {
+                        if matches!(
+                            error,
+                            ObjectPgActionError::MetadataCommandRecoveryTransferred
+                        ) {
+                            self.wait_for_transferred_metadata_command_with_work_budget(
+                                pg_id,
+                                &command,
+                                &mut finalization_work_budget,
+                            )?;
+                            continue;
+                        }
                         if object_pg_action_error_is_retryable_pending_drain(&error) {
                             finalization_work_budget
                                 .sleep_after_contention(
@@ -536,9 +547,16 @@ impl super::StorageCluster {
                             Ok(PendingMetadataCommandOutcome::TerminalCleanupPending {
                                 applied: false,
                             }) => {
-                                return Err(
-                                    ObjectPgActionError::MetadataCommandRecoveryTransferred,
-                                );
+                                // Outcome projection relinquishes this unrelated drainer's
+                                // recovery flight. Wait without trying to reacquire it; an
+                                // authorized recovery worker must remove the abandoned
+                                // command's retained terminal slot.
+                                self.wait_for_transferred_metadata_command_with_work_budget(
+                                    pg_id,
+                                    &command,
+                                    &mut finalization_work_budget,
+                                )?;
+                                continue;
                             }
                             Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
                                 finalization_work_budget
@@ -569,6 +587,17 @@ impl super::StorageCluster {
                         );
                         match drain {
                             Ok(_) => {}
+                            Err(ObjectPgActionError::MetadataCommandRecoveryTransferred) => {
+                                // This request relinquished recovery of an unrelated command.
+                                // Wait for the authorized recovery route to advance that exact
+                                // command instead of exposing the internal handoff as SlowDown.
+                                self.wait_for_transferred_metadata_command_with_work_budget(
+                                    pg_id,
+                                    &command,
+                                    &mut finalization_work_budget,
+                                )?;
+                                continue;
+                            }
                             Err(error)
                                 if object_pg_action_error_is_retryable_pending_drain(&error) =>
                             {
@@ -746,14 +775,11 @@ impl super::StorageCluster {
                             match drain {
                                 Ok(()) => {}
                                 Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
-                                    if late_conflict_command.as_ref().is_some_and(|command| {
-                                        same_object_publication_already_projected
-                                            == Some(command.id())
-                                    }) =>
+                                    if late_conflict_command.is_some() =>
                                 {
-                                    // This request already projected the logically published
-                                    // winner, then relinquished its recovery flight. Wait only
-                                    // for authorized recovery to advance that exact command;
+                                    // This request relinquished the recovery flight for the
+                                    // command that caused the log conflict. Wait only for
+                                    // authorized recovery to advance that exact command;
                                     // rejoining its drain here would violate recovery ownership.
                                     self.wait_for_transferred_metadata_command_with_work_budget(
                                         pg_id,
