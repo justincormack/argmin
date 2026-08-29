@@ -4182,14 +4182,15 @@ fn direct_put_does_not_evaluate_condition_after_local_snapshot_crosses_deadline(
     ));
 }
 
-#[derive(Clone, Copy)]
-enum DirectPutCommandIdRaceDrainFailure {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectPutCommandIdRaceDrainInterleaving {
     Contention,
     AwaitingAuthorizedRecovery,
+    AbandonedTerminalCleanup,
 }
 
 fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_action(
-    injected_failure: DirectPutCommandIdRaceDrainFailure,
+    interleaving: DirectPutCommandIdRaceDrainInterleaving,
 ) {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -4320,8 +4321,9 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
             Ok(())
         }));
 
-    let transient_drain_failure = Arc::new(AtomicBool::new(true));
-    let transient_drain_failure_for_hook = Arc::clone(&transient_drain_failure);
+    let drain_interleaving_pending = Arc::new(AtomicBool::new(true));
+    let drain_interleaving_pending_for_hook = Arc::clone(&drain_interleaving_pending);
+    let recovery_cluster = Arc::clone(&first_cluster);
     let _drain_hook = first_cluster
         .test_install_pending_object_metadata_command_drain_attempt_hook(Arc::new(
             move |command, _work_budget| {
@@ -4329,43 +4331,163 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
                     command.payload(),
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.object.generation_id == winner_generation_id
-                ) && transient_drain_failure_for_hook.swap(false, Ordering::SeqCst)
+                ) && drain_interleaving_pending_for_hook.swap(false, Ordering::SeqCst)
                 {
-                    return Err(match injected_failure {
-                        DirectPutCommandIdRaceDrainFailure::Contention => {
-                            crate::ObjectPgActionError::Store(
+                    return match interleaving {
+                        DirectPutCommandIdRaceDrainInterleaving::Contention => {
+                            Err(crate::ObjectPgActionError::Store(
                                 StoreError::MetadataCommandContention {
                                     context: "injected direct PUT contender drain contention",
                                 },
-                            )
+                            ))
                         }
-                        DirectPutCommandIdRaceDrainFailure::AwaitingAuthorizedRecovery => {
-                            crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+                        DirectPutCommandIdRaceDrainInterleaving::AwaitingAuthorizedRecovery => Err(
+                            crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery,
+                        ),
+                        DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup => {
+                            recovery_cluster
+                                .test_record_abandoned_metadata_command_to_acting_set_until(
+                                    command,
+                                    Instant::now() + Duration::from_secs(5),
+                                )
+                                .unwrap();
+                            Ok(())
                         }
-                    });
+                    };
                 }
                 Ok(())
             },
         ));
 
-    let calls_for_action = Arc::clone(&action_calls);
-    let result = first_cluster
-        .commit_direct_put_object_from_payload_shards(
-            &loser_req,
-            &loser_written.written_shards,
-            move |snapshot| {
-                calls_for_action.fetch_add(1, Ordering::SeqCst);
-                if snapshot.existing_etag.is_some() {
-                    Err("object already exists")
-                } else {
-                    Ok(())
-                }
+    let terminal_cleanup_blocked = Arc::new(AtomicBool::new(
+        interleaving == DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup,
+    ));
+    let terminal_cleanup_blocked_for_hook = Arc::clone(&terminal_cleanup_blocked);
+    let _terminal_cleanup_hook = first_cluster
+        .test_install_global_metadata_command_terminal_slot_removal_hook(Arc::new(
+            move |command| {
+                matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.generation_id == winner_generation_id
+                ) && terminal_cleanup_blocked_for_hook.load(Ordering::SeqCst)
             },
-        )
-        .unwrap();
-    assert!(matches!(result, Err("object already exists")));
+        ));
+
+    let result = if interleaving
+        == DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup
+    {
+        thread::scope(|scope| {
+            let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+            let commit_cluster = &first_cluster;
+            let commit_req = &loser_req;
+            let commit_shards = &loser_written.written_shards;
+            let calls_for_action = Arc::clone(&action_calls);
+            scope.spawn(move || {
+                result_tx
+                    .send(commit_cluster.commit_direct_put_object_from_payload_shards(
+                        commit_req,
+                        commit_shards,
+                        move |snapshot| {
+                            calls_for_action.fetch_add(1, Ordering::SeqCst);
+                            if snapshot.existing_etag.is_some() {
+                                Err("object already exists")
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    ))
+                    .unwrap();
+            });
+
+            let pg_id = PgId::new(2);
+            let handoff_deadline = Instant::now() + Duration::from_secs(5);
+            while drain_interleaving_pending.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < handoff_deadline,
+                    "contender did not enter abandoned-command recovery"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            let command = pending_metadata_command_for_test(&first_map, pg_id, &bucket)
+                .expect("deferred abandoned cleanup must retain the pending command");
+            while !first_map
+                .runtime_state()
+                .test_metadata_command_recovery_handoff_requested(pg_id, &command)
+            {
+                assert!(
+                    Instant::now() < handoff_deadline,
+                    "abandoned cleanup did not relinquish to authorized recovery"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(matches!(
+                result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                pending_metadata_command_for_test(&first_map, pg_id, &bucket),
+                Some(command.clone()),
+                "non-owning waiter must not remove the retained terminal slot"
+            );
+
+            terminal_cleanup_blocked.store(false, Ordering::SeqCst);
+            let recovery_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match first_cluster
+                    .drain_pending_metadata_command_with_authorized_recovery_route(
+                        pg_id,
+                        &command,
+                        &first_cluster,
+                    )
+                    .unwrap()
+                {
+                    PendingMetadataCommandOutcome::Abandoned => break,
+                    PendingMetadataCommandOutcome::TerminalCleanupPending { applied: false } => {
+                        assert!(
+                            Instant::now() < recovery_deadline,
+                            "authorized recovery did not remove the abandoned terminal slot"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    outcome => panic!("unexpected authorized recovery outcome: {outcome:?}"),
+                }
+            }
+            result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("contender did not finish after authorized terminal cleanup")
+                .unwrap()
+        })
+    } else {
+        let calls_for_action = Arc::clone(&action_calls);
+        first_cluster
+            .commit_direct_put_object_from_payload_shards(
+                &loser_req,
+                &loser_written.written_shards,
+                move |snapshot| {
+                    calls_for_action.fetch_add(1, Ordering::SeqCst);
+                    if snapshot.existing_etag.is_some() {
+                        Err("object already exists")
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap()
+    };
+    match interleaving {
+        DirectPutCommandIdRaceDrainInterleaving::Contention
+        | DirectPutCommandIdRaceDrainInterleaving::AwaitingAuthorizedRecovery => {
+            assert!(matches!(result, Err("object already exists")));
+        }
+        DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup => {
+            let outcome = result.expect("contender must publish after abandoned cleanup");
+            assert_eq!(outcome.live_size, loser_payload.len() as u64);
+        }
+    }
     assert!(hook_ran.load(Ordering::SeqCst));
-    assert!(!transient_drain_failure.load(Ordering::SeqCst));
+    assert!(!drain_interleaving_pending.load(Ordering::SeqCst));
+    assert!(!terminal_cleanup_blocked.load(Ordering::SeqCst));
     assert_eq!(
         action_calls.load(Ordering::SeqCst),
         2,
@@ -4382,22 +4504,38 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
             .unwrap();
         let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
         let live = stored.as_live().expect("winner object is live");
-        assert_eq!(live.generation_id, winner_generation_id);
-        assert_eq!(live.size, winner_payload.len() as u64);
+        let (expected_generation_id, expected_size) = match interleaving {
+            DirectPutCommandIdRaceDrainInterleaving::Contention
+            | DirectPutCommandIdRaceDrainInterleaving::AwaitingAuthorizedRecovery => {
+                (winner_generation_id, winner_payload.len() as u64)
+            }
+            DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup => {
+                (loser_generation_id, loser_payload.len() as u64)
+            }
+        };
+        assert_eq!(live.generation_id, expected_generation_id);
+        assert_eq!(live.size, expected_size);
     }
 }
 
 #[test]
 fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
     assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_action(
-        DirectPutCommandIdRaceDrainFailure::Contention,
+        DirectPutCommandIdRaceDrainInterleaving::Contention,
     );
 }
 
 #[test]
 fn direct_put_command_id_race_retries_awaiting_authorized_recovery() {
     assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_action(
-        DirectPutCommandIdRaceDrainFailure::AwaitingAuthorizedRecovery,
+        DirectPutCommandIdRaceDrainInterleaving::AwaitingAuthorizedRecovery,
+    );
+}
+
+#[test]
+fn direct_put_command_id_race_retries_abandoned_terminal_cleanup() {
+    assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_action(
+        DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup,
     );
 }
 

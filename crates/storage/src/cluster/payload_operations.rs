@@ -5056,8 +5056,20 @@ impl StorageCluster {
                         Ok(PendingMetadataCommandOutcome::TerminalCleanupPending {
                             applied: false,
                         }) => {
-                            cleanup_direct_put_attempt_before_command_ownership!();
-                            return Err(ObjectPgActionError::MetadataCommandRecoveryTransferred);
+                            // Outcome projection relinquishes this unrelated drainer's recovery
+                            // flight. Wait without trying to reacquire it; an authorized recovery
+                            // worker must remove the abandoned command's retained terminal slot.
+                            if let Err(error) = self
+                                .wait_for_transferred_metadata_command_with_work_budget(
+                                    pg_id,
+                                    &command,
+                                    &mut work_budget,
+                                )
+                            {
+                                cleanup_direct_put_attempt_before_command_ownership!();
+                                return Err(error);
+                            }
+                            continue;
                         }
                         Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
                             sleep_direct_put_before_command_ownership_after_contention!(
