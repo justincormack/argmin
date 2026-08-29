@@ -219,6 +219,7 @@ fn wall_clock_health_sample_with(
     mut health_time: impl FnMut() -> Option<u64>,
 ) -> Result<WallClockHealthSample, WallClockHealthSampleWindowTooWide> {
     let mut narrowest_window_ms = u64::MAX;
+    let mut greatest_health_ms = None;
     for _ in 0..CLOCK_HEALTH_SAMPLE_ATTEMPTS {
         let Some(health_before_ms) = health_time() else {
             return Ok(WallClockHealthSample {
@@ -226,6 +227,13 @@ fn wall_clock_health_sample_with(
                 health_time_ms: None,
             });
         };
+        if greatest_health_ms.is_some_and(|greatest| health_before_ms < greatest) {
+            return Ok(WallClockHealthSample {
+                wall_time_ms: wall_time(),
+                health_time_ms: None,
+            });
+        }
+        greatest_health_ms = Some(health_before_ms);
         let wall_time_ms = wall_time();
         let Some(health_after_ms) = health_time() else {
             return Ok(WallClockHealthSample {
@@ -233,6 +241,13 @@ fn wall_clock_health_sample_with(
                 health_time_ms: None,
             });
         };
+        if health_after_ms < greatest_health_ms.expect("the before sample established a maximum") {
+            return Ok(WallClockHealthSample {
+                wall_time_ms,
+                health_time_ms: None,
+            });
+        }
+        greatest_health_ms = Some(health_after_ms);
         let Some(window_ms) = health_after_ms.checked_sub(health_before_ms) else {
             return Ok(WallClockHealthSample {
                 wall_time_ms,
@@ -251,6 +266,14 @@ fn wall_clock_health_sample_with(
         narrowest_window_ms,
         max_window_ms: CLOCK_HEALTH_SAMPLE_MAX_WINDOW_MS,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn test_wall_clock_health_sample_with(
+    wall_time: impl FnMut() -> u64,
+    health_time: impl FnMut() -> Option<u64>,
+) -> Result<WallClockHealthSample, WallClockHealthSampleWindowTooWide> {
+    wall_clock_health_sample_with(wall_time, health_time)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "openbsd"))]
@@ -379,6 +402,27 @@ mod tests {
         assert_eq!(health.get(), 2 * 20 * CLOCK_HEALTH_SAMPLE_ATTEMPTS as u64);
         assert_eq!(error.narrowest_window_ms(), 20);
         assert_eq!(error.max_window_ms(), 0);
+    }
+
+    #[test]
+    fn wall_clock_health_sample_rejects_rollback_between_attempts() {
+        let mut walls = [9_000, 10_002].into_iter();
+        let mut health = [0, 1_002, 502].into_iter();
+
+        let sample = wall_clock_health_sample_with(
+            || walls.next().expect("each attempted sample needs wall time"),
+            || {
+                Some(
+                    health
+                        .next()
+                        .expect("the attempted samples need health times"),
+                )
+            },
+        )
+        .expect("clock rollback produces an unusable sample");
+
+        assert_eq!(sample.wall_time_ms(), 10_002);
+        assert_eq!(sample.health_time_ms(), None);
     }
 
     #[test]

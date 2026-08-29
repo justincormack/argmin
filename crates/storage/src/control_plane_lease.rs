@@ -77,6 +77,8 @@ pub(crate) enum LeaseHorizonError {
 struct ProcessLeaseClockHealth {
     initial_wall_ms: u64,
     initial_clock_health_ms: u64,
+    latest_wall_ms: u64,
+    latest_clock_health_ms: u64,
     healthy: bool,
 }
 
@@ -90,6 +92,8 @@ impl ProcessLeaseClockHealth {
         Ok(Self {
             initial_wall_ms: local_wall_ms,
             initial_clock_health_ms: local_clock_health_ms,
+            latest_wall_ms: local_wall_ms,
+            latest_clock_health_ms: local_clock_health_ms,
             healthy: true,
         })
     }
@@ -107,6 +111,10 @@ impl ProcessLeaseClockHealth {
             self.healthy = false;
             return false;
         };
+        if local_clock_health_ms < self.latest_clock_health_ms {
+            self.healthy = false;
+            return false;
+        }
         let Some(wall_elapsed_ms) = local_wall_ms.checked_sub(self.initial_wall_ms) else {
             self.healthy = false;
             return false;
@@ -118,7 +126,41 @@ impl ProcessLeaseClockHealth {
             return false;
         };
         self.healthy = wall_elapsed_ms.abs_diff(monotonic_elapsed_ms) <= skew_budget_ms;
+        if self.healthy {
+            if local_clock_health_ms > self.latest_clock_health_ms {
+                self.latest_clock_health_ms = local_clock_health_ms;
+                self.latest_wall_ms = local_wall_ms;
+            } else {
+                self.latest_wall_ms = self.latest_wall_ms.max(local_wall_ms);
+            }
+        }
         self.healthy
+    }
+
+    fn observe_with_older_sample_confirmation(
+        &mut self,
+        local_wall_ms: u64,
+        local_clock_health_ms: Option<u64>,
+        skew_budget_ms: u64,
+        confirm: impl FnOnce() -> Result<(u64, Option<u64>), ()>,
+    ) -> bool {
+        let sample_may_precede_latest = local_clock_health_ms.is_some_and(|health_ms| {
+            health_ms < self.latest_clock_health_ms
+                || (health_ms == self.latest_clock_health_ms && local_wall_ms < self.latest_wall_ms)
+        });
+        if sample_may_precede_latest {
+            // Callers sample before acquiring the process-health mutex, so a
+            // concurrent older sample may arrive after a newer one. Timestamp
+            // values alone cannot distinguish that ordering from a genuine
+            // paired clock rollback. Confirm while holding the mutex so the
+            // fresh sample is ordered with respect to health-state mutation.
+            let Ok((confirmed_wall_ms, confirmed_clock_health_ms)) = confirm() else {
+                self.healthy = false;
+                return false;
+            };
+            return self.observe(confirmed_wall_ms, confirmed_clock_health_ms, skew_budget_ms);
+        }
+        self.observe(local_wall_ms, local_clock_health_ms, skew_budget_ms)
     }
 }
 
@@ -136,27 +178,28 @@ pub(crate) fn validate_process_lease_clock(
         return Ok(());
     }
     static PROCESS_CLOCK_HEALTH: OnceLock<Mutex<ProcessLeaseClockHealth>> = OnceLock::new();
-    if let Some(health) = PROCESS_CLOCK_HEALTH.get() {
-        return if health
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .observe(local_wall_ms, local_clock_health_ms, skew_budget_ms)
-        {
-            Ok(())
-        } else if local_clock_health_ms.is_none() {
-            Err(LeaseClockError::ClockHealthSourceUnavailable)
-        } else {
-            Err(LeaseClockError::LocalClockUnhealthy { skew_budget_ms })
-        };
-    }
-    let initial_health = ProcessLeaseClockHealth::new(local_wall_ms, local_clock_health_ms)?;
-    let health = PROCESS_CLOCK_HEALTH.get_or_init(|| Mutex::new(initial_health));
-    if health
+    let health = if let Some(health) = PROCESS_CLOCK_HEALTH.get() {
+        health
+    } else {
+        let initial_health = ProcessLeaseClockHealth::new(local_wall_ms, local_clock_health_ms)?;
+        PROCESS_CLOCK_HEALTH.get_or_init(|| Mutex::new(initial_health))
+    };
+    let mut health = health
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .observe(local_wall_ms, local_clock_health_ms, skew_budget_ms)
-    {
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if health.observe_with_older_sample_confirmation(
+        local_wall_ms,
+        local_clock_health_ms,
+        skew_budget_ms,
+        || {
+            crate::clock::wall_clock_health_sample()
+                .map(|sample| (sample.wall_time_ms(), sample.health_time_ms()))
+                .map_err(|_| ())
+        },
+    ) {
         Ok(())
+    } else if local_clock_health_ms.is_none() {
+        Err(LeaseClockError::ClockHealthSourceUnavailable)
     } else {
         Err(LeaseClockError::LocalClockUnhealthy { skew_budget_ms })
     }
@@ -843,6 +886,68 @@ mod tests {
         let mut health = ProcessLeaseClockHealth::new(10_000, Some(500)).unwrap();
         assert!(!health.observe(12_001, Some(1_000), 1_000));
         assert!(!health.observe(10_500, Some(1_000), 1_000));
+    }
+
+    #[test]
+    fn process_clock_health_ignores_out_of_order_concurrent_sample() {
+        let mut health = ProcessLeaseClockHealth::new(10_001, Some(501)).unwrap();
+
+        assert!(
+            health.observe_with_older_sample_confirmation(10_000, Some(500), 1_000, || Ok((
+                10_002,
+                Some(502)
+            )),)
+        );
+        assert!(health.observe(10_002, Some(502), 1_000));
+    }
+
+    #[test]
+    fn process_clock_health_confirmation_retries_scheduler_delay() {
+        let mut health = ProcessLeaseClockHealth::new(10_001, Some(501)).unwrap();
+        let mut walls = [9_000, 10_502].into_iter();
+        let mut health_samples = [0, 1_002, 1_002, 1_002].into_iter();
+
+        assert!(
+            health.observe_with_older_sample_confirmation(10_000, Some(500), 1_000, || {
+                crate::clock::test_wall_clock_health_sample_with(
+                    || walls.next().expect("each attempt needs one wall sample"),
+                    || {
+                        Some(
+                            health_samples
+                                .next()
+                                .expect("each attempt needs two health samples"),
+                        )
+                    },
+                )
+                .map(|sample| (sample.wall_time_ms(), sample.health_time_ms()))
+                .map_err(|_| ())
+            },)
+        );
+        assert!(health.observe(10_503, Some(1_003), 1_000));
+    }
+
+    #[test]
+    fn process_clock_health_latches_confirmation_sampling_failure() {
+        let mut health = ProcessLeaseClockHealth::new(10_001, Some(501)).unwrap();
+
+        assert!(
+            !health.observe_with_older_sample_confirmation(10_000, Some(500), 1_000, || Err(()),)
+        );
+        assert!(!health.observe(10_002, Some(502), 1_000));
+    }
+
+    #[test]
+    fn process_clock_health_rejects_paired_clock_rollback() {
+        let mut health = ProcessLeaseClockHealth::new(10_000, Some(500)).unwrap();
+
+        assert!(health.observe(10_500, Some(1_000), 1_000));
+        assert!(
+            !health.observe_with_older_sample_confirmation(9_500, Some(0), 1_000, || Ok((
+                9_500,
+                Some(0)
+            )),)
+        );
+        assert!(!health.observe(10_700, Some(1_200), 1_000));
     }
 
     #[test]
