@@ -354,6 +354,13 @@ client TLS certificates and has no plaintext TCP mode.
 Transport limits must satisfy the protocol's compiled compatibility bounds.
 They cannot raise hard allocation ceilings or describe a frame too small for
 the configured maximum request, Raft append batch, membership, or snapshot.
+In replicated deployments, every `storage-rpc` endpoint must also use a
+profile whose `max_frame_bytes` can carry the maximum authenticated
+metadata-transfer staging publication. The current bound is slightly below 64
+MiB: it includes the 63 MiB artifact, canonical intent, storage-RPC frame,
+authentication binding, and maximum authentication-envelope overhead. This is
+checked for every alternate endpoint so the storage client's minimum selected
+transport limit cannot make a committed staging authorization unpublishable.
 
 ### Secret and TLS references
 

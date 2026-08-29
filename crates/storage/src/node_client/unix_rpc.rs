@@ -2875,6 +2875,67 @@ impl UnixStorageNodeClient {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn create_metadata_transfer_staging_intent(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<(), StoreError> {
+        let payload = encode_metadata_transfer_staging_intent_create_request(
+            &StorageRpcMetadataTransferStagingIntentCreateRequest {
+                intent: intent.clone(),
+            },
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "encode metadata-transfer staging intent request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataTransferStagingIntentCreate,
+            payload,
+        )?;
+        if !response.is_empty() {
+            return Err(self.rpc_payload_error(
+                "decode metadata-transfer staging intent response",
+                "response payload is not empty".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn publish_metadata_transfer_staging_artifact(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+        artifact: &[u8],
+    ) -> Result<MetadataTransferStagingReceipt, StoreError> {
+        let payload = encode_metadata_transfer_staging_artifact_publish_request(
+            &StorageRpcMetadataTransferStagingArtifactPublishRequest {
+                intent: intent.clone(),
+                artifact: artifact.to_vec(),
+            },
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "encode metadata-transfer staging artifact request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataTransferStagingArtifactPublish,
+            payload,
+        )?;
+        decode_metadata_transfer_staging_receipt_response(&response, intent, self.node_id).map_err(
+            |error| {
+                self.rpc_payload_error(
+                    "decode metadata-transfer staging artifact response",
+                    error.to_string(),
+                )
+            },
+        )
+    }
+
+    #[allow(dead_code)]
     fn install_metadata_transfer_checkpoint_base(
         &self,
         pg_id: PgId,

@@ -92,8 +92,8 @@ fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox(
             PgId::new(19),
             ClusterEpoch::new(12).unwrap(),
             ClusterEpoch::new(11).unwrap(),
-            vec![NodeId::new(501), NodeId::new(502), NodeId::new(503)],
             vec![NodeId::new(504), NodeId::new(502), NodeId::new(503)],
+            vec![NodeId::new(501), NodeId::new(502), NodeId::new(503)],
         );
         let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
             &binding,

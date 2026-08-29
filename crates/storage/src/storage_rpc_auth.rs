@@ -13,6 +13,7 @@ use crate::storage_rpc::{
     decode_storage_rpc_frame, encode_storage_rpc_frame,
     validate_storage_rpc_request_frame_payload_limit, StorageRpcFrame, StorageRpcFrameError,
     StorageRpcMessageKind, STORAGE_RPC_MAX_FRAME_LEN,
+    STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_FRAME_LEN,
 };
 use crate::NodeId;
 use std::fmt;
@@ -42,6 +43,13 @@ const STORAGE_RPC_AUTH_TRANSPORT_VERSION: u16 = 1;
 const STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD: usize = 64 * 1024;
 pub const STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN: usize =
     STORAGE_RPC_AUTH_MAX_BINDING_LEN + STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD;
+pub const STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_ENVELOPE_LEN: usize =
+    STORAGE_RPC_AUTH_BINDING_FIXED_LEN
+        + STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_FRAME_LEN
+        + STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD;
+const _: () = assert!(
+    STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_ENVELOPE_LEN <= STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN
+);
 const STORAGE_RPC_AUTH_PRE_AUTH_BYTE_BUDGET: usize = STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1363,6 +1371,7 @@ impl StorageRpcAuthorizedRoles {
         Self(Self::FRONTEND | Self::STORAGE_NODE | Self::MAINTENANCE | Self::ADMIN);
     const FRONTEND_STORAGE_ADMIN: Self = Self(Self::FRONTEND | Self::STORAGE_NODE | Self::ADMIN);
     const MAINTENANCE_ONLY: Self = Self(Self::MAINTENANCE);
+    const ADMIN_ONLY: Self = Self(Self::ADMIN);
     const STORAGE_MAINTENANCE: Self = Self(Self::STORAGE_NODE | Self::MAINTENANCE);
 
     fn allows(self, role: StorageRpcCallerRole) -> bool {
@@ -1420,6 +1429,11 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::MetadataCommandRetainedLogHashes
         | StorageRpcMessageKind::MetadataCommandRetainedLogEntries => {
             StorageRpcAuthorizedRoles::FRONTEND_STORAGE_ADMIN
+        }
+
+        StorageRpcMessageKind::MetadataTransferStagingIntentCreate
+        | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish => {
+            StorageRpcAuthorizedRoles::ADMIN_ONLY
         }
 
         StorageRpcMessageKind::ShardAckRecord | StorageRpcMessageKind::ShardAckValidate => {
@@ -1605,6 +1619,8 @@ fn admin_live_pg_metadata_transfer_operation(kind: StorageRpcMessageKind) -> boo
             | StorageRpcMessageKind::MetadataCommandRetainedLogEntries
             | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
             | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
+            | StorageRpcMessageKind::MetadataTransferStagingIntentCreate
+            | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish
     )
 }
 
@@ -2111,24 +2127,31 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 22, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
             0, 202, 74, 215, 141, 132, 131, 9, 128, 97, 98, 99,
         ];
-        let old_request = encode_binding_with_encoded_frame(
-            0x0102_0304_0506_0708,
-            TOPOLOGY_DIGEST,
-            NodeId::new(0x1122_3344),
-            None,
-            V21_FRAME,
-        )
-        .unwrap();
-        assert_eq!(
-            decode_binding(&old_request),
-            Err(StorageRpcAuthBindingError::Malformed)
-        );
+        const V23_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 23, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
+            0, 219, 185, 232, 25, 191, 51, 112, 119, 97, 98, 99,
+        ];
+        for historical_frame in [V21_FRAME, V22_FRAME] {
+            let old_request = encode_binding_with_encoded_frame(
+                0x0102_0304_0506_0708,
+                TOPOLOGY_DIGEST,
+                NodeId::new(0x1122_3344),
+                None,
+                historical_frame,
+            )
+            .unwrap();
+            assert_eq!(
+                decode_binding(&old_request),
+                Err(StorageRpcAuthBindingError::Malformed)
+            );
+        }
         let request = encode_binding_with_encoded_frame(
             0x0102_0304_0506_0708,
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
             None,
-            V22_FRAME,
+            V23_FRAME,
         )
         .unwrap();
         assert_eq!(
@@ -2137,8 +2160,8 @@ mod tests {
                 "4152475352504342000201020304050607080000004030313233343536373839",
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "6162636465663031323334353637383961626364656611223344000000003718",
-                "0000006172676d696e2d73746f726167652d7270632d6672616d651600080706",
-                "0504030201030003000000ca4ad78d84830980616263"
+                "0000006172676d696e2d73746f726167652d7270632d6672616d651700080706",
+                "0504030201030003000000dbb9e819bf337077616263"
             )
         );
 
@@ -2152,7 +2175,7 @@ mod tests {
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
             Some(&transcript),
-            V22_FRAME,
+            V23_FRAME,
         )
         .unwrap();
         assert_eq!(
@@ -2162,8 +2185,8 @@ mod tests {
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "616263646566303132333435363738396162636465661122334401673e6f836a",
                 "950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037",
-                "180000006172676d696e2d73746f726167652d7270632d6672616d6516000807",
-                "060504030201030003000000ca4ad78d84830980616263"
+                "180000006172676d696e2d73746f726167652d7270632d6672616d6517000807",
+                "060504030201030003000000dbb9e819bf337077616263"
             )
         );
 
@@ -2578,7 +2601,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 171, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 173, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]
@@ -2616,6 +2639,15 @@ mod tests {
             &admin,
             StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
         ));
+        for kind in [
+            StorageRpcMessageKind::MetadataTransferStagingIntentCreate,
+            StorageRpcMessageKind::MetadataTransferStagingArtifactPublish,
+        ] {
+            assert!(principal_allows_operation(&admin, kind));
+            assert!(!principal_allows_operation(&frontend, kind));
+            assert!(!principal_allows_operation(&storage, kind));
+            assert!(!principal_allows_operation(&maintenance, kind));
+        }
         assert!(!principal_allows_operation(
             &admin,
             StorageRpcMessageKind::MetadataCommandPendingSlotInsert

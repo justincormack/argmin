@@ -39,12 +39,14 @@ const INITIALIZATION_MARKER_LEN: usize = INITIALIZATION_MARKER_BODY_LEN + 8;
 const ESTABLISHMENT_MARKER_BODY_LEN: usize = STAGING_ESTABLISHMENT_MAGIC.len() + 2 + DIGEST_LEN;
 const ESTABLISHMENT_MARKER_LEN: usize = ESTABLISHMENT_MARKER_BODY_LEN + 8;
 const MAX_ENDPOINT_BYTES: usize = 2_048;
+pub(crate) const MAX_STAGING_INTENT_BYTES: usize = 16 * 1_024;
 pub(crate) const MAX_STAGING_EVIDENCE_BYTES: usize = 4_096;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_ENTRIES: usize = 64;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_BYTES: usize = 120 * 1_024;
 const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V1\0";
 const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V1\0";
 pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 1;
+pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES: u64 = 63 * 1_024 * 1_024;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MetadataTransferStagingError {
@@ -72,6 +74,8 @@ pub(crate) enum MetadataTransferStagingError {
     Capacity(String),
     #[error("metadata-transfer staging artifact digest or length mismatch")]
     ArtifactMismatch,
+    #[error("metadata-transfer staging artifact length {length} exceeds protocol limit {limit}")]
+    ArtifactTooLarge { length: u64, limit: u64 },
     #[error("metadata-transfer staging generation has been tombstoned or finalized")]
     GenerationRetired,
 }
@@ -99,9 +103,13 @@ impl MetadataTransferStagingLimits {
         max_artifact_bytes: u64,
         max_total_bytes: u64,
     ) -> Result<Self, MetadataTransferStagingError> {
-        if max_entries == 0 || max_artifact_bytes == 0 || max_total_bytes < max_artifact_bytes {
+        if max_entries == 0
+            || max_artifact_bytes == 0
+            || max_artifact_bytes > METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES
+            || max_total_bytes < max_artifact_bytes
+        {
             return Err(MetadataTransferStagingError::Invariant(
-                "staging limits require entries > 0 and total bytes >= artifact bytes > 0"
+                "staging limits require entries > 0 and total bytes >= artifact bytes > 0 within the protocol maximum"
                     .to_owned(),
             ));
         }
@@ -248,6 +256,27 @@ pub(crate) struct MetadataTransferStagingReceipt {
 impl MetadataTransferStagingReceipt {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn from_publication_bytes(
+        bytes: &[u8],
+        expected_intent: &MetadataTransferStagingIntent,
+        expected_node_id: NodeId,
+    ) -> Result<Self, MetadataTransferStagingError> {
+        let evidence = decode_staging_evidence(bytes)?;
+        if evidence.kind() != MetadataTransferStagingEvidenceKind::Publication {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging publication response contains non-publication evidence".to_owned(),
+            ));
+        }
+        if evidence.intent() != expected_intent || evidence.actor().node_id != expected_node_id {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging publication response does not match its request subject".to_owned(),
+            ));
+        }
+        Ok(Self {
+            bytes: evidence.as_bytes().to_vec(),
+        })
     }
 }
 
@@ -1325,6 +1354,14 @@ impl MetadataTransferStagingStore {
         intent: &MetadataTransferStagingIntent,
     ) -> Result<(), MetadataTransferStagingError> {
         validate_staging_intent_shape(intent)?;
+        if !intent
+            .destination_acting_set
+            .contains(&self.identity.node_id)
+        {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging-store actor is not a destination for the intent".to_owned(),
+            ));
+        }
         if intent.artifact_length > self.limits.max_artifact_bytes {
             return Err(MetadataTransferStagingError::Capacity(format!(
                 "artifact length {} exceeds limit {}",
@@ -1944,6 +1981,17 @@ fn require_exact_intent(
 fn validate_staging_intent_shape(
     intent: &MetadataTransferStagingIntent,
 ) -> Result<(), MetadataTransferStagingError> {
+    if intent.artifact_length == 0 {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging intent artifact length must be nonzero".to_owned(),
+        ));
+    }
+    if intent.artifact_length > METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES {
+        return Err(MetadataTransferStagingError::ArtifactTooLarge {
+            length: intent.artifact_length,
+            limit: METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
+        });
+    }
     if intent.artifact_format_version != METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION {
         return Err(MetadataTransferStagingError::Invariant(format!(
             "unsupported staged artifact format version {}",
@@ -2663,6 +2711,91 @@ fn encode_staging_intent_evidence(out: &mut Vec<u8>, intent: &MetadataTransferSt
     out.extend_from_slice(&intent.artifact_format_version.to_be_bytes());
 }
 
+pub(crate) fn encode_staging_intent(
+    intent: &MetadataTransferStagingIntent,
+) -> Result<Vec<u8>, MetadataTransferStagingError> {
+    validate_staging_intent_shape(intent)?;
+    let mut out = Vec::new();
+    encode_staging_intent_evidence(&mut out, intent);
+    if out.len() > MAX_STAGING_INTENT_BYTES {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging intent exceeds its encoded byte limit".to_owned(),
+        ));
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_staging_intent(
+    bytes: &[u8],
+) -> Result<MetadataTransferStagingIntent, MetadataTransferStagingError> {
+    if bytes.is_empty() || bytes.len() > MAX_STAGING_INTENT_BYTES {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging intent has invalid encoded length".to_owned(),
+        ));
+    }
+    let mut offset = 0;
+    let intent = decode_staging_intent_fields(bytes, &mut offset)?;
+    if offset != bytes.len() || encode_staging_intent(&intent)? != bytes {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging intent is not canonically encoded".to_owned(),
+        ));
+    }
+    Ok(intent)
+}
+
+fn decode_staging_intent_fields(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<MetadataTransferStagingIntent, MetadataTransferStagingError> {
+    let pg_id = PgId::new(u32::from_be_bytes(
+        take(bytes, offset, 4)?.try_into().unwrap(),
+    ));
+    let transition_epoch = ClusterEpoch::new(u64::from_be_bytes(
+        take(bytes, offset, 8)?.try_into().unwrap(),
+    ))
+    .ok_or_else(|| {
+        MetadataTransferStagingError::Invariant(
+            "staging intent transition epoch must be nonzero".to_owned(),
+        )
+    })?;
+    let source_epoch = ClusterEpoch::new(u64::from_be_bytes(
+        take(bytes, offset, 8)?.try_into().unwrap(),
+    ))
+    .ok_or_else(|| {
+        MetadataTransferStagingError::Invariant(
+            "staging intent source epoch must be nonzero".to_owned(),
+        )
+    })?;
+    let source_acting_set_len = usize::try_from(u32::from_be_bytes(
+        take(bytes, offset, 4)?.try_into().unwrap(),
+    ))
+    .unwrap();
+    let source_acting_set = decode_acting_set(take(bytes, offset, source_acting_set_len)?)?;
+    let destination_acting_set_len = usize::try_from(u32::from_be_bytes(
+        take(bytes, offset, 4)?.try_into().unwrap(),
+    ))
+    .unwrap();
+    let destination_acting_set =
+        decode_acting_set(take(bytes, offset, destination_acting_set_len)?)?;
+    let staging_generation = u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap());
+    let artifact_digest = take(bytes, offset, DIGEST_LEN)?.try_into().unwrap();
+    let artifact_length = u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap());
+    let artifact_format_version = u16::from_be_bytes(take(bytes, offset, 2)?.try_into().unwrap());
+    let intent = MetadataTransferStagingIntent {
+        pg_id,
+        transition_epoch,
+        source_epoch,
+        source_acting_set,
+        destination_acting_set,
+        staging_generation,
+        artifact_digest,
+        artifact_length,
+        artifact_format_version,
+    };
+    validate_staging_intent_shape(&intent)?;
+    Ok(intent)
+}
+
 fn validate_staging_evidence(
     bytes: &[u8],
     intent: &MetadataTransferStagingIntent,
@@ -2722,54 +2855,8 @@ pub(crate) fn decode_staging_evidence(
         }
     };
     let actor = decode_staging_evidence_actor(bytes, &mut offset)?;
-    let pg_id = PgId::new(u32::from_be_bytes(
-        take(bytes, &mut offset, 4)?.try_into().unwrap(),
-    ));
-    let transition_epoch = ClusterEpoch::new(u64::from_be_bytes(
-        take(bytes, &mut offset, 8)?.try_into().unwrap(),
-    ))
-    .ok_or_else(|| {
-        MetadataTransferStagingError::Invariant(
-            "staging evidence transition epoch must be nonzero".to_owned(),
-        )
-    })?;
-    let source_epoch = ClusterEpoch::new(u64::from_be_bytes(
-        take(bytes, &mut offset, 8)?.try_into().unwrap(),
-    ))
-    .ok_or_else(|| {
-        MetadataTransferStagingError::Invariant(
-            "staging evidence source epoch must be nonzero".to_owned(),
-        )
-    })?;
-    let source_acting_set_len = usize::try_from(u32::from_be_bytes(
-        take(bytes, &mut offset, 4)?.try_into().unwrap(),
-    ))
-    .unwrap();
-    let source_acting_set = decode_acting_set(take(bytes, &mut offset, source_acting_set_len)?)?;
-    let destination_acting_set_len = usize::try_from(u32::from_be_bytes(
-        take(bytes, &mut offset, 4)?.try_into().unwrap(),
-    ))
-    .unwrap();
-    let destination_acting_set =
-        decode_acting_set(take(bytes, &mut offset, destination_acting_set_len)?)?;
-    let staging_generation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
-    let artifact_digest = take(bytes, &mut offset, DIGEST_LEN)?.try_into().unwrap();
-    let artifact_length = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
-    let artifact_format_version =
-        u16::from_be_bytes(take(bytes, &mut offset, 2)?.try_into().unwrap());
+    let intent = decode_staging_intent_fields(bytes, &mut offset)?;
     let fsync_scope = *take(bytes, &mut offset, 1)?.first().unwrap();
-    let intent = MetadataTransferStagingIntent {
-        pg_id,
-        transition_epoch,
-        source_epoch,
-        source_acting_set,
-        destination_acting_set,
-        staging_generation,
-        artifact_digest,
-        artifact_length,
-        artifact_format_version,
-    };
-    validate_staging_intent_shape(&intent)?;
     let evidence = MetadataTransferStagingEvidence {
         actor,
         intent,
@@ -3811,12 +3898,16 @@ mod tests {
     }
 
     fn binding() -> UnavailablePgTransitionMutationBinding {
+        binding_with_destination(NodeId::new(4))
+    }
+
+    fn binding_with_destination(destination: NodeId) -> UnavailablePgTransitionMutationBinding {
         UnavailablePgTransitionMutationBinding::new(
             PgId::new(19),
             ClusterEpoch::new(12).unwrap(),
             ClusterEpoch::new(11).unwrap(),
             vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
-            vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
+            vec![destination, NodeId::new(2), NodeId::new(3)],
         )
     }
 
@@ -3848,6 +3939,29 @@ mod tests {
 
     fn open(root: &Path) -> MetadataTransferStagingStore {
         MetadataTransferStagingStore::open(root, identity(), limits()).unwrap()
+    }
+
+    #[test]
+    fn staging_intent_codec_is_canonical_and_bounded() {
+        let expected = intent(b"canonical staged artifact");
+        let encoded = encode_staging_intent(&expected).unwrap();
+
+        assert_eq!(decode_staging_intent(&encoded).unwrap(), expected);
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_staging_intent(&trailing),
+            Err(MetadataTransferStagingError::Invariant(_))
+        ));
+        assert!(matches!(
+            decode_staging_intent(&encoded[..encoded.len() - 1]),
+            Err(MetadataTransferStagingError::Invariant(_))
+        ));
+        assert!(matches!(
+            decode_staging_intent(&vec![0; MAX_STAGING_INTENT_BYTES + 1]),
+            Err(MetadataTransferStagingError::Invariant(_))
+        ));
     }
 
     #[test]
@@ -4264,18 +4378,101 @@ mod tests {
             .unwrap_err();
             assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
         }
+        assert!(matches!(
+            MetadataTransferStagingIntent::for_unavailable_transition(
+                &binding(),
+                [7; DIGEST_LEN],
+                METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES + 1,
+                METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+            ),
+            Err(MetadataTransferStagingError::ArtifactTooLarge { .. })
+        ));
+        assert!(matches!(
+            MetadataTransferStagingLimits::new(
+                1,
+                METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES + 1,
+                METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES + 1,
+            ),
+            Err(MetadataTransferStagingError::Invariant(_))
+        ));
+    }
+
+    #[test]
+    fn staging_store_rejects_intents_for_another_destination_before_mutation() {
+        let tmp = test_util::tempdir();
+        let store = MetadataTransferStagingStore::open(
+            tmp.path(),
+            identity(),
+            MetadataTransferStagingLimits::new(1, 1_024, 1_024).unwrap(),
+        )
+        .unwrap();
+        let artifact = b"misrouted artifact";
+        let misrouted = MetadataTransferStagingIntent::for_unavailable_transition(
+            &binding_with_destination(NodeId::new(5)),
+            checksum::sha256::digest(artifact),
+            u64::try_from(artifact.len()).unwrap(),
+            METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            store.create_intent(&misrouted),
+            Err(MetadataTransferStagingError::Invariant(message))
+                if message.contains("not a destination")
+        ));
+        assert!(matches!(
+            store.publish_artifact(&misrouted, artifact),
+            Err(MetadataTransferStagingError::Invariant(message))
+                if message.contains("not a destination")
+        ));
+
+        let valid = intent(b"valid artifact");
+        assert_eq!(
+            store.create_intent(&valid).unwrap(),
+            MetadataTransferStagingIntentOutcome::Created
+        );
+        assert!(!store
+            .publish_artifact(&valid, b"valid artifact")
+            .unwrap()
+            .as_bytes()
+            .is_empty());
     }
 
     #[test]
     fn staging_receipt_v1_encoding_is_fixed() {
         let artifact = b"one retained metadata command";
-        let intent = intent(artifact);
-        let receipt = encode_staging_evidence(&identity(), &intent, 0);
+        let expected_intent = intent(artifact);
+        let receipt = encode_staging_evidence(&identity(), &expected_intent, 0);
         assert_eq!(
             hex(&receipt),
             "4152474d494e2d53544147494e472d45564944454e43452d5631000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c8e23ea24e8bba02e69f180fc02083e99416e1f8614ce65c9d3a96c7f3d24d572000000000000001d000107"
         );
-        validate_staging_evidence(&receipt, &intent, 0, &identity()).unwrap();
+        validate_staging_evidence(&receipt, &expected_intent, 0, &identity()).unwrap();
+        assert!(MetadataTransferStagingReceipt::from_publication_bytes(
+            &receipt,
+            &expected_intent,
+            NodeId::new(4),
+        )
+        .is_ok());
+        assert!(MetadataTransferStagingReceipt::from_publication_bytes(
+            &receipt,
+            &intent(b"another artifact"),
+            NodeId::new(4),
+        )
+        .is_err());
+        assert!(MetadataTransferStagingReceipt::from_publication_bytes(
+            &receipt,
+            &expected_intent,
+            NodeId::new(5),
+        )
+        .is_err());
+        let tombstone = encode_staging_evidence(&identity(), &expected_intent, 1);
+        assert!(MetadataTransferStagingReceipt::from_publication_bytes(
+            &tombstone,
+            &expected_intent,
+            NodeId::new(4),
+        )
+        .is_err());
     }
 
     #[test]

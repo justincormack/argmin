@@ -652,6 +652,8 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
         | StorageRpcMessageKind::MetadataCommandPgLockAcquire
         | StorageRpcMessageKind::MetadataCommandPgLockRelease
+        | StorageRpcMessageKind::MetadataTransferStagingIntentCreate
+        | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish
         | StorageRpcMessageKind::ReadHandlesRelease
         | StorageRpcMessageKind::ObjectPayloadLeaseControl
         | StorageRpcMessageKind::ClaimHeartbeat

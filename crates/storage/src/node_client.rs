@@ -35,8 +35,8 @@ use crate::metadata_command::{
     PutObjectMetadataMutation, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node_runtime::pg_store::{
-    MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus, PgStore, ScavengerShardFileScan,
-    ScavengerShardRow,
+    MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus, MetadataTransferStagingIntent,
+    MetadataTransferStagingReceipt, PgStore, ScavengerShardFileScan, ScavengerShardRow,
 };
 use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
@@ -72,6 +72,7 @@ use crate::storage_rpc::{
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
+    decode_metadata_transfer_staging_receipt_response,
     decode_multipart_completion_barrier_command_build_response,
     decode_multipart_completion_preflight_response, decode_multipart_completion_snapshot_response,
     decode_multipart_completion_stale_source_response, decode_multipart_management_lookup_response,
@@ -138,6 +139,8 @@ use crate::storage_rpc::{
     encode_metadata_command_transfer_checkpoint_base_request,
     encode_metadata_command_transfer_empty_state_request,
     encode_metadata_command_transfer_matching_state_request,
+    encode_metadata_transfer_staging_artifact_publish_request,
+    encode_metadata_transfer_staging_intent_create_request,
     encode_multipart_completion_barrier_command_build_request,
     encode_multipart_completion_preflight_request, encode_multipart_completion_snapshot_request,
     encode_multipart_parts_list_request, encode_multipart_upload_load_request,
@@ -217,6 +220,8 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandTransferCheckpointBaseRequest,
     StorageRpcMetadataCommandTransferEmptyStateRequest,
     StorageRpcMetadataCommandTransferMatchingStateRequest,
+    StorageRpcMetadataTransferStagingArtifactPublishRequest,
+    StorageRpcMetadataTransferStagingIntentCreateRequest,
     StorageRpcMultipartCompletionBarrierCommandBuildRequest,
     StorageRpcMultipartCompletionPreflightOutcome, StorageRpcMultipartCompletionPreflightRequest,
     StorageRpcMultipartCompletionSnapshotOutcome, StorageRpcMultipartCompletionSnapshotRequest,

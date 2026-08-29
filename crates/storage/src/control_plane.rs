@@ -2413,6 +2413,8 @@ impl ClusterControlSnapshot {
                 if request.staging_generation
                     != request.unavailable_transition.transition_epoch().get()
                     || request.artifact_length == 0
+                    || request.artifact_length
+                        > crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES
                     || request.artifact_format_version
                         != crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION
                 {
@@ -7492,6 +7494,8 @@ fn validate_unavailable_pg_transition_invariant(
         });
         if authorization.staging_generation != transition.transition_epoch.get()
             || authorization.artifact_length == 0
+            || authorization.artifact_length
+                > crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES
             || authorization.artifact_format_version
                 != crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION
             || authorization.batch_receipt.source_epoch > snapshot.cluster_epoch

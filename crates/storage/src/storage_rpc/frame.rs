@@ -242,6 +242,12 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ShardWrite | StorageRpcMessageKind::ShardRepairWrite => {
             STORAGE_RPC_MAX_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::MetadataTransferStagingIntentCreate => {
+            4 + MAX_STAGING_INTENT_BYTES
+        }
+        StorageRpcMessageKind::MetadataTransferStagingArtifactPublish => {
+            STORAGE_RPC_MAX_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ReadHandlesAcquire => {
             STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN
         }

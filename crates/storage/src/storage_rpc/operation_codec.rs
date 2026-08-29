@@ -30,6 +30,104 @@ pub(crate) fn decode_metadata_command_item(
     Ok(item)
 }
 
+pub(crate) fn encode_metadata_transfer_staging_intent_create_request(
+    request: &StorageRpcMetadataTransferStagingIntentCreateRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let intent = encode_staging_intent(&request.intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    let mut out = Vec::new();
+    put_bytes(&mut out, &intent);
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_transfer_staging_intent_create_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataTransferStagingIntentCreateRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let intent = decoder.read_bytes_with_payload_limit(MAX_STAGING_INTENT_BYTES)?;
+    decoder.finish()?;
+    let intent = decode_staging_intent(intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    Ok(StorageRpcMetadataTransferStagingIntentCreateRequest { intent })
+}
+
+pub(crate) fn encode_metadata_transfer_staging_artifact_publish_request(
+    request: &StorageRpcMetadataTransferStagingArtifactPublishRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let intent = encode_staging_intent(&request.intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    if request.artifact.len() > STORAGE_RPC_MAX_STAGING_ARTIFACT_BYTES {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: request.artifact.len(),
+            limit: STORAGE_RPC_MAX_STAGING_ARTIFACT_BYTES,
+        });
+    }
+    if u64::try_from(request.artifact.len()).ok() != Some(request.intent.artifact_length())
+        || checksum::sha256::digest(&request.artifact) != request.intent.artifact_digest()
+    {
+        return Err(StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "artifact does not match its intent",
+        ));
+    }
+    let mut out = Vec::new();
+    put_bytes(&mut out, &intent);
+    put_bytes(&mut out, &request.artifact);
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_transfer_staging_artifact_publish_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataTransferStagingArtifactPublishRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let intent = decoder.read_bytes_with_payload_limit(MAX_STAGING_INTENT_BYTES)?;
+    let intent = decode_staging_intent(intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    let artifact = decoder
+        .read_bytes_with_payload_limit(STORAGE_RPC_MAX_STAGING_ARTIFACT_BYTES)?
+        .to_vec();
+    decoder.finish()?;
+    if u64::try_from(artifact.len()).ok() != Some(intent.artifact_length())
+        || checksum::sha256::digest(&artifact) != intent.artifact_digest()
+    {
+        return Err(StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "artifact does not match its intent",
+        ));
+    }
+    Ok(StorageRpcMetadataTransferStagingArtifactPublishRequest { intent, artifact })
+}
+
+pub(crate) fn encode_metadata_transfer_staging_receipt_response(
+    receipt: &MetadataTransferStagingReceipt,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_bytes(&mut out, receipt.as_bytes());
+    out
+}
+
+pub(crate) fn decode_metadata_transfer_staging_receipt_response(
+    bytes: &[u8],
+    expected_intent: &MetadataTransferStagingIntent,
+    expected_node_id: NodeId,
+) -> Result<MetadataTransferStagingReceipt, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let receipt = decoder.read_bytes_with_payload_limit(MAX_STAGING_EVIDENCE_BYTES)?;
+    decoder.finish()?;
+    MetadataTransferStagingReceipt::from_publication_bytes(
+        receipt,
+        expected_intent,
+        expected_node_id,
+    )
+    .map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "publication receipt is invalid",
+        )
+    })
+}
+
 fn validate_metadata_command_item(
     command_checksum: u64,
     command_bytes: Vec<u8>,

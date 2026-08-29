@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const METADATA_TRANSFER_STAGING_MAX_ENTRIES: usize = 256;
-const METADATA_TRANSFER_STAGING_MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const METADATA_TRANSFER_STAGING_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -906,7 +905,7 @@ impl StorageNodeServer {
                 })?;
                 let limits = MetadataTransferStagingLimits::new(
                     METADATA_TRANSFER_STAGING_MAX_ENTRIES,
-                    METADATA_TRANSFER_STAGING_MAX_ARTIFACT_BYTES,
+                    METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
                     METADATA_TRANSFER_STAGING_MAX_TOTAL_BYTES,
                 )
                 .map_err(|error| StorageNodeServerError::MetadataTransferStaging {
@@ -1567,6 +1566,7 @@ impl StorageNodeServer {
             runtime_route_source: Arc::clone(&self.runtime_route_state),
             route_admission: self.route_admission.clone(),
             node: Arc::clone(&self._node),
+            metadata_transfer_staging_store: self.metadata_transfer_staging_store.clone(),
             read_handles: Arc::clone(&self.read_handles),
             metadata_command_locks: self.metadata_command_locks.clone(),
             rpc_auth: self.rpc_auth.clone(),

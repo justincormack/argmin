@@ -47,6 +47,7 @@ use storage::{
     StaticInitialControlPlaneTopology, StaticInitialPgPlacement, StaticStorageFailureDomain,
     StaticStorageNodeEndpoint, StaticStoragePlacementNode, StaticStoragePlacementParameters,
     StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig, StorageRpcTransportLimits,
+    STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_ENVELOPE_LEN,
 };
 use x509_cert::der::Decode;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
@@ -4312,6 +4313,11 @@ fn validate_static_cluster_manifest(
         &tls_identities,
         &tls_trust_bundles,
     )?;
+    validate_staging_publication_transport(
+        &manifest.endpoints,
+        &transport_profiles,
+        manifest.deployment.mode,
+    )?;
     validate_global_runtime_path_namespace(
         &manifest.authorities,
         &manifest.storage_nodes,
@@ -5179,7 +5185,6 @@ fn validate_endpoints(
                 CONTROL_PLANE_RPC_MAX_FRAME_BYTES
             ));
         }
-
         let listen = parse_endpoint_address(&endpoint.listen, true)?;
         let advertise = parse_endpoint_address(&endpoint.advertise, false)?;
         if endpoint.listen != canonical_endpoint_uri(&listen) {
@@ -5443,6 +5448,34 @@ fn validate_endpoints(
             return Err(format!(
                 "storage node {} requires a TCP storage-rpc endpoint for cross-host clients",
                 storage_node.node_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_staging_publication_transport(
+    endpoints: &[EndpointInput],
+    transport_profiles: &BTreeMap<&str, &TransportProfileInput>,
+    deployment_mode: DeploymentMode,
+) -> Result<(), String> {
+    if deployment_mode != DeploymentMode::Replicated {
+        return Ok(());
+    }
+    let required_frame_bytes =
+        u64::try_from(STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_ENVELOPE_LEN)
+            .expect("storage staging publication frame limit fits u64");
+    for endpoint in endpoints
+        .iter()
+        .filter(|endpoint| endpoint.protocol == EndpointProtocol::StorageRpc)
+    {
+        let profile = transport_profiles
+            .get(endpoint.transport_profile_id.as_str())
+            .expect("endpoint transport profile was validated");
+        if profile.max_frame_bytes < required_frame_bytes {
+            return Err(format!(
+                "storage endpoint {} frame limit must be at least {required_frame_bytes} bytes to carry the maximum authenticated metadata-transfer staging publication",
+                endpoint.id
             ));
         }
     }
@@ -7093,6 +7126,13 @@ connect_timeout_ms = 1000
 io_timeout_ms = 5000
 
 [[transport_profiles]]
+id = "storage"
+max_frame_bytes = 67108864
+max_connections = 64
+connect_timeout_ms = 1000
+io_timeout_ms = 5000
+
+[[transport_profiles]]
 id = "control"
 max_frame_bytes = 8388648
 max_connections = 64
@@ -7175,7 +7215,7 @@ protocol = "storage-rpc"
 priority = 10
 listen = "unix:///run/argmin/storage-{number}.sock"
 advertise = "unix:///run/argmin/storage-{number}.sock"
-transport_profile_id = "internal"
+transport_profile_id = "storage"
 "#
             )
             .unwrap();
@@ -7390,6 +7430,13 @@ connect_timeout_ms = 1000
 io_timeout_ms = 15000
 
 [[transport_profiles]]
+id = "storage"
+max_frame_bytes = 67108864
+max_connections = 64
+connect_timeout_ms = 1000
+io_timeout_ms = 15000
+
+[[transport_profiles]]
 id = "control"
 max_frame_bytes = 8388648
 max_connections = 64
@@ -7491,7 +7538,7 @@ protocol = "storage-rpc"
 priority = 10
 listen = "tcp://0.0.0.0:{storage_port}"
 advertise = "tcp://storage-{host_number}.internal:{storage_port}"
-transport_profile_id = "internal"
+transport_profile_id = "storage"
 tls_identity_id = "host-{host_number}-identity"
 tls_trust_bundle_id = "cluster-ca"
 tls_server_name = "storage-{host_number}.internal"
@@ -7539,6 +7586,53 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
         manifest
     }
 
+    fn replicated_manifest_before_staging_publication_profile() -> StaticClusterManifestInput {
+        let manifest = replace_once(
+            &replicated_manifest(),
+            concat!(
+                "[[transport_profiles]]\n",
+                "id = \"storage\"\n",
+                "max_frame_bytes = 67108864\n",
+                "max_connections = 64\n",
+                "connect_timeout_ms = 1000\n",
+                "io_timeout_ms = 15000\n\n",
+            ),
+            "",
+        );
+        let manifest = manifest.replace(
+            "transport_profile_id = \"storage\"",
+            "transport_profile_id = \"internal\"",
+        );
+        let mut manifest: StaticClusterManifestInput = toml::from_str(&manifest).unwrap();
+        manifest
+            .transport_profiles
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        manifest.hosts.sort_by(|left, right| left.id.cmp(&right.id));
+        manifest.disks.sort_by(|left, right| left.id.cmp(&right.id));
+        manifest
+            .processes
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        manifest
+            .authorities
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        manifest
+            .storage_nodes
+            .sort_by_key(|storage_node| storage_node.node_id);
+        manifest
+            .endpoints
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        manifest
+            .tls_identities
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        manifest
+            .tls_trust_bundles
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        manifest
+            .auth_credentials
+            .sort_by(|left, right| credential_sort_key(left).cmp(&credential_sort_key(right)));
+        manifest
+    }
+
     fn replicated_unix_data_manifest() -> String {
         let mut manifest =
             replicated_manifest().replace("failure_domain = \"host\"", "failure_domain = \"disk\"");
@@ -7566,7 +7660,7 @@ protocol = "storage-rpc"
 priority = 1
 listen = "unix:///run/argmin/storage-{host_number}.sock"
 advertise = "unix:///run/argmin/storage-{host_number}.sock"
-transport_profile_id = "internal"
+transport_profile_id = "storage"
 "#
             );
             manifest.push_str(&unix_block);
@@ -9085,7 +9179,7 @@ protocol = "storage-rpc"
 priority = 1
 listen = "unix:///run/argmin/storage-1.sock"
 advertise = "unix:///run/argmin/storage-1.sock"
-transport_profile_id = "internal"
+transport_profile_id = "storage"
 "#
         );
         let validated = parse_static_cluster_manifest(&manifest, "control-1").unwrap();
@@ -9138,7 +9232,7 @@ protocol = "storage-rpc"
 priority = 10
 listen = "tcp://0.0.0.0:{port}"
 advertise = "tcp://storage-{storage_number}.internal:{port}"
-transport_profile_id = "internal"
+transport_profile_id = "storage"
 tls_identity_id = "host-{storage_number}-identity"
 tls_trust_bundle_id = "cluster-ca"
 tls_server_name = "storage-{storage_number}.internal"
@@ -9165,7 +9259,7 @@ protocol = "storage-rpc"
 priority = 1
 listen = "unix:///run/argmin/storage-{storage_number}.sock"
 advertise = "unix:///run/argmin/storage-{storage_number}.sock"
-transport_profile_id = "internal"
+transport_profile_id = "storage"
 "#
             )
             .unwrap();
@@ -9335,8 +9429,8 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
                 replicated.process_identity_digest(),
             ),
             (
-                "0d32b6801cdf4a4a37e9b8f294ed5d1f0e118edfccb6a6f5825e6f45962825ae",
-                "720ce6f51baf0752837a5250b5921c1dca2e4baff69b6c7ef4b1d7c4d5c62193",
+                "b98d9da7f18b78b1bc805d585fd45e76341b0c6a49c6eb237ce21bba2391994f",
+                "fbb1dca57b678fd0a43206d278cf428dee58e0c4371210f24956fea1d472207a",
             )
         );
     }
@@ -9353,13 +9447,18 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
         let standalone = parse_static_cluster_manifest(&standalone_manifest(), "all-1").unwrap();
         let replicated =
             parse_static_cluster_manifest(&replicated_manifest(), "control-2").unwrap();
+        let historical_replicated = replicated_manifest_before_staging_publication_profile();
         assert_eq!(
             standalone.full_config_fingerprint(),
             "eba1830e2f4d9e50ce05dbba6a439e9384381545cbd91de817fd7b7d654e59dc"
         );
         assert_eq!(
-            replicated.full_config_fingerprint(),
+            full_config_fingerprint(&historical_replicated),
             "8c5289c878434b3a0688e4e6fcce6d207f50cb06ee91a4c5194aa6afa492ba32"
+        );
+        assert_eq!(
+            replicated.full_config_fingerprint(),
+            "36eefdd9321970b5459e6f3f3b6e311b7c68fcac8bc175e3aad082fa6a459182"
         );
 
         let material = ResolvedStaticClusterMaterial {
@@ -9916,6 +10015,48 @@ tls_server_name = "control-1.internal""#,
         assert!(parse_static_cluster_manifest(&escaping, "all-1")
             .unwrap_err()
             .contains("not canonical"));
+    }
+
+    #[test]
+    fn replicated_storage_rpc_profiles_carry_maximum_staging_publication() {
+        let required =
+            u64::try_from(STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_ENVELOPE_LEN).unwrap();
+        assert!(required <= CLUSTER_MANIFEST_MAX_FRAME_BYTES);
+        let exact_bound = replace_once(
+            &replicated_manifest(),
+            "id = \"storage\"\nmax_frame_bytes = 67108864",
+            &format!("id = \"storage\"\nmax_frame_bytes = {required}"),
+        );
+        parse_static_cluster_manifest(&exact_bound, "control-1").unwrap();
+
+        let alternate_id = "storage-1-undersized-alternate";
+        let undersized = format!(
+            "{exact_bound}\n\
+             [[transport_profiles]]\n\
+             id = \"storage-undersized\"\n\
+             max_frame_bytes = {}\n\
+             max_connections = 64\n\
+             connect_timeout_ms = 1000\n\
+             io_timeout_ms = 15000\n\
+             \n\
+             [[endpoints]]\n\
+             id = \"{alternate_id}\"\n\
+             owner_process_id = \"storage-1\"\n\
+             protocol = \"storage-rpc\"\n\
+             priority = 20\n\
+             listen = \"unix:///run/argmin/storage-1-undersized.sock\"\n\
+             advertise = \"unix:///run/argmin/storage-1-undersized.sock\"\n\
+             transport_profile_id = \"storage-undersized\"\n",
+            required - 1,
+        );
+
+        let error = parse_static_cluster_manifest(&undersized, "control-1").unwrap_err();
+
+        assert!(
+            error.contains(alternate_id)
+                && error.contains("maximum authenticated metadata-transfer staging publication"),
+            "unexpected undersized storage profile error: {error}"
+        );
     }
 
     #[test]

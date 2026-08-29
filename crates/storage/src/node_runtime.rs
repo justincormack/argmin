@@ -506,21 +506,23 @@ pub(super) mod pg_store_facade {
     pub(crate) use super::pg_store::{
         canonical_empty_metadata_state_digest, decode_staging_evidence,
         decode_staging_evidence_apply_receipt, decode_staging_evidence_page_payload,
-        MetadataCommandStartupDisposition, MetadataProofStorageIssuer,
-        MetadataTransferStagingEvidence, MetadataTransferStagingEvidenceApplyReceipt,
-        MetadataTransferStagingEvidenceKind, MetadataTransferStagingEvidencePage,
-        MetadataTransferStagingStore, PendingMetadataCommandSlotInsertError,
-        PendingMetadataCommandSlotReplaceError, ScavengerShardFile, ScavengerShardFileScan,
-        ScavengerShardRow, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
+        decode_staging_intent, encode_staging_intent, MetadataCommandStartupDisposition,
+        MetadataProofStorageIssuer, MetadataTransferStagingEvidence,
+        MetadataTransferStagingEvidenceApplyReceipt, MetadataTransferStagingEvidenceKind,
+        MetadataTransferStagingEvidencePage, MetadataTransferStagingIntent,
+        MetadataTransferStagingReceipt, MetadataTransferStagingStore,
+        PendingMetadataCommandSlotInsertError, PendingMetadataCommandSlotReplaceError,
+        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow, MAX_STAGING_EVIDENCE_BYTES,
+        MAX_STAGING_INTENT_BYTES, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
         METADATA_COMMAND_CHECKPOINT_MAGIC, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
     };
     #[cfg(test)]
     pub(crate) use super::pg_store::{
         metadata_transfer_staging_evidence_page_for_test,
         metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
         metadata_transfer_staging_evidence_page_with_member_actor_for_test,
-        MetadataTransferStagingIntent, MetadataTransferStagingLimits,
-        MetadataTransferStagingNodeIdentity,
+        MetadataTransferStagingLimits, MetadataTransferStagingNodeIdentity,
     };
     pub use super::pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,

@@ -8,6 +8,7 @@ struct StorageNodeConnectionHandler {
     runtime_route_source: Arc<RwLock<StorageNodeRuntimeRouteState>>,
     route_admission: StorageNodeRouteAdmissionGate,
     node: Arc<SharedStorageNode>,
+    metadata_transfer_staging_store: Option<Arc<MetadataTransferStagingStore>>,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
     rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,

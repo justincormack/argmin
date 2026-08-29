@@ -2,10 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 22;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 23;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_STAGING_ARTIFACT_BYTES: usize =
+    METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES as usize;
+pub(crate) const STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_FRAME_LEN: usize = 4
+    + STORAGE_RPC_FRAME_MAGIC.len()
+    + 2
+    + 8
+    + 2
+    + 4
+    + 8
+    + 4
+    + MAX_STAGING_INTENT_BYTES
+    + 4
+    + STORAGE_RPC_MAX_STAGING_ARTIFACT_BYTES;
+const _: () = assert!(
+    4 + MAX_STAGING_INTENT_BYTES + 4 + STORAGE_RPC_MAX_STAGING_ARTIFACT_BYTES
+        <= STORAGE_RPC_MAX_PAYLOAD_LEN
+);
 pub(crate) const STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(1);
 pub(crate) const STORAGE_RPC_CLIENT_WRITE_TIMEOUT: std::time::Duration =

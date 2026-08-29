@@ -245,7 +245,12 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 22, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
             0, 0, 0, 202, 74, 215, 141, 132, 131, 9, 128, 97, 98, 99,
         ];
-        assert_eq!(bytes, V22_FRAME);
+        const V23_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 23, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 219, 185, 232, 25, 191, 51, 112, 119, 97, 98, 99,
+        ];
+        assert_eq!(bytes, V23_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
@@ -266,13 +271,17 @@ mod tests {
             decode_storage_rpc_frame(V21_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(21))
         );
+        assert_eq!(
+            decode_storage_rpc_frame(V22_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(22))
+        );
     }
 
     #[test]
-    fn current_storage_rpc_v22_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
+    fn current_storage_rpc_v23_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
     {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 22);
-        const EXPECTED_V22_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65160008070605040302013a0068010000ffac5bdc61c4e5260700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 23);
+        const EXPECTED_V23_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605040302013a00680100007a554333ab2d387d0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
 
         let bucket = BucketName::try_from("rpc").unwrap();
         let key = ObjectKey::try_from("k").unwrap();
@@ -317,8 +326,8 @@ mod tests {
         )
         .unwrap();
         let encoded_frame_hex = hex_bytes(&frame);
-        assert_eq!(encoded_frame_hex.len(), EXPECTED_V22_FRAME_HEX.len());
-        assert_eq!(encoded_frame_hex, EXPECTED_V22_FRAME_HEX);
+        assert_eq!(encoded_frame_hex.len(), EXPECTED_V23_FRAME_HEX.len());
+        assert_eq!(encoded_frame_hex, EXPECTED_V23_FRAME_HEX);
 
         let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
         assert_eq!(
@@ -472,6 +481,81 @@ mod tests {
     }
 
     #[test]
+    fn storage_rpc_v23_metadata_transfer_staging_publication_frame_is_stable() {
+        const EXPECTED_V23_STAGING_INTENT_CREATE_FRAME_HEX: &str = concat!(
+            "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605",
+            "04030201af0072000000c658c72e5bad9de46e0000000000000b0000000000000009",
+            "00000000000000070000001000000003000000010000000200000003000000100000",
+            "000300000001000000040000000300000000000000098e98a7dae88a0fd08243759d",
+            "f07802fd41329fe9ac2b5b010fbb569a90d3ff56000000000000000f0001",
+        );
+        const EXPECTED_V23_STAGING_FRAME_HEX: &str = concat!(
+            "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605",
+            "04030201b00085000000dd39f73868643ce06e0000000000000b0000000000000009",
+            "00000000000000070000001000000003000000010000000200000003000000100000",
+            "000300000001000000040000000300000000000000098e98a7dae88a0fd08243759d",
+            "f07802fd41329fe9ac2b5b010fbb569a90d3ff56000000000000000f00010f000000",
+            "7374616765642d6172746966616374",
+        );
+        let artifact = b"staged-artifact".to_vec();
+        let binding = crate::control_plane::UnavailablePgTransitionMutationBinding::new(
+            PgId::new(11),
+            ClusterEpoch::new(9).unwrap(),
+            ClusterEpoch::new(7).unwrap(),
+            vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+            vec![NodeId::new(1), NodeId::new(4), NodeId::new(3)],
+        );
+        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &binding,
+            checksum::sha256::digest(&artifact),
+            artifact.len() as u64,
+            crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        )
+        .unwrap();
+        let request = StorageRpcMetadataTransferStagingArtifactPublishRequest {
+            intent: intent.clone(),
+            artifact,
+        };
+        let create = StorageRpcMetadataTransferStagingIntentCreateRequest { intent };
+        let create_payload = encode_metadata_transfer_staging_intent_create_request(&create)
+            .unwrap();
+        assert_eq!(
+            decode_metadata_transfer_staging_intent_create_request(&create_payload).unwrap(),
+            create
+        );
+        let create_frame = encode_storage_rpc_frame(
+            0x0102_0304_0506_0708,
+            StorageRpcMessageKind::MetadataTransferStagingIntentCreate,
+            &create_payload,
+        )
+        .unwrap();
+        assert_eq!(
+            hex_bytes(&create_frame),
+            EXPECTED_V23_STAGING_INTENT_CREATE_FRAME_HEX
+        );
+        let payload = encode_metadata_transfer_staging_artifact_publish_request(&request).unwrap();
+        assert_eq!(
+            decode_metadata_transfer_staging_artifact_publish_request(&payload).unwrap(),
+            request
+        );
+        let frame = encode_storage_rpc_frame(
+            0x0102_0304_0506_0708,
+            StorageRpcMessageKind::MetadataTransferStagingArtifactPublish,
+            &payload,
+        )
+        .unwrap();
+        let frame_hex = hex_bytes(&frame);
+        assert_eq!(frame_hex, EXPECTED_V23_STAGING_FRAME_HEX);
+
+        let mut corrupted_artifact = payload;
+        *corrupted_artifact.last_mut().unwrap() ^= 0x01;
+        assert!(matches!(
+            decode_metadata_transfer_staging_artifact_publish_request(&corrupted_artifact),
+            Err(StorageRpcPayloadError::InvalidMetadataTransferStaging(_))
+        ));
+    }
+
+    #[test]
     fn storage_rpc_frame_rejects_resealed_old_and_new_version_fixtures() {
         assert_eq!(
             decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(16)),
@@ -498,8 +582,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(21))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(23)),
-            Err(StorageRpcFrameError::UnsupportedVersion(23))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(22)),
+            Err(StorageRpcFrameError::UnsupportedVersion(22))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(24)),
+            Err(StorageRpcFrameError::UnsupportedVersion(24))
         );
     }
 

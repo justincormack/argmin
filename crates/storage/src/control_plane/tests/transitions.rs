@@ -104,6 +104,20 @@ fn forge_staging_authorization_at_epoch(
     transitions: &[(PgId, ClusterEpoch)],
     receipt_epoch: ClusterEpoch,
 ) {
+    forge_staging_authorization_at_epoch_with_length(
+        snapshot,
+        transitions,
+        receipt_epoch,
+        |pg_id| 4_096 + u64::from(pg_id.get()),
+    );
+}
+
+fn forge_staging_authorization_at_epoch_with_length(
+    snapshot: &mut ClusterControlSnapshot,
+    transitions: &[(PgId, ClusterEpoch)],
+    receipt_epoch: ClusterEpoch,
+    artifact_length: impl Fn(PgId) -> u64,
+) {
     let requests = transitions
         .iter()
         .copied()
@@ -130,7 +144,7 @@ fn forge_staging_authorization_at_epoch(
                 ),
                 staging_generation: transition.transition_epoch.get(),
                 artifact_digest: [u8::try_from(pg_id.get()).unwrap(); 32],
-                artifact_length: 4_096 + u64::from(pg_id.get()),
+                artifact_length: artifact_length(pg_id),
                 artifact_format_version:
                     crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
             }
@@ -544,6 +558,16 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     assert!(recorded
         .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
             authorizations: invalid_artifact,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("invalid generation, artifact length, or storage format"));
+    let mut oversized_artifact = staging_requests.clone();
+    oversized_artifact[1].artifact_length =
+        crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES + 1;
+    assert!(recorded
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: oversized_artifact,
         })
         .unwrap_err()
         .to_string()
@@ -1248,6 +1272,32 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     authorization.batch_receipt.source_epoch = future_epoch;
     authorization.batch_receipt.target_epoch = future_epoch;
     assert!(future_receipt
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .to_string()
+        .contains("invalid staging authorization"));
+    let mut oversized_snapshot = recorded.clone();
+    let transition_epochs = pg_ids
+        .iter()
+        .copied()
+        .map(|pg_id| {
+            (
+                pg_id,
+                oversized_snapshot
+                    .unavailable_pg_placement_transition(pg_id)
+                    .unwrap()
+                    .transition_epoch(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let oversized_receipt_epoch = oversized_snapshot.cluster_epoch();
+    forge_staging_authorization_at_epoch_with_length(
+        &mut oversized_snapshot,
+        &transition_epochs,
+        oversized_receipt_epoch,
+        |_| crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES + 1,
+    );
+    assert!(oversized_snapshot
         .validate_current_state_invariants()
         .unwrap_err()
         .to_string()

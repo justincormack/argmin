@@ -53,6 +53,8 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandPublicationStart = 172,
     PlacedSegmentBackfillReferencePage = 169,
     ShardScavengerReferencePage = 174,
+    MetadataTransferStagingIntentCreate = 175,
+    MetadataTransferStagingArtifactPublish = 176,
     ShardScavengerReferenceMatch = 173,
     ObjectPayloadReclaimCommandBuild = 170,
     MetadataCommandRetainedAbortApply = 165,
@@ -348,6 +350,12 @@ impl StorageRpcMessageKind {
                 "placed segment backfill reference page"
             }
             Self::ShardScavengerReferencePage => "shard scavenger reference page",
+            Self::MetadataTransferStagingIntentCreate => {
+                "metadata transfer staging intent create"
+            }
+            Self::MetadataTransferStagingArtifactPublish => {
+                "metadata transfer staging artifact publish"
+            }
             Self::ShardScavengerReferenceMatch => "shard scavenger reference match",
             Self::ShardScavengerObservationRecord => "shard scavenger observation record",
             Self::ShardScavengerObservations => "shard scavenger observations",
@@ -606,6 +614,8 @@ impl StorageRpcMessageKind {
             172 => Ok(Self::MetadataCommandPublicationStart),
             169 => Ok(Self::PlacedSegmentBackfillReferencePage),
             174 => Ok(Self::ShardScavengerReferencePage),
+            175 => Ok(Self::MetadataTransferStagingIntentCreate),
+            176 => Ok(Self::MetadataTransferStagingArtifactPublish),
             173 => Ok(Self::ShardScavengerReferenceMatch),
             170 => Ok(Self::ObjectPayloadReclaimCommandBuild),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
@@ -807,6 +817,8 @@ pub(crate) enum StorageRpcPayloadError {
     UnsupportedMetadataProofCarrier(&'static str),
     #[error("invalid bucket metadata request: {0}")]
     InvalidBucketMetadataRequest(&'static str),
+    #[error("invalid metadata-transfer staging request: {0}")]
+    InvalidMetadataTransferStaging(&'static str),
     #[error("invalid object metadata request: {0}")]
     InvalidObjectMetadataRequest(&'static str),
     #[error("shard write size mismatch: expected {expected}, actual {actual}")]
@@ -2661,6 +2673,17 @@ pub(crate) struct StorageRpcMetadataCommandTransferCheckpointBaseRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) checkpoint: MetadataCommandCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataTransferStagingIntentCreateRequest {
+    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataTransferStagingArtifactPublishRequest {
+    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
+    pub(crate) artifact: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

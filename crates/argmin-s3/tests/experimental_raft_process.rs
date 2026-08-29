@@ -1381,6 +1381,13 @@ connect_timeout_ms = 1000
 io_timeout_ms = 15000
 
 [[transport_profiles]]
+id = "storage"
+max_frame_bytes = 67108864
+max_connections = 64
+connect_timeout_ms = 1000
+io_timeout_ms = 15000
+
+[[transport_profiles]]
 id = "control"
 max_frame_bytes = 8388648
 max_connections = 64
@@ -1494,7 +1501,7 @@ protocol = "storage-rpc"
 priority = 10
 listen = "tcp://127.0.0.1:{storage_port}"
 advertise = "tcp://localhost:{storage_port}"
-transport_profile_id = "internal"
+transport_profile_id = "storage"
 tls_identity_id = "cluster-server"
 tls_trust_bundle_id = "cluster-ca"
 tls_server_name = "localhost"

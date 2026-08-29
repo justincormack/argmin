@@ -71,9 +71,9 @@ use crate::node_client::{
 use crate::node_runtime::pg_store::{
     decode_metadata_command_checkpoint_candidate_rows, initialize_pg_durable_identity,
     inspect_pg_shard_inventory, sync_initialized_pg_store_layout, verify_pg_durable_identity,
-    MetadataCommandCheckpoint, MetadataCommandCheckpointCandidateRow,
+    MetadataCommandCheckpoint, MetadataCommandCheckpointCandidateRow, MetadataTransferStagingError,
     MetadataTransferStagingLimits, MetadataTransferStagingNodeIdentity,
-    MetadataTransferStagingStore, PgStore,
+    MetadataTransferStagingStore, PgStore, METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
 };
 use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, PgMetadataStore, ShardStore,
@@ -120,6 +120,8 @@ use crate::storage_rpc::{
     decode_metadata_command_transfer_checkpoint_base_request,
     decode_metadata_command_transfer_empty_state_request,
     decode_metadata_command_transfer_matching_state_request,
+    decode_metadata_transfer_staging_artifact_publish_request,
+    decode_metadata_transfer_staging_intent_create_request,
     decode_multipart_completion_barrier_command_build_request,
     decode_multipart_completion_preflight_request, decode_multipart_completion_snapshot_request,
     decode_multipart_parts_list_request, decode_multipart_upload_load_request,
@@ -184,6 +186,7 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
+    encode_metadata_transfer_staging_receipt_response,
     encode_multipart_completion_barrier_command_build_response,
     encode_multipart_completion_preflight_response, encode_multipart_completion_snapshot_response,
     encode_multipart_completion_stale_source_response, encode_multipart_management_lookup_response,
@@ -287,6 +290,8 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandTransferCheckpointBaseRequest,
     StorageRpcMetadataCommandTransferEmptyStateRequest,
     StorageRpcMetadataCommandTransferMatchingStateRequest,
+    StorageRpcMetadataTransferStagingArtifactPublishRequest,
+    StorageRpcMetadataTransferStagingIntentCreateRequest,
     StorageRpcMultipartCompletionBarrierCommandBuildRequest,
     StorageRpcMultipartCompletionBarrierCommandBuildResponse,
     StorageRpcMultipartCompletionPreflightOutcome, StorageRpcMultipartCompletionPreflightRequest,
@@ -2386,6 +2391,26 @@ impl StorageNodeConnectionHandler {
                     Ok(request) => self.metadata_command_transfer_checkpoint_base_install_response(
                         session, request,
                     ),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataTransferStagingIntentCreate => {
+                match decode_metadata_transfer_staging_intent_create_request(&frame.payload) {
+                    Ok(request) => self.metadata_transfer_staging_intent_create_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataTransferStagingArtifactPublish => {
+                match decode_metadata_transfer_staging_artifact_publish_request(&frame.payload) {
+                    Ok(request) => {
+                        self.metadata_transfer_staging_artifact_publish_response(request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8242,6 +8267,40 @@ impl StorageNodeConnectionHandler {
         Ok(response)
     }
 
+    fn metadata_transfer_staging_intent_create_response(
+        &self,
+        request: StorageRpcMetadataTransferStagingIntentCreateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let Some(store) = self.metadata_transfer_staging_store.as_ref() else {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnsupportedOperation,
+                message: "metadata-transfer staging is not configured".to_owned(),
+            });
+        };
+        match store.create_intent(&request.intent) {
+            Ok(_) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&staging_error_response(error)),
+        }
+    }
+
+    fn metadata_transfer_staging_artifact_publish_response(
+        &self,
+        request: StorageRpcMetadataTransferStagingArtifactPublishRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let Some(store) = self.metadata_transfer_staging_store.as_ref() else {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnsupportedOperation,
+                message: "metadata-transfer staging is not configured".to_owned(),
+            });
+        };
+        match store.publish_artifact(&request.intent, &request.artifact) {
+            Ok(receipt) => Ok(encode_storage_rpc_success_response(
+                &encode_metadata_transfer_staging_receipt_response(&receipt),
+            )),
+            Err(error) => encode_storage_rpc_error_response(&staging_error_response(error)),
+        }
+    }
+
     fn metadata_command_applied_hashes_response(
         &self,
         session: &StorageNodeSession,
@@ -9312,6 +9371,36 @@ impl StorageNodeConnectionHandler {
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
         };
         Ok(response)
+    }
+}
+
+fn staging_error_response(error: MetadataTransferStagingError) -> StorageRpcErrorResponse {
+    match error {
+        MetadataTransferStagingError::Capacity(_) => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::ResourceExhausted,
+            message: "metadata-transfer staging capacity is exhausted".to_owned(),
+        },
+        MetadataTransferStagingError::ArtifactMismatch => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::ShardIntegrity,
+            message: "metadata-transfer staging artifact failed integrity validation".to_owned(),
+        },
+        MetadataTransferStagingError::ArtifactTooLarge { .. } => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: "metadata-transfer staging artifact exceeds the protocol limit".to_owned(),
+        },
+        MetadataTransferStagingError::IntentConflict(_)
+        | MetadataTransferStagingError::GenerationRetired
+        | MetadataTransferStagingError::UnsupportedFormatVersion(_)
+        | MetadataTransferStagingError::UnsupportedCatalogueVersion(_) => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: "metadata-transfer staging request conflicts with durable state".to_owned(),
+        },
+        MetadataTransferStagingError::Io { .. }
+        | MetadataTransferStagingError::Sql { .. }
+        | MetadataTransferStagingError::Invariant(_) => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::Internal,
+            message: "metadata-transfer staging operation failed".to_owned(),
+        },
     }
 }
 

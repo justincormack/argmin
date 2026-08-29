@@ -434,9 +434,10 @@ when an uninstalled transition has already been retained. The same independent
 16-member and 131,042-byte command ceilings apply at encoder, decoder, state-machine,
 standalone, and Raft proposal boundaries. Immutable command-v21/state-v33
 aggregates and nested container vectors remain rejection evidence. This
-authorization command is still leader-internal and protocol-isolated: no
-production caller opens the staging store or sends destination staging RPCs
-until durable evidence publication and acknowledgement exist.
+authorization command is still leader-internal. The destination staging
+transport described below can persist only an already constructed exact
+authorization-bound intent; reconciliation does not yet select committed
+authorizations or consume their receipts for route installation.
 Command v23 and state v35 now provide the replicated half of durable staging
 evidence publication while keeping that protocol isolation. The new
 `ApplyMetadataTransferStagingEvidencePage` command carries the exact
@@ -452,9 +453,8 @@ validation treats the receipt actor as historical after admission, so a later
 node incarnation cannot invalidate already accepted evidence. Immutable
 command-v22/state-v34 aggregates remain rejection evidence. Control-plane RPC
 v19 and the production storage outbox now submit this command through isolated
-low-priority admission. Finalized-floor cleanup and destination staging remain
-later protocol slices; no production path creates staging publication or
-tombstone evidence yet.
+low-priority admission. Finalized-floor cleanup, tombstone publication, and
+destination-install receipt consumption remain later protocol slices.
 The storage-owned durable staging foundation is also complete but remains
 protocol-isolated. Staging-store format v1 has a fixed root manifest and exact
 initialization-complete marker, exact SQLite catalogue,
@@ -525,9 +525,35 @@ applied log before publishing the new overlay base; it never republishes a
 stale overlay captured before dispatch. Promotion completion also preserves an
 overlay that a renewal has already rebound to the promotion log. At most one
 evidence proposal runs at a time, and evidence publication never shares the
-storage node's heartbeat client or submission mutex. Finalized-floor pruning,
-compact actor-chain checkpoints, and destination staging operations remain
-later slices.
+storage node's heartbeat client or submission mutex.
+Storage RPC v23 now exposes the destination half of the staging boundary as
+two admin-only live-transfer operations. Intent creation carries the canonical
+storage-owned transition/generation/artifact tuple and performs the durable
+intent CAS. Artifact publication is bounded by the frame ceiling, rechecks its
+length and SHA-256 during encoding and decoding, and returns only a canonical
+publication receipt after the staging store's file and directory durability
+barriers plus catalogue commit. Exact intent and publication replay return the
+same durable outcome. The storage-owned protocol maximum is 63 MiB for this
+complete-artifact v23 transport; control-plane authorization, intent
+construction, store admission, and RPC encoding all reject larger artifacts as
+permanent protocol violations before reserving staging capacity. Replicated
+static configuration additionally requires every storage-RPC endpoint profile
+to carry the maximum authenticated publication envelope, including the
+canonical intent, frame, binding, and authentication overhead. Because the
+client uses the minimum limit across alternate endpoints, validating every
+endpoint prevents an exact authorization from becoming unpublishable after it
+commits. Supporting a larger artifact requires a future chunked publication
+grammar and coordinated format-version advance. Each destination also rejects an intent unless its
+durable actor identity is in the exact destination acting set. Authenticated
+Unix and TLS regressions exercise both
+operations through the production server and capability; ordinary frontend,
+storage-node, and maintenance principals are excluded. The operations are
+available only when the control-plane-managed node opened its established
+staging store. They deliberately do not mutate a PG route or install imported
+metadata. Reconciliation selection of committed staging authorizations,
+receipt-set consumption during destination installation, tombstone cleanup,
+finalized-floor pruning, and compact actor-chain checkpoints remain later
+slices.
 Command v19 additionally sealed the
 post-grace completion fence that prevents survivor heartbeats from indefinitely
 reactivating the old acting set; immutable command v18 remains rejection
@@ -1050,12 +1076,12 @@ immutable v22/v34 evidence. The destination install slice advances both
 versions again when it removes the remaining
 generic optional transition branches and makes installed staging evidence
 mandatory. The new transition-scoped artifact staging operations cross the
-storage RPC boundary and therefore require the corresponding storage-RPC
-version advance, fixed old/new frame evidence, authenticated Unix/TLS coverage,
-and explicit exclusion from ordinary frontend capabilities. Receipt-evidence
-publication crosses the control-plane RPC boundary, so advance control-plane
-RPC v17 to v18 and the shared authentication envelope from v1 to v2
-unconditionally. Preserve complete v17/v1 rejection evidence and add fixed v18
+storage RPC boundary and have advanced storage-RPC v22 to v23, retaining fixed
+v22/v23 frame evidence, authenticated Unix/TLS coverage, and explicit
+exclusion from ordinary frontend, storage-node, and maintenance capabilities.
+Receipt-evidence publication crosses the control-plane RPC boundary and has
+advanced control-plane RPC through v19 and the shared authentication envelope
+from v1 to v2. Preserve complete v17/v1 and v18/v2 rejection evidence and the fixed v19
 frames for a genesis page, a successor carrying a non-genesis
 `previous_apply_receipt_digest`, minimum, maximum-count, maximum-byte,
 multipage, generation-gap, exact-replay, and tombstone/finalized-floor

@@ -3950,6 +3950,7 @@ pub use storage_rpc_auth::{
     FrontendStorageRpcClientCapability, LivePgMetadataTransferStorageRpcClientCapability,
     MaintenanceStorageRpcClientCapability, StorageNodeStorageRpcClientCapability,
     StorageRpcServerAuthConfig, StorageRpcTransportLimits, STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN,
+    STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_ENVELOPE_LEN,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) use test_support::{
