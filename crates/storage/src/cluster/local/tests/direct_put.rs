@@ -4363,14 +4363,12 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
         interleaving == DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup,
     ));
     let terminal_cleanup_blocked_for_hook = Arc::clone(&terminal_cleanup_blocked);
+    let terminal_cleanup_bucket = bucket.clone();
     let _terminal_cleanup_hook = first_cluster
         .test_install_global_metadata_command_terminal_slot_removal_hook(Arc::new(
             move |command| {
-                matches!(
-                    command.payload(),
-                    MetadataCommandPayload::CommitDirectPutObject(commit)
-                        if commit.object.generation_id == winner_generation_id
-                ) && terminal_cleanup_blocked_for_hook.load(Ordering::SeqCst)
+                command.bucket_name() == &terminal_cleanup_bucket
+                    && terminal_cleanup_blocked_for_hook.load(Ordering::SeqCst)
             },
         ));
 
@@ -4431,28 +4429,126 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
                 "non-owning waiter must not remove the retained terminal slot"
             );
 
-            terminal_cleanup_blocked.store(false, Ordering::SeqCst);
-            let recovery_deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match first_cluster
-                    .drain_pending_metadata_command_with_authorized_recovery_route(
-                        pg_id,
-                        &command,
-                        &first_cluster,
-                    )
-                    .unwrap()
-                {
-                    PendingMetadataCommandOutcome::Abandoned => break,
-                    PendingMetadataCommandOutcome::TerminalCleanupPending { applied: false } => {
-                        assert!(
-                            Instant::now() < recovery_deadline,
-                            "authorized recovery did not remove the abandoned terminal slot"
+            let (recovery_result_tx, recovery_result_rx) = std::sync::mpsc::sync_channel(1);
+            let (retained_terminal_tx, retained_terminal_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_recovery_tx, release_recovery_rx) = std::sync::mpsc::sync_channel(1);
+            let recovery_cluster = &first_cluster;
+            let recovery_map = Arc::clone(&first_map);
+            let recovery_bucket = bucket.clone();
+            let initial_recovery_source = command.clone();
+            scope.spawn(move || {
+                let recovery_deadline = Instant::now() + Duration::from_secs(5);
+                let mut retained_terminal_tx = Some(retained_terminal_tx);
+                let mut initial_recovery_source = Some(initial_recovery_source);
+                loop {
+                    let Some(recovery_command) =
+                        pending_metadata_command_for_test(&recovery_map, pg_id, &recovery_bucket)
+                    else {
+                        recovery_result_tx
+                            .send(Ok(PendingMetadataCommandOutcome::Abandoned))
+                            .unwrap();
+                        break;
+                    };
+                    let recovery_authorized_source = match initial_recovery_source.take() {
+                        Some(source) => source,
+                        None => {
+                            let Some(source) = recovery_map
+                                .runtime_state()
+                                .metadata_command_recovery_handoff_source(
+                                    pg_id,
+                                    &recovery_command,
+                                )
+                            else {
+                                assert!(
+                                    Instant::now() < recovery_deadline,
+                                    "authorized recovery handoff did not expose its lineage root"
+                                );
+                                thread::sleep(Duration::from_millis(1));
+                                continue;
+                            };
+                            source
+                        }
+                    };
+                    let outcome = recovery_cluster
+                        .drain_pending_metadata_command_with_authorized_recovery_source(
+                            pg_id,
+                            &recovery_command,
+                            &recovery_authorized_source,
+                            recovery_cluster,
                         );
-                        thread::sleep(Duration::from_millis(1));
+                    match outcome {
+                        Ok(PendingMetadataCommandOutcome::TerminalCleanupPending {
+                            applied: false,
+                        }) => {
+                            if let Some(retained_terminal_tx) = retained_terminal_tx.take() {
+                                let retained_command = pending_metadata_command_for_test(
+                                    &recovery_map,
+                                    pg_id,
+                                    &recovery_bucket,
+                                )
+                                .expect("retained terminal outcome must preserve the pending slot");
+                                retained_terminal_tx.send(retained_command).unwrap();
+                                release_recovery_rx
+                                    .recv_timeout(Duration::from_secs(5))
+                                    .expect(
+                                        "test did not release authorized recovery after retained terminal observation",
+                                    );
+                            }
+                            assert!(
+                                Instant::now() < recovery_deadline,
+                                "authorized recovery did not remove the abandoned terminal slot"
+                            );
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(crate::ObjectPgActionError::Store(
+                            StoreError::MetadataCommandContention { .. },
+                        )) => {
+                            assert!(
+                                Instant::now() < recovery_deadline,
+                                "authorized recovery did not remove the abandoned terminal slot"
+                            );
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        outcome => {
+                            recovery_result_tx.send(outcome).unwrap();
+                            break;
+                        }
                     }
-                    outcome => panic!("unexpected authorized recovery outcome: {outcome:?}"),
                 }
-            }
+            });
+            let retained_terminal_command = retained_terminal_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "authorized recovery did not observe retained terminal cleanup: {error:?}; recovery outcome: {:?}",
+                        recovery_result_rx.try_recv()
+                    )
+                });
+            assert!(matches!(
+                result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                pending_metadata_command_for_test(&first_map, pg_id, &bucket),
+                Some(retained_terminal_command),
+                "retained terminal command must remain installed until authorized cleanup resumes"
+            );
+            terminal_cleanup_blocked.store(false, Ordering::SeqCst);
+            release_recovery_tx
+                .send(())
+                .expect("authorized recovery worker stopped before cleanup release");
+            let recovery_outcome = recovery_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("authorized recovery did not finish after terminal cleanup release")
+                .unwrap();
+            assert!(
+                matches!(
+                    recovery_outcome,
+                    PendingMetadataCommandOutcome::Abandoned
+                        | PendingMetadataCommandOutcome::Applied
+                ),
+                "unexpected authorized terminal cleanup outcome: {recovery_outcome:?}"
+            );
             result_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("contender did not finish after authorized terminal cleanup")
