@@ -1025,9 +1025,9 @@ mod tests {
 
     #[test]
     fn tcp_refusal_is_a_transport_connect_failure() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        // Port zero cannot name a listening TCP endpoint, so this cannot race
+        // an unrelated test that acquires a recently released ephemeral port.
+        let address = SocketAddr::from(([127, 0, 0, 1], 0));
         let endpoint = StorageRpcClientEndpoint::tls_tcp(
             format!("tcp://localhost:{}", address.port()),
             vec![address],

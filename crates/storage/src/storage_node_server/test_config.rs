@@ -7154,9 +7154,9 @@
             instance_id: "frontend-1".to_owned(),
         });
         let endpoint = if tcp {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            drop(listener);
+            // Port zero deterministically fails before connection and cannot
+            // be acquired by another parallel test after a listener is dropped.
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
             StorageRpcClientEndpoint::tcp_with_config(
                 format!("tcp://localhost:{}", address.port()),
                 vec![address],

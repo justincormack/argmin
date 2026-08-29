@@ -2076,10 +2076,10 @@ fn control_plane_raft_tls_peer_transport_bounds_trickled_response_absolutely() {
 
 #[test]
 fn control_plane_raft_tls_peer_connect_failure_is_unreachable() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let endpoint = raft_peer_test_tls_endpoint(port);
+    // TCP port zero is reserved and is never assigned to a listening socket.
+    // Releasing an ephemeral listener here would race every other listener in
+    // this test binary and could connect to an unrelated TLS peer instead.
+    let endpoint = raft_peer_test_tls_endpoint(0);
     let transport = raft_peer_test_configured_transport(2, endpoint.clone());
 
     let error =
