@@ -283,10 +283,19 @@ impl SnapshotSensitiveEvaluatedAttempt<'_> {
     }
 }
 
+struct AllocatorCleanupFreshInstallAdmission {
+    completion_admission: bool,
+    effect_fence: Option<AdmittedRouteEffectFence>,
+}
+
 #[must_use = "allocator contention outcomes must restart or continue deliberately"]
 enum AllocatorCleanupFreshInstallOutcome {
     Installed(Box<MetadataCommandEnvelope>),
     PendingContenderDrained,
+    PendingContenderAwaitingRecovery {
+        command: Box<MetadataCommandEnvelope>,
+        error: ObjectPgActionError,
+    },
     LogConflictHandled,
 }
 

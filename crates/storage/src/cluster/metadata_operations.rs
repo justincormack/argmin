@@ -4862,28 +4862,61 @@ impl StorageCluster {
         publisher: impl crate::metadata_command::AllocatorCleanupMetadataCommandPublisher,
         pg_id: PgId,
         bucket: &BucketName,
-        completion_admission: bool,
-        effect_fence: Option<AdmittedRouteEffectFence>,
+        admission: AllocatorCleanupFreshInstallAdmission,
+        work_budget: &mut RequestWorkBudget,
         build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
     ) -> Result<AllocatorCleanupFreshInstallOutcome, ObjectPgActionError> {
-        match self.try_install_object_pg_pending_command_with_fresh_id(
+        let AllocatorCleanupFreshInstallAdmission {
+            completion_admission,
+            effect_fence,
+        } = admission;
+        let (command, drained_outcome) = match self.try_install_object_pg_pending_command_with_fresh_id(
             pg_id,
             bucket,
             completion_admission,
             effect_fence,
             build_command,
         )? {
-            ObjectPgPendingCommandInstall::Installed(command) => Ok(
-                AllocatorCleanupFreshInstallOutcome::Installed(Box::new(command)),
+            ObjectPgPendingCommandInstall::Installed(command) => {
+                return Ok(AllocatorCleanupFreshInstallOutcome::Installed(Box::new(command)));
+            }
+            ObjectPgPendingCommandInstall::Pending(command) => (
+                command,
+                AllocatorCleanupFreshInstallOutcome::PendingContenderDrained,
             ),
-            ObjectPgPendingCommandInstall::Pending(command) => {
-                self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
-                Ok(AllocatorCleanupFreshInstallOutcome::PendingContenderDrained)
-            }
             ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
-                self.drain_after_object_pg_log_conflict(publisher, pg_id, bucket, pending_visible)?;
-                Ok(AllocatorCleanupFreshInstallOutcome::LogConflictHandled)
+                if !pending_visible {
+                    return Ok(AllocatorCleanupFreshInstallOutcome::LogConflictHandled);
+                }
+                let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
+                    return Ok(AllocatorCleanupFreshInstallOutcome::LogConflictHandled);
+                };
+                (
+                    command,
+                    AllocatorCleanupFreshInstallOutcome::LogConflictHandled,
+                )
             }
+        };
+        match self.drain_pending_object_metadata_command_with_work_budget(
+            publisher,
+            pg_id,
+            &command,
+            work_budget,
+        ) {
+            Ok(_) => Ok(drained_outcome),
+            Err(error @ ObjectPgActionError::MetadataCommandRecoveryTransferred)
+            | Err(error @ ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery) => {
+                #[cfg(test)]
+                request_ops::maybe_run_pending_object_metadata_command_recovery_transferred_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    &command,
+                );
+                Ok(AllocatorCleanupFreshInstallOutcome::PendingContenderAwaitingRecovery {
+                    command: Box::new(command),
+                    error,
+                })
+            }
+            Err(error) => Err(error),
         }
     }
 

@@ -897,8 +897,11 @@ impl StorageCluster {
                 publisher,
                 pg_id,
                 bucket,
-                false,
-                Some(effect_fence),
+                AllocatorCleanupFreshInstallAdmission {
+                    completion_admission: false,
+                    effect_fence: Some(effect_fence),
+                },
+                &mut work_budget,
                 |command_id| {
                     MetadataCommandEnvelope::new(
                         command_id,
@@ -921,6 +924,25 @@ impl StorageCluster {
                             "object generation reservation pending install retry budget exhausted",
                         )
                         .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
+                AllocatorCleanupFreshInstallOutcome::PendingContenderAwaitingRecovery {
+                    command,
+                    error,
+                } => {
+                    let unrelated_direct_put = matches!(
+                        command.payload(),
+                        MetadataCommandPayload::CommitDirectPutObject(commit)
+                            if commit.object.bucket != *bucket || commit.object.key != *key
+                    );
+                    if unrelated_direct_put {
+                        return Err(error);
+                    }
+                    self.wait_for_transferred_metadata_command_with_work_budget(
+                        pg_id,
+                        &command,
+                        &mut work_budget,
+                    )?;
                     continue;
                 }
                 AllocatorCleanupFreshInstallOutcome::LogConflictHandled => {
@@ -1250,8 +1272,11 @@ impl StorageCluster {
                 publisher,
                 pg_id,
                 bucket,
-                completion_admission,
-                effect_fence,
+                AllocatorCleanupFreshInstallAdmission {
+                    completion_admission,
+                    effect_fence,
+                },
+                &mut work_budget,
                 |command_id| {
                     MetadataCommandEnvelope::new(
                         command_id,
@@ -1284,6 +1309,17 @@ impl StorageCluster {
                             "object version reservation pending install retry budget exhausted",
                         )
                         .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
+                AllocatorCleanupFreshInstallOutcome::PendingContenderAwaitingRecovery {
+                    command,
+                    ..
+                } => {
+                    self.wait_for_transferred_metadata_command_with_work_budget(
+                        pg_id,
+                        &command,
+                        &mut work_budget,
+                    )?;
                     continue;
                 }
                 AllocatorCleanupFreshInstallOutcome::LogConflictHandled => {
@@ -3496,8 +3532,11 @@ impl StorageCluster {
                 publisher,
                 pg_id,
                 bucket,
-                false,
-                None,
+                AllocatorCleanupFreshInstallAdmission {
+                    completion_admission: false,
+                    effect_fence: None,
+                },
+                &mut work_budget,
                 |command_id| {
                     MetadataCommandEnvelope::new(
                         command_id,
@@ -3518,6 +3557,17 @@ impl StorageCluster {
                             "object generation release pending install retry budget exhausted",
                         )
                         .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
+                AllocatorCleanupFreshInstallOutcome::PendingContenderAwaitingRecovery {
+                    command,
+                    ..
+                } => {
+                    self.wait_for_transferred_metadata_command_with_work_budget(
+                        pg_id,
+                        &command,
+                        &mut work_budget,
+                    )?;
                     continue;
                 }
                 AllocatorCleanupFreshInstallOutcome::LogConflictHandled => {

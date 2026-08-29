@@ -2320,6 +2320,150 @@ fn object_generation_reservation_waits_after_transferring_authorized_recovery() 
 }
 
 #[test]
+fn object_generation_install_race_waits_for_authorized_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::VersionId::from_u64(1),
+        )),
+    );
+
+    let checksum = command.checksum_crc64();
+    let inject_transfer = Arc::new(AtomicBool::new(true));
+    let inject_transfer_for_hook = Arc::clone(&inject_transfer);
+    let _apply_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate.checksum_crc64() == checksum
+                && inject_transfer_for_hook.swap(false, Ordering::SeqCst)
+            {
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: candidate.id().cluster_epoch(),
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                });
+            }
+            Ok(())
+        }));
+
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_closure = Arc::clone(&hook_ran);
+    let hook_cluster = Arc::clone(&cluster);
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let hook_command = command.clone();
+    let (handoff_tx, handoff_rx) = std::sync::mpsc::sync_channel(1);
+    let _install_hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &hook_command);
+            let error = hook_cluster
+                .drain_pending_metadata_command_with_recovery_gate(pg_id, &hook_command)
+                .expect_err("injected command must transfer recovery authority");
+            assert!(matches!(
+                error,
+                ObjectPgActionError::MetadataCommandRecoveryTransferred
+            ));
+            handoff_tx.send(()).unwrap();
+        }));
+    let allocator_wait_observed = Arc::new(AtomicBool::new(false));
+    let allocator_wait_observed_for_hook = Arc::clone(&allocator_wait_observed);
+    let (allocator_wait_tx, allocator_wait_rx) = std::sync::mpsc::sync_channel(1);
+    let _allocator_wait_hook = cluster
+        .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+            move |candidate| {
+                if candidate.checksum_crc64() == checksum
+                    && !allocator_wait_observed_for_hook.swap(true, Ordering::SeqCst)
+                {
+                    allocator_wait_tx.send(()).unwrap();
+                }
+            },
+        ));
+
+    let reservation_id = crate::tests::stream_session_id("install-race");
+    let reservation_result = thread::scope(|scope| {
+        let (reservation_tx, reservation_rx) = std::sync::mpsc::sync_channel(1);
+        let reservation_cluster = Arc::clone(&cluster);
+        let reservation_bucket = &bucket;
+        let reservation_key = &key;
+        let reservation_id = &reservation_id;
+        scope.spawn(move || {
+            reservation_tx
+                .send(reservation_cluster.reserve_put_object_generation(
+                    reservation_bucket,
+                    reservation_key,
+                    reservation_id,
+                ))
+                .unwrap();
+        });
+
+        handoff_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("generation reservation did not encounter the injected install race");
+        allocator_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("allocator install did not preserve the pending recovery command");
+        assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+        assert!(matches!(
+            reservation_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket),
+            Some(command.clone())
+        );
+
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        reservation_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("generation reservation did not finish after authorized recovery")
+    });
+
+    assert_eq!(
+        reservation_result.expect(
+            "generation install race must wait instead of exposing internal recovery contention",
+        ),
+        GenerationId::new(1).unwrap()
+    );
+    assert!(hook_ran.load(Ordering::SeqCst));
+    assert!(!inject_transfer.load(Ordering::SeqCst));
+    assert!(allocator_wait_observed.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
 fn object_generation_reservation_preserves_unrelated_direct_put_transfer() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
