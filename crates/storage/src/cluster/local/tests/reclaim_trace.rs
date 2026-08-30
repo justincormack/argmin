@@ -724,27 +724,23 @@ impl TwoGenerationReclaimTraceModel {
                     }
                 };
                 match generation {
-                    TraceGeneration::Old if self.old_metadata_exists && !self.old_lease_held => {
-                        self.old_metadata_exists = false;
-                        self.enqueue_bucket_delete();
-                    }
-                    TraceGeneration::New if self.new_metadata_exists && !self.new_lease_held => {
-                        self.new_metadata_exists = false;
-                        self.enqueue_bucket_delete();
-                    }
                     TraceGeneration::Old
-                        if self.old_metadata_exists
-                            && self.old_lease_held
-                            && !self.deferred.contains(&generation) =>
+                        if self.old_lease_held && !self.deferred.contains(&generation) =>
                     {
                         self.deferred.push(generation);
                     }
                     TraceGeneration::New
-                        if self.new_metadata_exists
-                            && self.new_lease_held
-                            && !self.deferred.contains(&generation) =>
+                        if self.new_lease_held && !self.deferred.contains(&generation) =>
                     {
                         self.deferred.push(generation);
+                    }
+                    TraceGeneration::Old if self.old_metadata_exists => {
+                        self.old_metadata_exists = false;
+                        self.enqueue_bucket_delete();
+                    }
+                    TraceGeneration::New if self.new_metadata_exists => {
+                        self.new_metadata_exists = false;
+                        self.enqueue_bucket_delete();
                     }
                     _ => {}
                 }
@@ -907,27 +903,19 @@ impl TwoKeyReclaimTraceModel {
                     }
                 };
                 match key {
-                    TraceKey::A if self.key_a_metadata_exists && !self.key_a_lease_held => {
+                    TraceKey::A if self.key_a_lease_held && !self.deferred.contains(&key) => {
+                        self.deferred.push(key);
+                    }
+                    TraceKey::B if self.key_b_lease_held && !self.deferred.contains(&key) => {
+                        self.deferred.push(key);
+                    }
+                    TraceKey::A if self.key_a_metadata_exists => {
                         self.key_a_metadata_exists = false;
                         self.enqueue_bucket_delete();
                     }
-                    TraceKey::B if self.key_b_metadata_exists && !self.key_b_lease_held => {
+                    TraceKey::B if self.key_b_metadata_exists => {
                         self.key_b_metadata_exists = false;
                         self.enqueue_bucket_delete();
-                    }
-                    TraceKey::A
-                        if self.key_a_metadata_exists
-                            && self.key_a_lease_held
-                            && !self.deferred.contains(&key) =>
-                    {
-                        self.deferred.push(key);
-                    }
-                    TraceKey::B
-                        if self.key_b_metadata_exists
-                            && self.key_b_lease_held
-                            && !self.deferred.contains(&key) =>
-                    {
-                        self.deferred.push(key);
                     }
                     _ => {}
                 }
@@ -1455,12 +1443,17 @@ impl TwoGenerationReclaimTraceHarness {
         Ok(())
     }
 
-    fn execute_worker_object_step(&mut self, expected: TraceGeneration) -> TestCaseResult {
+    fn execute_worker_object_step(
+        &mut self,
+        expected: TraceGeneration,
+        context: &str,
+    ) -> TestCaseResult {
         let actual = self.take_object_generation_work()?;
         prop_assert_eq!(
             actual,
             expected,
-            "worker dequeued object reclaim generation out of FIFO order"
+            "worker dequeued object reclaim generation out of FIFO order\n{}",
+            context
         );
         let completed = execute_object_payload_reclaim_worker_step(
             &self.runtime,
@@ -1674,12 +1667,13 @@ impl TwoKeyReclaimTraceHarness {
         Ok(())
     }
 
-    fn execute_worker_object_step(&mut self, expected: TraceKey) -> TestCaseResult {
+    fn execute_worker_object_step(&mut self, expected: TraceKey, context: &str) -> TestCaseResult {
         let actual = self.take_object_key_work()?;
         prop_assert_eq!(
             actual,
             expected,
-            "worker dequeued object reclaim key out of bucket-root order"
+            "worker dequeued object reclaim key out of bucket-root order\n{}",
+            context
         );
         let completed = execute_object_payload_reclaim_worker_step(
             &self.runtime,
@@ -1938,6 +1932,31 @@ fn assert_two_key_reclaim_trace_matches_model(
     Ok(())
 }
 
+fn run_two_generation_reclaim_trace(ops: &[TwoGenerationReclaimTraceOp]) -> TestCaseResult {
+    let tmp = test_util::tempdir();
+    let runtime = make_test_read_runtime(tmp.path());
+    let mut harness = TwoGenerationReclaimTraceHarness::new(runtime);
+    let mut model = TwoGenerationReclaimTraceModel::new();
+
+    for (index, op) in ops.iter().enumerate() {
+        let context = format!(
+            "after step {index}: {op}\nfull trace:\n{}",
+            render_two_generation_reclaim_trace(&ops[..=index]),
+        );
+        if matches!(op, TwoGenerationReclaimTraceOp::WorkerObjectStep) {
+            let Some(expected) = model.next_object_generation() else {
+                panic!("legal worker step must have queued object work")
+            };
+            harness.execute_worker_object_step(expected, &context)?;
+        } else {
+            harness.execute(op)?;
+        }
+        model.apply(op);
+        assert_two_generation_reclaim_trace_matches_model(&harness, &model, &context)?;
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -1981,27 +2000,7 @@ proptest! {
     fn prop_two_generation_reclaim_queue_trace_matches_model(
         ops in two_generation_reclaim_trace_strategy()
     ) {
-        let tmp = test_util::tempdir();
-        let runtime = make_test_read_runtime(tmp.path());
-        let mut harness = TwoGenerationReclaimTraceHarness::new(runtime);
-        let mut model = TwoGenerationReclaimTraceModel::new();
-
-        for (index, op) in ops.iter().enumerate() {
-            let context = format!(
-                "after step {index}: {op}\nfull trace:\n{}",
-                render_two_generation_reclaim_trace(&ops[..=index]),
-            );
-            if matches!(op, TwoGenerationReclaimTraceOp::WorkerObjectStep) {
-                let Some(expected) = model.next_object_generation() else {
-                    panic!("legal worker step must have queued object work")
-                };
-                harness.execute_worker_object_step(expected)?;
-            } else {
-                harness.execute(op)?;
-            }
-            model.apply(op);
-            assert_two_generation_reclaim_trace_matches_model(&harness, &model, &context)?;
-        }
+        run_two_generation_reclaim_trace(&ops)?;
     }
 
     #[test]
@@ -2022,7 +2021,7 @@ proptest! {
                 let Some(expected) = model.next_object_key() else {
                     panic!("legal worker step must have queued object work")
                 };
-                harness.execute_worker_object_step(expected)?;
+                harness.execute_worker_object_step(expected, &context)?;
             } else {
                 harness.execute(op)?;
             }
@@ -2030,6 +2029,26 @@ proptest! {
             assert_two_key_reclaim_trace_matches_model(&harness, &model, &context)?;
         }
     }
+}
+
+#[test]
+fn stale_generation_hint_with_active_lease_remains_deferred_in_fifo_order() {
+    use TwoGenerationReclaimTraceOp::*;
+
+    run_two_generation_reclaim_trace(&[
+        SeedNewMetadata,
+        AcquireOldLease,
+        SeedBucketDelete,
+        EnqueueNewReclaim,
+        WorkerBucketDeleteStep,
+        AcquireNewLease,
+        SeedOldMetadata,
+        EnqueueOldReclaim,
+        WorkerObjectStep,
+        WorkerObjectStep,
+        WorkerObjectStep,
+    ])
+    .unwrap();
 }
 
 #[test]
