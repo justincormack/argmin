@@ -1957,6 +1957,31 @@ fn run_two_generation_reclaim_trace(ops: &[TwoGenerationReclaimTraceOp]) -> Test
     Ok(())
 }
 
+fn run_two_key_reclaim_trace(ops: &[TwoKeyReclaimTraceOp]) -> TestCaseResult {
+    let tmp = test_util::tempdir();
+    let runtime = make_test_read_runtime(tmp.path());
+    let mut harness = TwoKeyReclaimTraceHarness::new(runtime);
+    let mut model = TwoKeyReclaimTraceModel::new();
+
+    for (index, op) in ops.iter().enumerate() {
+        let context = format!(
+            "after step {index}: {op}\nfull trace:\n{}",
+            render_two_key_reclaim_trace(&ops[..=index]),
+        );
+        if matches!(op, TwoKeyReclaimTraceOp::WorkerObjectStep) {
+            let Some(expected) = model.next_object_key() else {
+                panic!("legal worker step must have queued object work")
+            };
+            harness.execute_worker_object_step(expected, &context)?;
+        } else {
+            harness.execute(op)?;
+        }
+        model.apply(op);
+        assert_two_key_reclaim_trace_matches_model(&harness, &model, &context)?;
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -2007,27 +2032,7 @@ proptest! {
     fn prop_two_key_reclaim_queue_trace_matches_model(
         ops in two_key_reclaim_trace_strategy()
     ) {
-        let tmp = test_util::tempdir();
-        let runtime = make_test_read_runtime(tmp.path());
-        let mut harness = TwoKeyReclaimTraceHarness::new(runtime);
-        let mut model = TwoKeyReclaimTraceModel::new();
-
-        for (index, op) in ops.iter().enumerate() {
-            let context = format!(
-                "after step {index}: {op}\nfull trace:\n{}",
-                render_two_key_reclaim_trace(&ops[..=index]),
-            );
-            if matches!(op, TwoKeyReclaimTraceOp::WorkerObjectStep) {
-                let Some(expected) = model.next_object_key() else {
-                    panic!("legal worker step must have queued object work")
-                };
-                harness.execute_worker_object_step(expected, &context)?;
-            } else {
-                harness.execute(op)?;
-            }
-            model.apply(op);
-            assert_two_key_reclaim_trace_matches_model(&harness, &model, &context)?;
-        }
+        run_two_key_reclaim_trace(&ops)?;
     }
 }
 
@@ -2044,6 +2049,26 @@ fn stale_generation_hint_with_active_lease_remains_deferred_in_fifo_order() {
         AcquireNewLease,
         SeedOldMetadata,
         EnqueueOldReclaim,
+        WorkerObjectStep,
+        WorkerObjectStep,
+        WorkerObjectStep,
+    ])
+    .unwrap();
+}
+
+#[test]
+fn stale_key_hint_with_active_lease_remains_deferred_in_queue_order() {
+    use TwoKeyReclaimTraceOp::*;
+
+    run_two_key_reclaim_trace(&[
+        SeedKeyBMetadata,
+        AcquireKeyALease,
+        SeedBucketDelete,
+        EnqueueKeyBReclaim,
+        WorkerBucketDeleteStep,
+        AcquireKeyBLease,
+        SeedKeyAMetadata,
+        EnqueueKeyAReclaim,
         WorkerObjectStep,
         WorkerObjectStep,
         WorkerObjectStep,
