@@ -2591,6 +2591,26 @@ impl ClusterControlSnapshot {
             .collect()
     }
 
+    pub fn authorize_unavailable_pg_staging_intents_batch_command(
+        &self,
+        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "staging authorization",
+            authorizations
+                .iter()
+                .map(|request| request.unavailable_transition.pg_id()),
+        )?;
+        let command = ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: authorizations.to_vec(),
+        };
+        self.validate_replication_safe_unavailable_pg_batch_command(
+            "staging authorization",
+            &command,
+        )?;
+        Ok(command)
+    }
+
     fn apply_validated_unavailable_pg_staging_authorizations(
         &self,
         validated: Vec<ValidatedUnavailablePgStagingIntentAuthorization>,
@@ -2950,6 +2970,45 @@ impl ClusterControlSnapshot {
         }
         next_snapshot.bump_epoch()?;
         Ok(Some(next_snapshot))
+    }
+
+    pub fn install_unavailable_pg_placement_transitions_batch_command(
+        &self,
+        transitions: &[UnavailablePgTransitionInstallRequest],
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "destination installation",
+            transitions
+                .iter()
+                .map(|request| request.unavailable_transition.pg_id()),
+        )?;
+        let command = ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
+            transitions: transitions.to_vec(),
+            expected_destination_epoch,
+        };
+        self.validate_replication_safe_unavailable_pg_batch_command(
+            "destination installation",
+            &command,
+        )?;
+        Ok(command)
+    }
+
+    fn validate_replication_safe_unavailable_pg_batch_command(
+        &self,
+        kind: &str,
+        command: &ControlPlaneCommand,
+    ) -> Result<(), ControlPlaneError> {
+        self.apply_control_plane_command(command.clone())?;
+        let encoded_len =
+            crate::control_plane_raft::control_plane_command_replication_encoded_len(command)?;
+        if encoded_len > crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
+            return Err(ControlPlaneError::invariant_failure(format!(
+                "unavailable placement {kind} batch encodes to {encoded_len} OpenRaft entry bytes, exceeding the replication-safe limit {}",
+                crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+            )));
+        }
+        Ok(())
     }
 
     fn validate_metadata_transfer_staging_evidence_authority(
@@ -11518,6 +11577,29 @@ pub trait ControlPlaneAdmin {
         let _ = (work, ready_at_ms);
         Err(ControlPlaneError::rpc_remote(
             "unavailable PG placement completion is not supported by this authority".to_owned(),
+        ))
+    }
+
+    fn authorize_unavailable_pg_staging_intents_batch(
+        &mut self,
+        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let _ = authorizations;
+        Err(ControlPlaneError::rpc_remote(
+            "unavailable PG staging authorization batches are not supported by this authority"
+                .to_owned(),
+        ))
+    }
+
+    fn install_unavailable_pg_placement_transitions_batch(
+        &mut self,
+        transitions: &[UnavailablePgTransitionInstallRequest],
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let _ = (transitions, expected_destination_epoch);
+        Err(ControlPlaneError::rpc_remote(
+            "unavailable PG destination installation batches are not supported by this authority"
+                .to_owned(),
         ))
     }
 

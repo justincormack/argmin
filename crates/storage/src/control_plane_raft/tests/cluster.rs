@@ -5192,6 +5192,461 @@ fn control_plane_openraft_transferred_leader_continues_after_old_leader_loss() {
 }
 
 #[test]
+fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_leader_transfer() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let ThreeVoterAuthorityFixture {
+            network: _,
+            config: _,
+            leader_log_store: _,
+            third_log_store: _,
+            authority1,
+            authority2,
+            authority3,
+        } = initialized_three_node_voter_authorities(
+            "control-plane-raft-plural-staging-install-test",
+            1201,
+            1202,
+            1203,
+        )
+        .await;
+        let authority1 = Arc::new(authority1);
+        let authority2 = Arc::new(authority2);
+        let authority3 = Arc::new(authority3);
+        let mut leader = crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost::new_for_test(
+            tokio::runtime::Handle::current(),
+            Arc::clone(&authority1),
+            false,
+        )
+        .unwrap();
+
+        let pg_ids = [PgId::new(70), PgId::new(71)];
+        let storage_nodes = (1..=4)
+            .map(|node_id| {
+                (
+                    NodeId::new(node_id),
+                    format!("unix:///raft-batch-storage-{node_id}.sock"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let source_acting_set = vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+        let pg_acting_sets = pg_ids
+            .iter()
+            .copied()
+            .map(|pg_id| (pg_id, source_acting_set.clone()))
+            .collect::<Vec<_>>();
+        let topology =
+            crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                3,
+                [0x6a; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                vec![1201, 1202, 1203],
+                &storage_nodes,
+                &pg_acting_sets,
+                crate::control_plane::test_certified_storage_placement_policy(
+                    (1..=4).map(NodeId::new),
+                    3,
+                    1,
+                ),
+            )
+            .unwrap();
+        leader
+            .submit_command_for_test(
+                ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                    nodes: storage_nodes.clone(),
+                    pg_acting_sets,
+                    topology,
+                },
+            )
+            .unwrap();
+
+        let heartbeat =
+            |host: &mut crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost,
+             node_id: u32,
+             lease_ms: u64,
+             state: Option<PgState>,
+             heartbeat_at_ms: u64| {
+                for _ in 0..4 {
+                    let observed_epoch = host.current_snapshot_for_test().unwrap().cluster_epoch();
+                    let refresh = match host.refresh_node_heartbeat(
+                        NodeHeartbeat {
+                            node_id: NodeId::new(node_id),
+                            node_incarnation: 1,
+                            endpoint: storage_nodes
+                                [usize::try_from(node_id.checked_sub(1).unwrap()).unwrap()]
+                            .1
+                            .clone(),
+                            observed_epoch,
+                            requested_lease_duration_ms: lease_ms,
+                            cluster_map_history_route_scan_generation:
+                                std::num::NonZeroU64::new(1).unwrap(),
+                            cluster_map_history_route_references: Default::default(),
+                            pg_observations: state
+                                .into_iter()
+                                .flat_map(|state| {
+                                    pg_ids.iter().copied().map(move |pg_id| {
+                                        NodePgHeartbeatObservation {
+                                            pg_id,
+                                            state,
+                                            metadata_proof: PgMetadataProof::empty(),
+                                            pending_metadata_command: None,
+                                        }
+                                    })
+                                })
+                                .collect(),
+                        },
+                        heartbeat_at_ms,
+                    ) {
+                        Ok(refresh) => refresh,
+                        Err(ControlPlaneError::PgPrimaryObservationNotActive { .. })
+                            if state == Some(PgState::Active) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => panic!(
+                            "storage node {node_id} {state:?} heartbeat failed: {error:?}"
+                        ),
+                    };
+                    if refresh.lease().serving() {
+                        return;
+                    }
+                }
+                panic!("storage node {node_id} did not receive a serving lease");
+            };
+
+        for node_id in 1..=4 {
+            heartbeat(
+                &mut leader,
+                node_id,
+                10_000,
+                None,
+                1_000 + u64::from(node_id),
+            );
+        }
+        for node_id in 1..=3 {
+            heartbeat(
+                &mut leader,
+                node_id,
+                10_000,
+                Some(PgState::Peering),
+                2_000 + u64::from(node_id),
+            );
+        }
+        for node_id in 1..=3 {
+            heartbeat(
+                &mut leader,
+                node_id,
+                if node_id == 1 { 100 } else { 10_000 },
+                Some(PgState::Active),
+                3_000 + u64::from(node_id),
+            );
+        }
+        let failed_deadline = leader
+            .current_snapshot_for_test()
+            .unwrap()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        leader.expire_heartbeat_leases(failed_deadline).unwrap();
+        for node_id in 2..=4 {
+            heartbeat(
+                &mut leader,
+                node_id,
+                10_000,
+                None,
+                failed_deadline + u64::from(node_id),
+            );
+        }
+        let proof_at_ms = leader
+            .current_snapshot_for_test()
+            .unwrap()
+            .max_committed_timestamp_ms()
+            .unwrap()
+            + 1;
+        for node_id in [2, 3] {
+            heartbeat(
+                &mut leader,
+                node_id,
+                10_000,
+                Some(PgState::Peering),
+                proof_at_ms + u64::from(node_id),
+            );
+        }
+        let begin_at_ms = leader
+            .current_snapshot_for_test()
+            .unwrap()
+            .unavailable_node_observation(NodeId::new(1))
+            .unwrap()
+            .observed_at_ms()
+            + 1;
+        let mut cursor = crate::control_plane::UnavailablePgReconciliationCursor::start();
+        let begun = leader
+            .poll_unavailable_pg_reconciliation_batch(&mut cursor, begin_at_ms)
+            .unwrap();
+        assert!(begun.rejected.is_empty());
+        assert_eq!(
+            begun
+                .work
+                .iter()
+                .map(crate::control_plane::UnavailablePgReconciliationWork::pg_id)
+                .collect::<Vec<_>>(),
+            pg_ids
+        );
+
+        let begun_snapshot = leader.current_snapshot_for_test().unwrap();
+        let authorizations = pg_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, pg_id)| {
+                let transition = begun_snapshot
+                    .unavailable_pg_placement_transition(pg_id)
+                    .unwrap();
+                crate::control_plane_command::UnavailablePgStagingIntentAuthorizationRequest {
+                    unavailable_transition:
+                        crate::control_plane::UnavailablePgTransitionMutationBinding::new(
+                            transition.pg_id(),
+                            transition.transition_epoch(),
+                            transition.source_epoch(),
+                            transition.source_acting_set().to_vec(),
+                            transition.destination_acting_set().to_vec(),
+                        ),
+                    staging_generation: transition.transition_epoch().get(),
+                    artifact_digest: [0x80 + u8::try_from(index).unwrap(); 32],
+                    artifact_length: 8_192 + u64::try_from(index).unwrap(),
+                    artifact_format_version:
+                        crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+                }
+            })
+            .collect::<Vec<_>>();
+        let authorization_epoch = begun_snapshot.cluster_epoch();
+        let authorized = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::authorize_unavailable_pg_staging_intents_batch(
+            &mut leader,
+            &authorizations,
+        )
+        .unwrap();
+        assert_eq!(authorized.cluster_epoch(), authorization_epoch);
+        let authorization_applied = authority1.status().await.unwrap().applied().unwrap();
+        authority2
+            .wait_for_applied_log_id(
+                authorization_applied,
+                Duration::from_secs(1),
+                "second voter applied plural staging authorization",
+            )
+            .await
+            .unwrap();
+        authority3
+            .wait_for_applied_log_id(
+                authorization_applied,
+                Duration::from_secs(1),
+                "third voter applied plural staging authorization",
+            )
+            .await
+            .unwrap();
+        for authority in [&authority1, &authority2, &authority3] {
+            let snapshot = authority
+                .durable_state_machine_snapshot_for_test()
+                .await
+                .unwrap();
+            assert_eq!(snapshot, authorized);
+        }
+
+        let transfer = PgMetadataTransferProof::new(
+            authorized.cluster_epoch(),
+            PgMetadataProof::empty(),
+        );
+        let destination_nodes = authorized
+            .unavailable_pg_placement_transition(pg_ids[0])
+            .unwrap()
+            .destination_acting_set()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut evidence_digests = BTreeMap::new();
+        for node_id in destination_nodes {
+            let node = authorized.node(node_id).unwrap();
+            let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+                node_id,
+                node.node_incarnation(),
+                node.endpoint().to_owned(),
+            )
+            .unwrap();
+            let mut previous_receipt = None;
+            for authorization in &authorizations {
+                let intent =
+                    crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+                        &authorization.unavailable_transition,
+                        authorization.artifact_digest,
+                        authorization.artifact_length,
+                        authorization.artifact_format_version,
+                    )
+                    .unwrap();
+                let page =
+                    crate::pg_store::metadata_transfer_staging_publication_evidence_page_for_test(
+                        actor.clone(),
+                        &intent,
+                        transfer,
+                        previous_receipt.as_ref(),
+                    );
+                evidence_digests.insert(
+                    (authorization.unavailable_transition.pg_id(), node_id),
+                    checksum::sha256::digest(page.entries()[0].evidence()),
+                );
+                let apply_receipt = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::apply_metadata_transfer_staging_evidence_page(
+                    &mut leader,
+                    page.operation_payload().to_vec(),
+                    page.page_digest(),
+                )
+                .unwrap();
+                previous_receipt = Some(
+                    crate::pg_store::decode_staging_evidence_apply_receipt(&apply_receipt).unwrap(),
+                );
+            }
+        }
+
+        let install_source = leader.current_snapshot_for_test().unwrap();
+        let destination_epoch = ClusterEpoch::new(install_source.cluster_epoch().get() + 1).unwrap();
+        let install_requests = authorizations
+            .iter()
+            .map(|authorization| {
+                let transition = install_source
+                    .unavailable_pg_placement_transition(
+                        authorization.unavailable_transition.pg_id(),
+                    )
+                    .unwrap();
+                let mut publications = transition
+                    .destination_acting_set()
+                    .iter()
+                    .copied()
+                    .map(|node_id| {
+                        let node = install_source.node(node_id).unwrap();
+                        crate::control_plane_command::UnavailablePgStagingPublicationBinding {
+                            node_id,
+                            node_incarnation: node.node_incarnation(),
+                            endpoint: node.endpoint().to_owned(),
+                            evidence_digest: evidence_digests
+                                [&(authorization.unavailable_transition.pg_id(), node_id)],
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                publications.sort_by_key(|publication| publication.node_id);
+                crate::control_plane_command::UnavailablePgTransitionInstallRequest {
+                    unavailable_transition: authorization.unavailable_transition.clone(),
+                    transfer,
+                    expected_destination_epoch: destination_epoch,
+                    publications,
+                }
+            })
+            .collect::<Vec<_>>();
+        let installed = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::install_unavailable_pg_placement_transitions_batch(
+            &mut leader,
+            &install_requests,
+            destination_epoch,
+        )
+        .unwrap();
+        assert_eq!(installed.cluster_epoch(), destination_epoch);
+        for pg_id in pg_ids {
+            let transition = installed
+                .unavailable_pg_placement_transition(pg_id)
+                .unwrap();
+            assert_eq!(transition.destination_epoch(), Some(destination_epoch));
+        }
+        let install_applied = authority1.status().await.unwrap().applied().unwrap();
+        authority2
+            .wait_for_applied_log_id(
+                install_applied,
+                Duration::from_secs(1),
+                "second voter applied plural destination installation",
+            )
+            .await
+            .unwrap();
+        authority3
+            .wait_for_applied_log_id(
+                install_applied,
+                Duration::from_secs(1),
+                "third voter applied plural destination installation",
+            )
+            .await
+            .unwrap();
+        for authority in [&authority1, &authority2, &authority3] {
+            assert_eq!(
+                authority
+                    .durable_state_machine_snapshot_for_test()
+                    .await
+                    .unwrap(),
+                installed
+            );
+        }
+
+        authority1.transfer_leadership_to(1202).await.unwrap();
+        authority2
+            .wait_for_current_leader(
+                1202,
+                Duration::from_secs(1),
+                "second voter accepted leadership before plural replay",
+            )
+            .await
+            .unwrap();
+        wait_for_authority_status_matching(
+            &authority2,
+            Duration::from_secs(1),
+            "second voter became serving before plural replay",
+            ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+        )
+        .await;
+        let mut successor =
+            crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost::new_for_test(
+                tokio::runtime::Handle::current(),
+                Arc::clone(&authority2),
+                false,
+            )
+            .unwrap();
+        let replayed_authorization = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::authorize_unavailable_pg_staging_intents_batch(
+            &mut successor,
+            &authorizations,
+        )
+        .unwrap();
+        assert_eq!(replayed_authorization, installed);
+        let replayed_install = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::install_unavailable_pg_placement_transitions_batch(
+            &mut successor,
+            &install_requests,
+            destination_epoch,
+        )
+        .unwrap();
+        assert_eq!(replayed_install, installed);
+
+        let replay_applied = authority2.status().await.unwrap().applied().unwrap();
+        authority1
+            .wait_for_applied_log_id(
+                replay_applied,
+                Duration::from_secs(1),
+                "old leader applied exact plural replay",
+            )
+            .await
+            .unwrap();
+        authority3
+            .wait_for_applied_log_id(
+                replay_applied,
+                Duration::from_secs(1),
+                "third voter applied exact plural replay",
+            )
+            .await
+            .unwrap();
+        for authority in [&authority1, &authority2, &authority3] {
+            assert_eq!(
+                authority
+                    .durable_state_machine_snapshot_for_test()
+                    .await
+                    .unwrap(),
+                installed
+            );
+        }
+
+        authority1.shutdown().await.unwrap();
+        authority2.shutdown().await.unwrap();
+        authority3.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn control_plane_openraft_restart_replays_committed_entries() {
     ControlPlaneRaftTypeConfig::run(async {
         let mut log_store = ControlPlaneRaftLogStore::empty();

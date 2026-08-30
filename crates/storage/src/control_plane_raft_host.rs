@@ -23,7 +23,10 @@ use crate::control_plane::{
     UnavailablePgReconciliationPollBatch, UnavailablePgReconciliationStage,
     UnavailablePgReconciliationWork,
 };
-use crate::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
+use crate::control_plane_command::{
+    ControlPlaneCommand, ControlPlaneCommandResponse,
+    UnavailablePgStagingIntentAuthorizationRequest, UnavailablePgTransitionInstallRequest,
+};
 use crate::control_plane_raft::{
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
     ControlPlaneRaftNodeId, SubmittedControlPlaneRaftCommand,
@@ -557,6 +560,48 @@ impl ControlPlaneRaftAuthorityHost {
         }
         work.sort_by_key(UnavailablePgReconciliationWork::pg_id);
         Ok(UnavailablePgReconciliationPollBatch { work, rejected })
+    }
+
+    pub fn authorize_unavailable_pg_staging_intents_batch(
+        &mut self,
+        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let authorizations = authorizations.to_vec();
+        let response = self.submit_raft_command_derived(move |current| {
+            current.authorize_unavailable_pg_staging_intents_batch_command(&authorizations)
+        })?;
+        if !matches!(
+            response,
+            ControlPlaneCommandResponse::AuthorizeUnavailablePgStagingIntents
+        ) {
+            return Err(ControlPlaneError::invariant_failure(
+                "staging authorization batch returned the wrong response",
+            ));
+        }
+        self.current_snapshot()
+    }
+
+    pub fn install_unavailable_pg_placement_transitions_batch(
+        &mut self,
+        transitions: &[UnavailablePgTransitionInstallRequest],
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let transitions = transitions.to_vec();
+        let response = self.submit_raft_command_derived(move |current| {
+            current.install_unavailable_pg_placement_transitions_batch_command(
+                &transitions,
+                expected_destination_epoch,
+            )
+        })?;
+        if !matches!(
+            response,
+            ControlPlaneCommandResponse::InstallUnavailablePgPlacementTransitions
+        ) {
+            return Err(ControlPlaneError::invariant_failure(
+                "destination installation batch returned the wrong response",
+            ));
+        }
+        self.current_snapshot()
     }
 
     pub fn complete_unavailable_pg_reconciliation(
@@ -1257,6 +1302,28 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
             )
         })?;
         self.current_snapshot()
+    }
+
+    fn authorize_unavailable_pg_staging_intents_batch(
+        &mut self,
+        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        ControlPlaneRaftAuthorityHost::authorize_unavailable_pg_staging_intents_batch(
+            self,
+            authorizations,
+        )
+    }
+
+    fn install_unavailable_pg_placement_transitions_batch(
+        &mut self,
+        transitions: &[UnavailablePgTransitionInstallRequest],
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        ControlPlaneRaftAuthorityHost::install_unavailable_pg_placement_transitions_batch(
+            self,
+            transitions,
+            expected_destination_epoch,
+        )
     }
 
     fn apply_metadata_transfer_staging_evidence_page(

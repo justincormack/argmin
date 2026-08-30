@@ -31,8 +31,9 @@ use openraft::{AnyError, Config, Membership, Raft, ReadPolicy, StorageError};
 use proptest::prelude::*;
 
 use crate::control_plane::{
-    ClusterControlSnapshot, NodeAvailabilityState, NodeHeartbeat, NodePgHeartbeatObservation,
-    PgMetadataProof, RuntimeMapFreshnessProof,
+    ClusterControlSnapshot, ControlPlaneHeartbeatRuntimeMapSource, NodeAvailabilityState,
+    NodeHeartbeat, NodePgHeartbeatObservation, PgMetadataProof, PgMetadataTransferProof,
+    RuntimeMapFreshnessProof,
 };
 use crate::control_plane_auth::ControlPlaneScopedCredentialInput;
 use crate::control_plane_command::LeaseHorizonAuthorityBinding;

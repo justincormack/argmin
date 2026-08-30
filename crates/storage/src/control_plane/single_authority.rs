@@ -2806,6 +2806,32 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    pub fn authorize_unavailable_pg_staging_intents_batch(
+        &mut self,
+        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .snapshot
+            .authorize_unavailable_pg_staging_intents_batch_command(authorizations)?;
+        self.apply_and_commit_command(command)?;
+        Ok(self.snapshot.clone())
+    }
+
+    pub fn install_unavailable_pg_placement_transitions_batch(
+        &mut self,
+        transitions: &[UnavailablePgTransitionInstallRequest],
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .snapshot
+            .install_unavailable_pg_placement_transitions_batch_command(
+                transitions,
+                expected_destination_epoch,
+            )?;
+        self.apply_and_commit_command(command)?;
+        Ok(self.snapshot.clone())
+    }
+
     pub fn complete_unavailable_pg_placement_transition(
         &mut self,
         work: &UnavailablePgReconciliationWork,
@@ -3836,6 +3862,28 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
             self,
             work,
             ready_at_ms,
+        )
+    }
+
+    fn authorize_unavailable_pg_staging_intents_batch(
+        &mut self,
+        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::authorize_unavailable_pg_staging_intents_batch(
+            self,
+            authorizations,
+        )
+    }
+
+    fn install_unavailable_pg_placement_transitions_batch(
+        &mut self,
+        transitions: &[UnavailablePgTransitionInstallRequest],
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::install_unavailable_pg_placement_transitions_batch(
+            self,
+            transitions,
+            expected_destination_epoch,
         )
     }
 

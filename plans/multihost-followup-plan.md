@@ -437,7 +437,10 @@ when an uninstalled transition has already been retained. The same independent
 16-member and 131,042-byte command ceilings apply at encoder, decoder, state-machine,
 standalone, and Raft proposal boundaries. Immutable command-v21/state-v33
 aggregates and nested container vectors remain rejection evidence. This
-authorization command is still leader-internal. The destination staging
+authorization command is still leader-internal. Snapshot builders now validate
+the complete immutable result and exact OpenRaft entry size before returning a
+plural command, and both standalone and Raft authorities expose that builder
+through the shared `ControlPlaneAdmin` batch boundary. The destination staging
 transport described below can persist only an already constructed exact
 authorization-bound intent; reconciliation does not yet select committed
 authorizations or consume their receipts for route installation.
@@ -473,7 +476,16 @@ state-v35 aggregates remain rejection evidence. The singular unavailable-PG
 install path remains temporarily available to the existing reconciliation
 worker; it must be retired in the same slice that switches that worker to
 authorization, staging, plural installation, and cleanup so outage recovery
-is never disabled between commits.
+is never disabled between commits. As with staging authorization, plural
+installation now has one replication-safe snapshot builder and shared
+standalone/Raft `ControlPlaneAdmin` submission boundary. Two-member durable
+standalone tests pin all-or-none rejection, exact replay before and after
+authority restart, and one shared destination epoch. A composed three-voter
+OpenRaft regression additionally invokes both plural `ControlPlaneAdmin`
+methods, verifies each intermediate snapshot on every replica, transfers
+leadership, and replays both exact batches through the successor leader without
+state or epoch mutation. The production worker does not consume that boundary
+yet.
 The storage-owned durable staging foundation is also complete but remains
 protocol-isolated. Staging-store format v2 has a fixed root manifest and exact
 initialization-complete marker, exact SQLite catalogue,
