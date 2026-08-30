@@ -2439,6 +2439,45 @@ impl super::StorageCluster {
         }
     }
 
+    fn finish_current_pending_mark_bucket_deleting(
+        &self,
+        metadata_route: &dyn crate::node_client::BucketMetadataRoute,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<bool, BucketWriteDrainError> {
+        let MetadataCommandPayload::MarkBucketDeleting(mark) = command.payload() else {
+            return Ok(false);
+        };
+        if mark.bucket_name() != bucket
+            || !metadata_route
+                .pending_mark_bucket_deleting_command_matches_current(mark)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+        {
+            return Ok(false);
+        }
+        let outcome = self
+            .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                pg_id,
+                command,
+                false,
+                work_budget,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        if matches!(
+            outcome,
+            FinishPendingMetadataCommandResult::RetryPartialExactConflict
+        ) {
+            return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                conflicting_pending_metadata_command(
+                    "retryable partial pending mark bucket deleting command",
+                ),
+            ));
+        }
+        Ok(true)
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn begin_bucket_delete_if_current(
         &self,
@@ -2587,38 +2626,19 @@ impl super::StorageCluster {
                     .pending_metadata_command_for_bucket(pg_id, bucket)
                     .map_err(BucketWriteDrainError::from)?
                 {
-                    if matches!(
-                        command.payload(),
-                        MetadataCommandPayload::MarkBucketDeleting(mark)
-                            if mark.bucket_name() == bucket
-                    ) {
-                        let mut work_budget = super::RequestWorkBudget::new(
-                            std::time::Duration::from_millis(
-                                BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS,
-                            ),
-                            None,
-                        )
-                        .for_operation("bucket_delete_begin")
-                        .for_pg(pg_id);
-                        let outcome = self
-                            .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
-                                pg_id,
-                                &command,
-                                false,
-                                &mut work_budget,
-                            )
-                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-                        if matches!(
-                            outcome,
-                            FinishPendingMetadataCommandResult::RetryPartialExactConflict
-                        ) {
-                            return Err(bucket_snapshot_error_to_bucket_write_drain_error(
-                                conflicting_pending_metadata_command(
-                                    "retryable partial pending mark bucket deleting command",
-                                ),
-                            ));
-                        }
-                    }
+                    let mut work_budget = super::RequestWorkBudget::new(
+                        std::time::Duration::from_millis(BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS),
+                        None,
+                    )
+                    .for_operation("bucket_delete_begin")
+                    .for_pg(pg_id);
+                    self.finish_current_pending_mark_bucket_deleting(
+                        metadata_route.as_ref(),
+                        pg_id,
+                        bucket,
+                        &command,
+                        &mut work_budget,
+                    )?;
                 }
                 let _ = observability::emit_flight_event(
                     super::TRACE_TARGET,
@@ -3969,7 +3989,57 @@ impl super::StorageCluster {
                                     );
                                     return Ok(());
                                 }
-                                Ok(Some(_)) => {}
+                                Ok(Some(command)) => {
+                                    match self.finish_current_pending_mark_bucket_deleting(
+                                        metadata_route.as_ref(),
+                                        pg_id,
+                                        bucket,
+                                        &command,
+                                        &mut work_budget,
+                                    ) {
+                                        Ok(true) => {
+                                            let _ = observability::emit_flight_event(
+                                                super::TRACE_TARGET,
+                                                "bucket_delete_begin_retryable_error_converged_pending_mark",
+                                                format!(
+                                                    "bucket={:?} pg_id={} phase={:?} elapsed_us={} original_error={:?}",
+                                                    bucket,
+                                                    pg_id.get(),
+                                                    attempt_phase,
+                                                    started.elapsed().as_micros(),
+                                                    error
+                                                ),
+                                            );
+                                            let _ = observability::emit_flight_event(
+                                                super::TRACE_TARGET,
+                                                "bucket_delete_begin_done",
+                                                format!(
+                                                    "bucket={:?} pg_id={} elapsed_us={}",
+                                                    bucket,
+                                                    pg_id.get(),
+                                                    started.elapsed().as_micros()
+                                                ),
+                                            );
+                                            return Ok(());
+                                        }
+                                        Ok(false) => {}
+                                        Err(recheck_error) => {
+                                            let _ = observability::emit_flight_event(
+                                                super::TRACE_TARGET,
+                                                "bucket_delete_begin_retryable_error_pending_mark_recheck_failed",
+                                                format!(
+                                                    "bucket={:?} pg_id={} phase={:?} elapsed_us={} original_error={:?} recheck_error={:?}",
+                                                    bucket,
+                                                    pg_id.get(),
+                                                    attempt_phase,
+                                                    started.elapsed().as_micros(),
+                                                    error,
+                                                    recheck_error
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
                                 Err(pending_recheck_error) => {
                                     let _ = observability::emit_flight_event(
                                         super::TRACE_TARGET,

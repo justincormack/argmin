@@ -4169,6 +4169,77 @@ fn begin_bucket_delete_response_loss_after_mark_install_preserves_drain_and_exac
 }
 
 #[test]
+fn begin_bucket_delete_accepts_its_concurrently_applied_mark_after_install() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-concurrent-mark-apply-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_hook = Arc::clone(&hook_ran);
+    let _hook = cluster.test_install_after_bucket_delete_pending_install_response_loss_hook(
+        Arc::new(move |command| {
+            let MetadataCommandPayload::MarkBucketDeleting(mark) = command.payload() else {
+                return false;
+            };
+            if mark.bucket_name() != &hook_bucket {
+                return false;
+            }
+            let primary = hook_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, command.id().pg_id())
+                .unwrap();
+            let pg = primary
+                .storage_node()
+                .get_pg(command.id().pg_id().get())
+                .unwrap();
+            pg.apply_metadata_command_and_record(primary.node_id().as_u32(), command)
+                .unwrap();
+            hook_ran_for_hook.store(true, Ordering::SeqCst);
+            false
+        }),
+    );
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect("the installed mark becoming current before its heartbeat must be success");
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "the test must apply the exact installed mark before the delete heartbeat"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
+        "DeleteBucket must retire its concurrently applied mark command"
+    );
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Deleting,
+            "DeleteBucket must converge its installed mark on node {node_id:?}"
+        );
+    }
+}
+
+#[test]
 fn concurrent_bucket_delete_adopters_preserve_drain_on_mark_validation_failure() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
