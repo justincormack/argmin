@@ -1432,7 +1432,8 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         }
 
         StorageRpcMessageKind::MetadataTransferStagingIntentCreate
-        | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish => {
+        | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish
+        | StorageRpcMessageKind::MetadataTransferStagingProofPublish => {
             StorageRpcAuthorizedRoles::ADMIN_ONLY
         }
 
@@ -1621,6 +1622,7 @@ fn admin_live_pg_metadata_transfer_operation(kind: StorageRpcMessageKind) -> boo
             | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
             | StorageRpcMessageKind::MetadataTransferStagingIntentCreate
             | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish
+            | StorageRpcMessageKind::MetadataTransferStagingProofPublish
     )
 }
 
@@ -2132,7 +2134,12 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 23, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
             0, 219, 185, 232, 25, 191, 51, 112, 119, 97, 98, 99,
         ];
-        for historical_frame in [V21_FRAME, V22_FRAME] {
+        const V24_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 24, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
+            0, 227, 38, 97, 110, 223, 29, 108, 239, 97, 98, 99,
+        ];
+        for historical_frame in [V21_FRAME, V22_FRAME, V23_FRAME] {
             let old_request = encode_binding_with_encoded_frame(
                 0x0102_0304_0506_0708,
                 TOPOLOGY_DIGEST,
@@ -2151,7 +2158,7 @@ mod tests {
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
             None,
-            V23_FRAME,
+            V24_FRAME,
         )
         .unwrap();
         assert_eq!(
@@ -2160,8 +2167,8 @@ mod tests {
                 "4152475352504342000201020304050607080000004030313233343536373839",
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "6162636465663031323334353637383961626364656611223344000000003718",
-                "0000006172676d696e2d73746f726167652d7270632d6672616d651700080706",
-                "0504030201030003000000dbb9e819bf337077616263"
+                "0000006172676d696e2d73746f726167652d7270632d6672616d651800080706",
+                "0504030201030003000000e326616edf1d6cef616263"
             )
         );
 
@@ -2175,7 +2182,7 @@ mod tests {
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
             Some(&transcript),
-            V23_FRAME,
+            V24_FRAME,
         )
         .unwrap();
         assert_eq!(
@@ -2185,8 +2192,8 @@ mod tests {
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "616263646566303132333435363738396162636465661122334401673e6f836a",
                 "950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037",
-                "180000006172676d696e2d73746f726167652d7270632d6672616d6517000807",
-                "060504030201030003000000dbb9e819bf337077616263"
+                "180000006172676d696e2d73746f726167652d7270632d6672616d6518000807",
+                "060504030201030003000000e326616edf1d6cef616263"
             )
         );
 
@@ -2601,7 +2608,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 173, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 174, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]
@@ -2642,6 +2649,7 @@ mod tests {
         for kind in [
             StorageRpcMessageKind::MetadataTransferStagingIntentCreate,
             StorageRpcMessageKind::MetadataTransferStagingArtifactPublish,
+            StorageRpcMessageKind::MetadataTransferStagingProofPublish,
         ] {
             assert!(principal_allows_operation(&admin, kind));
             assert!(!principal_allows_operation(&frontend, kind));

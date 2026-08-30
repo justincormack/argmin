@@ -788,6 +788,19 @@ impl CreateBucketCommand {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_config_with_fixed_upload_id_key_for_test(
+        config: &CreateBucketConfig<'_>,
+        created_at_millis: u64,
+        bucket_execution_generation: u64,
+    ) -> Result<Self, String> {
+        let mut command =
+            Self::from_config_for_test(config, created_at_millis, bucket_execution_generation)?;
+        command.bucket.multipart_upload_id_key =
+            MultipartUploadIdKey::from_bytes([0x42; MULTIPART_UPLOAD_ID_KEY_LEN]);
+        Ok(command)
+    }
+
     pub(crate) fn bucket(&self) -> &BucketRecord {
         &self.bucket
     }

@@ -146,6 +146,14 @@ mod metadata;
 #[path = "pg_store/metadata_transfer_staging.rs"]
 mod metadata_transfer_staging;
 pub(crate) use metadata_transfer_staging::MetadataTransferStagingIntent;
+#[cfg(test)]
+pub(crate) use metadata_transfer_staging::{
+    canonical_nonempty_staged_metadata_transfer_artifact_for_test,
+    metadata_transfer_staging_evidence_page_for_test,
+    metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
+    metadata_transfer_staging_evidence_page_with_member_actor_for_test,
+    metadata_transfer_staging_publication_evidence_page_for_test,
+};
 pub(crate) use metadata_transfer_staging::{
     decode_staging_evidence, decode_staging_evidence_apply_receipt,
     decode_staging_evidence_page_payload, decode_staging_intent, encode_staging_intent,
@@ -155,12 +163,6 @@ pub(crate) use metadata_transfer_staging::{
     MetadataTransferStagingNodeIdentity, MetadataTransferStagingReceipt,
     MetadataTransferStagingStore, MAX_STAGING_EVIDENCE_BYTES, MAX_STAGING_INTENT_BYTES,
     METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION, METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-};
-#[cfg(test)]
-pub(crate) use metadata_transfer_staging::{
-    metadata_transfer_staging_evidence_page_for_test,
-    metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
-    metadata_transfer_staging_evidence_page_with_member_actor_for_test,
 };
 #[path = "pg_store/rows.rs"]
 mod rows;

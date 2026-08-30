@@ -12,8 +12,19 @@ use std::sync::{Arc, Mutex};
 use placement::NodeId;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
-use crate::control_plane::UnavailablePgTransitionMutationBinding;
+use crate::control_plane::{
+    PgMetadataProof, PgMetadataTransferProof, UnavailablePgTransitionMutationBinding,
+};
 use crate::data_dir::prepare_private_data_dir;
+use crate::metadata_command::MetadataCommandLogRangeEntry;
+use crate::node_runtime::MetadataCommandDecodeAuthority;
+use crate::peering::{PgMetadataTransferArtifact, PgMetadataTransferBaseKind};
+use crate::storage_rpc::{
+    decode_metadata_command_checkpoint_payload, decode_metadata_command_log_entry_range_response,
+    encode_metadata_command_checkpoint_payload, encode_metadata_command_log_entry_range_response,
+    StorageRpcMetadataCommandLogEntryRangeResponse,
+    STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES,
+};
 use crate::{ClusterEpoch, PgId};
 
 const STAGING_STORE_DIR: &str = "metadata-transfer-staging";
@@ -28,9 +39,9 @@ const CATALOGUE_FILE: &str = "catalogue.db";
 const STAGING_STORE_MAGIC: &[u8; 8] = b"ARGMSTG\0";
 const STAGING_INITIALIZATION_MAGIC: &[u8; 8] = b"ARGMSTGI";
 const STAGING_ESTABLISHMENT_MAGIC: &[u8; 8] = b"ARGMSTGE";
-const STAGING_STORE_FORMAT_VERSION: u16 = 1;
-const STAGING_STORE_SCHEMA_V1: &str =
-    include_str!("schema_manifests/metadata_transfer_staging_v1.sql");
+const STAGING_STORE_FORMAT_VERSION: u16 = 2;
+const STAGING_STORE_SCHEMA_V2: &str =
+    include_str!("schema_manifests/metadata_transfer_staging_v2.sql");
 const DIGEST_LEN: usize = 32;
 const MANIFEST_BODY_LEN: usize = STAGING_STORE_MAGIC.len() + 2 + DIGEST_LEN;
 const MANIFEST_LEN: usize = MANIFEST_BODY_LEN + 8;
@@ -43,9 +54,11 @@ pub(crate) const MAX_STAGING_INTENT_BYTES: usize = 16 * 1_024;
 pub(crate) const MAX_STAGING_EVIDENCE_BYTES: usize = 4_096;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_ENTRIES: usize = 64;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_BYTES: usize = 120 * 1_024;
-const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V1\0";
-const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V1\0";
-pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 1;
+const MAX_STAGING_EPOCH_PROOFS_PER_INTENT: usize = 64;
+const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V2\0";
+const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V2\0";
+const STAGED_ARTIFACT_MAGIC: &[u8] = b"ARGMIN-METADATA-TRANSFER-ARTIFACT-V2\0";
+pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 2;
 pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES: u64 = 63 * 1_024 * 1_024;
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +87,8 @@ pub(crate) enum MetadataTransferStagingError {
     Capacity(String),
     #[error("metadata-transfer staging artifact digest or length mismatch")]
     ArtifactMismatch,
+    #[error("metadata-transfer staging artifact semantic validation failed: {0}")]
+    ArtifactSemanticMismatch(String),
     #[error("metadata-transfer staging artifact length {length} exceeds protocol limit {limit}")]
     ArtifactTooLarge { length: u64, limit: u64 },
     #[error("metadata-transfer staging generation has been tombstoned or finalized")]
@@ -278,6 +293,22 @@ impl MetadataTransferStagingReceipt {
             bytes: evidence.as_bytes().to_vec(),
         })
     }
+
+    pub(crate) fn from_epoch_bound_publication_bytes(
+        bytes: &[u8],
+        expected_intent: &MetadataTransferStagingIntent,
+        expected_node_id: NodeId,
+        expected_target_epoch: ClusterEpoch,
+    ) -> Result<Self, MetadataTransferStagingError> {
+        let receipt = Self::from_publication_bytes(bytes, expected_intent, expected_node_id)?;
+        let evidence = decode_staging_evidence(receipt.as_bytes())?;
+        if evidence.target_epoch() != Some(expected_target_epoch) {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging publication response does not match its requested target epoch".to_owned(),
+            ));
+        }
+        Ok(receipt)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,6 +373,8 @@ pub(crate) struct MetadataTransferStagingEvidence {
     actor: MetadataTransferStagingNodeIdentity,
     intent: MetadataTransferStagingIntent,
     kind: MetadataTransferStagingEvidenceKind,
+    target_epoch: Option<ClusterEpoch>,
+    transfer: Option<PgMetadataTransferProof>,
     fsync_scope: u8,
     bytes: Vec<u8>,
 }
@@ -363,9 +396,274 @@ impl MetadataTransferStagingEvidence {
         self.fsync_scope
     }
 
+    pub(crate) fn transfer(&self) -> Option<PgMetadataTransferProof> {
+        self.transfer
+    }
+
+    pub(crate) fn target_epoch(&self) -> Option<ClusterEpoch> {
+        self.target_epoch
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedStagedMetadataTransferArtifact {
+    artifact: PgMetadataTransferArtifact,
+    destination_epoch: ClusterEpoch,
+    transfer: PgMetadataTransferProof,
+}
+
+pub(crate) fn encode_staged_metadata_transfer_artifact(
+    artifact: &PgMetadataTransferArtifact,
+    destination_epoch: ClusterEpoch,
+) -> Result<Vec<u8>, MetadataTransferStagingError> {
+    let imported_proof = crate::StorageCluster::metadata_transfer_imported_proof_at_epoch(
+        artifact,
+        destination_epoch,
+    )
+    .map_err(|error| MetadataTransferStagingError::ArtifactSemanticMismatch(error.to_string()))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(STAGED_ARTIFACT_MAGIC);
+    out.extend_from_slice(&METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION.to_be_bytes());
+    out.extend_from_slice(&artifact.pg_id.get().to_be_bytes());
+    out.extend_from_slice(&artifact.source_node_id.as_u32().to_be_bytes());
+    out.extend_from_slice(&artifact.cluster_epoch.get().to_be_bytes());
+    out.push(match artifact.base_kind {
+        PgMetadataTransferBaseKind::Empty => 0,
+        PgMetadataTransferBaseKind::RetainedLogPrefix => 1,
+        PgMetadataTransferBaseKind::Checkpoint => 2,
+    });
+    encode_metadata_proof(&mut out, artifact.base_proof);
+    encode_metadata_proof(&mut out, artifact.proof);
+    out.extend_from_slice(&destination_epoch.get().to_be_bytes());
+    encode_metadata_proof(&mut out, imported_proof);
+    match artifact.checkpoint_base.as_ref() {
+        None => out.push(0),
+        Some(checkpoint) => {
+            out.push(1);
+            let checkpoint =
+                encode_metadata_command_checkpoint_payload(checkpoint).map_err(|error| {
+                    MetadataTransferStagingError::ArtifactSemanticMismatch(error.to_string())
+                })?;
+            put_bytes(&mut out, &checkpoint);
+        }
+    }
+    let chunks = artifact
+        .retained_log_entries
+        .chunks(STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES as usize)
+        .collect::<Vec<_>>();
+    out.extend_from_slice(
+        &u32::try_from(chunks.len())
+            .map_err(|_| {
+                MetadataTransferStagingError::ArtifactSemanticMismatch(
+                    "staged artifact has too many retained-log chunks".to_owned(),
+                )
+            })?
+            .to_be_bytes(),
+    );
+    for chunk in chunks {
+        let encoded = encode_metadata_command_log_entry_range_response(
+            &StorageRpcMetadataCommandLogEntryRangeResponse {
+                entries: chunk.to_vec(),
+            },
+        )
+        .map_err(|error| {
+            MetadataTransferStagingError::ArtifactSemanticMismatch(error.to_string())
+        })?;
+        put_bytes(&mut out, &encoded);
+    }
+    if out.len() as u64 > METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES {
+        return Err(MetadataTransferStagingError::ArtifactTooLarge {
+            length: out.len() as u64,
+            limit: METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
+        });
+    }
+    Ok(out)
+}
+
+fn validate_staged_metadata_transfer_artifact(
+    bytes: &[u8],
+    intent: &MetadataTransferStagingIntent,
+    authority: &MetadataCommandDecodeAuthority,
+) -> Result<ValidatedStagedMetadataTransferArtifact, MetadataTransferStagingError> {
+    let mut offset = 0;
+    if take(bytes, &mut offset, STAGED_ARTIFACT_MAGIC.len())? != STAGED_ARTIFACT_MAGIC {
+        return Err(MetadataTransferStagingError::ArtifactSemanticMismatch(
+            "staged artifact has invalid magic".to_owned(),
+        ));
+    }
+    let version = u16::from_be_bytes(take(bytes, &mut offset, 2)?.try_into().unwrap());
+    if version != METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION {
+        return Err(MetadataTransferStagingError::ArtifactSemanticMismatch(
+            format!("staged artifact has unsupported format version {version}"),
+        ));
+    }
+    let pg_id = PgId::new(u32::from_be_bytes(
+        take(bytes, &mut offset, 4)?.try_into().unwrap(),
+    ));
+    let source_node_id = NodeId::new(u32::from_be_bytes(
+        take(bytes, &mut offset, 4)?.try_into().unwrap(),
+    ));
+    let cluster_epoch = ClusterEpoch::new(u64::from_be_bytes(
+        take(bytes, &mut offset, 8)?.try_into().unwrap(),
+    ))
+    .ok_or_else(|| {
+        MetadataTransferStagingError::ArtifactSemanticMismatch(
+            "staged artifact source epoch is zero".to_owned(),
+        )
+    })?;
+    let base_kind = match take(bytes, &mut offset, 1)?[0] {
+        0 => PgMetadataTransferBaseKind::Empty,
+        1 => PgMetadataTransferBaseKind::RetainedLogPrefix,
+        2 => PgMetadataTransferBaseKind::Checkpoint,
+        _ => {
+            return Err(MetadataTransferStagingError::ArtifactSemanticMismatch(
+                "staged artifact has invalid base kind".to_owned(),
+            ))
+        }
+    };
+    let base_proof = decode_metadata_proof(bytes, &mut offset)?;
+    let proof = decode_metadata_proof(bytes, &mut offset)?;
+    let destination_epoch = ClusterEpoch::new(u64::from_be_bytes(
+        take(bytes, &mut offset, 8)?.try_into().unwrap(),
+    ))
+    .ok_or_else(|| {
+        MetadataTransferStagingError::ArtifactSemanticMismatch(
+            "staged artifact destination epoch is zero".to_owned(),
+        )
+    })?;
+    let claimed_imported_proof = decode_metadata_proof(bytes, &mut offset)?;
+    let checkpoint_base = match take(bytes, &mut offset, 1)?[0] {
+        0 => None,
+        1 => {
+            let checkpoint_bytes = take_length_prefixed(bytes, &mut offset)?;
+            Some(
+                decode_metadata_command_checkpoint_payload(checkpoint_bytes).map_err(|error| {
+                    MetadataTransferStagingError::ArtifactSemanticMismatch(error.to_string())
+                })?,
+            )
+        }
+        _ => {
+            return Err(MetadataTransferStagingError::ArtifactSemanticMismatch(
+                "staged artifact has invalid checkpoint tag".to_owned(),
+            ))
+        }
+    };
+    let chunk_count = usize::try_from(u32::from_be_bytes(
+        take(bytes, &mut offset, 4)?.try_into().unwrap(),
+    ))
+    .unwrap();
+    let mut retained_log_entries = Vec::<MetadataCommandLogRangeEntry>::new();
+    for chunk_index in 0..chunk_count {
+        let chunk = decode_metadata_command_log_entry_range_response(
+            take_length_prefixed(bytes, &mut offset)?,
+            authority,
+        )
+        .map_err(|error| MetadataTransferStagingError::ArtifactSemanticMismatch(error.to_string()))?
+        .entries;
+        if chunk.is_empty()
+            || (chunk_index + 1 < chunk_count
+                && chunk.len() != STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES as usize)
+        {
+            return Err(MetadataTransferStagingError::ArtifactSemanticMismatch(
+                "staged artifact retained-log chunks are not canonical".to_owned(),
+            ));
+        }
+        retained_log_entries.extend(chunk);
+    }
+    if offset != bytes.len()
+        || pg_id != intent.pg_id
+        || cluster_epoch < intent.transition_epoch
+        || destination_epoch <= intent.transition_epoch
+        || !intent.source_acting_set.contains(&source_node_id)
+    {
+        return Err(MetadataTransferStagingError::ArtifactSemanticMismatch(
+            "staged artifact does not match its authorized transition".to_owned(),
+        ));
+    }
+    let artifact = PgMetadataTransferArtifact {
+        pg_id,
+        source_node_id,
+        cluster_epoch,
+        base_kind,
+        base_proof,
+        checkpoint_base,
+        proof,
+        retained_log_entries,
+    };
+    let imported_proof = crate::StorageCluster::metadata_transfer_imported_proof_at_epoch(
+        &artifact,
+        destination_epoch,
+    )
+    .map_err(|error| MetadataTransferStagingError::ArtifactSemanticMismatch(error.to_string()))?;
+    if imported_proof != claimed_imported_proof
+        || encode_staged_metadata_transfer_artifact(&artifact, destination_epoch)? != bytes
+    {
+        return Err(MetadataTransferStagingError::ArtifactSemanticMismatch(
+            "staged artifact imported proof or canonical encoding is invalid".to_owned(),
+        ));
+    }
+    Ok(ValidatedStagedMetadataTransferArtifact {
+        artifact,
+        destination_epoch,
+        transfer: PgMetadataTransferProof::new_with_imported_metadata_proof(
+            cluster_epoch,
+            proof,
+            imported_proof,
+        ),
+    })
+}
+
+fn validate_staged_artifact_for_publication(
+    bytes: &[u8],
+    intent: &MetadataTransferStagingIntent,
+) -> Result<ValidatedStagedMetadataTransferArtifact, MetadataTransferStagingError> {
+    validate_staged_metadata_transfer_artifact(
+        bytes,
+        intent,
+        &MetadataCommandDecodeAuthority::new(),
+    )
+}
+
+fn encode_metadata_proof(out: &mut Vec<u8>, proof: PgMetadataProof) {
+    out.extend_from_slice(&proof.applied_log_index().to_be_bytes());
+    out.push(proof.applied_log_hash().encoding_version());
+    out.extend_from_slice(&proof.applied_log_hash().value().to_be_bytes());
+    out.push(proof.state_digest().encoding_version());
+    out.extend_from_slice(&proof.state_digest().value().to_be_bytes());
+}
+
+fn decode_metadata_proof(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<PgMetadataProof, MetadataTransferStagingError> {
+    let applied_log_index = u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap());
+    let applied_log_hash_encoding_version = take(bytes, offset, 1)?[0];
+    let applied_log_hash = u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap());
+    let state_digest_encoding_version = take(bytes, offset, 1)?[0];
+    let state_digest = u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap());
+    PgMetadataProof::from_encoded_parts(
+        applied_log_index,
+        applied_log_hash_encoding_version,
+        applied_log_hash,
+        state_digest_encoding_version,
+        state_digest,
+    )
+    .map_err(|error| MetadataTransferStagingError::ArtifactSemanticMismatch(error.to_string()))
+}
+
+fn take_length_prefixed<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+) -> Result<&'a [u8], MetadataTransferStagingError> {
+    let length = usize::try_from(u32::from_be_bytes(
+        take(bytes, offset, 4)?.try_into().unwrap(),
+    ))
+    .unwrap();
+    take(bytes, offset, length)
 }
 
 struct StagingInflightEvidencePage {
@@ -728,7 +1026,14 @@ impl MetadataTransferStagingStore {
                 )
             })?;
             validate_staging_evidence(&old_bytes, &row.intent, kind, &self.identity)?;
-            let rebound = encode_staging_evidence(&identity, &row.intent, kind);
+            let old_evidence = decode_staging_evidence(&old_bytes)?;
+            let rebound = encode_staging_evidence(
+                &identity,
+                &row.intent,
+                kind,
+                old_evidence.target_epoch,
+                old_evidence.transfer,
+            );
             let changed = transaction
                 .execute(
                     "UPDATE staging_evidence_deltas SET actor_node_id = ?1, \
@@ -751,7 +1056,7 @@ impl MetadataTransferStagingStore {
                     "staging evidence changed during actor rollover".to_owned(),
                 ));
             }
-            if kind == 0 {
+            if kind == 0 && row.publication_receipt.as_deref() == Some(old_bytes.as_slice()) {
                 let changed = transaction
                     .execute(
                         "UPDATE staging_intents SET publication_receipt = ?1 \
@@ -869,6 +1174,7 @@ impl MetadataTransferStagingStore {
         {
             return Err(MetadataTransferStagingError::ArtifactMismatch);
         }
+        let validated_artifact = validate_staged_artifact_for_publication(artifact, intent)?;
         let mut state = self.lock_state()?;
         let transaction = state
             .connection
@@ -890,22 +1196,27 @@ impl MetadataTransferStagingStore {
             }
             StagingState::Published | StagingState::Imported => {
                 validate_artifact_file(&self.artifact_path(intent), intent)?;
-                let receipt = existing.publication_receipt.ok_or_else(|| {
+                let delta = load_evidence_delta(
+                    &transaction,
+                    intent.pg_id,
+                    intent.staging_generation,
+                    0,
+                    Some(validated_artifact.destination_epoch),
+                )?
+                .ok_or_else(|| {
                     MetadataTransferStagingError::Invariant(
-                        "published staging row has no receipt".to_owned(),
+                        "published staging row has no exact epoch-bound evidence delta".to_owned(),
                     )
                 })?;
-                let delta =
-                    load_evidence_delta(&transaction, intent.pg_id, intent.staging_generation, 0)?
-                        .ok_or_else(|| {
-                            MetadataTransferStagingError::Invariant(
-                                "published staging row has no durable evidence delta".to_owned(),
-                            )
-                        })?;
+                let receipt = delta.bytes.clone();
                 validate_staging_evidence(&receipt, intent, 0, &delta.actor)?;
-                if delta.bytes != receipt {
+                let evidence = decode_staging_evidence(&receipt)?;
+                if evidence.target_epoch != Some(validated_artifact.destination_epoch)
+                    || evidence.transfer != Some(validated_artifact.transfer)
+                {
                     return Err(MetadataTransferStagingError::Invariant(
-                        "staging publication receipt and evidence delta differ".to_owned(),
+                        "staging publication receipt has the wrong semantic transfer proof"
+                            .to_owned(),
                     ));
                 }
                 return Ok(MetadataTransferStagingReceipt { bytes: receipt });
@@ -914,7 +1225,13 @@ impl MetadataTransferStagingStore {
         }
 
         self.publish_artifact_file(intent, artifact)?;
-        let receipt = encode_staging_evidence(&self.identity, intent, 0);
+        let receipt = encode_staging_evidence(
+            &self.identity,
+            intent,
+            0,
+            Some(validated_artifact.destination_epoch),
+            Some(validated_artifact.transfer),
+        );
         let changed = transaction
             .execute(
                 "UPDATE staging_intents SET state = 1, publication_receipt = ?1 \
@@ -933,9 +1250,143 @@ impl MetadataTransferStagingStore {
                 "staging publication lost its exact intent".to_owned(),
             ));
         }
-        insert_evidence_delta(&transaction, &self.identity, intent, 0, &receipt)?;
+        insert_evidence_delta(
+            &transaction,
+            &self.identity,
+            intent,
+            0,
+            Some(validated_artifact.destination_epoch),
+            &receipt,
+        )?;
         transaction.commit().map_err(|source| {
             MetadataTransferStagingError::sql("commit staging publication", source)
+        })?;
+        Ok(MetadataTransferStagingReceipt { bytes: receipt })
+    }
+
+    pub(crate) fn publish_proof_for_epoch(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+        target_epoch: ClusterEpoch,
+    ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
+        self.validate_intent_limits(intent)?;
+        if target_epoch <= intent.transition_epoch {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging proof target epoch must follow the transition epoch".to_owned(),
+            ));
+        }
+        let mut state = self.lock_state()?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("begin staging proof publication", source)
+            })?;
+        self.require_current_evidence_actor(&transaction)?;
+        let existing = load_staging_row(&transaction, intent.pg_id, intent.staging_generation)?
+            .ok_or_else(|| {
+                MetadataTransferStagingError::IntentConflict(
+                    "proof publication has no durable staged artifact".to_owned(),
+                )
+            })?;
+        require_exact_intent(&existing.intent, intent)?;
+        match existing.state {
+            StagingState::Intent => {
+                return Err(MetadataTransferStagingError::IntentConflict(
+                    "artifact has not been durably published".to_owned(),
+                ))
+            }
+            StagingState::Tombstoned => {
+                return Err(MetadataTransferStagingError::GenerationRetired)
+            }
+            StagingState::Published | StagingState::Imported => {}
+        }
+        if let Some(delta) = load_evidence_delta(
+            &transaction,
+            intent.pg_id,
+            intent.staging_generation,
+            0,
+            Some(target_epoch),
+        )? {
+            validate_staging_evidence(&delta.bytes, intent, 0, &delta.actor)?;
+            let evidence = decode_staging_evidence(&delta.bytes)?;
+            if evidence.target_epoch != Some(target_epoch) {
+                return Err(MetadataTransferStagingError::Invariant(
+                    "staging proof replay has the wrong target epoch".to_owned(),
+                ));
+            }
+            return Ok(MetadataTransferStagingReceipt { bytes: delta.bytes });
+        }
+        if existing.state == StagingState::Imported {
+            return Err(MetadataTransferStagingError::IntentConflict(
+                "imported staging artifact cannot publish a proof for a new epoch".to_owned(),
+            ));
+        }
+        let proof_count: usize = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM staging_evidence_deltas \
+                 WHERE pg_id = ?1 AND staging_generation = ?2 AND evidence_kind = 0",
+                params![
+                    i64::from(intent.pg_id.get()),
+                    to_sql_u64(intent.staging_generation)?,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("count staged epoch proofs", source)
+            })?;
+        if proof_count >= MAX_STAGING_EPOCH_PROOFS_PER_INTENT {
+            return Err(MetadataTransferStagingError::Capacity(format!(
+                "epoch-proof limit {MAX_STAGING_EPOCH_PROOFS_PER_INTENT} reached for the intent"
+            )));
+        }
+        let artifact = read_artifact_file(&self.artifact_path(intent), intent)?;
+        let validated = validate_staged_artifact_for_publication(&artifact, intent)?;
+        let imported_proof = crate::StorageCluster::metadata_transfer_imported_proof_at_epoch(
+            &validated.artifact,
+            target_epoch,
+        )
+        .map_err(|error| {
+            MetadataTransferStagingError::ArtifactSemanticMismatch(error.to_string())
+        })?;
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            validated.artifact.cluster_epoch,
+            validated.artifact.proof,
+            imported_proof,
+        );
+        let receipt = encode_staging_evidence(
+            &self.identity,
+            intent,
+            0,
+            Some(target_epoch),
+            Some(transfer),
+        );
+        let changed = transaction
+            .execute(
+                "UPDATE staging_intents SET publication_receipt = ?1 \
+                 WHERE pg_id = ?2 AND staging_generation = ?3 AND state = 1",
+                params![
+                    &receipt,
+                    i64::from(intent.pg_id.get()),
+                    to_sql_u64(intent.staging_generation)?,
+                ],
+            )
+            .map_err(|source| MetadataTransferStagingError::sql("publish staging proof", source))?;
+        if changed != 1 {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging proof publication lost its exact published intent".to_owned(),
+            ));
+        }
+        insert_evidence_delta(
+            &transaction,
+            &self.identity,
+            intent,
+            0,
+            Some(target_epoch),
+            &receipt,
+        )?;
+        transaction.commit().map_err(|source| {
+            MetadataTransferStagingError::sql("commit staging proof publication", source)
         })?;
         Ok(MetadataTransferStagingReceipt { bytes: receipt })
     }
@@ -1041,13 +1492,18 @@ impl MetadataTransferStagingStore {
         {
             require_exact_intent(&existing.intent, intent)?;
             if existing.state == StagingState::Tombstoned {
-                let receipt =
-                    load_evidence_delta(&transaction, intent.pg_id, intent.staging_generation, 1)?
-                        .ok_or_else(|| {
-                            MetadataTransferStagingError::Invariant(
-                                "tombstoned staging row has no durable evidence".to_owned(),
-                            )
-                        })?;
+                let receipt = load_evidence_delta(
+                    &transaction,
+                    intent.pg_id,
+                    intent.staging_generation,
+                    1,
+                    None,
+                )?
+                .ok_or_else(|| {
+                    MetadataTransferStagingError::Invariant(
+                        "tombstoned staging row has no durable evidence".to_owned(),
+                    )
+                })?;
                 validate_staging_evidence(&receipt.bytes, intent, 1, &receipt.actor)?;
                 remove_artifact_if_present(&self.artifact_path(intent))?;
                 sync_directory(&self.artifacts_dir, "sync replayed staging tombstone")?;
@@ -1064,7 +1520,7 @@ impl MetadataTransferStagingStore {
                 )));
             }
         }
-        let receipt = encode_staging_evidence(&self.identity, intent, 1);
+        let receipt = encode_staging_evidence(&self.identity, intent, 1, None, None);
         transaction
             .execute(
                 "INSERT INTO staging_intents (\
@@ -1088,7 +1544,7 @@ impl MetadataTransferStagingStore {
             .map_err(|source| {
                 MetadataTransferStagingError::sql("record staging tombstone", source)
             })?;
-        insert_evidence_delta(&transaction, &self.identity, intent, 1, &receipt)?;
+        insert_evidence_delta(&transaction, &self.identity, intent, 1, None, &receipt)?;
         transaction.commit().map_err(|source| {
             MetadataTransferStagingError::sql("commit staging tombstone", source)
         })?;
@@ -1594,7 +2050,16 @@ impl MetadataTransferStagingStore {
             )?;
         }
         for row in recovered_publications {
-            let receipt = encode_staging_evidence(&self.identity, &row.intent, 0);
+            let artifact = read_artifact_file(&self.artifact_path(&row.intent), &row.intent)?;
+            let validated_artifact =
+                validate_staged_artifact_for_publication(&artifact, &row.intent)?;
+            let receipt = encode_staging_evidence(
+                &self.identity,
+                &row.intent,
+                0,
+                Some(validated_artifact.destination_epoch),
+                Some(validated_artifact.transfer),
+            );
             let changed = transaction
                 .execute(
                     "UPDATE staging_intents SET state = 1, publication_receipt = ?1 \
@@ -1613,7 +2078,14 @@ impl MetadataTransferStagingStore {
                     "recovered staging publication lost its exact intent".to_owned(),
                 ));
             }
-            insert_evidence_delta(&transaction, &self.identity, &row.intent, 0, &receipt)?;
+            insert_evidence_delta(
+                &transaction,
+                &self.identity,
+                &row.intent,
+                0,
+                Some(validated_artifact.destination_epoch),
+                &receipt,
+            )?;
         }
         for path in tombstoned_artifacts {
             fs::remove_file(path).map_err(|source| {
@@ -1764,7 +2236,7 @@ fn initialize_or_validate_unmarked_catalogue(
                 ));
             }
             connection
-                .execute_batch(STAGING_STORE_SCHEMA_V1)
+                .execute_batch(STAGING_STORE_SCHEMA_V2)
                 .map_err(|source| {
                     MetadataTransferStagingError::sql("initialize staging catalogue", source)
                 })?;
@@ -1805,13 +2277,13 @@ fn validate_schema_catalogue(connection: &Connection) -> Result<(), MetadataTran
         MetadataTransferStagingError::sql("open expected staging catalogue", source)
     })?;
     expected
-        .execute_batch(STAGING_STORE_SCHEMA_V1)
+        .execute_batch(STAGING_STORE_SCHEMA_V2)
         .map_err(|source| {
             MetadataTransferStagingError::sql("build expected staging catalogue", source)
         })?;
     if schema_catalogue(connection)? != schema_catalogue(&expected)? {
         return Err(MetadataTransferStagingError::Invariant(
-            "staging catalogue schema does not match format v1".to_owned(),
+            "staging catalogue schema does not match format v2".to_owned(),
         ));
     }
     Ok(())
@@ -2039,15 +2511,17 @@ fn insert_evidence_delta(
     actor: &MetadataTransferStagingNodeIdentity,
     intent: &MetadataTransferStagingIntent,
     kind: i64,
+    target_epoch: Option<ClusterEpoch>,
     bytes: &[u8],
 ) -> Result<(), MetadataTransferStagingError> {
+    let target_epoch = target_epoch.map(ClusterEpoch::get).unwrap_or_default();
     let changed = connection
         .execute(
             "INSERT INTO staging_evidence_deltas (\
-                pg_id, staging_generation, evidence_kind, actor_node_id,\
+                pg_id, staging_generation, evidence_kind, target_epoch, actor_node_id,\
                 actor_node_incarnation, actor_endpoint, evidence_bytes\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-             ON CONFLICT(pg_id, staging_generation, evidence_kind) DO UPDATE SET \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(pg_id, staging_generation, evidence_kind, target_epoch) DO UPDATE SET \
                 evidence_bytes = excluded.evidence_bytes \
              WHERE staging_evidence_deltas.actor_node_id = excluded.actor_node_id \
                AND staging_evidence_deltas.actor_node_incarnation = excluded.actor_node_incarnation \
@@ -2057,6 +2531,7 @@ fn insert_evidence_delta(
                 i64::from(intent.pg_id.get()),
                 to_sql_u64(intent.staging_generation)?,
                 kind,
+                to_sql_u64(target_epoch)?,
                 i64::from(actor.node_id.as_u32()),
                 to_sql_u64(actor.node_incarnation)?,
                 &actor.endpoint,
@@ -2079,16 +2554,20 @@ fn load_evidence_delta(
     pg_id: PgId,
     staging_generation: u64,
     kind: i64,
+    target_epoch: Option<ClusterEpoch>,
 ) -> Result<Option<StagingEvidenceDelta>, MetadataTransferStagingError> {
+    let target_epoch = target_epoch.map(ClusterEpoch::get).unwrap_or_default();
     connection
         .query_row(
             "SELECT actor_node_id, actor_node_incarnation, actor_endpoint, evidence_bytes \
              FROM staging_evidence_deltas \
-             WHERE pg_id = ?1 AND staging_generation = ?2 AND evidence_kind = ?3",
+             WHERE pg_id = ?1 AND staging_generation = ?2 AND evidence_kind = ?3 \
+               AND target_epoch = ?4",
             params![
                 i64::from(pg_id.get()),
                 to_sql_u64(staging_generation)?,
-                kind
+                kind,
+                to_sql_u64(target_epoch)?,
             ],
             |row| {
                 Ok((
@@ -2390,10 +2869,10 @@ fn validate_auxiliary_catalogue(
         )));
     }
 
-    let evidence_limit = max_entries.saturating_mul(2);
+    let evidence_limit = max_entries.saturating_mul(MAX_STAGING_EPOCH_PROOFS_PER_INTENT + 1);
     let mut statement = connection
         .prepare(
-            "SELECT pg_id, staging_generation, evidence_kind, actor_node_id, \
+            "SELECT pg_id, staging_generation, evidence_kind, target_epoch, actor_node_id, \
                     actor_node_incarnation, actor_endpoint, evidence_bytes, acknowledged \
              FROM staging_evidence_deltas ORDER BY sequence LIMIT ?1",
         )
@@ -2408,11 +2887,12 @@ fn validate_auxiliary_catalogue(
                     row.get::<_, u32>(0)?,
                     row.get::<_, u64>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, u64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Vec<u8>>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u32>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         )
@@ -2432,6 +2912,7 @@ fn validate_auxiliary_catalogue(
         pg_id,
         generation,
         kind,
+        target_epoch,
         actor_node_id,
         actor_node_incarnation,
         actor_endpoint,
@@ -2471,11 +2952,22 @@ fn validate_auxiliary_catalogue(
             ));
         }
         validate_staging_evidence(&bytes, &row.intent, expected_kind, &actor)?;
+        let decoded = decode_staging_evidence(&bytes)?;
+        if decoded
+            .target_epoch()
+            .map(ClusterEpoch::get)
+            .unwrap_or_default()
+            != target_epoch
+        {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence target epoch does not match its catalogue identity".to_owned(),
+            ));
+        }
         match kind {
             0 if matches!(
                 row.state,
                 StagingState::Published | StagingState::Imported | StagingState::Tombstoned
-            ) && row.publication_receipt.as_deref() == Some(bytes.as_slice()) => {}
+            ) => {}
             1 if row.state == StagingState::Tombstoned => {}
             _ => {
                 return Err(MetadataTransferStagingError::Invariant(
@@ -2486,11 +2978,18 @@ fn validate_auxiliary_catalogue(
     }
     for row in rows {
         if let Some(publication_receipt) = row.publication_receipt.as_deref() {
+            let decoded = decode_staging_evidence(publication_receipt)?;
+            let target_epoch = decoded.target_epoch().ok_or_else(|| {
+                MetadataTransferStagingError::Invariant(
+                    "staging publication receipt has no target epoch".to_owned(),
+                )
+            })?;
             let delta = load_evidence_delta(
                 connection,
                 row.intent.pg_id,
                 row.intent.staging_generation,
                 0,
+                Some(target_epoch),
             )?
             .ok_or_else(|| {
                 MetadataTransferStagingError::Invariant(
@@ -2504,28 +3003,31 @@ fn validate_auxiliary_catalogue(
                 ));
             }
         }
-        let required_kind = match row.state {
-            StagingState::Intent => continue,
-            StagingState::Published | StagingState::Imported => 0,
-            StagingState::Tombstoned => 1,
-        };
-        let receipt = load_evidence_delta(
-            connection,
-            row.intent.pg_id,
-            row.intent.staging_generation,
-            required_kind,
-        )?
-        .ok_or_else(|| {
-            MetadataTransferStagingError::Invariant(
-                "staging intent is missing required durable evidence".to_owned(),
-            )
-        })?;
-        validate_staging_evidence(
-            &receipt.bytes,
-            &row.intent,
-            u8::try_from(required_kind).unwrap(),
-            &receipt.actor,
-        )?;
+        match row.state {
+            StagingState::Intent => {}
+            StagingState::Published | StagingState::Imported => {
+                if row.publication_receipt.is_none() {
+                    return Err(MetadataTransferStagingError::Invariant(
+                        "published staging intent is missing required durable evidence".to_owned(),
+                    ));
+                }
+            }
+            StagingState::Tombstoned => {
+                let receipt = load_evidence_delta(
+                    connection,
+                    row.intent.pg_id,
+                    row.intent.staging_generation,
+                    1,
+                    None,
+                )?
+                .ok_or_else(|| {
+                    MetadataTransferStagingError::Invariant(
+                        "tombstoned staging intent is missing required durable evidence".to_owned(),
+                    )
+                })?;
+                validate_staging_evidence(&receipt.bytes, &row.intent, 1, &receipt.actor)?;
+            }
+        }
     }
 
     let live_below_floor: i64 = connection
@@ -2687,14 +3189,31 @@ fn encode_staging_evidence(
     identity: &MetadataTransferStagingNodeIdentity,
     intent: &MetadataTransferStagingIntent,
     kind: u8,
+    target_epoch: Option<ClusterEpoch>,
+    transfer: Option<PgMetadataTransferProof>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(b"ARGMIN-STAGING-EVIDENCE-V1\0");
+    out.extend_from_slice(b"ARGMIN-STAGING-EVIDENCE-V2\0");
     out.push(kind);
     out.extend_from_slice(&identity.node_id.as_u32().to_be_bytes());
     out.extend_from_slice(&identity.node_incarnation.to_be_bytes());
     put_bytes(&mut out, identity.endpoint.as_bytes());
     encode_staging_intent_evidence(&mut out, intent);
+    out.extend_from_slice(
+        &target_epoch
+            .map(ClusterEpoch::get)
+            .unwrap_or_default()
+            .to_be_bytes(),
+    );
+    match transfer {
+        None => out.push(0),
+        Some(transfer) => {
+            out.push(1);
+            out.extend_from_slice(&transfer.source_epoch().get().to_be_bytes());
+            encode_metadata_proof(&mut out, transfer.source_metadata_proof());
+            encode_metadata_proof(&mut out, transfer.metadata_proof());
+        }
+    }
     out.push(0b0000_0111); // artifact, catalogue, and parent-directory fsync scope
     out
 }
@@ -2833,7 +3352,7 @@ fn validate_staging_evidence(
 pub(crate) fn decode_staging_evidence(
     bytes: &[u8],
 ) -> Result<MetadataTransferStagingEvidence, MetadataTransferStagingError> {
-    const MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-V1\0";
+    const MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-V2\0";
     if bytes.is_empty() || bytes.len() > MAX_STAGING_EVIDENCE_BYTES {
         return Err(MetadataTransferStagingError::Invariant(
             "staging evidence has invalid length".to_owned(),
@@ -2856,17 +3375,52 @@ pub(crate) fn decode_staging_evidence(
     };
     let actor = decode_staging_evidence_actor(bytes, &mut offset)?;
     let intent = decode_staging_intent_fields(bytes, &mut offset)?;
+    let target_epoch_raw = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
+    let target_epoch = ClusterEpoch::new(target_epoch_raw);
+    let transfer = match take(bytes, &mut offset, 1)?[0] {
+        0 => None,
+        1 => {
+            let source_epoch = ClusterEpoch::new(u64::from_be_bytes(
+                take(bytes, &mut offset, 8)?.try_into().unwrap(),
+            ))
+            .ok_or_else(|| {
+                MetadataTransferStagingError::Invariant(
+                    "staging evidence transfer source epoch is zero".to_owned(),
+                )
+            })?;
+            Some(PgMetadataTransferProof::new_with_imported_metadata_proof(
+                source_epoch,
+                decode_metadata_proof(bytes, &mut offset)?,
+                decode_metadata_proof(bytes, &mut offset)?,
+            ))
+        }
+        _ => {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence has invalid transfer-proof tag".to_owned(),
+            ))
+        }
+    };
     let fsync_scope = *take(bytes, &mut offset, 1)?.first().unwrap();
     let evidence = MetadataTransferStagingEvidence {
         actor,
         intent,
         kind,
+        target_epoch,
+        transfer,
         fsync_scope,
         bytes: bytes.to_vec(),
     };
     if offset != bytes.len()
         || fsync_scope != 0b0000_0111
-        || encode_staging_evidence(&evidence.actor, &evidence.intent, evidence.kind as u8) != bytes
+        || (kind == MetadataTransferStagingEvidenceKind::Publication) != transfer.is_some()
+        || (kind == MetadataTransferStagingEvidenceKind::Publication) != target_epoch.is_some()
+        || encode_staging_evidence(
+            &evidence.actor,
+            &evidence.intent,
+            evidence.kind as u8,
+            evidence.target_epoch,
+            evidence.transfer,
+        ) != bytes
     {
         return Err(MetadataTransferStagingError::Invariant(
             "staging evidence is not canonical or fsync-complete".to_owned(),
@@ -3071,7 +3625,45 @@ pub(crate) fn metadata_transfer_staging_evidence_page_with_member_actor_for_test
     kind: MetadataTransferStagingEvidenceKind,
     previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
 ) -> MetadataTransferStagingEvidencePage {
-    let evidence = encode_staging_evidence(&evidence_actor, intent, kind as u8);
+    metadata_transfer_staging_evidence_page_with_transfer_for_test(
+        page_actor,
+        evidence_actor,
+        intent,
+        kind,
+        test_staging_evidence_transfer(intent, kind),
+        previous_receipt,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_transfer_staging_publication_evidence_page_for_test(
+    actor: MetadataTransferStagingNodeIdentity,
+    intent: &MetadataTransferStagingIntent,
+    transfer: PgMetadataTransferProof,
+    previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
+) -> MetadataTransferStagingEvidencePage {
+    metadata_transfer_staging_evidence_page_with_transfer_for_test(
+        actor.clone(),
+        actor,
+        intent,
+        MetadataTransferStagingEvidenceKind::Publication,
+        Some(transfer),
+        previous_receipt,
+    )
+}
+
+#[cfg(test)]
+fn metadata_transfer_staging_evidence_page_with_transfer_for_test(
+    page_actor: MetadataTransferStagingNodeIdentity,
+    evidence_actor: MetadataTransferStagingNodeIdentity,
+    intent: &MetadataTransferStagingIntent,
+    kind: MetadataTransferStagingEvidenceKind,
+    transfer: Option<PgMetadataTransferProof>,
+    previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
+) -> MetadataTransferStagingEvidencePage {
+    let target_epoch = transfer.map(|_| test_staging_evidence_target_epoch(intent));
+    let evidence =
+        encode_staging_evidence(&evidence_actor, intent, kind as u8, target_epoch, transfer);
     let (previous_generation, previous_apply_receipt_digest) =
         previous_receipt.map_or((0, [0; DIGEST_LEN]), |receipt| {
             (
@@ -3096,13 +3688,114 @@ pub(crate) fn metadata_transfer_staging_evidence_page_with_member_actor_for_test
 }
 
 #[cfg(test)]
+fn test_staging_evidence_transfer(
+    intent: &MetadataTransferStagingIntent,
+    kind: MetadataTransferStagingEvidenceKind,
+) -> Option<PgMetadataTransferProof> {
+    (kind == MetadataTransferStagingEvidenceKind::Publication).then(|| {
+        PgMetadataTransferProof::new_with_imported_metadata_proof(
+            intent.source_epoch,
+            PgMetadataProof::empty(),
+            PgMetadataProof::empty(),
+        )
+    })
+}
+
+#[cfg(test)]
+fn test_staging_evidence_target_epoch(intent: &MetadataTransferStagingIntent) -> ClusterEpoch {
+    ClusterEpoch::new(intent.transition_epoch.get().checked_add(1).unwrap()).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+    binding: &UnavailablePgTransitionMutationBinding,
+    destination_epoch: ClusterEpoch,
+) -> Vec<u8> {
+    use crate::control_plane::{CanonicalStateDigest, MetadataCommandLogHash};
+    use crate::metadata_command::{
+        metadata_command_log_hash, CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
+        MetadataCommandLogIndex, MetadataCommandLogRangeEntryKind, MetadataCommandPayload,
+        MetadataCommandReplicaState,
+    };
+
+    let owner = crate::types::OwnerIdentity::from_principal("staging-artifact-owner");
+    let bucket = crate::types::BucketName::try_from(format!(
+        "staged-pg-{}-epoch-{}",
+        binding.pg_id().get(),
+        binding.transition_epoch().get()
+    ))
+    .unwrap();
+    let config = crate::types::CreateBucketConfig {
+        name: bucket.as_str(),
+        owner_principal: &owner.principal,
+        owner_canonical_id: &owner.canonical_id,
+        acl_grants: &s3_types::AclGrants::default(),
+        public_read: false,
+        public_write: false,
+        versioning: s3_types::BucketVersioningState::Disabled,
+        object_lock: s3_types::BucketObjectLockConfig::default(),
+        ownership_controls: crate::types::BucketOwnershipControls {
+            object_ownership: crate::types::BucketObjectOwnership::ObjectWriter,
+        },
+    };
+    let log_index = MetadataCommandLogIndex::new(1).unwrap();
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(binding.transition_epoch(), binding.pg_id(), log_index),
+        MetadataCommandPayload::CreateBucket(
+            CreateBucketCommand::from_config_with_fixed_upload_id_key_for_test(&config, 1, 1)
+                .unwrap(),
+        ),
+    );
+    let previous_log_hash = MetadataCommandLogHash::genesis();
+    let log_hash = metadata_command_log_hash(
+        binding.transition_epoch(),
+        binding.pg_id(),
+        log_index,
+        previous_log_hash.value(),
+        command.checksum_crc64(),
+    );
+    let pre_state_digest = CanonicalStateDigest::genesis();
+    let post_state_digest = CanonicalStateDigest::for_test(0x5354_4147_4544);
+    let entry = MetadataCommandLogRangeEntry {
+        log_index: log_index.get(),
+        previous_log_hash,
+        log_hash,
+        pre_state_digest: Some(pre_state_digest),
+        post_state_digest: Some(post_state_digest),
+        kind: MetadataCommandLogRangeEntryKind::Applied(Box::new(command)),
+    };
+    let artifact = crate::peering::build_pg_metadata_transfer_artifact_from_retained_log_entries(
+        binding.transition_epoch(),
+        binding.pg_id(),
+        binding.source_acting_set()[0],
+        MetadataCommandReplicaState {
+            cluster_epoch: binding.transition_epoch(),
+            applied_log_index: 1,
+            applied_log_hash: log_hash,
+            state_digest: post_state_digest,
+        },
+        false,
+        vec![entry],
+    )
+    .unwrap();
+    encode_staged_metadata_transfer_artifact(&artifact, destination_epoch).unwrap()
+}
+
+#[cfg(test)]
 pub(crate) fn metadata_transfer_staging_evidence_page_with_duplicate_member_for_test(
     actor: MetadataTransferStagingNodeIdentity,
     intent: &MetadataTransferStagingIntent,
     kind: MetadataTransferStagingEvidenceKind,
     previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
 ) -> MetadataTransferStagingEvidencePage {
-    let evidence = encode_staging_evidence(&actor, intent, kind as u8);
+    let evidence = encode_staging_evidence(
+        &actor,
+        intent,
+        kind as u8,
+        test_staging_evidence_transfer(intent, kind)
+            .map(|_| test_staging_evidence_target_epoch(intent)),
+        test_staging_evidence_transfer(intent, kind),
+    );
     let (previous_generation, previous_apply_receipt_digest) =
         previous_receipt.map_or((0, [0; DIGEST_LEN]), |receipt| {
             (
@@ -3709,7 +4402,7 @@ fn current_initialization_marker_bytes() -> Vec<u8> {
     bytes.extend_from_slice(STAGING_INITIALIZATION_MAGIC);
     bytes.extend_from_slice(&STAGING_STORE_FORMAT_VERSION.to_be_bytes());
     bytes.extend_from_slice(&checksum::sha256::digest(
-        STAGING_STORE_SCHEMA_V1.as_bytes(),
+        STAGING_STORE_SCHEMA_V2.as_bytes(),
     ));
     let checksum = checksum::crc64::checksum(&bytes);
     bytes.extend_from_slice(&checksum.to_be_bytes());
@@ -3800,7 +4493,7 @@ fn current_manifest_bytes() -> Vec<u8> {
     bytes.extend_from_slice(STAGING_STORE_MAGIC);
     bytes.extend_from_slice(&STAGING_STORE_FORMAT_VERSION.to_be_bytes());
     bytes.extend_from_slice(&checksum::sha256::digest(
-        STAGING_STORE_SCHEMA_V1.as_bytes(),
+        STAGING_STORE_SCHEMA_V2.as_bytes(),
     ));
     let checksum = checksum::crc64::checksum(&bytes);
     bytes.extend_from_slice(&checksum.to_be_bytes());
@@ -3868,6 +4561,19 @@ mod tests {
 
     use super::*;
 
+    fn decode_hex(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|digits| {
+                let high = char::from(digits[0]).to_digit(16).unwrap();
+                let low = char::from(digits[1]).to_digit(16).unwrap();
+                u8::try_from((high << 4) | low).unwrap()
+            })
+            .collect()
+    }
+
     struct AssignmentGateRelease(Option<mpsc::SyncSender<()>>);
 
     impl AssignmentGateRelease {
@@ -3902,8 +4608,12 @@ mod tests {
     }
 
     fn binding_with_destination(destination: NodeId) -> UnavailablePgTransitionMutationBinding {
+        binding_for_pg(PgId::new(19), destination)
+    }
+
+    fn binding_for_pg(pg_id: PgId, destination: NodeId) -> UnavailablePgTransitionMutationBinding {
         UnavailablePgTransitionMutationBinding::new(
-            PgId::new(19),
+            pg_id,
             ClusterEpoch::new(12).unwrap(),
             ClusterEpoch::new(11).unwrap(),
             vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
@@ -3912,13 +4622,55 @@ mod tests {
     }
 
     fn intent(bytes: &[u8]) -> MetadataTransferStagingIntent {
+        intent_for_binding(bytes, &binding())
+    }
+
+    fn intent_for_binding(
+        bytes: &[u8],
+        binding: &UnavailablePgTransitionMutationBinding,
+    ) -> MetadataTransferStagingIntent {
         MetadataTransferStagingIntent::for_unavailable_transition(
-            &binding(),
+            binding,
             checksum::sha256::digest(bytes),
             u64::try_from(bytes.len()).unwrap(),
             METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
         )
         .unwrap()
+    }
+
+    fn canonical_artifact(label: &[u8]) -> &'static [u8] {
+        canonical_artifact_for_binding(label, &binding())
+    }
+
+    fn canonical_artifact_for_binding(
+        label: &[u8],
+        binding: &UnavailablePgTransitionMutationBinding,
+    ) -> &'static [u8] {
+        let source_epoch = ClusterEpoch::new(
+            binding
+                .transition_epoch()
+                .get()
+                .checked_add(checksum::crc64::checksum(label) % 1_024)
+                .unwrap(),
+        )
+        .unwrap();
+        let destination_epoch =
+            ClusterEpoch::new(source_epoch.get().checked_add(1).unwrap()).unwrap();
+        let artifact = PgMetadataTransferArtifact {
+            pg_id: binding.pg_id(),
+            source_node_id: binding.source_acting_set()[0],
+            cluster_epoch: source_epoch,
+            base_kind: PgMetadataTransferBaseKind::Empty,
+            base_proof: PgMetadataProof::empty(),
+            checkpoint_base: None,
+            proof: PgMetadataProof::empty(),
+            retained_log_entries: Vec::new(),
+        };
+        Box::leak(
+            encode_staged_metadata_transfer_artifact(&artifact, destination_epoch)
+                .unwrap()
+                .into_boxed_slice(),
+        )
     }
 
     fn staging_root(root: &Path) -> PathBuf {
@@ -3965,11 +4717,11 @@ mod tests {
     }
 
     #[test]
-    fn current_metadata_transfer_staging_store_matches_frozen_v1_manifest_and_requires_version_bump(
+    fn current_metadata_transfer_staging_store_matches_frozen_v2_manifest_and_requires_version_bump(
     ) {
         assert_eq!(
             hex(&current_manifest_bytes()),
-            "4152474d5354470000013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed7b6fa66472b5374b"
+            "4152474d5354470000026e722f4492ef06abc27ea34e6bc367916cd81c0ef362fb9c4f1e41b1e5cae494f8f99a4accd44275"
         );
         let tmp = test_util::tempdir();
         let store = open(tmp.path());
@@ -3983,19 +4735,43 @@ mod tests {
     }
 
     #[test]
-    fn initialization_marker_v1_encoding_is_fixed() {
+    fn initialization_marker_v2_encoding_is_fixed() {
         assert_eq!(
             hex(&current_initialization_marker_bytes()),
-            "4152474d5354474900013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed6c99898468dc761d"
+            "4152474d5354474900026e722f4492ef06abc27ea34e6bc367916cd81c0ef362fb9c4f1e41b1e5cae494ef0fb5aad6bd0323"
         );
     }
 
     #[test]
-    fn establishment_marker_v1_encoding_is_fixed() {
+    fn establishment_marker_v2_encoding_is_fixed() {
         assert_eq!(
             hex(&current_establishment_marker_bytes()),
-            "4152474d535447450001a7221d66ea51b3a38deafc1868ce6a6b0bb884463dd56626720658a445cc29bcb4fd5b0300c7b553"
+            "4152474d5354474500027c9533697c7a588542438ed5f246c781c987d4a750c7c2b52d8ed329cd145a1453a427f53714c545"
         );
+    }
+
+    #[test]
+    fn historical_staging_store_v1_markers_remain_exact_rejection_evidence() {
+        let manifest = decode_hex(
+            "4152474d5354470000013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed7b6fa66472b5374b",
+        );
+        let initialization = decode_hex(
+            "4152474d5354474900013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed6c99898468dc761d",
+        );
+        let establishment = decode_hex(
+            "4152474d535447450001a7221d66ea51b3a38deafc1868ce6a6b0bb884463dd56626720658a445cc29bcb4fd5b0300c7b553",
+        );
+
+        for result in [
+            validate_manifest(&manifest),
+            validate_initialization_marker(&initialization),
+            validate_establishment_marker(&establishment),
+        ] {
+            assert!(matches!(
+                result,
+                Err(MetadataTransferStagingError::UnsupportedFormatVersion(1))
+            ));
+        }
     }
 
     #[test]
@@ -4040,7 +4816,7 @@ mod tests {
         );
         assert!(initialization_marker_path(tmp.path()).exists());
         assert!(establishment_marker_path(tmp.path()).exists());
-        let artifact = b"receipt after durable staging-root establishment";
+        let artifact = canonical_artifact(b"receipt after durable staging-root establishment");
         let intent = intent(artifact);
         store.create_intent(&intent).unwrap();
         assert!(!store
@@ -4110,7 +4886,8 @@ mod tests {
                 };
             assert_eq!(*retry_points.lock().unwrap(), expected_retry_points);
 
-            let artifact = b"receipt only after retrying the failed parent sync";
+            let artifact =
+                canonical_artifact(b"receipt only after retrying the failed parent sync");
             let intent = intent(artifact);
             store.create_intent(&intent).unwrap();
             assert!(!store
@@ -4130,7 +4907,7 @@ mod tests {
             let mut marker = current_initialization_marker_bytes();
             if corrupt_version {
                 let offset = STAGING_INITIALIZATION_MAGIC.len();
-                marker[offset..offset + 2].copy_from_slice(&2u16.to_be_bytes());
+                marker[offset..offset + 2].copy_from_slice(&3u16.to_be_bytes());
                 let checksum = checksum::crc64::checksum(&marker[..INITIALIZATION_MARKER_BODY_LEN]);
                 marker[INITIALIZATION_MARKER_BODY_LEN..].copy_from_slice(&checksum.to_be_bytes());
             } else {
@@ -4146,7 +4923,7 @@ mod tests {
             if corrupt_version {
                 assert!(matches!(
                     error,
-                    MetadataTransferStagingError::UnsupportedFormatVersion(2)
+                    MetadataTransferStagingError::UnsupportedFormatVersion(3)
                 ));
             } else {
                 assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
@@ -4167,7 +4944,7 @@ mod tests {
             let mut marker = current_establishment_marker_bytes();
             if corrupt_version {
                 let offset = STAGING_ESTABLISHMENT_MAGIC.len();
-                marker[offset..offset + 2].copy_from_slice(&2u16.to_be_bytes());
+                marker[offset..offset + 2].copy_from_slice(&3u16.to_be_bytes());
                 let checksum = checksum::crc64::checksum(&marker[..ESTABLISHMENT_MARKER_BODY_LEN]);
                 marker[ESTABLISHMENT_MARKER_BODY_LEN..].copy_from_slice(&checksum.to_be_bytes());
             } else {
@@ -4184,7 +4961,7 @@ mod tests {
             if corrupt_version {
                 assert!(matches!(
                     error,
-                    MetadataTransferStagingError::UnsupportedFormatVersion(2)
+                    MetadataTransferStagingError::UnsupportedFormatVersion(3)
                 ));
             } else {
                 assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
@@ -4340,7 +5117,7 @@ mod tests {
 
     #[test]
     fn staging_store_rejects_adjacent_versions_without_mutation() {
-        for version in [0u16, 2] {
+        for version in [1u16, 3] {
             let tmp = test_util::tempdir();
             let store = open(tmp.path());
             drop(store);
@@ -4367,8 +5144,8 @@ mod tests {
     }
 
     #[test]
-    fn staged_artifact_format_accepts_only_exact_v1() {
-        for version in [0, 2] {
+    fn staged_artifact_format_accepts_only_exact_v2() {
+        for version in [1, 3] {
             let error = MetadataTransferStagingIntent::for_unavailable_transition(
                 &binding(),
                 [7; DIGEST_LEN],
@@ -4398,6 +5175,158 @@ mod tests {
     }
 
     #[test]
+    fn staged_artifact_publication_derives_and_binds_the_exact_transfer_proof() {
+        let tmp = test_util::tempdir();
+        let artifact = PgMetadataTransferArtifact {
+            pg_id: PgId::new(19),
+            source_node_id: NodeId::new(1),
+            cluster_epoch: ClusterEpoch::new(12).unwrap(),
+            base_kind: PgMetadataTransferBaseKind::Empty,
+            base_proof: PgMetadataProof::empty(),
+            checkpoint_base: None,
+            proof: PgMetadataProof::empty(),
+            retained_log_entries: Vec::new(),
+        };
+        let destination_epoch = ClusterEpoch::new(13).unwrap();
+        let bytes = encode_staged_metadata_transfer_artifact(&artifact, destination_epoch).unwrap();
+        let staged_intent = intent(&bytes);
+        let store = open(tmp.path());
+        store.create_intent(&staged_intent).unwrap();
+
+        let receipt = store.publish_artifact(&staged_intent, &bytes).unwrap();
+        let evidence = decode_staging_evidence(receipt.as_bytes()).unwrap();
+        assert_eq!(
+            evidence.transfer(),
+            Some(PgMetadataTransferProof::new_with_imported_metadata_proof(
+                artifact.cluster_epoch,
+                artifact.proof,
+                PgMetadataProof::empty(),
+            ))
+        );
+
+        let mut forged = bytes;
+        let imported_hash_value_offset =
+            STAGED_ARTIFACT_MAGIC.len() + 2 + 4 + 4 + 8 + 1 + 26 + 26 + 8 + 8 + 1;
+        forged[imported_hash_value_offset] ^= 1;
+        let forged_intent = intent(&forged);
+        let forged_tmp = test_util::tempdir();
+        let forged_store = open(forged_tmp.path());
+        forged_store.create_intent(&forged_intent).unwrap();
+        assert!(matches!(
+            forged_store.publish_artifact(&forged_intent, &forged),
+            Err(MetadataTransferStagingError::ArtifactSemanticMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn nonempty_staged_artifact_publishes_replaceable_epoch_bound_proofs() {
+        let tmp = test_util::tempdir();
+        let initial_epoch = ClusterEpoch::new(13).unwrap();
+        let rebased_epoch = ClusterEpoch::new(14).unwrap();
+        let artifact = canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+            &binding(),
+            initial_epoch,
+        );
+        let intent = intent(&artifact);
+        let store = open(tmp.path());
+        store.create_intent(&intent).unwrap();
+
+        let initial = store.publish_artifact(&intent, &artifact).unwrap();
+        let initial_evidence = decode_staging_evidence(initial.as_bytes()).unwrap();
+        assert_eq!(initial_evidence.target_epoch(), Some(initial_epoch));
+        let rebased = store
+            .publish_proof_for_epoch(&intent, rebased_epoch)
+            .unwrap();
+        let rebased_evidence = decode_staging_evidence(rebased.as_bytes()).unwrap();
+        assert_eq!(rebased_evidence.target_epoch(), Some(rebased_epoch));
+        assert_ne!(rebased_evidence.transfer(), initial_evidence.transfer());
+        assert_eq!(
+            store
+                .publish_proof_for_epoch(&intent, rebased_epoch)
+                .unwrap(),
+            rebased
+        );
+        assert_eq!(store.publish_artifact(&intent, &artifact).unwrap(), initial);
+        drop(store);
+
+        let reopened = open(tmp.path());
+        assert_eq!(
+            reopened
+                .publish_proof_for_epoch(&intent, rebased_epoch)
+                .unwrap(),
+            rebased
+        );
+        assert_eq!(
+            reopened.publish_artifact(&intent, &artifact).unwrap(),
+            initial
+        );
+        assert!(matches!(
+            reopened.publish_proof_for_epoch(&intent, binding().transition_epoch()),
+            Err(MetadataTransferStagingError::Invariant(_))
+        ));
+    }
+
+    #[test]
+    fn epoch_rebound_publication_receipts_survive_actor_rollover_and_reopen() {
+        let tmp = test_util::tempdir();
+        let initial_epoch = ClusterEpoch::new(13).unwrap();
+        let rebound_epoch = ClusterEpoch::new(14).unwrap();
+        let artifact = canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+            &binding(),
+            initial_epoch,
+        );
+        let intent = intent(&artifact);
+        let old = open(tmp.path());
+        old.create_intent(&intent).unwrap();
+        let initial = old.publish_artifact(&intent, &artifact).unwrap();
+        let rebound = old.publish_proof_for_epoch(&intent, rebound_epoch).unwrap();
+        drop(old);
+
+        let restarted_identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            8,
+            "tcp://storage-4.example:9000".to_owned(),
+        )
+        .unwrap();
+        let restarted =
+            MetadataTransferStagingStore::open(tmp.path(), restarted_identity.clone(), limits())
+                .unwrap();
+        let rebound_initial = restarted.publish_artifact(&intent, &artifact).unwrap();
+        let rebound_current = restarted
+            .publish_proof_for_epoch(&intent, rebound_epoch)
+            .unwrap();
+        assert_ne!(rebound_initial, initial);
+        assert_ne!(rebound_current, rebound);
+        for (receipt, target_epoch) in [
+            (&rebound_initial, initial_epoch),
+            (&rebound_current, rebound_epoch),
+        ] {
+            let evidence = decode_staging_evidence(receipt.as_bytes()).unwrap();
+            assert_eq!(evidence.actor(), &restarted_identity);
+            assert_eq!(evidence.target_epoch(), Some(target_epoch));
+        }
+        let page = restarted.next_evidence_page().unwrap().unwrap();
+        assert_eq!(page.entries().len(), 2);
+        assert!(page.entries().iter().all(|entry| {
+            decode_staging_evidence(entry.evidence()).unwrap().actor() == &restarted_identity
+        }));
+        drop(restarted);
+
+        let reopened =
+            MetadataTransferStagingStore::open(tmp.path(), restarted_identity, limits()).unwrap();
+        assert_eq!(
+            reopened.publish_artifact(&intent, &artifact).unwrap(),
+            rebound_initial
+        );
+        assert_eq!(
+            reopened
+                .publish_proof_for_epoch(&intent, rebound_epoch)
+                .unwrap(),
+            rebound_current
+        );
+    }
+
+    #[test]
     fn staging_store_rejects_intents_for_another_destination_before_mutation() {
         let tmp = test_util::tempdir();
         let store = MetadataTransferStagingStore::open(
@@ -4406,7 +5335,7 @@ mod tests {
             MetadataTransferStagingLimits::new(1, 1_024, 1_024).unwrap(),
         )
         .unwrap();
-        let artifact = b"misrouted artifact";
+        let artifact = canonical_artifact(b"misrouted artifact");
         let misrouted = MetadataTransferStagingIntent::for_unavailable_transition(
             &binding_with_destination(NodeId::new(5)),
             checksum::sha256::digest(artifact),
@@ -4426,26 +5355,36 @@ mod tests {
                 if message.contains("not a destination")
         ));
 
-        let valid = intent(b"valid artifact");
+        let valid_artifact = canonical_artifact(b"valid artifact");
+        let valid = intent(valid_artifact);
         assert_eq!(
             store.create_intent(&valid).unwrap(),
             MetadataTransferStagingIntentOutcome::Created
         );
         assert!(!store
-            .publish_artifact(&valid, b"valid artifact")
+            .publish_artifact(&valid, valid_artifact)
             .unwrap()
             .as_bytes()
             .is_empty());
     }
 
     #[test]
-    fn staging_receipt_v1_encoding_is_fixed() {
-        let artifact = b"one retained metadata command";
+    fn staging_receipt_v2_encoding_is_fixed() {
+        let artifact = canonical_artifact(b"one retained metadata command receipt");
         let expected_intent = intent(artifact);
-        let receipt = encode_staging_evidence(&identity(), &expected_intent, 0);
+        let receipt = encode_staging_evidence(
+            &identity(),
+            &expected_intent,
+            0,
+            Some(test_staging_evidence_target_epoch(&expected_intent)),
+            test_staging_evidence_transfer(
+                &expected_intent,
+                MetadataTransferStagingEvidenceKind::Publication,
+            ),
+        );
         assert_eq!(
             hex(&receipt),
-            "4152474d494e2d53544147494e472d45564944454e43452d5631000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c8e23ea24e8bba02e69f180fc02083e99416e1f8614ce65c9d3a96c7f3d24d572000000000000001d000107"
+            "4152474d494e2d53544147494e472d45564944454e43452d5632000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0a2188fce572c606858dffa56cc1590344a166e9ff8858bab341658e0c2e596000000000000000930002000000000000000d01000000000000000b0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
         );
         validate_staging_evidence(&receipt, &expected_intent, 0, &identity()).unwrap();
         assert!(MetadataTransferStagingReceipt::from_publication_bytes(
@@ -4466,7 +5405,7 @@ mod tests {
             NodeId::new(5),
         )
         .is_err());
-        let tombstone = encode_staging_evidence(&identity(), &expected_intent, 1);
+        let tombstone = encode_staging_evidence(&identity(), &expected_intent, 1, None, None);
         assert!(MetadataTransferStagingReceipt::from_publication_bytes(
             &tombstone,
             &expected_intent,
@@ -4478,7 +5417,7 @@ mod tests {
     #[test]
     fn artifact_publication_is_durable_idempotent_and_restart_readable() {
         let tmp = test_util::tempdir();
-        let artifact = b"one retained metadata command";
+        let artifact = canonical_artifact(b"one retained metadata command publication");
         let intent = intent(artifact);
         let store = open(tmp.path());
         assert_eq!(
@@ -4525,7 +5464,7 @@ mod tests {
     #[test]
     fn existing_artifact_retry_syncs_directory_before_publication_receipt() {
         let tmp = test_util::tempdir();
-        let artifact = b"renamed before publication retry";
+        let artifact = canonical_artifact(b"renamed before publication retry");
         let intent = intent(artifact);
         let observed = Arc::new(AtomicUsize::new(0));
         let observed_for_hook = Arc::clone(&observed);
@@ -4562,7 +5501,7 @@ mod tests {
     #[test]
     fn startup_syncs_recovered_artifact_directory_before_publication_receipt() {
         let tmp = test_util::tempdir();
-        let artifact = b"renamed before startup recovery";
+        let artifact = canonical_artifact(b"renamed before startup recovery");
         let intent = intent(artifact);
         let store = open(tmp.path());
         store.create_intent(&intent).unwrap();
@@ -4622,7 +5561,7 @@ mod tests {
         ];
         for invalid_identity in invalid_identities {
             let tmp = test_util::tempdir();
-            let artifact = b"unreconciled publication";
+            let artifact = canonical_artifact(b"unreconciled publication");
             let intent = intent(artifact);
             let store = open(tmp.path());
             store.create_intent(&intent).unwrap();
@@ -4678,7 +5617,7 @@ mod tests {
     #[test]
     fn tombstone_precedes_removal_and_rejects_delayed_publication() {
         let tmp = test_util::tempdir();
-        let artifact = b"staged then cancelled";
+        let artifact = canonical_artifact(b"staged then cancelled");
         let intent = intent(artifact);
         let store = open(tmp.path());
         store.create_intent(&intent).unwrap();
@@ -4705,7 +5644,7 @@ mod tests {
     #[test]
     fn tombstone_before_intent_rejects_delayed_stage_and_rebinds_receipt_on_restart() {
         let tmp = test_util::tempdir();
-        let artifact = b"cancelled before destination stage";
+        let artifact = canonical_artifact(b"cancelled before destination stage");
         let intent = intent(artifact);
         let store = open(tmp.path());
         let receipt = store.tombstone(&intent).unwrap();
@@ -4746,7 +5685,7 @@ mod tests {
     #[test]
     fn restart_recovers_exact_renamed_artifact_and_quarantines_unknown_file() {
         let tmp = test_util::tempdir();
-        let artifact = b"renamed before catalogue commit";
+        let artifact = canonical_artifact(b"renamed before catalogue commit");
         let intent = intent(artifact);
         let store = open(tmp.path());
         store.create_intent(&intent).unwrap();
@@ -4831,7 +5770,7 @@ mod tests {
     fn restart_fails_closed_for_missing_or_corrupt_published_artifact() {
         for corrupt in [false, true] {
             let tmp = test_util::tempdir();
-            let artifact = b"durable artifact";
+            let artifact = canonical_artifact(b"durable artifact");
             let intent = intent(artifact);
             let store = open(tmp.path());
             store.create_intent(&intent).unwrap();
@@ -4857,7 +5796,7 @@ mod tests {
 
     #[test]
     fn catalogue_rejects_adjacent_versions_and_schema_changes_without_repair() {
-        for version in [0u32, 2] {
+        for version in [0u32, 1, 3] {
             let tmp = test_util::tempdir();
             drop(open(tmp.path()));
             let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
@@ -4910,7 +5849,7 @@ mod tests {
     #[test]
     fn startup_rejects_coordinated_receipt_corruption() {
         let tmp = test_util::tempdir();
-        let artifact = b"receipt-bound artifact";
+        let artifact = canonical_artifact(b"receipt-bound artifact");
         let intent = intent(artifact);
         let store = open(tmp.path());
         store.create_intent(&intent).unwrap();
@@ -4958,13 +5897,22 @@ mod tests {
         ];
         for forged_identity in forged_identities {
             let tmp = test_util::tempdir();
-            let artifact = b"actor-bound staging receipt";
+            let artifact = canonical_artifact(b"actor-bound staging receipt");
             let intent = intent(artifact);
             let store = open(tmp.path());
             store.create_intent(&intent).unwrap();
             store.publish_artifact(&intent, artifact).unwrap();
             drop(store);
-            let forged_receipt = encode_staging_evidence(&forged_identity, &intent, 0);
+            let forged_receipt = encode_staging_evidence(
+                &forged_identity,
+                &intent,
+                0,
+                Some(test_staging_evidence_target_epoch(&intent)),
+                test_staging_evidence_transfer(
+                    &intent,
+                    MetadataTransferStagingEvidenceKind::Publication,
+                ),
+            );
             let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
             connection
                 .execute(
@@ -5038,11 +5986,12 @@ mod tests {
     #[test]
     fn startup_validates_complete_catalogue_before_reconciling_files() {
         let tmp = test_util::tempdir();
-        let recover_artifact = b"renamed but not committed";
+        let recover_artifact = canonical_artifact(b"renamed but not committed");
         let recover_intent = intent(recover_artifact);
-        let published_artifact = b"published with later corruption";
-        let mut published_intent = intent(published_artifact);
-        published_intent.pg_id = PgId::new(20);
+        let published_binding = binding_for_pg(PgId::new(20), NodeId::new(4));
+        let published_artifact =
+            canonical_artifact_for_binding(b"published with later corruption", &published_binding);
+        let published_intent = intent_for_binding(published_artifact, &published_binding);
         let store = open(tmp.path());
         store.create_intent(&recover_intent).unwrap();
         fs::write(store.artifact_path(&recover_intent), recover_artifact).unwrap();
@@ -5104,7 +6053,7 @@ mod tests {
     #[test]
     fn evidence_page_replays_within_an_incarnation_and_rebinds_on_restart() {
         let tmp = test_util::tempdir();
-        let first_artifact = b"first evidence page artifact";
+        let first_artifact = canonical_artifact(b"first evidence page artifact");
         let first = intent(first_artifact);
         let store = open(tmp.path());
         store.create_intent(&first).unwrap();
@@ -5193,19 +6142,24 @@ mod tests {
         let tmp = test_util::tempdir();
         let old = open(tmp.path());
 
-        let unpublished_bytes = b"stale publication";
+        let unpublished_bytes = canonical_artifact(b"stale publication");
         let unpublished = intent(unpublished_bytes);
         old.create_intent(&unpublished).unwrap();
 
-        let mut published = intent(b"stale import");
-        published.pg_id = PgId::new(20);
+        let published_binding = binding_for_pg(PgId::new(20), NodeId::new(4));
+        let published_artifact =
+            canonical_artifact_for_binding(b"stale import", &published_binding);
+        let published = intent_for_binding(published_artifact, &published_binding);
         old.create_intent(&published).unwrap();
-        old.publish_artifact(&published, b"stale import").unwrap();
+        old.publish_artifact(&published, published_artifact)
+            .unwrap();
 
-        let mut retained_artifact = intent(b"stale tombstone");
-        retained_artifact.pg_id = PgId::new(21);
+        let retained_binding = binding_for_pg(PgId::new(21), NodeId::new(4));
+        let retained_artifact_bytes =
+            canonical_artifact_for_binding(b"stale tombstone", &retained_binding);
+        let retained_artifact = intent_for_binding(retained_artifact_bytes, &retained_binding);
         old.create_intent(&retained_artifact).unwrap();
-        old.publish_artifact(&retained_artifact, b"stale tombstone")
+        old.publish_artifact(&retained_artifact, retained_artifact_bytes)
             .unwrap();
         let retained_artifact_path = old.artifact_path(&retained_artifact);
 
@@ -5268,7 +6222,7 @@ mod tests {
     #[test]
     fn evidence_page_assignment_is_atomic_across_independent_store_handles() {
         let tmp = test_util::tempdir();
-        let artifact = b"two-handle evidence assignment";
+        let artifact = canonical_artifact(b"two-handle evidence assignment");
         let intent = intent(artifact);
         let setup = open(tmp.path());
         setup.create_intent(&intent).unwrap();
@@ -5329,9 +6283,9 @@ mod tests {
     }
 
     #[test]
-    fn staging_evidence_page_and_apply_receipt_v1_encodings_are_fixed() {
+    fn staging_evidence_page_and_apply_receipt_v2_encodings_are_fixed() {
         let tmp = test_util::tempdir();
-        let artifact = b"fixed evidence page artifact";
+        let artifact = canonical_artifact(b"fixed evidence page artifact");
         let intent = intent(artifact);
         let store = open(tmp.path());
         store.create_intent(&intent).unwrap();
@@ -5341,18 +6295,37 @@ mod tests {
 
         assert_eq!(
             hex(page.operation_payload()),
-            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56310000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000000bc4152474d494e2d53544147494e472d45564944454e43452d5631000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0bf51475e8b2d3cf459b84790992ceb689fd3261ab949c76545228fd3cf39381000000000000001c000107"
+            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56320000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000001014152474d494e2d53544147494e472d45564944454e43452d5632000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000cdf119ce6d30f03ee41c522f38a714f40c51f6203f5686863315034ea17d5815c0000000000000093000200000000000003340100000000000003330000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
         );
         assert_eq!(
             hex(receipt.as_bytes()),
-            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56310000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001b97e8570c0ac86e556b72d83542c0aafea95e3908882344ac802537b5e55a57e0000000000000001"
+            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56320000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001d21dec7bc9da9454bf830dd0c5b7d398f5de9db47b004d49fa396e8eb8ef76ea0000000000000001"
         );
+    }
+
+    #[test]
+    fn historical_staging_evidence_v1_encodings_remain_rejected() {
+        let evidence = decode_hex(
+            "4152474d494e2d53544147494e472d45564944454e43452d5631000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c8e23ea24e8bba02e69f180fc02083e99416e1f8614ce65c9d3a96c7f3d24d572000000000000001d000107",
+        );
+        let page = decode_hex(
+            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56310000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000000bc4152474d494e2d53544147494e472d45564944454e43452d5631000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0bf51475e8b2d3cf459b84790992ceb689fd3261ab949c76545228fd3cf39381000000000000001c000107",
+        );
+        let apply_receipt = decode_hex(
+            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56310000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001b97e8570c0ac86e556b72d83542c0aafea95e3908882344ac802537b5e55a57e0000000000000001",
+        );
+
+        assert!(decode_staging_evidence(&evidence).is_err());
+        assert!(
+            decode_staging_evidence_page_payload(&page, checksum::sha256::digest(&page)).is_err()
+        );
+        assert!(decode_staging_evidence_apply_receipt(&apply_receipt).is_err());
     }
 
     #[test]
     fn evidence_acknowledgement_is_atomic_and_chains_the_successor_page() {
         let tmp = test_util::tempdir();
-        let first_artifact = b"acknowledged evidence page artifact";
+        let first_artifact = canonical_artifact(b"acknowledged evidence page artifact");
         let first = intent(first_artifact);
         let store = open(tmp.path());
         store.create_intent(&first).unwrap();
@@ -5393,7 +6366,7 @@ mod tests {
     #[test]
     fn invalid_apply_receipt_cannot_acknowledge_or_replace_the_inflight_page() {
         let tmp = test_util::tempdir();
-        let artifact = b"receipt rejection artifact";
+        let artifact = canonical_artifact(b"receipt rejection artifact");
         let intent = intent(artifact);
         let store = open(tmp.path());
         store.create_intent(&intent).unwrap();
@@ -5467,7 +6440,13 @@ mod tests {
         let next_sequence = oversized.last().unwrap().sequence + 1;
         oversized.push(MetadataTransferStagingEvidencePageEntry {
             sequence: next_sequence,
-            evidence: encode_staging_evidence(&store.identity, &intent(b"next evidence"), 1),
+            evidence: encode_staging_evidence(
+                &store.identity,
+                &intent(b"next evidence"),
+                1,
+                None,
+                None,
+            ),
         });
         assert!(
             encode_staging_evidence_page_payload(
@@ -5486,7 +6465,7 @@ mod tests {
     fn startup_rejects_partial_evidence_acknowledgement_transactions() {
         for receipt_without_members in [false, true] {
             let tmp = test_util::tempdir();
-            let artifact = b"partial evidence acknowledgement";
+            let artifact = canonical_artifact(b"partial evidence acknowledgement");
             let intent = intent(artifact);
             let store = open(tmp.path());
             store.create_intent(&intent).unwrap();
@@ -5520,7 +6499,7 @@ mod tests {
     #[test]
     fn startup_rejects_acknowledged_evidence_without_its_retained_page() {
         let tmp = test_util::tempdir();
-        let artifact = b"missing acknowledged evidence page";
+        let artifact = canonical_artifact(b"missing acknowledged evidence page");
         let intent = intent(artifact);
         let store = open(tmp.path());
         store.create_intent(&intent).unwrap();
@@ -5548,7 +6527,7 @@ mod tests {
     #[test]
     fn startup_rejects_acknowledged_evidence_outside_the_retained_page_chain() {
         let tmp = test_util::tempdir();
-        let first_artifact = b"retained acknowledged evidence page";
+        let first_artifact = canonical_artifact(b"retained acknowledged evidence page");
         let first = intent(first_artifact);
         let store = open(tmp.path());
         store.create_intent(&first).unwrap();
@@ -5587,7 +6566,7 @@ mod tests {
     fn acknowledged_genesis_page_reopens_before_successor_assignment() {
         for queue_successor_delta in [false, true] {
             let tmp = test_util::tempdir();
-            let artifact = b"acknowledged genesis restart";
+            let artifact = canonical_artifact(b"acknowledged genesis restart");
             let first = intent(artifact);
             let store = open(tmp.path());
             store.create_intent(&first).unwrap();
@@ -5626,7 +6605,7 @@ mod tests {
     #[test]
     fn startup_rejects_apply_receipt_not_bound_to_the_durable_page() {
         let tmp = test_util::tempdir();
-        let artifact = b"startup apply receipt validation";
+        let artifact = canonical_artifact(b"startup apply receipt validation");
         let intent = intent(artifact);
         let store = open(tmp.path());
         store.create_intent(&intent).unwrap();

@@ -340,7 +340,7 @@ fn control_plane_rpc_catalogue_staging_page() -> MetadataTransferStagingEvidence
 }
 
 #[test]
-fn control_plane_rpc_v19_staging_evidence_frames_are_exact() {
+fn control_plane_rpc_v20_staging_evidence_frames_are_exact() {
     let genesis = control_plane_rpc_catalogue_staging_page();
     let genesis_receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&genesis);
     let successor = metadata_transfer_staging_evidence_page_for_test(
@@ -379,16 +379,16 @@ fn control_plane_rpc_v19_staging_evidence_frames_are_exact() {
         evidence,
         [
             (
-                399,
-                "87273c299e0f59383af9db57f2facf8fa4f7bdd46754596f15557d0224c36a64".to_owned(),
+                468,
+                "15bc016bd360627200cfb3b98248a6ebd1f9bbfb636c6effebae08a255f32bfe".to_owned(),
                 214,
-                "b210fca00ee74f1f7bc048f6c7532da724d8a883eef2a7c387005ebf719a9266".to_owned(),
+                "bee0379f5da51fc501859b8379c35a80d961e49ef142f030ae71104db9087a3b".to_owned(),
             ),
             (
-                399,
-                "28fe22f2b91ca95849115c3a7f937d5794119fb790ed5c04149b44c63c9a75ed".to_owned(),
+                408,
+                "5a80f9b90c622202a9675218177b22a9e95415c64139cf5a4197845894e24bef".to_owned(),
                 214,
-                "ae16925689c4b0ec0bc4151938064235dc450a3bcc1d6906b1ba17686be46ecd".to_owned(),
+                "4968d40ed671495bf7dfc6538f7ab0ed56dc0aea7418f00adf0d4616baf2ad4d".to_owned(),
             ),
         ]
     );
@@ -1550,7 +1550,7 @@ fn control_plane_rpc_v18_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v19_operation_catalogue_is_exact() {
+fn control_plane_rpc_v20_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -1763,8 +1763,8 @@ fn control_plane_rpc_v19_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            15_048,
-            "4f85af2454a93c36cd1b42f4664f8fe6ff044c3ece91da30dbd57e0fc617852f".to_owned()
+            15_117,
+            "094ddb4121c20cc79579482e0e98b80f27421a865790b647fad5f3029a2c12dd".to_owned()
         )
     );
 }
@@ -1882,8 +1882,41 @@ fn authenticated_control_plane_rpc_v18_auth_v2_payload_binding_remains_rejected_
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v19_auth_v2_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 19);
+fn authenticated_control_plane_rpc_v19_auth_v2_payload_binding_remains_rejected_evidence() {
+    let kind = ControlPlaneRpcKind::RuntimeMapStatus;
+    let credential = frontend_auth_credential("auth-cluster", "frontend-1");
+    let request = signed_frontend_runtime_map_request(
+        kind,
+        &credential,
+        Vec::new(),
+        Some(1_000),
+        Some(6_000),
+    );
+    let response = signed_runtime_map_response_payload(kind, &credential, vec![0xa5, 0x5a], 1_001);
+    let request_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 19).unwrap();
+    let response_frame = encode_control_plane_rpc_frame_with_version(kind, &response, 19).unwrap();
+    assert_eq!(
+        (
+            request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&request_frame)),
+            response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&response_frame)),
+        ),
+        (
+            182,
+            "7f0f26416b3d44b483263180346bf4216fc79f539df75aecbc45ea46750e7160".to_owned(),
+            190,
+            "6a35ac60562ceb3bc41f153ddcc46481ae41bf6823861684ec1be536bc4cbd77".to_owned(),
+        )
+    );
+    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(request_frame)).is_err());
+    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(response_frame)).is_err());
+}
+
+#[test]
+fn authenticated_control_plane_rpc_v20_auth_v2_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 20);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -1929,9 +1962,9 @@ fn authenticated_control_plane_rpc_v19_auth_v2_payload_bindings_are_exact() {
         ),
         (
             182,
-            "7f0f26416b3d44b483263180346bf4216fc79f539df75aecbc45ea46750e7160".to_owned(),
+            "51d44a3b6a3b2fd7b5a2023f5295404fdbd4bb0c22763fc1c465ba18221cc0d5".to_owned(),
             190,
-            "6a35ac60562ceb3bc41f153ddcc46481ae41bf6823861684ec1be536bc4cbd77".to_owned(),
+            "134a93cdda52e552d882626b326e0ffb755f9418aeb5457b36e71f54c614d3e0".to_owned(),
         )
     );
 }
@@ -6720,16 +6753,20 @@ fn authenticated_saturation_defers_the_durable_staging_outbox() {
         )
         .unwrap(),
     );
-    let artifact = b"authenticated staging outbox saturation artifact";
+    let transition = control_plane_rpc_catalogue_transition_binding();
+    let artifact = crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+        &transition,
+        next_epoch(transition.transition_epoch()).unwrap(),
+    );
     let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
-        &control_plane_rpc_catalogue_transition_binding(),
-        checksum::sha256::digest(artifact),
+        &transition,
+        checksum::sha256::digest(&artifact),
         u64::try_from(artifact.len()).unwrap(),
         METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
     )
     .unwrap();
     store.create_intent(&intent).unwrap();
-    store.publish_artifact(&intent, artifact).unwrap();
+    store.publish_artifact(&intent, &artifact).unwrap();
     let page = store.next_evidence_page().unwrap().unwrap();
 
     let listener = ControlPlaneRpcServerListener::unix(

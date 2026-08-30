@@ -519,9 +519,11 @@ pub(super) mod pg_store_facade {
     };
     #[cfg(test)]
     pub(crate) use super::pg_store::{
+        canonical_nonempty_staged_metadata_transfer_artifact_for_test,
         metadata_transfer_staging_evidence_page_for_test,
         metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
         metadata_transfer_staging_evidence_page_with_member_actor_for_test,
+        metadata_transfer_staging_publication_evidence_page_for_test,
         MetadataTransferStagingLimits, MetadataTransferStagingNodeIdentity,
     };
     pub use super::pg_store::{

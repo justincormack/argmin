@@ -138,7 +138,7 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
         ),
         (
             714,
-            "4a0e0a9638a9342eb83f513bb39df701bad69269e7b963f69c291c76c514c6c0".to_owned()
+            "6f2345ff53a23b9da974384c88f484f894524e26b644dbbafd47bb168b46e0bf".to_owned()
         )
     );
 }
@@ -163,7 +163,7 @@ fn control_plane_raft_wal_v2_rejects_noncurrent_nested_command_versions() {
         .filter_map(|(offset, candidate)| (candidate == current.as_slice()).then_some(offset))
         .collect::<Vec<_>>();
     assert_eq!(offsets.len(), 1);
-    for version in [16, 20, 21, 22, 24] {
+    for version in [16, 20, 21, 22, 23, 25] {
         let previous =
             crate::control_plane_command::encode_control_plane_command_with_version_for_test(
                 &command, version,
@@ -569,7 +569,7 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         (
             75,
             236,
-            "56d939b8fe74ef1d8b739e7f5ec2b1cf1b609684337c4ecf75afda7e1c55d293".to_owned(),
+            "980e50db580798d690e4a7a006ec86cc1998822c8dc2c12761ac3cb2e4238fd1".to_owned(),
             112,
             "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62".to_owned()
         )

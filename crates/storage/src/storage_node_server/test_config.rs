@@ -5372,7 +5372,7 @@
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [22_u16, 24] {
+            for unsupported_version in [23_u16, 25] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());
@@ -6259,9 +6259,9 @@
                 credential,
             )),
         );
-        let artifact = b"authenticated staged metadata transfer";
-        let misrouted_artifact = b"misrouted authenticated staged artifact";
         let transition_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
+        let initial_destination_epoch = ClusterEpoch::new(transition_epoch.get() + 1).unwrap();
+        let rebased_destination_epoch = ClusterEpoch::new(initial_destination_epoch.get() + 1).unwrap();
         let misrouted_binding = UnavailablePgTransitionMutationBinding::new(
             PgId::new(0),
             transition_epoch,
@@ -6269,10 +6269,15 @@
             vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
             vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
         );
+        let misrouted_artifact =
+            crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+                &misrouted_binding,
+                initial_destination_epoch,
+            );
         let misrouted_intent =
             crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
                 &misrouted_binding,
-                checksum::sha256::digest(misrouted_artifact),
+                checksum::sha256::digest(&misrouted_artifact),
                 u64::try_from(misrouted_artifact.len()).unwrap(),
                 crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
             )
@@ -6283,7 +6288,33 @@
         assert!(client
             .publish_metadata_transfer_staging_artifact(
                 &misrouted_intent,
-                misrouted_artifact,
+                &misrouted_artifact,
+            )
+            .is_err());
+
+        let malformed_artifact =
+            b"ARGMIN-METADATA-TRANSFER-ARTIFACT-V2\0malformed".as_slice();
+        let malformed_intent =
+            crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+                &UnavailablePgTransitionMutationBinding::new(
+                    PgId::new(1),
+                    transition_epoch,
+                    config.cluster_epoch,
+                    vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+                    vec![config.node_id, NodeId::new(2), NodeId::new(3)],
+                ),
+                checksum::sha256::digest(malformed_artifact),
+                u64::try_from(malformed_artifact.len()).unwrap(),
+                crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+            )
+            .unwrap();
+        client
+            .create_metadata_transfer_staging_intent(&malformed_intent)
+            .unwrap();
+        assert!(client
+            .publish_metadata_transfer_staging_artifact(
+                &malformed_intent,
+                malformed_artifact,
             )
             .is_err());
 
@@ -6294,9 +6325,14 @@
             vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
             vec![config.node_id, NodeId::new(2), NodeId::new(3)],
         );
+        let artifact =
+            crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+                &binding,
+                initial_destination_epoch,
+            );
         let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
             &binding,
-            checksum::sha256::digest(artifact),
+            checksum::sha256::digest(&artifact),
             u64::try_from(artifact.len()).unwrap(),
             crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
         )
@@ -6309,13 +6345,31 @@
             .create_metadata_transfer_staging_intent(&intent)
             .unwrap();
         let first = client
-            .publish_metadata_transfer_staging_artifact(&intent, artifact)
+            .publish_metadata_transfer_staging_artifact(&intent, &artifact)
             .unwrap();
         let replay = client
-            .publish_metadata_transfer_staging_artifact(&intent, artifact)
+            .publish_metadata_transfer_staging_artifact(&intent, &artifact)
             .unwrap();
         assert_eq!(replay, first);
         assert!(!first.as_bytes().is_empty());
+        let initial = crate::pg_store::decode_staging_evidence(first.as_bytes()).unwrap();
+        assert_eq!(initial.target_epoch(), Some(initial_destination_epoch));
+        let rebased = client
+            .publish_metadata_transfer_staging_proof(&intent, rebased_destination_epoch)
+            .unwrap();
+        let rebased_evidence =
+            crate::pg_store::decode_staging_evidence(rebased.as_bytes()).unwrap();
+        assert_eq!(
+            rebased_evidence.target_epoch(),
+            Some(rebased_destination_epoch)
+        );
+        assert_ne!(rebased_evidence.transfer(), initial.transfer());
+        assert_eq!(
+            client
+                .publish_metadata_transfer_staging_proof(&intent, rebased_destination_epoch)
+                .unwrap(),
+            rebased
+        );
 
         drop(client);
         assert!(join.join().unwrap().is_ok());

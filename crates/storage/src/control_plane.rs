@@ -30,7 +30,8 @@ use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneCommandStateMachine,
     ControlPlaneLogId, ExpiredNodeHeartbeatLease, PromotedNodeHeartbeatLease,
     ReadyPgPeeringCompletion, UnavailablePgStagingIntentAuthorizationRequest,
-    UnavailablePgTransitionBeginRequest, UnavailablePgTransitionCompletionRequest,
+    UnavailablePgStagingPublicationBinding, UnavailablePgTransitionBeginRequest,
+    UnavailablePgTransitionCompletionRequest, UnavailablePgTransitionInstallRequest,
 };
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::control_plane_lease::{
@@ -66,7 +67,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 19;
+const CONTROL_PLANE_RPC_VERSION: u16 = 20;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -78,7 +79,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 35;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 36;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
@@ -869,6 +870,7 @@ struct MetadataTransferStagingEvidenceKey {
     actor_node_id: NodeId,
     actor_node_incarnation: u64,
     kind: crate::pg_store::MetadataTransferStagingEvidenceKind,
+    target_epoch: Option<ClusterEpoch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -930,6 +932,7 @@ pub struct UnavailablePgPlacementTransition {
     completion: Option<ReadyPgPeeringCompletion>,
     begin_batch_receipt: UnavailablePgTransitionBatchReceipt,
     staging_authorization: Option<UnavailablePgStagingIntentAuthorization>,
+    destination_install: Option<UnavailablePgDestinationInstall>,
     completion_batch_receipt: Option<UnavailablePgTransitionBatchReceipt>,
 }
 
@@ -942,10 +945,18 @@ pub struct UnavailablePgStagingIntentAuthorization {
     batch_receipt: UnavailablePgTransitionBatchReceipt,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnavailablePgDestinationInstall {
+    transfer: PgMetadataTransferProof,
+    publications: Vec<UnavailablePgStagingPublicationBinding>,
+    batch_receipt: UnavailablePgTransitionBatchReceipt,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum UnavailablePgTransitionBatchStage {
     Begin,
     StagingAuthorization,
+    DestinationInstall,
     Completion,
 }
 
@@ -954,6 +965,7 @@ impl UnavailablePgTransitionBatchStage {
         match self {
             Self::Begin => "begin",
             Self::StagingAuthorization => "staging-authorization",
+            Self::DestinationInstall => "destination-install",
             Self::Completion => "completion",
         }
     }
@@ -962,6 +974,7 @@ impl UnavailablePgTransitionBatchStage {
         match value {
             "begin" => Ok(Self::Begin),
             "staging-authorization" => Ok(Self::StagingAuthorization),
+            "destination-install" => Ok(Self::DestinationInstall),
             "completion" => Ok(Self::Completion),
             _ => Err(format!(
                 "unknown unavailable PG transition batch stage {value:?}"
@@ -1026,6 +1039,27 @@ enum ValidatedUnavailablePgStagingIntentAuthorization {
         pg_id: PgId,
         authorization: UnavailablePgStagingIntentAuthorization,
     },
+}
+
+#[derive(Debug)]
+enum ValidatedUnavailablePgDestinationInstall {
+    ExactReplay {
+        pg_id: PgId,
+    },
+    Apply {
+        pg_id: PgId,
+        transfer: PgMetadataTransferProof,
+        publications: Vec<UnavailablePgStagingPublicationBinding>,
+        batch_identity: UnavailablePgTransitionBatchReceiptIdentity,
+    },
+}
+
+impl ValidatedUnavailablePgDestinationInstall {
+    fn pg_id(&self) -> PgId {
+        match self {
+            Self::ExactReplay { pg_id } | Self::Apply { pg_id, .. } => *pg_id,
+        }
+    }
 }
 
 impl ValidatedUnavailablePgStagingIntentAuthorization {
@@ -1200,6 +1234,46 @@ fn unavailable_pg_staging_authorization_batch_identity(
     }
 }
 
+fn unavailable_pg_destination_install_batch_identity(
+    requests: &[UnavailablePgTransitionInstallRequest],
+    expected_destination_epoch: ClusterEpoch,
+) -> UnavailablePgTransitionBatchReceiptIdentity {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(
+        &mut hasher,
+        UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN,
+    );
+    digest_u8(&mut hasher, 4);
+    digest_u64(&mut hasher, expected_destination_epoch.get());
+    digest_len(&mut hasher, requests.len());
+    for request in requests {
+        digest_unavailable_pg_transition_binding(&mut hasher, &request.unavailable_transition);
+        digest_u64(&mut hasher, request.transfer.source_epoch().get());
+        digest_pg_metadata_proof(&mut hasher, request.transfer.source_metadata_proof());
+        digest_pg_metadata_proof(&mut hasher, request.transfer.metadata_proof());
+        digest_u64(&mut hasher, request.expected_destination_epoch.get());
+        digest_len(&mut hasher, request.publications.len());
+        for publication in &request.publications {
+            digest_u32(&mut hasher, publication.node_id.as_u32());
+            digest_u64(&mut hasher, publication.node_incarnation);
+            digest_bytes(&mut hasher, publication.endpoint.as_bytes());
+            digest_bytes(&mut hasher, &publication.evidence_digest);
+        }
+    }
+    UnavailablePgTransitionBatchReceiptIdentity {
+        stage: UnavailablePgTransitionBatchStage::DestinationInstall,
+        member_pg_ids: requests
+            .iter()
+            .map(|request| request.unavailable_transition.pg_id())
+            .collect(),
+        members_digest: hasher
+            .finalize()
+            .bytes()
+            .try_into()
+            .expect("SHA-256 destination install batch digest must contain 32 bytes"),
+    }
+}
+
 fn unavailable_pg_staging_authorization_request_from_durable(
     transition: &UnavailablePgPlacementTransition,
 ) -> Option<UnavailablePgStagingIntentAuthorizationRequest> {
@@ -1216,6 +1290,24 @@ fn unavailable_pg_staging_authorization_request_from_durable(
         artifact_digest: authorization.artifact_digest,
         artifact_length: authorization.artifact_length,
         artifact_format_version: authorization.artifact_format_version,
+    })
+}
+
+fn unavailable_pg_destination_install_request_from_durable(
+    transition: &UnavailablePgPlacementTransition,
+) -> Option<UnavailablePgTransitionInstallRequest> {
+    let install = transition.destination_install.as_ref()?;
+    Some(UnavailablePgTransitionInstallRequest {
+        unavailable_transition: UnavailablePgTransitionMutationBinding::new(
+            transition.pg_id,
+            transition.transition_epoch,
+            transition.source_epoch,
+            transition.source_acting_set.clone(),
+            transition.destination_acting_set.clone(),
+        ),
+        transfer: install.transfer,
+        expected_destination_epoch: transition.destination_epoch?,
+        publications: install.publications.clone(),
     })
 }
 
@@ -1969,6 +2061,7 @@ impl ClusterControlSnapshot {
             completion: None,
             begin_batch_receipt: batch_receipt.clone(),
             staging_authorization: None,
+            destination_install: None,
             completion_batch_receipt: None,
         };
         if let Some(existing) = self
@@ -1981,6 +2074,7 @@ impl ClusterControlSnapshot {
             original_request.payload_readiness = None;
             original_request.completion = None;
             original_request.staging_authorization = None;
+            original_request.destination_install = None;
             original_request.completion_batch_receipt = None;
             if original_request == requested {
                 return Ok(ValidatedUnavailablePgTransitionBegin::ExactReplay { pg_id });
@@ -1999,6 +2093,7 @@ impl ClusterControlSnapshot {
             original_request.payload_readiness = None;
             original_request.completion = None;
             original_request.staging_authorization = None;
+            original_request.destination_install = None;
             original_request.completion_batch_receipt = None;
             if original_request == requested {
                 return Ok(ValidatedUnavailablePgTransitionBegin::ExactReplay { pg_id });
@@ -2544,6 +2639,319 @@ impl ClusterControlSnapshot {
         Ok(Some(next_snapshot))
     }
 
+    fn validate_unavailable_pg_destination_install_batch(
+        &self,
+        requests: Vec<UnavailablePgTransitionInstallRequest>,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<Vec<ValidatedUnavailablePgDestinationInstall>, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "destination installation",
+            requests
+                .iter()
+                .map(|request| request.unavailable_transition.pg_id()),
+        )?;
+        let batch_identity = unavailable_pg_destination_install_batch_identity(
+            &requests,
+            expected_destination_epoch,
+        );
+        requests
+            .into_iter()
+            .map(|request| {
+                let pg_id = request.unavailable_transition.pg_id();
+                let transition_epoch = request.unavailable_transition.transition_epoch();
+                let active_transition = self
+                    .unavailable_pg_placement_transitions
+                    .get(&pg_id)
+                    .filter(|transition| transition.transition_epoch == transition_epoch);
+                let transition = self
+                    .retained_unavailable_pg_placement_transitions
+                    .get(&(pg_id, transition_epoch))
+                    .or(active_transition)
+                    .ok_or_else(|| ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} has no matching unavailable transition for destination installation",
+                            pg_id.get()
+                        ),
+                    })?;
+                if !request.unavailable_transition.matches_transition(transition) {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} destination installation does not match its unavailable transition",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                if let Some(existing) = &transition.destination_install {
+                    if transition.destination_epoch == Some(request.expected_destination_epoch)
+                        && existing.transfer == request.transfer
+                        && existing.publications == request.publications
+                        && existing.batch_receipt.identity == batch_identity
+                    {
+                        return Ok(ValidatedUnavailablePgDestinationInstall::ExactReplay {
+                            pg_id,
+                        });
+                    }
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} destination installation conflicts with durable install evidence",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                if active_transition.is_none()
+                    || transition.destination_epoch.is_some()
+                    || request.expected_destination_epoch != expected_destination_epoch
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} destination installation is not applicable to its active transition",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
+                    ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} destination installation has no staging authorization",
+                            pg_id.get()
+                        ),
+                    }
+                })?;
+                validate_acting_set(self, pg_id, &transition.destination_acting_set)?;
+                validate_acting_set_preserves_pending_recovery(
+                    self,
+                    pg_id,
+                    &transition.destination_acting_set,
+                )?;
+                let publication_nodes = request
+                    .publications
+                    .iter()
+                    .map(|publication| publication.node_id)
+                    .collect::<BTreeSet<_>>();
+                let destination_nodes = transition
+                    .destination_acting_set
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if request.publications.len() != transition.destination_acting_set.len()
+                    || publication_nodes.len() != request.publications.len()
+                    || publication_nodes != destination_nodes
+                    || request
+                        .publications
+                        .windows(2)
+                        .any(|pair| pair[0].node_id >= pair[1].node_id)
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} destination installation does not carry one canonical publication per destination",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                for publication in &request.publications {
+                    let node = self.nodes.get(&publication.node_id).ok_or(
+                        ControlPlaneError::UnknownNode {
+                            node_id: publication.node_id.as_u32(),
+                        },
+                    )?;
+                    if node.node_incarnation != publication.node_incarnation
+                        || node.endpoint != publication.endpoint
+                    {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} destination {} publication identity is stale",
+                                pg_id.get(),
+                                publication.node_id.as_u32()
+                            ),
+                        });
+                    }
+                    let key = MetadataTransferStagingEvidenceKey {
+                        pg_id,
+                        staging_generation: authorization.staging_generation,
+                        actor_node_id: publication.node_id,
+                        actor_node_incarnation: publication.node_incarnation,
+                        kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                        target_epoch: Some(request.expected_destination_epoch),
+                    };
+                    let evidence_bytes = self
+                        .metadata_transfer_staging_evidence
+                        .get(&key)
+                        .ok_or_else(|| ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} destination {} has no committed staging publication",
+                                pg_id.get(),
+                                publication.node_id.as_u32()
+                            ),
+                        })?;
+                    if checksum::sha256::digest(evidence_bytes) != publication.evidence_digest {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} destination {} staging publication digest does not match retained evidence",
+                                pg_id.get(),
+                                publication.node_id.as_u32()
+                            ),
+                        });
+                    }
+                    let evidence = crate::pg_store::decode_staging_evidence(evidence_bytes)
+                        .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
+                            context: "retained metadata-transfer staging evidence is invalid",
+                            message: error.to_string(),
+                        })?;
+                    self.validate_metadata_transfer_staging_evidence_authority(&evidence, false)?;
+                    if evidence.actor().endpoint() != publication.endpoint {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} destination {} staging publication endpoint does not match",
+                                pg_id.get(),
+                                publication.node_id.as_u32()
+                            ),
+                        });
+                    }
+                    if evidence.target_epoch() != Some(request.expected_destination_epoch)
+                        || evidence.transfer() != Some(request.transfer)
+                    {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} destination {} staged artifact does not derive the requested transfer proof",
+                                pg_id.get(),
+                                publication.node_id.as_u32()
+                            ),
+                        });
+                    }
+                }
+                let record = self.pg(pg_id).ok_or(ControlPlaneError::UnknownPg {
+                    pg_id: pg_id.get(),
+                })?;
+                let required_floor = record.peering_metadata_proof_floor.ok_or(
+                    ControlPlaneError::PgMetadataMigrationRequiresTransfer {
+                        pg_id: pg_id.get(),
+                    },
+                )?;
+                validate_metadata_transfer_proof(MetadataTransferProofValidation {
+                    snapshot: self,
+                    pg_id,
+                    state: record.state,
+                    metadata_transfer_fenced: record.metadata_transfer_fenced,
+                    metadata_transfer_fence_source_imported:
+                        record.metadata_transfer_fence_source_imported,
+                    metadata_transfer_fence_epoch: record.metadata_transfer_fence_epoch,
+                    required_floor,
+                    required_floor_epoch: record.peering_metadata_proof_floor_epoch,
+                    transfer: request.transfer,
+                })?;
+                Ok(ValidatedUnavailablePgDestinationInstall::Apply {
+                    pg_id,
+                    transfer: request.transfer,
+                    publications: request.publications,
+                    batch_identity: batch_identity.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn apply_validated_unavailable_pg_destination_installs(
+        &self,
+        validated: Vec<ValidatedUnavailablePgDestinationInstall>,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "destination installation",
+            validated
+                .iter()
+                .map(ValidatedUnavailablePgDestinationInstall::pg_id),
+        )?;
+        if validated.iter().all(|entry| {
+            matches!(
+                entry,
+                ValidatedUnavailablePgDestinationInstall::ExactReplay { .. }
+            )
+        }) {
+            return Ok(None);
+        }
+        if validated.iter().any(|entry| {
+            matches!(
+                entry,
+                ValidatedUnavailablePgDestinationInstall::ExactReplay { .. }
+            )
+        }) {
+            return Err(ControlPlaneError::CommandDecode {
+                message:
+                    "unavailable placement destination install batch mixes replayed and new members"
+                        .to_owned(),
+            });
+        }
+        let actual_destination_epoch = next_epoch(self.cluster_epoch)?;
+        if actual_destination_epoch != expected_destination_epoch {
+            return Err(
+                ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+                    pg_id: validated[0].pg_id().get(),
+                    expected_destination_epoch,
+                    actual_destination_epoch,
+                },
+            );
+        }
+        let mut next_snapshot = self.clone();
+        for entry in validated {
+            let ValidatedUnavailablePgDestinationInstall::Apply {
+                pg_id,
+                transfer,
+                publications,
+                batch_identity,
+            } = entry
+            else {
+                unreachable!("mixed replay was rejected before destination installation");
+            };
+            let transition = next_snapshot
+                .unavailable_pg_placement_transitions
+                .get(&pg_id)
+                .expect("destination install transition was validated");
+            let destination_acting_set = transition.destination_acting_set.clone();
+            let source_node_id = transition.source_node_id;
+            let record = next_snapshot
+                .pgs
+                .get_mut(&pg_id)
+                .expect("destination install PG was validated");
+            let previous_primary_lease = active_primary_lease(self, record)
+                .or_else(|| record.previous_primary_lease.clone())
+                .map(PreviousPrimaryLease::without_reactivation_preference);
+            record.acting_set = destination_acting_set;
+            record.state = PgState::Peering;
+            record.active_primary = None;
+            record.active_metadata_proof = None;
+            record.active_metadata_proof_epoch = None;
+            record.active_metadata_transfer_imported = false;
+            record.previous_primary_lease = previous_primary_lease;
+            record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
+            record.peering_metadata_proof_floor_epoch = Some(self.cluster_epoch);
+            record.peering_metadata_proof_floor_imported = true;
+            record.peering_metadata_transfer = Some(transfer);
+            record.peering_metadata_transfer_source_route_epoch = Some(self.cluster_epoch);
+            record.peering_metadata_transfer_source_node_id = Some(source_node_id);
+            record.metadata_transfer_fenced = false;
+            record.metadata_transfer_fence_source_lease_deadline_ms = None;
+            record.metadata_transfer_fence_source_imported = false;
+            record.metadata_transfer_fence_epoch = None;
+            let destination_route = HistoricalPgRouteRecord::from(&*record);
+            let transition = next_snapshot
+                .unavailable_pg_placement_transitions
+                .get_mut(&pg_id)
+                .expect("destination install transition was validated");
+            transition.destination_epoch = Some(expected_destination_epoch);
+            transition.destination_route = Some(destination_route);
+            transition.destination_install = Some(UnavailablePgDestinationInstall {
+                transfer,
+                publications,
+                batch_receipt: UnavailablePgTransitionBatchReceipt {
+                    identity: batch_identity,
+                    source_epoch: self.cluster_epoch,
+                    target_epoch: expected_destination_epoch,
+                },
+            });
+        }
+        next_snapshot.bump_epoch()?;
+        Ok(Some(next_snapshot))
+    }
+
     fn validate_metadata_transfer_staging_evidence_authority(
         &self,
         evidence: &crate::pg_store::MetadataTransferStagingEvidence,
@@ -2705,6 +3113,7 @@ impl ClusterControlSnapshot {
                     actor_node_id: evidence.actor().node_id(),
                     actor_node_incarnation: evidence.actor().node_incarnation(),
                     kind: evidence.kind(),
+                    target_epoch: evidence.target_epoch(),
                 };
                 if page_members
                     .insert(evidence_key, entry.evidence().to_vec())
@@ -2732,6 +3141,7 @@ impl ClusterControlSnapshot {
                 actor_node_id: evidence.actor().node_id(),
                 actor_node_incarnation: evidence.actor().node_incarnation(),
                 kind: evidence.kind(),
+                target_epoch: evidence.target_epoch(),
             };
             if *key != decoded_key || evidence.as_bytes() != bytes {
                 return Err(
@@ -2843,6 +3253,7 @@ impl ClusterControlSnapshot {
                 actor_node_id: evidence.actor().node_id(),
                 actor_node_incarnation: evidence.actor().node_incarnation(),
                 kind: evidence.kind(),
+                target_epoch: evidence.target_epoch(),
             };
             if self.metadata_transfer_staging_evidence.contains_key(&key)
                 || !page_evidence_keys.insert(key.clone())
@@ -5985,6 +6396,26 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 operation_payload,
                 page_digest,
             } => self.apply_metadata_transfer_staging_evidence_page(operation_payload, page_digest),
+            ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
+                transitions,
+                expected_destination_epoch,
+            } => {
+                let validated = self.validate_unavailable_pg_destination_install_batch(
+                    transitions,
+                    expected_destination_epoch,
+                )?;
+                let next_snapshot = self.apply_validated_unavailable_pg_destination_installs(
+                    validated,
+                    expected_destination_epoch,
+                )?;
+                let changed = next_snapshot.is_some();
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot.unwrap_or_else(|| self.clone()),
+                    ControlPlaneCommandResponse::InstallUnavailablePgPlacementTransitions,
+                    changed,
+                ))
+            }
             ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
                 ready_at_ms,
                 transitions,
@@ -7513,6 +7944,99 @@ fn validate_unavailable_pg_transition_invariant(
             UnavailablePgTransitionBatchStage::StagingAuthorization,
         )?;
     }
+    if transition.destination_install.is_some() && transition.destination_epoch.is_none() {
+        return Err(format!(
+            "unavailable PG transition {} has destination install evidence without an installed route",
+            transition.pg_id.get()
+        ));
+    }
+    if let Some(install) = &transition.destination_install {
+        let destination_route = transition.destination_route.as_ref().ok_or_else(|| {
+            format!(
+                "unavailable PG transition {} has destination install evidence without a route",
+                transition.pg_id.get()
+            )
+        })?;
+        if destination_route.pg_id != transition.pg_id
+            || destination_route.state != PgState::Peering
+            || destination_route.acting_set != transition.destination_acting_set
+            || destination_route.active_primary.is_some()
+            || destination_route.peering_metadata_proof_floor
+                != Some(install.transfer.metadata_proof())
+            || destination_route.peering_metadata_proof_floor_epoch
+                != Some(install.batch_receipt.source_epoch)
+            || !destination_route.peering_metadata_proof_floor_imported
+            || destination_route.peering_metadata_transfer != Some(install.transfer)
+            || destination_route.peering_metadata_transfer_source_route_epoch
+                != Some(install.batch_receipt.source_epoch)
+            || destination_route.peering_metadata_transfer_source_node_id
+                != Some(transition.source_node_id)
+            || install.publications.len() != transition.destination_acting_set.len()
+            || install
+                .publications
+                .windows(2)
+                .any(|pair| pair[0].node_id >= pair[1].node_id)
+            || install
+                .publications
+                .iter()
+                .map(|publication| publication.node_id)
+                .collect::<BTreeSet<_>>()
+                != transition
+                    .destination_acting_set
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+        {
+            return Err(format!(
+                "unavailable PG transition {} has invalid destination install evidence",
+                transition.pg_id.get()
+            ));
+        }
+        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
+            format!(
+                "unavailable PG transition {} has destination install evidence without staging authorization",
+                transition.pg_id.get()
+            )
+        })?;
+        for publication in &install.publications {
+            let key = MetadataTransferStagingEvidenceKey {
+                pg_id: transition.pg_id,
+                staging_generation: authorization.staging_generation,
+                actor_node_id: publication.node_id,
+                actor_node_incarnation: publication.node_incarnation,
+                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                target_epoch: Some(install.batch_receipt.target_epoch),
+            };
+            let evidence = snapshot.metadata_transfer_staging_evidence.get(&key).ok_or_else(|| {
+                format!(
+                    "unavailable PG transition {} destination install references missing publication evidence",
+                    transition.pg_id.get()
+                )
+            })?;
+            if checksum::sha256::digest(evidence) != publication.evidence_digest {
+                return Err(format!(
+                    "unavailable PG transition {} destination install publication digest is invalid",
+                    transition.pg_id.get()
+                ));
+            }
+            let decoded = crate::pg_store::decode_staging_evidence(evidence)
+                .map_err(|error| error.to_string())?;
+            if decoded.actor().endpoint() != publication.endpoint
+                || decoded.target_epoch() != Some(install.batch_receipt.target_epoch)
+                || decoded.transfer() != Some(install.transfer)
+            {
+                return Err(format!(
+                    "unavailable PG transition {} destination install publication semantics are invalid",
+                    transition.pg_id.get()
+                ));
+            }
+        }
+        validate_unavailable_pg_transition_batch_receipt(
+            transition,
+            &install.batch_receipt,
+            UnavailablePgTransitionBatchStage::DestinationInstall,
+        )?;
+    }
     if transition.completion.is_some() != transition.completion_batch_receipt.is_some() {
         return Err(format!(
             "unavailable PG transition {} has incomplete completion receipt evidence",
@@ -7652,6 +8176,7 @@ fn validate_unavailable_pg_transition_batch_receipt(
                     || receipt.source_epoch < transition.transition_epoch
             }
             UnavailablePgTransitionBatchStage::Begin
+            | UnavailablePgTransitionBatchStage::DestinationInstall
             | UnavailablePgTransitionBatchStage::Completion => {
                 receipt.source_epoch >= receipt.target_epoch
             }
@@ -7659,6 +8184,9 @@ fn validate_unavailable_pg_transition_batch_receipt(
         || (expected_stage == UnavailablePgTransitionBatchStage::Begin
             && (receipt.source_epoch != transition.source_epoch
                 || receipt.target_epoch != transition.transition_epoch))
+        || (expected_stage == UnavailablePgTransitionBatchStage::DestinationInstall
+            && (transition.destination_epoch != Some(receipt.target_epoch)
+                || next_epoch(receipt.source_epoch).ok() != Some(receipt.target_epoch)))
     {
         return Err(format!(
             "unavailable PG transition {} has an invalid {} batch receipt",
@@ -7688,6 +8216,12 @@ fn validate_unavailable_pg_transition_batch_receipts(
                     .staging_authorization
                     .as_ref()
                     .map(|authorization| &authorization.batch_receipt),
+            )
+            .chain(
+                transition
+                    .destination_install
+                    .as_ref()
+                    .map(|install| &install.batch_receipt),
             )
             .chain(transition.completion_batch_receipt.as_ref())
         {
@@ -7757,6 +8291,21 @@ fn validate_unavailable_pg_transition_batch_receipts(
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 unavailable_pg_staging_authorization_batch_identity(&requests)
+            }
+            UnavailablePgTransitionBatchStage::DestinationInstall => {
+                let requests = member_transitions
+                    .iter()
+                    .map(|transition| {
+                        unavailable_pg_destination_install_request_from_durable(transition)
+                            .ok_or_else(|| {
+                                format!(
+                                    "unavailable PG transition {} has an install receipt without install evidence",
+                                    transition.pg_id.get()
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                unavailable_pg_destination_install_batch_identity(&requests, receipt.target_epoch)
             }
             UnavailablePgTransitionBatchStage::Completion => {
                 let requests_and_times = member_transitions
@@ -10080,6 +10629,35 @@ impl PgMetadataReadRoute {
 }
 
 impl PgMetadataProof {
+    pub(crate) fn from_encoded_parts(
+        applied_log_index: u64,
+        applied_log_hash_encoding_version: u8,
+        applied_log_hash: u64,
+        state_digest_encoding_version: u8,
+        state_digest: u64,
+    ) -> Result<Self, MetadataProofCarrierVersionError> {
+        Ok(Self::from_carriers(
+            applied_log_index,
+            MetadataCommandLogHash::from_encoded_parts(
+                applied_log_hash_encoding_version,
+                applied_log_hash,
+            )?,
+            CanonicalStateDigest::from_encoded_parts(state_digest_encoding_version, state_digest)?,
+        ))
+    }
+
+    pub(crate) const fn applied_log_index(self) -> u64 {
+        self.applied_log_index
+    }
+
+    pub(crate) const fn applied_log_hash(self) -> MetadataCommandLogHash {
+        self.applied_log_hash
+    }
+
+    pub(crate) const fn state_digest(self) -> CanonicalStateDigest {
+        self.state_digest
+    }
+
     pub(crate) const fn from_carriers(
         applied_log_index: u64,
         applied_log_hash: MetadataCommandLogHash,
@@ -11324,7 +11902,7 @@ fn format_unavailable_pg_placement_transition(
     transition: &UnavailablePgPlacementTransition,
 ) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         transition.pg_id.get(),
         transition.transition_epoch.get(),
         option_u64(
@@ -11368,11 +11946,52 @@ fn format_unavailable_pg_placement_transition(
                 format_unavailable_pg_staging_authorization(authorization).as_bytes()
             )
         ),
+        transition.destination_install.as_ref().map_or_else(
+            || "-".to_string(),
+            |install| hex_encode(format_unavailable_pg_destination_install(install).as_bytes())
+        ),
         transition.completion_batch_receipt.as_ref().map_or_else(
             || "-".to_string(),
             |receipt| hex_encode(
                 format_unavailable_pg_transition_batch_receipt(receipt).as_bytes()
             )
+        )
+    )
+}
+
+fn format_unavailable_pg_destination_install(install: &UnavailablePgDestinationInstall) -> String {
+    let source = install.transfer.source_metadata_proof();
+    let imported = install.transfer.metadata_proof();
+    let publications = install
+        .publications
+        .iter()
+        .map(|publication| {
+            format!(
+                "{}:{}:{}:{}",
+                publication.node_id.as_u32(),
+                publication.node_incarnation,
+                hex_encode(publication.endpoint.as_bytes()),
+                hex_encode(&publication.evidence_digest)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!(
+        "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        install.transfer.source_epoch().get(),
+        source.applied_log_index,
+        source.applied_log_hash.encoding_version(),
+        source.applied_log_hash.value(),
+        source.state_digest.encoding_version(),
+        source.state_digest.value(),
+        imported.applied_log_index,
+        imported.applied_log_hash.encoding_version(),
+        imported.applied_log_hash.value(),
+        imported.state_digest.encoding_version(),
+        imported.state_digest.value(),
+        publications,
+        hex_encode(
+            format_unavailable_pg_transition_batch_receipt(&install.batch_receipt).as_bytes()
         )
     )
 }
@@ -12191,6 +12810,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                 actor_node_id: evidence.actor().node_id(),
                 actor_node_incarnation: evidence.actor().node_incarnation(),
                 kind: evidence.kind(),
+                target_epoch: evidence.target_epoch(),
             };
             if metadata_transfer_staging_evidence
                 .insert(key, bytes)
@@ -13122,10 +13742,10 @@ fn parse_unavailable_pg_placement_transition(
     value: &str,
 ) -> Result<UnavailablePgPlacementTransition, ControlPlaneError> {
     let fields: Vec<_> = value.split(',').collect();
-    if fields.len() != 23 {
+    if fields.len() != 24 {
         return Err(parse_error(
             line,
-            "unavailable PG placement transition must have twenty-three fields",
+            "unavailable PG placement transition must have twenty-four fields",
         ));
     }
     let topology_digest = hex_decode(line, fields[4])?
@@ -13181,14 +13801,92 @@ fn parse_unavailable_pg_placement_transition(
         completion: parse_ready_pg_peering_completion(line, fields[19])?,
         begin_batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[20])?,
         staging_authorization: parse_unavailable_pg_staging_authorization(line, fields[21])?,
-        completion_batch_receipt: if fields[22] == "-" {
+        destination_install: parse_unavailable_pg_destination_install(line, fields[22])?,
+        completion_batch_receipt: if fields[23] == "-" {
             None
         } else {
             Some(parse_unavailable_pg_transition_batch_receipt(
-                line, fields[22],
+                line, fields[23],
             )?)
         },
     })
+}
+
+fn parse_unavailable_pg_destination_install(
+    line: usize,
+    value: &str,
+) -> Result<Option<UnavailablePgDestinationInstall>, ControlPlaneError> {
+    if value == "-" {
+        return Ok(None);
+    }
+    let encoded = String::from_utf8(hex_decode(line, value)?)
+        .map_err(|_| parse_error(line, "destination install evidence is not UTF-8"))?;
+    let fields = encoded.split(',').collect::<Vec<_>>();
+    if fields.len() != 13 {
+        return Err(parse_error(
+            line,
+            "destination install evidence must have thirteen fields",
+        ));
+    }
+    let source_metadata_proof = parse_optional_metadata_proof(
+        line,
+        &fields[1..6],
+        "destination install source metadata proof",
+    )?
+    .ok_or_else(|| parse_error(line, "destination install source proof is required"))?;
+    let imported_metadata_proof = parse_optional_metadata_proof(
+        line,
+        &fields[6..11],
+        "destination install imported metadata proof",
+    )?
+    .ok_or_else(|| parse_error(line, "destination install imported proof is required"))?;
+    let mut publications = Vec::new();
+    if !fields[11].is_empty() {
+        for publication in fields[11].split(';') {
+            let parts = publication.split(':').collect::<Vec<_>>();
+            if parts.len() != 4 {
+                return Err(parse_error(
+                    line,
+                    "destination install publication must have four fields",
+                ));
+            }
+            let endpoint = String::from_utf8(hex_decode(line, parts[2])?).map_err(|_| {
+                parse_error(
+                    line,
+                    "destination install publication endpoint is not UTF-8",
+                )
+            })?;
+            let evidence_digest = hex_decode(line, parts[3])?.try_into().map_err(|_| {
+                parse_error(
+                    line,
+                    "destination install publication digest must contain 32 bytes",
+                )
+            })?;
+            publications.push(UnavailablePgStagingPublicationBinding {
+                node_id: NodeId::new(parse_u32(
+                    line,
+                    parts[0],
+                    "destination install publication node",
+                )?),
+                node_incarnation: parse_u64(
+                    line,
+                    parts[1],
+                    "destination install publication incarnation",
+                )?,
+                endpoint,
+                evidence_digest,
+            });
+        }
+    }
+    Ok(Some(UnavailablePgDestinationInstall {
+        transfer: PgMetadataTransferProof::new_with_imported_metadata_proof(
+            parse_required_cluster_epoch(line, fields[0], "destination install source epoch")?,
+            source_metadata_proof,
+            imported_metadata_proof,
+        ),
+        publications,
+        batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[12])?,
+    }))
 }
 
 fn parse_unavailable_pg_staging_authorization(

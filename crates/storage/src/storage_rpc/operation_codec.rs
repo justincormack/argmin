@@ -100,6 +100,39 @@ pub(crate) fn decode_metadata_transfer_staging_artifact_publish_request(
     Ok(StorageRpcMetadataTransferStagingArtifactPublishRequest { intent, artifact })
 }
 
+pub(crate) fn encode_metadata_transfer_staging_proof_publish_request(
+    request: &StorageRpcMetadataTransferStagingProofPublishRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let intent = encode_staging_intent(&request.intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    let mut out = Vec::new();
+    put_bytes(&mut out, &intent);
+    put_u64(&mut out, request.target_epoch.get());
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_transfer_staging_proof_publish_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataTransferStagingProofPublishRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let intent = decoder.read_bytes_with_payload_limit(MAX_STAGING_INTENT_BYTES)?;
+    let intent = decode_staging_intent(intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    let target_epoch = decoder.read_cluster_epoch()?;
+    decoder.finish()?;
+    if target_epoch <= intent.transition_epoch() {
+        return Err(StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "proof target epoch must follow the transition epoch",
+        ));
+    }
+    Ok(StorageRpcMetadataTransferStagingProofPublishRequest {
+        intent,
+        target_epoch,
+    })
+}
+
 pub(crate) fn encode_metadata_transfer_staging_receipt_response(
     receipt: &MetadataTransferStagingReceipt,
 ) -> Vec<u8> {
@@ -124,6 +157,28 @@ pub(crate) fn decode_metadata_transfer_staging_receipt_response(
     .map_err(|_| {
         StorageRpcPayloadError::InvalidMetadataTransferStaging(
             "publication receipt is invalid",
+        )
+    })
+}
+
+pub(crate) fn decode_metadata_transfer_staging_epoch_bound_receipt_response(
+    bytes: &[u8],
+    expected_intent: &MetadataTransferStagingIntent,
+    expected_node_id: NodeId,
+    expected_target_epoch: ClusterEpoch,
+) -> Result<MetadataTransferStagingReceipt, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let receipt = decoder.read_bytes_with_payload_limit(MAX_STAGING_EVIDENCE_BYTES)?;
+    decoder.finish()?;
+    MetadataTransferStagingReceipt::from_epoch_bound_publication_bytes(
+        receipt,
+        expected_intent,
+        expected_node_id,
+        expected_target_epoch,
+    )
+    .map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "receipt does not match the epoch-bound publication request",
         )
     })
 }

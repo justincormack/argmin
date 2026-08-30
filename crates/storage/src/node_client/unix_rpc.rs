@@ -2936,6 +2936,42 @@ impl UnixStorageNodeClient {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn publish_metadata_transfer_staging_proof(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+        target_epoch: ClusterEpoch,
+    ) -> Result<MetadataTransferStagingReceipt, StoreError> {
+        let payload = encode_metadata_transfer_staging_proof_publish_request(
+            &StorageRpcMetadataTransferStagingProofPublishRequest {
+                intent: intent.clone(),
+                target_epoch,
+            },
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "encode metadata-transfer staging proof request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataTransferStagingProofPublish,
+            payload,
+        )?;
+        decode_metadata_transfer_staging_epoch_bound_receipt_response(
+            &response,
+            intent,
+            self.node_id,
+            target_epoch,
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "decode metadata-transfer staging proof response",
+                error.to_string(),
+            )
+        })
+    }
+
+    #[allow(dead_code)]
     fn install_metadata_transfer_checkpoint_base(
         &self,
         pg_id: PgId,

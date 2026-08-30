@@ -87,7 +87,6 @@ fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox(
             )
             .unwrap(),
         );
-        let artifact = b"Raft host post-dispatch staging uncertainty";
         let binding = crate::control_plane::UnavailablePgTransitionMutationBinding::new(
             PgId::new(19),
             ClusterEpoch::new(12).unwrap(),
@@ -95,15 +94,20 @@ fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox(
             vec![NodeId::new(504), NodeId::new(502), NodeId::new(503)],
             vec![NodeId::new(501), NodeId::new(502), NodeId::new(503)],
         );
+        let artifact =
+            crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+                &binding,
+                ClusterEpoch::new(13).unwrap(),
+            );
         let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
             &binding,
-            checksum::sha256::digest(artifact),
+            checksum::sha256::digest(&artifact),
             u64::try_from(artifact.len()).unwrap(),
             crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
         )
         .unwrap();
         store.create_intent(&intent).unwrap();
-        store.publish_artifact(&intent, artifact).unwrap();
+        store.publish_artifact(&intent, &artifact).unwrap();
         let retained_page = store.next_evidence_page().unwrap().unwrap();
 
         let credential_input =

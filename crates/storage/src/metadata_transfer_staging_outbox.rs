@@ -232,6 +232,7 @@ mod tests {
     use super::*;
     use crate::control_plane::UnavailablePgTransitionMutationBinding;
     use crate::pg_store::{
+        canonical_nonempty_staged_metadata_transfer_artifact_for_test,
         MetadataTransferStagingIntent, MetadataTransferStagingLimits,
         MetadataTransferStagingNodeIdentity, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
     };
@@ -282,7 +283,6 @@ mod tests {
             MetadataTransferStagingLimits::new(8, 1024 * 1024, 4 * 1024 * 1024).unwrap(),
         )
         .unwrap();
-        let artifact = b"durable staging evidence outbox artifact";
         let binding = UnavailablePgTransitionMutationBinding::new(
             PgId::new(19),
             ClusterEpoch::new(12).unwrap(),
@@ -290,15 +290,19 @@ mod tests {
             vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
             vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
         );
+        let artifact = canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+            &binding,
+            ClusterEpoch::new(13).unwrap(),
+        );
         let intent = MetadataTransferStagingIntent::for_unavailable_transition(
             &binding,
-            checksum::sha256::digest(artifact),
+            checksum::sha256::digest(&artifact),
             u64::try_from(artifact.len()).unwrap(),
             METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
         )
         .unwrap();
         store.create_intent(&intent).unwrap();
-        store.publish_artifact(&intent, artifact).unwrap();
+        store.publish_artifact(&intent, &artifact).unwrap();
         (root, store)
     }
 

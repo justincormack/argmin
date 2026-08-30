@@ -240,6 +240,630 @@ fn completion_request_from_command(
     (transitions.remove(0), ready_at_ms)
 }
 
+pub(super) fn staged_two_pg_install_fixture() -> (
+    ClusterControlSnapshot,
+    Vec<UnavailablePgTransitionInstallRequest>,
+) {
+    staged_two_pg_install_fixture_with_proof(PgMetadataProof::current(23, 0x2323, 0x3434))
+}
+
+fn staged_two_pg_install_fixture_with_proof(
+    proof: PgMetadataProof,
+) -> (
+    ClusterControlSnapshot,
+    Vec<UnavailablePgTransitionInstallRequest>,
+) {
+    let pg_ids = [PgId::new(70), PgId::new(71)];
+    let (_tmp, _store, mut authority, _) = certified_spare_authority_with_policy_and_pgs(
+        4,
+        test_certified_storage_placement_policy((1..=4).map(NodeId::new), 3, 50),
+        pg_ids.to_vec(),
+    );
+    for node_id in 1..=4 {
+        heartbeat_spare_node(&mut authority, node_id, 1_000 + u64::from(node_id));
+    }
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proofs_and_lease_duration(
+            &mut authority,
+            node_id,
+            &pg_ids,
+            PgState::Peering,
+            proof,
+            2_000 + u64::from(node_id),
+            10_000,
+        );
+    }
+    authority.complete_ready_pg_peerings(2_004).unwrap();
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proofs_and_lease_duration(
+            &mut authority,
+            node_id,
+            &pg_ids,
+            PgState::Active,
+            proof,
+            3_000 + u64::from(node_id),
+            if node_id == 1 { 100 } else { 10_000 },
+        );
+    }
+    let failed_deadline = authority
+        .snapshot()
+        .node(NodeId::new(1))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    authority.expire_heartbeat_leases(failed_deadline).unwrap();
+    for node_id in 2..=4 {
+        heartbeat_spare_node(
+            &mut authority,
+            node_id,
+            failed_deadline + u64::from(node_id),
+        );
+    }
+    let proof_at_ms = authority.snapshot().max_committed_timestamp_ms().unwrap() + 1;
+    for node_id in [2, 3] {
+        heartbeat_with_pg_proofs_and_lease_duration(
+            &mut authority,
+            node_id,
+            &pg_ids,
+            PgState::Peering,
+            proof,
+            proof_at_ms + u64::from(node_id),
+            10_000,
+        );
+    }
+    let begin_at_ms = authority
+        .snapshot()
+        .unavailable_node_observation(NodeId::new(1))
+        .unwrap()
+        .observed_at_ms()
+        + 50;
+    let begin = authority
+        .snapshot()
+        .begin_unavailable_pg_placement_transition_batch_command(
+            &pg_ids.map(|pg_id| (pg_id, NodeId::new(1))),
+            begin_at_ms,
+        )
+        .unwrap();
+    let begun = authority
+        .snapshot()
+        .apply_control_plane_command(begin)
+        .unwrap()
+        .into_snapshot();
+    let authorizations = pg_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, pg_id)| {
+            let transition = begun.unavailable_pg_placement_transition(pg_id).unwrap();
+            UnavailablePgStagingIntentAuthorizationRequest {
+                unavailable_transition: UnavailablePgTransitionMutationBinding::new(
+                    transition.pg_id,
+                    transition.transition_epoch,
+                    transition.source_epoch,
+                    transition.source_acting_set.clone(),
+                    transition.destination_acting_set.clone(),
+                ),
+                staging_generation: transition.transition_epoch.get(),
+                artifact_digest: [0x80 + u8::try_from(index).unwrap(); 32],
+                artifact_length: 8_192 + u64::try_from(index).unwrap(),
+                artifact_format_version:
+                    crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut snapshot = begun
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: authorizations.clone(),
+        })
+        .unwrap()
+        .into_snapshot();
+    let staged_transfer = PgMetadataTransferProof::new(snapshot.cluster_epoch(), proof);
+
+    let destination_nodes = snapshot
+        .unavailable_pg_placement_transition(pg_ids[0])
+        .unwrap()
+        .destination_acting_set
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for node_id in destination_nodes {
+        let node = snapshot.node(node_id).unwrap();
+        let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+            node_id,
+            node.node_incarnation(),
+            node.endpoint().to_owned(),
+        )
+        .unwrap();
+        let mut previous_receipt = None;
+        for authorization in &authorizations {
+            let intent =
+                crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+                    &authorization.unavailable_transition,
+                    authorization.artifact_digest,
+                    authorization.artifact_length,
+                    authorization.artifact_format_version,
+                )
+                .unwrap();
+            let page =
+                crate::pg_store::metadata_transfer_staging_publication_evidence_page_for_test(
+                    actor.clone(),
+                    &intent,
+                    staged_transfer,
+                    previous_receipt.as_ref(),
+                );
+            let applied = snapshot
+                .apply_control_plane_command(
+                    ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                        operation_payload: page.operation_payload().to_vec(),
+                        page_digest: page.page_digest(),
+                    },
+                )
+                .unwrap();
+            let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
+                apply_receipt,
+            } = applied.response()
+            else {
+                panic!("staging publication returned the wrong response kind");
+            };
+            previous_receipt = Some(
+                crate::pg_store::decode_staging_evidence_apply_receipt(apply_receipt).unwrap(),
+            );
+            snapshot = applied.into_snapshot();
+        }
+    }
+
+    let destination_epoch = next_epoch(snapshot.cluster_epoch()).unwrap();
+    let requests = authorizations
+        .iter()
+        .map(|authorization| {
+            let transition = snapshot
+                .unavailable_pg_placement_transition(authorization.unavailable_transition.pg_id())
+                .unwrap();
+            let mut publications = transition
+                .destination_acting_set
+                .iter()
+                .copied()
+                .map(|node_id| {
+                    let node = snapshot.node(node_id).unwrap();
+                    let key = MetadataTransferStagingEvidenceKey {
+                        pg_id: transition.pg_id,
+                        staging_generation: authorization.staging_generation,
+                        actor_node_id: node_id,
+                        actor_node_incarnation: node.node_incarnation(),
+                        kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                        target_epoch: Some(destination_epoch),
+                    };
+                    UnavailablePgStagingPublicationBinding {
+                        node_id,
+                        node_incarnation: node.node_incarnation(),
+                        endpoint: node.endpoint().to_owned(),
+                        evidence_digest: checksum::sha256::digest(
+                            &snapshot.metadata_transfer_staging_evidence[&key],
+                        ),
+                    }
+                })
+                .collect::<Vec<_>>();
+            publications.sort_by_key(|publication| publication.node_id);
+            UnavailablePgTransitionInstallRequest {
+                unavailable_transition: authorization.unavailable_transition.clone(),
+                transfer: staged_transfer,
+                expected_destination_epoch: destination_epoch,
+                publications,
+            }
+        })
+        .collect();
+    (snapshot, requests)
+}
+
+#[test]
+fn unavailable_pg_destination_install_batch_is_receipt_bound_atomic_and_replayable() {
+    let (source, requests) = staged_two_pg_install_fixture();
+    let destination_epoch = requests[0].expected_destination_epoch;
+    let command = ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
+        transitions: requests.clone(),
+        expected_destination_epoch: destination_epoch,
+    };
+    assert_eq!(
+        decode_control_plane_command(&encode_control_plane_command(&command).unwrap()).unwrap(),
+        command
+    );
+
+    let mut invalid = requests.clone();
+    invalid[1].publications[0].evidence_digest[0] ^= 0x80;
+    let error = source
+        .apply_control_plane_command(
+            ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
+                transitions: invalid,
+                expected_destination_epoch: destination_epoch,
+            },
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("digest does not match retained evidence"));
+
+    let mut wrong_transfer = requests.clone();
+    wrong_transfer[0].transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+        wrong_transfer[0].transfer.source_epoch(),
+        wrong_transfer[0].transfer.source_metadata_proof(),
+        PgMetadataProof::current(23, 0x2323, 0x3435),
+    );
+    let error = source
+        .apply_control_plane_command(
+            ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
+                transitions: wrong_transfer,
+                expected_destination_epoch: destination_epoch,
+            },
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("staged artifact does not derive the requested transfer proof"));
+
+    let applied = source.apply_control_plane_command(command.clone()).unwrap();
+    assert!(applied.changed());
+    assert_eq!(applied.snapshot().cluster_epoch(), destination_epoch);
+    for pg_id in [PgId::new(70), PgId::new(71)] {
+        let transition = applied
+            .snapshot()
+            .unavailable_pg_placement_transition(pg_id)
+            .unwrap();
+        assert_eq!(transition.destination_epoch(), Some(destination_epoch));
+        assert!(transition.destination_install.is_some());
+    }
+    applied
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(applied.snapshot())).unwrap(),
+        *applied.snapshot()
+    );
+
+    let replay = applied
+        .snapshot()
+        .apply_control_plane_command(command)
+        .unwrap();
+    assert!(!replay.changed());
+    assert_eq!(replay.snapshot(), applied.snapshot());
+
+    let subset = ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
+        transitions: vec![requests[0].clone()],
+        expected_destination_epoch: destination_epoch,
+    };
+    assert!(applied
+        .snapshot()
+        .apply_control_plane_command(subset)
+        .unwrap_err()
+        .to_string()
+        .contains("conflicts with durable install evidence"));
+
+    let mut forged = applied.snapshot().clone();
+    forged
+        .unavailable_pg_placement_transitions
+        .get_mut(&PgId::new(70))
+        .unwrap()
+        .destination_install
+        .as_mut()
+        .unwrap()
+        .publications[0]
+        .evidence_digest[0] ^= 1;
+    assert!(parse_snapshot(&format_snapshot(&forged))
+        .unwrap_err()
+        .to_string()
+        .contains("publication digest is invalid"));
+
+    let mut coordinated_receipt_forgery = applied.snapshot().clone();
+    for pg_id in [PgId::new(70), PgId::new(71)] {
+        coordinated_receipt_forgery
+            .unavailable_pg_placement_transitions
+            .get_mut(&pg_id)
+            .unwrap()
+            .destination_install
+            .as_mut()
+            .unwrap()
+            .batch_receipt
+            .identity
+            .members_digest[0] ^= 1;
+    }
+    assert!(
+        parse_snapshot(&format_snapshot(&coordinated_receipt_forgery))
+            .unwrap_err()
+            .to_string()
+            .contains("batch receipt digest does not match its durable member evidence")
+    );
+
+    let mut forged_floor_epoch = applied.snapshot().clone();
+    let pg_id = PgId::new(70);
+    let forged_epoch = forged_floor_epoch
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap()
+        .source_epoch;
+    forged_floor_epoch
+        .pgs
+        .get_mut(&pg_id)
+        .unwrap()
+        .peering_metadata_proof_floor_epoch = Some(forged_epoch);
+    forged_floor_epoch
+        .unavailable_pg_placement_transitions
+        .get_mut(&pg_id)
+        .unwrap()
+        .destination_route
+        .as_mut()
+        .unwrap()
+        .peering_metadata_proof_floor_epoch = Some(forged_epoch);
+    assert!(parse_snapshot(&format_snapshot(&forged_floor_epoch))
+        .unwrap_err()
+        .to_string()
+        .contains("invalid destination install evidence"));
+}
+
+#[test]
+fn nonempty_staged_artifact_requires_epoch_rebound_proof_after_unrelated_advance() {
+    let (probe_snapshot, probe_requests) =
+        staged_two_pg_install_fixture_with_proof(PgMetadataProof::empty());
+    let binding = probe_requests[0].unavailable_transition.clone();
+    let pg_id = binding.pg_id();
+    let initial_destination_epoch = probe_requests[0].expected_destination_epoch;
+    let artifact = crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+        &binding,
+        initial_destination_epoch,
+    );
+    let artifact_digest = checksum::sha256::digest(&artifact);
+    let artifact_length = u64::try_from(artifact.len()).unwrap();
+    let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+        &binding,
+        artifact_digest,
+        artifact_length,
+        crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    )
+    .unwrap();
+    let probe_node_id = binding.destination_acting_set()[0];
+    let probe_node = probe_snapshot.node(probe_node_id).unwrap();
+    let probe_temp = test_util::tempdir();
+    let probe_store = crate::pg_store::MetadataTransferStagingStore::open(
+        probe_temp.path(),
+        crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+            probe_node_id,
+            probe_node.node_incarnation(),
+            probe_node.endpoint().to_owned(),
+        )
+        .unwrap(),
+        crate::pg_store::MetadataTransferStagingLimits::new(8, 1 << 20, 8 << 20).unwrap(),
+    )
+    .unwrap();
+    probe_store.create_intent(&intent).unwrap();
+    let source_proof = crate::pg_store::decode_staging_evidence(
+        probe_store
+            .publish_artifact(&intent, &artifact)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap()
+    .transfer()
+    .unwrap()
+    .source_metadata_proof();
+    drop(probe_store);
+    drop(probe_temp);
+
+    let (mut snapshot, original_requests) = staged_two_pg_install_fixture_with_proof(source_proof);
+    assert_eq!(original_requests[0].unavailable_transition, binding);
+    assert_eq!(
+        original_requests[0].expected_destination_epoch,
+        initial_destination_epoch
+    );
+    let authorization_request = UnavailablePgStagingIntentAuthorizationRequest {
+        unavailable_transition: binding.clone(),
+        staging_generation: binding.transition_epoch().get(),
+        artifact_digest,
+        artifact_length,
+        artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    };
+    let authorization_epoch = snapshot
+        .unavailable_pg_placement_transition(pg_id)
+        .unwrap()
+        .staging_authorization
+        .as_ref()
+        .unwrap()
+        .batch_receipt
+        .source_epoch;
+    let authorization_receipt = UnavailablePgTransitionBatchReceipt {
+        identity: unavailable_pg_staging_authorization_batch_identity(std::slice::from_ref(
+            &authorization_request,
+        )),
+        source_epoch: authorization_epoch,
+        target_epoch: authorization_epoch,
+    };
+    snapshot.metadata_transfer_staging_evidence_pages.clear();
+    snapshot.metadata_transfer_staging_evidence.clear();
+    snapshot
+        .unavailable_pg_placement_transitions
+        .get_mut(&PgId::new(71))
+        .unwrap()
+        .staging_authorization = None;
+    snapshot
+        .unavailable_pg_placement_transitions
+        .get_mut(&pg_id)
+        .unwrap()
+        .staging_authorization = Some(UnavailablePgStagingIntentAuthorization {
+        staging_generation: authorization_request.staging_generation,
+        artifact_digest,
+        artifact_length,
+        artifact_format_version: authorization_request.artifact_format_version,
+        batch_receipt: authorization_receipt,
+    });
+    snapshot.validate_current_state_invariants().unwrap();
+
+    let mut destination_stores = Vec::new();
+    for node_id in binding.destination_acting_set().iter().copied() {
+        let node = snapshot.node(node_id).unwrap();
+        let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+            node_id,
+            node.node_incarnation(),
+            node.endpoint().to_owned(),
+        )
+        .unwrap();
+        let temp = test_util::tempdir();
+        let store = crate::pg_store::MetadataTransferStagingStore::open(
+            temp.path(),
+            actor,
+            crate::pg_store::MetadataTransferStagingLimits::new(8, 1 << 20, 8 << 20).unwrap(),
+        )
+        .unwrap();
+        store.create_intent(&intent).unwrap();
+        let publication = store.publish_artifact(&intent, &artifact).unwrap();
+        let page = store.next_evidence_page().unwrap().unwrap();
+        let applied = snapshot
+            .apply_control_plane_command(
+                ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                    operation_payload: page.operation_payload().to_vec(),
+                    page_digest: page.page_digest(),
+                },
+            )
+            .unwrap();
+        let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt } =
+            applied.response()
+        else {
+            panic!("staging publication returned the wrong response kind");
+        };
+        let apply_receipt =
+            crate::pg_store::decode_staging_evidence_apply_receipt(apply_receipt).unwrap();
+        store
+            .record_evidence_apply_receipt(&page, &apply_receipt)
+            .unwrap();
+        snapshot = applied.into_snapshot();
+        destination_stores.push((temp, store, publication));
+    }
+
+    let initial_transfer = destination_stores
+        .iter()
+        .map(|(_, _, receipt)| {
+            let evidence = crate::pg_store::decode_staging_evidence(receipt.as_bytes()).unwrap();
+            assert_eq!(evidence.target_epoch(), Some(initial_destination_epoch));
+            evidence.transfer().unwrap()
+        })
+        .reduce(|left, right| {
+            assert_eq!(left, right);
+            left
+        })
+        .unwrap();
+    let mut initial_publications = destination_stores
+        .iter()
+        .map(|(_, _, receipt)| {
+            let evidence = crate::pg_store::decode_staging_evidence(receipt.as_bytes()).unwrap();
+            UnavailablePgStagingPublicationBinding {
+                node_id: evidence.actor().node_id(),
+                node_incarnation: evidence.actor().node_incarnation(),
+                endpoint: evidence.actor().endpoint().to_owned(),
+                evidence_digest: checksum::sha256::digest(receipt.as_bytes()),
+            }
+        })
+        .collect::<Vec<_>>();
+    initial_publications.sort_by_key(|publication| publication.node_id);
+
+    snapshot = snapshot
+        .apply_control_plane_command(ControlPlaneCommand::SetPgActingSet {
+            pg_id: PgId::new(99),
+            acting_set: vec![NodeId::new(2), NodeId::new(3), NodeId::new(4)],
+        })
+        .unwrap()
+        .into_snapshot();
+    assert_eq!(snapshot.cluster_epoch(), initial_destination_epoch);
+    let rebound_destination_epoch = next_epoch(snapshot.cluster_epoch()).unwrap();
+    let stale_error = snapshot
+        .apply_control_plane_command(
+            ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
+                transitions: vec![UnavailablePgTransitionInstallRequest {
+                    unavailable_transition: binding.clone(),
+                    transfer: initial_transfer,
+                    expected_destination_epoch: rebound_destination_epoch,
+                    publications: initial_publications,
+                }],
+                expected_destination_epoch: rebound_destination_epoch,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        stale_error
+            .to_string()
+            .contains("has no committed staging publication"),
+        "unexpected stale staging-proof error: {stale_error}"
+    );
+
+    let mut rebound_transfer = None;
+    let mut rebound_publications = Vec::new();
+    for (_, store, _) in &destination_stores {
+        let receipt = store
+            .publish_proof_for_epoch(&intent, rebound_destination_epoch)
+            .unwrap();
+        let evidence = crate::pg_store::decode_staging_evidence(receipt.as_bytes()).unwrap();
+        assert_eq!(evidence.target_epoch(), Some(rebound_destination_epoch));
+        assert_ne!(evidence.transfer(), Some(initial_transfer));
+        match rebound_transfer {
+            Some(expected) => assert_eq!(evidence.transfer(), Some(expected)),
+            None => rebound_transfer = evidence.transfer(),
+        }
+        let page = store.next_evidence_page().unwrap().unwrap();
+        let applied = snapshot
+            .apply_control_plane_command(
+                ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                    operation_payload: page.operation_payload().to_vec(),
+                    page_digest: page.page_digest(),
+                },
+            )
+            .unwrap();
+        let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt } =
+            applied.response()
+        else {
+            panic!("staging proof publication returned the wrong response kind");
+        };
+        store
+            .record_evidence_apply_receipt(
+                &page,
+                &crate::pg_store::decode_staging_evidence_apply_receipt(apply_receipt).unwrap(),
+            )
+            .unwrap();
+        snapshot = applied.into_snapshot();
+        rebound_publications.push(UnavailablePgStagingPublicationBinding {
+            node_id: evidence.actor().node_id(),
+            node_incarnation: evidence.actor().node_incarnation(),
+            endpoint: evidence.actor().endpoint().to_owned(),
+            evidence_digest: checksum::sha256::digest(receipt.as_bytes()),
+        });
+    }
+    rebound_publications.sort_by_key(|publication| publication.node_id);
+    let rebound_transfer = rebound_transfer.unwrap();
+    let applied = snapshot
+        .apply_control_plane_command(
+            ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
+                transitions: vec![UnavailablePgTransitionInstallRequest {
+                    unavailable_transition: binding,
+                    transfer: rebound_transfer,
+                    expected_destination_epoch: rebound_destination_epoch,
+                    publications: rebound_publications,
+                }],
+                expected_destination_epoch: rebound_destination_epoch,
+            },
+        )
+        .unwrap();
+    assert!(applied.changed());
+    assert_eq!(
+        applied.snapshot().cluster_epoch(),
+        rebound_destination_epoch
+    );
+    assert_eq!(
+        applied
+            .snapshot()
+            .unavailable_pg_placement_transition(pg_id)
+            .unwrap()
+            .destination_epoch(),
+        Some(rebound_destination_epoch)
+    );
+    applied
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+}
+
 #[test]
 fn unavailable_pg_reconciliation_scan_is_cursor_and_page_bounded() {
     let nodes = vec![(NodeId::new(1), "/tmp/reconcile-node-1.sock".to_owned())];
@@ -817,6 +1441,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
                 actor_node_id: actor.node_id(),
                 actor_node_incarnation: actor.node_incarnation(),
                 kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+                target_epoch: None,
             }));
     }
     rebound_page_committed
@@ -952,6 +1577,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
                 actor_node_id: evidence_actor_id,
                 actor_node_incarnation: evidence_actor.node_incarnation(),
                 kind: same_actor_unpaged_evidence.kind(),
+                target_epoch: same_actor_unpaged_evidence.target_epoch(),
             },
             same_actor_unpaged_evidence.as_bytes().to_vec(),
         );
@@ -1046,6 +1672,13 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
                 actor_node_id: second_actor_id,
                 actor_node_incarnation: second_actor.node_incarnation(),
                 kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                target_epoch: crate::ClusterEpoch::new(
+                    evidence_request
+                        .unavailable_transition
+                        .transition_epoch()
+                        .get()
+                        + 1,
+                ),
             },
             foreign_evidence.clone(),
         );
@@ -1064,6 +1697,13 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
                 actor_node_id: second_actor_id,
                 actor_node_incarnation: second_actor.node_incarnation(),
                 kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                target_epoch: crate::ClusterEpoch::new(
+                    evidence_request
+                        .unavailable_transition
+                        .transition_epoch()
+                        .get()
+                        + 1,
+                ),
             },
             foreign_evidence,
         );
@@ -1154,6 +1794,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
             actor_node_id: evidence_actor_id,
             actor_node_incarnation: evidence_actor.node_incarnation(),
             kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+            target_epoch: None,
         });
     assert!(missing_member
         .validate_current_state_invariants()

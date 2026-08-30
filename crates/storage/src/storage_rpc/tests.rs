@@ -16,6 +16,19 @@ mod tests {
         out
     }
 
+    fn decode_hex(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|digits| {
+                let high = char::from(digits[0]).to_digit(16).unwrap();
+                let low = char::from(digits[1]).to_digit(16).unwrap();
+                u8::try_from((high << 4) | low).unwrap()
+            })
+            .collect()
+    }
+
     fn metadata_command_decode_authority_for_test() -> MetadataCommandDecodeAuthority {
         MetadataCommandDecodeAuthority::new_for_test()
     }
@@ -250,7 +263,12 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 23, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
             0, 0, 0, 219, 185, 232, 25, 191, 51, 112, 119, 97, 98, 99,
         ];
-        assert_eq!(bytes, V23_FRAME);
+        const V24_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101,
+            45, 114, 112, 99, 45, 102, 114, 97, 109, 101, 24, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3,
+            0, 3, 0, 0, 0, 227, 38, 97, 110, 223, 29, 108, 239, 97, 98, 99,
+        ];
+        assert_eq!(bytes, V24_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
@@ -275,13 +293,17 @@ mod tests {
             decode_storage_rpc_frame(V22_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(22))
         );
+        assert_eq!(
+            decode_storage_rpc_frame(V23_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(23))
+        );
     }
 
     #[test]
-    fn current_storage_rpc_v23_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
+    fn current_storage_rpc_v24_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
     {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 23);
-        const EXPECTED_V23_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605040302013a00680100007a554333ab2d387d0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 24);
+        const EXPECTED_V24_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65180008070605040302013a006801000074c0762f7d94ad7d0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
 
         let bucket = BucketName::try_from("rpc").unwrap();
         let key = ObjectKey::try_from("k").unwrap();
@@ -326,8 +348,8 @@ mod tests {
         )
         .unwrap();
         let encoded_frame_hex = hex_bytes(&frame);
-        assert_eq!(encoded_frame_hex.len(), EXPECTED_V23_FRAME_HEX.len());
-        assert_eq!(encoded_frame_hex, EXPECTED_V23_FRAME_HEX);
+        assert_eq!(encoded_frame_hex.len(), EXPECTED_V24_FRAME_HEX.len());
+        assert_eq!(encoded_frame_hex, EXPECTED_V24_FRAME_HEX);
 
         let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
         assert_eq!(
@@ -481,23 +503,16 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_v23_metadata_transfer_staging_publication_frame_is_stable() {
-        const EXPECTED_V23_STAGING_INTENT_CREATE_FRAME_HEX: &str = concat!(
-            "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605",
-            "04030201af0072000000c658c72e5bad9de46e0000000000000b0000000000000009",
+    fn storage_rpc_v24_metadata_transfer_staging_frames_are_stable() {
+        const EXPECTED_V24_STAGING_INTENT_CREATE_FRAME_HEX: &str = concat!(
+            "180000006172676d696e2d73746f726167652d7270632d6672616d65180008070605",
+            "04030201af0072000000bb7a22bfefcb52a06e0000000000000b0000000000000009",
             "00000000000000070000001000000003000000010000000200000003000000100000",
-            "000300000001000000040000000300000000000000098e98a7dae88a0fd08243759d",
-            "f07802fd41329fe9ac2b5b010fbb569a90d3ff56000000000000000f0001",
+            "000300000001000000040000000300000000000000099f6f2d1205e035eb1dbe1e5b",
+            "f3d0d95eb4984a8ccf87e31d7f86463992e00c0c00000000000001fa0002",
         );
-        const EXPECTED_V23_STAGING_FRAME_HEX: &str = concat!(
-            "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605",
-            "04030201b00085000000dd39f73868643ce06e0000000000000b0000000000000009",
-            "00000000000000070000001000000003000000010000000200000003000000100000",
-            "000300000001000000040000000300000000000000098e98a7dae88a0fd08243759d",
-            "f07802fd41329fe9ac2b5b010fbb569a90d3ff56000000000000000f00010f000000",
-            "7374616765642d6172746966616374",
-        );
-        let artifact = b"staged-artifact".to_vec();
+        const EXPECTED_V24_STAGING_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d6518000807060504030201b00070020000b346cff68d26f6eb6e0000000000000b000000000000000900000000000000070000001000000003000000010000000200000003000000100000000300000001000000040000000300000000000000099f6f2d1205e035eb1dbe1e5bf3d0d95eb4984a8ccf87e31d7f86463992e00c0c00000000000001fa0002fa0100004152474d494e2d4d455441444154412d5452414e534645522d41525449464143542d56320000020000000b000000010000000000000009000000000000000000010000000000000000050000000000000000000000000000000101283b033dd2cd9390050000535441474544000000000000000a00000000000000010173103dbd79cb3d3a050000535441474544000000000100000163010000000100000000000000010000000000000000019093cdd23d033b28010500000000000000000105444547415453000000844fae280f4a240a24010000170000006172676d696e2d6d657461646174612d636f6d6d616e64080009000000000000000b00000001000000000000000100140000007374616765642d70672d31312d65706f63682d391600000073746167696e672d61727469666163742d6f776e657240000000613836643236633962646239626564333763643135653339316530356336373466346633636339663332356561376463626132343964383363653539386665340100000000000000000000000000140000004152474d494e2d41434c2d4752414e54532f310a00000001020000000000000000000000000000000000010000000000000001000000000000002000000042424242424242424242424242424242424242424242424242424242424242420000000000000000000001";
+        const EXPECTED_V24_STAGING_PROOF_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d6518000807060504030201b1007a0000000f9f4bbd4adf14056e0000000000000b000000000000000900000000000000070000001000000003000000010000000200000003000000100000000300000001000000040000000300000000000000099f6f2d1205e035eb1dbe1e5bf3d0d95eb4984a8ccf87e31d7f86463992e00c0c00000000000001fa00020b00000000000000";
         let binding = crate::control_plane::UnavailablePgTransitionMutationBinding::new(
             PgId::new(11),
             ClusterEpoch::new(9).unwrap(),
@@ -505,6 +520,12 @@ mod tests {
             vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
             vec![NodeId::new(1), NodeId::new(4), NodeId::new(3)],
         );
+        let destination_epoch = ClusterEpoch::new(10).unwrap();
+        let artifact =
+            crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+                &binding,
+                destination_epoch,
+            );
         let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
             &binding,
             checksum::sha256::digest(&artifact),
@@ -531,7 +552,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             hex_bytes(&create_frame),
-            EXPECTED_V23_STAGING_INTENT_CREATE_FRAME_HEX
+            EXPECTED_V24_STAGING_INTENT_CREATE_FRAME_HEX
         );
         let payload = encode_metadata_transfer_staging_artifact_publish_request(&request).unwrap();
         assert_eq!(
@@ -545,7 +566,28 @@ mod tests {
         )
         .unwrap();
         let frame_hex = hex_bytes(&frame);
-        assert_eq!(frame_hex, EXPECTED_V23_STAGING_FRAME_HEX);
+        assert_eq!(frame_hex, EXPECTED_V24_STAGING_FRAME_HEX);
+
+        let proof_request = StorageRpcMetadataTransferStagingProofPublishRequest {
+            intent: request.intent.clone(),
+            target_epoch: ClusterEpoch::new(11).unwrap(),
+        };
+        let proof_payload =
+            encode_metadata_transfer_staging_proof_publish_request(&proof_request).unwrap();
+        assert_eq!(
+            decode_metadata_transfer_staging_proof_publish_request(&proof_payload).unwrap(),
+            proof_request
+        );
+        let proof_frame = encode_storage_rpc_frame(
+            0x0102_0304_0506_0708,
+            StorageRpcMessageKind::MetadataTransferStagingProofPublish,
+            &proof_payload,
+        )
+        .unwrap();
+        assert_eq!(
+            hex_bytes(&proof_frame),
+            EXPECTED_V24_STAGING_PROOF_FRAME_HEX
+        );
 
         let mut corrupted_artifact = payload;
         *corrupted_artifact.last_mut().unwrap() ^= 0x01;
@@ -553,6 +595,35 @@ mod tests {
             decode_metadata_transfer_staging_artifact_publish_request(&corrupted_artifact),
             Err(StorageRpcPayloadError::InvalidMetadataTransferStaging(_))
         ));
+    }
+
+    #[test]
+    fn storage_rpc_v23_metadata_transfer_staging_frames_remain_exact_rejection_evidence() {
+        const V23_STAGING_INTENT_CREATE_FRAME_HEX: &str = concat!(
+            "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605",
+            "04030201af0072000000c658c72e5bad9de46e0000000000000b0000000000000009",
+            "00000000000000070000001000000003000000010000000200000003000000100000",
+            "000300000001000000040000000300000000000000098e98a7dae88a0fd08243759d",
+            "f07802fd41329fe9ac2b5b010fbb569a90d3ff56000000000000000f0001",
+        );
+        const V23_STAGING_ARTIFACT_PUBLISH_FRAME_HEX: &str = concat!(
+            "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605",
+            "04030201b00085000000dd39f73868643ce06e0000000000000b0000000000000009",
+            "00000000000000070000001000000003000000010000000200000003000000100000",
+            "000300000001000000040000000300000000000000098e98a7dae88a0fd08243759d",
+            "f07802fd41329fe9ac2b5b010fbb569a90d3ff56000000000000000f00010f000000",
+            "7374616765642d6172746966616374",
+        );
+
+        for frame in [
+            decode_hex(V23_STAGING_INTENT_CREATE_FRAME_HEX),
+            decode_hex(V23_STAGING_ARTIFACT_PUBLISH_FRAME_HEX),
+        ] {
+            assert_eq!(
+                decode_storage_rpc_frame(&frame),
+                Err(StorageRpcFrameError::UnsupportedVersion(23))
+            );
+        }
     }
 
     #[test]
@@ -586,8 +657,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(22))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(24)),
-            Err(StorageRpcFrameError::UnsupportedVersion(24))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(23)),
+            Err(StorageRpcFrameError::UnsupportedVersion(23))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(25)),
+            Err(StorageRpcFrameError::UnsupportedVersion(25))
         );
     }
 

@@ -654,6 +654,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandPgLockRelease
         | StorageRpcMessageKind::MetadataTransferStagingIntentCreate
         | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish
+        | StorageRpcMessageKind::MetadataTransferStagingProofPublish
         | StorageRpcMessageKind::ReadHandlesRelease
         | StorageRpcMessageKind::ObjectPayloadLeaseControl
         | StorageRpcMessageKind::ClaimHeartbeat

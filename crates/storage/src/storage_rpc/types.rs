@@ -55,6 +55,7 @@ pub(crate) enum StorageRpcMessageKind {
     ShardScavengerReferencePage = 174,
     MetadataTransferStagingIntentCreate = 175,
     MetadataTransferStagingArtifactPublish = 176,
+    MetadataTransferStagingProofPublish = 177,
     ShardScavengerReferenceMatch = 173,
     ObjectPayloadReclaimCommandBuild = 170,
     MetadataCommandRetainedAbortApply = 165,
@@ -356,6 +357,9 @@ impl StorageRpcMessageKind {
             Self::MetadataTransferStagingArtifactPublish => {
                 "metadata transfer staging artifact publish"
             }
+            Self::MetadataTransferStagingProofPublish => {
+                "metadata transfer staging proof publish"
+            }
             Self::ShardScavengerReferenceMatch => "shard scavenger reference match",
             Self::ShardScavengerObservationRecord => "shard scavenger observation record",
             Self::ShardScavengerObservations => "shard scavenger observations",
@@ -616,6 +620,7 @@ impl StorageRpcMessageKind {
             174 => Ok(Self::ShardScavengerReferencePage),
             175 => Ok(Self::MetadataTransferStagingIntentCreate),
             176 => Ok(Self::MetadataTransferStagingArtifactPublish),
+            177 => Ok(Self::MetadataTransferStagingProofPublish),
             173 => Ok(Self::ShardScavengerReferenceMatch),
             170 => Ok(Self::ObjectPayloadReclaimCommandBuild),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
@@ -2684,6 +2689,12 @@ pub(crate) struct StorageRpcMetadataTransferStagingIntentCreateRequest {
 pub(crate) struct StorageRpcMetadataTransferStagingArtifactPublishRequest {
     pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
     pub(crate) artifact: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataTransferStagingProofPublishRequest {
+    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
+    pub(crate) target_epoch: ClusterEpoch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
