@@ -16,7 +16,7 @@ Development has focused on correctness, security and data safety over raw perfor
 
 ## Prerequisites
 
-- Rust toolchain (2021 edition), 1.94.1 or later
+- Rust toolchain (2021 edition), 1.95.0 or later
 - Linux/Unix runtime platform
 - amd64, aarch64 or riscv64 architecture for accelerated crc and EC
 
