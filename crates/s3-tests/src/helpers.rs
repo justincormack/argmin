@@ -3587,25 +3587,19 @@ pub async fn delete_object_retrying_operation_aborted(
         .await
 }
 
-/// Assert that an S3 SDK error contains the expected error code string.
-pub fn assert_s3_err_code<T, E: std::fmt::Debug>(
+/// Assert the exact service error code, not its HTTP status or diagnostic text.
+/// HEAD responses may omit error codes; use `err_status` explicitly for those.
+pub fn assert_s3_err_code<T, E: std::fmt::Debug + ProvideErrorMetadata>(
     result: &Result<T, aws_sdk_s3::error::SdkError<E>>,
     expected_code: &str,
 ) {
     match result {
         Ok(_) => panic!("expected error with code {}, got Ok", expected_code),
         Err(e) => {
-            if expected_code == "AccessDenied"
-                && e.raw_response().map(|r| r.status().as_u16()) == Some(403)
-            {
-                return;
-            }
-            let msg = format!("{:?}", e);
-            assert!(
-                msg.contains(expected_code),
-                "expected error code '{}' in error: {}",
-                expected_code,
-                msg
+            assert_eq!(
+                e.as_service_error().and_then(ProvideErrorMetadata::code),
+                Some(expected_code),
+                "expected error code '{expected_code}' in error: {e:?}"
             );
         }
     }
@@ -3718,6 +3712,66 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
+
+    fn sdk_error_code_fixture(
+        code: Option<&str>,
+        message: &str,
+    ) -> aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError> {
+        let mut metadata = aws_smithy_types::error::ErrorMetadata::builder().message(message);
+        if let Some(code) = code {
+            metadata = metadata.code(code);
+        }
+        let response = hyper::http::Response::builder()
+            .status(403)
+            .body(aws_smithy_types::body::SdkBody::empty())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        aws_sdk_s3::error::SdkError::service_error(
+            aws_sdk_s3::operation::get_object::GetObjectError::generic(metadata.build()),
+            response,
+        )
+    }
+
+    #[test]
+    fn s3_error_code_assertion_accepts_exact_service_code() {
+        assert_s3_err_code(
+            &Err::<(), _>(sdk_error_code_fixture(Some("AccessDenied"), "denied")),
+            "AccessDenied",
+        );
+    }
+
+    #[test]
+    fn s3_error_code_assertion_rejects_unrelated_or_absent_codes_on_403() {
+        for code in [
+            Some("SignatureDoesNotMatch"),
+            Some("InvalidAccessKeyId"),
+            Some("AccessDeniedException"),
+            None,
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    // The expected code in the message must not satisfy the assertion.
+                    assert_s3_err_code(
+                        &Err::<(), _>(sdk_error_code_fixture(code, "AccessDenied")),
+                        "AccessDenied",
+                    );
+                })
+                .is_err(),
+                "accepted unrelated code {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected error")]
+    fn s3_error_code_assertion_rejects_success() {
+        let result: Result<
+            (),
+            aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+        > = Ok(());
+        assert_s3_err_code(&result, "AccessDenied");
+    }
 
     fn raw_complete_error(status: u16, code: &str) -> RawResponse {
         RawResponse {

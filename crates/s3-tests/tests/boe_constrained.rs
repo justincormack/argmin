@@ -25,7 +25,7 @@ fn constrained_client() -> &'static aws_sdk_s3::Client {
 async fn eventually_access_denied<T, E, F, Fut>(description: &str, mut op: F)
 where
     T: std::fmt::Debug,
-    E: std::fmt::Debug,
+    E: std::fmt::Debug + aws_sdk_s3::error::ProvideErrorMetadata,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
 {
@@ -45,6 +45,30 @@ where
     }
 
     unreachable!()
+}
+
+// HEAD has no error body; do not claim a semantic AccessDenied assertion here.
+async fn eventually_head_object_forbidden<F, Fut>(description: &str, mut op: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<
+        Output = Result<
+            aws_sdk_s3::operation::head_object::HeadObjectOutput,
+            aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::head_object::HeadObjectError>,
+        >,
+    >,
+{
+    const MAX_ATTEMPTS: usize = 20;
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = op().await;
+        if result.is_err() && err_status(&result) == 403 {
+            return;
+        }
+        if attempt + 1 == MAX_ATTEMPTS {
+            panic!("{description} did not converge to HTTP 403: {result:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 async fn create_boe_bucket(client: &aws_sdk_s3::Client) -> String {
@@ -123,7 +147,7 @@ fn test_same_account_constrained_user_cannot_read_boe_object() {
             .await
             .unwrap();
 
-        eventually_access_denied("constrained HeadObject on BOE object", || {
+        eventually_head_object_forbidden("constrained HeadObject on BOE object", || {
             limited_client.head_object().bucket(&bucket).key(key).send()
         })
         .await;
@@ -256,7 +280,7 @@ fn test_same_account_constrained_user_cannot_discover_missing_boe_object() {
         let bucket = create_boe_bucket(root_client).await;
         let missing_key = "missing";
 
-        eventually_access_denied("constrained HeadObject on missing BOE object", || {
+        eventually_head_object_forbidden("constrained HeadObject on missing BOE object", || {
             limited_client
                 .head_object()
                 .bucket(&bucket)
@@ -360,7 +384,7 @@ fn test_same_account_constrained_user_cannot_read_boe_object_version() {
             .unwrap();
         let version_id = put.version_id().unwrap().to_string();
 
-        eventually_access_denied("constrained HeadObject on BOE object version", || {
+        eventually_head_object_forbidden("constrained HeadObject on BOE object version", || {
             limited_client
                 .head_object()
                 .bucket(&bucket)

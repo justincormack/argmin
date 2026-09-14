@@ -27,7 +27,10 @@ use serde_json::json;
 const PART_SIZE: usize = 5 * 1024 * 1024;
 const WRONG_OWNER: &str = "000000000000";
 
-fn assert_expected_bucket_owner_denied<T: std::fmt::Debug, E: std::fmt::Debug>(
+fn assert_expected_bucket_owner_denied<
+    T: std::fmt::Debug,
+    E: std::fmt::Debug + aws_sdk_s3::error::ProvideErrorMetadata,
+>(
     result: &Result<T, aws_sdk_s3::error::SdkError<E>>,
 ) {
     assert_eq!(err_status(result), 403, "unexpected result: {result:?}");

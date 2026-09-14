@@ -100,8 +100,8 @@ async fn owner_head_object_access_denied_eventually(bucket: &str, key: &str) {
             .send()
             .await;
         if result.is_err() {
+            // HEAD has no error body, so only the HTTP status is observable.
             assert_eq!(err_status(&result), 403);
-            assert_s3_err_code(&result, "AccessDenied");
             return;
         }
 

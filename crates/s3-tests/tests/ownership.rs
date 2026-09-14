@@ -379,7 +379,7 @@ fn has_grant(grants: &[Grant], permission: Permission, canonical_user_id: &str) 
     })
 }
 
-fn assert_acl_not_supported<T, E: std::fmt::Debug>(
+fn assert_acl_not_supported<T, E: std::fmt::Debug + aws_sdk_s3::error::ProvideErrorMetadata>(
     result: &Result<T, aws_sdk_s3::error::SdkError<E>>,
     context: &str,
 ) {
@@ -1265,7 +1265,8 @@ fn test_bucket_policy_foreign_owned_object_access_matrix_matches_aws() {
             .await;
 
         assert_s3_err_code(&get_object, "AccessDenied");
-        assert_s3_err_code(&head_object, "AccessDenied");
+        // HEAD has no error body, so only the HTTP status is observable.
+        assert_eq!(err_status(&head_object), 403);
         assert_s3_err_code(&get_object_attributes, "AccessDenied");
         assert_s3_err_code(&get_object_acl, "AccessDenied");
         get_object_tagging
