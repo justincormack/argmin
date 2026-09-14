@@ -3315,7 +3315,7 @@ async fn handle_streaming_put(
                                 ingest_streaming_put_payload(&state, &ctx, &payload, &mut ingest)
                                     .await
                             {
-                                return resp;
+                                return *resp;
                             }
                         }
                     } else {
@@ -3340,7 +3340,7 @@ async fn handle_streaming_put(
                         )
                         .await
                         {
-                            return resp;
+                            return *resp;
                         }
                     }
                 }
@@ -3532,7 +3532,7 @@ async fn handle_streaming_put(
         if let Err(resp) =
             append_streaming_put_buffer(&state, &ctx, &mut append_state, buf, total_size).await
         {
-            return resp;
+            return *resp;
         }
     }
 
@@ -3685,7 +3685,7 @@ async fn ensure_streaming_put_session(
     session_id: &mut Option<SessionId>,
     body_bytes_received: u64,
     abort_guard: &Arc<StreamingAbortGuard>,
-) -> Result<(), S3Response> {
+) -> Result<(), Box<S3Response>> {
     let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     if let Some(existing) = session_id.as_ref() {
         abort_guard.arm_put(ctx, existing);
@@ -3743,8 +3743,8 @@ async fn ensure_streaming_put_session(
             *session_id = Some(new_session_id);
             Ok(())
         }
-        Ok(Err(err)) => Err(error_response(&err, &wire_ids)),
-        Err(_) => Err(internal_error_response(&wire_ids)),
+        Ok(Err(err)) => Err(Box::new(error_response(&err, &wire_ids))),
+        Err(_) => Err(Box::new(internal_error_response(&wire_ids))),
     }
 }
 
@@ -3754,7 +3754,7 @@ async fn append_streaming_put_buffer(
     append: &mut StreamingPutAppendState<'_>,
     flush_data: PooledSegmentBuffer,
     body_bytes_received: u64,
-) -> Result<(), S3Response> {
+) -> Result<(), Box<S3Response>> {
     let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     ensure_streaming_put_session(
         state,
@@ -3841,11 +3841,11 @@ async fn append_streaming_put_buffer(
         }
         Ok((Err(err), _flush_data)) => {
             abort_streaming(state, ctx, append.session_id.clone()).await;
-            Err(error_response(&err, &wire_ids))
+            Err(Box::new(error_response(&err, &wire_ids)))
         }
         Err(_) => {
             abort_streaming(state, ctx, append.session_id.clone()).await;
-            Err(internal_error_response(&wire_ids))
+            Err(Box::new(internal_error_response(&wire_ids)))
         }
     }
 }
@@ -3855,7 +3855,7 @@ async fn ingest_streaming_put_payload(
     ctx: &Arc<super::StreamingPutContext>,
     payload: &[u8],
     ingest: &mut StreamingPutIngestState<'_>,
-) -> Result<(), S3Response> {
+) -> Result<(), Box<S3Response>> {
     let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     if payload.is_empty() {
         return Ok(());
@@ -3875,13 +3875,13 @@ async fn ingest_streaming_put_payload(
     *ingest.total_size += payload.len() as u64;
     if *ingest.total_size > MAX_OBJECT_SIZE {
         abort_streaming(state, ctx, ingest.session_id.clone()).await;
-        return Err(error_response(
+        return Err(Box::new(error_response(
             &ServerError::ObjectTooLarge {
                 size: *ingest.total_size,
                 max: MAX_OBJECT_SIZE,
             },
             &wire_ids,
-        ));
+        )));
     }
     if !*ingest.body_started_emitted {
         *ingest.body_started_emitted = true;
@@ -4247,7 +4247,7 @@ async fn handle_streaming_part(
                                 ingest_streaming_part_payload(&state, &ctx, &payload, &mut ingest)
                                     .await
                             {
-                                return resp;
+                                return *resp;
                             }
                         }
                     } else {
@@ -4271,7 +4271,7 @@ async fn handle_streaming_part(
                         )
                         .await
                         {
-                            return resp;
+                            return *resp;
                         }
                     }
                 }
@@ -4740,7 +4740,7 @@ async fn ingest_streaming_part_payload(
     ctx: &Arc<super::StreamingPartContext>,
     payload: &[u8],
     ingest: &mut StreamingPartIngestState<'_>,
-) -> Result<(), S3Response> {
+) -> Result<(), Box<S3Response>> {
     let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     if payload.is_empty() {
         return Ok(());
@@ -4760,13 +4760,13 @@ async fn ingest_streaming_part_payload(
     *ingest.total_size += payload.len() as u64;
     if *ingest.total_size > MAX_OBJECT_SIZE {
         abort_streaming_part_ctx(state, ctx).await;
-        return Err(error_response(
+        return Err(Box::new(error_response(
             &ServerError::ObjectTooLarge {
                 size: *ingest.total_size,
                 max: MAX_OBJECT_SIZE,
             },
             &wire_ids,
-        ));
+        )));
     }
     if !*ingest.body_started_emitted {
         *ingest.body_started_emitted = true;
@@ -4912,7 +4912,7 @@ async fn ingest_streaming_part_payload(
                     None,
                 );
                 abort_streaming_part_ctx(state, ctx).await;
-                return Err(error_response(&err, &wire_ids));
+                return Err(Box::new(error_response(&err, &wire_ids)));
             }
             Err(_) => {
                 emit_streaming_part_phase(
@@ -4924,7 +4924,7 @@ async fn ingest_streaming_part_payload(
                     None,
                 );
                 abort_streaming_part_ctx(state, ctx).await;
-                return Err(internal_error_response(&wire_ids));
+                return Err(Box::new(internal_error_response(&wire_ids)));
             }
         }
         ingest.timing.append_wait_us += elapsed_micros(dispatch_start);

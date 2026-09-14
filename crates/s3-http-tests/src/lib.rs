@@ -98,6 +98,10 @@ pub fn test_agent() -> s3_tests::Agent {
     build_test_agent(CTX.endpoint(), None, std::time::Duration::from_secs(30))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 pub async fn create_bucket(
     client: &Client,
     bucket: &str,

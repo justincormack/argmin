@@ -1597,8 +1597,9 @@ impl PgStore {
             ));
         };
         let Some(encoded) = encoded_page
-            .chunks_exact(PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN)
-            .nth(within_page)
+            .as_chunks::<PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN>()
+            .0
+            .get(within_page)
         else {
             return Err(Self::invalid_pending_placed_reference_index(
                 "missing exact encoded reference",
@@ -2084,7 +2085,9 @@ impl PgStore {
             }
             let skip = next_reference - page_start;
             for encoded in encoded_page
-                .chunks_exact(PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN)
+                .as_chunks::<PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN>()
+                .0
+                .iter()
                 .skip(skip)
                 .take(limit - (next_reference - start))
             {
@@ -2234,7 +2237,9 @@ impl PgStore {
             }
             let skip = next_reference - page_start;
             for encoded in encoded_page
-                .chunks_exact(PENDING_RECLAIM_REFERENCE_RECORD_LEN)
+                .as_chunks::<PENDING_RECLAIM_REFERENCE_RECORD_LEN>()
+                .0
+                .iter()
                 .skip(skip)
                 .take(limit - (next_reference - start))
             {

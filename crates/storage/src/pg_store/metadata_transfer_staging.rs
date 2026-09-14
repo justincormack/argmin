@@ -3998,8 +3998,8 @@ fn decode_acting_set(bytes: &[u8]) -> Result<Vec<NodeId>, MetadataTransferStagin
     }
     let mut seen = BTreeSet::new();
     let mut acting_set = Vec::with_capacity(count);
-    for chunk in bytes[4..].chunks_exact(4) {
-        let node_id = NodeId::new(u32::from_be_bytes(chunk.try_into().unwrap()));
+    for chunk in bytes[4..].as_chunks::<4>().0 {
+        let node_id = NodeId::new(u32::from_be_bytes(*chunk));
         if !seen.insert(node_id) {
             return Err(MetadataTransferStagingError::Invariant(
                 "staging acting set contains a duplicate node".to_owned(),
@@ -4667,7 +4667,9 @@ mod tests {
         assert_eq!(value.len() % 2, 0);
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|digits| {
                 let high = char::from(digits[0]).to_digit(16).unwrap();
                 let low = char::from(digits[1]).to_digit(16).unwrap();

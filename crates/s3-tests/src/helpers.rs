@@ -337,6 +337,10 @@ where
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 pub async fn retrying_operation_aborted_result<T, E, F, Fut>(
     mut op: F,
 ) -> Result<T, aws_sdk_s3::error::SdkError<E>>
@@ -352,6 +356,10 @@ where
     .await
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 pub async fn retrying_exact_operation_aborted_result<T, E, F, Fut>(
     mut op: F,
 ) -> Result<T, aws_sdk_s3::error::SdkError<E>>
@@ -367,6 +375,10 @@ where
     .await
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn retrying_operation_contention_result<T, E, F, Fut>(
     op: &mut F,
     scope: OperationContentionRetryScope,
@@ -479,6 +491,10 @@ fn operation_contention_retry_delay(
     (!remaining.is_zero()).then_some(RETRY_DELAY.min(remaining))
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn send_with_operation_contention_retry<B>(
     builder: B,
     scope: OperationContentionRetryScope,
@@ -490,6 +506,10 @@ where
     send_with_operation_contention_retry_until(builder, scope, deadline).await
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn send_with_operation_contention_retry_until<B>(
     builder: B,
     scope: OperationContentionRetryScope,
@@ -1158,6 +1178,10 @@ pub async fn delete_objects_retrying_operation_aborted(
 
 /// Retry only whole-request and per-entry `OperationAborted` results from a
 /// DeleteObjects request, preserving successful entries across retries.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 pub async fn delete_objects_retrying_exact_operation_aborted_result(
     client: &Client,
     bucket: &str,
@@ -1172,6 +1196,10 @@ pub async fn delete_objects_retrying_exact_operation_aborted_result(
     .await
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn delete_objects_retrying_operation_contention_result(
     client: &Client,
     bucket: &str,
@@ -1188,6 +1216,10 @@ async fn delete_objects_retrying_operation_contention_result(
     .await
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn delete_objects_retrying_operation_contention_result_until<F, Fut>(
     delete: Delete,
     scope: OperationContentionRetryScope,
@@ -3571,6 +3603,10 @@ async fn cleanup_versioning_readiness_key(client: &Client, bucket: &str) {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 pub async fn delete_object_retrying_operation_aborted(
     client: &Client,
     bucket: &str,

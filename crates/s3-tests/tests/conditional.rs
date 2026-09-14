@@ -354,6 +354,10 @@ async fn put_object(bucket: &str, key: &str, body: &'static [u8]) -> String {
     resp.e_tag().unwrap().to_string()
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn put_object_result_retrying_operation_aborted(
     _context: &str,
     mut build: impl FnMut() -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,

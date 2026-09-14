@@ -16412,7 +16412,7 @@ fn hex_decode(line: usize, value: &str) -> Result<Vec<u8>, ControlPlaneError> {
         return Err(parse_error(line, "hex string has odd length"));
     }
     let mut out = Vec::with_capacity(value.len() / 2);
-    for pair in value.as_bytes().chunks_exact(2) {
+    for pair in value.as_bytes().as_chunks::<2>().0 {
         let high = hex_nibble(pair[0]).ok_or_else(|| parse_error(line, "invalid hex digit"))?;
         let low = hex_nibble(pair[1]).ok_or_else(|| parse_error(line, "invalid hex digit"))?;
         out.push((high << 4) | low);

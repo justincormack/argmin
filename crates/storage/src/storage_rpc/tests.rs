@@ -20,7 +20,9 @@ mod tests {
         assert_eq!(value.len() % 2, 0);
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|digits| {
                 let high = char::from(digits[0]).to_digit(16).unwrap();
                 let low = char::from(digits[1]).to_digit(16).unwrap();

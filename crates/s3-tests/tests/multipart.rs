@@ -244,6 +244,10 @@ async fn upload_part_retrying_operation_aborted(
     panic!("upload part during multipart setup did not complete");
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn upload_part_result_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -314,6 +318,10 @@ async fn upload_part_with_crc32_retrying_operation_aborted(
     panic!("upload part with checksum during multipart setup did not complete");
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn upload_part_copy_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -353,6 +361,10 @@ fn single_part_completion(etag: &str, part_number: i32) -> CompletedMultipartUpl
         .build()
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn send_single_part_completion(
     client: &aws_sdk_s3::Client,
     bucket: &str,

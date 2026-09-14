@@ -66,6 +66,10 @@ async fn put_bucket_policy_retrying_operation_aborted(
     .await
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn put_bucket_policy_result_retrying_operation_aborted(
     client: &Client,
     bucket: &str,

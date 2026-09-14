@@ -53,6 +53,10 @@ async fn put_object_retrying_operation_aborted(
     panic!("put object during tagging setup did not complete");
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn put_object_result_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -200,6 +204,10 @@ async fn complete_multipart_upload_retrying_operation_aborted(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn copy_object_without_metadata_directive_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,

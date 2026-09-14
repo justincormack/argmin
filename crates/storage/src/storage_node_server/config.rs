@@ -1344,7 +1344,7 @@ fn hex_decode(path: &Path, value: &str) -> Result<Vec<u8>, StorageNodeServerErro
     }
     let mut out = Vec::with_capacity(value.len() / 2);
     let bytes = value.as_bytes();
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let high =
             hex_value(pair[0]).ok_or_else(|| runtime_config_invalid(path, "invalid hex field"))?;
         let low =

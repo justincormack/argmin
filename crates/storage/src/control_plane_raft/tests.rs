@@ -2496,7 +2496,9 @@ fn raft_test_decode_hex(encoded: &str) -> Vec<u8> {
         .collect::<Vec<_>>();
     assert_eq!(encoded.len() % 2, 0, "hex fixture must have whole bytes");
     encoded
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|digits| {
             let digits = std::str::from_utf8(digits).expect("hex fixture must be ASCII");
             u8::from_str_radix(digits, 16).expect("hex fixture must contain hexadecimal digits")

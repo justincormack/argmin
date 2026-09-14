@@ -598,6 +598,10 @@ async fn assert_distinct_external_s3_owners(
     );
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn create_external_setup_probe_bucket(
     client: &Client,
     bucket: &str,
@@ -628,6 +632,10 @@ async fn delete_external_setup_probe_bucket(client: &Client, bucket: &str, label
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 pub async fn create_bucket(
     client: &Client,
     bucket: &str,
@@ -643,6 +651,10 @@ pub async fn create_bucket(
 /// reusable. Local tests use this helper for delete-then-recreate flows so they
 /// model the same bounded retry behavior instead of assuming synchronous
 /// namespace release.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 pub async fn create_bucket_retrying_reuse(
     client: &Client,
     bucket: &str,
@@ -669,6 +681,10 @@ pub fn create_bucket_request(
     create_bucket_request_in_region(client, bucket, CTX.region())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn create_bucket_in_region(
     client: &Client,
     bucket: &str,
@@ -681,6 +697,10 @@ async fn create_bucket_in_region(
         .map(|_| ())
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
 async fn create_bucket_in_region_accepting_verified_lost_success(
     client: &Client,
     bucket: &str,

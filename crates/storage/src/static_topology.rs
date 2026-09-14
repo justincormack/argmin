@@ -409,7 +409,7 @@ fn decode_topology_digest(
         ));
     }
     let mut decoded = [0_u8; DIGEST_LEN];
-    for (output, pair) in decoded.iter_mut().zip(digest.as_bytes().chunks_exact(2)) {
+    for (output, pair) in decoded.iter_mut().zip(digest.as_bytes().as_chunks::<2>().0) {
         let high = decode_hex_nibble(pair[0]).ok_or_else(|| {
             StaticStorageTopologyError::new("static topology digest contains invalid hex")
         })?;

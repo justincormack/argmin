@@ -570,7 +570,7 @@ fn decode_multipart_upload_id_hex<const N: usize>(encoded: &str) -> Option<[u8; 
         return None;
     }
     let mut decoded = [0u8; N];
-    for (index, encoded) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, encoded) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = decode_hex_nibble(encoded[0])?;
         let low = decode_hex_nibble(encoded[1])?;
         decoded[index] = (high << 4) | low;
