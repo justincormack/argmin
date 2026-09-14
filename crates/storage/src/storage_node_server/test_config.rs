@@ -5372,7 +5372,7 @@
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [23_u16, 25] {
+            for unsupported_version in [24_u16, 26] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());
@@ -6220,7 +6220,14 @@
 
     fn authenticated_metadata_transfer_staging_publication_round_trip(tcp: bool) {
         let tmp = test_util::tempdir();
-        let config = bounded_runtime_refresh_config(test_config(&tmp));
+        let staging =
+            crate::control_plane::tests::transitions::authenticated_staging_authorization_fixture();
+        let mut config = bounded_runtime_refresh_config(test_config(&tmp));
+        config.node_id = staging.destination_node_id;
+        config.cluster_epoch = staging.runtime_map.cluster_epoch();
+        config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+        config.pg_routes[0].primary_node_id = staging.destination_node_id;
+        config.pg_routes[0].acting_set = vec![staging.destination_node_id];
         private_socket_dir(config.socket_path.parent().unwrap());
         let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Admin {
             instance_id: "metadata-transfer-staging-1".to_owned(),
@@ -6236,7 +6243,7 @@
                 ),
             ]);
         }
-        let server = prepared.bind().unwrap();
+        let server = Arc::new(prepared.bind().unwrap());
         let endpoint = if tcp {
             let address = server.tcp_listener_addr_for_test();
             StorageRpcClientEndpoint::tcp_with_config(
@@ -6249,7 +6256,8 @@
         } else {
             StorageRpcClientEndpoint::unix(config.socket_path.clone())
         };
-        let join = thread::spawn(move || server.accept_one());
+        let serving = Arc::clone(&server);
+        let join = thread::spawn(move || serving.accept_one());
         let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
             config.node_id,
             config.cluster_epoch,
@@ -6259,13 +6267,45 @@
                 credential,
             )),
         );
-        let transition_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
-        let initial_destination_epoch = ClusterEpoch::new(transition_epoch.get() + 1).unwrap();
-        let rebased_destination_epoch = ClusterEpoch::new(initial_destination_epoch.get() + 1).unwrap();
+        let transition_epoch = staging.intent.transition_epoch();
+        let initial_destination_epoch = staging.initial_destination_epoch;
+        let rebased_destination_epoch = staging.rebased_destination_epoch;
+        let not_observed = client
+            .create_metadata_transfer_staging_intent(&staging.authorization, &staging.intent)
+            .unwrap_err();
+        assert_eq!(
+            not_observed.operation_failure_class(),
+            crate::error::StoreOperationFailureClass::RetryableConvergence
+        );
+        assert!(!server
+            .metadata_transfer_staging_store
+            .as_ref()
+            .unwrap()
+            .has_intent_for_test(
+                staging.intent.pg_id(),
+                staging.intent.staging_generation(),
+            ));
+
+        server.install_authority_runtime_map_for_test(&staging.cross_member_runtime_map);
+        assert!(client
+            .create_metadata_transfer_staging_intent(
+                &staging.cross_member_authorization,
+                &staging.cross_member_intent,
+            )
+            .is_err());
+        assert!(!server
+            .metadata_transfer_staging_store
+            .as_ref()
+            .unwrap()
+            .has_intent_for_test(
+                staging.cross_member_intent.pg_id(),
+                staging.cross_member_intent.staging_generation(),
+            ));
+
         let misrouted_binding = UnavailablePgTransitionMutationBinding::new(
             PgId::new(0),
             transition_epoch,
-            config.cluster_epoch,
+            staging.intent.source_epoch(),
             vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
             vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
         );
@@ -6282,11 +6322,19 @@
                 crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
             )
             .unwrap();
+        let misrouted_authorization =
+            crate::pg_store::committed_staging_authorization_for_intent_for_test(
+                &misrouted_intent,
+            );
         assert!(client
-            .create_metadata_transfer_staging_intent(&misrouted_intent)
+            .create_metadata_transfer_staging_intent(
+                &misrouted_authorization,
+                &misrouted_intent,
+            )
             .is_err());
         assert!(client
             .publish_metadata_transfer_staging_artifact(
+                &misrouted_authorization,
                 &misrouted_intent,
                 &misrouted_artifact,
             )
@@ -6299,7 +6347,7 @@
                 &UnavailablePgTransitionMutationBinding::new(
                     PgId::new(1),
                     transition_epoch,
-                    config.cluster_epoch,
+                    staging.intent.source_epoch(),
                     vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
                     vec![config.node_id, NodeId::new(2), NodeId::new(3)],
                 ),
@@ -6308,54 +6356,90 @@
                 crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
             )
             .unwrap();
-        client
-            .create_metadata_transfer_staging_intent(&malformed_intent)
-            .unwrap();
-        assert!(client
-            .publish_metadata_transfer_staging_artifact(
+        let malformed_authorization =
+            crate::pg_store::committed_staging_authorization_for_intent_for_test(
                 &malformed_intent,
-                malformed_artifact,
+            );
+        assert!(client
+            .create_metadata_transfer_staging_intent(
+                &malformed_authorization,
+                &malformed_intent,
             )
             .is_err());
+        assert!(!server
+            .metadata_transfer_staging_store
+            .as_ref()
+            .unwrap()
+            .has_intent_for_test(
+                malformed_intent.pg_id(),
+                malformed_intent.staging_generation(),
+            ));
+        let intent = staging.intent;
+        let artifact = staging.artifact;
+        let authorization = staging.authorization;
+        server.install_authority_runtime_map_for_test(&staging.runtime_map);
 
-        let binding = UnavailablePgTransitionMutationBinding::new(
-            PgId::new(0),
-            transition_epoch,
-            config.cluster_epoch,
-            vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
-            vec![config.node_id, NodeId::new(2), NodeId::new(3)],
+        let mut malformed_presentation = authorization.presentation().clone();
+        let mut malformed_digest = malformed_presentation.batch_members_digest();
+        malformed_digest[0] ^= 0x80;
+        malformed_presentation.test_set_batch_members_digest(malformed_digest);
+        let malformed_error = client
+            .create_metadata_transfer_staging_intent_with_presentation_for_test(
+                &malformed_presentation,
+                &intent,
+            )
+            .unwrap_err();
+        assert_eq!(
+            malformed_error.operation_failure_class(),
+            crate::error::StoreOperationFailureClass::Other
         );
-        let artifact =
-            crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
-                &binding,
-                initial_destination_epoch,
-            );
-        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
-            &binding,
-            checksum::sha256::digest(&artifact),
-            u64::try_from(artifact.len()).unwrap(),
-            crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-        )
-        .unwrap();
+
+        let mut stale_presentation = authorization.presentation().clone();
+        stale_presentation.test_set_committed_epoch(
+            ClusterEpoch::new(config.cluster_epoch.get().checked_sub(1).unwrap()).unwrap(),
+        );
+        let stale_error = client
+            .create_metadata_transfer_staging_intent_with_presentation_for_test(
+                &stale_presentation,
+                &intent,
+            )
+            .unwrap_err();
+        assert_eq!(
+            stale_error.operation_failure_class(),
+            crate::error::StoreOperationFailureClass::Other
+        );
+        assert!(!server
+            .metadata_transfer_staging_store
+            .as_ref()
+            .unwrap()
+            .has_intent_for_test(intent.pg_id(), intent.staging_generation()));
+
+        assert!(client
+            .create_metadata_transfer_staging_intent(&malformed_authorization, &intent)
+            .is_err());
 
         client
-            .create_metadata_transfer_staging_intent(&intent)
+            .create_metadata_transfer_staging_intent(&authorization, &intent)
             .unwrap();
         client
-            .create_metadata_transfer_staging_intent(&intent)
+            .create_metadata_transfer_staging_intent(&authorization, &intent)
             .unwrap();
         let first = client
-            .publish_metadata_transfer_staging_artifact(&intent, &artifact)
+            .publish_metadata_transfer_staging_artifact(&authorization, &intent, &artifact)
             .unwrap();
         let replay = client
-            .publish_metadata_transfer_staging_artifact(&intent, &artifact)
+            .publish_metadata_transfer_staging_artifact(&authorization, &intent, &artifact)
             .unwrap();
         assert_eq!(replay, first);
         assert!(!first.as_bytes().is_empty());
         let initial = crate::pg_store::decode_staging_evidence(first.as_bytes()).unwrap();
         assert_eq!(initial.target_epoch(), Some(initial_destination_epoch));
         let rebased = client
-            .publish_metadata_transfer_staging_proof(&intent, rebased_destination_epoch)
+            .publish_metadata_transfer_staging_proof(
+                &authorization,
+                &intent,
+                rebased_destination_epoch,
+            )
             .unwrap();
         let rebased_evidence =
             crate::pg_store::decode_staging_evidence(rebased.as_bytes()).unwrap();
@@ -6366,7 +6450,11 @@
         assert_ne!(rebased_evidence.transfer(), initial.transfer());
         assert_eq!(
             client
-                .publish_metadata_transfer_staging_proof(&intent, rebased_destination_epoch)
+                .publish_metadata_transfer_staging_proof(
+                    &authorization,
+                    &intent,
+                    rebased_destination_epoch,
+                )
                 .unwrap(),
             rebased
         );
@@ -6383,6 +6471,83 @@
     #[test]
     fn authenticated_tls_metadata_transfer_staging_publication_round_trip() {
         authenticated_metadata_transfer_staging_publication_round_trip(true);
+    }
+
+    #[test]
+    fn storage_node_bootstrap_preserves_committed_staging_authorizations() {
+        let tmp = test_util::tempdir();
+        let staging =
+            crate::control_plane::tests::transitions::authenticated_staging_authorization_fixture();
+        let destination_node_id = NodeId::new(2);
+        let socket_path = PathBuf::from("/tmp/transition-node-2.sock");
+        let bootstrap = StorageNodeBootstrap::open_control_plane_managed(
+            destination_node_id,
+            tmp.path().join("node"),
+            &[70, 71],
+            EcShape { k: 2, m: 1 },
+            &socket_path,
+        )
+        .unwrap();
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Admin {
+            instance_id: "metadata-transfer-bootstrap-1".to_owned(),
+        });
+        let prepared = bootstrap
+            .prepare(&staging.runtime_map)
+            .unwrap()
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .with_metadata_transfer_staging_node_incarnation(11)
+            .with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        assert!(prepared.verifies_staging_authorization_for_test(
+            destination_node_id,
+            staging.intent.pg_id(),
+            staging.authorization.presentation(),
+        ));
+        let server = Arc::new(prepared.bind().unwrap());
+        let address = server.tcp_listener_addr_for_test();
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let serving = Arc::clone(&server);
+        let join = thread::spawn(move || serving.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            destination_node_id,
+            staging.runtime_map.cluster_epoch(),
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(live_pg_metadata_transfer_storage_rpc_client_auth(
+                credential,
+            )),
+        );
+        let authorization =
+            crate::control_plane::committed_staging_authorization_from_presentation_for_test(
+                staging.authorization.presentation().clone(),
+                destination_node_id,
+                staging.intent.pg_id(),
+            );
+
+        client
+            .create_metadata_transfer_staging_intent(&authorization, &staging.intent)
+            .unwrap();
+        assert!(server
+            .metadata_transfer_staging_store
+            .as_ref()
+            .unwrap()
+            .has_intent_for_test(
+                staging.intent.pg_id(),
+                staging.intent.staging_generation(),
+            ));
+
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
     }
 
     fn authenticated_checkpoint_export_uses_current_peering_source_fence(tcp: bool) {

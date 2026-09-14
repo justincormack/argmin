@@ -15,6 +15,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use crate::control_plane::{
     PgMetadataProof, PgMetadataTransferProof, UnavailablePgTransitionMutationBinding,
 };
+use crate::control_plane_command::CommittedUnavailablePgStagingAuthorization;
 use crate::data_dir::prepare_private_data_dir;
 use crate::metadata_command::MetadataCommandLogRangeEntry;
 use crate::node_runtime::MetadataCommandDecodeAuthority;
@@ -39,9 +40,9 @@ const CATALOGUE_FILE: &str = "catalogue.db";
 const STAGING_STORE_MAGIC: &[u8; 8] = b"ARGMSTG\0";
 const STAGING_INITIALIZATION_MAGIC: &[u8; 8] = b"ARGMSTGI";
 const STAGING_ESTABLISHMENT_MAGIC: &[u8; 8] = b"ARGMSTGE";
-const STAGING_STORE_FORMAT_VERSION: u16 = 2;
-const STAGING_STORE_SCHEMA_V2: &str =
-    include_str!("schema_manifests/metadata_transfer_staging_v2.sql");
+const STAGING_STORE_FORMAT_VERSION: u16 = 3;
+const STAGING_STORE_SCHEMA_V3: &str =
+    include_str!("schema_manifests/metadata_transfer_staging_v3.sql");
 const DIGEST_LEN: usize = 32;
 const MANIFEST_BODY_LEN: usize = STAGING_STORE_MAGIC.len() + 2 + DIGEST_LEN;
 const MANIFEST_LEN: usize = MANIFEST_BODY_LEN + 8;
@@ -55,10 +56,11 @@ pub(crate) const MAX_STAGING_EVIDENCE_BYTES: usize = 4_096;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_ENTRIES: usize = 64;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_BYTES: usize = 120 * 1_024;
 const MAX_STAGING_EPOCH_PROOFS_PER_INTENT: usize = 64;
-const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V2\0";
-const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V2\0";
-const STAGED_ARTIFACT_MAGIC: &[u8] = b"ARGMIN-METADATA-TRANSFER-ARTIFACT-V2\0";
-pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 2;
+const STAGING_EVIDENCE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-V3\0";
+const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V3\0";
+const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V3\0";
+const STAGED_ARTIFACT_MAGIC: &[u8] = b"ARGMIN-METADATA-TRANSFER-ARTIFACT-V3\0";
+pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 3;
 pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES: u64 = 63 * 1_024 * 1_024;
 
 #[derive(Debug, thiserror::Error)]
@@ -576,7 +578,7 @@ fn validate_staged_metadata_transfer_artifact(
     }
     if offset != bytes.len()
         || pg_id != intent.pg_id
-        || cluster_epoch < intent.transition_epoch
+        || cluster_epoch > intent.source_epoch
         || destination_epoch <= intent.transition_epoch
         || !intent.source_acting_set.contains(&source_node_id)
     {
@@ -799,6 +801,14 @@ pub(crate) struct MetadataTransferStagingStore {
 }
 
 impl MetadataTransferStagingStore {
+    #[cfg(test)]
+    pub(crate) fn has_intent_for_test(&self, pg_id: PgId, staging_generation: u64) -> bool {
+        let state = self.lock_state().unwrap();
+        load_staging_row(&state.connection, pg_id, staging_generation)
+            .unwrap()
+            .is_some()
+    }
+
     pub(crate) fn open(
         data_dir: &Path,
         identity: MetadataTransferStagingNodeIdentity,
@@ -1111,7 +1121,7 @@ impl MetadataTransferStagingStore {
         Ok(())
     }
 
-    pub(crate) fn create_intent(
+    fn create_intent_inner(
         &self,
         intent: &MetadataTransferStagingIntent,
     ) -> Result<MetadataTransferStagingIntentOutcome, MetadataTransferStagingError> {
@@ -1163,7 +1173,24 @@ impl MetadataTransferStagingStore {
         Ok(MetadataTransferStagingIntentOutcome::Created)
     }
 
-    pub(crate) fn publish_artifact(
+    pub(crate) fn create_intent_authorized(
+        &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<MetadataTransferStagingIntentOutcome, MetadataTransferStagingError> {
+        validate_committed_staging_authorization(&self.identity, authorization, intent)?;
+        self.create_intent_inner(intent)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_intent(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<MetadataTransferStagingIntentOutcome, MetadataTransferStagingError> {
+        self.create_intent_inner(intent)
+    }
+
+    fn publish_artifact_inner(
         &self,
         intent: &MetadataTransferStagingIntent,
         artifact: &[u8],
@@ -1264,7 +1291,26 @@ impl MetadataTransferStagingStore {
         Ok(MetadataTransferStagingReceipt { bytes: receipt })
     }
 
-    pub(crate) fn publish_proof_for_epoch(
+    pub(crate) fn publish_artifact_authorized(
+        &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
+        intent: &MetadataTransferStagingIntent,
+        artifact: &[u8],
+    ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
+        validate_committed_staging_authorization(&self.identity, authorization, intent)?;
+        self.publish_artifact_inner(intent, artifact)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_artifact(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+        artifact: &[u8],
+    ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
+        self.publish_artifact_inner(intent, artifact)
+    }
+
+    fn publish_proof_for_epoch_inner(
         &self,
         intent: &MetadataTransferStagingIntent,
         target_epoch: ClusterEpoch,
@@ -1389,6 +1435,25 @@ impl MetadataTransferStagingStore {
             MetadataTransferStagingError::sql("commit staging proof publication", source)
         })?;
         Ok(MetadataTransferStagingReceipt { bytes: receipt })
+    }
+
+    pub(crate) fn publish_proof_for_epoch_authorized(
+        &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
+        intent: &MetadataTransferStagingIntent,
+        target_epoch: ClusterEpoch,
+    ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
+        validate_committed_staging_authorization(&self.identity, authorization, intent)?;
+        self.publish_proof_for_epoch_inner(intent, target_epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_proof_for_epoch(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+        target_epoch: ClusterEpoch,
+    ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
+        self.publish_proof_for_epoch_inner(intent, target_epoch)
     }
 
     pub(crate) fn mark_imported(
@@ -2236,7 +2301,7 @@ fn initialize_or_validate_unmarked_catalogue(
                 ));
             }
             connection
-                .execute_batch(STAGING_STORE_SCHEMA_V2)
+                .execute_batch(STAGING_STORE_SCHEMA_V3)
                 .map_err(|source| {
                     MetadataTransferStagingError::sql("initialize staging catalogue", source)
                 })?;
@@ -2277,13 +2342,13 @@ fn validate_schema_catalogue(connection: &Connection) -> Result<(), MetadataTran
         MetadataTransferStagingError::sql("open expected staging catalogue", source)
     })?;
     expected
-        .execute_batch(STAGING_STORE_SCHEMA_V2)
+        .execute_batch(STAGING_STORE_SCHEMA_V3)
         .map_err(|source| {
             MetadataTransferStagingError::sql("build expected staging catalogue", source)
         })?;
     if schema_catalogue(connection)? != schema_catalogue(&expected)? {
         return Err(MetadataTransferStagingError::Invariant(
-            "staging catalogue schema does not match format v2".to_owned(),
+            "staging catalogue schema does not match format v3".to_owned(),
         ));
     }
     Ok(())
@@ -2445,6 +2510,44 @@ fn require_exact_intent(
     if actual != expected {
         return Err(MetadataTransferStagingError::IntentConflict(
             "same PG/generation has a different transition or artifact tuple".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_committed_staging_authorization(
+    actor: &MetadataTransferStagingNodeIdentity,
+    authorization: &CommittedUnavailablePgStagingAuthorization,
+    intent: &MetadataTransferStagingIntent,
+) -> Result<(), MetadataTransferStagingError> {
+    if authorization.destination_node_id() != actor.node_id()
+        || authorization.pg_id() != intent.pg_id
+    {
+        return Err(MetadataTransferStagingError::IntentConflict(
+            "committed authorization is not bound to this staging actor and PG".to_owned(),
+        ));
+    }
+    let Some(committed) = authorization.authorization_for_pg(intent.pg_id) else {
+        return Err(MetadataTransferStagingError::IntentConflict(
+            "committed authorization does not contain the staging intent PG".to_owned(),
+        ));
+    };
+    let binding = UnavailablePgTransitionMutationBinding::new(
+        intent.pg_id,
+        intent.transition_epoch,
+        intent.source_epoch,
+        intent.source_acting_set.clone(),
+        intent.destination_acting_set.clone(),
+    );
+    if committed.unavailable_transition != binding
+        || committed.staging_generation != intent.staging_generation
+        || committed.artifact_digest != intent.artifact_digest
+        || committed.artifact_length != intent.artifact_length
+        || committed.artifact_format_version != intent.artifact_format_version
+        || authorization.committed_epoch() < intent.transition_epoch
+    {
+        return Err(MetadataTransferStagingError::IntentConflict(
+            "committed authorization does not match the exact staging intent".to_owned(),
         ));
     }
     Ok(())
@@ -3193,7 +3296,7 @@ fn encode_staging_evidence(
     transfer: Option<PgMetadataTransferProof>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(b"ARGMIN-STAGING-EVIDENCE-V2\0");
+    out.extend_from_slice(STAGING_EVIDENCE_MAGIC);
     out.push(kind);
     out.extend_from_slice(&identity.node_id.as_u32().to_be_bytes());
     out.extend_from_slice(&identity.node_incarnation.to_be_bytes());
@@ -3352,14 +3455,13 @@ fn validate_staging_evidence(
 pub(crate) fn decode_staging_evidence(
     bytes: &[u8],
 ) -> Result<MetadataTransferStagingEvidence, MetadataTransferStagingError> {
-    const MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-V2\0";
     if bytes.is_empty() || bytes.len() > MAX_STAGING_EVIDENCE_BYTES {
         return Err(MetadataTransferStagingError::Invariant(
             "staging evidence has invalid length".to_owned(),
         ));
     }
-    let mut offset = MAGIC.len();
-    if bytes.get(..offset) != Some(MAGIC) {
+    let mut offset = STAGING_EVIDENCE_MAGIC.len();
+    if bytes.get(..offset) != Some(STAGING_EVIDENCE_MAGIC) {
         return Err(MetadataTransferStagingError::Invariant(
             "staging evidence has invalid magic".to_owned(),
         ));
@@ -3740,7 +3842,7 @@ pub(crate) fn canonical_nonempty_staged_metadata_transfer_artifact_for_test(
     };
     let log_index = MetadataCommandLogIndex::new(1).unwrap();
     let command = MetadataCommandEnvelope::new(
-        MetadataCommandId::new(binding.transition_epoch(), binding.pg_id(), log_index),
+        MetadataCommandId::new(binding.source_epoch(), binding.pg_id(), log_index),
         MetadataCommandPayload::CreateBucket(
             CreateBucketCommand::from_config_with_fixed_upload_id_key_for_test(&config, 1, 1)
                 .unwrap(),
@@ -3748,7 +3850,7 @@ pub(crate) fn canonical_nonempty_staged_metadata_transfer_artifact_for_test(
     );
     let previous_log_hash = MetadataCommandLogHash::genesis();
     let log_hash = metadata_command_log_hash(
-        binding.transition_epoch(),
+        binding.source_epoch(),
         binding.pg_id(),
         log_index,
         previous_log_hash.value(),
@@ -3765,11 +3867,11 @@ pub(crate) fn canonical_nonempty_staged_metadata_transfer_artifact_for_test(
         kind: MetadataCommandLogRangeEntryKind::Applied(Box::new(command)),
     };
     let artifact = crate::peering::build_pg_metadata_transfer_artifact_from_retained_log_entries(
-        binding.transition_epoch(),
+        binding.source_epoch(),
         binding.pg_id(),
         binding.source_acting_set()[0],
         MetadataCommandReplicaState {
-            cluster_epoch: binding.transition_epoch(),
+            cluster_epoch: binding.source_epoch(),
             applied_log_index: 1,
             applied_log_hash: log_hash,
             state_digest: post_state_digest,
@@ -4402,7 +4504,7 @@ fn current_initialization_marker_bytes() -> Vec<u8> {
     bytes.extend_from_slice(STAGING_INITIALIZATION_MAGIC);
     bytes.extend_from_slice(&STAGING_STORE_FORMAT_VERSION.to_be_bytes());
     bytes.extend_from_slice(&checksum::sha256::digest(
-        STAGING_STORE_SCHEMA_V2.as_bytes(),
+        STAGING_STORE_SCHEMA_V3.as_bytes(),
     ));
     let checksum = checksum::crc64::checksum(&bytes);
     bytes.extend_from_slice(&checksum.to_be_bytes());
@@ -4493,7 +4595,7 @@ fn current_manifest_bytes() -> Vec<u8> {
     bytes.extend_from_slice(STAGING_STORE_MAGIC);
     bytes.extend_from_slice(&STAGING_STORE_FORMAT_VERSION.to_be_bytes());
     bytes.extend_from_slice(&checksum::sha256::digest(
-        STAGING_STORE_SCHEMA_V2.as_bytes(),
+        STAGING_STORE_SCHEMA_V3.as_bytes(),
     ));
     let checksum = checksum::crc64::checksum(&bytes);
     bytes.extend_from_slice(&checksum.to_be_bytes());
@@ -4646,16 +4748,13 @@ mod tests {
         label: &[u8],
         binding: &UnavailablePgTransitionMutationBinding,
     ) -> &'static [u8] {
+        let source_route_epoch = binding.source_epoch().get();
         let source_epoch = ClusterEpoch::new(
-            binding
-                .transition_epoch()
-                .get()
-                .checked_add(checksum::crc64::checksum(label) % 1_024)
-                .unwrap(),
+            source_route_epoch - checksum::crc64::checksum(label) % source_route_epoch,
         )
         .unwrap();
         let destination_epoch =
-            ClusterEpoch::new(source_epoch.get().checked_add(1).unwrap()).unwrap();
+            ClusterEpoch::new(binding.transition_epoch().get().checked_add(1).unwrap()).unwrap();
         let artifact = PgMetadataTransferArtifact {
             pg_id: binding.pg_id(),
             source_node_id: binding.source_acting_set()[0],
@@ -4717,11 +4816,11 @@ mod tests {
     }
 
     #[test]
-    fn current_metadata_transfer_staging_store_matches_frozen_v2_manifest_and_requires_version_bump(
+    fn current_metadata_transfer_staging_store_matches_frozen_v3_manifest_and_requires_version_bump(
     ) {
         assert_eq!(
             hex(&current_manifest_bytes()),
-            "4152474d5354470000026e722f4492ef06abc27ea34e6bc367916cd81c0ef362fb9c4f1e41b1e5cae494f8f99a4accd44275"
+            "4152474d535447000003643f43e864097c6001733c10fefe1649bd18411ef8c7e4392efc5e27762c1f6f2f034ddb97f20b7b"
         );
         let tmp = test_util::tempdir();
         let store = open(tmp.path());
@@ -4735,42 +4834,48 @@ mod tests {
     }
 
     #[test]
-    fn initialization_marker_v2_encoding_is_fixed() {
+    fn initialization_marker_v3_encoding_is_fixed() {
         assert_eq!(
             hex(&current_initialization_marker_bytes()),
-            "4152474d5354474900026e722f4492ef06abc27ea34e6bc367916cd81c0ef362fb9c4f1e41b1e5cae494ef0fb5aad6bd0323"
+            "4152474d535447490003643f43e864097c6001733c10fefe1649bd18411ef8c7e4392efc5e27762c1f6f38f5623b8d9b4a2d"
         );
     }
 
     #[test]
-    fn establishment_marker_v2_encoding_is_fixed() {
+    fn establishment_marker_v3_encoding_is_fixed() {
         assert_eq!(
             hex(&current_establishment_marker_bytes()),
-            "4152474d5354474500027c9533697c7a588542438ed5f246c781c987d4a750c7c2b52d8ed329cd145a1453a427f53714c545"
+            "4152474d535447450003a1d53a4cc83b031831e2c5cc0274d4d0acbde55d560a014e2b59c132195f052b0af5e90a20720eaa"
         );
     }
 
     #[test]
-    fn historical_staging_store_v1_markers_remain_exact_rejection_evidence() {
-        let manifest = decode_hex(
-            "4152474d5354470000013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed7b6fa66472b5374b",
-        );
-        let initialization = decode_hex(
-            "4152474d5354474900013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed6c99898468dc761d",
-        );
-        let establishment = decode_hex(
-            "4152474d535447450001a7221d66ea51b3a38deafc1868ce6a6b0bb884463dd56626720658a445cc29bcb4fd5b0300c7b553",
-        );
-
-        for result in [
-            validate_manifest(&manifest),
-            validate_initialization_marker(&initialization),
-            validate_establishment_marker(&establishment),
+    fn historical_staging_store_v1_v2_markers_remain_exact_rejection_evidence() {
+        for (version, manifest, initialization, establishment) in [
+            (
+                1,
+                "4152474d5354470000013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed7b6fa66472b5374b",
+                "4152474d5354474900013f41a30ad6b597e31dbdbd63329cd7ccd944c18a5c27b93f492d3f684774c2ed6c99898468dc761d",
+                "4152474d535447450001a7221d66ea51b3a38deafc1868ce6a6b0bb884463dd56626720658a445cc29bcb4fd5b0300c7b553",
+            ),
+            (
+                2,
+                "4152474d5354470000026e722f4492ef06abc27ea34e6bc367916cd81c0ef362fb9c4f1e41b1e5cae494f8f99a4accd44275",
+                "4152474d5354474900026e722f4492ef06abc27ea34e6bc367916cd81c0ef362fb9c4f1e41b1e5cae494ef0fb5aad6bd0323",
+                "4152474d5354474500027c9533697c7a588542438ed5f246c781c987d4a750c7c2b52d8ed329cd145a1453a427f53714c545",
+            ),
         ] {
-            assert!(matches!(
-                result,
-                Err(MetadataTransferStagingError::UnsupportedFormatVersion(1))
-            ));
+            for result in [
+                validate_manifest(&decode_hex(manifest)),
+                validate_initialization_marker(&decode_hex(initialization)),
+                validate_establishment_marker(&decode_hex(establishment)),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(MetadataTransferStagingError::UnsupportedFormatVersion(actual))
+                        if actual == version
+                ));
+            }
         }
     }
 
@@ -4907,7 +5012,7 @@ mod tests {
             let mut marker = current_initialization_marker_bytes();
             if corrupt_version {
                 let offset = STAGING_INITIALIZATION_MAGIC.len();
-                marker[offset..offset + 2].copy_from_slice(&3u16.to_be_bytes());
+                marker[offset..offset + 2].copy_from_slice(&4u16.to_be_bytes());
                 let checksum = checksum::crc64::checksum(&marker[..INITIALIZATION_MARKER_BODY_LEN]);
                 marker[INITIALIZATION_MARKER_BODY_LEN..].copy_from_slice(&checksum.to_be_bytes());
             } else {
@@ -4923,7 +5028,7 @@ mod tests {
             if corrupt_version {
                 assert!(matches!(
                     error,
-                    MetadataTransferStagingError::UnsupportedFormatVersion(3)
+                    MetadataTransferStagingError::UnsupportedFormatVersion(4)
                 ));
             } else {
                 assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
@@ -4944,7 +5049,7 @@ mod tests {
             let mut marker = current_establishment_marker_bytes();
             if corrupt_version {
                 let offset = STAGING_ESTABLISHMENT_MAGIC.len();
-                marker[offset..offset + 2].copy_from_slice(&3u16.to_be_bytes());
+                marker[offset..offset + 2].copy_from_slice(&4u16.to_be_bytes());
                 let checksum = checksum::crc64::checksum(&marker[..ESTABLISHMENT_MARKER_BODY_LEN]);
                 marker[ESTABLISHMENT_MARKER_BODY_LEN..].copy_from_slice(&checksum.to_be_bytes());
             } else {
@@ -4961,7 +5066,7 @@ mod tests {
             if corrupt_version {
                 assert!(matches!(
                     error,
-                    MetadataTransferStagingError::UnsupportedFormatVersion(3)
+                    MetadataTransferStagingError::UnsupportedFormatVersion(4)
                 ));
             } else {
                 assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
@@ -5117,7 +5222,7 @@ mod tests {
 
     #[test]
     fn staging_store_rejects_adjacent_versions_without_mutation() {
-        for version in [1u16, 3] {
+        for version in [1u16, 2, 4] {
             let tmp = test_util::tempdir();
             let store = open(tmp.path());
             drop(store);
@@ -5144,8 +5249,8 @@ mod tests {
     }
 
     #[test]
-    fn staged_artifact_format_accepts_only_exact_v2() {
-        for version in [1, 3] {
+    fn staged_artifact_format_accepts_only_exact_v3() {
+        for version in [1, 2, 4] {
             let error = MetadataTransferStagingIntent::for_unavailable_transition(
                 &binding(),
                 [7; DIGEST_LEN],
@@ -5180,7 +5285,7 @@ mod tests {
         let artifact = PgMetadataTransferArtifact {
             pg_id: PgId::new(19),
             source_node_id: NodeId::new(1),
-            cluster_epoch: ClusterEpoch::new(12).unwrap(),
+            cluster_epoch: ClusterEpoch::new(11).unwrap(),
             base_kind: PgMetadataTransferBaseKind::Empty,
             base_proof: PgMetadataProof::empty(),
             checkpoint_base: None,
@@ -5214,6 +5319,21 @@ mod tests {
         forged_store.create_intent(&forged_intent).unwrap();
         assert!(matches!(
             forged_store.publish_artifact(&forged_intent, &forged),
+            Err(MetadataTransferStagingError::ArtifactSemanticMismatch(_))
+        ));
+
+        let future_artifact = PgMetadataTransferArtifact {
+            cluster_epoch: ClusterEpoch::new(12).unwrap(),
+            ..artifact
+        };
+        let future_bytes =
+            encode_staged_metadata_transfer_artifact(&future_artifact, destination_epoch).unwrap();
+        let future_intent = intent(&future_bytes);
+        let future_tmp = test_util::tempdir();
+        let future_store = open(future_tmp.path());
+        future_store.create_intent(&future_intent).unwrap();
+        assert!(matches!(
+            future_store.publish_artifact(&future_intent, &future_bytes),
             Err(MetadataTransferStagingError::ArtifactSemanticMismatch(_))
         ));
     }
@@ -5355,6 +5475,21 @@ mod tests {
                 if message.contains("not a destination")
         ));
 
+        let cross_member =
+            crate::control_plane::tests::transitions::authenticated_staging_authorization_fixture();
+        assert!(matches!(
+            store.create_intent_authorized(
+                &cross_member.cross_member_authorization,
+                &cross_member.cross_member_intent,
+            ),
+            Err(MetadataTransferStagingError::IntentConflict(message))
+                if message.contains("not bound to this staging actor and PG")
+        ));
+        assert!(!store.has_intent_for_test(
+            cross_member.cross_member_intent.pg_id(),
+            cross_member.cross_member_intent.staging_generation(),
+        ));
+
         let valid_artifact = canonical_artifact(b"valid artifact");
         let valid = intent(valid_artifact);
         assert_eq!(
@@ -5369,7 +5504,11 @@ mod tests {
     }
 
     #[test]
-    fn staging_receipt_v2_encoding_is_fixed() {
+    fn staging_receipt_v3_encoding_is_fixed_and_v2_remains_rejected() {
+        let historical_v2 = decode_hex(
+            "4152474d494e2d53544147494e472d45564944454e43452d5632000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0a2188fce572c606858dffa56cc1590344a166e9ff8858bab341658e0c2e596000000000000000930002000000000000000d01000000000000000b0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007",
+        );
+        assert!(decode_staging_evidence(&historical_v2).is_err());
         let artifact = canonical_artifact(b"one retained metadata command receipt");
         let expected_intent = intent(artifact);
         let receipt = encode_staging_evidence(
@@ -5384,7 +5523,7 @@ mod tests {
         );
         assert_eq!(
             hex(&receipt),
-            "4152474d494e2d53544147494e472d45564944454e43452d5632000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0a2188fce572c606858dffa56cc1590344a166e9ff8858bab341658e0c2e596000000000000000930002000000000000000d01000000000000000b0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
+            "4152474d494e2d53544147494e472d45564944454e43452d5633000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0efadd220adcc57506f8a395ce807f64911785127f9af6724bde5399ea513ba500000000000000930003000000000000000d01000000000000000b0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
         );
         validate_staging_evidence(&receipt, &expected_intent, 0, &identity()).unwrap();
         assert!(MetadataTransferStagingReceipt::from_publication_bytes(
@@ -5796,7 +5935,7 @@ mod tests {
 
     #[test]
     fn catalogue_rejects_adjacent_versions_and_schema_changes_without_repair() {
-        for version in [0u32, 1, 3] {
+        for version in [0u32, 1, 2, 4] {
             let tmp = test_util::tempdir();
             drop(open(tmp.path()));
             let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
@@ -6283,7 +6422,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_evidence_page_and_apply_receipt_v2_encodings_are_fixed() {
+    fn staging_evidence_page_and_apply_receipt_v3_encodings_are_fixed() {
         let tmp = test_util::tempdir();
         let artifact = canonical_artifact(b"fixed evidence page artifact");
         let intent = intent(artifact);
@@ -6295,11 +6434,11 @@ mod tests {
 
         assert_eq!(
             hex(page.operation_payload()),
-            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56320000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000001014152474d494e2d53544147494e472d45564944454e43452d5632000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000cdf119ce6d30f03ee41c522f38a714f40c51f6203f5686863315034ea17d5815c0000000000000093000200000000000003340100000000000003330000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
+            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56330000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000001014152474d494e2d53544147494e472d45564944454e43452d5633000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0efadd220adcc57506f8a395ce807f64911785127f9af6724bde5399ea513ba500000000000000930003000000000000000d01000000000000000a0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
         );
         assert_eq!(
             hex(receipt.as_bytes()),
-            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56320000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001d21dec7bc9da9454bf830dd0c5b7d398f5de9db47b004d49fa396e8eb8ef76ea0000000000000001"
+            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56330000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000015318b54c537c0c6ffa829573687a23ffcc84968b7f56fa41d947adf146c89b570000000000000001"
         );
     }
 
@@ -6316,6 +6455,21 @@ mod tests {
         );
 
         assert!(decode_staging_evidence(&evidence).is_err());
+        assert!(
+            decode_staging_evidence_page_payload(&page, checksum::sha256::digest(&page)).is_err()
+        );
+        assert!(decode_staging_evidence_apply_receipt(&apply_receipt).is_err());
+    }
+
+    #[test]
+    fn historical_staging_evidence_v2_page_and_apply_receipt_remain_rejected() {
+        let page = decode_hex(
+            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56320000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000001014152474d494e2d53544147494e472d45564944454e43452d5632000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000cdf119ce6d30f03ee41c522f38a714f40c51f6203f5686863315034ea17d5815c0000000000000093000200000000000003340100000000000003330000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007",
+        );
+        let apply_receipt = decode_hex(
+            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56320000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001d21dec7bc9da9454bf830dd0c5b7d398f5de9db47b004d49fa396e8eb8ef76ea0000000000000001",
+        );
+
         assert!(
             decode_staging_evidence_page_payload(&page, checksum::sha256::digest(&page)).is_err()
         );

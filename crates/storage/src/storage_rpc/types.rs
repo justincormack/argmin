@@ -220,6 +220,7 @@ pub(crate) enum StorageRpcWireErrorCode {
     MultipartConditionalRequestConflict = 25,
     MetadataCommandIntegrity = 26,
     MetadataCommandMutationUncertain = 27,
+    StagingAuthorizationNotObserved = 28,
 }
 
 pub(crate) type StorageRpcErrorCode = StorageNodeFailure;
@@ -266,6 +267,8 @@ impl StorageNodeFailure {
         Self(StorageRpcWireErrorCode::MetadataCommandIntegrity);
     pub(crate) const MetadataCommandMutationUncertain: Self =
         Self(StorageRpcWireErrorCode::MetadataCommandMutationUncertain);
+    pub(crate) const StagingAuthorizationNotObserved: Self =
+        Self(StorageRpcWireErrorCode::StagingAuthorizationNotObserved);
 
     fn from_u16(value: u16) -> Result<Self, StorageRpcPayloadError> {
         match value {
@@ -296,6 +299,7 @@ impl StorageNodeFailure {
             25 => Ok(Self::MultipartConditionalRequestConflict),
             26 => Ok(Self::MetadataCommandIntegrity),
             27 => Ok(Self::MetadataCommandMutationUncertain),
+            28 => Ok(Self::StagingAuthorizationNotObserved),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),
@@ -2682,17 +2686,23 @@ pub(crate) struct StorageRpcMetadataCommandTransferCheckpointBaseRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataTransferStagingIntentCreateRequest {
+    pub(crate) authorization:
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
     pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataTransferStagingArtifactPublishRequest {
+    pub(crate) authorization:
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
     pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
     pub(crate) artifact: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataTransferStagingProofPublishRequest {
+    pub(crate) authorization:
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
     pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
     pub(crate) target_epoch: ClusterEpoch,
 }

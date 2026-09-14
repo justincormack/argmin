@@ -296,7 +296,22 @@ fn control_plane_rpc_v18_frame_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v20_frame_encoding_is_exact() {
+fn control_plane_rpc_v20_frame_remains_rejected_evidence() {
+    const FRAME: &[u8] = &[
+        97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97, 110,
+        101, 45, 114, 112, 99, 0, 20, 0, 12, 0, 0, 0, 3, 213, 207, 126, 151, 150, 219, 145, 206, 1,
+        2, 3,
+    ];
+    let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(FRAME)).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str() == "unsupported control-plane RPC version 20"
+    ));
+}
+
+#[test]
+fn control_plane_rpc_v21_frame_encoding_is_exact() {
     let frame =
         encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
             .unwrap();
@@ -305,8 +320,8 @@ fn control_plane_rpc_v20_frame_encoding_is_exact() {
         frame,
         [
             97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
-            110, 101, 45, 114, 112, 99, 0, 20, 0, 12, 0, 0, 0, 3, 213, 207, 126, 151, 150, 219,
-            145, 206, 1, 2, 3,
+            110, 101, 45, 114, 112, 99, 0, 21, 0, 12, 0, 0, 0, 3, 135, 188, 48, 52, 113, 253, 109,
+            154, 1, 2, 3,
         ]
     );
 }
@@ -332,7 +347,17 @@ fn control_plane_rpc_frame_marker_failures_are_typed() {
         Err(ControlPlaneRpcFrameFormatError::UnknownMagic)
     );
 
-    for version in [13, 14, 15, 16, 17, 18, 19, CONTROL_PLANE_RPC_VERSION + 1] {
+    for version in [
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        CONTROL_PLANE_RPC_VERSION + 1,
+    ] {
         let mut unsupported = Vec::from(CONTROL_PLANE_RPC_MAGIC);
         unsupported.extend_from_slice(&version.to_be_bytes());
         assert_eq!(
@@ -1425,15 +1450,15 @@ fn canonical_snapshot_with_node() -> ClusterControlSnapshot {
 }
 
 #[test]
-fn runtime_map_current_state_digest_v3_is_stable() {
+fn runtime_map_current_state_digest_v4_is_stable() {
     let control_snapshot = canonical_snapshot_with_node();
     let runtime_map = rpc::runtime_map_test_snapshot_with_active_route();
 
     assert_eq!(
         runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
         [
-            115, 66, 203, 234, 194, 85, 22, 244, 172, 73, 200, 107, 65, 138, 49, 98, 196, 61, 209,
-            119, 184, 25, 153, 248, 201, 136, 48, 77, 224, 251, 175, 144,
+            80, 218, 200, 242, 185, 195, 41, 114, 198, 162, 33, 132, 151, 163, 175, 7, 198, 170,
+            85, 0, 57, 226, 178, 255, 0, 199, 69, 98, 246, 50, 229, 152,
         ]
     );
 }
@@ -1604,15 +1629,15 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         require_current_control_plane_state_version(None),
         Err(ControlPlaneStateVersionError::Missing)
     );
-    for version in [28, 29, 30, 31, 32, 33, 34, 35, 37] {
+    for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 38] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
             Err(ControlPlaneStateVersionError::Unsupported(version))
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(36)),
-        Ok(36)
+        require_current_control_plane_state_version(Some(37)),
+        Ok(37)
     );
 
     assert!(matches!(
@@ -1827,11 +1852,29 @@ fn canonical_control_plane_state_v35_text_remains_rejected_evidence() {
 }
 
 #[test]
-fn canonical_control_plane_state_v36_text_is_exact() {
+fn canonical_control_plane_state_v36_text_remains_rejected_evidence() {
+    const V36: &str = concat!(
+        "version=36\n",
+        "authority_incarnation=1\n",
+        "cluster_epoch=1\n",
+        "initial_topology=-\n",
+        "max_committed_timestamp_ms=123\n",
+        "lease_grant_horizon=-\n",
+        "node=1,active,1,healthy,11,1,100,200,-,6e6f64652d312e736f636b\n",
+    );
+    assert!(matches!(
+        parse_snapshot(V36),
+        Err(ControlPlaneError::Parse { line: 1, message })
+            if message == "unsupported control-plane state version 36"
+    ));
+}
+
+#[test]
+fn canonical_control_plane_state_v37_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=36\n",
+            "version=37\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -1967,7 +2010,37 @@ fn canonical_control_plane_state_v33_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v36_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v36_representative_aggregate_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("testdata/state_v36_representative.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            38_995,
+            "2eedd2196545416805fdd55f11d193d7819340a369edc15187113fb73f64e9a1".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0;
+    while !remaining.is_empty() {
+        let (length, tail) = remaining.split_at(8);
+        let length = usize::try_from(u64::from_be_bytes(length.try_into().unwrap())).unwrap();
+        let (snapshot, tail) = tail.split_at(length);
+        assert!(matches!(
+            parse_snapshot(std::str::from_utf8(snapshot).unwrap()),
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 36"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > 1, "v36 aggregate must contain a corpus");
+}
+
+#[test]
+fn canonical_control_plane_state_v37_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -2572,7 +2645,7 @@ fn canonical_control_plane_state_v36_representative_aggregate_is_stable() {
         aggregate_text.push_str(&formatted);
     }
     for required_record in [
-        "version=36\n",
+        "version=37\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -2602,7 +2675,7 @@ fn canonical_control_plane_state_v36_representative_aggregate_is_stable() {
         ),
         (
             38_995,
-            "2eedd2196545416805fdd55f11d193d7819340a369edc15187113fb73f64e9a1".to_owned()
+            "5e09f13e0d032acbd63811fd768a3b9d79f9535feaf0370c5dea89bc808b2f51".to_owned()
         )
     );
 }
@@ -5663,7 +5736,7 @@ mod routing;
 mod pg_lifecycle;
 
 #[path = "tests/transitions.rs"]
-mod transitions;
+pub(crate) mod transitions;
 
 #[test]
 fn heartbeat_lease_is_issued_after_persisted_epoch_map_tuple() {

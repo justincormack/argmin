@@ -340,7 +340,44 @@ fn control_plane_rpc_catalogue_staging_page() -> MetadataTransferStagingEvidence
 }
 
 #[test]
-fn control_plane_rpc_v20_staging_evidence_frames_are_exact() {
+fn control_plane_rpc_v20_staging_evidence_frames_remain_rejected_evidence() {
+    for (frame, expected_len, expected_digest) in [
+        (
+            include_bytes!("../testdata/rpc_v20_staging_request_genesis.frame").as_slice(),
+            468,
+            "15bc016bd360627200cfb3b98248a6ebd1f9bbfb636c6effebae08a255f32bfe",
+        ),
+        (
+            include_bytes!("../testdata/rpc_v20_staging_response_genesis.frame").as_slice(),
+            214,
+            "bee0379f5da51fc501859b8379c35a80d961e49ef142f030ae71104db9087a3b",
+        ),
+        (
+            include_bytes!("../testdata/rpc_v20_staging_request_successor.frame").as_slice(),
+            408,
+            "5a80f9b90c622202a9675218177b22a9e95415c64139cf5a4197845894e24bef",
+        ),
+        (
+            include_bytes!("../testdata/rpc_v20_staging_response_successor.frame").as_slice(),
+            214,
+            "4968d40ed671495bf7dfc6538f7ab0ed56dc0aea7418f00adf0d4616baf2ad4d",
+        ),
+    ] {
+        assert_eq!(frame.len(), expected_len);
+        assert_eq!(
+            hex_encode(&checksum::sha256::digest(frame)),
+            expected_digest
+        );
+        assert!(matches!(
+            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+            Err(ControlPlaneError::RpcProtocol { diagnostic })
+                if diagnostic.as_str() == "unsupported control-plane RPC version 20"
+        ));
+    }
+}
+
+#[test]
+fn control_plane_rpc_v21_staging_evidence_frames_are_exact() {
     let genesis = control_plane_rpc_catalogue_staging_page();
     let genesis_receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&genesis);
     let successor = metadata_transfer_staging_evidence_page_for_test(
@@ -380,15 +417,15 @@ fn control_plane_rpc_v20_staging_evidence_frames_are_exact() {
         [
             (
                 468,
-                "15bc016bd360627200cfb3b98248a6ebd1f9bbfb636c6effebae08a255f32bfe".to_owned(),
+                "9735d5c659430811cb6dd82184bf5643053391128ad31b81a142f575a5a94aed".to_owned(),
                 214,
-                "bee0379f5da51fc501859b8379c35a80d961e49ef142f030ae71104db9087a3b".to_owned(),
+                "10e4f160d95a586c5a67346a2bf5f53d2ddc63ad6d9fa4f05961386863c1c898".to_owned(),
             ),
             (
                 408,
-                "5a80f9b90c622202a9675218177b22a9e95415c64139cf5a4197845894e24bef".to_owned(),
+                "be75dff9edcde7b3d1d31a4b64083125e6319a626fcc62d9bf64af443a94fd15".to_owned(),
                 214,
-                "4968d40ed671495bf7dfc6538f7ab0ed56dc0aea7418f00adf0d4616baf2ad4d".to_owned(),
+                "b2d46c47ea1cb0658dbb8498250c73fdce0b72f90f5db5bf8326c15c208884ad".to_owned(),
             ),
         ]
     );
@@ -1550,7 +1587,38 @@ fn control_plane_rpc_v18_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v20_operation_catalogue_is_exact() {
+fn control_plane_rpc_v20_operation_catalogue_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v20_operation.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            15_117,
+            "094ddb4121c20cc79579482e0e98b80f27421a865790b647fad5f3029a2c12dd".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0_usize;
+    while !remaining.is_empty() {
+        let (_section, tail) = remaining.split_first().unwrap();
+        let (raw_len, tail) = tail.split_at(4);
+        let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+        let (frame, tail) = tail.split_at(len);
+        assert!(matches!(
+            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+            Err(ControlPlaneError::RpcProtocol { diagnostic })
+                if diagnostic.as_str() == "unsupported control-plane RPC version 20"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > ControlPlaneRpcKind::ALL.len());
+}
+
+#[test]
+fn control_plane_rpc_v21_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -1763,8 +1831,8 @@ fn control_plane_rpc_v20_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            15_117,
-            "094ddb4121c20cc79579482e0e98b80f27421a865790b647fad5f3029a2c12dd".to_owned()
+            15_193,
+            "c4560adbeb5be3d23db767c7f3275caa64b7059448023d12ab34030d81ff735f".to_owned()
         )
     );
 }
@@ -1915,8 +1983,41 @@ fn authenticated_control_plane_rpc_v19_auth_v2_payload_binding_remains_rejected_
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v20_auth_v2_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 20);
+fn authenticated_control_plane_rpc_v20_auth_v2_payload_binding_remains_rejected_evidence() {
+    let kind = ControlPlaneRpcKind::RuntimeMapStatus;
+    let credential = frontend_auth_credential("auth-cluster", "frontend-1");
+    let request = signed_frontend_runtime_map_request(
+        kind,
+        &credential,
+        Vec::new(),
+        Some(1_000),
+        Some(6_000),
+    );
+    let response = signed_runtime_map_response_payload(kind, &credential, vec![0xa5, 0x5a], 1_001);
+    let request_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 20).unwrap();
+    let response_frame = encode_control_plane_rpc_frame_with_version(kind, &response, 20).unwrap();
+    assert_eq!(
+        (
+            request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&request_frame)),
+            response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&response_frame)),
+        ),
+        (
+            182,
+            "51d44a3b6a3b2fd7b5a2023f5295404fdbd4bb0c22763fc1c465ba18221cc0d5".to_owned(),
+            190,
+            "134a93cdda52e552d882626b326e0ffb755f9418aeb5457b36e71f54c614d3e0".to_owned(),
+        )
+    );
+    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(request_frame)).is_err());
+    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(response_frame)).is_err());
+}
+
+#[test]
+fn authenticated_control_plane_rpc_v21_auth_v2_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 21);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -1962,9 +2063,9 @@ fn authenticated_control_plane_rpc_v20_auth_v2_payload_bindings_are_exact() {
         ),
         (
             182,
-            "51d44a3b6a3b2fd7b5a2023f5295404fdbd4bb0c22763fc1c465ba18221cc0d5".to_owned(),
+            "2b27c639ed0c6ccd8b6c781ad6e321fed4a1464fd8f12cb5a868543ce5bc91bf".to_owned(),
             190,
-            "134a93cdda52e552d882626b326e0ffb755f9418aeb5457b36e71f54c614d3e0".to_owned(),
+            "54745c61058a7d6ae389e4df5337b586f73c71cee3c20d39a3464f0b738c6063".to_owned(),
         )
     );
 }
@@ -12404,7 +12505,7 @@ fn write_runtime_map_test_single_authority_proof(out: &mut Vec<u8>) {
     write_u64(out, 1_000);
 }
 
-fn decode_runtime_map_test_snapshot(
+pub(super) fn decode_runtime_map_test_snapshot(
     snapshot: ClusterRuntimeMapSnapshot,
 ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
     let mut payload = Vec::new();
@@ -12426,6 +12527,7 @@ fn runtime_map_test_snapshot(
         pg_routes: Vec::new(),
         historical_pg_routes: Vec::new(),
         historical_cluster_epochs: Vec::new(),
+        staging_authorizations: Vec::new(),
     }
 }
 
@@ -12460,6 +12562,7 @@ pub(super) fn runtime_map_test_snapshot_with_active_route() -> ClusterRuntimeMap
         }],
         historical_pg_routes: Vec::new(),
         historical_cluster_epochs: Vec::new(),
+        staging_authorizations: Vec::new(),
     }
 }
 
@@ -12713,6 +12816,7 @@ fn route_map_validity_rejects_reserved_unbounded_deadline() {
     write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);
+    write_u32(&mut payload, 0);
 
     let mut reader = PayloadReader::new(&payload);
     assert!(matches!(
@@ -12728,6 +12832,7 @@ fn control_plane_rpc_rejects_unbounded_runtime_map_validity() {
     write_u64(&mut payload, ClusterEpoch::INITIAL.get());
     write_option_u64(&mut payload, None);
     write_runtime_map_test_single_authority_proof(&mut payload);
+    write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);

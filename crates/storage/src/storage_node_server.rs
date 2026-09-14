@@ -601,6 +601,26 @@ include!("storage_node_server/admission.rs");
 include!("storage_node_server/routes.rs");
 
 impl StorageNodeConnectionHandler {
+    fn verify_staging_authorization(
+        &self,
+        presented: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+        pg_id: PgId,
+    ) -> Result<
+        crate::control_plane_command::CommittedUnavailablePgStagingAuthorization,
+        crate::control_plane::StagingAuthorizationVerificationError,
+    > {
+        let route_state = self
+            .runtime_route_source
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        route_state.staging_authorizations.verify(
+            route_state.config.node_id(),
+            pg_id,
+            route_state.config.cluster_epoch(),
+            presented,
+        )
+    }
+
     fn read_request_frame(
         &self,
         stream: &mut BoxStorageRpcStream,
@@ -8288,7 +8308,17 @@ impl StorageNodeConnectionHandler {
                 message: "metadata-transfer staging is not configured".to_owned(),
             });
         };
-        match store.create_intent(&request.intent) {
+        let authorization = match self
+            .verify_staging_authorization(&request.authorization, request.intent.pg_id())
+        {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&staging_authorization_error_response(
+                    error,
+                ));
+            }
+        };
+        match store.create_intent_authorized(&authorization, &request.intent) {
             Ok(_) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&staging_error_response(error)),
         }
@@ -8304,7 +8334,18 @@ impl StorageNodeConnectionHandler {
                 message: "metadata-transfer staging is not configured".to_owned(),
             });
         };
-        match store.publish_artifact(&request.intent, &request.artifact) {
+        let authorization = match self
+            .verify_staging_authorization(&request.authorization, request.intent.pg_id())
+        {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&staging_authorization_error_response(
+                    error,
+                ));
+            }
+        };
+        match store.publish_artifact_authorized(&authorization, &request.intent, &request.artifact)
+        {
             Ok(receipt) => Ok(encode_storage_rpc_success_response(
                 &encode_metadata_transfer_staging_receipt_response(&receipt),
             )),
@@ -8322,7 +8363,21 @@ impl StorageNodeConnectionHandler {
                 message: "metadata-transfer staging is not configured".to_owned(),
             });
         };
-        match store.publish_proof_for_epoch(&request.intent, request.target_epoch) {
+        let authorization = match self
+            .verify_staging_authorization(&request.authorization, request.intent.pg_id())
+        {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&staging_authorization_error_response(
+                    error,
+                ));
+            }
+        };
+        match store.publish_proof_for_epoch_authorized(
+            &authorization,
+            &request.intent,
+            request.target_epoch,
+        ) {
             Ok(receipt) => Ok(encode_storage_rpc_success_response(
                 &encode_metadata_transfer_staging_receipt_response(&receipt),
             )),
@@ -9431,6 +9486,26 @@ fn staging_error_response(error: MetadataTransferStagingError) -> StorageRpcErro
             code: StorageRpcErrorCode::Internal,
             message: "metadata-transfer staging operation failed".to_owned(),
         },
+    }
+}
+
+fn staging_authorization_error_response(
+    error: crate::control_plane::StagingAuthorizationVerificationError,
+) -> StorageRpcErrorResponse {
+    match error {
+        crate::control_plane::StagingAuthorizationVerificationError::NotObserved => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StagingAuthorizationNotObserved,
+                message: "committed metadata-transfer staging authorization has not been observed"
+                    .to_owned(),
+            }
+        }
+        crate::control_plane::StagingAuthorizationVerificationError::Invalid(error) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: error.retained_diagnostic_message(),
+            }
+        }
     }
 }
 

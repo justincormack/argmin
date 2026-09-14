@@ -243,13 +243,20 @@ fn message_kind_request_max_payload_len(
             STORAGE_RPC_MAX_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataTransferStagingIntentCreate => {
-            4 + MAX_STAGING_INTENT_BYTES
+            STORAGE_RPC_STAGING_AUTHORIZATION_PRESENTATION_OVERHEAD
+                + STORAGE_RPC_MAX_STAGING_AUTHORIZATION_BYTES
+                + 4
+                + MAX_STAGING_INTENT_BYTES
         }
         StorageRpcMessageKind::MetadataTransferStagingArtifactPublish => {
             STORAGE_RPC_MAX_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataTransferStagingProofPublish => {
-            4 + MAX_STAGING_INTENT_BYTES + 8
+            STORAGE_RPC_STAGING_AUTHORIZATION_PRESENTATION_OVERHEAD
+                + STORAGE_RPC_MAX_STAGING_AUTHORIZATION_BYTES
+                + 4
+                + MAX_STAGING_INTENT_BYTES
+                + 8
         }
         StorageRpcMessageKind::ReadHandlesAcquire => {
             STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN

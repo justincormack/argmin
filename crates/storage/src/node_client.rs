@@ -19,6 +19,7 @@ use super::ObjectMetadataPgId;
 use super::ObjectMetadataScanPgId;
 use super::PreparedRetainedStreamUploadAbort;
 use crate::control_plane::{CanonicalStateDigest, MetadataCommandLogHash, PgMetadataReadRoute};
+use crate::control_plane_command::CommittedUnavailablePgStagingAuthorization;
 use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceMultipartCompletionBarrierCommand, BucketPropertyMutation,

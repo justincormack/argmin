@@ -527,7 +527,7 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
         ),
         (
             2196,
-            "2f7fa2c02f753cdfe26d9146ade7af2d522cfb82a9221a6a83edbc8fa44da607"
+            "bb03ca7958a9206082281c2b0a5369eae025465ec527541159bf8b6d2a6d89c8"
                 .to_string()
         )
     );
@@ -557,7 +557,7 @@ fn control_plane_raft_restart_v5_rejects_noncurrent_nested_versions() {
     };
     let encoded = artifact.encode_durable_artifact().unwrap();
 
-    for version in [16, 20, 21, 22, 23, 25] {
+    for version in [16, 20, 21, 22, 23, 24, 26] {
         let previous =
             crate::control_plane_command::encode_control_plane_command_with_version_for_test(
                 &command, version,
@@ -586,7 +586,7 @@ fn control_plane_raft_restart_v5_rejects_noncurrent_nested_versions() {
             );
         }
     }
-    for version in [29, 32, 33, 34, 35, 37] {
+    for version in [29, 32, 33, 34, 35, 36, 38] {
         let previous =
             crate::control_plane_command::reseal_control_plane_snapshot_state_version_for_test(
                 &current_snapshot,

@@ -1,6 +1,43 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+fn put_staging_authorization_presentation(
+    out: &mut Vec<u8>,
+    authorization: &UnavailablePgStagingAuthorizationPresentation,
+) -> Result<(), StorageRpcPayloadError> {
+    let command = authorization.encode_command().map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "committed authorization is invalid",
+        )
+    })?;
+    put_u64(out, authorization.committed_epoch().get());
+    out.extend_from_slice(&authorization.batch_members_digest());
+    put_bytes(out, &command);
+    Ok(())
+}
+
+fn read_staging_authorization_presentation(
+    decoder: &mut StorageRpcDecoder<'_>,
+) -> Result<UnavailablePgStagingAuthorizationPresentation, StorageRpcPayloadError> {
+    let committed_epoch = decoder.read_cluster_epoch()?;
+    let batch_members_digest = decoder
+        .read_exact(32)?
+        .try_into()
+        .map_err(|_| StorageRpcPayloadError::Truncated)?;
+    let command = decoder
+        .read_bytes_with_payload_limit(STORAGE_RPC_MAX_STAGING_AUTHORIZATION_BYTES)?;
+    UnavailablePgStagingAuthorizationPresentation::decode_command(
+        command,
+        committed_epoch,
+        batch_members_digest,
+    )
+    .map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "committed authorization is invalid",
+        )
+    })
+}
+
 pub(crate) fn encode_metadata_command_item(
     item: &StorageRpcMetadataCommandItem,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -37,6 +74,7 @@ pub(crate) fn encode_metadata_transfer_staging_intent_create_request(
         StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
     })?;
     let mut out = Vec::new();
+    put_staging_authorization_presentation(&mut out, &request.authorization)?;
     put_bytes(&mut out, &intent);
     Ok(out)
 }
@@ -45,12 +83,16 @@ pub(crate) fn decode_metadata_transfer_staging_intent_create_request(
     bytes: &[u8],
 ) -> Result<StorageRpcMetadataTransferStagingIntentCreateRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
+    let authorization = read_staging_authorization_presentation(&mut decoder)?;
     let intent = decoder.read_bytes_with_payload_limit(MAX_STAGING_INTENT_BYTES)?;
     decoder.finish()?;
     let intent = decode_staging_intent(intent).map_err(|_| {
         StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
     })?;
-    Ok(StorageRpcMetadataTransferStagingIntentCreateRequest { intent })
+    Ok(StorageRpcMetadataTransferStagingIntentCreateRequest {
+        authorization,
+        intent,
+    })
 }
 
 pub(crate) fn encode_metadata_transfer_staging_artifact_publish_request(
@@ -73,6 +115,7 @@ pub(crate) fn encode_metadata_transfer_staging_artifact_publish_request(
         ));
     }
     let mut out = Vec::new();
+    put_staging_authorization_presentation(&mut out, &request.authorization)?;
     put_bytes(&mut out, &intent);
     put_bytes(&mut out, &request.artifact);
     Ok(out)
@@ -82,6 +125,7 @@ pub(crate) fn decode_metadata_transfer_staging_artifact_publish_request(
     bytes: &[u8],
 ) -> Result<StorageRpcMetadataTransferStagingArtifactPublishRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
+    let authorization = read_staging_authorization_presentation(&mut decoder)?;
     let intent = decoder.read_bytes_with_payload_limit(MAX_STAGING_INTENT_BYTES)?;
     let intent = decode_staging_intent(intent).map_err(|_| {
         StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
@@ -97,7 +141,11 @@ pub(crate) fn decode_metadata_transfer_staging_artifact_publish_request(
             "artifact does not match its intent",
         ));
     }
-    Ok(StorageRpcMetadataTransferStagingArtifactPublishRequest { intent, artifact })
+    Ok(StorageRpcMetadataTransferStagingArtifactPublishRequest {
+        authorization,
+        intent,
+        artifact,
+    })
 }
 
 pub(crate) fn encode_metadata_transfer_staging_proof_publish_request(
@@ -107,6 +155,7 @@ pub(crate) fn encode_metadata_transfer_staging_proof_publish_request(
         StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
     })?;
     let mut out = Vec::new();
+    put_staging_authorization_presentation(&mut out, &request.authorization)?;
     put_bytes(&mut out, &intent);
     put_u64(&mut out, request.target_epoch.get());
     Ok(out)
@@ -116,6 +165,7 @@ pub(crate) fn decode_metadata_transfer_staging_proof_publish_request(
     bytes: &[u8],
 ) -> Result<StorageRpcMetadataTransferStagingProofPublishRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
+    let authorization = read_staging_authorization_presentation(&mut decoder)?;
     let intent = decoder.read_bytes_with_payload_limit(MAX_STAGING_INTENT_BYTES)?;
     let intent = decode_staging_intent(intent).map_err(|_| {
         StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
@@ -128,6 +178,7 @@ pub(crate) fn decode_metadata_transfer_staging_proof_publish_request(
         ));
     }
     Ok(StorageRpcMetadataTransferStagingProofPublishRequest {
+        authorization,
         intent,
         target_epoch,
     })

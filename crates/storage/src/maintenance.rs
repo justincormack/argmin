@@ -987,7 +987,8 @@ fn storage_node_failure_is_shard_backfill_stale_retry(failure: StorageNodeFailur
         | StorageNodeFailureClass::PgRouteUnavailable
         | StorageNodeFailureClass::TransportInterrupted => true,
         StorageNodeFailureClass::MetadataCommandContention
-        | StorageNodeFailureClass::MetadataTransferHistoricalRouteActive => false,
+        | StorageNodeFailureClass::MetadataTransferHistoricalRouteActive
+        | StorageNodeFailureClass::StagingAuthorizationNotObserved => false,
     }
 }
 

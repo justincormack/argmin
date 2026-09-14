@@ -54,6 +54,7 @@ pub(crate) enum StorageNodeFailureClass {
     PgRouteUnavailable,
     MetadataCommandContention,
     MetadataTransferHistoricalRouteActive,
+    StagingAuthorizationNotObserved,
     TransportInterrupted,
 }
 
@@ -833,7 +834,8 @@ impl StoreError {
                 | StorageRpcWireErrorCode::WrongClusterEpoch
                 | StorageRpcWireErrorCode::TransportTimeout
                 | StorageRpcWireErrorCode::TransportClosed
-                | StorageRpcWireErrorCode::MetadataCommandMutationUncertain => {
+                | StorageRpcWireErrorCode::MetadataCommandMutationUncertain
+                | StorageRpcWireErrorCode::StagingAuthorizationNotObserved => {
                     StoreOperationFailureClass::RetryableConvergence
                 }
                 StorageRpcWireErrorCode::FrameDecode
@@ -1003,6 +1005,7 @@ impl StoreError {
                 | StorageRpcWireErrorCode::InactivePgRoute
                 | StorageRpcWireErrorCode::NonActingSetAccess
                 | StorageRpcWireErrorCode::WrongClusterEpoch
+                | StorageRpcWireErrorCode::StagingAuthorizationNotObserved
                 | StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive => {
                     StoreFailureDiagnosticCategory::Topology
                 }
@@ -1080,6 +1083,9 @@ impl StoreError {
                 }
                 StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive => {
                     Some(StorageNodeFailureClass::MetadataTransferHistoricalRouteActive)
+                }
+                StorageRpcWireErrorCode::StagingAuthorizationNotObserved => {
+                    Some(StorageNodeFailureClass::StagingAuthorizationNotObserved)
                 }
                 StorageRpcWireErrorCode::TransportTimeout
                 | StorageRpcWireErrorCode::TransportClosed => {
@@ -1962,6 +1968,7 @@ fn storage_node_failure_requires_metadata_transfer_route_refresh(
         StorageNodeFailureClass::ShardLocationStale
         | StorageNodeFailureClass::MetadataCommandContention
         | StorageNodeFailureClass::MetadataTransferHistoricalRouteActive
+        | StorageNodeFailureClass::StagingAuthorizationNotObserved
         | StorageNodeFailureClass::TransportInterrupted => true,
         StorageNodeFailureClass::PgRouteUnavailable => false,
     }

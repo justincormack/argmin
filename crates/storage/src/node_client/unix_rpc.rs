@@ -2877,10 +2877,32 @@ impl UnixStorageNodeClient {
     #[allow(dead_code)]
     pub(crate) fn create_metadata_transfer_staging_intent(
         &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<(), StoreError> {
+        self.create_metadata_transfer_staging_intent_with_presentation(
+            authorization.presentation(),
+            intent,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_metadata_transfer_staging_intent_with_presentation_for_test(
+        &self,
+        authorization: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<(), StoreError> {
+        self.create_metadata_transfer_staging_intent_with_presentation(authorization, intent)
+    }
+
+    fn create_metadata_transfer_staging_intent_with_presentation(
+        &self,
+        authorization: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
         intent: &MetadataTransferStagingIntent,
     ) -> Result<(), StoreError> {
         let payload = encode_metadata_transfer_staging_intent_create_request(
             &StorageRpcMetadataTransferStagingIntentCreateRequest {
+                authorization: authorization.clone(),
                 intent: intent.clone(),
             },
         )
@@ -2906,11 +2928,13 @@ impl UnixStorageNodeClient {
     #[allow(dead_code)]
     pub(crate) fn publish_metadata_transfer_staging_artifact(
         &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
         intent: &MetadataTransferStagingIntent,
         artifact: &[u8],
     ) -> Result<MetadataTransferStagingReceipt, StoreError> {
         let payload = encode_metadata_transfer_staging_artifact_publish_request(
             &StorageRpcMetadataTransferStagingArtifactPublishRequest {
+                authorization: authorization.presentation().clone(),
                 intent: intent.clone(),
                 artifact: artifact.to_vec(),
             },
@@ -2938,11 +2962,13 @@ impl UnixStorageNodeClient {
     #[allow(dead_code)]
     pub(crate) fn publish_metadata_transfer_staging_proof(
         &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
         intent: &MetadataTransferStagingIntent,
         target_epoch: ClusterEpoch,
     ) -> Result<MetadataTransferStagingReceipt, StoreError> {
         let payload = encode_metadata_transfer_staging_proof_publish_request(
             &StorageRpcMetadataTransferStagingProofPublishRequest {
+                authorization: authorization.presentation().clone(),
                 intent: intent.clone(),
                 target_epoch,
             },

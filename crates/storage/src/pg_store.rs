@@ -154,15 +154,52 @@ pub(crate) use metadata_transfer_staging::{
     metadata_transfer_staging_evidence_page_with_member_actor_for_test,
     metadata_transfer_staging_publication_evidence_page_for_test,
 };
+
+#[cfg(test)]
+pub(crate) fn committed_staging_authorization_for_intent_for_test(
+    intent: &MetadataTransferStagingIntent,
+) -> crate::control_plane_command::CommittedUnavailablePgStagingAuthorization {
+    use crate::control_plane::UnavailablePgTransitionMutationBinding;
+    use crate::control_plane_command::UnavailablePgStagingIntentAuthorizationRequest;
+
+    let authorizations = vec![UnavailablePgStagingIntentAuthorizationRequest {
+        unavailable_transition: UnavailablePgTransitionMutationBinding::new(
+            intent.pg_id(),
+            intent.transition_epoch(),
+            intent.source_epoch(),
+            intent.source_acting_set().to_vec(),
+            intent.destination_acting_set().to_vec(),
+        ),
+        staging_generation: intent.staging_generation(),
+        artifact_digest: intent.artifact_digest(),
+        artifact_length: intent.artifact_length(),
+        artifact_format_version: intent.artifact_format_version(),
+    }];
+    let batch_members_digest =
+        crate::control_plane::unavailable_pg_staging_authorization_members_digest(&authorizations);
+    let presentation = crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
+        authorizations,
+        intent.transition_epoch(),
+        batch_members_digest,
+    )
+    .expect("test staging intent must produce a canonical authorization presentation");
+    let destination_node_id = intent.destination_acting_set()[0];
+    crate::control_plane::committed_staging_authorization_from_presentation_for_test(
+        presentation,
+        destination_node_id,
+        intent.pg_id(),
+    )
+}
 pub(crate) use metadata_transfer_staging::{
     decode_staging_evidence, decode_staging_evidence_apply_receipt,
-    decode_staging_evidence_page_payload, decode_staging_intent, encode_staging_intent,
-    MetadataTransferStagingError, MetadataTransferStagingEvidence,
-    MetadataTransferStagingEvidenceApplyReceipt, MetadataTransferStagingEvidenceKind,
-    MetadataTransferStagingEvidencePage, MetadataTransferStagingLimits,
-    MetadataTransferStagingNodeIdentity, MetadataTransferStagingReceipt,
-    MetadataTransferStagingStore, MAX_STAGING_EVIDENCE_BYTES, MAX_STAGING_INTENT_BYTES,
-    METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION, METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
+    decode_staging_evidence_page_payload, decode_staging_intent,
+    encode_staged_metadata_transfer_artifact, encode_staging_intent, MetadataTransferStagingError,
+    MetadataTransferStagingEvidence, MetadataTransferStagingEvidenceApplyReceipt,
+    MetadataTransferStagingEvidenceKind, MetadataTransferStagingEvidencePage,
+    MetadataTransferStagingLimits, MetadataTransferStagingNodeIdentity,
+    MetadataTransferStagingReceipt, MetadataTransferStagingStore, MAX_STAGING_EVIDENCE_BYTES,
+    MAX_STAGING_INTENT_BYTES, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
 };
 #[path = "pg_store/rows.rs"]
 mod rows;

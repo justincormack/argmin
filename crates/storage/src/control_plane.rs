@@ -33,6 +33,30 @@ use crate::control_plane_command::{
     UnavailablePgStagingPublicationBinding, UnavailablePgTransitionBeginRequest,
     UnavailablePgTransitionCompletionRequest, UnavailablePgTransitionInstallRequest,
 };
+
+pub(crate) struct AuthorityPublishedStagingAuthorizationSeal {
+    _private: (),
+}
+
+fn authority_published_staging_authorization_seal() -> AuthorityPublishedStagingAuthorizationSeal {
+    AuthorityPublishedStagingAuthorizationSeal { _private: () }
+}
+
+#[cfg(test)]
+pub(crate) fn committed_staging_authorization_from_presentation_for_test(
+    presentation: crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+    destination_node_id: NodeId,
+    pg_id: PgId,
+) -> crate::control_plane_command::CommittedUnavailablePgStagingAuthorization {
+    assert!(presentation.authorizes_destination_for_pg(destination_node_id, pg_id));
+    crate::control_plane_command::CommittedUnavailablePgStagingAuthorization::from_authority_published(
+        presentation,
+        destination_node_id,
+        pg_id,
+        authority_published_staging_authorization_seal(),
+    )
+}
+
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::control_plane_lease::{
     bounded_renewal_deadline, successor_activation_fence_satisfied, validate_process_lease_clock,
@@ -67,7 +91,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 20;
+const CONTROL_PLANE_RPC_VERSION: u16 = 21;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -79,7 +103,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 36;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 37;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
@@ -1232,6 +1256,12 @@ fn unavailable_pg_staging_authorization_batch_identity(
             .try_into()
             .expect("SHA-256 staging authorization batch digest must contain 32 bytes"),
     }
+}
+
+pub(crate) fn unavailable_pg_staging_authorization_members_digest(
+    requests: &[UnavailablePgStagingIntentAuthorizationRequest],
+) -> [u8; 32] {
+    unavailable_pg_staging_authorization_batch_identity(requests).members_digest
 }
 
 fn unavailable_pg_destination_install_batch_identity(
@@ -2589,6 +2619,109 @@ impl ClusterControlSnapshot {
                 })
             })
             .collect()
+    }
+
+    pub(crate) fn committed_unavailable_pg_staging_authorization(
+        &self,
+        expected: &UnavailablePgStagingIntentAuthorizationRequest,
+        destination_node_id: NodeId,
+    ) -> Result<
+        crate::control_plane_command::CommittedUnavailablePgStagingAuthorization,
+        ControlPlaneError,
+    > {
+        let pg_id = expected.unavailable_transition.pg_id();
+        let transition_epoch = expected.unavailable_transition.transition_epoch();
+        let transition = self
+            .retained_unavailable_pg_placement_transitions
+            .get(&(pg_id, transition_epoch))
+            .or_else(|| {
+                self.unavailable_pg_placement_transitions
+                    .get(&pg_id)
+                    .filter(|transition| transition.transition_epoch == transition_epoch)
+            })
+            .ok_or_else(|| {
+                ControlPlaneError::invariant_failure(
+                    "committed staging authorization transition is absent",
+                )
+            })?;
+        let durable = unavailable_pg_staging_authorization_request_from_durable(transition)
+            .ok_or_else(|| {
+                ControlPlaneError::invariant_failure(
+                    "committed staging authorization is absent from its transition",
+                )
+            })?;
+        if &durable != expected {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} committed staging authorization does not match the prepared artifact",
+                    pg_id.get()
+                ),
+            });
+        }
+        let receipt = &transition
+            .staging_authorization
+            .as_ref()
+            .expect("durable staging request requires authorization")
+            .batch_receipt;
+        let mut authorizations = Vec::with_capacity(receipt.identity.member_pg_ids.len());
+        for member_pg_id in receipt.identity.member_pg_ids.iter().copied() {
+            let mut matching =
+                self.retained_unavailable_pg_placement_transitions
+                    .values()
+                    .chain(self.unavailable_pg_placement_transitions.values())
+                    .filter(|candidate| {
+                        candidate.pg_id == member_pg_id
+                            && candidate.staging_authorization.as_ref().is_some_and(
+                                |authorization| authorization.batch_receipt == *receipt,
+                            )
+                    });
+            let member = matching.next().ok_or_else(|| {
+                ControlPlaneError::invariant_failure(
+                    "committed staging authorization batch member is absent",
+                )
+            })?;
+            if matching.next().is_some() {
+                return Err(ControlPlaneError::invariant_failure(
+                    "committed staging authorization batch member is ambiguous",
+                ));
+            }
+            authorizations.push(
+                unavailable_pg_staging_authorization_request_from_durable(member).ok_or_else(
+                    || {
+                        ControlPlaneError::invariant_failure(
+                            "committed staging authorization batch member has no request",
+                        )
+                    },
+                )?,
+            );
+        }
+        if unavailable_pg_staging_authorization_batch_identity(&authorizations) != receipt.identity
+            || receipt.source_epoch != receipt.target_epoch
+        {
+            return Err(ControlPlaneError::invariant_failure(
+                "committed staging authorization batch receipt is invalid",
+            ));
+        }
+        let presentation = crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
+            authorizations,
+            receipt.source_epoch,
+            receipt.identity.members_digest,
+        )?;
+        if !presentation.authorizes_destination_for_pg(destination_node_id, pg_id) {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "node {} is not a destination of PG {} in the committed staging authorization batch",
+                    destination_node_id.as_u32(),
+                    pg_id.get()
+                ),
+            });
+        }
+        Ok(crate::control_plane_command::CommittedUnavailablePgStagingAuthorization::from_authority_published(
+            presentation,
+            destination_node_id,
+            pg_id,
+            authority_published_staging_authorization_seal(),
+        ))
     }
 
     pub fn authorize_unavailable_pg_staging_intents_batch_command(
@@ -4149,13 +4282,17 @@ impl ClusterControlSnapshot {
             })?;
         route.pending_metadata_command_recovery =
             self.pending_metadata_command_recovery_for_pg(record)?;
-        self.runtime_map_from_pg_routes_with_history(
+        self.runtime_map_from_pg_routes_with_history_and_extra_nodes(
             vec![route],
             self.historical_pg_routes_for_runtime_map_pg(pg_id)?,
             self.historical_cluster_epochs(),
             RuntimeMapFreshnessProof::Reconstructed {
                 authority_incarnation: self.authority_incarnation,
             },
+            self.unavailable_pg_placement_transitions
+                .get(&pg_id)
+                .into_iter()
+                .flat_map(|transition| transition.destination_acting_set.iter().copied()),
             fallback_validity,
         )
     }
@@ -4306,7 +4443,70 @@ impl ClusterControlSnapshot {
             pg_routes,
             historical_pg_routes,
             historical_cluster_epochs,
+            staging_authorizations: self.committed_staging_authorization_presentations()?,
         })
+    }
+
+    fn committed_staging_authorization_presentations(
+        &self,
+    ) -> Result<
+        Vec<crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation>,
+        ControlPlaneError,
+    > {
+        let mut batches = BTreeMap::<
+            UnavailablePgTransitionBatchReceipt,
+            Vec<UnavailablePgStagingIntentAuthorizationRequest>,
+        >::new();
+        for transition in self
+            .retained_unavailable_pg_placement_transitions
+            .values()
+            .chain(self.unavailable_pg_placement_transitions.values())
+        {
+            let Some(authorization) = transition.staging_authorization.as_ref() else {
+                continue;
+            };
+            let request = unavailable_pg_staging_authorization_request_from_durable(transition)
+                .expect("staging authorization has a durable request");
+            batches
+                .entry(authorization.batch_receipt.clone())
+                .or_default()
+                .push(request);
+        }
+        let mut presentations = batches
+            .into_iter()
+            .map(|(receipt, mut authorizations)| {
+                authorizations.sort_by_key(|authorization| {
+                    authorization.unavailable_transition.pg_id()
+                });
+                if receipt.source_epoch != receipt.target_epoch
+                    || receipt.identity.stage
+                        != UnavailablePgTransitionBatchStage::StagingAuthorization
+                    || receipt.identity.member_pg_ids
+                        != authorizations
+                            .iter()
+                            .map(|authorization| authorization.unavailable_transition.pg_id())
+                            .collect::<Vec<_>>()
+                    || receipt.identity
+                        != unavailable_pg_staging_authorization_batch_identity(&authorizations)
+                {
+                    return Err(ControlPlaneError::invariant_failure(
+                        "committed staging authorization batch receipt is invalid",
+                    ));
+                }
+                crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
+                    authorizations,
+                    receipt.source_epoch,
+                    receipt.identity.members_digest,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        presentations.sort_by_key(|authorization| {
+            (
+                authorization.committed_epoch(),
+                authorization.batch_members_digest(),
+            )
+        });
+        Ok(presentations)
     }
 
     fn historical_cluster_epochs(&self) -> Vec<ClusterEpoch> {
@@ -8952,11 +9152,72 @@ pub struct ClusterRuntimeMapSnapshot {
     pg_routes: Vec<PgRouteSnapshot>,
     historical_pg_routes: Vec<PgRouteSnapshot>,
     historical_cluster_epochs: Vec<ClusterEpoch>,
+    staging_authorizations:
+        Vec<crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation>,
+}
+
+/// Authorization state copied only from an authority-issued runtime map. The
+/// private representation prevents decoded storage RPC bytes from being
+/// upgraded directly to a committed staging capability.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AuthorityPublishedUnavailablePgStagingAuthorizations {
+    presentations: Vec<crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation>,
+}
+
+#[derive(Debug)]
+pub(crate) enum StagingAuthorizationVerificationError {
+    NotObserved,
+    Invalid(ControlPlaneError),
+}
+
+impl AuthorityPublishedUnavailablePgStagingAuthorizations {
+    pub(crate) fn verify(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        observed_cluster_epoch: ClusterEpoch,
+        presented: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+    ) -> Result<
+        crate::control_plane_command::CommittedUnavailablePgStagingAuthorization,
+        StagingAuthorizationVerificationError,
+    > {
+        let Some(authority_published) = self
+            .presentations
+            .iter()
+            .find(|candidate| *candidate == presented)
+        else {
+            if presented.committed_epoch() < observed_cluster_epoch {
+                return Err(StagingAuthorizationVerificationError::Invalid(
+                    ControlPlaneError::rpc_protocol(format!(
+                        "staging authorization committed at epoch {} is absent from newer runtime-map epoch {}",
+                        presented.committed_epoch().get(),
+                        observed_cluster_epoch.get()
+                    )),
+                ));
+            }
+            return Err(StagingAuthorizationVerificationError::NotObserved);
+        };
+        if !authority_published.authorizes_destination_for_pg(node_id, pg_id) {
+            return Err(StagingAuthorizationVerificationError::Invalid(
+                ControlPlaneError::rpc_protocol(format!(
+                    "node {} is not a destination of PG {} in the committed staging authorization batch",
+                    node_id.as_u32(),
+                    pg_id.get()
+                )),
+            ));
+        }
+        Ok(crate::control_plane_command::CommittedUnavailablePgStagingAuthorization::from_authority_published(
+            authority_published.clone(),
+            node_id,
+            pg_id,
+            authority_published_staging_authorization_seal(),
+        ))
+    }
 }
 
 const RUNTIME_MAP_CONTENT_DIGEST_LEN: usize = 32;
-const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v3";
-const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v3";
+const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v4";
+const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeMapContentDigest([u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
@@ -9101,6 +9362,14 @@ impl ClusterRuntimeMapSnapshot {
         &self.historical_pg_routes
     }
 
+    pub(crate) fn authority_published_staging_authorizations(
+        &self,
+    ) -> AuthorityPublishedUnavailablePgStagingAuthorizations {
+        AuthorityPublishedUnavailablePgStagingAuthorizations {
+            presentations: self.staging_authorizations.clone(),
+        }
+    }
+
     #[must_use]
     pub fn historical_cluster_epochs(&self) -> &[ClusterEpoch] {
         &self.historical_cluster_epochs
@@ -9159,6 +9428,7 @@ impl ClusterRuntimeMapSnapshot {
             pg_routes,
             historical_pg_routes: self.historical_pg_routes.clone(),
             historical_cluster_epochs: self.historical_cluster_epochs.clone(),
+            staging_authorizations: Vec::new(),
         })
     }
 
@@ -9251,6 +9521,7 @@ impl ClusterRuntimeMapSnapshot {
                 .cloned()
                 .collect(),
             historical_cluster_epochs: self.historical_cluster_epochs.clone(),
+            staging_authorizations: Vec::new(),
         })
     }
 
@@ -9305,6 +9576,7 @@ impl ClusterRuntimeMapSnapshot {
                 .cloned()
                 .collect(),
             historical_cluster_epochs: self.historical_cluster_epochs.clone(),
+            staging_authorizations: Vec::new(),
         })
     }
 }
@@ -9330,6 +9602,7 @@ fn runtime_map_content_digest(snapshot: &ClusterRuntimeMapSnapshot) -> RuntimeMa
     for epoch in snapshot.historical_cluster_epochs() {
         digest_u64(&mut hasher, epoch.get());
     }
+    digest_staging_authorization_presentations(&mut hasher, &snapshot.staging_authorizations);
     let checksum = hasher.finalize();
     RuntimeMapContentDigest::from_bytes(
         checksum
@@ -9358,6 +9631,10 @@ fn runtime_map_current_state_digest(
         );
     }
     digest_pg_routes(&mut hasher, pg_routes);
+    let staging_authorizations = snapshot
+        .committed_staging_authorization_presentations()
+        .expect("validated control-plane state has valid staging authorization receipts");
+    digest_staging_authorization_presentations(&mut hasher, &staging_authorizations);
     let checksum = hasher.finalize();
     RuntimeMapContentDigest::from_bytes(
         checksum
@@ -9365,6 +9642,23 @@ fn runtime_map_current_state_digest(
             .try_into()
             .expect("SHA-256 current runtime-map digest must contain 32 bytes"),
     )
+}
+
+fn digest_staging_authorization_presentations(
+    hasher: &mut ChecksumHasher,
+    authorizations: &[crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation],
+) {
+    digest_len(hasher, authorizations.len());
+    for authorization in authorizations {
+        digest_u64(hasher, authorization.committed_epoch().get());
+        digest_bytes(hasher, &authorization.batch_members_digest());
+        digest_bytes(
+            hasher,
+            &authorization
+                .encode_command()
+                .expect("authority-published staging authorization is canonical"),
+        );
+    }
 }
 
 pub(crate) fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSnapshot]) {
@@ -16247,4 +16541,4 @@ pub fn ensure_control_plane_state_parent_directory(
 
 #[cfg(test)]
 #[path = "control_plane/tests.rs"]
-mod tests;
+pub(crate) mod tests;

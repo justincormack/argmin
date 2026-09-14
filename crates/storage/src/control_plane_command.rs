@@ -24,7 +24,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 24;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 25;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -76,6 +76,161 @@ pub struct UnavailablePgStagingIntentAuthorizationRequest {
     pub artifact_digest: [u8; 32],
     pub artifact_length: u64,
     pub artifact_format_version: u16,
+}
+
+/// Untrusted wire presentation of one complete staging-authorization batch.
+/// Storage upgrades this to [`CommittedUnavailablePgStagingAuthorization`]
+/// only after exact matching against its authority-published runtime state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnavailablePgStagingAuthorizationPresentation {
+    authorizations: Vec<UnavailablePgStagingIntentAuthorizationRequest>,
+    committed_epoch: ClusterEpoch,
+    batch_members_digest: [u8; 32],
+}
+
+impl UnavailablePgStagingAuthorizationPresentation {
+    pub(super) fn from_authority_state(
+        authorizations: Vec<UnavailablePgStagingIntentAuthorizationRequest>,
+        committed_epoch: ClusterEpoch,
+        batch_members_digest: [u8; 32],
+    ) -> Result<Self, ControlPlaneError> {
+        validate_unavailable_transition_command_members(
+            "committed staging authorization",
+            authorizations
+                .iter()
+                .map(|authorization| authorization.unavailable_transition.pg_id()),
+        )?;
+        if crate::control_plane::unavailable_pg_staging_authorization_members_digest(
+            &authorizations,
+        ) != batch_members_digest
+        {
+            return Err(command_protocol_error(
+                "committed staging authorization batch digest is not canonical",
+            ));
+        }
+        Ok(Self {
+            authorizations,
+            committed_epoch,
+            batch_members_digest,
+        })
+    }
+
+    pub(crate) fn authorization_for_pg(
+        &self,
+        pg_id: PgId,
+    ) -> Option<&UnavailablePgStagingIntentAuthorizationRequest> {
+        self.authorizations
+            .binary_search_by_key(&pg_id, |authorization| {
+                authorization.unavailable_transition.pg_id()
+            })
+            .ok()
+            .map(|index| &self.authorizations[index])
+    }
+
+    pub(super) fn authorizations(&self) -> &[UnavailablePgStagingIntentAuthorizationRequest] {
+        &self.authorizations
+    }
+
+    pub(crate) fn authorizes_destination_for_pg(&self, node_id: NodeId, pg_id: PgId) -> bool {
+        self.authorization_for_pg(pg_id)
+            .is_some_and(|authorization| {
+                authorization
+                    .unavailable_transition
+                    .destination_acting_set()
+                    .contains(&node_id)
+            })
+    }
+
+    pub(crate) fn committed_epoch(&self) -> ClusterEpoch {
+        self.committed_epoch
+    }
+
+    pub(crate) fn batch_members_digest(&self) -> [u8; 32] {
+        self.batch_members_digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_batch_members_digest(&mut self, digest: [u8; 32]) {
+        self.batch_members_digest = digest;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_committed_epoch(&mut self, committed_epoch: ClusterEpoch) {
+        self.committed_epoch = committed_epoch;
+    }
+
+    pub(crate) fn encode_command(&self) -> Result<Vec<u8>, ControlPlaneError> {
+        encode_control_plane_command(&ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: self.authorizations.clone(),
+        })
+    }
+
+    pub(crate) fn decode_command(
+        command: &[u8],
+        committed_epoch: ClusterEpoch,
+        batch_members_digest: [u8; 32],
+    ) -> Result<Self, ControlPlaneError> {
+        let ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents { authorizations } =
+            decode_control_plane_command(command)?
+        else {
+            return Err(command_protocol_error(
+                "committed staging authorization contains the wrong command kind",
+            ));
+        };
+        Self::from_authority_state(authorizations, committed_epoch, batch_members_digest)
+    }
+}
+
+/// Opaque proof that one complete staging-authorization batch is present in
+/// authority-published committed control-plane state. Destination mutation
+/// APIs accept this type, never a decoded wire presentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedUnavailablePgStagingAuthorization {
+    presentation: UnavailablePgStagingAuthorizationPresentation,
+    destination_node_id: NodeId,
+    pg_id: PgId,
+}
+
+impl CommittedUnavailablePgStagingAuthorization {
+    pub(super) fn from_authority_published(
+        presentation: UnavailablePgStagingAuthorizationPresentation,
+        destination_node_id: NodeId,
+        pg_id: PgId,
+        _seal: crate::control_plane::AuthorityPublishedStagingAuthorizationSeal,
+    ) -> Self {
+        debug_assert!(presentation.authorizes_destination_for_pg(destination_node_id, pg_id));
+        Self {
+            presentation,
+            destination_node_id,
+            pg_id,
+        }
+    }
+
+    pub(crate) fn presentation(&self) -> &UnavailablePgStagingAuthorizationPresentation {
+        &self.presentation
+    }
+
+    pub(crate) fn authorization_for_pg(
+        &self,
+        pg_id: PgId,
+    ) -> Option<&UnavailablePgStagingIntentAuthorizationRequest> {
+        if self.pg_id != pg_id {
+            return None;
+        }
+        self.presentation.authorization_for_pg(pg_id)
+    }
+
+    pub(crate) fn destination_node_id(&self) -> NodeId {
+        self.destination_node_id
+    }
+
+    pub(crate) fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    pub(crate) fn committed_epoch(&self) -> ClusterEpoch {
+        self.presentation.committed_epoch()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4084,7 +4239,40 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_command_v24_aggregate_encoding_is_stable() {
+    fn control_plane_command_v24_aggregate_remains_rejected_evidence() {
+        const AGGREGATE: &[u8] =
+            include_bytes!("control_plane/testdata/command_v24_representative.aggregate");
+        let digest: [u8; 32] =
+            checksum::compute_checksum(checksum::ChecksumAlgorithm::Sha256, AGGREGATE)
+                .bytes()
+                .try_into()
+                .unwrap();
+        assert_eq!(
+            (AGGREGATE.len(), digest),
+            (
+                3_627,
+                [
+                    156, 97, 203, 37, 118, 35, 130, 73, 197, 172, 72, 17, 15, 254, 83, 89, 42, 61,
+                    132, 47, 244, 243, 12, 247, 100, 146, 142, 87, 222, 180, 156, 184,
+                ],
+            )
+        );
+        let mut remaining = AGGREGATE;
+        while !remaining.is_empty() {
+            let (raw_len, tail) = remaining.split_at(4);
+            let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+            let (command, tail) = tail.split_at(len);
+            assert!(matches!(
+                decode_control_plane_command(command),
+                Err(ControlPlaneError::CommandDecode { message })
+                    if message == "unsupported control-plane command version 24"
+            ));
+            remaining = tail;
+        }
+    }
+
+    #[test]
+    fn control_plane_command_v25_aggregate_encoding_is_stable() {
         let mut aggregate = Vec::new();
         for command in sample_commands().into_iter().chain(degenerate_commands()) {
             let encoded = encode_control_plane_command(&command).unwrap();
@@ -4104,8 +4292,8 @@ mod tests {
             (
                 3_627,
                 [
-                    156, 97, 203, 37, 118, 35, 130, 73, 197, 172, 72, 17, 15, 254, 83, 89, 42, 61,
-                    132, 47, 244, 243, 12, 247, 100, 146, 142, 87, 222, 180, 156, 184,
+                    55, 51, 113, 56, 119, 10, 47, 116, 240, 134, 95, 224, 15, 41, 153, 94, 68, 67,
+                    102, 62, 120, 227, 12, 245, 55, 23, 190, 115, 32, 208, 208, 73,
                 ],
             )
         );
@@ -4132,7 +4320,7 @@ mod tests {
             Err(ControlPlaneCommandFormatError::UnknownMagic)
         );
 
-        for version in [15_u16, 16, 17, 18, 19, 20, 21, 22, 23, 25] {
+        for version in [15_u16, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26] {
             let mut unsupported = Vec::from(CONTROL_PLANE_COMMAND_MAGIC.as_slice());
             unsupported.extend_from_slice(&version.to_be_bytes());
             assert_eq!(
@@ -4372,7 +4560,7 @@ mod tests {
         append_control_plane_command_checksum(&mut bad_magic);
         assert_decode_error_contains(&bad_magic, "invalid control-plane command magic");
 
-        for version in [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25] {
+        for version in [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 26] {
             let encoded = encode_control_plane_command_with_version_for_test(
                 &ControlPlaneCommand::ExpireHeartbeatLeases {
                     expire_at_ms: 1_000,
@@ -4831,7 +5019,8 @@ mod tests {
         const PREVIOUS_V33: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=33\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x70\x2d\x09\xe3\x50\xf5\x0e\x52";
         const PREVIOUS_V34: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=34\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x2a\x14\x57\xcb\x01\x38\xbc\x57";
         const PREVIOUS_V35: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=35\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xfa\x97\x8a\x92\x4c\xae\x8d\xca";
-        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=36\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xbf\xca\xcb\x2a\xc2\x83\x4c\x06";
+        const PREVIOUS_V36: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=36\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xbf\xca\xcb\x2a\xc2\x83\x4c\x06";
+        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=37\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x6f\x49\x16\x73\x8f\x15\x7d\x9b";
         let encoded = encode_control_plane_snapshot(&ClusterControlSnapshot::empty()).unwrap();
 
         assert_eq!(encoded, EXPECTED);
@@ -4878,6 +5067,11 @@ mod tests {
             decode_control_plane_snapshot(PREVIOUS_V35),
             Err(ControlPlaneError::Parse { message, .. })
                 if message == "unsupported control-plane state version 35"
+        ));
+        assert!(matches!(
+            decode_control_plane_snapshot(PREVIOUS_V36),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "unsupported control-plane state version 36"
         ));
     }
 
@@ -4959,9 +5153,9 @@ mod tests {
     #[test]
     fn replicated_snapshot_install_rejects_noncurrent_state_versions_before_mutation() {
         let current_contents = format_snapshot(&sample_snapshot());
-        for version in [28, 29, 30, 31, 32, 33, 34, 35, 37] {
+        for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 38] {
             let unsupported_contents =
-                current_contents.replacen("version=36\n", &format!("version={version}\n"), 1);
+                current_contents.replacen("version=37\n", &format!("version={version}\n"), 1);
             let payload =
                 snapshot_frame_with_version(CONTROL_PLANE_SNAPSHOT_VERSION, &unsupported_contents);
             let mut installed = replay_sample_state_machine();

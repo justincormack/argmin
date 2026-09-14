@@ -422,6 +422,28 @@ fsynced bytes; the artifact digest and staging authorization do not change.
 Artifact decoding and proof rebasing therefore remain outside control-plane
 command derivation. This is still protocol-neutral and does not authorize
 staging or route installation by itself.
+The lifecycle now continues through opaque `Prepared`, `Authorized`,
+`Published`, and `Staged` ownership states for unavailable-PG reconciliation.
+`Prepared` is protocol-neutral and cannot reach a destination mutation API.
+Only a snapshot-issued `Authorized` capability containing the complete exact
+committed authorization batch can create the intent or publish the immutable
+artifact and epoch proof to destination actors. Across storage RPC that
+capability becomes an untrusted presentation; the destination upgrades it only
+after exact matching against the complete batch receipt in its latest
+authority-authenticated runtime map. Admin authentication alone is not staging
+authority, and uncommitted, subset, or regrouped presentations fail before
+catalogue or filesystem mutation. Partial destination failure retains the same
+presentation for exact retry. Only the complete receipt set can become staged.
+The composed nonempty regression then applies every destination's
+durable evidence page, advances an unrelated cluster epoch, republishes the
+proof receipts derived from the same staged bytes, installs the plural
+destination transition, imports the retained artifact, and activates the PG.
+The source artifact may describe an older retained route, but its epoch must
+not exceed the staging authorization's exact source epoch. Production
+reconciliation remains on the singular wrapper until the cleanup,
+tombstone/finalized-floor, and durable artifact-retrieval protocol below can
+replace it atomically; this slice does not leave two production ownership
+paths active.
 Command v22 and state v34 now add the fourth homogeneous batch boundary,
 `AuthorizeUnavailablePgStagingIntents`. Each canonical member binds the exact
 active unavailable transition, transition-derived staging generation,
@@ -441,9 +463,10 @@ authorization command is still leader-internal. Snapshot builders now validate
 the complete immutable result and exact OpenRaft entry size before returning a
 plural command, and both standalone and Raft authorities expose that builder
 through the shared `ControlPlaneAdmin` batch boundary. The destination staging
-transport described below can persist only an already constructed exact
-authorization-bound intent; reconciliation does not yet select committed
-authorizations or consume their receipts for route installation.
+transport described below accepts only the opaque capability reconstructed
+after exact comparison with the authority-published committed authorization
+receipt; a locally prepared request or admin-signed storage request is not
+sufficient authority.
 Command v23 and state v35 now provide the replicated half of durable staging
 evidence publication while keeping that protocol isolation. The new
 `ApplyMetadataTransferStagingEvidencePage` command carries the exact
@@ -486,7 +509,7 @@ methods, verifies each intermediate snapshot on every replica, transfers
 leadership, and replays both exact batches through the successor leader without
 state or epoch mutation. The production worker does not consume that boundary
 yet.
-The storage-owned durable staging foundation is also complete but remains
+The storage-owned durable staging foundation was first sealed at v2 and remains
 protocol-isolated. Staging-store format v2 has a fixed root manifest and exact
 initialization-complete marker, exact SQLite catalogue,
 exact transition/generation/artifact intent CAS, bounded
@@ -509,9 +532,9 @@ presence requires the existing initialized root and exact v2 catalogue without
 create/repair authority, so whole-root deletion, catalogue deletion, or
 truncation cannot erase tombstones or finalized floors by becoming fresh
 initialization. The complete v1 manifest, markers, publication receipt, page,
-and apply-receipt bytes remain immutable rejection evidence. Current v2
-fixtures seal the proof-bearing artifact and evidence grammar; v1/v3 format,
-catalogue, and artifact versions reject without repair. The catalogue
+and apply-receipt bytes remain immutable rejection evidence. The former v2
+fixtures seal the previous proof-bearing artifact and evidence grammar and
+remain immutable rejection evidence under v3. The catalogue
 now owns the local durable evidence-page protocol required below. It selects at
 most 64 deltas beneath the 120 KiB operation-payload ceiling, persists the exact
 canonical payload and digest before transmission, and replays those bytes
@@ -530,7 +553,7 @@ matching apply receipt, and fail-stops the process on local durability,
 protocol, or integrity failure. Retryable transport, leadership, response-loss,
 and bounded evidence-admission failures retain the page and use a one-second
 backoff. Standalone storage nodes do not create this protocol state. The
-control-plane RPC v20/authentication-envelope-v2
+control-plane RPC v21/authentication-envelope-v2
 slice now exposes a dedicated storage-node-only evidence operation over
 authenticated Unix and TLS, dispatches the existing replicated evidence
 command, validates the exact canonical apply receipt, and separates its bounded
@@ -542,7 +565,7 @@ boundary when a new ordinary waiter appears. The bounded RaftCore enqueue is
 itself raced against waiter registration and is accepted only when its
 cancellation-safe send completes. The final ordinary waiter broadcasts its
 completion so every admitted evidence caller can continue to durable
-serialization. Authenticated evidence saturation is a typed v20 response;
+serialization. Authenticated evidence saturation is a typed v21 response;
 response loss remains retryable, while observed
 authentication, framing, protocol, and receipt-integrity failures fail-stop.
 After RaftCore accepts a proposal, the evidence lane retains its own
@@ -557,7 +580,7 @@ stale overlay captured before dispatch. Promotion completion also preserves an
 overlay that a renewal has already rebound to the promotion log. At most one
 evidence proposal runs at a time, and evidence publication never shares the
 storage node's heartbeat client or submission mutex.
-Storage RPC v24 exposes the destination half of the staging boundary as
+Storage RPC v24 first exposed the destination half of the staging boundary as
 three admin-only live-transfer operations. Intent creation carries the canonical
 storage-owned transition/generation/artifact tuple and performs the durable
 intent CAS. Artifact format v2 canonically carries the checkpoint, bounded
@@ -774,9 +797,24 @@ excluding heartbeat renewal.
 
 An ownership token alone is not sufficient once the committed imported proof
 is bound to exact artifact bytes. Before destination-route installation, the
-prepare phase durably stages the immutable artifact under its transition
-binding and content digest on every destination actor and obtains authenticated
-fsync-complete receipts. `CreateStagingIntent` compare-and-swaps the complete
+prepare phase first binds its immutable artifact to the committed authorization,
+then durably stages it under its transition binding and content digest on every
+destination actor and obtains authenticated fsync-complete receipts. Every
+destination mutation carries an opaque committed capability bound to the exact
+`(destination node, PG)` batch member and rejects a missing, cross-member, or
+mismatched capability before catalogue or filesystem mutation. Storage checks
+that binding again against its durable actor identity rather than trusting the
+RPC route. A newly committed epoch-neutral authorization can reach the sender
+before the destination's next runtime-map refresh; that specific
+same-epoch or newer-epoch not-yet-observed result is typed retryable and
+non-mutating. Storage validates the canonical batch digest before authority
+lookup, and a presentation absent from a strictly newer observed runtime-map
+epoch is definitively stale; malformed, stale, regrouped, foreign-member, and
+otherwise invalid presentations fail closed. Initial storage bootstrap carries
+the authorizations from the authoritative startup map through listener binding,
+so the first authenticated staging request after restart observes the same
+authority state without a separate runtime-map installation.
+`CreateStagingIntent` compare-and-swaps the complete
 committed authorization tuple: exact transition, staging generation, artifact
 digest, artifact byte length, and staging-store format version. Exact replay is
 idempotent; any field mismatch is a typed intent conflict and no bytes are
@@ -788,7 +826,7 @@ endpoint identity, exact transition binding, artifact digest and byte length,
 staging generation, storage-format version, and an
 explicit fsync scope covering the artifact, catalogue record, and parent
 directory publication. Transport authentication alone is not replicated proof.
-Receipt evidence uses a mandatory control-plane RPC v20 operation separate
+Receipt evidence uses a mandatory control-plane RPC v21 operation separate
 from lease heartbeat renewal. Each authenticated storage node maintains a
 durable outbox of receipt and tombstone deltas. A page binds node identity and
 incarnation, required `previous_generation` and
@@ -858,7 +896,7 @@ the control plane accepts the exact successor page whose
 `previous_generation` and previous apply-receipt digest cite it. Because the
 node may construct that successor only after durably recording the cited
 receipt, acceptance is the observable acknowledgement boundary. This retains
-the contributor pages under the current state-v36 representation. State v36
+the contributor pages under the current state-v37 representation. State v37
 does not permit per-PG detailed-evidence or page pruning: pages may mix PGs, and
 removing either one member or an interior page would destroy snapshot-verifiable
 provenance. Finalized-floor cleanup remains gated until the compact actor-chain
@@ -1131,10 +1169,23 @@ storage RPC again from v23 to v24 for semantic artifact format v2 and the
 epoch-bound proof-publication operation. Fixed v22/v23/v24 frame evidence,
 authenticated Unix/TLS coverage, and explicit
 exclusion from ordinary frontend, storage-node, and maintenance capabilities.
-Receipt-evidence publication crosses the control-plane RPC boundary and has
-advanced control-plane RPC from v19 to v20 while retaining authentication
-envelope v2. Preserve complete v17/v1, v18/v2, and v19/v2 rejection evidence
-and fixed v20 frames for a genesis page, a successor carrying a non-genesis
+All three staging-operation admission bounds include the committed epoch,
+complete batch digest, length-prefixed authorization command, and their
+operation-specific fields; encoder-derived exact-bound fixtures prevent any
+accepted authorization from exceeding its configured transport envelope.
+The composed prepared-to-import lifecycle changes the accepted historical
+artifact epoch semantics and therefore advances the storage-owned staging
+store, catalogue, artifact, evidence page, and apply-receipt formats from v2
+to v3. Storage RPC advances from v24 to v25, command encoding from v24 to v25,
+and logical state from v36 to v37 so every containing reader rejects the old
+semantics before dispatch or construction. Immutable v2, storage-RPC-v24,
+command-v24, state-v36, replicated-snapshot, and standalone-journal fixtures
+remain exact rejection evidence. No compatibility reader is added.
+Receipt-evidence publication crosses the control-plane RPC boundary. Its v3
+evidence grammar advances control-plane RPC from v20 to v21 while retaining
+authentication envelope v2. Preserve complete v17/v1, v18/v2, v19/v2, and
+v20/v2 rejection evidence and fixed v20 frames for a genesis page and a
+successor carrying a non-genesis
 `previous_apply_receipt_digest`, minimum, maximum-count, maximum-byte,
 multipage, generation-gap, exact-replay, and tombstone/finalized-floor
 evidence. Frame-limit constants and exact-boundary fixtures include the full
@@ -1147,7 +1198,7 @@ and require no additional
 control-plane RPC operation beyond that receipt protocol.
 
 Durable artifact staging uses a separate storage-owned format rather than
-silently extending the PG schema. Staging-store format v2 owns the
+silently extending the PG schema. Staging-store format v3 owns the
 versioned root manifest, initialization-complete marker, outer establishment
 marker in the storage data directory, generation catalogue, durable singleton
 evidence actor,
@@ -1175,7 +1226,7 @@ receipt/tombstone state fail closed. Bounded startup reconciliation removes
 unpublished temporary files, completes tombstone-directed unlink and directory
 sync, and quarantines unexplained final files rather than authorizing them.
 Store admission accounts for temporary, published, and tombstoned cleanup
-bytes. Retain immutable v1 rejection fixtures and fixed v2 manifest,
+bytes. Retain immutable v1/v2 rejection fixtures and fixed v3 manifest,
 initialization and establishment markers, catalogue, artifact, proof-bearing
 receipt, page, apply receipt, and crash-state corpus in the
 [storage format ledger](../guides/storage-format-ledger.md); no

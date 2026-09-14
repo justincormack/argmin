@@ -9651,6 +9651,18 @@ fn write_runtime_map_snapshot(
     for epoch in snapshot.historical_cluster_epochs() {
         write_u64(out, epoch.get());
     }
+    write_u32(
+        out,
+        len_as_u32(
+            snapshot.staging_authorizations.len(),
+            "runtime staging authorizations",
+        )?,
+    );
+    for authorization in &snapshot.staging_authorizations {
+        write_u64(out, authorization.committed_epoch().get());
+        out.extend_from_slice(&authorization.batch_members_digest());
+        write_bytes(out, &authorization.encode_command()?)?;
+    }
     Ok(())
 }
 
@@ -9827,6 +9839,27 @@ fn read_runtime_map_snapshot(
             "runtime map historical cluster epoch",
         )?);
     }
+    let staging_authorization_count = reader.read_collection_len(
+        "runtime staging authorizations",
+        8 + 32 + 4,
+    )?;
+    let mut staging_authorizations = Vec::with_capacity(staging_authorization_count);
+    for _ in 0..staging_authorization_count {
+        let committed_epoch = read_cluster_epoch(reader, "staging authorization commit epoch")?;
+        let batch_members_digest = reader.read_exact(32)?.try_into().map_err(|_| {
+            ControlPlaneError::rpc_protocol(
+                "staging authorization batch digest has invalid length".to_owned(),
+            )
+        })?;
+        let command = reader.read_bytes()?;
+        staging_authorizations.push(
+            crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::decode_command(
+                command,
+                committed_epoch,
+                batch_members_digest,
+            )?,
+        );
+    }
     let Some(valid_until_ms) = valid_until_ms else {
         return Err(ControlPlaneError::rpc_protocol(
             "runtime map validity must be bounded on the wire".to_owned(),
@@ -9844,6 +9877,7 @@ fn read_runtime_map_snapshot(
         pg_routes,
         historical_pg_routes,
         historical_cluster_epochs,
+        staging_authorizations,
     };
     validate_runtime_map_snapshot(&snapshot)?;
     Ok(snapshot)
@@ -9852,6 +9886,30 @@ fn read_runtime_map_snapshot(
 fn validate_runtime_map_snapshot(
     snapshot: &ClusterRuntimeMapSnapshot,
 ) -> Result<(), ControlPlaneError> {
+    let mut previous_staging_authorization = None;
+    for authorization in &snapshot.staging_authorizations {
+        let identity = unavailable_pg_staging_authorization_batch_identity(
+            authorization.authorizations(),
+        );
+        if authorization.batch_members_digest() != identity.members_digest
+            || authorization.committed_epoch() > snapshot.cluster_epoch()
+        {
+            return Err(ControlPlaneError::rpc_protocol(
+                "runtime-map staging authorization does not match its complete durable batch receipt"
+                    .to_owned(),
+            ));
+        }
+        let ordering_key = (
+            authorization.committed_epoch(),
+            authorization.batch_members_digest(),
+        );
+        if previous_staging_authorization.is_some_and(|previous| previous >= ordering_key) {
+            return Err(ControlPlaneError::rpc_protocol(
+                "runtime-map staging authorizations are not strictly ordered".to_owned(),
+            ));
+        }
+        previous_staging_authorization = Some(ordering_key);
+    }
     let mut previous_historical_epoch = None;
     for epoch in snapshot.historical_cluster_epochs() {
         if *epoch >= snapshot.cluster_epoch() {

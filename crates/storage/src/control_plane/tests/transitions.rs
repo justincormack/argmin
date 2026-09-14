@@ -468,6 +468,113 @@ fn begun_two_pg_staging_authorization_authority_fixture_with_proof(
     (tmp, store, authority, authorizations)
 }
 
+pub(crate) struct AuthenticatedStagingAuthorizationFixture {
+    pub(crate) destination_node_id: NodeId,
+    pub(crate) runtime_map: ClusterRuntimeMapSnapshot,
+    pub(crate) authorization:
+        crate::control_plane_command::CommittedUnavailablePgStagingAuthorization,
+    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
+    pub(crate) artifact: Vec<u8>,
+    pub(crate) initial_destination_epoch: ClusterEpoch,
+    pub(crate) rebased_destination_epoch: ClusterEpoch,
+    pub(crate) cross_member_runtime_map: ClusterRuntimeMapSnapshot,
+    pub(crate) cross_member_authorization:
+        crate::control_plane_command::CommittedUnavailablePgStagingAuthorization,
+    pub(crate) cross_member_intent: crate::pg_store::MetadataTransferStagingIntent,
+}
+
+pub(crate) fn authenticated_staging_authorization_fixture(
+) -> AuthenticatedStagingAuthorizationFixture {
+    let (_tmp, _store, mut authority, mut authorizations) =
+        begun_two_pg_staging_authorization_authority_fixture_with_proof(PgMetadataProof::current(
+            23, 0x2323, 0x3434,
+        ));
+    let initial_destination_epoch = next_epoch(authority.snapshot().cluster_epoch()).unwrap();
+    let rebased_destination_epoch = next_epoch(initial_destination_epoch).unwrap();
+    let artifact = crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+        &authorizations[0].unavailable_transition,
+        initial_destination_epoch,
+    );
+    authorizations[0].artifact_digest = checksum::sha256::digest(&artifact);
+    authorizations[0].artifact_length = u64::try_from(artifact.len()).unwrap();
+    let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+        &authorizations[0].unavailable_transition,
+        authorizations[0].artifact_digest,
+        authorizations[0].artifact_length,
+        authorizations[0].artifact_format_version,
+    )
+    .unwrap();
+    let authorized = authority
+        .authorize_unavailable_pg_staging_intents_batch(&authorizations)
+        .unwrap();
+    let authorization = authorized
+        .committed_unavailable_pg_staging_authorization(&authorizations[0], NodeId::new(4))
+        .unwrap();
+    let runtime_map = authorized
+        .runtime_map(authorized.max_committed_timestamp_ms().unwrap() + 1)
+        .unwrap();
+    let destination_node_id = authorizations[0]
+        .unavailable_transition
+        .destination_acting_set()[0];
+    let second = &authorizations[1];
+    let cross_member_binding = UnavailablePgTransitionMutationBinding::new(
+        second.unavailable_transition.pg_id(),
+        second.unavailable_transition.transition_epoch(),
+        second.unavailable_transition.source_epoch(),
+        second.unavailable_transition.source_acting_set().to_vec(),
+        vec![NodeId::new(5), NodeId::new(2), NodeId::new(3)],
+    );
+    let cross_member_artifact =
+        crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+            &cross_member_binding,
+            initial_destination_epoch,
+        );
+    authorizations[1] = UnavailablePgStagingIntentAuthorizationRequest {
+        unavailable_transition: cross_member_binding.clone(),
+        staging_generation: cross_member_binding.transition_epoch().get(),
+        artifact_digest: checksum::sha256::digest(&cross_member_artifact),
+        artifact_length: u64::try_from(cross_member_artifact.len()).unwrap(),
+        artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    };
+    let cross_member_identity =
+        unavailable_pg_staging_authorization_batch_identity(&authorizations);
+    let cross_member_presentation =
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
+            authorizations.clone(),
+            runtime_map.cluster_epoch(),
+            cross_member_identity.members_digest,
+        )
+        .unwrap();
+    let cross_member_authorization =
+        crate::control_plane::committed_staging_authorization_from_presentation_for_test(
+            cross_member_presentation.clone(),
+            NodeId::new(5),
+            cross_member_binding.pg_id(),
+        );
+    let cross_member_intent =
+        crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &cross_member_binding,
+            checksum::sha256::digest(&cross_member_artifact),
+            u64::try_from(cross_member_artifact.len()).unwrap(),
+            crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        )
+        .unwrap();
+    let mut cross_member_runtime_map = runtime_map.clone();
+    cross_member_runtime_map.staging_authorizations = vec![cross_member_presentation];
+    AuthenticatedStagingAuthorizationFixture {
+        destination_node_id,
+        runtime_map,
+        authorization,
+        intent,
+        artifact,
+        initial_destination_epoch,
+        rebased_destination_epoch,
+        cross_member_runtime_map,
+        cross_member_authorization,
+        cross_member_intent,
+    }
+}
+
 #[test]
 fn plural_staging_authorization_builder_and_standalone_authority_are_atomic_and_replayable() {
     let (_tmp, store, mut authority, authorizations) =
@@ -475,6 +582,25 @@ fn plural_staging_authorization_builder_and_standalone_authority_are_atomic_and_
             23, 0x2323, 0x3434,
         ));
     let source = authority.snapshot().clone();
+    let source_runtime = source
+        .runtime_map(source.max_committed_timestamp_ms().unwrap() + 1)
+        .unwrap();
+    let uncommitted_presentation =
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
+            authorizations.clone(),
+            source.cluster_epoch(),
+            unavailable_pg_staging_authorization_batch_identity(&authorizations).members_digest,
+        )
+        .unwrap();
+    assert!(source_runtime
+        .authority_published_staging_authorizations()
+        .verify(
+            NodeId::new(4),
+            PgId::new(70),
+            source_runtime.cluster_epoch(),
+            &uncommitted_presentation,
+        )
+        .is_err());
     let command = source
         .authorize_unavailable_pg_staging_intents_batch_command(&authorizations)
         .unwrap();
@@ -520,6 +646,52 @@ fn plural_staging_authorization_builder_and_standalone_authority_are_atomic_and_
             .staging_authorization
             .is_some());
     }
+    let committed = authorized
+        .committed_unavailable_pg_staging_authorization(&authorizations[0], NodeId::new(4))
+        .unwrap();
+    let authorized_runtime = authorized
+        .runtime_map(authorized.max_committed_timestamp_ms().unwrap() + 1)
+        .unwrap();
+    let decoded_authorized_runtime =
+        super::rpc::decode_runtime_map_test_snapshot(authorized_runtime).unwrap();
+    let published = decoded_authorized_runtime.authority_published_staging_authorizations();
+    assert_eq!(
+        published
+            .verify(
+                NodeId::new(4),
+                authorizations[0].unavailable_transition.pg_id(),
+                decoded_authorized_runtime.cluster_epoch(),
+                committed.presentation(),
+            )
+            .unwrap(),
+        committed
+    );
+    let regrouped_authorizations = vec![authorizations[0].clone()];
+    let regrouped =
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
+            regrouped_authorizations.clone(),
+            committed.committed_epoch(),
+            unavailable_pg_staging_authorization_members_digest(&regrouped_authorizations),
+        )
+        .unwrap();
+    assert!(published
+        .verify(
+            NodeId::new(4),
+            PgId::new(70),
+            decoded_authorized_runtime.cluster_epoch(),
+            &regrouped,
+        )
+        .is_err());
+    let mut forged_runtime = decoded_authorized_runtime;
+    let mut forged_digest = forged_runtime.staging_authorizations[0].batch_members_digest();
+    forged_digest[0] ^= 0x80;
+    forged_runtime.staging_authorizations[0].test_set_batch_members_digest(forged_digest);
+    let forged_error = super::rpc::decode_runtime_map_test_snapshot(forged_runtime).unwrap_err();
+    assert!(matches!(
+        forged_error,
+        ControlPlaneError::CommandDecode { message }
+            if message.contains("batch digest is not canonical")
+    ));
     let replay = authority
         .authorize_unavailable_pg_staging_intents_batch(&authorizations)
         .unwrap();

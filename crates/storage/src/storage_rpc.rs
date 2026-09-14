@@ -4,6 +4,9 @@
 use crate::{
     cluster::ShardLocation,
     control_plane::{CanonicalStateDigest, MetadataCommandLogHash},
+    control_plane_command::{
+        UnavailablePgStagingAuthorizationPresentation, MAX_UNAVAILABLE_PG_TRANSITION_COMMAND_BYTES,
+    },
     metadata_command::{
         decode_metadata_command_envelope, validate_metadata_command_envelope_bytes,
         BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
