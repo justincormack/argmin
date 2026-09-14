@@ -604,6 +604,32 @@ impl ControlPlaneRaftAuthorityHost {
         self.current_snapshot()
     }
 
+    pub fn checkpoint_metadata_transfer_staging_evidence_pages(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let response = self.submit_low_priority_raft_command(
+            ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+            },
+        )?;
+        if !matches!(
+            response,
+            ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages
+        ) {
+            return Err(ControlPlaneError::invariant_failure(
+                "staging evidence checkpoint returned the wrong response",
+            ));
+        }
+        self.current_snapshot()
+    }
+
     pub fn complete_unavailable_pg_reconciliation(
         &mut self,
         work: &UnavailablePgReconciliationWork,
@@ -1343,6 +1369,22 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
             unreachable!("staging evidence command returned the wrong response");
         };
         Ok(apply_receipt)
+    }
+
+    fn checkpoint_metadata_transfer_staging_evidence_pages(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        ControlPlaneRaftAuthorityHost::checkpoint_metadata_transfer_staging_evidence_pages(
+            self,
+            actor_node_id,
+            actor_node_incarnation,
+            first_generation,
+            last_generation,
+        )
     }
 
     fn fence_pg_for_metadata_transfer(

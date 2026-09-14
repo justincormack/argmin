@@ -363,6 +363,385 @@ fn staged_two_pg_install_authority_fixture_with_proof(
     (tmp, store, authority, requests)
 }
 
+#[test]
+fn staging_evidence_checkpoint_compacts_history_without_consuming_the_tip() {
+    let (_tmp, store, mut authority, installs) = staged_two_pg_install_authority_fixture_with_proof(
+        PgMetadataProof::current(23, 0x2323, 0x3434),
+    );
+    let first_install = &installs[0];
+    let actor_node_id = first_install.publications[0].node_id;
+    let actor_node_incarnation = first_install.publications[0].node_incarnation;
+    let actor_key = (actor_node_id, actor_node_incarnation);
+    let original_epoch = authority.snapshot().cluster_epoch();
+    let first_page = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages[&(actor_key.0, actor_key.1, 1)]
+        .clone();
+
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation: 1,
+                last_generation: 65,
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exceeds the 64 page limit"));
+
+    let compacted = ControlPlaneAdmin::checkpoint_metadata_transfer_staging_evidence_pages(
+        &mut authority,
+        actor_node_id,
+        actor_node_incarnation,
+        1,
+        1,
+    )
+    .unwrap();
+    assert_eq!(compacted.cluster_epoch(), original_epoch);
+    assert!(!compacted
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(actor_key.0, actor_key.1, 1)));
+    assert!(compacted
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(actor_key.0, actor_key.1, 2)));
+    let segment = &compacted.metadata_transfer_staging_evidence_checkpoint_segments
+        [&(actor_key.0, actor_key.1, 1)];
+    assert_eq!((segment.first_generation, segment.last_generation), (1, 1));
+    assert_eq!(segment.commitments.len(), 1);
+    compacted.validate_current_state_invariants().unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(&compacted)).unwrap(),
+        compacted
+    );
+
+    let replayed = ControlPlaneAdmin::checkpoint_metadata_transfer_staging_evidence_pages(
+        &mut authority,
+        actor_node_id,
+        actor_node_incarnation,
+        1,
+        1,
+    )
+    .unwrap();
+    assert_eq!(replayed, compacted);
+    assert!(authority
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: first_page.operation_payload,
+                page_digest: first_page.page_digest,
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not extend the retained generation"));
+
+    assert!(
+        ControlPlaneAdmin::checkpoint_metadata_transfer_staging_evidence_pages(
+            &mut authority,
+            actor_node_id,
+            actor_node_incarnation,
+            2,
+            2,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("cannot consume the actor page tip")
+    );
+
+    let second_page = &authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages[&(actor_key.0, actor_key.1, 2)];
+    let second_receipt =
+        crate::pg_store::decode_staging_evidence_apply_receipt(&second_page.apply_receipt).unwrap();
+    let transition = first_install.unavailable_transition.clone();
+    let actor_record = authority.snapshot().node(actor_node_id).unwrap();
+    let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        actor_node_id,
+        actor_node_incarnation,
+        actor_record.endpoint().to_owned(),
+    )
+    .unwrap();
+    let authorization = authority
+        .snapshot()
+        .unavailable_pg_placement_transition(transition.pg_id())
+        .unwrap()
+        .staging_authorization
+        .as_ref()
+        .unwrap();
+    let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+        &transition,
+        authorization.artifact_digest,
+        authorization.artifact_length,
+        authorization.artifact_format_version,
+    )
+    .unwrap();
+    let third_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        actor,
+        &transition,
+        intent.artifact_digest(),
+        intent.artifact_length(),
+        intent.artifact_format_version(),
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+        Some(&second_receipt),
+    );
+    ControlPlaneAdmin::apply_metadata_transfer_staging_evidence_page(
+        &mut authority,
+        third_page.operation_payload().to_vec(),
+        third_page.page_digest(),
+    )
+    .unwrap();
+    let third_page = &authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages[&(actor_key.0, actor_key.1, 3)];
+    let third_receipt =
+        crate::pg_store::decode_staging_evidence_apply_receipt(&third_page.apply_receipt).unwrap();
+    let second_install = &installs[1];
+    assert!(second_install
+        .publications
+        .iter()
+        .any(|publication| publication.node_id == actor_node_id));
+    let second_transition = second_install.unavailable_transition.clone();
+    let second_authorization = authority
+        .snapshot()
+        .unavailable_pg_placement_transition(second_transition.pg_id())
+        .unwrap()
+        .staging_authorization
+        .as_ref()
+        .unwrap()
+        .clone();
+    let fourth_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+            actor_node_id,
+            actor_node_incarnation,
+            authority
+                .snapshot()
+                .node(actor_node_id)
+                .unwrap()
+                .endpoint()
+                .to_owned(),
+        )
+        .unwrap(),
+        &second_transition,
+        second_authorization.artifact_digest,
+        second_authorization.artifact_length,
+        second_authorization.artifact_format_version,
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+        Some(&third_receipt),
+    );
+    ControlPlaneAdmin::apply_metadata_transfer_staging_evidence_page(
+        &mut authority,
+        fourth_page.operation_payload().to_vec(),
+        fourth_page.page_digest(),
+    )
+    .unwrap();
+    authority
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+    let compacted_second = ControlPlaneAdmin::checkpoint_metadata_transfer_staging_evidence_pages(
+        &mut authority,
+        actor_node_id,
+        actor_node_incarnation,
+        2,
+        3,
+    )
+    .unwrap();
+    assert_eq!(compacted_second.cluster_epoch(), original_epoch);
+    let second_segment = &compacted_second.metadata_transfer_staging_evidence_checkpoint_segments
+        [&(actor_key.0, actor_key.1, 2)];
+    assert_eq!(second_segment.last_generation, 3);
+    assert_eq!(second_segment.page_links.len(), 2);
+    let formatted_checkpoint_state = format_snapshot(&compacted_second);
+    let second_segment_record = formatted_checkpoint_state
+        .lines()
+        .filter(|line| {
+            line.starts_with(METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_PREFIX)
+        })
+        .find(|line| line.contains(",2,3,"))
+        .unwrap();
+    assert_eq!(
+        metadata_transfer_staging_evidence_checkpoint_state_record_len(second_segment),
+        second_segment_record.len() + 1
+    );
+    assert!(
+        second_segment_record.len()
+            < MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_BYTES
+    );
+    assert_eq!(
+        compacted_second
+            .metadata_transfer_staging_evidence_checkpoint_segments
+            .range((actor_key.0, actor_key.1, 0)..=(actor_key.0, actor_key.1, u64::MAX))
+            .count(),
+        2
+    );
+    assert!(compacted_second
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(actor_key.0, actor_key.1, 4)));
+    compacted_second
+        .validate_current_state_invariants()
+        .unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(&compacted_second)).unwrap(),
+        compacted_second
+    );
+    drop(authority);
+    let restarted = SingleAuthorityControlPlane::open(store).unwrap();
+    assert_eq!(
+        restarted
+            .snapshot()
+            .metadata_transfer_staging_evidence_checkpoint_segments,
+        compacted_second.metadata_transfer_staging_evidence_checkpoint_segments
+    );
+    assert_eq!(
+        restarted
+            .snapshot()
+            .metadata_transfer_staging_evidence_pages,
+        compacted_second.metadata_transfer_staging_evidence_pages
+    );
+    assert_eq!(
+        restarted.snapshot().metadata_transfer_staging_evidence,
+        compacted_second.metadata_transfer_staging_evidence
+    );
+    restarted
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+
+    let mut changed_commitment = compacted_second.clone();
+    changed_commitment
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .get_mut(&(actor_key.0, actor_key.1, 1))
+        .unwrap()
+        .commitments
+        .values_mut()
+        .next()
+        .unwrap()[0] ^= 1;
+    assert!(parse_snapshot(&format_snapshot(&changed_commitment))
+        .unwrap_err()
+        .to_string()
+        .contains("does not match its retained chain commitment"));
+
+    let mut changed_interior_link = compacted_second.clone();
+    changed_interior_link
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .get_mut(&(actor_key.0, actor_key.1, 2))
+        .unwrap()
+        .page_links[0]
+        .page_digest[0] ^= 1;
+    assert!(parse_snapshot(&format_snapshot(&changed_interior_link))
+        .unwrap_err()
+        .to_string()
+        .contains("page link has an invalid apply receipt digest"));
+
+    let mut changed_commitment_actor = compacted_second.clone();
+    changed_commitment_actor
+        .nodes
+        .get_mut(&actor_node_id)
+        .unwrap()
+        .node_incarnation += 1;
+    let changed_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        actor_node_id,
+        actor_node_incarnation,
+        "unix:///changed-historical-actor.sock".to_owned(),
+    )
+    .unwrap();
+    let first_segment = changed_commitment_actor
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .get_mut(&(actor_key.0, actor_key.1, 1))
+        .unwrap();
+    let first_segment_keys = first_segment
+        .commitments
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in first_segment_keys {
+        let rebound = crate::pg_store::rebind_metadata_transfer_staging_evidence_actor_for_test(
+            &changed_commitment_actor.metadata_transfer_staging_evidence[&key],
+            &changed_actor,
+        );
+        first_segment
+            .commitments
+            .insert(key.clone(), checksum::sha256::digest(&rebound));
+        changed_commitment_actor
+            .metadata_transfer_staging_evidence
+            .insert(key, rebound);
+    }
+    assert!(parse_snapshot(&format_snapshot(&changed_commitment_actor))
+        .unwrap_err()
+        .to_string()
+        .contains("does not match its retained chain commitment"));
+
+    let mut changed_page_actor = compacted_second.clone();
+    changed_page_actor
+        .nodes
+        .get_mut(&actor_node_id)
+        .unwrap()
+        .node_incarnation += 1;
+    let changed_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        actor_node_id,
+        actor_node_incarnation,
+        "unix:///changed-page-actor.sock".to_owned(),
+    )
+    .unwrap();
+    let changed_fourth_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        changed_actor,
+        &second_transition,
+        second_authorization.artifact_digest,
+        second_authorization.artifact_length,
+        second_authorization.artifact_format_version,
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+        Some(&third_receipt),
+    );
+    let changed_fourth_evidence =
+        crate::pg_store::decode_staging_evidence(changed_fourth_page.entries()[0].evidence())
+            .unwrap();
+    let changed_fourth_key = metadata_transfer_staging_evidence_key(&changed_fourth_evidence);
+    changed_page_actor
+        .metadata_transfer_staging_evidence
+        .insert(
+            changed_fourth_key,
+            changed_fourth_evidence.as_bytes().to_vec(),
+        );
+    let changed_fourth_receipt =
+        crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(
+            &changed_fourth_page,
+        );
+    changed_page_actor
+        .metadata_transfer_staging_evidence_pages
+        .insert(
+            (actor_key.0, actor_key.1, 4),
+            MetadataTransferStagingEvidencePageRecord {
+                operation_payload: changed_fourth_page.operation_payload().to_vec(),
+                page_digest: changed_fourth_page.page_digest(),
+                apply_receipt: changed_fourth_receipt.as_bytes().to_vec(),
+            },
+        );
+    let changed_page_actor_error = parse_snapshot(&format_snapshot(&changed_page_actor))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        changed_page_actor_error.contains("actor chain has a gap")
+            || changed_page_actor_error.contains("must retain its current page tip"),
+        "unexpected changed-page-actor error: {changed_page_actor_error}"
+    );
+
+    let mut missing_tip = compacted_second.clone();
+    missing_tip
+        .metadata_transfer_staging_evidence_pages
+        .remove(&(actor_key.0, actor_key.1, 4));
+    let error = parse_snapshot(&format_snapshot(&missing_tip))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("must retain its current page tip")
+            || error.contains("does not exactly match retained chain membership"),
+        "unexpected missing-tip error: {error}"
+    );
+}
+
 fn begun_two_pg_staging_authorization_authority_fixture_with_proof(
     proof: PgMetadataProof,
 ) -> (
@@ -1907,7 +2286,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         parse_snapshot(&format_snapshot(&same_actor_unpaged_snapshot))
             .unwrap_err()
             .to_string()
-            .contains("does not exactly match retained page membership")
+            .contains("does not exactly match retained chain membership")
     );
 
     let mut future_actor_snapshot = evidence_applied.snapshot().clone();
@@ -2032,7 +2411,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     assert!(parse_snapshot(&format_snapshot(&orphan_actor_snapshot))
         .unwrap_err()
         .to_string()
-        .contains("does not exactly match retained page membership"));
+        .contains("does not exactly match retained chain membership"));
 
     let mut changed_actor_snapshot = evidence_applied.snapshot().clone();
     let changed_endpoint = "/tmp/reincarnated-evidence-actor.sock".to_owned();
@@ -2106,7 +2485,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     assert!(parse_snapshot(&format_snapshot(&missing_predecessor_page))
         .unwrap_err()
         .to_string()
-        .contains("page chain has a generation gap"));
+        .contains("actor chain has a gap or invalid predecessor"));
     let mut missing_member = successor_applied.snapshot().clone();
     missing_member
         .metadata_transfer_staging_evidence
@@ -2121,7 +2500,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     assert!(missing_member
         .validate_current_state_invariants()
         .unwrap_err()
-        .contains("does not exactly match retained page membership"));
+        .contains("does not exactly match retained chain membership"));
 
     let unauthorized_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
         crate::pg_store::MetadataTransferStagingNodeIdentity::new(

@@ -5461,6 +5461,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
             .copied()
             .collect::<BTreeSet<_>>();
         let mut evidence_digests = BTreeMap::new();
+        let mut evidence_actors = Vec::new();
         for node_id in destination_nodes {
             let node = authorized.node(node_id).unwrap();
             let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
@@ -5469,6 +5470,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 node.endpoint().to_owned(),
             )
             .unwrap();
+            evidence_actors.push(actor.clone());
             let mut previous_receipt = None;
             for authorization in &authorizations {
                 let intent =
@@ -5500,6 +5502,58 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                     crate::pg_store::decode_staging_evidence_apply_receipt(&apply_receipt).unwrap(),
                 );
             }
+        }
+
+        let checkpoint_epoch = leader
+            .current_snapshot_for_test()
+            .unwrap()
+            .cluster_epoch();
+        let mut checkpointed = None;
+        for actor in &evidence_actors {
+            checkpointed = Some(
+                <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::checkpoint_metadata_transfer_staging_evidence_pages(
+                    &mut leader,
+                    actor.node_id(),
+                    actor.node_incarnation(),
+                    1,
+                    1,
+                )
+                .unwrap(),
+            );
+        }
+        let checkpointed = checkpointed.unwrap();
+        assert_eq!(checkpointed.cluster_epoch(), checkpoint_epoch);
+        assert_eq!(
+            crate::control_plane::format_snapshot(&checkpointed)
+                .matches("metadata_transfer_staging_evidence_checkpoint=")
+                .count(),
+            evidence_actors.len()
+        );
+        let checkpoint_applied = authority1.status().await.unwrap().applied().unwrap();
+        authority2
+            .wait_for_applied_log_id(
+                checkpoint_applied,
+                Duration::from_secs(1),
+                "second voter applied staging evidence checkpoints",
+            )
+            .await
+            .unwrap();
+        authority3
+            .wait_for_applied_log_id(
+                checkpoint_applied,
+                Duration::from_secs(1),
+                "third voter applied staging evidence checkpoints",
+            )
+            .await
+            .unwrap();
+        for authority in [&authority1, &authority2, &authority3] {
+            assert_eq!(
+                authority
+                    .durable_state_machine_snapshot_for_test()
+                    .await
+                    .unwrap(),
+                checkpointed
+            );
         }
 
         let install_source = leader.current_snapshot_for_test().unwrap();
@@ -5599,6 +5653,17 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 false,
             )
             .unwrap();
+        for actor in &evidence_actors {
+            let replayed_checkpoint = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::checkpoint_metadata_transfer_staging_evidence_pages(
+                &mut successor,
+                actor.node_id(),
+                actor.node_incarnation(),
+                1,
+                1,
+            )
+            .unwrap();
+            assert_eq!(replayed_checkpoint, installed);
+        }
         let replayed_authorization = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::authorize_unavailable_pg_staging_intents_batch(
             &mut successor,
             &authorizations,

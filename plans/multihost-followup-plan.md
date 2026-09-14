@@ -618,8 +618,9 @@ available only when the control-plane-managed node opened its established
 staging store. They deliberately do not mutate a PG route or install imported
 metadata. Reconciliation selection of committed staging authorizations,
 receipt-set consumption during destination installation, tombstone cleanup,
-finalized-floor pruning, and compact actor-chain checkpoints remain later
-slices.
+and finalized-floor pruning remain later slices. Bounded compact actor-chain
+checkpoint segments are implemented by the command-v26/state-v38 slice
+described below.
 Command v19 additionally sealed the
 post-grace completion fence that prevents survivor heartbeats from indefinitely
 reactivating the old acting set; immutable command v18 remains rejection
@@ -895,13 +896,13 @@ compaction, Raft compaction, and authority failover. The tip advances only when
 the control plane accepts the exact successor page whose
 `previous_generation` and previous apply-receipt digest cite it. Because the
 node may construct that successor only after durably recording the cited
-receipt, acceptance is the observable acknowledgement boundary. This retains
-the contributor pages under the current state-v37 representation. State v37
-does not permit per-PG detailed-evidence or page pruning: pages may mix PGs, and
-removing either one member or an interior page would destroy snapshot-verifiable
-provenance. Finalized-floor cleanup remains gated until the compact actor-chain
-checkpoint segments below are implemented in a coordinated later state/command
-version.
+receipt, acceptance is the observable acknowledgement boundary. State v38 can
+replace acknowledged non-tip page ranges with the bounded actor-chain
+checkpoint segments below. It still does not permit per-PG detailed-evidence
+pruning: pages and segments may mix PGs, and removing an uncovered member would
+destroy snapshot-verifiable provenance. Finalized-floor cleanup remains gated
+until actor-incarnation chain closure and the floor-driven detail-removal and
+segment-collapse protocol are implemented.
 
 A Raft log ID or standalone journal position may accompany the apply receipt
 as diagnostic metadata, but is not part of receipt identity or required for
@@ -918,22 +919,27 @@ omitted, malformed, genesis-on-successor, or incorrect predecessor digest is a
 protocol error that leaves the retained receipt and all evidence unchanged. A
 conflicting digest for an assigned generation is fatal protocol evidence.
 
-Before enabling finalized-floor pruning, add canonical compact actor-chain
-checkpoint segments. A segment replaces an exact contiguous range of complete
+Command v26 and state v38 add canonical compact actor-chain checkpoint
+segments. A segment replaces an exact contiguous range of complete
 accepted pages atomically and contains the exact actor tuple, predecessor
 anchor, range-tip generation, canonical tip apply receipt and digest, plus a
 sorted fixed-width commitment for every distinct evidence identity in that
 range: the complete evidence key and SHA-256 digest of its canonical bytes. A
-segment contains at most 64 commitments and its production-encoded command and
-state representations must each fit the 120 KiB evidence-operation ceiling and
-the replication-safe Raft-entry ceiling. The builder adds only whole pages and
-stops before either limit; the format must prove that the commitments derived
-from one maximum-sized source page always fit one segment. Count, encoded-byte,
-single-page-fit, and over-limit rejection are state-machine invariants rather
-than scheduler policy.
+segment contains at most 64 commitments. Control-plane command v26 independently
+limits a request to 64 pages, while state v38 independently limits a complete
+checkpoint state record, including its key prefix and newline, to 120 KiB. The
+command must also fit the replication-safe Raft-entry ceiling. The state machine
+checks the complete canonical state record before removing any page and rejects
+a range before traversal when its page count exceeds the bound. These
+control-plane-owned count and encoded-byte limits do not inherit staging-page
+format constants; changing either language requires the corresponding
+control-plane command or state version advancement.
 
 The checkpoint operation validates the source pages, receipts, predecessor
-links, member set, and both bounds before removing those page payloads. The
+links, complete actor tuple, member set, and both bounds before removing those
+page payloads. Every compacted link must reproduce the digest of the canonical
+storage-owned apply receipt for its actor, predecessor, generation, and page
+digest; interior links are not trusted as opaque digest pairs. The
 first later segment or retained page must cite the preceding segment's exact
 tip receipt. Snapshot validation reconstructs every boundary and rejects gaps,
 overlap, reordered or duplicate commitments, altered member digests, an
@@ -942,6 +948,17 @@ Later complete page ranges may become separate checkpoint segments even while
 an earlier segment retains an unresolved PG commitment; an unresolved member
 therefore pins at most one bounded segment rather than the actor's later page
 history.
+
+The implementation retains every detailed evidence byte and keeps each
+actor's complete current page tip replayable. Snapshot validation reconstructs
+the contiguous page/segment chain keyed by exact node, incarnation, and
+endpoint, verifies every page link and tip receipt, and compares each segment
+commitment with retained canonical evidence from that exact actor.
+Standalone restart and three-voter Raft tests cover multi-page and adjacent
+segments, epoch-neutral replication, leadership-transfer replay, and corrupted
+commitment/tip rejection. The following per-PG floor pruning, covered-segment
+collapse, coalescing, and actor-incarnation closure remain gated follow-up
+slices.
 
 Per-PG cleanup then advances the durable finalized floor and removes detailed
 bytes independently, but retains the fixed-width commitment until its key is

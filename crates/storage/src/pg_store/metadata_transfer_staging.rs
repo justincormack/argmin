@@ -740,6 +740,26 @@ impl MetadataTransferStagingEvidenceApplyReceipt {
         receipt
     }
 
+    pub(crate) fn for_checkpoint_link(
+        actor: MetadataTransferStagingNodeIdentity,
+        previous_generation: u64,
+        previous_apply_receipt_digest: [u8; DIGEST_LEN],
+        generation: u64,
+        page_digest: [u8; DIGEST_LEN],
+    ) -> Self {
+        let mut receipt = Self {
+            actor,
+            previous_generation,
+            previous_apply_receipt_digest,
+            generation,
+            page_digest,
+            accepted_generation: generation,
+            bytes: Vec::new(),
+        };
+        receipt.bytes = encode_staging_evidence_apply_receipt(&receipt);
+        receipt
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -750,6 +770,18 @@ impl MetadataTransferStagingEvidenceApplyReceipt {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn previous_generation(&self) -> u64 {
+        self.previous_generation
+    }
+
+    pub(crate) fn previous_apply_receipt_digest(&self) -> [u8; DIGEST_LEN] {
+        self.previous_apply_receipt_digest
+    }
+
+    pub(crate) fn accepted_generation(&self) -> u64 {
+        self.accepted_generation
     }
 
     pub(crate) fn page_digest(&self) -> [u8; DIGEST_LEN] {
@@ -3716,6 +3748,21 @@ pub(crate) fn metadata_transfer_staging_evidence_page_for_test(
         &intent,
         kind,
         previous_receipt,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn rebind_metadata_transfer_staging_evidence_actor_for_test(
+    bytes: &[u8],
+    actor: &MetadataTransferStagingNodeIdentity,
+) -> Vec<u8> {
+    let evidence = decode_staging_evidence(bytes).unwrap();
+    encode_staging_evidence(
+        actor,
+        evidence.intent(),
+        evidence.kind() as u8,
+        evidence.target_epoch(),
+        evidence.transfer(),
     )
 }
 

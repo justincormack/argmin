@@ -87,6 +87,11 @@ pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 pub const DEFAULT_UNAVAILABLE_PLACEMENT_GRACE_MS: u64 = 30_000;
 pub const UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE: usize = 16;
 pub const MAX_UNAVAILABLE_PG_TRANSITION_BATCH: usize = 16;
+pub(crate) const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES: usize = 64;
+const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS: usize = 64;
+const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_BYTES: usize = 120 * 1_024;
+const METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_PREFIX: &str =
+    "metadata_transfer_staging_evidence_checkpoint=";
 pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
@@ -103,7 +108,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 37;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 38;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
@@ -876,6 +881,8 @@ pub struct ClusterControlSnapshot {
         BTreeMap<(PgId, ClusterEpoch), UnavailablePgPlacementTransition>,
     metadata_transfer_staging_evidence_pages:
         BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidencePageRecord>,
+    metadata_transfer_staging_evidence_checkpoint_segments:
+        BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidenceCheckpointSegment>,
     metadata_transfer_staging_evidence: BTreeMap<MetadataTransferStagingEvidenceKey, Vec<u8>>,
     history: Vec<ClusterMapHistoryRecord>,
 }
@@ -887,6 +894,25 @@ struct MetadataTransferStagingEvidencePageRecord {
     apply_receipt: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataTransferStagingEvidenceCheckpointSegment {
+    actor: crate::pg_store::MetadataTransferStagingNodeIdentity,
+    first_generation: u64,
+    last_generation: u64,
+    previous_generation: u64,
+    previous_apply_receipt_digest: [u8; 32],
+    page_links: Vec<MetadataTransferStagingEvidenceCheckpointPageLink>,
+    tip_apply_receipt: Vec<u8>,
+    commitments: BTreeMap<MetadataTransferStagingEvidenceKey, [u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataTransferStagingEvidenceCheckpointPageLink {
+    page_digest: [u8; 32],
+    previous_apply_receipt_digest: [u8; 32],
+    apply_receipt_digest: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MetadataTransferStagingEvidenceKey {
     pg_id: PgId,
@@ -895,6 +921,19 @@ struct MetadataTransferStagingEvidenceKey {
     actor_node_incarnation: u64,
     kind: crate::pg_store::MetadataTransferStagingEvidenceKind,
     target_epoch: Option<ClusterEpoch>,
+}
+
+fn metadata_transfer_staging_evidence_key(
+    evidence: &crate::pg_store::MetadataTransferStagingEvidence,
+) -> MetadataTransferStagingEvidenceKey {
+    MetadataTransferStagingEvidenceKey {
+        pg_id: evidence.intent().pg_id(),
+        staging_generation: evidence.intent().staging_generation(),
+        actor_node_id: evidence.actor().node_id(),
+        actor_node_incarnation: evidence.actor().node_incarnation(),
+        kind: evidence.kind(),
+        target_epoch: evidence.target_epoch(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1696,6 +1735,7 @@ impl ClusterControlSnapshot {
             unavailable_pg_placement_transitions: BTreeMap::new(),
             retained_unavailable_pg_placement_transitions: BTreeMap::new(),
             metadata_transfer_staging_evidence_pages: BTreeMap::new(),
+            metadata_transfer_staging_evidence_checkpoint_segments: BTreeMap::new(),
             metadata_transfer_staging_evidence: BTreeMap::new(),
             history: Vec::new(),
         }
@@ -3215,6 +3255,9 @@ impl ClusterControlSnapshot {
 
     fn validate_metadata_transfer_staging_evidence_invariants(&self) -> Result<(), String> {
         let mut page_members = BTreeMap::new();
+        let mut checkpoint_members = BTreeMap::new();
+        type ChainRange = (u64, u64, u64, [u8; 32], [u8; 32], bool);
+        let mut actor_chains: BTreeMap<(NodeId, u64, String), Vec<ChainRange>> = BTreeMap::new();
         for (key, record) in &self.metadata_transfer_staging_evidence_pages {
             let page = crate::pg_store::decode_staging_evidence_page_payload(
                 &record.operation_payload,
@@ -3255,42 +3298,17 @@ impl ClusterControlSnapshot {
                     "metadata-transfer staging page has a mismatched apply receipt".to_owned(),
                 );
             }
-            if page.generation() == 1 {
-                if page.previous_generation() != 0
-                    || page.previous_apply_receipt_digest() != [0; 32]
-                {
-                    return Err(
-                        "metadata-transfer staging actor page chain has an invalid genesis"
-                            .to_owned(),
-                    );
-                }
-            } else {
-                let predecessor = self
-                    .metadata_transfer_staging_evidence_pages
-                    .get(&(
-                        page.actor().node_id(),
-                        page.actor().node_incarnation(),
-                        page.generation() - 1,
-                    ))
-                    .ok_or_else(|| {
-                        "metadata-transfer staging actor page chain has a generation gap".to_owned()
-                    })?;
-                let predecessor_page = crate::pg_store::decode_staging_evidence_page_payload(
-                    &predecessor.operation_payload,
-                    predecessor.page_digest,
-                )
-                .map_err(|error| error.to_string())?;
-                if predecessor_page.actor() != page.actor()
-                    || page.previous_generation() != predecessor_page.generation()
-                    || page.previous_apply_receipt_digest()
-                        != checksum::sha256::digest(&predecessor.apply_receipt)
-                {
-                    return Err(
-                        "metadata-transfer staging actor page does not extend its exact predecessor"
-                            .to_owned(),
-                    );
-                }
-            }
+            actor_chains
+                .entry((key.0, key.1, page.actor().endpoint().to_owned()))
+                .or_default()
+                .push((
+                    page.generation(),
+                    page.generation(),
+                    page.previous_generation(),
+                    page.previous_apply_receipt_digest(),
+                    checksum::sha256::digest(&record.apply_receipt),
+                    true,
+                ));
             for entry in page.entries() {
                 let evidence = crate::pg_store::decode_staging_evidence(entry.evidence())
                     .map_err(|error| error.to_string())?;
@@ -3318,9 +3336,171 @@ impl ClusterControlSnapshot {
                 }
             }
         }
-        if page_members != self.metadata_transfer_staging_evidence {
+        for (key, segment) in &self.metadata_transfer_staging_evidence_checkpoint_segments {
+            if *key
+                != (
+                    segment.actor.node_id(),
+                    segment.actor.node_incarnation(),
+                    segment.first_generation,
+                )
+            {
+                return Err(
+                    "metadata-transfer staging checkpoint key does not match its actor and range"
+                        .to_owned(),
+                );
+            }
+            let node = self.nodes.get(&segment.actor.node_id()).ok_or_else(|| {
+                "metadata-transfer staging checkpoint references an unknown actor".to_owned()
+            })?;
+            if node.node_incarnation < segment.actor.node_incarnation()
+                || (node.node_incarnation == segment.actor.node_incarnation()
+                    && node.endpoint != segment.actor.endpoint())
+            {
+                return Err(
+                    "metadata-transfer staging checkpoint actor is incompatible with current node identity"
+                        .to_owned(),
+                );
+            }
+            if segment.first_generation == 0
+                || segment.first_generation > segment.last_generation
+                || segment.commitments.is_empty()
+                || segment.commitments.len()
+                    > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS
+                || segment.page_links.is_empty()
+                || segment.page_links.len()
+                    > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES
+                || u64::try_from(segment.page_links.len()).ok()
+                    != segment
+                        .last_generation
+                        .checked_sub(segment.first_generation)
+                        .and_then(|distance| distance.checked_add(1))
+            {
+                return Err(
+                    "metadata-transfer staging checkpoint has invalid range or bounds".to_owned(),
+                );
+            }
+            if metadata_transfer_staging_evidence_checkpoint_state_record_len(segment)
+                > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_BYTES
+            {
+                return Err(
+                    "metadata-transfer staging checkpoint exceeds its encoded byte limit"
+                        .to_owned(),
+                );
+            }
+            let mut preceding_generation = segment.previous_generation;
+            let mut preceding_digest = segment.previous_apply_receipt_digest;
+            for (offset, link) in segment.page_links.iter().enumerate() {
+                if link.previous_apply_receipt_digest != preceding_digest {
+                    return Err(
+                        "metadata-transfer staging checkpoint page links are discontinuous"
+                            .to_owned(),
+                    );
+                }
+                let generation = segment
+                    .first_generation
+                    .checked_add(u64::try_from(offset).map_err(|_| {
+                        "metadata-transfer staging checkpoint page offset does not fit u64"
+                            .to_owned()
+                    })?)
+                    .ok_or_else(|| {
+                        "metadata-transfer staging checkpoint page generation overflow".to_owned()
+                    })?;
+                let expected_receipt = crate::pg_store::
+                    MetadataTransferStagingEvidenceApplyReceipt::for_checkpoint_link(
+                        segment.actor.clone(),
+                        preceding_generation,
+                        preceding_digest,
+                        generation,
+                        link.page_digest,
+                    );
+                if checksum::sha256::digest(expected_receipt.as_bytes())
+                    != link.apply_receipt_digest
+                {
+                    return Err(
+                        "metadata-transfer staging checkpoint page link has an invalid apply receipt digest"
+                            .to_owned(),
+                    );
+                }
+                preceding_generation = generation;
+                preceding_digest = link.apply_receipt_digest;
+            }
+            let tip_receipt =
+                crate::pg_store::decode_staging_evidence_apply_receipt(&segment.tip_apply_receipt)
+                    .map_err(|error| error.to_string())?;
+            let tip_link = segment.page_links.last().expect("nonempty links validated");
+            if tip_receipt.actor() != &segment.actor
+                || tip_receipt.generation() != segment.last_generation
+                || tip_receipt.accepted_generation() != segment.last_generation
+                || tip_receipt.page_digest() != tip_link.page_digest
+                || tip_receipt.previous_generation() != segment.last_generation.saturating_sub(1)
+                || tip_receipt.previous_apply_receipt_digest()
+                    != tip_link.previous_apply_receipt_digest
+                || checksum::sha256::digest(&segment.tip_apply_receipt)
+                    != tip_link.apply_receipt_digest
+            {
+                return Err(
+                    "metadata-transfer staging checkpoint tip receipt is invalid".to_owned(),
+                );
+            }
+            for (evidence_key, digest) in &segment.commitments {
+                if evidence_key.actor_node_id != segment.actor.node_id()
+                    || evidence_key.actor_node_incarnation != segment.actor.node_incarnation()
+                    || checkpoint_members
+                        .insert(evidence_key.clone(), (*digest, segment.actor.clone()))
+                        .is_some()
+                    || page_members.contains_key(evidence_key)
+                {
+                    return Err(
+                        "metadata-transfer staging evidence appears in more than one retained chain range"
+                            .to_owned(),
+                    );
+                }
+            }
+            actor_chains
+                .entry((key.0, key.1, segment.actor.endpoint().to_owned()))
+                .or_default()
+                .push((
+                    segment.first_generation,
+                    segment.last_generation,
+                    segment.previous_generation,
+                    segment.previous_apply_receipt_digest,
+                    checksum::sha256::digest(&segment.tip_apply_receipt),
+                    false,
+                ));
+        }
+        for ranges in actor_chains.values_mut() {
+            ranges.sort_by_key(|range| range.0);
+            let mut expected_generation = 1_u64;
+            let mut previous_generation = 0_u64;
+            let mut previous_receipt_digest = [0; 32];
+            for (first, last, predecessor, predecessor_digest, tip_digest, _) in ranges.iter() {
+                if *first != expected_generation
+                    || *predecessor != previous_generation
+                    || *predecessor_digest != previous_receipt_digest
+                {
+                    return Err(
+                        "metadata-transfer staging actor chain has a gap or invalid predecessor"
+                            .to_owned(),
+                    );
+                }
+                expected_generation = last.checked_add(1).ok_or_else(|| {
+                    "metadata-transfer staging actor generation overflow".to_owned()
+                })?;
+                previous_generation = *last;
+                previous_receipt_digest = *tip_digest;
+            }
+            if !ranges.last().is_some_and(|range| range.5) {
+                return Err(
+                    "metadata-transfer staging actor chain must retain its current page tip"
+                        .to_owned(),
+                );
+            }
+        }
+        if page_members.len() + checkpoint_members.len()
+            != self.metadata_transfer_staging_evidence.len()
+        {
             return Err(
-                "metadata-transfer staging detailed evidence does not exactly match retained page membership"
+                "metadata-transfer staging detailed evidence does not exactly match retained chain membership"
                     .to_owned(),
             );
         }
@@ -3339,6 +3519,18 @@ impl ClusterControlSnapshot {
                 return Err(
                     "metadata-transfer staging evidence key does not match its payload".to_owned(),
                 );
+            }
+            match (page_members.get(key), checkpoint_members.get(key)) {
+                (Some(expected), None) if expected == bytes => {}
+                (None, Some((expected_digest, expected_actor)))
+                    if *expected_digest == checksum::sha256::digest(bytes)
+                        && evidence.actor() == expected_actor => {}
+                _ => {
+                    return Err(
+                        "metadata-transfer staging detailed evidence does not match its retained chain commitment"
+                            .to_owned(),
+                    );
+                }
             }
             self.validate_metadata_transfer_staging_evidence_authority(&evidence, false)
                 .map_err(|error| error.to_string())?;
@@ -3484,6 +3676,236 @@ impl ClusterControlSnapshot {
             },
             true,
         ))
+    }
+
+    fn checkpoint_metadata_transfer_staging_evidence_pages(
+        &self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        if first_generation == 0 || first_generation > last_generation {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "metadata-transfer staging checkpoint generation range is invalid"
+                    .to_owned(),
+            });
+        }
+        let page_count = last_generation
+            .checked_sub(first_generation)
+            .and_then(|distance| distance.checked_add(1))
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "metadata-transfer staging checkpoint generation range overflows"
+                    .to_owned(),
+            })?;
+        if page_count
+            > u64::try_from(MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES)
+                .expect("checkpoint page limit fits u64")
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "metadata-transfer staging checkpoint exceeds the {} page limit",
+                    MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES
+                ),
+            });
+        }
+        let segment_key = (actor_node_id, actor_node_incarnation, first_generation);
+        if let Some(existing) = self
+            .metadata_transfer_staging_evidence_checkpoint_segments
+            .get(&segment_key)
+        {
+            if existing.last_generation == last_generation {
+                return Ok(AppliedControlPlaneCommand::new(
+                    self.clone(),
+                    ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages,
+                    false,
+                ));
+            }
+            return Err(ControlPlaneError::CommandDecode {
+                message: "metadata-transfer staging checkpoint conflicts with retained segment"
+                    .to_owned(),
+            });
+        }
+        if self
+            .metadata_transfer_staging_evidence_checkpoint_segments
+            .values()
+            .any(|segment| {
+                segment.actor.node_id() == actor_node_id
+                    && segment.actor.node_incarnation() == actor_node_incarnation
+                    && first_generation <= segment.last_generation
+                    && segment.first_generation <= last_generation
+            })
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "metadata-transfer staging checkpoint overlaps a retained segment"
+                    .to_owned(),
+            });
+        }
+        let actor_key = (actor_node_id, actor_node_incarnation);
+        let latest_generation = self
+            .metadata_transfer_staging_evidence_pages
+            .range((actor_key.0, actor_key.1, 0)..=(actor_key.0, actor_key.1, u64::MAX))
+            .next_back()
+            .map(|(key, _)| key.2)
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "metadata-transfer staging checkpoint actor has no retained pages"
+                    .to_owned(),
+            })?;
+        if last_generation >= latest_generation {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "metadata-transfer staging checkpoint cannot consume the actor page tip"
+                    .to_owned(),
+            });
+        }
+
+        let mut actor = None;
+        let mut previous_generation = 0;
+        let mut previous_apply_receipt_digest = [0; 32];
+        let mut expected_previous_generation = None;
+        let mut expected_previous_digest = None;
+        let mut page_links = Vec::new();
+        let mut tip_apply_receipt = Vec::new();
+        let mut commitments = BTreeMap::new();
+        for generation in first_generation..=last_generation {
+            let record = self
+                .metadata_transfer_staging_evidence_pages
+                .get(&(actor_node_id, actor_node_incarnation, generation))
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "metadata-transfer staging checkpoint is missing generation {generation}"
+                    ),
+                })?;
+            let page = crate::pg_store::decode_staging_evidence_page_payload(
+                &record.operation_payload,
+                record.page_digest,
+            )
+            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
+                context: "retained metadata-transfer staging evidence page is invalid",
+                message: error.to_string(),
+            })?;
+            if page.actor().node_id() != actor_node_id
+                || page.actor().node_incarnation() != actor_node_incarnation
+                || page.generation() != generation
+            {
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
+                    context: "retained metadata-transfer staging evidence page is invalid",
+                    message: "page identity does not match its retained key".to_owned(),
+                });
+            }
+            if generation == first_generation {
+                actor = Some(page.actor().clone());
+                previous_generation = page.previous_generation();
+                previous_apply_receipt_digest = page.previous_apply_receipt_digest();
+            } else if Some(page.actor()) != actor.as_ref()
+                || page.previous_generation() != expected_previous_generation.unwrap()
+                || page.previous_apply_receipt_digest() != expected_previous_digest.unwrap()
+            {
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
+                    context: "retained metadata-transfer staging evidence page is invalid",
+                    message: "checkpoint source pages are not a contiguous exact chain".to_owned(),
+                });
+            }
+            let receipt =
+                crate::pg_store::decode_staging_evidence_apply_receipt(&record.apply_receipt)
+                    .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
+                        context: "retained metadata-transfer staging evidence receipt is invalid",
+                        message: error.to_string(),
+                    })?;
+            if !receipt.is_for_page(&page) {
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
+                    context: "retained metadata-transfer staging evidence receipt is invalid",
+                    message: "receipt does not identify its page".to_owned(),
+                });
+            }
+            page_links.push(MetadataTransferStagingEvidenceCheckpointPageLink {
+                page_digest: page.page_digest(),
+                previous_apply_receipt_digest: page.previous_apply_receipt_digest(),
+                apply_receipt_digest: checksum::sha256::digest(&record.apply_receipt),
+            });
+            for entry in page.entries() {
+                let evidence = crate::pg_store::decode_staging_evidence(entry.evidence()).map_err(
+                    |error| ControlPlaneError::SnapshotInvariantViolation {
+                        context: "retained metadata-transfer staging evidence is invalid",
+                        message: error.to_string(),
+                    },
+                )?;
+                let key = metadata_transfer_staging_evidence_key(&evidence);
+                if commitments
+                    .insert(key, checksum::sha256::digest(entry.evidence()))
+                    .is_some()
+                {
+                    return Err(ControlPlaneError::SnapshotInvariantViolation {
+                        context: "retained metadata-transfer staging evidence is invalid",
+                        message: "checkpoint source contains duplicate evidence identity"
+                            .to_owned(),
+                    });
+                }
+                if commitments.len() > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "metadata-transfer staging checkpoint exceeds the {} commitment limit",
+                            MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS
+                        ),
+                    });
+                }
+            }
+            expected_previous_generation = Some(generation);
+            expected_previous_digest = Some(checksum::sha256::digest(&record.apply_receipt));
+            tip_apply_receipt.clone_from(&record.apply_receipt);
+        }
+        let segment = MetadataTransferStagingEvidenceCheckpointSegment {
+            actor: actor.expect("nonempty checkpoint range has an actor"),
+            first_generation,
+            last_generation,
+            previous_generation,
+            previous_apply_receipt_digest,
+            page_links,
+            tip_apply_receipt,
+            commitments,
+        };
+        if metadata_transfer_staging_evidence_checkpoint_state_record_len(&segment)
+            > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_BYTES
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "metadata-transfer staging checkpoint exceeds the {} byte limit",
+                    MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_BYTES
+                ),
+            });
+        }
+
+        let mut next_snapshot = self.clone();
+        for generation in first_generation..=last_generation {
+            next_snapshot
+                .metadata_transfer_staging_evidence_pages
+                .remove(&(actor_node_id, actor_node_incarnation, generation));
+        }
+        next_snapshot
+            .metadata_transfer_staging_evidence_checkpoint_segments
+            .insert(segment_key, segment);
+        Ok(AppliedControlPlaneCommand::new(
+            next_snapshot,
+            ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages,
+            true,
+        ))
+    }
+
+    pub(crate) fn checkpoint_metadata_transfer_staging_evidence_pages_command(
+        &self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        let command = ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
+            actor_node_id,
+            actor_node_incarnation,
+            first_generation,
+            last_generation,
+        };
+        self.apply_control_plane_command(command.clone())?;
+        Ok(command)
     }
 
     pub(crate) fn complete_unavailable_pg_placement_transition_command(
@@ -6655,6 +7077,17 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 operation_payload,
                 page_digest,
             } => self.apply_metadata_transfer_staging_evidence_page(operation_payload, page_digest),
+            ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+            } => self.checkpoint_metadata_transfer_staging_evidence_pages(
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+            ),
             ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
                 transitions,
                 expected_destination_epoch,
@@ -11909,6 +12342,25 @@ pub trait ControlPlaneAdmin {
         ))
     }
 
+    fn checkpoint_metadata_transfer_staging_evidence_pages(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let _ = (
+            actor_node_id,
+            actor_node_incarnation,
+            first_generation,
+            last_generation,
+        );
+        Err(ControlPlaneError::rpc_remote(
+            "metadata-transfer staging evidence checkpointing is not supported by this authority"
+                .to_owned(),
+        ))
+    }
+
     fn fence_pg_for_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -12251,6 +12703,15 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             hex_encode(&record.apply_receipt)
         ));
     }
+    for segment in snapshot
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .values()
+    {
+        out.push_str(&format!(
+            "{METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_PREFIX}{}\n",
+            format_metadata_transfer_staging_evidence_checkpoint_segment(segment)
+        ));
+    }
     for evidence in snapshot.metadata_transfer_staging_evidence.values() {
         out.push_str(&format!(
             "metadata_transfer_staging_evidence={}\n",
@@ -12261,6 +12722,240 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
         out.push_str(&format!("pg={}\n", format_pg_record(record)));
     }
     out
+}
+
+fn metadata_transfer_staging_evidence_checkpoint_state_record_len(
+    segment: &MetadataTransferStagingEvidenceCheckpointSegment,
+) -> usize {
+    METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_PREFIX.len()
+        + format_metadata_transfer_staging_evidence_checkpoint_segment(segment).len()
+        + 1
+}
+
+fn format_metadata_transfer_staging_evidence_checkpoint_segment(
+    segment: &MetadataTransferStagingEvidenceCheckpointSegment,
+) -> String {
+    let mut fields = vec![
+        segment.actor.node_id().as_u32().to_string(),
+        segment.actor.node_incarnation().to_string(),
+        hex_encode(segment.actor.endpoint().as_bytes()),
+        segment.first_generation.to_string(),
+        segment.last_generation.to_string(),
+        segment.previous_generation.to_string(),
+        hex_encode(&segment.previous_apply_receipt_digest),
+        hex_encode(&segment.tip_apply_receipt),
+        segment.page_links.len().to_string(),
+    ];
+    for link in &segment.page_links {
+        fields.extend([
+            hex_encode(&link.page_digest),
+            hex_encode(&link.previous_apply_receipt_digest),
+            hex_encode(&link.apply_receipt_digest),
+        ]);
+    }
+    fields.push(segment.commitments.len().to_string());
+    for (key, digest) in &segment.commitments {
+        fields.extend([
+            key.pg_id.get().to_string(),
+            key.staging_generation.to_string(),
+            key.actor_node_id.as_u32().to_string(),
+            key.actor_node_incarnation.to_string(),
+            (key.kind as u8).to_string(),
+            key.target_epoch
+                .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string()),
+            hex_encode(digest),
+        ]);
+    }
+    fields.join(",")
+}
+
+fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
+    line: usize,
+    value: &str,
+) -> Result<MetadataTransferStagingEvidenceCheckpointSegment, ControlPlaneError> {
+    const HEADER_FIELDS: usize = 9;
+    const PAGE_LINK_FIELDS: usize = 3;
+    const COMMITMENT_FIELDS: usize = 7;
+
+    let fields = value.split(',').collect::<Vec<_>>();
+    if fields.len() < HEADER_FIELDS {
+        return Err(parse_error(
+            line,
+            "metadata-transfer staging checkpoint has too few fields",
+        ));
+    }
+    let page_link_count = usize::try_from(parse_u64(
+        line,
+        fields[8],
+        "staging checkpoint page-link count",
+    )?)
+    .map_err(|_| {
+        parse_error(
+            line,
+            "staging checkpoint page-link count does not fit usize",
+        )
+    })?;
+    if page_link_count == 0
+        || page_link_count > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES
+    {
+        return Err(parse_error(
+            line,
+            "metadata-transfer staging checkpoint has an invalid page-link count",
+        ));
+    }
+    let commitment_count_offset = HEADER_FIELDS
+        .checked_add(
+            page_link_count
+                .checked_mul(PAGE_LINK_FIELDS)
+                .ok_or_else(|| {
+                    parse_error(line, "staging checkpoint page-link field count overflow")
+                })?,
+        )
+        .ok_or_else(|| parse_error(line, "staging checkpoint field count overflow"))?;
+    let commitment_count = fields
+        .get(commitment_count_offset)
+        .ok_or_else(|| parse_error(line, "staging checkpoint commitment count is missing"))?;
+    let commitment_count = usize::try_from(parse_u64(
+        line,
+        commitment_count,
+        "staging checkpoint commitment count",
+    )?)
+    .map_err(|_| {
+        parse_error(
+            line,
+            "staging checkpoint commitment count does not fit usize",
+        )
+    })?;
+    if commitment_count == 0
+        || commitment_count > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS
+    {
+        return Err(parse_error(
+            line,
+            "metadata-transfer staging checkpoint has an invalid commitment count",
+        ));
+    }
+    let commitments_offset = commitment_count_offset + 1;
+    let expected_fields = commitments_offset
+        .checked_add(
+            commitment_count
+                .checked_mul(COMMITMENT_FIELDS)
+                .ok_or_else(|| {
+                    parse_error(line, "staging checkpoint commitment field count overflow")
+                })?,
+        )
+        .ok_or_else(|| parse_error(line, "staging checkpoint field count overflow"))?;
+    if fields.len() != expected_fields {
+        return Err(parse_error(
+            line,
+            "metadata-transfer staging checkpoint field count does not match its commitments",
+        ));
+    }
+    let endpoint_bytes = hex_decode(line, fields[2])?;
+    let endpoint = String::from_utf8(endpoint_bytes)
+        .map_err(|_| parse_error(line, "staging checkpoint endpoint is not UTF-8"))?;
+    let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        NodeId::new(parse_u32(line, fields[0], "staging checkpoint actor node")?),
+        parse_u64(line, fields[1], "staging checkpoint actor incarnation")?,
+        endpoint,
+    )
+    .map_err(|error| parse_error(line, &error.to_string()))?;
+    let first_generation = parse_u64(line, fields[3], "staging checkpoint first generation")?;
+    let last_generation = parse_u64(line, fields[4], "staging checkpoint last generation")?;
+    let previous_generation = parse_u64(line, fields[5], "staging checkpoint previous generation")?;
+    let previous_apply_receipt_digest = hex_decode(line, fields[6])?.try_into().map_err(|_| {
+        parse_error(
+            line,
+            "staging checkpoint previous receipt digest must contain 32 bytes",
+        )
+    })?;
+    let tip_apply_receipt = hex_decode(line, fields[7])?;
+    let mut page_links = Vec::with_capacity(page_link_count);
+    for index in 0..page_link_count {
+        let offset = HEADER_FIELDS + index * PAGE_LINK_FIELDS;
+        let decode_digest = |value: &str, field| {
+            hex_decode(line, value)?.try_into().map_err(|_| {
+                parse_error(
+                    line,
+                    &format!("staging checkpoint {field} must contain 32 bytes"),
+                )
+            })
+        };
+        page_links.push(MetadataTransferStagingEvidenceCheckpointPageLink {
+            page_digest: decode_digest(fields[offset], "page digest")?,
+            previous_apply_receipt_digest: decode_digest(
+                fields[offset + 1],
+                "page predecessor receipt digest",
+            )?,
+            apply_receipt_digest: decode_digest(fields[offset + 2], "page apply receipt digest")?,
+        });
+    }
+    let mut commitments = BTreeMap::new();
+    for index in 0..commitment_count {
+        let offset = commitments_offset + index * COMMITMENT_FIELDS;
+        let kind = match parse_u16(line, fields[offset + 4], "staging evidence kind")? {
+            0 => crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+            1 => crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+            _ => {
+                return Err(parse_error(
+                    line,
+                    "invalid staging checkpoint evidence kind",
+                ))
+            }
+        };
+        let target_epoch = if fields[offset + 5] == "-" {
+            None
+        } else {
+            Some(parse_required_cluster_epoch(
+                line,
+                fields[offset + 5],
+                "staging checkpoint target epoch",
+            )?)
+        };
+        let key = MetadataTransferStagingEvidenceKey {
+            pg_id: PgId::new(parse_u32(line, fields[offset], "staging checkpoint PG")?),
+            staging_generation: parse_u64(
+                line,
+                fields[offset + 1],
+                "staging checkpoint generation",
+            )?,
+            actor_node_id: NodeId::new(parse_u32(
+                line,
+                fields[offset + 2],
+                "staging checkpoint evidence actor",
+            )?),
+            actor_node_incarnation: parse_u64(
+                line,
+                fields[offset + 3],
+                "staging checkpoint evidence incarnation",
+            )?,
+            kind,
+            target_epoch,
+        };
+        let digest = hex_decode(line, fields[offset + 6])?
+            .try_into()
+            .map_err(|_| {
+                parse_error(
+                    line,
+                    "staging checkpoint evidence digest must contain 32 bytes",
+                )
+            })?;
+        if commitments.insert(key, digest).is_some() {
+            return Err(parse_error(
+                line,
+                "duplicate staging checkpoint evidence commitment",
+            ));
+        }
+    }
+    Ok(MetadataTransferStagingEvidenceCheckpointSegment {
+        actor,
+        first_generation,
+        last_generation,
+        previous_generation,
+        previous_apply_receipt_digest,
+        page_links,
+        tip_apply_receipt,
+        commitments,
+    })
 }
 
 fn format_unavailable_node_observation(observation: &NodeUnavailableObservation) -> String {
@@ -12933,6 +13628,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut unavailable_pg_placement_transitions = BTreeMap::new();
     let mut retained_unavailable_pg_placement_transitions = BTreeMap::new();
     let mut metadata_transfer_staging_evidence_pages = BTreeMap::new();
+    let mut metadata_transfer_staging_evidence_checkpoint_segments = BTreeMap::new();
     let mut metadata_transfer_staging_evidence = BTreeMap::new();
     let mut pg_lines = BTreeMap::new();
     let mut node_pg_lines = BTreeMap::<(NodeId, PgId), usize>::new();
@@ -13176,6 +13872,25 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                     "duplicate metadata-transfer staging evidence page actor",
                 ));
             }
+        } else if let Some(value) =
+            line.strip_prefix("metadata_transfer_staging_evidence_checkpoint=")
+        {
+            let segment =
+                parse_metadata_transfer_staging_evidence_checkpoint_segment(line_number, value)?;
+            let key = (
+                segment.actor.node_id(),
+                segment.actor.node_incarnation(),
+                segment.first_generation,
+            );
+            if metadata_transfer_staging_evidence_checkpoint_segments
+                .insert(key, segment)
+                .is_some()
+            {
+                return Err(parse_error(
+                    line_number,
+                    "duplicate metadata-transfer staging evidence checkpoint segment",
+                ));
+            }
         } else if let Some(value) = line.strip_prefix("metadata_transfer_staging_evidence=") {
             let bytes = hex_decode(line_number, value)?;
             let evidence = crate::pg_store::decode_staging_evidence(&bytes)
@@ -13266,6 +13981,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         unavailable_pg_placement_transitions,
         retained_unavailable_pg_placement_transitions,
         metadata_transfer_staging_evidence_pages,
+        metadata_transfer_staging_evidence_checkpoint_segments,
         metadata_transfer_staging_evidence,
         max_committed_timestamp_ms,
         lease_grant_horizon,

@@ -153,6 +153,7 @@ pub(crate) use metadata_transfer_staging::{
     metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
     metadata_transfer_staging_evidence_page_with_member_actor_for_test,
     metadata_transfer_staging_publication_evidence_page_for_test,
+    rebind_metadata_transfer_staging_evidence_actor_for_test,
 };
 
 #[cfg(test)]
