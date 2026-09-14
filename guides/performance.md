@@ -10,6 +10,13 @@ fsync, and the erasure coding, encryption and checksum paths documented below.
 There are not yet optimisations for small objects, either on the read side
 or batched fsync on the write side.
 
+There is currently no support for prefix based partitioning, so write performance
+is partly serialized per bucket.
+
+The rest of this performance document mostly covers low level components such as
+erasure coding that may need per platform optimisations, and may be limiting factors
+on slower hardware,
+
 ## Benchmarks
 
 Argmin provides focused benchmarks for the CPU-heavy checksum, erasure-coding,
