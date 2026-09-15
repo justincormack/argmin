@@ -182,6 +182,32 @@ fn forge_staging_authorization_at_epoch_with_length(
     }
 }
 
+fn retain_staging_evidence_page_for_test(
+    snapshot: &mut ClusterControlSnapshot,
+    page: &crate::pg_store::MetadataTransferStagingEvidencePage,
+) {
+    for entry in page.entries() {
+        let evidence = crate::pg_store::decode_staging_evidence(entry.evidence()).unwrap();
+        snapshot.metadata_transfer_staging_evidence.insert(
+            metadata_transfer_staging_evidence_key(&evidence),
+            evidence.as_bytes().to_vec(),
+        );
+    }
+    let receipt = crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(page);
+    snapshot.metadata_transfer_staging_evidence_pages.insert(
+        (
+            page.actor().node_id(),
+            page.actor().node_incarnation(),
+            page.generation(),
+        ),
+        MetadataTransferStagingEvidencePageRecord {
+            operation_payload: page.operation_payload().to_vec(),
+            page_digest: page.page_digest(),
+            apply_receipt: receipt.as_bytes().to_vec(),
+        },
+    );
+}
+
 fn heartbeat_with_pg_proofs_and_lease_duration(
     authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
     node_id: u32,
@@ -245,6 +271,102 @@ pub(super) fn staged_two_pg_install_fixture() -> (
     Vec<UnavailablePgTransitionInstallRequest>,
 ) {
     staged_two_pg_install_fixture_with_proof(PgMetadataProof::current(23, 0x2323, 0x3434))
+}
+
+pub(super) fn staging_actor_closure_snapshot_fixture() -> ClusterControlSnapshot {
+    let (_tmp, _store, authority, authorizations) =
+        begun_two_pg_staging_authorization_authority_fixture_with_proof(PgMetadataProof::current(
+            23, 0x2323, 0x3434,
+        ));
+    let authorized = authority
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+            authorizations: authorizations.clone(),
+        })
+        .unwrap()
+        .into_snapshot();
+    let authorization = &authorizations[0];
+    let actor_node_id = authorization
+        .unavailable_transition
+        .destination_acting_set()[0];
+    let actor_record = authorized.node(actor_node_id).unwrap();
+    let old_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        actor_node_id,
+        actor_record.node_incarnation(),
+        actor_record.endpoint().to_owned(),
+    )
+    .unwrap();
+    let staging_tmp = test_util::tempdir();
+    let limits = crate::pg_store::MetadataTransferStagingLimits::new(8, 1 << 20, 8 << 20).unwrap();
+    let old_store = crate::pg_store::MetadataTransferStagingStore::open(
+        staging_tmp.path(),
+        old_actor.clone(),
+        limits,
+    )
+    .unwrap();
+    let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+        &authorization.unavailable_transition,
+        authorization.artifact_digest,
+        authorization.artifact_length,
+        authorization.artifact_format_version,
+    )
+    .unwrap();
+    old_store.tombstone(&intent).unwrap();
+    let old_page = old_store.next_evidence_page().unwrap().unwrap();
+    let old_committed = authorized
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: old_page.operation_payload().to_vec(),
+                page_digest: old_page.page_digest(),
+            },
+        )
+        .unwrap()
+        .into_snapshot();
+    drop(old_store);
+
+    let next_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        actor_node_id,
+        old_actor.node_incarnation() + 1,
+        format!("{}-restarted", old_actor.endpoint()),
+    )
+    .unwrap();
+    let heartbeat_at_ms = old_committed.max_committed_timestamp_ms().unwrap_or(0).max(
+        old_committed
+            .node(actor_node_id)
+            .and_then(NodeControlRecord::lease_deadline_ms)
+            .unwrap_or(0),
+    ) + 1;
+    let mut heartbeat = heartbeat_from_snapshot(
+        &old_committed,
+        actor_node_id.as_u32(),
+        old_committed.cluster_epoch(),
+        heartbeat_at_ms,
+    );
+    heartbeat.node_incarnation = next_actor.node_incarnation();
+    heartbeat.endpoint = next_actor.endpoint().to_owned();
+    heartbeat.requested_lease_duration_ms = 10_000;
+    let actor_advanced = old_committed
+        .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            heartbeat_at_ms,
+            lease_deadline_ms: heartbeat_at_ms + 10_000,
+            lease_horizon_authority: None,
+        })
+        .unwrap()
+        .into_snapshot();
+    let rebound_store =
+        crate::pg_store::MetadataTransferStagingStore::open(staging_tmp.path(), next_actor, limits)
+            .unwrap();
+    let rebound_page = rebound_store.next_evidence_page().unwrap().unwrap();
+    actor_advanced
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: rebound_page.operation_payload().to_vec(),
+                page_digest: rebound_page.page_digest(),
+            },
+        )
+        .unwrap()
+        .into_snapshot()
 }
 
 fn staged_two_pg_install_fixture_with_proof(
@@ -729,7 +851,7 @@ fn staging_evidence_checkpoint_compacts_history_without_consuming_the_tip() {
         .to_string();
     assert!(
         changed_page_actor_error.contains("actor chain has a gap")
-            || changed_page_actor_error.contains("must retain its current page tip"),
+            || changed_page_actor_error.contains("must retain a replayable or closed tip"),
         "unexpected changed-page-actor error: {changed_page_actor_error}"
     );
 
@@ -741,7 +863,7 @@ fn staging_evidence_checkpoint_compacts_history_without_consuming_the_tip() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("must retain its current page tip")
+        error.contains("must retain a replayable or closed tip")
             || error.contains("does not exactly match retained chain membership"),
         "unexpected missing-tip error: {error}"
     );
@@ -1944,6 +2066,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     .unwrap();
     assert!(evidence_actor.node_incarnation() > 1);
     for rollover_boundary in 0..3 {
+        let mut rollover_snapshot = staged.snapshot().clone();
         let staging_tmp = test_util::tempdir();
         let old_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
             evidence_actor_id,
@@ -1978,6 +2101,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
                 store
                     .record_evidence_apply_receipt(&old_page, &old_receipt)
                     .unwrap();
+                retain_staging_evidence_page_for_test(&mut rollover_snapshot, &old_page);
             }
         }
         drop(store);
@@ -1995,8 +2119,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         let rebound_evidence =
             crate::pg_store::decode_staging_evidence(rebound_page.entries()[0].evidence()).unwrap();
         assert_eq!(rebound_evidence.actor(), &evidence_actor);
-        assert!(staged
-            .snapshot()
+        assert!(rollover_snapshot
             .apply_control_plane_command(
                 ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
                     operation_payload: rebound_page.operation_payload().to_vec(),
@@ -2117,6 +2240,127 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         )
         .unwrap();
     assert!(rebound_page_committed.changed());
+    let closure_key = (
+        response_loss_old_actor.node_id(),
+        response_loss_old_actor.node_incarnation(),
+    );
+    let closure = &rebound_page_committed
+        .snapshot()
+        .metadata_transfer_staging_actor_closures[&closure_key];
+    assert_eq!(closure.source_actor, response_loss_old_actor);
+    assert_eq!(closure.source_tip_generation, 1);
+    assert_eq!(
+        closure.source_tip_page_digest,
+        response_loss_old_page.page_digest()
+    );
+    assert_eq!(closure.destination_actor, evidence_actor);
+    assert_eq!(
+        closure.destination_genesis_page_digest,
+        response_loss_rebound_page.page_digest()
+    );
+    drop(response_loss_reopened);
+    let final_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        evidence_actor_id,
+        evidence_actor.node_incarnation() + 1,
+        "/tmp/response-loss-final-staging-actor.sock".to_owned(),
+    )
+    .unwrap();
+    let final_heartbeat_at_ms = rebound_page_committed
+        .snapshot()
+        .node(evidence_actor_id)
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap_or(0)
+        .max(
+            rebound_page_committed
+                .snapshot()
+                .max_committed_timestamp_ms()
+                .unwrap_or(0),
+        )
+        + 1;
+    let mut final_heartbeat = heartbeat_from_snapshot(
+        rebound_page_committed.snapshot(),
+        evidence_actor_id.as_u32(),
+        rebound_page_committed.snapshot().cluster_epoch(),
+        final_heartbeat_at_ms,
+    );
+    final_heartbeat.node_incarnation = final_actor.node_incarnation();
+    final_heartbeat.endpoint = final_actor.endpoint().to_owned();
+    final_heartbeat.requested_lease_duration_ms = requested_lease_duration_ms;
+    let final_actor_advanced = rebound_page_committed
+        .snapshot()
+        .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat: final_heartbeat,
+            heartbeat_at_ms: final_heartbeat_at_ms,
+            lease_deadline_ms: final_heartbeat_at_ms + requested_lease_duration_ms,
+            lease_horizon_authority: None,
+        })
+        .unwrap();
+    let final_store = crate::pg_store::MetadataTransferStagingStore::open(
+        response_loss_tmp.path(),
+        final_actor.clone(),
+        crate::pg_store::MetadataTransferStagingLimits::new(8, 1 << 20, 8 << 20).unwrap(),
+    )
+    .unwrap();
+    let final_rebound_page = final_store.next_evidence_page().unwrap().unwrap();
+    let mut foreign_through_actor_payload = final_rebound_page.operation_payload().to_vec();
+    let through_endpoint = evidence_actor.endpoint().as_bytes();
+    let through_endpoint_offset = foreign_through_actor_payload
+        .windows(through_endpoint.len())
+        .enumerate()
+        .filter_map(|(offset, candidate)| (candidate == through_endpoint).then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(through_endpoint_offset.len(), 1);
+    let changed_byte = through_endpoint_offset[0] + through_endpoint.len() - 1;
+    foreign_through_actor_payload[changed_byte] = b'x';
+    let foreign_through_actor_digest = checksum::sha256::digest(&foreign_through_actor_payload);
+    let foreign_through_actor = final_actor_advanced
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: foreign_through_actor_payload,
+                page_digest: foreign_through_actor_digest,
+            },
+        )
+        .unwrap_err();
+    assert!(foreign_through_actor
+        .to_string()
+        .contains("through actor does not match retained chain identity"));
+    let final_page_committed = final_actor_advanced
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: final_rebound_page.operation_payload().to_vec(),
+                page_digest: final_rebound_page.page_digest(),
+            },
+        )
+        .unwrap();
+    let retained_first_closure = &final_page_committed
+        .snapshot()
+        .metadata_transfer_staging_actor_closures[&closure_key];
+    assert_eq!(retained_first_closure.destination_actor, evidence_actor);
+    assert_eq!(
+        retained_first_closure.destination_genesis_page_digest,
+        response_loss_rebound_page.page_digest()
+    );
+    let intermediate_closure = &final_page_committed
+        .snapshot()
+        .metadata_transfer_staging_actor_closures
+        [&(evidence_actor.node_id(), evidence_actor.node_incarnation())];
+    assert_eq!(intermediate_closure.source_actor, evidence_actor);
+    assert_eq!(intermediate_closure.destination_actor, final_actor);
+    assert_eq!(
+        intermediate_closure.destination_genesis_page_digest,
+        final_rebound_page.page_digest()
+    );
+    final_page_committed
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(final_page_committed.snapshot())).unwrap(),
+        *final_page_committed.snapshot()
+    );
     let old_page_replay = rebound_page_committed
         .snapshot()
         .apply_control_plane_command(
@@ -2133,6 +2377,53 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
             apply_receipt
         } if apply_receipt == response_loss_old_receipt.as_bytes()
     ));
+    let checkpointed_old_tip = rebound_page_committed
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
+                actor_node_id: response_loss_old_actor.node_id(),
+                actor_node_incarnation: response_loss_old_actor.node_incarnation(),
+                first_generation: 1,
+                last_generation: 1,
+            },
+        )
+        .unwrap();
+    assert!(checkpointed_old_tip.changed());
+    assert!(!checkpointed_old_tip
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(
+            response_loss_old_actor.node_id(),
+            response_loss_old_actor.node_incarnation(),
+            1,
+        )));
+    assert!(checkpointed_old_tip
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .contains_key(&(
+            response_loss_old_actor.node_id(),
+            response_loss_old_actor.node_incarnation(),
+            1,
+        )));
+    checkpointed_old_tip
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(checkpointed_old_tip.snapshot())).unwrap(),
+        *checkpointed_old_tip.snapshot()
+    );
+
+    let mut forged_closure = rebound_page_committed.snapshot().clone();
+    forged_closure
+        .metadata_transfer_staging_actor_closures
+        .get_mut(&closure_key)
+        .unwrap()
+        .rebound_evidence_digest[0] ^= 1;
+    assert!(parse_snapshot(&format_snapshot(&forged_closure))
+        .unwrap_err()
+        .to_string()
+        .contains("actor closures do not match retained chain evidence"));
     for actor in [&response_loss_old_actor, &evidence_actor] {
         assert!(rebound_page_committed
             .snapshot()
@@ -2890,6 +3181,335 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         .unwrap_err()
         .to_string()
         .contains("strictly increasing"));
+}
+
+#[test]
+fn actor_chain_closure_waits_for_the_complete_rebound_page_prefix() {
+    let (_tmp, _store, authority, _) = certified_spare_authority();
+    let mut snapshot = authority.snapshot().clone();
+    let actor_node_id = NodeId::new(4);
+    let old_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        actor_node_id,
+        7,
+        "unix:///tmp/staging-actor-7.sock".to_owned(),
+    )
+    .unwrap();
+    let next_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        actor_node_id,
+        8,
+        "/tmp/transition-node-4.sock".to_owned(),
+    )
+    .unwrap();
+    let node = snapshot.nodes.get_mut(&actor_node_id).unwrap();
+    node.node_incarnation = next_actor.node_incarnation();
+    node.endpoint = next_actor.endpoint().to_owned();
+
+    let staging_tmp = test_util::tempdir();
+    let evidence_count = crate::pg_store::MAX_STAGING_EVIDENCE_PAGE_ENTRIES + 1;
+    let limits = crate::pg_store::MetadataTransferStagingLimits::new(
+        evidence_count,
+        1024,
+        u64::try_from(evidence_count).unwrap() * 1024,
+    )
+    .unwrap();
+    let old_store = crate::pg_store::MetadataTransferStagingStore::open(
+        staging_tmp.path(),
+        old_actor.clone(),
+        limits,
+    )
+    .unwrap();
+    for pg in 1..=u32::try_from(evidence_count).unwrap() {
+        let binding = UnavailablePgTransitionMutationBinding::new(
+            PgId::new(pg),
+            ClusterEpoch::new(9).unwrap(),
+            ClusterEpoch::new(7).unwrap(),
+            vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+            vec![NodeId::new(1), actor_node_id, NodeId::new(3)],
+        );
+        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &binding,
+            [u8::try_from(pg).unwrap(); 32],
+            1,
+            crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        )
+        .unwrap();
+        old_store.tombstone(&intent).unwrap();
+    }
+    let old_page = old_store.next_evidence_page().unwrap().unwrap();
+    drop(old_store);
+
+    let rebound_store = crate::pg_store::MetadataTransferStagingStore::open(
+        staging_tmp.path(),
+        next_actor.clone(),
+        limits,
+    )
+    .unwrap();
+    let first_rebound_page = rebound_store.next_evidence_page().unwrap().unwrap();
+    assert!(first_rebound_page.entries().len() < evidence_count);
+    retain_staging_evidence_page_for_test(&mut snapshot, &old_page);
+    retain_staging_evidence_page_for_test(&mut snapshot, &first_rebound_page);
+    snapshot.metadata_transfer_staging_actor_closures = snapshot
+        .reconstruct_metadata_transfer_staging_actor_closures()
+        .unwrap();
+    assert!(snapshot.metadata_transfer_staging_actor_closures.is_empty());
+
+    let first_receipt =
+        crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&first_rebound_page);
+    rebound_store
+        .record_evidence_apply_receipt(&first_rebound_page, &first_receipt)
+        .unwrap();
+    let final_rebound_page = rebound_store.next_evidence_page().unwrap().unwrap();
+    retain_staging_evidence_page_for_test(&mut snapshot, &final_rebound_page);
+    snapshot.metadata_transfer_staging_actor_closures = snapshot
+        .reconstruct_metadata_transfer_staging_actor_closures()
+        .unwrap();
+
+    let closure = &snapshot.metadata_transfer_staging_actor_closures
+        [&(old_actor.node_id(), old_actor.node_incarnation())];
+    assert_eq!(closure.source_actor, old_actor);
+    assert_eq!(closure.source_tip_generation, old_page.generation());
+    assert_eq!(closure.destination_actor, next_actor);
+    assert_eq!(
+        closure.rebound_entry_count,
+        u64::try_from(evidence_count).unwrap()
+    );
+
+    let destination_checkpoint = snapshot
+        .checkpoint_metadata_transfer_staging_evidence_pages(
+            next_actor.node_id(),
+            next_actor.node_incarnation(),
+            1,
+            1,
+        )
+        .unwrap_err();
+    assert!(destination_checkpoint
+        .to_string()
+        .contains("cannot consume an actor-closure chain"));
+
+    let compacted_source = snapshot
+        .checkpoint_metadata_transfer_staging_evidence_pages(
+            old_actor.node_id(),
+            old_actor.node_incarnation(),
+            1,
+            1,
+        )
+        .unwrap()
+        .into_snapshot();
+    assert!(!compacted_source
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(old_actor.node_id(), old_actor.node_incarnation(), 1)));
+    assert_eq!(
+        compacted_source
+            .reconstruct_metadata_transfer_staging_actor_closures()
+            .unwrap(),
+        compacted_source.metadata_transfer_staging_actor_closures
+    );
+}
+
+#[test]
+fn incomplete_actor_closure_prefix_validates_through_actor_before_acknowledgement() {
+    let mut snapshot = staging_actor_closure_snapshot_fixture();
+    let existing_closure = snapshot
+        .metadata_transfer_staging_actor_closures
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let first_tip_record = snapshot
+        .metadata_transfer_staging_evidence_pages
+        .get(&(
+            existing_closure.source_actor.node_id(),
+            existing_closure.source_actor.node_incarnation(),
+            existing_closure.source_tip_generation,
+        ))
+        .unwrap();
+    let first_tip = crate::pg_store::decode_staging_evidence_page_payload(
+        &first_tip_record.operation_payload,
+        first_tip_record.page_digest,
+    )
+    .unwrap();
+    let through_record = snapshot
+        .metadata_transfer_staging_evidence_pages
+        .get(&(
+            existing_closure.destination_actor.node_id(),
+            existing_closure.destination_actor.node_incarnation(),
+            1,
+        ))
+        .unwrap();
+    let through_page = crate::pg_store::decode_staging_evidence_page_payload(
+        &through_record.operation_payload,
+        through_record.page_digest,
+    )
+    .unwrap();
+    let destination_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        existing_closure.destination_actor.node_id(),
+        existing_closure.destination_actor.node_incarnation() + 1,
+        "/tmp/incomplete-closure-destination.sock".to_owned(),
+    )
+    .unwrap();
+    let node = snapshot
+        .nodes
+        .get_mut(&destination_actor.node_id())
+        .unwrap();
+    node.node_incarnation = destination_actor.node_incarnation();
+    node.endpoint = destination_actor.endpoint().to_owned();
+    let incomplete_page =
+        crate::pg_store::metadata_transfer_staging_incomplete_closure_evidence_page_for_test(
+            &first_tip,
+            existing_closure.destination_actor.clone(),
+            destination_actor.clone(),
+            &through_page.entries()[0],
+        );
+    assert_eq!(incomplete_page.entries().len(), 1);
+    assert_eq!(
+        incomplete_page
+            .actor_closure_candidate()
+            .unwrap()
+            .rebound_entry_count(),
+        2
+    );
+
+    let mut foreign_through_actor_payload = incomplete_page.operation_payload().to_vec();
+    let through_endpoint = existing_closure.destination_actor.endpoint().as_bytes();
+    let through_endpoint_offsets = foreign_through_actor_payload
+        .windows(through_endpoint.len())
+        .enumerate()
+        .filter_map(|(offset, bytes)| (bytes == through_endpoint).then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(through_endpoint_offsets.len(), 1);
+    let changed_byte = through_endpoint_offsets[0] + through_endpoint.len() - 1;
+    foreign_through_actor_payload[changed_byte] = b'x';
+    let foreign_through_actor_digest = checksum::sha256::digest(&foreign_through_actor_payload);
+    let unchanged = snapshot.clone();
+    let error = snapshot
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: foreign_through_actor_payload,
+                page_digest: foreign_through_actor_digest,
+            },
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("through actor does not match retained chain identity"));
+    assert_eq!(snapshot, unchanged);
+    assert!(!snapshot
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(
+            destination_actor.node_id(),
+            destination_actor.node_incarnation(),
+            1,
+        )));
+
+    let incomplete_applied = snapshot
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: incomplete_page.operation_payload().to_vec(),
+                page_digest: incomplete_page.page_digest(),
+            },
+        )
+        .unwrap();
+    assert!(incomplete_applied.changed());
+    assert!(!incomplete_applied
+        .snapshot()
+        .metadata_transfer_staging_actor_closures
+        .contains_key(&(
+            existing_closure.destination_actor.node_id(),
+            existing_closure.destination_actor.node_incarnation(),
+        )));
+}
+
+#[test]
+fn actor_chain_closure_selects_acknowledged_tip_when_assigned_successor_was_not_dispatched() {
+    let (_tmp, _store, authority, _) = certified_spare_authority();
+    let mut snapshot = authority.snapshot().clone();
+    let old_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        NodeId::new(4),
+        7,
+        "unix:///tmp/staging-actor-7.sock".to_owned(),
+    )
+    .unwrap();
+    let next_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        NodeId::new(4),
+        8,
+        "/tmp/transition-node-4.sock".to_owned(),
+    )
+    .unwrap();
+    let node = snapshot.nodes.get_mut(&NodeId::new(4)).unwrap();
+    node.node_incarnation = next_actor.node_incarnation();
+    node.endpoint = next_actor.endpoint().to_owned();
+
+    let staging_tmp = test_util::tempdir();
+    let limits = crate::pg_store::MetadataTransferStagingLimits::new(4, 1024, 4096).unwrap();
+    let old_store = crate::pg_store::MetadataTransferStagingStore::open(
+        staging_tmp.path(),
+        old_actor.clone(),
+        limits,
+    )
+    .unwrap();
+    let intent_for_pg = |pg_id| {
+        crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &UnavailablePgTransitionMutationBinding::new(
+                PgId::new(pg_id),
+                ClusterEpoch::new(9).unwrap(),
+                ClusterEpoch::new(7).unwrap(),
+                vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+                vec![NodeId::new(1), NodeId::new(4), NodeId::new(3)],
+            ),
+            [u8::try_from(pg_id).unwrap(); 32],
+            1,
+            crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        )
+        .unwrap()
+    };
+    old_store.tombstone(&intent_for_pg(7)).unwrap();
+    let acknowledged_page = old_store.next_evidence_page().unwrap().unwrap();
+    let acknowledged_receipt =
+        crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&acknowledged_page);
+    old_store
+        .record_evidence_apply_receipt(&acknowledged_page, &acknowledged_receipt)
+        .unwrap();
+    old_store.tombstone(&intent_for_pg(8)).unwrap();
+    let assigned_successor = old_store.next_evidence_page().unwrap().unwrap();
+    assert_eq!(assigned_successor.generation(), 2);
+    retain_staging_evidence_page_for_test(&mut snapshot, &acknowledged_page);
+    drop(old_store);
+
+    let rebound_store = crate::pg_store::MetadataTransferStagingStore::open(
+        staging_tmp.path(),
+        next_actor.clone(),
+        limits,
+    )
+    .unwrap();
+    let rebound_genesis = rebound_store.next_evidence_page().unwrap().unwrap();
+    let candidate = rebound_genesis.actor_closure_candidate().unwrap();
+    assert!(candidate.accepts_first_tip(
+        &old_actor,
+        assigned_successor.generation(),
+        assigned_successor.page_digest(),
+        checksum::sha256::digest(
+            crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(
+                &assigned_successor,
+            )
+            .as_bytes(),
+        ),
+    ));
+    retain_staging_evidence_page_for_test(&mut snapshot, &rebound_genesis);
+    snapshot.metadata_transfer_staging_actor_closures = snapshot
+        .reconstruct_metadata_transfer_staging_actor_closures()
+        .unwrap();
+
+    let closure = &snapshot.metadata_transfer_staging_actor_closures
+        [&(old_actor.node_id(), old_actor.node_incarnation())];
+    assert_eq!(
+        closure.source_tip_generation,
+        acknowledged_page.generation()
+    );
+    assert_eq!(
+        closure.source_tip_page_digest,
+        acknowledged_page.page_digest()
+    );
+    assert_eq!(closure.destination_actor, next_actor);
 }
 
 #[test]

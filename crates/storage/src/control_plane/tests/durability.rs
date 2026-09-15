@@ -707,19 +707,19 @@ fn historical_v37_v25_single_authority_journal_chain_remains_rejected_evidence()
 }
 
 #[test]
-fn current_v38_v26_single_authority_journal_chain_matches_frozen_v3_vectors() {
-    const EMPTY_STATE_V38: &str = concat!(
-        "version=38\n",
+fn current_v39_v27_single_authority_journal_chain_matches_frozen_v3_vectors() {
+    const EMPTY_STATE_V39: &str = concat!(
+        "version=39\n",
         "authority_incarnation=1\n",
         "cluster_epoch=1\n",
         "initial_topology=-\n",
         "max_committed_timestamp_ms=-\n",
         "lease_grant_horizon=-\n",
     );
-    const SNAPSHOT_SEED: u64 = 0x0abd_6e38_1803_463c;
+    const SNAPSHOT_SEED: u64 = 0xda3e_b361_5595_77a1;
 
     let snapshot = ClusterControlSnapshot::empty();
-    assert_eq!(format_snapshot(&snapshot), EMPTY_STATE_V38);
+    assert_eq!(format_snapshot(&snapshot), EMPTY_STATE_V39);
     assert_eq!(single_authority_snapshot_digest(&snapshot), SNAPSHOT_SEED);
     let first_command = ControlPlaneCommand::SetNodeMembership {
         node_id: NodeId::new(7),
@@ -760,13 +760,45 @@ fn current_v38_v26_single_authority_journal_chain_matches_frozen_v3_vectors() {
             hex_encode(&encoded_record),
         ),
         (
-            "4152474350434d44001a000200000007028c9141db27c41626".to_string(),
-            14_610_454_830_538_743_296,
-            "4152474350434d44001a00030000000903bc06d436c771faa4".to_string(),
-            14_497_789_482_199_802_126,
-            "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0abd6e381803463ccac2c3424526de0002000000194152474350434d44001a000200000007028c9141db27c41626b648f2f71365fe49".to_string(),
+            "4152474350434d44001b00020000000702ad7837c502e2378a".to_string(),
+            5_013_506_723_306_011_765,
+            "4152474350434d44001b000300000009039defa228e257db08".to_string(),
+            8_788_947_242_171_545_571,
+            "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fda3eb361559577a145938dcd59affc7502000000194152474350434d44001b00020000000702ad7837c502e2378aa669b4bd5638f839".to_string(),
         )
     );
+}
+
+#[test]
+fn historical_v38_v26_single_authority_journal_chain_remains_rejected_evidence() {
+    const EMPTY_STATE_V38: &str = concat!(
+        "version=38\n",
+        "authority_incarnation=1\n",
+        "cluster_epoch=1\n",
+        "initial_topology=-\n",
+        "max_committed_timestamp_ms=-\n",
+        "lease_grant_horizon=-\n",
+    );
+    const FIRST_COMMAND: &str = "4152474350434d44001a000200000007028c9141db27c41626";
+    const SECOND_COMMAND: &str = "4152474350434d44001a00030000000903bc06d436c771faa4";
+    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0abd6e381803463ccac2c3424526de0002000000194152474350434d44001a000200000007028c9141db27c41626b648f2f71365fe49";
+    assert!(matches!(
+        parse_snapshot(EMPTY_STATE_V38),
+        Err(ControlPlaneError::Parse { line: 1, message })
+            if message == "unsupported control-plane state version 38"
+    ));
+    for command in [FIRST_COMMAND, SECOND_COMMAND] {
+        assert!(matches!(
+            decode_control_plane_command(&hex_decode(0, command).unwrap()),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message == "unsupported control-plane command version 26"
+        ));
+    }
+    assert!(matches!(
+        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
+        Err(ControlPlaneError::CommandDecode { message })
+            if message == "unsupported control-plane command version 26"
+    ));
 }
 
 #[test]
@@ -951,6 +983,30 @@ fn historical_v37_v25_single_authority_journal_file_remains_rejected_evidence() 
 }
 
 #[test]
+fn historical_v38_v26_single_authority_journal_file_remains_rejected_evidence() {
+    const BYTES: &[u8] = include_bytes!("../testdata/single_authority_journal_v38_v26.bin");
+    assert_eq!(
+        (BYTES.len(), hex_encode(&checksum::sha256::digest(BYTES))),
+        (
+            209,
+            "affaa37a0c1c52f05be1941257e53e004d17e4b4de04972a438ddd9cf1da7096".to_owned()
+        )
+    );
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    std::fs::write(store.journal_path(), BYTES).unwrap();
+    let frames = store.journal.read_frames_from(0).unwrap();
+    assert_eq!(frames.frames.len(), 2);
+    SingleAuthorityJournalRecord::decode(&frames.frames[0]).unwrap();
+    assert!(matches!(
+        SingleAuthorityJournalRecord::decode(&frames.frames[1]),
+        Err(ControlPlaneError::CommandDecode { message })
+            if message == "unsupported control-plane command version 26"
+    ));
+    assert_eq!(std::fs::read(store.journal_path()).unwrap(), BYTES);
+}
+
+#[test]
 fn single_authority_journal_v2_full_file_layout_is_exact() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -1002,7 +1058,7 @@ fn single_authority_journal_v2_full_file_layout_is_exact() {
         (bytes.len(), hex_encode(&checksum::sha256::digest(&bytes))),
         (
             209,
-            "affaa37a0c1c52f05be1941257e53e004d17e4b4de04972a438ddd9cf1da7096".to_owned()
+            "5fb3fc0bcdd3c13708fd5a5f73df50c3ea8edf9d2fcb35c49f27f0fd44ab3734".to_owned()
         )
     );
 }
@@ -1218,11 +1274,11 @@ fn file_backed_authority_rejects_pre_v7_state() {
 
 #[test]
 fn file_backed_authority_rejects_previous_and_future_state_versions() {
-    for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39] {
+    for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40] {
         let tmp = test_util::tempdir();
         let path = tmp.path().join(format!("control-plane-v{version}.state"));
         let current = format_snapshot(&canonical_snapshot_with_node());
-        let unsupported = current.replacen("version=38\n", &format!("version={version}\n"), 1);
+        let unsupported = current.replacen("version=39\n", &format!("version={version}\n"), 1);
         std::fs::write(&path, &unsupported).unwrap();
 
         assert!(matches!(
@@ -1240,7 +1296,7 @@ fn file_backed_authority_rejects_previous_and_future_state_versions() {
 
 #[test]
 fn file_backed_authority_rejects_noncurrent_nested_command_versions_before_replay() {
-    for version in [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27] {
+    for version in [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28] {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(
             tmp.path()
@@ -1291,7 +1347,7 @@ fn file_backed_authority_rejects_current_state_missing_timestamp_high_water() {
     let path = tmp.path().join("control-plane.state");
     std::fs::write(
         &path,
-        "version=38\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\n",
+        "version=39\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\n",
     )
     .unwrap();
     let store = FileControlPlaneStore::new(path);
@@ -2872,7 +2928,7 @@ fn file_backed_authority_rejects_duplicate_pg_acting_set_nodes() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
@@ -2895,7 +2951,7 @@ fn file_backed_authority_rejects_current_pg_nodes_absent_from_current_map() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -2919,7 +2975,7 @@ fn file_backed_authority_rejects_current_pg_future_metadata_transfer_epoch() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -2944,7 +3000,7 @@ fn file_backed_authority_rejects_active_imported_provenance_without_epoch() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -2987,7 +3043,7 @@ fn file_backed_authority_rejects_current_or_future_history_epochs() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -3010,7 +3066,7 @@ fn file_backed_authority_rejects_history_pg_nodes_absent_from_history_map() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=3\n",
@@ -3035,7 +3091,7 @@ fn file_backed_authority_rejects_reconstructible_observations_in_history() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=3\n",
@@ -3065,7 +3121,7 @@ fn file_backed_authority_rejects_history_pg_future_metadata_transfer_epoch() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=4\n",
@@ -3101,7 +3157,7 @@ fn file_backed_authority_rejects_incomplete_compact_history_routes() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join(format!("control-plane-{index}.state"));
         let contents = format!(
-            "version=38\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
+            "version=39\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
         );
         std::fs::write(&path, contents).unwrap();
 
@@ -3169,7 +3225,7 @@ fn file_backed_authority_rejects_broken_compact_history_transfer_chains() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join(format!("control-plane-{name}.state"));
         let contents = format!(
-            "version=38\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}"
+            "version=39\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}"
         );
         std::fs::write(&path, contents).unwrap();
 
@@ -3237,7 +3293,7 @@ fn file_backed_authority_rejects_invalid_pg_introduction_history() {
         std::fs::write(
             &path,
             format!(
-                "version=38\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}{current_node}{current_pg}"
+                "version=39\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}{current_node}{current_pg}"
             ),
         )
         .unwrap();
@@ -3261,7 +3317,7 @@ fn file_backed_authority_rejects_noncanonical_absent_pg_order() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -3313,7 +3369,7 @@ fn file_backed_authority_rejects_current_pg_observation_outside_acting_set() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -3339,7 +3395,7 @@ fn file_backed_authority_rejects_current_pg_observation_wrong_epoch() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=3\n",
@@ -3364,7 +3420,7 @@ fn file_backed_authority_rejects_active_pg_observation_with_mismatched_proof() {
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -3390,7 +3446,7 @@ fn file_backed_authority_accepts_active_pg_observation_after_metadata_progress()
     let store = FileControlPlaneStore::new(&path);
     let initial = SingleAuthorityControlPlane::open(store.clone()).unwrap();
     let snapshot = parse_snapshot(concat!(
-            "version=38\n",
+            "version=39\n",
         "authority_incarnation=1\n",
         "cluster_epoch=2\n",
         "initial_topology=-\n",
@@ -3418,7 +3474,7 @@ fn file_backed_authority_accepts_active_pg_observation_after_metadata_progress()
 #[test]
 fn control_plane_state_rejects_each_unsupported_metadata_proof_carrier() {
     let current = concat!(
-            "version=38\n",
+            "version=39\n",
         "authority_incarnation=1\n",
         "cluster_epoch=2\n",
         "initial_topology=-\n",
@@ -4605,7 +4661,7 @@ fn file_backed_authority_rejects_active_pg_observation_with_non_current_pending_
     std::fs::write(
         &path,
         concat!(
-            "version=38\ninitial_topology=-\n",
+            "version=39\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",

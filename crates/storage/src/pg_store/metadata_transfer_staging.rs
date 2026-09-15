@@ -40,9 +40,9 @@ const CATALOGUE_FILE: &str = "catalogue.db";
 const STAGING_STORE_MAGIC: &[u8; 8] = b"ARGMSTG\0";
 const STAGING_INITIALIZATION_MAGIC: &[u8; 8] = b"ARGMSTGI";
 const STAGING_ESTABLISHMENT_MAGIC: &[u8; 8] = b"ARGMSTGE";
-const STAGING_STORE_FORMAT_VERSION: u16 = 3;
-const STAGING_STORE_SCHEMA_V3: &str =
-    include_str!("schema_manifests/metadata_transfer_staging_v3.sql");
+const STAGING_STORE_FORMAT_VERSION: u16 = 4;
+const STAGING_STORE_SCHEMA_V4: &str =
+    include_str!("schema_manifests/metadata_transfer_staging_v4.sql");
 const DIGEST_LEN: usize = 32;
 const MANIFEST_BODY_LEN: usize = STAGING_STORE_MAGIC.len() + 2 + DIGEST_LEN;
 const MANIFEST_LEN: usize = MANIFEST_BODY_LEN + 8;
@@ -56,9 +56,9 @@ pub(crate) const MAX_STAGING_EVIDENCE_BYTES: usize = 4_096;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_ENTRIES: usize = 64;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_BYTES: usize = 120 * 1_024;
 pub(crate) const MAX_STAGING_EPOCH_PROOFS_PER_INTENT: usize = 64;
-const STAGING_EVIDENCE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-V3\0";
-const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V3\0";
-const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V3\0";
+const STAGING_EVIDENCE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-V4\0";
+const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V4\0";
+const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V4\0";
 const STAGED_ARTIFACT_MAGIC: &[u8] = b"ARGMIN-METADATA-TRANSFER-ARTIFACT-V3\0";
 pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 3;
 pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES: u64 = 63 * 1_024 * 1_024;
@@ -138,7 +138,7 @@ impl MetadataTransferStagingLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MetadataTransferStagingNodeIdentity {
     node_id: NodeId,
     node_incarnation: u64,
@@ -349,6 +349,72 @@ struct StagingEvidenceDelta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MetadataTransferStagingActorClosureCandidate {
+    first_actor: MetadataTransferStagingNodeIdentity,
+    first_accepted_generation: u64,
+    first_accepted_apply_receipt_digest: [u8; DIGEST_LEN],
+    first_ambiguous_page: Option<MetadataTransferStagingActorClosureAmbiguousPage>,
+    through_actor: MetadataTransferStagingNodeIdentity,
+    rebound_entry_count: u64,
+    rebound_max_sequence: u64,
+    rebound_evidence_digest: [u8; DIGEST_LEN],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataTransferStagingActorClosureAmbiguousPage {
+    generation: u64,
+    page_digest: [u8; DIGEST_LEN],
+    apply_receipt_digest: [u8; DIGEST_LEN],
+}
+
+impl MetadataTransferStagingActorClosureCandidate {
+    pub(crate) fn first_actor(&self) -> &MetadataTransferStagingNodeIdentity {
+        &self.first_actor
+    }
+
+    pub(crate) fn first_accepted_generation(&self) -> u64 {
+        self.first_accepted_generation
+    }
+
+    pub(crate) fn first_accepted_apply_receipt_digest(&self) -> [u8; DIGEST_LEN] {
+        self.first_accepted_apply_receipt_digest
+    }
+
+    pub(crate) fn accepts_first_tip(
+        &self,
+        actor: &MetadataTransferStagingNodeIdentity,
+        generation: u64,
+        page_digest: [u8; DIGEST_LEN],
+        apply_receipt_digest: [u8; DIGEST_LEN],
+    ) -> bool {
+        actor == &self.first_actor
+            && ((generation == self.first_accepted_generation
+                && apply_receipt_digest == self.first_accepted_apply_receipt_digest)
+                || self.first_ambiguous_page.as_ref().is_some_and(|ambiguous| {
+                    generation == ambiguous.generation
+                        && page_digest == ambiguous.page_digest
+                        && apply_receipt_digest == ambiguous.apply_receipt_digest
+                }))
+    }
+
+    pub(crate) fn through_actor(&self) -> &MetadataTransferStagingNodeIdentity {
+        &self.through_actor
+    }
+
+    pub(crate) fn rebound_entry_count(&self) -> u64 {
+        self.rebound_entry_count
+    }
+
+    pub(crate) fn rebound_max_sequence(&self) -> u64 {
+        self.rebound_max_sequence
+    }
+
+    pub(crate) fn rebound_evidence_digest(&self) -> [u8; DIGEST_LEN] {
+        self.rebound_evidence_digest
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataTransferStagingEvidencePageEntry {
     sequence: u64,
     evidence: Vec<u8>,
@@ -408,6 +474,16 @@ impl MetadataTransferStagingEvidence {
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(crate) fn rebound_for_actor(&self, actor: &MetadataTransferStagingNodeIdentity) -> Vec<u8> {
+        encode_staging_evidence(
+            actor,
+            &self.intent,
+            self.kind as u8,
+            self.target_epoch,
+            self.transfer,
+        )
     }
 }
 
@@ -676,6 +752,7 @@ struct StagingInflightEvidencePage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataTransferStagingEvidencePage {
     actor: MetadataTransferStagingNodeIdentity,
+    actor_closure_candidate: Option<MetadataTransferStagingActorClosureCandidate>,
     previous_generation: u64,
     previous_apply_receipt_digest: [u8; DIGEST_LEN],
     generation: u64,
@@ -699,6 +776,12 @@ impl MetadataTransferStagingEvidencePage {
 
     pub(crate) fn actor(&self) -> &MetadataTransferStagingNodeIdentity {
         &self.actor
+    }
+
+    pub(crate) fn actor_closure_candidate(
+        &self,
+    ) -> Option<&MetadataTransferStagingActorClosureCandidate> {
+        self.actor_closure_candidate.as_ref()
     }
 
     pub(crate) fn previous_generation(&self) -> u64 {
@@ -1015,6 +1098,9 @@ impl MetadataTransferStagingStore {
                 "staging evidence actor changed through another store handle".to_owned(),
             ));
         }
+        let existing_closure_candidate =
+            load_staging_evidence_actor_closure_candidate(&transaction)?;
+        let old_inflight = load_inflight_evidence_page(&transaction)?;
 
         let rows = load_all_staging_rows(&transaction, self.limits.max_entries + 1)?;
         if rows.len() > self.limits.max_entries {
@@ -1124,6 +1210,61 @@ impl MetadataTransferStagingStore {
                 }
             }
         }
+        let closure_candidate = if let Some(existing) = existing_closure_candidate {
+            let (entry_count, max_sequence, evidence_digest) =
+                rebound_staging_evidence_digest(&transaction, None)?;
+            Some(MetadataTransferStagingActorClosureCandidate {
+                first_actor: existing.first_actor,
+                first_accepted_generation: existing.first_accepted_generation,
+                first_accepted_apply_receipt_digest: existing.first_accepted_apply_receipt_digest,
+                first_ambiguous_page: existing.first_ambiguous_page,
+                through_actor: self.identity.clone(),
+                rebound_entry_count: entry_count,
+                rebound_max_sequence: max_sequence,
+                rebound_evidence_digest: evidence_digest,
+            })
+        } else if let Some(old_inflight) = old_inflight {
+            let expected_receipt =
+                MetadataTransferStagingEvidenceApplyReceipt::for_page(&old_inflight.page);
+            let (
+                first_accepted_generation,
+                first_accepted_apply_receipt_digest,
+                first_ambiguous_page,
+            ) = if let Some(receipt) = old_inflight.apply_receipt.as_deref() {
+                let receipt = decode_staging_evidence_apply_receipt(receipt)?;
+                require_apply_receipt_for_page(&receipt, &old_inflight.page)?;
+                (
+                    old_inflight.page.generation(),
+                    checksum::sha256::digest(receipt.as_bytes()),
+                    None,
+                )
+            } else {
+                (
+                    old_inflight.page.previous_generation(),
+                    old_inflight.page.previous_apply_receipt_digest(),
+                    Some(MetadataTransferStagingActorClosureAmbiguousPage {
+                        generation: old_inflight.page.generation(),
+                        page_digest: old_inflight.page.page_digest(),
+                        apply_receipt_digest: checksum::sha256::digest(expected_receipt.as_bytes()),
+                    }),
+                )
+            };
+            let (entry_count, max_sequence, evidence_digest) =
+                rebound_staging_evidence_digest(&transaction, None)?;
+            Some(MetadataTransferStagingActorClosureCandidate {
+                first_actor: self.identity.clone(),
+                first_accepted_generation,
+                first_accepted_apply_receipt_digest,
+                first_ambiguous_page,
+                through_actor: self.identity.clone(),
+                rebound_entry_count: entry_count,
+                rebound_max_sequence: max_sequence,
+                rebound_evidence_digest: evidence_digest,
+            })
+        } else {
+            None
+        };
+        persist_staging_evidence_actor_closure_candidate(&transaction, closure_candidate.as_ref())?;
         transaction
             .execute("DELETE FROM staging_evidence_inflight_page", [])
             .map_err(|source| {
@@ -1728,6 +1869,7 @@ impl MetadataTransferStagingStore {
                 let successor = build_staging_evidence_page(
                     &transaction,
                     &self.identity,
+                    None,
                     page.generation,
                     predecessor_digest,
                 )?
@@ -1746,8 +1888,14 @@ impl MetadataTransferStagingStore {
                 None
             }
         } else {
-            let page =
-                build_staging_evidence_page(&transaction, &self.identity, 0, [0; DIGEST_LEN])?;
+            let closure_candidate = load_staging_evidence_actor_closure_candidate(&transaction)?;
+            let page = build_staging_evidence_page(
+                &transaction,
+                &self.identity,
+                closure_candidate.as_ref(),
+                0,
+                [0; DIGEST_LEN],
+            )?;
             if let Some(page) = page {
                 if let Some(observer) = &self.evidence_page_assignment_observer {
                     observer();
@@ -2228,6 +2376,350 @@ fn load_staging_evidence_actor(
         .transpose()
 }
 
+fn load_staging_evidence_actor_closure_candidate(
+    connection: &Connection,
+) -> Result<Option<MetadataTransferStagingActorClosureCandidate>, MetadataTransferStagingError> {
+    connection
+        .query_row(
+            "SELECT first_node_id, first_node_incarnation, first_endpoint, \
+                    first_accepted_generation, first_accepted_apply_receipt_digest, \
+                    first_ambiguous_generation, first_ambiguous_page_digest, \
+                    first_ambiguous_apply_receipt_digest, through_node_id, \
+                    through_node_incarnation, through_endpoint, rebound_entry_count, \
+                    rebound_max_sequence, rebound_evidence_digest \
+             FROM staging_evidence_actor_closure_candidate WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<u64>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, u32>(8)?,
+                    row.get::<_, u64>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, u64>(11)?,
+                    row.get::<_, u64>(12)?,
+                    row.get::<_, Vec<u8>>(13)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("load staging evidence actor closure", source)
+        })?
+        .map(
+            |(
+                first_node_id,
+                first_node_incarnation,
+                first_endpoint,
+                first_accepted_generation,
+                first_accepted_apply_receipt_digest,
+                first_ambiguous_generation,
+                first_ambiguous_page_digest,
+                first_ambiguous_apply_receipt_digest,
+                through_node_id,
+                through_node_incarnation,
+                through_endpoint,
+                rebound_entry_count,
+                rebound_max_sequence,
+                rebound_evidence_digest,
+            )| {
+                let candidate = MetadataTransferStagingActorClosureCandidate {
+                    first_actor: MetadataTransferStagingNodeIdentity::new(
+                        NodeId::new(first_node_id),
+                        first_node_incarnation,
+                        first_endpoint,
+                    )?,
+                    first_accepted_generation,
+                    first_accepted_apply_receipt_digest: first_accepted_apply_receipt_digest
+                        .try_into()
+                        .map_err(|_| {
+                            MetadataTransferStagingError::Invariant(
+                                "staging actor closure accepted receipt digest has invalid length"
+                                    .to_owned(),
+                            )
+                        })?,
+                    first_ambiguous_page: match (
+                        first_ambiguous_generation,
+                        first_ambiguous_page_digest,
+                        first_ambiguous_apply_receipt_digest,
+                    ) {
+                        (None, None, None) => None,
+                        (Some(generation), Some(page_digest), Some(apply_receipt_digest)) => {
+                            Some(MetadataTransferStagingActorClosureAmbiguousPage {
+                                generation,
+                                page_digest: page_digest.try_into().map_err(|_| {
+                                    MetadataTransferStagingError::Invariant(
+                                        "staging actor closure ambiguous page digest has invalid length"
+                                            .to_owned(),
+                                    )
+                                })?,
+                                apply_receipt_digest: apply_receipt_digest.try_into().map_err(
+                                    |_| {
+                                        MetadataTransferStagingError::Invariant(
+                                            "staging actor closure ambiguous receipt digest has invalid length"
+                                                .to_owned(),
+                                        )
+                                    },
+                                )?,
+                            })
+                        }
+                        _ => {
+                            return Err(MetadataTransferStagingError::Invariant(
+                                "staging actor closure has incomplete ambiguous page evidence"
+                                    .to_owned(),
+                            ));
+                        }
+                    },
+                    through_actor: MetadataTransferStagingNodeIdentity::new(
+                        NodeId::new(through_node_id),
+                        through_node_incarnation,
+                        through_endpoint,
+                    )?,
+                    rebound_entry_count,
+                    rebound_max_sequence,
+                    rebound_evidence_digest: rebound_evidence_digest.try_into().map_err(|_| {
+                        MetadataTransferStagingError::Invariant(
+                            "staging actor closure evidence digest has invalid length".to_owned(),
+                        )
+                    })?,
+                };
+                validate_staging_evidence_actor_closure_candidate(&candidate)?;
+                Ok(candidate)
+            },
+        )
+        .transpose()
+}
+
+fn persist_staging_evidence_actor_closure_candidate(
+    connection: &Connection,
+    candidate: Option<&MetadataTransferStagingActorClosureCandidate>,
+) -> Result<(), MetadataTransferStagingError> {
+    if let Some(candidate) = candidate {
+        validate_staging_evidence_actor_closure_candidate(candidate)?;
+        connection
+            .execute(
+                "INSERT INTO staging_evidence_actor_closure_candidate (\
+                    singleton, first_node_id, first_node_incarnation, first_endpoint, \
+                    first_accepted_generation, first_accepted_apply_receipt_digest, \
+                    first_ambiguous_generation, first_ambiguous_page_digest, \
+                    first_ambiguous_apply_receipt_digest, through_node_id, \
+                    through_node_incarnation, through_endpoint, rebound_entry_count, \
+                    rebound_max_sequence, rebound_evidence_digest\
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+                 ON CONFLICT(singleton) DO UPDATE SET \
+                    first_node_id = excluded.first_node_id, \
+                    first_node_incarnation = excluded.first_node_incarnation, \
+                    first_endpoint = excluded.first_endpoint, \
+                    first_accepted_generation = excluded.first_accepted_generation, \
+                    first_accepted_apply_receipt_digest = excluded.first_accepted_apply_receipt_digest, \
+                    first_ambiguous_generation = excluded.first_ambiguous_generation, \
+                    first_ambiguous_page_digest = excluded.first_ambiguous_page_digest, \
+                    first_ambiguous_apply_receipt_digest = excluded.first_ambiguous_apply_receipt_digest, \
+                    through_node_id = excluded.through_node_id, \
+                    through_node_incarnation = excluded.through_node_incarnation, \
+                    through_endpoint = excluded.through_endpoint, \
+                    rebound_entry_count = excluded.rebound_entry_count, \
+                    rebound_max_sequence = excluded.rebound_max_sequence, \
+                    rebound_evidence_digest = excluded.rebound_evidence_digest",
+                params![
+                    i64::from(candidate.first_actor.node_id().as_u32()),
+                    to_sql_u64(candidate.first_actor.node_incarnation())?,
+                    candidate.first_actor.endpoint(),
+                    to_sql_u64(candidate.first_accepted_generation)?,
+                    &candidate.first_accepted_apply_receipt_digest[..],
+                    candidate
+                        .first_ambiguous_page
+                        .as_ref()
+                        .map(|page| to_sql_u64(page.generation))
+                        .transpose()?,
+                    candidate
+                        .first_ambiguous_page
+                        .as_ref()
+                        .map(|page| page.page_digest.as_slice()),
+                    candidate
+                        .first_ambiguous_page
+                        .as_ref()
+                        .map(|page| page.apply_receipt_digest.as_slice()),
+                    i64::from(candidate.through_actor.node_id().as_u32()),
+                    to_sql_u64(candidate.through_actor.node_incarnation())?,
+                    candidate.through_actor.endpoint(),
+                    to_sql_u64(candidate.rebound_entry_count)?,
+                    to_sql_u64(candidate.rebound_max_sequence)?,
+                    &candidate.rebound_evidence_digest[..],
+                ],
+            )
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("persist staging evidence actor closure", source)
+            })?;
+    } else {
+        connection
+            .execute("DELETE FROM staging_evidence_actor_closure_candidate", [])
+            .map_err(|source| {
+                MetadataTransferStagingError::sql("clear staging evidence actor closure", source)
+            })?;
+    }
+    Ok(())
+}
+
+fn validate_staging_evidence_actor_closure_candidate(
+    candidate: &MetadataTransferStagingActorClosureCandidate,
+) -> Result<(), MetadataTransferStagingError> {
+    let accepted_is_genesis = candidate.first_accepted_generation == 0;
+    let accepted_digest_is_genesis =
+        candidate.first_accepted_apply_receipt_digest == [0; DIGEST_LEN];
+    if candidate.first_actor.node_id() != candidate.through_actor.node_id()
+        || candidate.first_actor.node_incarnation() > candidate.through_actor.node_incarnation()
+        || (candidate.first_actor.node_incarnation() == candidate.through_actor.node_incarnation()
+            && candidate.first_actor != candidate.through_actor)
+        || accepted_is_genesis != accepted_digest_is_genesis
+        || (accepted_is_genesis && candidate.first_ambiguous_page.is_none())
+        || candidate.first_ambiguous_page.as_ref().is_some_and(|page| {
+            page.generation
+                != candidate
+                    .first_accepted_generation
+                    .checked_add(1)
+                    .unwrap_or(0)
+        })
+        || candidate.rebound_entry_count == 0
+        || candidate.rebound_max_sequence == 0
+        || candidate.rebound_entry_count > candidate.rebound_max_sequence
+    {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging evidence actor closure candidate is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_staging_evidence_actor_closure_candidate(
+    out: &mut Vec<u8>,
+    candidate: &MetadataTransferStagingActorClosureCandidate,
+) {
+    encode_staging_evidence_actor(out, &candidate.first_actor);
+    out.extend_from_slice(&candidate.first_accepted_generation.to_be_bytes());
+    out.extend_from_slice(&candidate.first_accepted_apply_receipt_digest);
+    if let Some(page) = &candidate.first_ambiguous_page {
+        out.push(1);
+        out.extend_from_slice(&page.generation.to_be_bytes());
+        out.extend_from_slice(&page.page_digest);
+        out.extend_from_slice(&page.apply_receipt_digest);
+    } else {
+        out.push(0);
+    }
+    encode_staging_evidence_actor(out, &candidate.through_actor);
+    out.extend_from_slice(&candidate.rebound_entry_count.to_be_bytes());
+    out.extend_from_slice(&candidate.rebound_max_sequence.to_be_bytes());
+    out.extend_from_slice(&candidate.rebound_evidence_digest);
+}
+
+fn decode_staging_evidence_actor_closure_candidate(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<MetadataTransferStagingActorClosureCandidate, MetadataTransferStagingError> {
+    let first_actor = decode_staging_evidence_actor(bytes, offset)?;
+    let first_accepted_generation = u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap());
+    let first_accepted_apply_receipt_digest = take(bytes, offset, DIGEST_LEN)?.try_into().unwrap();
+    let first_ambiguous_page = match take(bytes, offset, 1)?[0] {
+        0 => None,
+        1 => Some(MetadataTransferStagingActorClosureAmbiguousPage {
+            generation: u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap()),
+            page_digest: take(bytes, offset, DIGEST_LEN)?.try_into().unwrap(),
+            apply_receipt_digest: take(bytes, offset, DIGEST_LEN)?.try_into().unwrap(),
+        }),
+        _ => {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging actor closure has an invalid ambiguous page tag".to_owned(),
+            ));
+        }
+    };
+    let through_actor = decode_staging_evidence_actor(bytes, offset)?;
+    let rebound_entry_count = u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap());
+    let rebound_max_sequence = u64::from_be_bytes(take(bytes, offset, 8)?.try_into().unwrap());
+    let rebound_evidence_digest = take(bytes, offset, DIGEST_LEN)?.try_into().unwrap();
+    let candidate = MetadataTransferStagingActorClosureCandidate {
+        first_actor,
+        first_accepted_generation,
+        first_accepted_apply_receipt_digest,
+        first_ambiguous_page,
+        through_actor,
+        rebound_entry_count,
+        rebound_max_sequence,
+        rebound_evidence_digest,
+    };
+    validate_staging_evidence_actor_closure_candidate(&candidate)?;
+    Ok(candidate)
+}
+
+fn rebound_staging_evidence_digest(
+    connection: &Connection,
+    through_sequence: Option<u64>,
+) -> Result<(u64, u64, [u8; DIGEST_LEN]), MetadataTransferStagingError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, evidence_bytes FROM staging_evidence_deltas \
+             WHERE sequence <= ?1 ORDER BY sequence",
+        )
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("prepare rebound staging evidence digest", source)
+        })?;
+    let rows = statement
+        .query_map(
+            [through_sequence.map_or(Ok(i64::MAX), to_sql_u64)?],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("query rebound staging evidence digest", source)
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| {
+            MetadataTransferStagingError::sql("read rebound staging evidence digest", source)
+        })?;
+    metadata_transfer_staging_rebound_evidence_digest(
+        rows.iter()
+            .map(|(sequence, evidence)| (*sequence, evidence.as_slice())),
+    )
+}
+
+pub(crate) fn metadata_transfer_staging_rebound_evidence_digest<'a>(
+    entries: impl IntoIterator<Item = (u64, &'a [u8])>,
+) -> Result<(u64, u64, [u8; DIGEST_LEN]), MetadataTransferStagingError> {
+    let rows = entries.into_iter().collect::<Vec<_>>();
+    let entry_count = u64::try_from(rows.len()).map_err(|_| {
+        MetadataTransferStagingError::Invariant(
+            "staging evidence entry count does not fit u64".to_owned(),
+        )
+    })?;
+    let max_sequence = rows.last().map_or(0, |(sequence, _)| *sequence);
+    if entry_count == 0 || max_sequence == 0 {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging actor closure has no rebound evidence".to_owned(),
+        ));
+    }
+    let mut context = checksum::sha256::Sha256::new();
+    context.update(b"argmin-staging-evidence-rebound-v1\0");
+    context.update(&entry_count.to_be_bytes());
+    context.update(&max_sequence.to_be_bytes());
+    let mut previous_sequence = 0;
+    for (sequence, evidence) in rows {
+        if sequence <= previous_sequence {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence rebound entries are not strictly ordered".to_owned(),
+            ));
+        }
+        previous_sequence = sequence;
+        context.update(&sequence.to_be_bytes());
+        context.update(&u64::try_from(evidence.len()).unwrap().to_be_bytes());
+        context.update(evidence);
+    }
+    Ok((entry_count, max_sequence, context.finalize()))
+}
+
 fn validate_staging_evidence_actor_open(
     durable: &MetadataTransferStagingNodeIdentity,
     requested: &MetadataTransferStagingNodeIdentity,
@@ -2333,7 +2825,7 @@ fn initialize_or_validate_unmarked_catalogue(
                 ));
             }
             connection
-                .execute_batch(STAGING_STORE_SCHEMA_V3)
+                .execute_batch(STAGING_STORE_SCHEMA_V4)
                 .map_err(|source| {
                     MetadataTransferStagingError::sql("initialize staging catalogue", source)
                 })?;
@@ -2374,13 +2866,13 @@ fn validate_schema_catalogue(connection: &Connection) -> Result<(), MetadataTran
         MetadataTransferStagingError::sql("open expected staging catalogue", source)
     })?;
     expected
-        .execute_batch(STAGING_STORE_SCHEMA_V3)
+        .execute_batch(STAGING_STORE_SCHEMA_V4)
         .map_err(|source| {
             MetadataTransferStagingError::sql("build expected staging catalogue", source)
         })?;
     if schema_catalogue(connection)? != schema_catalogue(&expected)? {
         return Err(MetadataTransferStagingError::Invariant(
-            "staging catalogue schema does not match format v3".to_owned(),
+            "staging catalogue schema does not match format v4".to_owned(),
         ));
     }
     Ok(())
@@ -2745,6 +3237,7 @@ fn unacknowledged_evidence_exists(
 fn build_staging_evidence_page(
     connection: &Connection,
     actor: &MetadataTransferStagingNodeIdentity,
+    actor_closure_candidate: Option<&MetadataTransferStagingActorClosureCandidate>,
     previous_generation: u64,
     previous_apply_receipt_digest: [u8; DIGEST_LEN],
 ) -> Result<Option<MetadataTransferStagingEvidencePage>, MetadataTransferStagingError> {
@@ -2752,6 +3245,22 @@ fn build_staging_evidence_page(
         return Err(MetadataTransferStagingError::Invariant(
             "staging evidence page has an invalid predecessor".to_owned(),
         ));
+    }
+    if actor_closure_candidate.is_some() && previous_generation != 0 {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging actor closure candidate must appear only on a genesis page".to_owned(),
+        ));
+    }
+    if let Some(candidate) = actor_closure_candidate {
+        validate_staging_evidence_actor_closure_candidate(candidate)?;
+        if candidate.first_actor.node_id() != actor.node_id()
+            || candidate.through_actor.node_id() != actor.node_id()
+            || candidate.through_actor.node_incarnation() >= actor.node_incarnation()
+        {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging actor closure candidate does not precede its genesis actor".to_owned(),
+            ));
+        }
     }
     let generation = previous_generation.checked_add(1).ok_or_else(|| {
         MetadataTransferStagingError::Invariant(
@@ -2792,6 +3301,7 @@ fn build_staging_evidence_page(
         entries.push(candidate);
         let payload = encode_staging_evidence_page_payload(
             actor,
+            actor_closure_candidate,
             previous_generation,
             previous_apply_receipt_digest,
             generation,
@@ -2809,6 +3319,7 @@ fn build_staging_evidence_page(
     }
     let operation_payload = encode_staging_evidence_page_payload(
         actor,
+        actor_closure_candidate,
         previous_generation,
         previous_apply_receipt_digest,
         generation,
@@ -2817,6 +3328,7 @@ fn build_staging_evidence_page(
     let page_digest = checksum::sha256::digest(&operation_payload);
     Ok(Some(MetadataTransferStagingEvidencePage {
         actor: actor.clone(),
+        actor_closure_candidate: actor_closure_candidate.cloned(),
         previous_generation,
         previous_apply_receipt_digest,
         generation,
@@ -3162,6 +3674,27 @@ fn validate_auxiliary_catalogue(
                 })?;
                 validate_staging_evidence(&receipt.bytes, &row.intent, 1, &receipt.actor)?;
             }
+        }
+    }
+
+    if let Some(candidate) = load_staging_evidence_actor_closure_candidate(connection)? {
+        if candidate.first_actor.node_id() != durable_actor.node_id()
+            || candidate.through_actor.node_id() != durable_actor.node_id()
+            || candidate.through_actor.node_incarnation() >= durable_actor.node_incarnation()
+        {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging actor closure does not precede the durable actor".to_owned(),
+            ));
+        }
+        let (entry_count, max_sequence, evidence_digest) =
+            rebound_staging_evidence_digest(connection, Some(candidate.rebound_max_sequence))?;
+        if entry_count != candidate.rebound_entry_count
+            || max_sequence != candidate.rebound_max_sequence
+            || evidence_digest != candidate.rebound_evidence_digest
+        {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging actor closure does not bind the exact rebound evidence prefix".to_owned(),
+            ));
         }
     }
 
@@ -3565,6 +4098,7 @@ pub(crate) fn decode_staging_evidence(
 
 fn encode_staging_evidence_page_payload(
     actor: &MetadataTransferStagingNodeIdentity,
+    actor_closure_candidate: Option<&MetadataTransferStagingActorClosureCandidate>,
     previous_generation: u64,
     previous_apply_receipt_digest: [u8; DIGEST_LEN],
     generation: u64,
@@ -3573,6 +4107,12 @@ fn encode_staging_evidence_page_payload(
     let mut out = Vec::new();
     out.extend_from_slice(STAGING_EVIDENCE_PAGE_MAGIC);
     encode_staging_evidence_actor(&mut out, actor);
+    if let Some(candidate) = actor_closure_candidate {
+        out.push(1);
+        encode_staging_evidence_actor_closure_candidate(&mut out, candidate);
+    } else {
+        out.push(0);
+    }
     out.extend_from_slice(&previous_generation.to_be_bytes());
     out.extend_from_slice(&previous_apply_receipt_digest);
     out.extend_from_slice(&generation.to_be_bytes());
@@ -3603,6 +4143,18 @@ pub(crate) fn decode_staging_evidence_page_payload(
         ));
     }
     let actor = decode_staging_evidence_actor(bytes, &mut offset)?;
+    let actor_closure_candidate = match take(bytes, &mut offset, 1)?[0] {
+        0 => None,
+        1 => Some(decode_staging_evidence_actor_closure_candidate(
+            bytes,
+            &mut offset,
+        )?),
+        _ => {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging evidence page has an invalid actor closure tag".to_owned(),
+            ))
+        }
+    };
     let previous_generation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
     let previous_apply_receipt_digest = take(bytes, &mut offset, DIGEST_LEN)?.try_into().unwrap();
     let generation = u64::from_be_bytes(take(bytes, &mut offset, 8)?.try_into().unwrap());
@@ -3614,6 +4166,12 @@ pub(crate) fn decode_staging_evidence_page_payload(
         || count > MAX_STAGING_EVIDENCE_PAGE_ENTRIES
         || generation != previous_generation.checked_add(1).unwrap_or(0)
         || (previous_generation == 0) != (previous_apply_receipt_digest == [0; DIGEST_LEN])
+        || (actor_closure_candidate.is_some() && previous_generation != 0)
+        || actor_closure_candidate.as_ref().is_some_and(|candidate| {
+            candidate.first_actor.node_id() != actor.node_id()
+                || candidate.through_actor.node_id() != actor.node_id()
+                || candidate.through_actor.node_incarnation() >= actor.node_incarnation()
+        })
     {
         return Err(MetadataTransferStagingError::Invariant(
             "staging evidence page has invalid count, generation, or predecessor".to_owned(),
@@ -3647,6 +4205,7 @@ pub(crate) fn decode_staging_evidence_page_payload(
     }
     let canonical = encode_staging_evidence_page_payload(
         &actor,
+        actor_closure_candidate.as_ref(),
         previous_generation,
         previous_apply_receipt_digest,
         generation,
@@ -3659,6 +4218,7 @@ pub(crate) fn decode_staging_evidence_page_payload(
     }
     Ok(MetadataTransferStagingEvidencePage {
         actor,
+        actor_closure_candidate,
         previous_generation,
         previous_apply_receipt_digest,
         generation,
@@ -3749,6 +4309,107 @@ pub(crate) fn metadata_transfer_staging_evidence_page_for_test(
         kind,
         previous_receipt,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_transfer_staging_closure_evidence_page_for_test(
+    first_actor: MetadataTransferStagingNodeIdentity,
+    destination_actor: MetadataTransferStagingNodeIdentity,
+    binding: &UnavailablePgTransitionMutationBinding,
+    artifact_digest: [u8; DIGEST_LEN],
+    artifact_length: u64,
+    artifact_format_version: u16,
+    kind: MetadataTransferStagingEvidenceKind,
+) -> MetadataTransferStagingEvidencePage {
+    let old_page = metadata_transfer_staging_evidence_page_for_test(
+        first_actor.clone(),
+        binding,
+        artifact_digest,
+        artifact_length,
+        artifact_format_version,
+        kind,
+        None,
+    );
+    let rebound_entries = old_page
+        .entries()
+        .iter()
+        .map(|entry| MetadataTransferStagingEvidencePageEntry {
+            sequence: entry.sequence(),
+            evidence: decode_staging_evidence(entry.evidence())
+                .unwrap()
+                .rebound_for_actor(&destination_actor),
+        })
+        .collect::<Vec<_>>();
+    let (rebound_entry_count, rebound_max_sequence, rebound_evidence_digest) =
+        metadata_transfer_staging_rebound_evidence_digest(
+            rebound_entries
+                .iter()
+                .map(|entry| (entry.sequence(), entry.evidence())),
+        )
+        .unwrap();
+    let candidate = MetadataTransferStagingActorClosureCandidate {
+        first_actor: first_actor.clone(),
+        first_accepted_generation: 0,
+        first_accepted_apply_receipt_digest: [0; DIGEST_LEN],
+        first_ambiguous_page: Some(MetadataTransferStagingActorClosureAmbiguousPage {
+            generation: old_page.generation(),
+            page_digest: old_page.page_digest(),
+            apply_receipt_digest: checksum::sha256::digest(
+                MetadataTransferStagingEvidenceApplyReceipt::for_page(&old_page).as_bytes(),
+            ),
+        }),
+        through_actor: first_actor,
+        rebound_entry_count,
+        rebound_max_sequence,
+        rebound_evidence_digest,
+    };
+    let operation_payload = encode_staging_evidence_page_payload(
+        &destination_actor,
+        Some(&candidate),
+        0,
+        [0; DIGEST_LEN],
+        1,
+        &rebound_entries,
+    );
+    let page_digest = checksum::sha256::digest(&operation_payload);
+    decode_staging_evidence_page_payload(&operation_payload, page_digest).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_transfer_staging_incomplete_closure_evidence_page_for_test(
+    first_tip: &MetadataTransferStagingEvidencePage,
+    through_actor: MetadataTransferStagingNodeIdentity,
+    destination_actor: MetadataTransferStagingNodeIdentity,
+    through_entry: &MetadataTransferStagingEvidencePageEntry,
+) -> MetadataTransferStagingEvidencePage {
+    let through_evidence = decode_staging_evidence(through_entry.evidence()).unwrap();
+    assert_eq!(through_evidence.actor(), &through_actor);
+    let entries = vec![MetadataTransferStagingEvidencePageEntry {
+        sequence: through_entry.sequence(),
+        evidence: through_evidence.rebound_for_actor(&destination_actor),
+    }];
+    let candidate = MetadataTransferStagingActorClosureCandidate {
+        first_actor: first_tip.actor().clone(),
+        first_accepted_generation: first_tip.generation(),
+        first_accepted_apply_receipt_digest: checksum::sha256::digest(
+            MetadataTransferStagingEvidenceApplyReceipt::for_page(first_tip).as_bytes(),
+        ),
+        first_ambiguous_page: None,
+        through_actor,
+        rebound_entry_count: 2,
+        rebound_max_sequence: through_entry.sequence().checked_add(1).unwrap(),
+        rebound_evidence_digest: [0x5a; DIGEST_LEN],
+    };
+    let operation_payload = encode_staging_evidence_page_payload(
+        &destination_actor,
+        Some(&candidate),
+        0,
+        [0; DIGEST_LEN],
+        1,
+        &entries,
+    );
+    let page_digest = checksum::sha256::digest(&operation_payload);
+    decode_staging_evidence_page_payload(&operation_payload, page_digest).unwrap()
 }
 
 #[cfg(test)]
@@ -3867,6 +4528,7 @@ fn metadata_transfer_staging_evidence_page_with_target_for_test(
     }];
     let operation_payload = encode_staging_evidence_page_payload(
         &page_actor,
+        None,
         previous_generation,
         previous_apply_receipt_digest,
         generation,
@@ -4005,6 +4667,7 @@ pub(crate) fn metadata_transfer_staging_evidence_page_with_duplicate_member_for_
     ];
     let operation_payload = encode_staging_evidence_page_payload(
         &actor,
+        None,
         previous_generation,
         previous_apply_receipt_digest,
         generation,
@@ -4591,7 +5254,7 @@ fn current_initialization_marker_bytes() -> Vec<u8> {
     bytes.extend_from_slice(STAGING_INITIALIZATION_MAGIC);
     bytes.extend_from_slice(&STAGING_STORE_FORMAT_VERSION.to_be_bytes());
     bytes.extend_from_slice(&checksum::sha256::digest(
-        STAGING_STORE_SCHEMA_V3.as_bytes(),
+        STAGING_STORE_SCHEMA_V4.as_bytes(),
     ));
     let checksum = checksum::crc64::checksum(&bytes);
     bytes.extend_from_slice(&checksum.to_be_bytes());
@@ -4682,7 +5345,7 @@ fn current_manifest_bytes() -> Vec<u8> {
     bytes.extend_from_slice(STAGING_STORE_MAGIC);
     bytes.extend_from_slice(&STAGING_STORE_FORMAT_VERSION.to_be_bytes());
     bytes.extend_from_slice(&checksum::sha256::digest(
-        STAGING_STORE_SCHEMA_V3.as_bytes(),
+        STAGING_STORE_SCHEMA_V4.as_bytes(),
     ));
     let checksum = checksum::crc64::checksum(&bytes);
     bytes.extend_from_slice(&checksum.to_be_bytes());
@@ -4905,11 +5568,11 @@ mod tests {
     }
 
     #[test]
-    fn current_metadata_transfer_staging_store_matches_frozen_v3_manifest_and_requires_version_bump(
+    fn current_metadata_transfer_staging_store_matches_frozen_v4_manifest_and_requires_version_bump(
     ) {
         assert_eq!(
             hex(&current_manifest_bytes()),
-            "4152474d535447000003643f43e864097c6001733c10fefe1649bd18411ef8c7e4392efc5e27762c1f6f2f034ddb97f20b7b"
+            "4152474d53544700000423102023e7f72fa5d48c93286276a9beab0186ee83033fda684f4c73b6445fec97dbab018fc0b574"
         );
         let tmp = test_util::tempdir();
         let store = open(tmp.path());
@@ -4923,23 +5586,23 @@ mod tests {
     }
 
     #[test]
-    fn initialization_marker_v3_encoding_is_fixed() {
+    fn initialization_marker_v4_encoding_is_fixed() {
         assert_eq!(
             hex(&current_initialization_marker_bytes()),
-            "4152474d535447490003643f43e864097c6001733c10fefe1649bd18411ef8c7e4392efc5e27762c1f6f38f5623b8d9b4a2d"
+            "4152474d53544749000423102023e7f72fa5d48c93286276a9beab0186ee83033fda684f4c73b6445fec802d84e195a9f422"
         );
     }
 
     #[test]
-    fn establishment_marker_v3_encoding_is_fixed() {
+    fn establishment_marker_v4_encoding_is_fixed() {
         assert_eq!(
             hex(&current_establishment_marker_bytes()),
-            "4152474d535447450003a1d53a4cc83b031831e2c5cc0274d4d0acbde55d560a014e2b59c132195f052b0af5e90a20720eaa"
+            "4152474d53544745000489a556301f7a0cfa523303a2fe8cf748d3886648a69b685a196d96fbcb7e0a3e413ecc4a40ff5b0e"
         );
     }
 
     #[test]
-    fn historical_staging_store_v1_v2_markers_remain_exact_rejection_evidence() {
+    fn historical_staging_store_v1_v2_v3_markers_remain_exact_rejection_evidence() {
         for (version, manifest, initialization, establishment) in [
             (
                 1,
@@ -4952,6 +5615,12 @@ mod tests {
                 "4152474d5354470000026e722f4492ef06abc27ea34e6bc367916cd81c0ef362fb9c4f1e41b1e5cae494f8f99a4accd44275",
                 "4152474d5354474900026e722f4492ef06abc27ea34e6bc367916cd81c0ef362fb9c4f1e41b1e5cae494ef0fb5aad6bd0323",
                 "4152474d5354474500027c9533697c7a588542438ed5f246c781c987d4a750c7c2b52d8ed329cd145a1453a427f53714c545",
+            ),
+            (
+                3,
+                "4152474d535447000003643f43e864097c6001733c10fefe1649bd18411ef8c7e4392efc5e27762c1f6f2f034ddb97f20b7b",
+                "4152474d535447490003643f43e864097c6001733c10fefe1649bd18411ef8c7e4392efc5e27762c1f6f38f5623b8d9b4a2d",
+                "4152474d535447450003a1d53a4cc83b031831e2c5cc0274d4d0acbde55d560a014e2b59c132195f052b0af5e90a20720eaa",
             ),
         ] {
             for result in [
@@ -5101,7 +5770,7 @@ mod tests {
             let mut marker = current_initialization_marker_bytes();
             if corrupt_version {
                 let offset = STAGING_INITIALIZATION_MAGIC.len();
-                marker[offset..offset + 2].copy_from_slice(&4u16.to_be_bytes());
+                marker[offset..offset + 2].copy_from_slice(&5u16.to_be_bytes());
                 let checksum = checksum::crc64::checksum(&marker[..INITIALIZATION_MARKER_BODY_LEN]);
                 marker[INITIALIZATION_MARKER_BODY_LEN..].copy_from_slice(&checksum.to_be_bytes());
             } else {
@@ -5117,7 +5786,7 @@ mod tests {
             if corrupt_version {
                 assert!(matches!(
                     error,
-                    MetadataTransferStagingError::UnsupportedFormatVersion(4)
+                    MetadataTransferStagingError::UnsupportedFormatVersion(5)
                 ));
             } else {
                 assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
@@ -5138,7 +5807,7 @@ mod tests {
             let mut marker = current_establishment_marker_bytes();
             if corrupt_version {
                 let offset = STAGING_ESTABLISHMENT_MAGIC.len();
-                marker[offset..offset + 2].copy_from_slice(&4u16.to_be_bytes());
+                marker[offset..offset + 2].copy_from_slice(&5u16.to_be_bytes());
                 let checksum = checksum::crc64::checksum(&marker[..ESTABLISHMENT_MARKER_BODY_LEN]);
                 marker[ESTABLISHMENT_MARKER_BODY_LEN..].copy_from_slice(&checksum.to_be_bytes());
             } else {
@@ -5155,7 +5824,7 @@ mod tests {
             if corrupt_version {
                 assert!(matches!(
                     error,
-                    MetadataTransferStagingError::UnsupportedFormatVersion(4)
+                    MetadataTransferStagingError::UnsupportedFormatVersion(5)
                 ));
             } else {
                 assert!(matches!(error, MetadataTransferStagingError::Invariant(_)));
@@ -5311,7 +5980,7 @@ mod tests {
 
     #[test]
     fn staging_store_rejects_adjacent_versions_without_mutation() {
-        for version in [1u16, 2, 4] {
+        for version in [1u16, 2, 3, 5] {
             let tmp = test_util::tempdir();
             let store = open(tmp.path());
             drop(store);
@@ -5593,11 +6262,15 @@ mod tests {
     }
 
     #[test]
-    fn staging_receipt_v3_encoding_is_fixed_and_v2_remains_rejected() {
+    fn staging_receipt_v4_encoding_is_fixed_and_v2_v3_remain_rejected() {
         let historical_v2 = decode_hex(
             "4152474d494e2d53544147494e472d45564944454e43452d5632000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0a2188fce572c606858dffa56cc1590344a166e9ff8858bab341658e0c2e596000000000000000930002000000000000000d01000000000000000b0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007",
         );
         assert!(decode_staging_evidence(&historical_v2).is_err());
+        let historical_v3 = decode_hex(
+            "4152474d494e2d53544147494e472d45564944454e43452d5633000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0efadd220adcc57506f8a395ce807f64911785127f9af6724bde5399ea513ba500000000000000930003000000000000000d01000000000000000b0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007",
+        );
+        assert!(decode_staging_evidence(&historical_v3).is_err());
         let artifact = canonical_artifact(b"one retained metadata command receipt");
         let expected_intent = intent(artifact);
         let receipt = encode_staging_evidence(
@@ -5612,7 +6285,7 @@ mod tests {
         );
         assert_eq!(
             hex(&receipt),
-            "4152474d494e2d53544147494e472d45564944454e43452d5633000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0efadd220adcc57506f8a395ce807f64911785127f9af6724bde5399ea513ba500000000000000930003000000000000000d01000000000000000b0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
+            "4152474d494e2d53544147494e472d45564944454e43452d5634000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0efadd220adcc57506f8a395ce807f64911785127f9af6724bde5399ea513ba500000000000000930003000000000000000d01000000000000000b0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
         );
         validate_staging_evidence(&receipt, &expected_intent, 0, &identity()).unwrap();
         assert!(MetadataTransferStagingReceipt::from_publication_bytes(
@@ -6024,7 +6697,7 @@ mod tests {
 
     #[test]
     fn catalogue_rejects_adjacent_versions_and_schema_changes_without_repair() {
-        for version in [0u32, 1, 2, 4] {
+        for version in [0u32, 1, 2, 3, 5] {
             let tmp = test_util::tempdir();
             drop(open(tmp.path()));
             let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
@@ -6318,6 +6991,34 @@ mod tests {
         assert_eq!(replay.previous_generation(), 0);
         assert_eq!(replay.generation(), 1);
         assert_eq!(replay.entries.len(), 2);
+        let closure = replay
+            .actor_closure_candidate()
+            .expect("rollover genesis must carry durable actor closure evidence");
+        assert_eq!(closure.first_actor(), &identity());
+        assert_eq!(closure.first_accepted_generation(), 0);
+        assert_eq!(closure.first_accepted_apply_receipt_digest(), [0; 32]);
+        assert!(closure.accepts_first_tip(
+            &identity(),
+            first_page.generation(),
+            first_page.page_digest(),
+            checksum::sha256::digest(
+                MetadataTransferStagingEvidenceApplyReceipt::for_page(&first_page).as_bytes()
+            ),
+        ));
+        assert_eq!(closure.through_actor(), &identity());
+        assert_eq!(closure.rebound_entry_count(), 2);
+        assert_eq!(closure.rebound_max_sequence(), 2);
+        assert_eq!(
+            closure.rebound_evidence_digest(),
+            metadata_transfer_staging_rebound_evidence_digest(
+                replay
+                    .entries()
+                    .iter()
+                    .map(|entry| (entry.sequence(), entry.evidence()))
+            )
+            .unwrap()
+            .2
+        );
         for entry in replay.entries() {
             assert_eq!(
                 decode_staging_evidence(entry.evidence()).unwrap().actor(),
@@ -6325,6 +7026,223 @@ mod tests {
             );
         }
         assert_eq!(restarted.unacknowledged_evidence_count(), 2);
+    }
+
+    #[test]
+    fn repeated_actor_rollover_preserves_the_first_tip_and_advances_the_rebind_boundary() {
+        let tmp = test_util::tempdir();
+        let first = open(tmp.path());
+        first
+            .tombstone(&intent(b"first rollover evidence"))
+            .unwrap();
+        let first_page = first.next_evidence_page().unwrap().unwrap();
+        drop(first);
+
+        let second_identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            8,
+            "tcp://storage-4.example:9000".to_owned(),
+        )
+        .unwrap();
+        let second =
+            MetadataTransferStagingStore::open(tmp.path(), second_identity.clone(), limits())
+                .unwrap();
+        let second_page = second.next_evidence_page().unwrap().unwrap();
+        drop(second);
+
+        let third_identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            9,
+            "tcp://storage-4.example:9001".to_owned(),
+        )
+        .unwrap();
+        let third =
+            MetadataTransferStagingStore::open(tmp.path(), third_identity.clone(), limits())
+                .unwrap();
+        let third_page = third.next_evidence_page().unwrap().unwrap();
+        let closure = third_page.actor_closure_candidate().unwrap();
+
+        assert_eq!(closure.first_actor(), &identity());
+        assert_eq!(closure.first_accepted_generation(), 0);
+        assert!(closure.accepts_first_tip(
+            &identity(),
+            first_page.generation(),
+            first_page.page_digest(),
+            checksum::sha256::digest(
+                MetadataTransferStagingEvidenceApplyReceipt::for_page(&first_page).as_bytes()
+            ),
+        ));
+        assert_eq!(closure.through_actor(), &second_identity);
+        assert_eq!(third_page.actor(), &third_identity);
+        assert_ne!(third_page.page_digest(), second_page.page_digest());
+        assert_eq!(closure.rebound_entry_count(), 1);
+        assert_eq!(closure.rebound_max_sequence(), 1);
+    }
+
+    #[test]
+    fn rollover_preserves_acknowledged_floor_and_ambiguous_assigned_successor() {
+        let tmp = test_util::tempdir();
+        let first = open(tmp.path());
+        first
+            .tombstone(&intent(b"acknowledged rollover evidence"))
+            .unwrap();
+        let acknowledged_page = first.next_evidence_page().unwrap().unwrap();
+        let acknowledged_receipt =
+            MetadataTransferStagingEvidenceApplyReceipt::for_page(&acknowledged_page);
+        first
+            .record_evidence_apply_receipt(&acknowledged_page, &acknowledged_receipt)
+            .unwrap();
+
+        let mut second_intent = intent(b"ambiguous rollover evidence");
+        second_intent.pg_id = PgId::new(20);
+        first.tombstone(&second_intent).unwrap();
+        let ambiguous_page = first.next_evidence_page().unwrap().unwrap();
+        assert_eq!(ambiguous_page.generation(), 2);
+        drop(first);
+
+        let next_identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            8,
+            "tcp://storage-4.example:9000".to_owned(),
+        )
+        .unwrap();
+        let restarted =
+            MetadataTransferStagingStore::open(tmp.path(), next_identity, limits()).unwrap();
+        let rebound_page = restarted.next_evidence_page().unwrap().unwrap();
+        let closure = rebound_page.actor_closure_candidate().unwrap();
+
+        assert_eq!(
+            closure.first_accepted_generation(),
+            acknowledged_page.generation()
+        );
+        assert_eq!(
+            closure.first_accepted_apply_receipt_digest(),
+            checksum::sha256::digest(acknowledged_receipt.as_bytes())
+        );
+        assert!(closure.accepts_first_tip(
+            acknowledged_page.actor(),
+            acknowledged_page.generation(),
+            acknowledged_page.page_digest(),
+            checksum::sha256::digest(acknowledged_receipt.as_bytes()),
+        ));
+        assert!(closure.accepts_first_tip(
+            ambiguous_page.actor(),
+            ambiguous_page.generation(),
+            ambiguous_page.page_digest(),
+            checksum::sha256::digest(
+                MetadataTransferStagingEvidenceApplyReceipt::for_page(&ambiguous_page).as_bytes()
+            ),
+        ));
+    }
+
+    #[test]
+    fn actor_closure_candidate_binds_the_complete_paged_rebound_prefix() {
+        let tmp = test_util::tempdir();
+        let evidence_count = MAX_STAGING_EVIDENCE_PAGE_ENTRIES + 1;
+        let page_limits = MetadataTransferStagingLimits::new(
+            evidence_count,
+            1024,
+            u64::try_from(evidence_count).unwrap() * 1024,
+        )
+        .unwrap();
+        let first =
+            MetadataTransferStagingStore::open(tmp.path(), identity(), page_limits).unwrap();
+        for pg in 1..=u32::try_from(evidence_count).unwrap() {
+            let mut cancelled = intent(b"paged actor closure evidence");
+            cancelled.pg_id = PgId::new(pg);
+            first.tombstone(&cancelled).unwrap();
+        }
+        let old_page = first.next_evidence_page().unwrap().unwrap();
+        drop(first);
+
+        let next_identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            8,
+            "tcp://storage-4.example:9000".to_owned(),
+        )
+        .unwrap();
+        let restarted =
+            MetadataTransferStagingStore::open(tmp.path(), next_identity.clone(), page_limits)
+                .unwrap();
+        let first_rebound_page = restarted.next_evidence_page().unwrap().unwrap();
+        let closure = first_rebound_page
+            .actor_closure_candidate()
+            .cloned()
+            .expect("rebound genesis must carry the closure candidate");
+        assert!(closure.accepts_first_tip(
+            &identity(),
+            old_page.generation(),
+            old_page.page_digest(),
+            checksum::sha256::digest(
+                MetadataTransferStagingEvidenceApplyReceipt::for_page(&old_page).as_bytes()
+            ),
+        ));
+        assert_eq!(
+            closure.rebound_entry_count(),
+            u64::try_from(evidence_count).unwrap()
+        );
+        assert!(first_rebound_page.entries().len() < evidence_count);
+
+        let mut impossible_closure = closure.clone();
+        impossible_closure.rebound_entry_count = impossible_closure.rebound_max_sequence + 1;
+        assert!(validate_staging_evidence_actor_closure_candidate(&impossible_closure).is_err());
+        let impossible_payload = encode_staging_evidence_page_payload(
+            first_rebound_page.actor(),
+            Some(&impossible_closure),
+            first_rebound_page.previous_generation(),
+            first_rebound_page.previous_apply_receipt_digest(),
+            first_rebound_page.generation(),
+            first_rebound_page.entries(),
+        );
+        assert!(decode_staging_evidence_page_payload(
+            &impossible_payload,
+            checksum::sha256::digest(&impossible_payload),
+        )
+        .is_err());
+
+        let mut rebound_entries = Vec::new();
+        let mut page = first_rebound_page;
+        loop {
+            assert_eq!(page.actor(), &next_identity);
+            if page.generation() > 1 {
+                assert!(page.actor_closure_candidate().is_none());
+            }
+            rebound_entries.extend(
+                page.entries()
+                    .iter()
+                    .map(|entry| (entry.sequence(), entry.evidence().to_vec())),
+            );
+            let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+            restarted
+                .record_evidence_apply_receipt(&page, &receipt)
+                .unwrap();
+            let Some(next) = restarted.next_evidence_page().unwrap() else {
+                break;
+            };
+            page = next;
+        }
+
+        assert_eq!(rebound_entries.len(), evidence_count);
+        let (entry_count, max_sequence, evidence_digest) =
+            metadata_transfer_staging_rebound_evidence_digest(
+                rebound_entries
+                    .iter()
+                    .map(|(sequence, evidence)| (*sequence, evidence.as_slice())),
+            )
+            .unwrap();
+        assert_eq!(entry_count, closure.rebound_entry_count());
+        assert_eq!(max_sequence, closure.rebound_max_sequence());
+        assert_eq!(evidence_digest, closure.rebound_evidence_digest());
+        drop(restarted);
+
+        let connection = Connection::open(catalogue_path(tmp.path())).unwrap();
+        assert!(connection
+            .execute(
+                "UPDATE staging_evidence_actor_closure_candidate \
+                 SET rebound_entry_count = rebound_max_sequence + 1",
+                [],
+            )
+            .is_err());
     }
 
     #[test]
@@ -6511,7 +7429,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_evidence_page_and_apply_receipt_v3_encodings_are_fixed() {
+    fn staging_evidence_page_and_apply_receipt_v4_encodings_are_fixed() {
         let tmp = test_util::tempdir();
         let artifact = canonical_artifact(b"fixed evidence page artifact");
         let intent = intent(artifact);
@@ -6523,11 +7441,11 @@ mod tests {
 
         assert_eq!(
             hex(page.operation_payload()),
-            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56330000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000001014152474d494e2d53544147494e472d45564944454e43452d5633000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0efadd220adcc57506f8a395ce807f64911785127f9af6724bde5399ea513ba500000000000000930003000000000000000d01000000000000000a0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
+            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56340000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000001014152474d494e2d53544147494e472d45564944454e43452d5634000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0efadd220adcc57506f8a395ce807f64911785127f9af6724bde5399ea513ba500000000000000930003000000000000000d01000000000000000a0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007"
         );
         assert_eq!(
             hex(receipt.as_bytes()),
-            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56330000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000015318b54c537c0c6ffa829573687a23ffcc84968b7f56fa41d947adf146c89b570000000000000001"
+            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56340000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001b8f437d29cbd3a83732c4708bfebf568026c69dd725c33aebbfcf4c6b9dccd050000000000000001"
         );
     }
 
@@ -6557,6 +7475,21 @@ mod tests {
         );
         let apply_receipt = decode_hex(
             "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56320000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001d21dec7bc9da9454bf830dd0c5b7d398f5de9db47b004d49fa396e8eb8ef76ea0000000000000001",
+        );
+
+        assert!(
+            decode_staging_evidence_page_payload(&page, checksum::sha256::digest(&page)).is_err()
+        );
+        assert!(decode_staging_evidence_apply_receipt(&apply_receipt).is_err());
+    }
+
+    #[test]
+    fn historical_staging_evidence_v3_page_and_apply_receipt_remain_rejected() {
+        let page = decode_hex(
+            "4152474d494e2d53544147494e472d45564944454e43452d504147452d56330000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000010000000000000001000001014152474d494e2d53544147494e472d45564944454e43452d5633000000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b00000013000000000000000c000000000000000b00000010000000030000000100000002000000030000001000000003000000040000000200000003000000000000000c0efadd220adcc57506f8a395ce807f64911785127f9af6724bde5399ea513ba500000000000000930003000000000000000d01000000000000000a0000000000000000010000000000000000050000000000000000000000000000000001000000000000000005000000000000000007",
+        );
+        let apply_receipt = decode_hex(
+            "4152474d494e2d53544147494e472d45564944454e43452d4150504c592d56330000000004000000000000000700000021756e69783a2f2f2f72756e2f6172676d696e2f73746f726167652d342e736f636b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000015318b54c537c0c6ffa829573687a23ffcc84968b7f56fa41d947adf146c89b570000000000000001",
         );
 
         assert!(
@@ -6694,6 +7627,7 @@ mod tests {
         assert!(
             encode_staging_evidence_page_payload(
                 &page.actor,
+                page.actor_closure_candidate.as_ref(),
                 page.previous_generation,
                 page.previous_apply_receipt_digest,
                 page.generation,

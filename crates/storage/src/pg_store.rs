@@ -149,12 +149,14 @@ pub(crate) use metadata_transfer_staging::MetadataTransferStagingIntent;
 #[cfg(test)]
 pub(crate) use metadata_transfer_staging::{
     canonical_nonempty_staged_metadata_transfer_artifact_for_test,
+    metadata_transfer_staging_closure_evidence_page_for_test,
     metadata_transfer_staging_evidence_page_for_test,
     metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
     metadata_transfer_staging_evidence_page_with_member_actor_for_test,
+    metadata_transfer_staging_incomplete_closure_evidence_page_for_test,
     metadata_transfer_staging_publication_evidence_page_at_epoch_for_test,
     metadata_transfer_staging_publication_evidence_page_for_test,
-    rebind_metadata_transfer_staging_evidence_actor_for_test,
+    rebind_metadata_transfer_staging_evidence_actor_for_test, MAX_STAGING_EVIDENCE_PAGE_ENTRIES,
 };
 
 #[cfg(test)]
@@ -195,7 +197,8 @@ pub(crate) fn committed_staging_authorization_for_intent_for_test(
 pub(crate) use metadata_transfer_staging::{
     decode_staging_evidence, decode_staging_evidence_apply_receipt,
     decode_staging_evidence_page_payload, decode_staging_intent,
-    encode_staged_metadata_transfer_artifact, encode_staging_intent, MetadataTransferStagingError,
+    encode_staged_metadata_transfer_artifact, encode_staging_intent,
+    metadata_transfer_staging_rebound_evidence_digest, MetadataTransferStagingError,
     MetadataTransferStagingEvidence, MetadataTransferStagingEvidenceApplyReceipt,
     MetadataTransferStagingEvidenceKind, MetadataTransferStagingEvidencePage,
     MetadataTransferStagingLimits, MetadataTransferStagingNodeIdentity,

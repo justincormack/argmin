@@ -62,7 +62,7 @@ fn control_plane_raft_peer_rpc_rejects_noncurrent_nested_command_versions() {
     ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded).unwrap();
 
     let mut unsupported_frames = Vec::new();
-    for version in [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27] {
+    for version in [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28] {
         let unsupported_command =
             crate::control_plane_command::encode_control_plane_command_with_version_for_test(
                 &command, version,
@@ -868,7 +868,7 @@ fn control_plane_raft_peer_server_rejects_noncurrent_nested_snapshot_versions_be
 #[test]
 fn control_plane_raft_peer_server_rejects_noncurrent_nested_state_versions_before_publication() {
     let current = current_peer_snapshot_payload();
-    for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 39] {
+    for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40] {
         let unsupported =
             crate::control_plane_command::reseal_control_plane_snapshot_state_version_for_test(
                 &current, version,
@@ -1718,9 +1718,74 @@ fn control_plane_raft_peer_rpc_v3_catalogue_is_exact() {
         ),
         (
             2_402,
+            "53044898a6c6e50bd3a4bd8608461878e2b5e96dabb3e4c3ec0bbb339cc5be89".to_owned()
+        )
+    );
+}
+
+#[test]
+fn historical_state_v38_command_v26_peer_rpc_v3_catalogue_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!(
+        "../../control_plane/testdata/raft_peer_v3_state_v38_command_v26.aggregate"
+    );
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            raft_test_hex(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            2_402,
             "31e136e10fb30bcac3eb8ded11357a12fcf57a8b88ed1ce1d799c0647eba8674".to_owned()
         )
     );
+
+    let mut offset = 0;
+    let mut expected_sample = 1_u8;
+    let mut command_rejections = 0;
+    let mut state_rejections = 0;
+    while offset < AGGREGATE.len() {
+        assert_eq!(AGGREGATE[offset], expected_sample);
+        offset += 1;
+        let frame_len = u32::from_be_bytes(
+            AGGREGATE[offset..offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset += std::mem::size_of::<u32>();
+        let frame = &AGGREGATE[offset..offset + frame_len];
+        offset += frame_len;
+        let tag_offset = CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + std::mem::size_of::<u16>();
+        let result = match frame[tag_offset] {
+            1 => ControlPlaneRaftPeerRpcRequest::decode_frame(frame).map(|_| ()),
+            2 => ControlPlaneRaftPeerRpcResponse::decode_frame(frame).map(|_| ()),
+            3 => ControlPlaneRaftPeerSnapshotRequest::decode_frame(
+                frame,
+                usize::MAX,
+                usize::MAX,
+            )
+            .map(|_| ()),
+            4 => ControlPlaneRaftPeerSnapshotResponse::decode_frame(frame).map(|_| ()),
+            tag => panic!("unexpected historical peer frame tag {tag}"),
+        };
+        match result {
+            Err(ControlPlaneError::CommandDecode { message })
+                if message == "unsupported control-plane command version 26" =>
+            {
+                command_rejections += 1;
+            }
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 38" =>
+            {
+                state_rejections += 1;
+            }
+            Ok(()) => {}
+            Err(error) => panic!("unexpected historical peer frame rejection: {error:?}"),
+        }
+        expected_sample = expected_sample.checked_add(1).unwrap();
+    }
+    assert_eq!(expected_sample, 21);
+    assert!(command_rejections > 0);
+    assert!(state_rejections > 0);
 }
 
 #[test]

@@ -553,7 +553,7 @@ matching apply receipt, and fail-stops the process on local durability,
 protocol, or integrity failure. Retryable transport, leadership, response-loss,
 and bounded evidence-admission failures retain the page and use a one-second
 backoff. Standalone storage nodes do not create this protocol state. The
-control-plane RPC v21/authentication-envelope-v2
+control-plane RPC v22/authentication-envelope-v2
 slice now exposes a dedicated storage-node-only evidence operation over
 authenticated Unix and TLS, dispatches the existing replicated evidence
 command, validates the exact canonical apply receipt, and separates its bounded
@@ -565,7 +565,7 @@ boundary when a new ordinary waiter appears. The bounded RaftCore enqueue is
 itself raced against waiter registration and is accepted only when its
 cancellation-safe send completes. The final ordinary waiter broadcasts its
 completion so every admitted evidence caller can continue to durable
-serialization. Authenticated evidence saturation is a typed v21 response;
+serialization. Authenticated evidence saturation is a typed v22 response;
 response loss remains retryable, while observed
 authentication, framing, protocol, and receipt-integrity failures fail-stop.
 After RaftCore accepts a proposal, the evidence lane retains its own
@@ -827,7 +827,7 @@ endpoint identity, exact transition binding, artifact digest and byte length,
 staging generation, storage-format version, and an
 explicit fsync scope covering the artifact, catalogue record, and parent
 directory publication. Transport authentication alone is not replicated proof.
-Receipt evidence uses a mandatory control-plane RPC v21 operation separate
+Receipt evidence uses a mandatory control-plane RPC v22 operation separate
 from lease heartbeat renewal. Each authenticated storage node maintains a
 durable outbox of receipt and tombstone deltas. A page binds node identity and
 incarnation, required `previous_generation` and
@@ -956,9 +956,9 @@ endpoint, verifies every page link and tip receipt, and compares each segment
 commitment with retained canonical evidence from that exact actor.
 Standalone restart and three-voter Raft tests cover multi-page and adjacent
 segments, epoch-neutral replication, leadership-transfer replay, and corrupted
-commitment/tip rejection. The following per-PG floor pruning, covered-segment
-collapse, coalescing, and actor-incarnation closure remain gated follow-up
-slices.
+commitment/tip rejection. Actor-incarnation closure is implemented as described
+below. Per-PG floor pruning, covered-segment collapse, and coalescing remain
+gated follow-up slices.
 
 Per-PG cleanup then advances the durable finalized floor and removes detailed
 bytes independently, but retains the fixed-width commitment until its key is
@@ -990,22 +990,53 @@ detailed evidence. A compacted historical page is no longer an exact-replay
 target. The new current tip remains fully retained and replayable across
 response loss.
 
-An actor-incarnation rollover cannot submit an old-actor successor, so the
-later checkpoint slice must add one separately versioned actor-chain closure
-path rather than treating new-actor genesis as implicit acknowledgement. The
-storage rollover transaction durably records a canonical closure candidate
-containing the old actor tuple, old tip generation and page digest, and a digest
-of the complete semantic evidence set rebound into the new actor. The new
-genesis page cites that candidate. After accepting the genesis page, an exact
-control-plane CAS verifies the retained old page and receipt, the current node
-incarnation and endpoint, complete old-to-new evidence rebinding, and durable
-fencing of the old actor, then records a canonical closure certificate bound to
-both chains. That certificate makes the old tip eligible for a checkpoint
-segment without claiming that the old response was received. Missing,
+An actor-incarnation rollover cannot submit an old-actor successor, so store
+and evidence format v4 provide a separately versioned actor-chain closure path
+rather than treating new-actor genesis as implicit acknowledgement. The
+storage rollover transaction durably records a canonical closure candidate.
+It preserves the first unclosed actor tuple, the exact acknowledged
+predecessor tip, and an optional exact ambiguously assigned successor across
+repeated rollovers. The authority selects whichever of those two exact tips it
+actually retained, so assigning page N+1 and crashing before dispatch cannot
+make an authority that accepted only N irreconcilable. The candidate advances
+the `through_actor` to the latest crossed incarnation, binds that actor's exact
+endpoint, and binds the count, maximum durable sequence, and digest of the
+complete semantic evidence prefix rebound into the new actor. Only the new
+actor's genesis page carries the candidate. If that prefix spans multiple
+bounded pages, closure remains unavailable until all of those pages have been
+accepted. Candidate construction and decoding require
+`rebound_entry_count <= rebound_max_sequence`. Authority application validates
+the candidate's actor/incarnation ordering, current-node fence, retained first
+tip, and every currently observable `through_actor` endpoint before considering
+the rebound prefix incomplete. Only a strictly lower observed count whose
+maximum sequence is still below the committed bound defers; an excess count or
+an incomplete set that has already reached the committed maximum is rejected
+without retaining or acknowledging the genesis page.
+
+Applying the page under command v27/state v39 builds shared indexes for actor
+tips, page entries, and detailed evidence, then reconstructs every candidate
+in one ordered pass. It validates the current-or-successor node incarnation
+fence and exact endpoints and verifies every source actor's retained evidence
+has an exact rebound member. Each unclosed actor tip is consumed at most once,
+so validation grows linearly with retained pages and evidence plus ordered-map
+lookup rather than rescanning all history for every incarnation. It then records one immutable
+closure certificate for each still-unclosed source tip through the candidate's
+`through_actor`. A later rollover retains an existing A-to-B certificate and
+adds B-to-C; it cannot rewrite A's destination or source tip. Each certificate
+is bound to the destination genesis page and complete rebound prefix. The state
+validator reconstructs the same closure set from durable chain evidence, so a
+forged, omitted, widened, or conflicting certificate fails before state
+replacement. A certificate makes the closed source tip eligible for a
+checkpoint segment without claiming that the old response was received. The
+candidate-bearing destination chain remains checkpoint-ineligible until the
+certificate-retirement slice persists an equivalent compact dependency;
+otherwise checkpointing its genesis would erase the only reconstruction
+source. Missing,
 incomplete, or conflicting closure evidence leaves the old page fully retained
-and replayable. Adding the closure candidate advances the storage-owned page
-and staging-store formats together with the control-plane command/state
-versions; it cannot be inferred from the current v1 genesis grammar.
+and replayable. Response-loss, paged-prefix, checkpointed-tip, repeated-rollover,
+standalone restart, Raft restart, and exact old/current format rejection are
+covered. Floor-driven evidence removal and closure-certificate retirement are
+still gated by the next cleanup slice.
 
 Receipt evidence has bounded low-priority admission independent of lease
 renewal. It uses a separate connection/session allowance, request-worker
@@ -1214,8 +1245,18 @@ reuse a generic heartbeat or runtime-map capability. Batch transition commands r
 and require no additional
 control-plane RPC operation beyond that receipt protocol.
 
+Actor-incarnation chain closure advances the storage-owned staging store,
+catalogue, evidence, page, and apply-receipt formats from v3 to v4 while the
+immutable staged-artifact format remains v3. The closure-bearing page grammar
+advances control-plane RPC v21 to v22; applying that page has new replicated
+semantics, so command v26 advances to v27 and logical state v38 advances to
+v39. Immutable store/evidence v3, RPC v21, command v26, and state v38 bytes
+remain exact rejection evidence in their direct, authenticated, snapshot,
+journal, Raft peer, restart, WAL, and compaction containers. Authentication
+envelope v2 is unchanged, and no compatibility reader is added.
+
 Durable artifact staging uses a separate storage-owned format rather than
-silently extending the PG schema. Staging-store format v3 owns the
+silently extending the PG schema. Staging-store format v4 owns the
 versioned root manifest, initialization-complete marker, outer establishment
 marker in the storage data directory, generation catalogue, durable singleton
 evidence actor,
@@ -1243,9 +1284,10 @@ receipt/tombstone state fail closed. Bounded startup reconciliation removes
 unpublished temporary files, completes tombstone-directed unlink and directory
 sync, and quarantines unexplained final files rather than authorizing them.
 Store admission accounts for temporary, published, and tombstoned cleanup
-bytes. Retain immutable v1/v2 rejection fixtures and fixed v3 manifest,
-initialization and establishment markers, catalogue, artifact, proof-bearing
-receipt, page, apply receipt, and crash-state corpus in the
+bytes. Retain immutable v1-v3 rejection fixtures and fixed current v4 manifest,
+initialization and establishment markers, catalogue, proof-bearing receipt,
+page, apply receipt, closure candidate, and crash-state corpus, plus the
+independently versioned current v3 artifact, in the
 [storage format ledger](../guides/storage-format-ledger.md); no
 upgrade decoder is required while the repository supports one format at a
 time.
@@ -1315,6 +1357,16 @@ Required deterministic and generated coverage includes:
   remains unpruned until a new-format genesis and exact actor-chain closure CAS
   bind complete semantic evidence rebinding and old-actor fencing; malformed,
   partial, or absent closure evidence must retain the replayable old chain;
+  this includes page N accepted, page N+1 durably assigned but never
+  dispatched, and exact selection of N rather than the ambiguous successor;
+- exact actor endpoint binding across A-to-B and A-to-B-to-C rollover,
+  rejection of a foreign `through_actor` endpoint, checkpointing of a closed
+  source tip, and rejection of candidate-bearing destination-chain
+  checkpointing until certificate retirement;
+- incomplete multi-page closure prefixes with valid authority defer, while a
+  foreign currently observable `through_actor` endpoint rejects the genesis
+  without state mutation; zero/impossible cardinality, excess observed members,
+  and a short prefix that has reached its committed maximum also reject;
 - blocked and saturated evidence connections, workers, and Raft proposals while
   lease deadlines continue to advance and the global cluster-map epoch remains
   unchanged;

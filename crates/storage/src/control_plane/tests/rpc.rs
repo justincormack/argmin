@@ -339,6 +339,28 @@ fn control_plane_rpc_catalogue_staging_page() -> MetadataTransferStagingEvidence
     )
 }
 
+fn control_plane_rpc_catalogue_staging_closure_page() -> MetadataTransferStagingEvidencePage {
+    crate::pg_store::metadata_transfer_staging_closure_evidence_page_for_test(
+        MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(3),
+            3,
+            "unix:///catalogue/storage-3-old.sock".to_owned(),
+        )
+        .unwrap(),
+        MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(3),
+            4,
+            "unix:///catalogue/storage-3.sock".to_owned(),
+        )
+        .unwrap(),
+        &control_plane_rpc_catalogue_transition_binding(),
+        [0x7c; 32],
+        67_890,
+        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        MetadataTransferStagingEvidenceKind::Publication,
+    )
+}
+
 #[test]
 fn control_plane_rpc_v20_staging_evidence_frames_remain_rejected_evidence() {
     for (frame, expected_len, expected_digest) in [
@@ -377,7 +399,44 @@ fn control_plane_rpc_v20_staging_evidence_frames_remain_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v21_staging_evidence_frames_are_exact() {
+fn control_plane_rpc_v21_staging_evidence_frames_remain_rejected_evidence() {
+    for (frame, expected_len, expected_digest) in [
+        (
+            include_bytes!("../testdata/rpc_v21_staging_request_genesis.frame").as_slice(),
+            468,
+            "9735d5c659430811cb6dd82184bf5643053391128ad31b81a142f575a5a94aed",
+        ),
+        (
+            include_bytes!("../testdata/rpc_v21_staging_response_genesis.frame").as_slice(),
+            214,
+            "10e4f160d95a586c5a67346a2bf5f53d2ddc63ad6d9fa4f05961386863c1c898",
+        ),
+        (
+            include_bytes!("../testdata/rpc_v21_staging_request_successor.frame").as_slice(),
+            408,
+            "be75dff9edcde7b3d1d31a4b64083125e6319a626fcc62d9bf64af443a94fd15",
+        ),
+        (
+            include_bytes!("../testdata/rpc_v21_staging_response_successor.frame").as_slice(),
+            214,
+            "b2d46c47ea1cb0658dbb8498250c73fdce0b72f90f5db5bf8326c15c208884ad",
+        ),
+    ] {
+        assert_eq!(frame.len(), expected_len);
+        assert_eq!(
+            hex_encode(&checksum::sha256::digest(frame)),
+            expected_digest
+        );
+        assert!(matches!(
+            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+            Err(ControlPlaneError::RpcProtocol { diagnostic })
+                if diagnostic.as_str() == "unsupported control-plane RPC version 21"
+        ));
+    }
+}
+
+#[test]
+fn control_plane_rpc_v22_staging_evidence_frames_are_exact() {
     let genesis = control_plane_rpc_catalogue_staging_page();
     let genesis_receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&genesis);
     let successor = metadata_transfer_staging_evidence_page_for_test(
@@ -390,7 +449,8 @@ fn control_plane_rpc_v21_staging_evidence_frames_are_exact() {
         Some(&genesis_receipt),
     );
     let mut evidence = Vec::new();
-    for page in [&genesis, &successor] {
+    let closure = control_plane_rpc_catalogue_staging_closure_page();
+    for page in [&genesis, &successor, &closure] {
         let mut request = Vec::new();
         write_staging_evidence_publication_request(&mut request, page).unwrap();
         let request_frame = encode_control_plane_rpc_frame(
@@ -416,16 +476,22 @@ fn control_plane_rpc_v21_staging_evidence_frames_are_exact() {
         evidence,
         [
             (
-                468,
-                "9735d5c659430811cb6dd82184bf5643053391128ad31b81a142f575a5a94aed".to_owned(),
+                469,
+                "9b38041c63c362c5fd5b0143bb77e446d03cac450736db2651d493c62b4d08c7".to_owned(),
                 214,
-                "10e4f160d95a586c5a67346a2bf5f53d2ddc63ad6d9fa4f05961386863c1c898".to_owned(),
+                "dd3b3a617b47db2c236a0d818b8cf453eff749e9a37210220e7da6ac78b9de8f".to_owned(),
             ),
             (
-                408,
-                "be75dff9edcde7b3d1d31a4b64083125e6319a626fcc62d9bf64af443a94fd15".to_owned(),
+                409,
+                "cf214cf8cd90496ccbabd942426e71ecc5d96b7de1f8df6dd18f6b870257f244".to_owned(),
                 214,
-                "b2d46c47ea1cb0658dbb8498250c73fdce0b72f90f5db5bf8326c15c208884ad".to_owned(),
+                "4e14262d62cca4cc2a390f58e22bb407baca3377e10db446bf126ad211643100".to_owned(),
+            ),
+            (
+                734,
+                "0973b0e570fcf5607a331ce961104f02b3aed8752300e677e1dce413adff9d57".to_owned(),
+                214,
+                "68a6dafdc3031792d395964fab5b8d1313f2f2c55175391efbe4bc6dfa891156".to_owned(),
             ),
         ]
     );
@@ -1618,7 +1684,38 @@ fn control_plane_rpc_v20_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v21_operation_catalogue_is_exact() {
+fn control_plane_rpc_v21_operation_catalogue_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v21_operation.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            15_193,
+            "c4560adbeb5be3d23db767c7f3275caa64b7059448023d12ab34030d81ff735f".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0_usize;
+    while !remaining.is_empty() {
+        let (_section, tail) = remaining.split_first().unwrap();
+        let (raw_len, tail) = tail.split_at(4);
+        let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+        let (frame, tail) = tail.split_at(len);
+        assert!(matches!(
+            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+            Err(ControlPlaneError::RpcProtocol { diagnostic })
+                if diagnostic.as_str() == "unsupported control-plane RPC version 21"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > ControlPlaneRpcKind::ALL.len());
+}
+
+#[test]
+fn control_plane_rpc_v22_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -1831,8 +1928,8 @@ fn control_plane_rpc_v21_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            15_193,
-            "c4560adbeb5be3d23db767c7f3275caa64b7059448023d12ab34030d81ff735f".to_owned()
+            15_194,
+            "e14fdaa8c1ac38e2af2d68f7e6219169cca55561af3306201a2dca0659b1216a".to_owned()
         )
     );
 }
@@ -2016,8 +2113,8 @@ fn authenticated_control_plane_rpc_v20_auth_v2_payload_binding_remains_rejected_
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v21_auth_v2_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 21);
+fn authenticated_control_plane_rpc_v22_auth_v2_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 22);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -2041,6 +2138,37 @@ fn authenticated_control_plane_rpc_v21_auth_v2_payload_bindings_are_exact() {
     client
         .verify_runtime_map_response(kind, 1_001, &response)
         .unwrap();
+    let historical_request = signed_frontend_runtime_map_request(
+        kind,
+        client.credential(),
+        Vec::new(),
+        Some(1_000),
+        Some(6_000),
+    );
+    let historical_request_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &historical_request.payload, 21).unwrap();
+    let historical_response_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &response, 21).unwrap();
+    assert_eq!(
+        (
+            historical_request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&historical_request_frame)),
+            historical_response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&historical_response_frame)),
+        ),
+        (
+            182,
+            "2b27c639ed0c6ccd8b6c781ad6e321fed4a1464fd8f12cb5a868543ce5bc91bf".to_owned(),
+            190,
+            "54745c61058a7d6ae389e4df5337b586f73c71cee3c20d39a3464f0b738c6063".to_owned(),
+        )
+    );
+    assert!(
+        read_control_plane_rpc_frame(&mut std::io::Cursor::new(historical_request_frame)).is_err()
+    );
+    assert!(
+        read_control_plane_rpc_frame(&mut std::io::Cursor::new(historical_response_frame)).is_err()
+    );
     let request_frame = encode_control_plane_rpc_frame(
         kind,
         &signed_frontend_runtime_map_request(
@@ -2063,9 +2191,64 @@ fn authenticated_control_plane_rpc_v21_auth_v2_payload_bindings_are_exact() {
         ),
         (
             182,
-            "2b27c639ed0c6ccd8b6c781ad6e321fed4a1464fd8f12cb5a868543ce5bc91bf".to_owned(),
+            "de3f513bde163b51fb9842dae142ef5a14488ee03d0f4b9b5a0860404e44df02".to_owned(),
             190,
-            "54745c61058a7d6ae389e4df5337b586f73c71cee3c20d39a3464f0b738c6063".to_owned(),
+            "28aff8719a51dcc0e7d135f075bf9bf6b25ab75f80b026d65bb3e326913221bb".to_owned(),
+        )
+    );
+}
+
+#[test]
+fn authenticated_control_plane_rpc_v22_closure_page_frames_are_exact() {
+    let kind = ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage;
+    let page = control_plane_rpc_catalogue_staging_closure_page();
+    assert!(page.actor_closure_candidate().is_some());
+    let credential = storage_node_auth_credential("auth-cluster", 3, 4);
+    let client = AuthenticatedUnixControlPlaneClient::new(
+        UnixControlPlaneClient::new("unused-test-socket"),
+        credential.clone(),
+    );
+    let mut logical_request = Vec::new();
+    write_staging_evidence_publication_request(&mut logical_request, &page).unwrap();
+    let signed_request = client
+        .sign_staging_evidence_request(1_000, logical_request)
+        .unwrap();
+    let request_frame = encode_control_plane_rpc_frame(kind, &signed_request).unwrap();
+
+    let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+    let logical_response =
+        encode_control_plane_rpc_response(Ok(receipt.as_bytes().to_vec())).unwrap();
+    let response_payload = write_authenticated_control_plane_rpc_payload(kind, &logical_response);
+    let response_credential = credential
+        .staging_evidence_response_credential_for_storage_node()
+        .unwrap();
+    let signed_response = response_credential
+        .sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
+            target: ControlPlaneAuthTarget::Principal(credential.principal().clone()),
+            operation: ControlPlaneAuthOperation::StagingEvidenceResponse,
+            issued_at_ms: Some(1_001),
+            expires_at_ms: Some(6_001),
+            sequence: None,
+            nonce: Vec::new(),
+            payload: response_payload,
+        })
+        .unwrap()
+        .encode_frame()
+        .unwrap();
+    let response_frame = encode_control_plane_rpc_frame(kind, &signed_response).unwrap();
+
+    assert_eq!(
+        (
+            request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&request_frame)),
+            response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&response_frame)),
+        ),
+        (
+            867,
+            "1ae5f2c34784fd377e230f14b983de06cd096711f973e5b7a5cf0798c74c8d8c".to_owned(),
+            348,
+            "0c9bf876851ba06e57be6b125a62576007b73f52a1579297997e8f76d14e1a8c".to_owned(),
         )
     );
 }
