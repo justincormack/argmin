@@ -272,7 +272,12 @@ fn staged_two_pg_install_authority_fixture_with_proof(
     authority
         .authorize_unavailable_pg_staging_intents_batch(&authorizations)
         .unwrap();
-    let staged_transfer = PgMetadataTransferProof::new(authority.snapshot().cluster_epoch(), proof);
+    // Production staging binds the artifact proof to the authorized source
+    // epoch, not the later authority epoch after the staging batch commits.
+    let staged_transfer = PgMetadataTransferProof::new(
+        authorizations[0].unavailable_transition.source_epoch(),
+        proof,
+    );
 
     let destination_nodes = authority
         .snapshot()

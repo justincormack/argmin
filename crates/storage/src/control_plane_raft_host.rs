@@ -29,7 +29,8 @@ use crate::control_plane_command::{
 };
 use crate::control_plane_raft::{
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
-    ControlPlaneRaftNodeId, SubmittedControlPlaneRaftCommand,
+    ControlPlaneRaftNodeId, LowPriorityControlPlaneRaftCommandResult,
+    SubmittedControlPlaneRaftCommand,
 };
 use crate::control_plane_raft_durability::ControlPlaneRaftAuthorityDurability;
 use crate::control_plane_server_bootstrap::{
@@ -1357,12 +1358,19 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
         operation_payload: Vec<u8>,
         page_digest: [u8; 32],
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let response = self.submit_low_priority_raft_command(
-            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
-                operation_payload,
-                page_digest,
-            },
-        )?;
+        self.ensure_not_durably_poisoned()?;
+        let response = match self.block_on(
+            self.authority
+                .submit_low_priority_metadata_transfer_staging_evidence_page(
+                    operation_payload,
+                    page_digest,
+                ),
+        )? {
+            LowPriorityControlPlaneRaftCommandResult::PreflightResolved(response) => response,
+            LowPriorityControlPlaneRaftCommandResult::Submitted(submitted) => {
+                self.finish_submitted_raft_command(submitted, true)?
+            }
+        };
         let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt } =
             response
         else {

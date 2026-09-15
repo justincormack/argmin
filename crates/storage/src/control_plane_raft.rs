@@ -67,8 +67,9 @@ use crate::control_plane::{
     ControlPlaneAuthorityClockContext, ControlPlaneError, ControlPlaneRaftOperationErrorKind,
     ControlPlaneRpcResponsePublication, ControlPlaneRuntimeMapDiagnosticSnapshot,
     ControlPlaneRuntimeMapNodeLeaseDiagnostic, ControlPlaneRuntimeMapStatus, DeadlineUnixStream,
-    NodeAvailabilityState, NodeMembershipState, RuntimeMapContentCertificate,
-    RuntimeMapFreshnessProof, CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS,
+    MetadataTransferStagingEvidencePageClassification, NodeAvailabilityState, NodeMembershipState,
+    RuntimeMapContentCertificate, RuntimeMapFreshnessProof,
+    CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS,
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
@@ -192,6 +193,11 @@ pub enum ControlPlaneRaftCommandOutcome {
 pub struct SubmittedControlPlaneRaftCommand {
     log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
     outcome: ControlPlaneRaftCommandOutcome,
+}
+
+pub(crate) enum LowPriorityControlPlaneRaftCommandResult {
+    PreflightResolved(ControlPlaneCommandResponse),
+    Submitted(SubmittedControlPlaneRaftCommand),
 }
 
 impl SubmittedControlPlaneRaftCommand {
@@ -4359,6 +4365,81 @@ impl ControlPlaneRaftAuthority {
         self.command_metrics
             .record_submission(queue_wait, operation, result.is_ok());
         result
+    }
+
+    pub(crate) async fn submit_low_priority_metadata_transfer_staging_evidence_page(
+        &self,
+        operation_payload: Vec<u8>,
+        page_digest: [u8; 32],
+    ) -> Result<LowPriorityControlPlaneRaftCommandResult, ControlPlaneError> {
+        let queue_started = Instant::now();
+        let mut update_guard = self
+            .evidence_submission_admission
+            .acquire_evidence_update_gate(&self.volatile_heartbeat_update_gate)
+            .await;
+        #[cfg(test)]
+        self.block_low_priority_after_update_gate_for_test().await;
+
+        let preflight_snapshot = self
+            .confirmed_low_priority_preflight_snapshot(&update_guard)
+            .await?;
+        let classification = preflight_snapshot
+            .classify_metadata_transfer_staging_evidence_page(&operation_payload, page_digest)?;
+        if let MetadataTransferStagingEvidencePageClassification::ExactReplay { apply_receipt } =
+            classification
+        {
+            return Ok(LowPriorityControlPlaneRaftCommandResult::PreflightResolved(
+                ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
+                    apply_receipt,
+                },
+            ));
+        }
+
+        let queue_wait = queue_started.elapsed();
+        let operation_started = Instant::now();
+        let result = self
+            .submit_control_plane_command_derived_locked(None, Some(&mut update_guard), move |_| {
+                Ok(
+                    ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                        operation_payload,
+                        page_digest,
+                    },
+                )
+            })
+            .await;
+        let operation = operation_started.elapsed();
+        observability::record_control_plane_raft_command_submission(
+            queue_wait,
+            operation,
+            result.is_ok(),
+        );
+        self.command_metrics
+            .record_submission(queue_wait, operation, result.is_ok());
+        result.map(LowPriorityControlPlaneRaftCommandResult::Submitted)
+    }
+
+    async fn confirmed_low_priority_preflight_snapshot(
+        &self,
+        update_guard: &ControlPlaneRaftEvidenceUpdateGuard<'_>,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let admission = update_guard.admission;
+        let status = admission
+            .run_evidence_preappend(self.confirmed_linearized_authority_status())
+            .await?;
+        let authority_term = status.current_term();
+        let (durable_snapshot, durable_applied) = admission
+            .run_evidence_preappend(self.durable_snapshot_and_applied())
+            .await?;
+        match (authority_term, status.applied(), durable_applied) {
+            (Some(authority_term), Some(status_applied), Some(durable_applied))
+                if status_applied == durable_applied =>
+            {
+                Ok(self
+                    .volatile_heartbeat_overlay_snapshot(authority_term, durable_applied)?
+                    .unwrap_or(durable_snapshot))
+            }
+            _ => Ok(durable_snapshot),
+        }
     }
 
     pub(crate) async fn submit_control_plane_command_derived<F>(

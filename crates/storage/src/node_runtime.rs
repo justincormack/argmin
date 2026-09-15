@@ -513,9 +513,10 @@ pub(super) mod pg_store_facade {
         MetadataTransferStagingIntent, MetadataTransferStagingNodeIdentity,
         MetadataTransferStagingReceipt, MetadataTransferStagingStore,
         PendingMetadataCommandSlotInsertError, PendingMetadataCommandSlotReplaceError,
-        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow, MAX_STAGING_EVIDENCE_BYTES,
-        MAX_STAGING_INTENT_BYTES, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
-        METADATA_COMMAND_CHECKPOINT_MAGIC, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,
+        MAX_STAGING_EPOCH_PROOFS_PER_INTENT, MAX_STAGING_EVIDENCE_BYTES, MAX_STAGING_INTENT_BYTES,
+        METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, METADATA_COMMAND_CHECKPOINT_MAGIC,
+        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
         METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
     };
     #[cfg(test)]
@@ -525,6 +526,7 @@ pub(super) mod pg_store_facade {
         metadata_transfer_staging_evidence_page_for_test,
         metadata_transfer_staging_evidence_page_with_duplicate_member_for_test,
         metadata_transfer_staging_evidence_page_with_member_actor_for_test,
+        metadata_transfer_staging_publication_evidence_page_at_epoch_for_test,
         metadata_transfer_staging_publication_evidence_page_for_test,
         rebind_metadata_transfer_staging_evidence_actor_for_test, MetadataTransferStagingError,
         MetadataTransferStagingLimits,

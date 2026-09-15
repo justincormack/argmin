@@ -59,13 +59,171 @@ fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox(
         .await;
         let authority = Arc::new(authority);
         let follower = Arc::new(follower);
-        authority
-            .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
-                nodes: vec![(NodeId::new(501), "node-501".to_owned())],
-                pg_ids: vec![PgId::new(0)],
+        let mut host = crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost::new_for_test(
+            tokio::runtime::Handle::current(),
+            Arc::clone(&authority),
+            false,
+        )
+        .unwrap();
+
+        let pg_id = PgId::new(19);
+        let storage_nodes = (501..=504)
+            .map(|node_id| {
+                (
+                    NodeId::new(node_id),
+                    format!("unix:///catalogue/storage-{node_id}.sock"),
+                )
             })
-            .await
+            .collect::<Vec<_>>();
+        let source_acting_set = vec![NodeId::new(504), NodeId::new(502), NodeId::new(503)];
+        let topology =
+            crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                2,
+                [0x71; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                vec![501, 502],
+                &storage_nodes,
+                &[(pg_id, source_acting_set.clone())],
+                crate::control_plane::test_certified_storage_placement_policy(
+                    (501..=504).map(NodeId::new),
+                    3,
+                    1,
+                ),
+            )
             .unwrap();
+        host.submit_command_for_test(ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes: storage_nodes.clone(),
+            pg_acting_sets: vec![(pg_id, source_acting_set)],
+            topology,
+        })
+        .unwrap();
+
+        let heartbeat =
+            |host: &mut crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost,
+             node_id: u32,
+             lease_ms: u64,
+             state: Option<PgState>,
+             heartbeat_at_ms: u64| {
+                for _ in 0..4 {
+                    let observed_epoch =
+                        host.current_snapshot_for_test().unwrap().cluster_epoch();
+                    let endpoint = storage_nodes
+                        .iter()
+                        .find(|(candidate, _)| candidate.as_u32() == node_id)
+                        .unwrap()
+                        .1
+                        .clone();
+                    let refresh = match host.refresh_node_heartbeat(
+                        NodeHeartbeat {
+                            node_id: NodeId::new(node_id),
+                            node_incarnation: 4,
+                            endpoint,
+                            observed_epoch,
+                            requested_lease_duration_ms: lease_ms,
+                            cluster_map_history_route_scan_generation:
+                                std::num::NonZeroU64::new(1).unwrap(),
+                            cluster_map_history_route_references: Default::default(),
+                            pg_observations: state
+                                .map(|state| {
+                                    vec![crate::control_plane::NodePgHeartbeatObservation {
+                                        pg_id,
+                                        state,
+                                        metadata_proof: PgMetadataProof::empty(),
+                                        pending_metadata_command: None,
+                                    }]
+                                })
+                                .unwrap_or_default(),
+                        },
+                        heartbeat_at_ms,
+                    ) {
+                        Ok(refresh) => refresh,
+                        Err(ControlPlaneError::PgPrimaryObservationNotActive { .. })
+                            if state == Some(PgState::Active) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => panic!(
+                            "storage node {node_id} {state:?} heartbeat failed: {error:?}"
+                        ),
+                    };
+                    if refresh.lease().serving() {
+                        return;
+                    }
+                }
+                panic!("storage node {node_id} did not receive a serving lease");
+            };
+
+        for node_id in 501..=504 {
+            heartbeat(
+                &mut host,
+                node_id,
+                10_000,
+                None,
+                1_000 + u64::from(node_id),
+            );
+        }
+        for (offset, node_id) in [504, 502, 503].into_iter().enumerate() {
+            heartbeat(
+                &mut host,
+                node_id,
+                10_000,
+                Some(PgState::Peering),
+                2_000 + u64::try_from(offset).unwrap(),
+            );
+        }
+        for (offset, node_id) in [504, 502, 503].into_iter().enumerate() {
+            heartbeat(
+                &mut host,
+                node_id,
+                if node_id == 504 { 100 } else { 10_000 },
+                Some(PgState::Active),
+                3_000 + u64::try_from(offset).unwrap(),
+            );
+        }
+        let failed_deadline = host
+            .current_snapshot_for_test()
+            .unwrap()
+            .node(NodeId::new(504))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        host.expire_heartbeat_leases(failed_deadline).unwrap();
+        for node_id in [501, 502, 503] {
+            heartbeat(
+                &mut host,
+                node_id,
+                10_000,
+                None,
+                failed_deadline + u64::from(node_id),
+            );
+        }
+        let proof_at_ms = host
+            .current_snapshot_for_test()
+            .unwrap()
+            .max_committed_timestamp_ms()
+            .unwrap()
+            + 1;
+        for node_id in [502, 503] {
+            heartbeat(
+                &mut host,
+                node_id,
+                10_000,
+                Some(PgState::Peering),
+                proof_at_ms + u64::from(node_id),
+            );
+        }
+        let begin_at_ms = host
+            .current_snapshot_for_test()
+            .unwrap()
+            .unavailable_node_observation(NodeId::new(504))
+            .unwrap()
+            .observed_at_ms()
+            + 1;
+        let mut cursor = crate::control_plane::UnavailablePgReconciliationCursor::start();
+        let begun = host
+            .poll_unavailable_pg_reconciliation_batch(&mut cursor, begin_at_ms)
+            .unwrap();
+        assert!(begun.rejected.is_empty());
+        assert_eq!(begun.work.len(), 1);
 
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("staging-evidence-uncertainty.sock");
@@ -88,11 +246,29 @@ fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox(
             .unwrap(),
         );
         let binding = crate::control_plane::UnavailablePgTransitionMutationBinding::new(
-            PgId::new(19),
-            ClusterEpoch::new(12).unwrap(),
-            ClusterEpoch::new(11).unwrap(),
-            vec![NodeId::new(504), NodeId::new(502), NodeId::new(503)],
-            vec![NodeId::new(501), NodeId::new(502), NodeId::new(503)],
+            pg_id,
+            host.current_snapshot_for_test()
+                .unwrap()
+                .unavailable_pg_placement_transition(pg_id)
+                .unwrap()
+                .transition_epoch(),
+            host.current_snapshot_for_test()
+                .unwrap()
+                .unavailable_pg_placement_transition(pg_id)
+                .unwrap()
+                .source_epoch(),
+            host.current_snapshot_for_test()
+                .unwrap()
+                .unavailable_pg_placement_transition(pg_id)
+                .unwrap()
+                .source_acting_set()
+                .to_vec(),
+            host.current_snapshot_for_test()
+                .unwrap()
+                .unavailable_pg_placement_transition(pg_id)
+                .unwrap()
+                .destination_acting_set()
+                .to_vec(),
         );
         let artifact =
             crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
@@ -109,6 +285,19 @@ fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox(
         store.create_intent(&intent).unwrap();
         store.publish_artifact(&intent, &artifact).unwrap();
         let retained_page = store.next_evidence_page().unwrap().unwrap();
+        let authorization =
+            crate::control_plane_command::UnavailablePgStagingIntentAuthorizationRequest {
+                unavailable_transition: binding.clone(),
+                staging_generation: intent.staging_generation(),
+                artifact_digest: intent.artifact_digest(),
+                artifact_length: intent.artifact_length(),
+                artifact_format_version: intent.artifact_format_version(),
+            };
+        <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::authorize_unavailable_pg_staging_intents_batch(
+            &mut host,
+            std::slice::from_ref(&authorization),
+        )
+        .unwrap();
 
         let credential_input =
             crate::control_plane::ControlPlaneStorageNodeAuthCredentialInput {
@@ -132,12 +321,6 @@ fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox(
             4,
             crate::control_plane::CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
             Duration::from_secs(2),
-        )
-        .unwrap();
-        let host = crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost::new_for_test(
-            tokio::runtime::Handle::current(),
-            Arc::clone(&authority),
-            false,
         )
         .unwrap();
         let confirmation_host = host.clone();
@@ -5450,7 +5633,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
         }
 
         let transfer = PgMetadataTransferProof::new(
-            authorized.cluster_epoch(),
+            authorizations[0].unavailable_transition.source_epoch(),
             PgMetadataProof::empty(),
         );
         let destination_nodes = authorized
@@ -5708,6 +5891,476 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
         authority1.shutdown().await.unwrap();
         authority2.shutdown().await.unwrap();
         authority3.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn authenticated_staging_evidence_preflight_suppresses_invalid_pages_and_exact_replays() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let tmp = test_util::tempdir();
+        let cluster_id = "authenticated-staging-evidence-preflight";
+        let authority_node_id = 1301;
+        let artifact_path = tmp.path().join("authority.state");
+        let wal_path = tmp.path().join("authority.wal");
+        let authority = Arc::new(
+            ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                cluster_id,
+                authority_node_id,
+                &artifact_path,
+                &wal_path,
+            )
+            .await
+            .unwrap(),
+        );
+        authority
+            .initialize_single_node_membership(authority_node_id)
+            .await
+            .unwrap();
+        authority
+            .wait_for_current_leader(
+                authority_node_id,
+                Duration::from_secs(1),
+                "staging-evidence preflight leadership",
+            )
+            .await
+            .unwrap();
+        wait_for_authority_status_matching(
+            &authority,
+            Duration::from_secs(1),
+            "staging-evidence preflight serving state",
+            ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+        )
+        .await;
+        let mut host = crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost::new_for_test(
+            tokio::runtime::Handle::current(),
+            Arc::clone(&authority),
+            true,
+        )
+        .unwrap();
+
+        let pg_id = PgId::new(70);
+        let storage_nodes = (1..=4)
+            .map(|node_id| {
+                (
+                    NodeId::new(node_id),
+                    format!("unix:///staging-evidence-preflight-{node_id}.sock"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let source_acting_set = vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+        let topology =
+            crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                1,
+                [0x6b; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                vec![authority_node_id],
+                &storage_nodes,
+                &[(pg_id, source_acting_set.clone())],
+                crate::control_plane::test_certified_storage_placement_policy(
+                    (1..=4).map(NodeId::new),
+                    3,
+                    1,
+                ),
+            )
+            .unwrap();
+        host.submit_command_for_test(ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes: storage_nodes.clone(),
+            pg_acting_sets: vec![(pg_id, source_acting_set)],
+            topology,
+        })
+        .unwrap();
+
+        let heartbeat =
+            |host: &mut crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost,
+             node_id: u32,
+             lease_ms: u64,
+             state: Option<PgState>,
+             heartbeat_at_ms: u64| {
+                for _ in 0..4 {
+                    let observed_epoch =
+                        host.current_snapshot_for_test().unwrap().cluster_epoch();
+                    let refresh = match host.refresh_node_heartbeat(
+                        crate::control_plane::NodeHeartbeat {
+                            node_id: NodeId::new(node_id),
+                            node_incarnation: 1,
+                            endpoint: storage_nodes
+                                [usize::try_from(node_id.checked_sub(1).unwrap()).unwrap()]
+                            .1
+                            .clone(),
+                            observed_epoch,
+                            requested_lease_duration_ms: lease_ms,
+                            cluster_map_history_route_scan_generation:
+                                std::num::NonZeroU64::new(1).unwrap(),
+                            cluster_map_history_route_references: Default::default(),
+                            pg_observations: state
+                                .map(|state| {
+                                    vec![crate::control_plane::NodePgHeartbeatObservation {
+                                        pg_id,
+                                        state,
+                                        metadata_proof: PgMetadataProof::empty(),
+                                        pending_metadata_command: None,
+                                    }]
+                                })
+                                .unwrap_or_default(),
+                        },
+                        heartbeat_at_ms,
+                    ) {
+                        Ok(refresh) => refresh,
+                        Err(ControlPlaneError::PgPrimaryObservationNotActive { .. })
+                            if state == Some(PgState::Active) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => panic!(
+                            "storage node {node_id} {state:?} heartbeat failed: {error:?}"
+                        ),
+                    };
+                    if refresh.lease().serving() {
+                        return;
+                    }
+                }
+                panic!("storage node {node_id} did not receive a serving lease");
+            };
+
+        for node_id in 1..=4 {
+            heartbeat(&mut host, node_id, 10_000, None, 1_000 + u64::from(node_id));
+        }
+        for node_id in 1..=3 {
+            heartbeat(
+                &mut host,
+                node_id,
+                10_000,
+                Some(PgState::Peering),
+                2_000 + u64::from(node_id),
+            );
+        }
+        for node_id in 1..=3 {
+            heartbeat(
+                &mut host,
+                node_id,
+                if node_id == 1 { 100 } else { 10_000 },
+                Some(PgState::Active),
+                3_000 + u64::from(node_id),
+            );
+        }
+        let failed_deadline = host
+            .current_snapshot_for_test()
+            .unwrap()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        host.expire_heartbeat_leases(failed_deadline).unwrap();
+        for node_id in 2..=4 {
+            heartbeat(
+                &mut host,
+                node_id,
+                10_000,
+                None,
+                failed_deadline + u64::from(node_id),
+            );
+        }
+        let proof_at_ms = host
+            .current_snapshot_for_test()
+            .unwrap()
+            .max_committed_timestamp_ms()
+            .unwrap()
+            + 1;
+        for node_id in [2, 3] {
+            heartbeat(
+                &mut host,
+                node_id,
+                10_000,
+                Some(PgState::Peering),
+                proof_at_ms + u64::from(node_id),
+            );
+        }
+        let begin_at_ms = host
+            .current_snapshot_for_test()
+            .unwrap()
+            .unavailable_node_observation(NodeId::new(1))
+            .unwrap()
+            .observed_at_ms()
+            + 1;
+        let mut cursor = crate::control_plane::UnavailablePgReconciliationCursor::start();
+        let begun = host
+            .poll_unavailable_pg_reconciliation_batch(&mut cursor, begin_at_ms)
+            .unwrap();
+        assert!(begun.rejected.is_empty());
+        assert_eq!(begun.work.len(), 1);
+
+        let begun_snapshot = host.current_snapshot_for_test().unwrap();
+        let transition = begun_snapshot
+            .unavailable_pg_placement_transition(pg_id)
+            .unwrap();
+        let authorization =
+            crate::control_plane_command::UnavailablePgStagingIntentAuthorizationRequest {
+                unavailable_transition:
+                    crate::control_plane::UnavailablePgTransitionMutationBinding::new(
+                        transition.pg_id(),
+                        transition.transition_epoch(),
+                        transition.source_epoch(),
+                        transition.source_acting_set().to_vec(),
+                        transition.destination_acting_set().to_vec(),
+                    ),
+                staging_generation: transition.transition_epoch().get(),
+                artifact_digest: [0x80; 32],
+                artifact_length: 8_192,
+                artifact_format_version:
+                    crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+            };
+        let authorized = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::authorize_unavailable_pg_staging_intents_batch(
+            &mut host,
+            std::slice::from_ref(&authorization),
+        )
+        .unwrap();
+        let actor_node_id = authorization.unavailable_transition.destination_acting_set()[0];
+        let actor_node = authorized.node(actor_node_id).unwrap();
+        let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+            actor_node_id,
+            actor_node.node_incarnation(),
+            actor_node.endpoint().to_owned(),
+        )
+        .unwrap();
+        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &authorization.unavailable_transition,
+            authorization.artifact_digest,
+            authorization.artifact_length,
+            authorization.artifact_format_version,
+        )
+        .unwrap();
+        let transfer = PgMetadataTransferProof::new(
+            intent.source_epoch(),
+            PgMetadataProof::empty(),
+        );
+        let valid_page =
+            crate::pg_store::metadata_transfer_staging_publication_evidence_page_for_test(
+                actor.clone(),
+                &intent,
+                transfer,
+                None,
+            );
+        let invalid_page =
+            crate::pg_store::metadata_transfer_staging_evidence_page_with_duplicate_member_for_test(
+                actor.clone(),
+                &intent,
+                crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                None,
+            );
+        let invalid_target_page = crate::pg_store::metadata_transfer_staging_publication_evidence_page_at_epoch_for_test(
+            actor.clone(),
+            &intent,
+            intent.transition_epoch(),
+            transfer,
+            None,
+        );
+        let invalid_source_page = crate::pg_store::metadata_transfer_staging_publication_evidence_page_at_epoch_for_test(
+            actor.clone(),
+            &intent,
+            ClusterEpoch::new(intent.transition_epoch().get().checked_add(1).unwrap()).unwrap(),
+            PgMetadataTransferProof::new(
+                intent.transition_epoch(),
+                PgMetadataProof::empty(),
+            ),
+            None,
+        );
+        let credential_input = crate::control_plane::ControlPlaneStorageNodeAuthCredentialInput {
+            node_id: actor_node_id,
+            credential_id: "staging-evidence-node".to_owned(),
+            credential_version: 1,
+            secret: b"staging-evidence-secret".to_vec(),
+        };
+        let credential = crate::control_plane::ControlPlaneStorageNodeAuthCredential::new(
+            credential_input.clone(),
+        )
+        .unwrap();
+        let scoped_credential = credential
+            .scoped_for_cluster_and_incarnation(cluster_id, actor.node_incarnation())
+            .unwrap();
+        let verifier = crate::control_plane::ControlPlaneUnixAuthVerifier::new(
+            cluster_id,
+            vec![credential],
+        )
+        .unwrap();
+        let socket_path = tmp.path().join("staging-evidence.sock");
+        let listener = crate::control_plane::ControlPlaneRpcServerListener::unix(
+            UnixListener::bind(&socket_path).unwrap(),
+            4,
+            crate::control_plane::CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let confirmation_host = host.clone();
+        let policy = crate::control_plane::ControlPlaneRpcServerPolicy::new(
+            crate::control_plane::ControlPlaneRpcServerRole::Ordinary,
+            4,
+            crate::control_plane::CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap()
+        .with_auth_verifier(Arc::new(verifier))
+        .with_authority_confirmation(Arc::new(move || {
+            confirmation_host
+                .block_on_for_test(
+                    confirmation_host
+                        .authority_for_test()
+                        .confirmed_linearized_authority_status(),
+                )
+                .map(|_| ())
+        }));
+        let server = std::thread::spawn(move || {
+            listener
+                .serve_shared_requests_for_test(
+                    Arc::new(Mutex::new(host)),
+                    policy,
+                    vec![
+                        20_000;
+                        3 + crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT + 1 + 2
+                    ],
+                    |_| {},
+                )
+                .unwrap();
+        });
+        let client = crate::control_plane::AuthenticatedUnixControlPlaneClient::new(
+            crate::control_plane::UnixControlPlaneClient::new(&socket_path),
+            scoped_credential,
+        );
+
+        let baseline_log_id = authority.status().await.unwrap().last_log_id().unwrap();
+        let baseline_metrics = authority.durability_metric_snapshots_for_test();
+        for invalid_page in [&invalid_page, &invalid_target_page, &invalid_source_page] {
+            let error = client
+                .publish_metadata_transfer_staging_evidence_page(invalid_page, 20_000)
+                .expect_err("semantically invalid evidence must be rejected before Raft");
+            assert!(
+                matches!(error, ControlPlaneError::RpcRemote { .. }),
+                "unexpected semantic rejection: {error:?}"
+            );
+        }
+        assert_eq!(
+            authority.status().await.unwrap().last_log_id(),
+            Some(baseline_log_id)
+        );
+        assert_eq!(
+            authority.durability_metric_snapshots_for_test(),
+            baseline_metrics,
+            "preflight rejection must not submit, append, or checkpoint"
+        );
+
+        let first_receipt = client
+            .publish_metadata_transfer_staging_evidence_page(&valid_page, 20_000)
+            .unwrap();
+        assert!(first_receipt.is_for_page(&valid_page));
+        let mut previous_receipt = first_receipt.clone();
+        for offset in 1..crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT {
+            let target_epoch = ClusterEpoch::new(
+                intent
+                    .transition_epoch()
+                    .get()
+                    .checked_add(u64::try_from(offset).unwrap() + 1)
+                    .unwrap(),
+            )
+            .unwrap();
+            let page = crate::pg_store::metadata_transfer_staging_publication_evidence_page_at_epoch_for_test(
+                actor.clone(),
+                &intent,
+                target_epoch,
+                PgMetadataTransferProof::new(
+                    intent.source_epoch(),
+                    PgMetadataProof::empty(),
+                ),
+                Some(&previous_receipt),
+            );
+            previous_receipt = client
+                .publish_metadata_transfer_staging_evidence_page(&page, 20_000)
+                .unwrap();
+            assert!(previous_receipt.is_for_page(&page));
+        }
+        let capped_log_id = authority.status().await.unwrap().last_log_id().unwrap();
+        assert_eq!(
+            capped_log_id.index(),
+            baseline_log_id.index()
+                + u64::try_from(crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT).unwrap()
+        );
+        let capped_metrics = authority.durability_metric_snapshots_for_test();
+        assert_eq!(
+            capped_metrics.command.submit_total,
+            baseline_metrics.command.submit_total
+                + u64::try_from(crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT).unwrap()
+        );
+        assert_eq!(
+            capped_metrics.checkpoint.store_total,
+            baseline_metrics.checkpoint.store_total
+                + u64::try_from(crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT).unwrap()
+        );
+
+        let excess_target_epoch = ClusterEpoch::new(
+            intent
+                .transition_epoch()
+                .get()
+                .checked_add(
+                    u64::try_from(crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT).unwrap()
+                        + 1,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let excess_page = crate::pg_store::metadata_transfer_staging_publication_evidence_page_at_epoch_for_test(
+            actor,
+            &intent,
+            excess_target_epoch,
+            PgMetadataTransferProof::new(intent.source_epoch(), PgMetadataProof::empty()),
+            Some(&previous_receipt),
+        );
+        let excess_error = client
+            .publish_metadata_transfer_staging_evidence_page(&excess_page, 20_000)
+            .expect_err("the first publication above the per-intent limit must be rejected");
+        assert!(
+            matches!(excess_error, ControlPlaneError::RpcRemote { .. }),
+            "unexpected excess-publication rejection: {excess_error:?}"
+        );
+        assert_eq!(
+            authority.status().await.unwrap().last_log_id(),
+            Some(capped_log_id)
+        );
+        assert_eq!(
+            authority.durability_metric_snapshots_for_test(),
+            capped_metrics,
+            "excess evidence must not submit, append, or checkpoint"
+        );
+        let capped_snapshot = authority
+            .durable_state_machine_snapshot_for_test()
+            .await
+            .unwrap();
+        assert!(matches!(
+            capped_snapshot.apply_control_plane_command(
+                ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                    operation_payload: excess_page.operation_payload().to_vec(),
+                    page_digest: excess_page.page_digest(),
+                }
+            ),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message.contains("per-intent publication-target limit")
+        ));
+
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .publish_metadata_transfer_staging_evidence_page(&valid_page, 20_000)
+                    .unwrap(),
+                first_receipt
+            );
+        }
+        server.join().unwrap();
+        assert_eq!(
+            authority.status().await.unwrap().last_log_id(),
+            Some(capped_log_id)
+        );
+        assert_eq!(
+            authority.durability_metric_snapshots_for_test(),
+            capped_metrics,
+            "exact replay must return its receipt without submitting or checkpointing"
+        );
+
+        authority.shutdown().await.unwrap();
     });
 }
 

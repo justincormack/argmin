@@ -894,6 +894,17 @@ struct MetadataTransferStagingEvidencePageRecord {
     apply_receipt: Vec<u8>,
 }
 
+pub(crate) enum MetadataTransferStagingEvidencePageClassification {
+    NewAuthorized {
+        page_key: (NodeId, u64, u64),
+        decoded_entries: Vec<(MetadataTransferStagingEvidenceKey, Vec<u8>)>,
+        apply_receipt: Vec<u8>,
+    },
+    ExactReplay {
+        apply_receipt: Vec<u8>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MetadataTransferStagingEvidenceCheckpointSegment {
     actor: crate::pg_store::MetadataTransferStagingNodeIdentity,
@@ -914,7 +925,7 @@ struct MetadataTransferStagingEvidenceCheckpointPageLink {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct MetadataTransferStagingEvidenceKey {
+pub(crate) struct MetadataTransferStagingEvidenceKey {
     pg_id: PgId,
     staging_generation: u64,
     actor_node_id: NodeId,
@@ -3250,6 +3261,33 @@ impl ClusterControlSnapshot {
                 ),
             });
         }
+        match (
+            evidence.kind(),
+            evidence.target_epoch(),
+            evidence.transfer(),
+        ) {
+            (
+                crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                Some(target_epoch),
+                Some(transfer),
+            ) if target_epoch > intent.transition_epoch()
+                && transfer.source_epoch() <= intent.source_epoch() =>
+            {
+                // The staging node validates the complete imported proof against
+                // the artifact before publication. The authority does not own
+                // that artifact, but it can and must reject impossible epoch
+                // relationships before admitting the evidence to Raft.
+            }
+            (crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone, None, None) => {}
+            _ => {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} metadata-transfer staging evidence has invalid publication semantics",
+                        intent.pg_id().get()
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -3504,7 +3542,23 @@ impl ClusterControlSnapshot {
                     .to_owned(),
             );
         }
+        let mut publication_targets = BTreeMap::<_, BTreeSet<_>>::new();
         for (key, bytes) in &self.metadata_transfer_staging_evidence {
+            if key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication {
+                let target_epoch = key.target_epoch.ok_or_else(|| {
+                    "metadata-transfer publication evidence is missing its target epoch".to_owned()
+                })?;
+                let targets = publication_targets
+                    .entry((key.pg_id, key.staging_generation))
+                    .or_default();
+                targets.insert(target_epoch);
+                if targets.len() > crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT {
+                    return Err(format!(
+                        "metadata-transfer staging evidence exceeds the per-intent publication-target limit {}",
+                        crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
+                    ));
+                }
+            }
             let evidence = crate::pg_store::decode_staging_evidence(bytes)
                 .map_err(|error| error.to_string())?;
             let decoded_key = MetadataTransferStagingEvidenceKey {
@@ -3538,16 +3592,16 @@ impl ClusterControlSnapshot {
         Ok(())
     }
 
-    fn apply_metadata_transfer_staging_evidence_page(
+    pub(crate) fn classify_metadata_transfer_staging_evidence_page(
         &self,
-        operation_payload: Vec<u8>,
+        operation_payload: &[u8],
         page_digest: [u8; 32],
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+    ) -> Result<MetadataTransferStagingEvidencePageClassification, ControlPlaneError> {
         let page =
-            crate::pg_store::decode_staging_evidence_page_payload(&operation_payload, page_digest)
+            crate::pg_store::decode_staging_evidence_page_payload(operation_payload, page_digest)
                 .map_err(|error| ControlPlaneError::CommandDecode {
-                    message: format!("invalid metadata-transfer staging evidence page: {error}"),
-                })?;
+                message: format!("invalid metadata-transfer staging evidence page: {error}"),
+            })?;
         let actor_key = (page.actor().node_id(), page.actor().node_incarnation());
         let page_key = (actor_key.0, actor_key.1, page.generation());
         if let Some(existing) = self.metadata_transfer_staging_evidence_pages.get(&page_key) {
@@ -3563,13 +3617,11 @@ impl ClusterControlSnapshot {
                 && existing.operation_payload == operation_payload
                 && existing.page_digest == page_digest
             {
-                return Ok(AppliedControlPlaneCommand::new(
-                    self.clone(),
-                    ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
+                return Ok(
+                    MetadataTransferStagingEvidencePageClassification::ExactReplay {
                         apply_receipt: existing.apply_receipt.clone(),
                     },
-                    false,
-                ));
+                );
             }
             return Err(ControlPlaneError::CommandDecode {
                 message: format!(
@@ -3615,6 +3667,25 @@ impl ClusterControlSnapshot {
             });
         }
 
+        let mut publication_targets = BTreeMap::<_, BTreeSet<_>>::new();
+        for key in self
+            .metadata_transfer_staging_evidence
+            .keys()
+            .filter(|key| {
+                key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication
+            })
+        {
+            let target_epoch =
+                key.target_epoch
+                    .ok_or_else(|| ControlPlaneError::SnapshotInvariantViolation {
+                        context: "retained metadata-transfer staging publication is invalid",
+                        message: "publication evidence is missing its target epoch".to_owned(),
+                    })?;
+            publication_targets
+                .entry((key.pg_id, key.staging_generation))
+                .or_default()
+                .insert(target_epoch);
+        }
         let mut decoded_entries = Vec::with_capacity(page.entries().len());
         let mut page_evidence_keys = BTreeSet::new();
         for entry in page.entries() {
@@ -3639,6 +3710,31 @@ impl ClusterControlSnapshot {
                 kind: evidence.kind(),
                 target_epoch: evidence.target_epoch(),
             };
+            if key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication {
+                let target_epoch =
+                    key.target_epoch
+                        .ok_or_else(|| ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} staging publication evidence is missing its target epoch",
+                                key.pg_id.get()
+                            ),
+                        })?;
+                let targets = publication_targets
+                    .entry((key.pg_id, key.staging_generation))
+                    .or_default();
+                if !targets.contains(&target_epoch)
+                    && targets.len() >= crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging evidence exceeds the per-intent publication-target limit {}",
+                            key.pg_id.get(),
+                            crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
+                        ),
+                    });
+                }
+                targets.insert(target_epoch);
+            }
             if self.metadata_transfer_staging_evidence.contains_key(&key)
                 || !page_evidence_keys.insert(key.clone())
             {
@@ -3652,7 +3748,42 @@ impl ClusterControlSnapshot {
             decoded_entries.push((key, evidence.as_bytes().to_vec()));
         }
 
-        let receipt = crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
+        let apply_receipt =
+            crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&page)
+                .as_bytes()
+                .to_vec();
+        Ok(
+            MetadataTransferStagingEvidencePageClassification::NewAuthorized {
+                page_key,
+                decoded_entries,
+                apply_receipt,
+            },
+        )
+    }
+
+    fn apply_metadata_transfer_staging_evidence_page(
+        &self,
+        operation_payload: Vec<u8>,
+        page_digest: [u8; 32],
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        let (page_key, decoded_entries, apply_receipt) = match self
+            .classify_metadata_transfer_staging_evidence_page(&operation_payload, page_digest)?
+        {
+            MetadataTransferStagingEvidencePageClassification::NewAuthorized {
+                page_key,
+                decoded_entries,
+                apply_receipt,
+            } => (page_key, decoded_entries, apply_receipt),
+            MetadataTransferStagingEvidencePageClassification::ExactReplay { apply_receipt } => {
+                return Ok(AppliedControlPlaneCommand::new(
+                    self.clone(),
+                    ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
+                        apply_receipt,
+                    },
+                    false,
+                ));
+            }
+        };
         let mut next_snapshot = self.clone();
         for (key, evidence) in decoded_entries {
             next_snapshot
@@ -3666,14 +3797,12 @@ impl ClusterControlSnapshot {
                 MetadataTransferStagingEvidencePageRecord {
                     operation_payload,
                     page_digest,
-                    apply_receipt: receipt.as_bytes().to_vec(),
+                    apply_receipt: apply_receipt.clone(),
                 },
             );
         Ok(AppliedControlPlaneCommand::new(
             next_snapshot,
-            ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
-                apply_receipt: receipt.as_bytes().to_vec(),
-            },
+            ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt },
             true,
         ))
     }

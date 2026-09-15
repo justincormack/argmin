@@ -2652,23 +2652,19 @@ fn canonical_control_plane_state_v38_representative_aggregate_is_stable() {
         .all(|transition| transition.destination_install.is_some()));
     snapshots.push(installed.clone());
 
-    let mut historical_v37_aggregate = Vec::new();
-    for snapshot in &snapshots {
-        let formatted = format_snapshot(snapshot).replacen("version=38\n", "version=37\n", 1);
-        historical_v37_aggregate.extend_from_slice(&(formatted.len() as u64).to_be_bytes());
-        historical_v37_aggregate.extend_from_slice(formatted.as_bytes());
-    }
+    const HISTORICAL_V37_AGGREGATE: &[u8] =
+        include_bytes!("testdata/state_v37_representative.aggregate");
     assert_eq!(
         (
-            historical_v37_aggregate.len(),
-            hex_encode(&checksum::sha256::digest(&historical_v37_aggregate))
+            HISTORICAL_V37_AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(HISTORICAL_V37_AGGREGATE))
         ),
         (
             38_995,
             "5e09f13e0d032acbd63811fd768a3b9d79f9535feaf0370c5dea89bc808b2f51".to_owned()
         )
     );
-    let mut remaining = historical_v37_aggregate.as_slice();
+    let mut remaining = HISTORICAL_V37_AGGREGATE;
     while !remaining.is_empty() {
         let (length, tail) = remaining.split_at(8);
         let length = usize::try_from(u64::from_be_bytes(length.try_into().unwrap())).unwrap();
@@ -2747,7 +2743,7 @@ fn canonical_control_plane_state_v38_representative_aggregate_is_stable() {
         ),
         (
             58_029,
-            "7c417a5442e51b3c590f3cac9529c1d3530398e5398ff9a6404604ad6d8b7b55".to_owned()
+            "ea1d5bea6346cf9cfa05b496a29d6cb61afb5944db23c869e58d8614fe346b51".to_owned()
         )
     );
 }

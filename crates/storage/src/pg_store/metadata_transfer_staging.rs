@@ -55,7 +55,7 @@ pub(crate) const MAX_STAGING_INTENT_BYTES: usize = 16 * 1_024;
 pub(crate) const MAX_STAGING_EVIDENCE_BYTES: usize = 4_096;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_ENTRIES: usize = 64;
 pub(crate) const MAX_STAGING_EVIDENCE_PAGE_BYTES: usize = 120 * 1_024;
-const MAX_STAGING_EPOCH_PROOFS_PER_INTENT: usize = 64;
+pub(crate) const MAX_STAGING_EPOCH_PROOFS_PER_INTENT: usize = 64;
 const STAGING_EVIDENCE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-V3\0";
 const STAGING_EVIDENCE_PAGE_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-PAGE-V3\0";
 const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-APPLY-V3\0";
@@ -3802,6 +3802,25 @@ pub(crate) fn metadata_transfer_staging_publication_evidence_page_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn metadata_transfer_staging_publication_evidence_page_at_epoch_for_test(
+    actor: MetadataTransferStagingNodeIdentity,
+    intent: &MetadataTransferStagingIntent,
+    target_epoch: ClusterEpoch,
+    transfer: PgMetadataTransferProof,
+    previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
+) -> MetadataTransferStagingEvidencePage {
+    metadata_transfer_staging_evidence_page_with_target_for_test(
+        actor.clone(),
+        actor,
+        intent,
+        MetadataTransferStagingEvidenceKind::Publication,
+        Some(target_epoch),
+        Some(transfer),
+        previous_receipt,
+    )
+}
+
+#[cfg(test)]
 fn metadata_transfer_staging_evidence_page_with_transfer_for_test(
     page_actor: MetadataTransferStagingNodeIdentity,
     evidence_actor: MetadataTransferStagingNodeIdentity,
@@ -3811,6 +3830,27 @@ fn metadata_transfer_staging_evidence_page_with_transfer_for_test(
     previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
 ) -> MetadataTransferStagingEvidencePage {
     let target_epoch = transfer.map(|_| test_staging_evidence_target_epoch(intent));
+    metadata_transfer_staging_evidence_page_with_target_for_test(
+        page_actor,
+        evidence_actor,
+        intent,
+        kind,
+        target_epoch,
+        transfer,
+        previous_receipt,
+    )
+}
+
+#[cfg(test)]
+fn metadata_transfer_staging_evidence_page_with_target_for_test(
+    page_actor: MetadataTransferStagingNodeIdentity,
+    evidence_actor: MetadataTransferStagingNodeIdentity,
+    intent: &MetadataTransferStagingIntent,
+    kind: MetadataTransferStagingEvidenceKind,
+    target_epoch: Option<ClusterEpoch>,
+    transfer: Option<PgMetadataTransferProof>,
+    previous_receipt: Option<&MetadataTransferStagingEvidenceApplyReceipt>,
+) -> MetadataTransferStagingEvidencePage {
     let evidence =
         encode_staging_evidence(&evidence_actor, intent, kind as u8, target_epoch, transfer);
     let (previous_generation, previous_apply_receipt_digest) =
