@@ -13,13 +13,64 @@ The default expectation in this repository is:
 - known incompatibilities should be written down clearly rather than left as
   tribal knowledge
 
-This guide is a short list of currently known gaps. It is intentionally
-non-exhaustive, but anything listed here should be treated as an explicit,
-temporary compatibility exception rather than a surprise.
+This guide describes the usable surface first, then known differences and
+behavioral evidence. It is not an exhaustive AWS API or parameter catalogue.
+An implemented handler is not, by itself, a supported feature.
+
+## Reading the compatibility overview
+
+Argmin is **pre-production**. Availability below does not imply production
+readiness, complete AWS parity, or support for upgrades. See the
+[configuration guide](configuration.md), [threat model](threat_model.md), and
+[versioning guide](versioning.md) for those separate boundaries.
+
+The capability groups are navigation aids, not blanket compatibility claims:
+
+- **Supported surface** names usable operations or modes with shared local/AWS
+  tests. The detailed exceptions below still apply.
+- **Partial surface** names a usable subset and its important exclusions.
+- **Unsupported** means there is no supported user workflow, even where partial
+  implementation or reference tests exist.
+
+The normal S3 surface is served by the standalone server or a replicated
+frontend using the credentials and endpoint configuration documented in the
+configuration guide. Test-only identities and fixtures are not additional
+deployment options. SSE-C additionally requires its configured validator key
+and a TLS connection to Argmin.
+
+## Capability and operation overview
+
+The evidence links are entry points into the shared test suites, not claims
+that one file exhaustively tests a capability. `Get`/`Put`/`Delete` below name
+the corresponding operations on the stated resource.
+
+| Capability | Available surface | Scope, exclusions, and evidence |
+| --- | --- | --- |
+| Buckets and listing | Supported surface: CreateBucket, HeadBucket, DeleteBucket, ListBuckets, GetBucketLocation, ListObjects/ListObjectsV2 | General-purpose buckets; not directory buckets/S3 Express. [Bucket tests](../crates/s3-tests/tests/bucket_crud.rs), [listing tests](../crates/s3-tests/tests/bucket_list.rs). |
+| Object reads and writes | Supported surface: PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects, CopyObject, GetObjectAttributes | Includes ranges and conditional requests; ETags are opaque, not AWS MD5 values (gap 1). [Object tests](../crates/s3-tests/tests/object_crud.rs), [conditions](../crates/s3-tests/tests/conditional.rs), [copy](../crates/s3-tests/tests/copy_object.rs), [attributes](../crates/s3-tests/tests/object_attributes.rs). |
+| Multipart uploads | Supported surface: CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload, AbortMultipartUpload, ListMultipartUploads, ListParts | See the explicit malformed-completion exception below. [Multipart tests](../crates/s3-tests/tests/multipart.rs). |
+| Request authentication | Supported surface: configured-key SigV4 headers, presigned requests, POST Object, aws-chunked uploads | No SigV2 or usable temporary-credential workflow. [Presigned](../crates/s3-tests/tests/presigned.rs), [POST](../crates/s3-tests/tests/post_object.rs), [chunked tests](../crates/s3-tests/tests/chunked.rs). |
+| Policies and access controls | Partial surface: bucket policy Get/Put/Delete and policy status; bucket/object ACL Get/Put; bucket ownership controls and bucket-level public access block Get/Put/Delete | Not general IAM. Policy keys, principal validation, and denial text have limitations below; account-level Block Public Access is unsupported. [Policy](../crates/s3-tests/tests/bucket_policy.rs), [ACL](../crates/s3-tests/tests/bucket_acl.rs), [ownership](../crates/s3-tests/tests/ownership.rs), [public access block tests](../crates/s3-tests/tests/public_access_block.rs). |
+| Encryption | Supported surface: SSE-S3, SSE-C, bucket encryption Get/Put/Delete | SSE-KMS is unsupported; accepting an encryption-related input does not provide a KMS integration. [Bucket encryption](../crates/s3-tests/tests/bucket_encryption.rs), [SSE-C tests](../crates/s3-tests/tests/sse_c.rs). |
+| Checksums | Supported surface: request checksum validation and stored checksum retrieval on the implemented object/multipart operations | Algorithm and operation combinations are covered in [checksum tests](../crates/s3-tests/tests/checksums.rs) and [request checksum tests](../crates/s3-tests/tests/request_checksums.rs); this does not change the ETag exception. |
+| Versioning and Object Lock | Supported surface: bucket versioning Get/Put, ListObjectVersions, version-specific object operations; bucket Object Lock configuration and object retention/legal hold Get/Put | MFA Delete is unsupported. [Versioning](../crates/s3-tests/tests/versioning.rs), [Object Lock tests](../crates/s3-tests/tests/object_lock.rs). |
+| Tags and bucket ABAC | Supported surface: bucket/object tagging Get/Put/Delete; bucket ABAC Get/Put | Policy-condition limitations remain relevant. [Tagging](../crates/s3-tests/tests/tagging.rs), [ABAC tests](../crates/s3-tests/tests/bucket_policy_abac.rs). |
+| CORS | Supported surface: bucket CORS Get/Put/Delete and OPTIONS handling | CORS is not authorization and can reveal bucket existence. [CORS tests](../crates/s3-tests/tests/cors.rs). |
+| Lifecycle | Partial surface: bucket lifecycle configuration Get/Put/Delete; execution of current and noncurrent version expiration, expired delete-marker cleanup, and incomplete multipart-upload abortion | Storage-class transitions are unsupported; see also the transition-default-header limitation below. [Lifecycle tests](../crates/s3-tests/tests/lifecycle.rs). |
+| Website behavior | Partial surface: object website-redirect metadata through the REST API | Website configuration and website endpoint hosting are unsupported. [Redirect tests](../crates/s3-tests/tests/website_redirect.rs). |
+| S3 Control | Partial surface: TagResource, UntagResource, ListTagsForResource for general-purpose buckets | Service-specific routing and validation; not access points, Storage Lens, batch operations, or general account administration. [S3 Control tests](../crates/s3-tests/tests/s3_control.rs), [tag operation tests](../crates/s3-tests/tests/bucket_policy_multivalue.rs). |
+| STS and temporary credentials | Unsupported | Partial issuance/authentication code and reference evidence do not provide a functional STS deployment. Assumed-role authorization remains blocked. See the note below. |
+| Other AWS services and endpoints | Unsupported: directory buckets, access-point/MRAP endpoints, bucket logging, billing/Requester Pays, and website hosting | See the detailed gaps below. Unlisted AWS APIs must not be inferred supported from a capability heading. |
+
+Shared tests exercise the same assertions against local and AWS targets; see
+the [testing guide](testing.md) for running them and required fixtures.
+When a difference affects whether or how a client can use an operation,
+document it below; individual malformed-input and precedence cases
+normally belong in the permanent tests rather than separate overview rows.
 
 ## Bucket scope
 
-Argmin currently supports the normal S3 API surface for standard buckets.
+The operations listed above target general-purpose S3 buckets.
 It does not implement AWS S3 directory buckets / S3 Express One Zone as a
 bucket class.
 
@@ -33,11 +84,13 @@ corresponding error.
 
 ## Behavior notes
 
-### STS and temporary session credentials are not implemented
+### STS and temporary session credentials are unsupported
 
-Argmin currently supports static S3 access key credentials only. It does not
-implement STS endpoints or temporary session credentials, and credential records
-do not carry an expected session token.
+The supported deployment uses configured S3 access key credentials. STS is not
+currently functional or supported. Partial issuance, session-token, and
+authentication code exists, but assumed-role sessions are rejected at the
+authorization boundary. There is no supported configuration that enables an
+end-to-end temporary-credential workflow.
 
 For static credentials, supplied security-token inputs are still rejected with
 AWS-compatible S3 errors:
@@ -48,9 +101,10 @@ AWS-compatible S3 errors:
 - an unsigned `x-amz-security-token` header is rejected by the general SigV4
   `x-amz-*` signing rule with `HeadersNotSigned`
 
-Tests for temporary credential authentication should not be added until Argmin
-has real temporary credential support. AWS-backed compatibility tests should
-instead pin how S3 rejects token inputs supplied with static credentials.
+The [shared issuance tests](../crates/sts-tests/tests/assume_role.rs) cover a
+bounded development slice, not a deployable STS service. The observations below
+are historical AWS reference evidence for future work, not current support
+claims.
 
 Ad hoc AWS validation on 2026-07-07 with expired `GetSessionToken`
 credentials showed that S3 returns `ExpiredToken` before signature mismatch for
@@ -451,33 +505,23 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](../plans/aws-auth-compat-plan.md)
 
-### 12. The `s3-control` API family is not implemented
+### 12. S3 Control is limited to bucket tagging
 
 Argmin implements the normal S3 API/data-plane endpoint and only a very narrow
 bucket-ABAC subset of `s3-control`.
 
-That means the following AWS surface is currently unsupported:
+`TagResource`, `UntagResource`, and `ListTagsForResource` use service-specific
+routing, signing validation, and error rendering. Their bounded method/path,
+payload, and mutation behavior is covered by the shared
+[S3 Control tests](../crates/s3-tests/tests/s3_control.rs) and
+[tag operation matrix](../crates/s3-tests/tests/bucket_policy_multivalue.rs).
+The two deliberate `UntagResource` non-500 responses are listed above.
 
-- `s3-control` endpoint routing and host-style distinctions
-- broader `s3-control` surfaces such as access-point, multi-region access
-  point, Storage Lens, batch operations, and other account/control-plane APIs
+Broader S3 Control surfaces such as access points, multi-region access points,
+Storage Lens, batch operations, and other account/control-plane APIs remain
+unsupported. Bucket tagging support does not imply those features exist.
 
-Current narrow exception:
-
-- `TagResource` / `UntagResource` for the bucket-ABAC general-purpose-bucket
-  flow are implemented
-- AWS-pinned control-plane behavior uses the account-prefixed host
-  `https://{account_id}.s3-control.{region}.amazonaws.com`
-- locally they are still accepted on the ordinary S3 endpoint without distinct
-  `s3-control` host or HTTPS-only transport validation
-- this is intentionally temporary and will be removed by the typed
-  `s3-control` routing work
-
-In practice, any AWS behavior that depends on `s3-control` APIs, endpoint
-routing, or control-plane state such as `TagResource` / `UntagResource` should
-be treated as unsupported apart from this narrow bucket-ABAC tagging subset.
-
-### 12. Bucket-policy condition support is broad but still partial
+### 13. Bucket-policy condition support is broad but still partial
 
 Argmin recognizes AWS-documented bucket-policy condition keys on the
 implemented S3 surface, but deliberately rejects keys that are not yet
@@ -618,9 +662,8 @@ uses the request `Referer` header with normal absent-key condition semantics.
 AWS exposes `s3:signatureAge` for presigned query and POST authentication;
 header-auth requests treat that key as absent.
 
-`aws:PrincipalArn` is evaluated with the AWS-pinned `ArnEquals` operator. An
-assumed-role request exposes the path-bearing IAM role ARN rather than its STS
-session ARN. A configured principal exposes an IAM user ARN only after its
+`aws:PrincipalArn` is evaluated with the AWS-pinned `ArnEquals` operator. A
+configured principal exposes an IAM user ARN only after its
 syntax and account binding have been validated. Opaque configured principals
 cannot satisfy an allow and make a dependent deny fail closed.
 
@@ -629,10 +672,9 @@ can model exactly. Variables are expanded in `Resource` patterns and string
 condition values, but not in numeric, date, boolean, binary, IP, or `Null`
 condition values.
 
-Assumed-role identity context now resolves `aws:userid` as the stable role ID
-plus session name, `aws:PrincipalType` as `AssumedRole`, and
-`aws:TokenIssueTime` from the immutable authenticated session lifetime.
-Anonymous principal type/user ID behavior also remains available. IAM-user
+Assumed-role authorization is blocked; role ARN, role user ID, session type,
+and token-issue-time behavior is not a supported policy surface. Anonymous
+principal type/user ID behavior remains available. IAM-user
 stable IDs, `aws:username`, principal tags, session tags, and other richer IAM
 variables remain unresolved; Argmin leaves those values unavailable rather
 than guessing from a visible principal string. ABAC policies that depend on
@@ -659,7 +701,7 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](../plans/aws-auth-compat-plan.md)
 
-### 13. `AccessDenied` does not yet match AWS principal-specific error text
+### 14. `AccessDenied` does not yet match AWS principal-specific error text
 
 Argmin now matches the generic XML error shape for several `AccessDenied`
 cases, but it does not yet reproduce AWS's more specific denial messages that
@@ -692,7 +734,7 @@ Related plan:
 
 - [plans/persistent-account-and-credential-management.md](../plans/persistent-account-and-credential-management.md)
 
-### 14. Bucket-policy principal validation is format-level only
+### 15. Bucket-policy principal validation is format-level only
 
 `PutBucketPolicy` rejects `AWS` principal entries whose IAM ARN qualifier is
 not one AWS accepts (`root`, `user/<name>`, `role/<name>`), with the
