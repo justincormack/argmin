@@ -25,6 +25,7 @@ use crate::control_plane::{
 };
 use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse,
+    FinalizeMetadataTransferStagingGenerationRequest,
     UnavailablePgStagingIntentAuthorizationRequest, UnavailablePgTransitionInstallRequest,
 };
 use crate::control_plane_raft::{
@@ -626,6 +627,24 @@ impl ControlPlaneRaftAuthorityHost {
         ) {
             return Err(ControlPlaneError::invariant_failure(
                 "staging evidence checkpoint returned the wrong response",
+            ));
+        }
+        self.current_snapshot()
+    }
+
+    pub fn finalize_metadata_transfer_staging_generation(
+        &mut self,
+        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let response = self.submit_low_priority_raft_command(
+            ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup },
+        )?;
+        if !matches!(
+            response,
+            ControlPlaneCommandResponse::FinalizeMetadataTransferStagingGeneration
+        ) {
+            return Err(ControlPlaneError::invariant_failure(
+                "staging cleanup returned the wrong response",
             ));
         }
         self.current_snapshot()
@@ -1393,6 +1412,13 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
             first_generation,
             last_generation,
         )
+    }
+
+    fn finalize_metadata_transfer_staging_generation(
+        &mut self,
+        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        ControlPlaneRaftAuthorityHost::finalize_metadata_transfer_staging_generation(self, cleanup)
     }
 
     fn fence_pg_for_metadata_transfer(

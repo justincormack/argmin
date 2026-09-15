@@ -5645,6 +5645,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
             .collect::<BTreeSet<_>>();
         let mut evidence_digests = BTreeMap::new();
         let mut evidence_actors = Vec::new();
+        let mut evidence_tips = BTreeMap::new();
         for node_id in destination_nodes {
             let node = authorized.node(node_id).unwrap();
             let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
@@ -5685,6 +5686,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                     crate::pg_store::decode_staging_evidence_apply_receipt(&apply_receipt).unwrap(),
                 );
             }
+            evidence_tips.insert(node_id, previous_receipt.unwrap());
         }
 
         let checkpoint_epoch = leader
@@ -5813,6 +5815,172 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
             );
         }
 
+        let readiness_at_ms = installed
+            .unavailable_pg_placement_transitions()
+            .map(|transition| transition.grace_cutoff_ms())
+            .max()
+            .unwrap()
+            .max(installed.max_committed_timestamp_ms().unwrap())
+            + crate::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS
+            + 1;
+        let destination_nodes = installed
+            .unavailable_pg_placement_transition(pg_ids[0])
+            .unwrap()
+            .destination_acting_set()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for (offset, node_id) in destination_nodes.iter().copied().enumerate() {
+            heartbeat(
+                &mut leader,
+                node_id.as_u32(),
+                10_000,
+                Some(PgState::Peering),
+                readiness_at_ms + u64::try_from(offset).unwrap(),
+            );
+        }
+        let ready_snapshot = leader.current_snapshot_for_test().unwrap();
+        let work = pg_ids
+            .iter()
+            .map(|pg_id| {
+                crate::control_plane::UnavailablePgReconciliationWork::from_transition(
+                    ready_snapshot
+                        .unavailable_pg_placement_transition(*pg_id)
+                        .unwrap(),
+                    crate::control_plane::UnavailablePgReconciliationStage::PayloadReadiness,
+                )
+            })
+            .collect::<Vec<_>>();
+        let completion = leader
+            .complete_unavailable_pg_reconciliation_batch(
+                &work,
+                ready_snapshot.max_committed_timestamp_ms().unwrap() + 1,
+            )
+            .unwrap();
+        assert!(
+            completion.rejected.is_empty(),
+            "unexpected completion rejection: {:?}",
+            completion.rejected
+        );
+        assert_eq!(completion.completed.len(), pg_ids.len());
+        assert!(completion.rederive.is_empty());
+        let completed = leader.current_snapshot_for_test().unwrap();
+        for pg_id in pg_ids {
+            assert!(completed.unavailable_pg_placement_transition(pg_id).is_none());
+        }
+
+        let mut tombstone_digests = BTreeMap::new();
+        for actor in &evidence_actors {
+            let mut previous_receipt = evidence_tips[&actor.node_id()].clone();
+            for authorization in &authorizations {
+                let page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+                    actor.clone(),
+                    &authorization.unavailable_transition,
+                    authorization.artifact_digest,
+                    authorization.artifact_length,
+                    authorization.artifact_format_version,
+                    crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+                    Some(&previous_receipt),
+                );
+                tombstone_digests.insert(
+                    (
+                        authorization.unavailable_transition.pg_id(),
+                        actor.node_id(),
+                    ),
+                    checksum::sha256::digest(page.entries()[0].evidence()),
+                );
+                let apply_receipt = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::apply_metadata_transfer_staging_evidence_page(
+                    &mut leader,
+                    page.operation_payload().to_vec(),
+                    page.page_digest(),
+                )
+                .unwrap();
+                previous_receipt =
+                    crate::pg_store::decode_staging_evidence_apply_receipt(&apply_receipt).unwrap();
+            }
+        }
+        for actor in &evidence_actors {
+            <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::checkpoint_metadata_transfer_staging_evidence_pages(
+                &mut leader,
+                actor.node_id(),
+                actor.node_incarnation(),
+                2,
+                3,
+            )
+            .unwrap();
+        }
+        let first_authorization = &authorizations[0];
+        let first_transition = completed
+            .retained_unavailable_pg_placement_transitions()
+            .find(|transition| {
+                transition.pg_id() == first_authorization.unavailable_transition.pg_id()
+                    && transition.transition_epoch()
+                        == first_authorization
+                            .unavailable_transition
+                            .transition_epoch()
+            })
+            .unwrap();
+        let mut tombstones = first_transition
+            .destination_acting_set()
+            .iter()
+            .copied()
+            .map(|node_id| {
+                let node = completed.node(node_id).unwrap();
+                crate::control_plane_command::MetadataTransferStagingTombstoneBinding {
+                    node_id,
+                    node_incarnation: node.node_incarnation(),
+                    endpoint: node.endpoint().to_owned(),
+                    evidence_digest: tombstone_digests[&(
+                        first_authorization.unavailable_transition.pg_id(),
+                        node_id,
+                    )],
+                }
+            })
+            .collect::<Vec<_>>();
+        tombstones.sort_by_key(|tombstone| tombstone.node_id);
+        let cleanup =
+            crate::control_plane_command::FinalizeMetadataTransferStagingGenerationRequest {
+                unavailable_transition: first_authorization.unavailable_transition.clone(),
+                staging_generation: first_authorization.staging_generation,
+                tombstones,
+            };
+        let cleanup_epoch = leader
+            .current_snapshot_for_test()
+            .unwrap()
+            .cluster_epoch();
+        let finalized = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::finalize_metadata_transfer_staging_generation(
+            &mut leader,
+            cleanup.clone(),
+        )
+        .unwrap();
+        assert_eq!(finalized.cluster_epoch(), cleanup_epoch);
+        let cleanup_applied = authority1.status().await.unwrap().applied().unwrap();
+        authority2
+            .wait_for_applied_log_id(
+                cleanup_applied,
+                Duration::from_secs(1),
+                "second voter applied staging cleanup",
+            )
+            .await
+            .unwrap();
+        authority3
+            .wait_for_applied_log_id(
+                cleanup_applied,
+                Duration::from_secs(1),
+                "third voter applied staging cleanup",
+            )
+            .await
+            .unwrap();
+        for authority in [&authority1, &authority2, &authority3] {
+            assert_eq!(
+                authority
+                    .durable_state_machine_snapshot_for_test()
+                    .await
+                    .unwrap(),
+                finalized
+            );
+        }
+
         authority1.transfer_leadership_to(1202).await.unwrap();
         authority2
             .wait_for_current_leader(
@@ -5845,21 +6013,27 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 1,
             )
             .unwrap();
-            assert_eq!(replayed_checkpoint, installed);
+            assert_eq!(replayed_checkpoint, finalized);
         }
         let replayed_authorization = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::authorize_unavailable_pg_staging_intents_batch(
             &mut successor,
             &authorizations,
         )
         .unwrap();
-        assert_eq!(replayed_authorization, installed);
+        assert_eq!(replayed_authorization, finalized);
         let replayed_install = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::install_unavailable_pg_placement_transitions_batch(
             &mut successor,
             &install_requests,
             destination_epoch,
         )
         .unwrap();
-        assert_eq!(replayed_install, installed);
+        assert_eq!(replayed_install, finalized);
+        let replayed_cleanup = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::finalize_metadata_transfer_staging_generation(
+            &mut successor,
+            cleanup,
+        )
+        .unwrap();
+        assert_eq!(replayed_cleanup, finalized);
 
         let replay_applied = authority2.status().await.unwrap().applied().unwrap();
         authority1
@@ -5884,7 +6058,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                     .durable_state_machine_snapshot_for_test()
                     .await
                     .unwrap(),
-                installed
+                finalized
             );
         }
 

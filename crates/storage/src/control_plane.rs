@@ -28,10 +28,11 @@ use crate::control_plane_auth::{
 use crate::control_plane_command::{
     decode_control_plane_command, encode_control_plane_command, AppliedControlPlaneCommand,
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneCommandStateMachine,
-    ControlPlaneLogId, ExpiredNodeHeartbeatLease, PromotedNodeHeartbeatLease,
-    ReadyPgPeeringCompletion, UnavailablePgStagingIntentAuthorizationRequest,
-    UnavailablePgStagingPublicationBinding, UnavailablePgTransitionBeginRequest,
-    UnavailablePgTransitionCompletionRequest, UnavailablePgTransitionInstallRequest,
+    ControlPlaneLogId, ExpiredNodeHeartbeatLease, FinalizeMetadataTransferStagingGenerationRequest,
+    MetadataTransferStagingTombstoneBinding, PromotedNodeHeartbeatLease, ReadyPgPeeringCompletion,
+    UnavailablePgStagingIntentAuthorizationRequest, UnavailablePgStagingPublicationBinding,
+    UnavailablePgTransitionBeginRequest, UnavailablePgTransitionCompletionRequest,
+    UnavailablePgTransitionInstallRequest,
 };
 
 pub(crate) struct AuthorityPublishedStagingAuthorizationSeal {
@@ -95,6 +96,8 @@ const METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_PREFIX: &str =
     "metadata_transfer_staging_evidence_checkpoint=";
 const METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_STATE_RECORD_PREFIX: &str =
     "metadata_transfer_staging_actor_closure=";
+const METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_STATE_RECORD_PREFIX: &str =
+    "metadata_transfer_staging_finalized_floor=";
 pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
@@ -111,9 +114,11 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 39;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 40;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
+const METADATA_TRANSFER_STAGING_CLEANUP_DIGEST_DOMAIN: &[u8] =
+    b"argmin-metadata-transfer-staging-cleanup-v1";
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
 const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
@@ -888,6 +893,8 @@ pub struct ClusterControlSnapshot {
         BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidenceCheckpointSegment>,
     metadata_transfer_staging_actor_closures:
         BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureCertificate>,
+    metadata_transfer_staging_finalized_floors:
+        BTreeMap<(PgId, u64), MetadataTransferStagingFinalizedFloor>,
     metadata_transfer_staging_evidence: BTreeMap<MetadataTransferStagingEvidenceKey, Vec<u8>>,
     history: Vec<ClusterMapHistoryRecord>,
 }
@@ -927,6 +934,13 @@ struct MetadataTransferStagingEvidenceCheckpointPageLink {
     page_digest: [u8; 32],
     previous_apply_receipt_digest: [u8; 32],
     apply_receipt_digest: [u8; 32],
+    entries: Vec<MetadataTransferStagingEvidenceCheckpointPageEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataTransferStagingEvidenceCheckpointPageEntry {
+    sequence: u64,
+    evidence_key: MetadataTransferStagingEvidenceKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -940,6 +954,65 @@ struct MetadataTransferStagingActorClosureCertificate {
     rebound_entry_count: u64,
     rebound_max_sequence: u64,
     rebound_evidence_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataTransferStagingFinalizedFloor {
+    transition: UnavailablePgTransitionMutationBinding,
+    staging_generation: u64,
+    artifact_digest: [u8; 32],
+    artifact_length: u64,
+    artifact_format_version: u16,
+    publications: Vec<MetadataTransferStagingFinalizedPublicationBinding>,
+    tombstones: Vec<MetadataTransferStagingTombstoneBinding>,
+    tombstone_set_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataTransferStagingFinalizedPublicationBinding {
+    node_id: NodeId,
+    node_incarnation: u64,
+    endpoint: String,
+    target_epoch: ClusterEpoch,
+    transfer: PgMetadataTransferProof,
+    evidence_digest: [u8; 32],
+}
+
+type MetadataTransferStagingFinalizedPublicationIndex<'a> = BTreeMap<
+    (PgId, u64, ClusterEpoch, NodeId),
+    &'a MetadataTransferStagingFinalizedPublicationBinding,
+>;
+
+fn metadata_transfer_staging_finalized_publication_index(
+    floors: &BTreeMap<(PgId, u64), MetadataTransferStagingFinalizedFloor>,
+) -> Result<MetadataTransferStagingFinalizedPublicationIndex<'_>, String> {
+    let mut index = BTreeMap::new();
+    for ((pg_id, staging_generation), floor) in floors {
+        if floor.publications.len()
+            > crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
+                .saturating_mul(floor.transition.destination_acting_set().len())
+        {
+            return Err(
+                "metadata-transfer staging finalized publication exceeds its bounded actor-target index"
+                    .to_owned(),
+            );
+        }
+        for publication in &floor.publications {
+            let key = (
+                *pg_id,
+                *staging_generation,
+                publication.target_epoch,
+                publication.node_id,
+            );
+            if index.insert(key, publication).is_some() {
+                return Err(
+                    "metadata-transfer staging finalized publication has a duplicate actor-target identity"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    Ok(index)
 }
 
 #[derive(Clone)]
@@ -971,6 +1044,16 @@ fn metadata_transfer_staging_evidence_key(
         kind: evidence.kind(),
         target_epoch: evidence.target_epoch(),
     }
+}
+
+fn metadata_transfer_staging_finalized_generation(
+    floors: &BTreeMap<(PgId, u64), MetadataTransferStagingFinalizedFloor>,
+    pg_id: PgId,
+) -> Option<u64> {
+    floors
+        .range((pg_id, 0)..=(pg_id, u64::MAX))
+        .next_back()
+        .map(|(key, _)| key.1)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1500,6 +1583,35 @@ fn digest_unavailable_pg_transition_binding(
     digest_node_ids(hasher, &binding.destination_acting_set);
 }
 
+fn metadata_transfer_staging_cleanup_digest(
+    transition: &UnavailablePgTransitionMutationBinding,
+    staging_generation: u64,
+    artifact_digest: [u8; 32],
+    artifact_length: u64,
+    artifact_format_version: u16,
+    tombstones: &[MetadataTransferStagingTombstoneBinding],
+) -> [u8; 32] {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(&mut hasher, METADATA_TRANSFER_STAGING_CLEANUP_DIGEST_DOMAIN);
+    digest_unavailable_pg_transition_binding(&mut hasher, transition);
+    digest_u64(&mut hasher, staging_generation);
+    digest_bytes(&mut hasher, &artifact_digest);
+    digest_u64(&mut hasher, artifact_length);
+    digest_u16(&mut hasher, artifact_format_version);
+    digest_len(&mut hasher, tombstones.len());
+    for tombstone in tombstones {
+        digest_u32(&mut hasher, tombstone.node_id.as_u32());
+        digest_u64(&mut hasher, tombstone.node_incarnation);
+        digest_bytes(&mut hasher, tombstone.endpoint.as_bytes());
+        digest_bytes(&mut hasher, &tombstone.evidence_digest);
+    }
+    hasher
+        .finalize()
+        .bytes()
+        .try_into()
+        .expect("SHA-256 staging cleanup digest must contain 32 bytes")
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UnavailablePgReconciliationCursor {
     after_pg_id: Option<PgId>,
@@ -1774,6 +1886,7 @@ impl ClusterControlSnapshot {
             metadata_transfer_staging_evidence_pages: BTreeMap::new(),
             metadata_transfer_staging_evidence_checkpoint_segments: BTreeMap::new(),
             metadata_transfer_staging_actor_closures: BTreeMap::new(),
+            metadata_transfer_staging_finalized_floors: BTreeMap::new(),
             metadata_transfer_staging_evidence: BTreeMap::new(),
             history: Vec::new(),
         }
@@ -3318,9 +3431,130 @@ impl ClusterControlSnapshot {
         Ok(())
     }
 
+    fn metadata_transfer_staging_checkpoint_evidence_bytes(
+        &self,
+        key: &MetadataTransferStagingEvidenceKey,
+        actor: &crate::pg_store::MetadataTransferStagingNodeIdentity,
+        finalized_publications: &MetadataTransferStagingFinalizedPublicationIndex<'_>,
+        expected_digest: [u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        if let Some(bytes) = self.metadata_transfer_staging_evidence.get(key) {
+            if checksum::sha256::digest(bytes) != expected_digest {
+                return Err(
+                    "metadata-transfer staging checkpoint commitment digest is invalid".to_owned(),
+                );
+            }
+            return Ok(bytes.clone());
+        }
+        let floor = self
+            .metadata_transfer_staging_finalized_floors
+            .get(&(key.pg_id, key.staging_generation))
+            .ok_or_else(|| {
+                "metadata-transfer staging checkpoint member lacks detailed or finalized evidence"
+                    .to_owned()
+            })?;
+        let transition = self
+            .retained_unavailable_pg_placement_transitions
+            .get(&(key.pg_id, floor.transition.transition_epoch()))
+            .filter(|transition| floor.transition.matches_transition(transition))
+            .ok_or_else(|| {
+                "metadata-transfer staging checkpoint member has no exact finalized transition"
+                    .to_owned()
+            })?;
+        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
+            "metadata-transfer staging checkpoint member has no finalized authorization".to_owned()
+        })?;
+        if actor.node_id() != key.actor_node_id
+            || actor.node_incarnation() != key.actor_node_incarnation
+        {
+            return Err(
+                "metadata-transfer staging checkpoint member actor does not match its page"
+                    .to_owned(),
+            );
+        }
+        let (target_epoch, transfer) = match key.kind {
+            crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone => {
+                let tombstone = floor
+                    .tombstones
+                    .iter()
+                    .find(|tombstone| {
+                        tombstone.node_id == key.actor_node_id
+                            && tombstone.node_incarnation == key.actor_node_incarnation
+                    })
+                    .ok_or_else(|| {
+                        "metadata-transfer staging checkpoint tombstone is absent from its finalized certificate"
+                            .to_owned()
+                    })?;
+                if key.target_epoch.is_some()
+                    || tombstone.endpoint != actor.endpoint()
+                    || tombstone.evidence_digest != expected_digest
+                {
+                    return Err(
+                        "metadata-transfer staging checkpoint tombstone does not match its finalized certificate"
+                            .to_owned(),
+                    );
+                }
+                (None, None)
+            }
+            crate::pg_store::MetadataTransferStagingEvidenceKind::Publication => {
+                let target_epoch = key.target_epoch.ok_or_else(|| {
+                    "metadata-transfer staging checkpoint publication has no target epoch"
+                        .to_owned()
+                })?;
+                let publication = finalized_publications
+                    .get(&(
+                        key.pg_id,
+                        key.staging_generation,
+                        target_epoch,
+                        key.actor_node_id,
+                    ))
+                    .copied()
+                    .ok_or_else(|| {
+                        "metadata-transfer staging checkpoint publication is absent from its finalized certificate"
+                            .to_owned()
+                    })?;
+                if publication.node_incarnation != key.actor_node_incarnation
+                    || publication.endpoint != actor.endpoint()
+                    || publication.evidence_digest != expected_digest
+                {
+                    return Err(
+                        "metadata-transfer staging checkpoint publication does not match its finalized certificate"
+                            .to_owned(),
+                    );
+                }
+                (Some(target_epoch), Some(publication.transfer))
+            }
+        };
+        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            &floor.transition,
+            authorization.artifact_digest,
+            authorization.artifact_length,
+            authorization.artifact_format_version,
+        )
+        .map_err(|error| error.to_string())?;
+        let bytes = crate::pg_store::canonical_metadata_transfer_staging_evidence(
+            actor,
+            &intent,
+            key.kind,
+            target_epoch,
+            transfer,
+        )
+        .map_err(|error| error.to_string())?;
+        if checksum::sha256::digest(&bytes) != expected_digest {
+            return Err(
+                "metadata-transfer staging checkpoint member is not canonically committed"
+                    .to_owned(),
+            );
+        }
+        Ok(bytes)
+    }
+
     fn validate_metadata_transfer_staging_evidence_invariants(&self) -> Result<(), String> {
         let mut page_members = BTreeMap::new();
         let mut checkpoint_members = BTreeMap::new();
+        let finalized_publications = metadata_transfer_staging_finalized_publication_index(
+            &self.metadata_transfer_staging_finalized_floors,
+        )?;
         type ChainRange = (u64, u64, u64, [u8; 32], [u8; 32], bool);
         let mut actor_chains: BTreeMap<(NodeId, u64, String), Vec<ChainRange>> = BTreeMap::new();
         for (key, record) in &self.metadata_transfer_staging_evidence_pages {
@@ -3390,6 +3624,17 @@ impl ClusterControlSnapshot {
                     kind: evidence.kind(),
                     target_epoch: evidence.target_epoch(),
                 };
+                if metadata_transfer_staging_finalized_generation(
+                    &self.metadata_transfer_staging_finalized_floors,
+                    evidence_key.pg_id,
+                )
+                .is_some_and(|floor| evidence_key.staging_generation <= floor)
+                {
+                    return Err(
+                        "metadata-transfer staging page retains evidence at or below its finalized floor"
+                            .to_owned(),
+                    );
+                }
                 if page_members
                     .insert(evidence_key, entry.evidence().to_vec())
                     .is_some()
@@ -3454,11 +3699,18 @@ impl ClusterControlSnapshot {
             }
             let mut preceding_generation = segment.previous_generation;
             let mut preceding_digest = segment.previous_apply_receipt_digest;
+            let mut segment_members = BTreeSet::new();
             for (offset, link) in segment.page_links.iter().enumerate() {
-                if link.previous_apply_receipt_digest != preceding_digest {
+                if link.previous_apply_receipt_digest != preceding_digest
+                    || link.entries.is_empty()
+                    || link.entries.len() > crate::pg_store::MAX_STAGING_EVIDENCE_PAGE_ENTRIES
+                    || link
+                        .entries
+                        .windows(2)
+                        .any(|pair| pair[0].sequence >= pair[1].sequence)
+                {
                     return Err(
-                        "metadata-transfer staging checkpoint page links are discontinuous"
-                            .to_owned(),
+                        "metadata-transfer staging checkpoint page link is invalid".to_owned()
                     );
                 }
                 let generation = segment
@@ -3470,6 +3722,61 @@ impl ClusterControlSnapshot {
                     .ok_or_else(|| {
                         "metadata-transfer staging checkpoint page generation overflow".to_owned()
                     })?;
+                let mut page_entries = Vec::with_capacity(link.entries.len());
+                for entry in &link.entries {
+                    if !segment_members.insert(entry.evidence_key.clone())
+                        || entry.evidence_key.actor_node_id != segment.actor.node_id()
+                        || entry.evidence_key.actor_node_incarnation
+                            != segment.actor.node_incarnation()
+                    {
+                        return Err(
+                            "metadata-transfer staging checkpoint page membership is invalid"
+                                .to_owned(),
+                        );
+                    }
+                    let evidence_digest = *segment
+                        .commitments
+                        .get(&entry.evidence_key)
+                        .ok_or_else(|| {
+                            "metadata-transfer staging checkpoint page member has no commitment"
+                                .to_owned()
+                        })?;
+                    let evidence = self.metadata_transfer_staging_checkpoint_evidence_bytes(
+                        &entry.evidence_key,
+                        &segment.actor,
+                        &finalized_publications,
+                        evidence_digest,
+                    )?;
+                    page_entries.push((entry.sequence, evidence));
+                    if checkpoint_members
+                        .insert(
+                            entry.evidence_key.clone(),
+                            (evidence_digest, segment.actor.clone()),
+                        )
+                        .is_some()
+                        || page_members.contains_key(&entry.evidence_key)
+                    {
+                        return Err(
+                            "metadata-transfer staging evidence appears in more than one retained chain range"
+                                .to_owned(),
+                        );
+                    }
+                }
+                let reconstructed_page_digest =
+                    crate::pg_store::metadata_transfer_staging_checkpoint_page_digest(
+                        &segment.actor,
+                        preceding_generation,
+                        preceding_digest,
+                        generation,
+                        &page_entries,
+                    )
+                    .map_err(|error| error.to_string())?;
+                if reconstructed_page_digest != link.page_digest {
+                    return Err(
+                        "metadata-transfer staging checkpoint page membership does not match its digest"
+                            .to_owned(),
+                    );
+                }
                 let expected_receipt = crate::pg_store::
                     MetadataTransferStagingEvidenceApplyReceipt::for_checkpoint_link(
                         segment.actor.clone(),
@@ -3507,19 +3814,10 @@ impl ClusterControlSnapshot {
                     "metadata-transfer staging checkpoint tip receipt is invalid".to_owned(),
                 );
             }
-            for (evidence_key, digest) in &segment.commitments {
-                if evidence_key.actor_node_id != segment.actor.node_id()
-                    || evidence_key.actor_node_incarnation != segment.actor.node_incarnation()
-                    || checkpoint_members
-                        .insert(evidence_key.clone(), (*digest, segment.actor.clone()))
-                        .is_some()
-                    || page_members.contains_key(evidence_key)
-                {
-                    return Err(
-                        "metadata-transfer staging evidence appears in more than one retained chain range"
-                            .to_owned(),
-                    );
-                }
+            if segment_members.len() != segment.commitments.len() {
+                return Err(
+                    "metadata-transfer staging checkpoint has unassigned commitments".to_owned(),
+                );
             }
             actor_chains
                 .entry((key.0, key.1, segment.actor.endpoint().to_owned()))
@@ -3583,13 +3881,226 @@ impl ClusterControlSnapshot {
                 );
             }
         }
-        if page_members.len() + checkpoint_members.len()
-            != self.metadata_transfer_staging_evidence.len()
+        for ((pg_id, staging_generation), floor) in &self.metadata_transfer_staging_finalized_floors
         {
-            return Err(
-                "metadata-transfer staging detailed evidence does not exactly match retained chain membership"
-                    .to_owned(),
-            );
+            if *pg_id != floor.transition.pg_id()
+                || *staging_generation != floor.staging_generation
+                || floor.staging_generation != floor.transition.transition_epoch().get()
+                || floor.publications.is_empty()
+                || floor.publications.windows(2).any(|pair| {
+                    (pair[0].target_epoch, pair[0].node_id)
+                        >= (pair[1].target_epoch, pair[1].node_id)
+                })
+                || floor.tombstones.is_empty()
+                || floor
+                    .tombstones
+                    .windows(2)
+                    .any(|pair| pair[0].node_id >= pair[1].node_id)
+                || floor.tombstone_set_digest
+                    != metadata_transfer_staging_cleanup_digest(
+                        &floor.transition,
+                        floor.staging_generation,
+                        floor.artifact_digest,
+                        floor.artifact_length,
+                        floor.artifact_format_version,
+                        &floor.tombstones,
+                    )
+            {
+                return Err(
+                    "metadata-transfer staging finalized floor has invalid identity or digest"
+                        .to_owned(),
+                );
+            }
+            let transition = self
+                .retained_unavailable_pg_placement_transitions
+                .get(&(*pg_id, floor.transition.transition_epoch()))
+                .filter(|transition| floor.transition.matches_transition(transition))
+                .ok_or_else(|| {
+                    "metadata-transfer staging finalized floor has no exact retained transition"
+                        .to_owned()
+                })?;
+            if transition.destination_epoch.is_none()
+                || transition.completion.is_none()
+                || transition.completion_batch_receipt.is_none()
+            {
+                return Err(
+                    "metadata-transfer staging finalized floor transition is not completed"
+                        .to_owned(),
+                );
+            }
+            let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
+                "metadata-transfer staging finalized floor has no retained authorization".to_owned()
+            })?;
+            if authorization.staging_generation != floor.staging_generation
+                || authorization.artifact_digest != floor.artifact_digest
+                || authorization.artifact_length != floor.artifact_length
+                || authorization.artifact_format_version != floor.artifact_format_version
+                || transition.destination_acting_set.len() != floor.tombstones.len()
+                || transition
+                    .destination_acting_set
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    != floor
+                        .tombstones
+                        .iter()
+                        .map(|tombstone| tombstone.node_id)
+                        .collect()
+            {
+                return Err(
+                    "metadata-transfer staging finalized floor does not match its authorization"
+                        .to_owned(),
+                );
+            }
+            let install = transition.destination_install.as_ref().ok_or_else(|| {
+                "metadata-transfer staging finalized floor has no destination install".to_owned()
+            })?;
+            let mut publication_transfers = BTreeMap::new();
+            for publication in &floor.publications {
+                let node = self.nodes.get(&publication.node_id).ok_or_else(|| {
+                    "metadata-transfer staging finalized publication references an unknown actor"
+                        .to_owned()
+                })?;
+                if !transition
+                    .destination_acting_set
+                    .contains(&publication.node_id)
+                    || node.node_incarnation < publication.node_incarnation
+                    || (node.node_incarnation == publication.node_incarnation
+                        && node.endpoint != publication.endpoint)
+                    || publication.target_epoch <= transition.transition_epoch
+                    || publication.transfer.source_epoch() > transition.source_epoch
+                {
+                    return Err(
+                        "metadata-transfer staging finalized publication has invalid authority"
+                            .to_owned(),
+                    );
+                }
+                if let Some(existing) =
+                    publication_transfers.insert(publication.target_epoch, publication.transfer)
+                {
+                    if existing != publication.transfer {
+                        return Err(
+                            "metadata-transfer staging finalized publication target has conflicting proofs"
+                                .to_owned(),
+                        );
+                    }
+                }
+                let key = MetadataTransferStagingEvidenceKey {
+                    pg_id: *pg_id,
+                    staging_generation: floor.staging_generation,
+                    actor_node_id: publication.node_id,
+                    actor_node_incarnation: publication.node_incarnation,
+                    kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                    target_epoch: Some(publication.target_epoch),
+                };
+                let Some((digest, actor)) = checkpoint_members.get(&key) else {
+                    return Err(
+                        "metadata-transfer staging finalized publication has no checkpoint commitment"
+                            .to_owned(),
+                    );
+                };
+                if *digest != publication.evidence_digest
+                    || actor.node_id() != publication.node_id
+                    || actor.node_incarnation() != publication.node_incarnation
+                    || actor.endpoint() != publication.endpoint
+                {
+                    return Err(
+                        "metadata-transfer staging finalized publication does not match its checkpoint commitment"
+                            .to_owned(),
+                    );
+                }
+            }
+            if publication_transfers.len() > crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT {
+                return Err(format!(
+                    "metadata-transfer staging finalized publication exceeds the per-intent target limit {}",
+                    crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
+                ));
+            }
+            let final_publications = floor
+                .publications
+                .iter()
+                .filter(|publication| {
+                    publication.target_epoch == install.batch_receipt.target_epoch
+                })
+                .collect::<Vec<_>>();
+            if final_publications.len() != install.publications.len()
+                || install.publications.iter().any(|installed| {
+                    !final_publications.iter().any(|publication| {
+                        publication.node_id == installed.node_id
+                            && publication.node_incarnation == installed.node_incarnation
+                            && publication.endpoint == installed.endpoint
+                            && publication.evidence_digest == installed.evidence_digest
+                            && publication.transfer == install.transfer
+                    })
+                })
+            {
+                return Err(
+                    "metadata-transfer staging finalized publication does not match its destination install"
+                        .to_owned(),
+                );
+            }
+            for tombstone in &floor.tombstones {
+                let node = self.nodes.get(&tombstone.node_id).ok_or_else(|| {
+                    "metadata-transfer staging finalized floor references an unknown actor"
+                        .to_owned()
+                })?;
+                if node.node_incarnation < tombstone.node_incarnation
+                    || (node.node_incarnation == tombstone.node_incarnation
+                        && node.endpoint != tombstone.endpoint)
+                {
+                    return Err(
+                        "metadata-transfer staging finalized floor actor is incompatible with current node identity"
+                            .to_owned(),
+                    );
+                }
+                let key = MetadataTransferStagingEvidenceKey {
+                    pg_id: *pg_id,
+                    staging_generation: floor.staging_generation,
+                    actor_node_id: tombstone.node_id,
+                    actor_node_incarnation: tombstone.node_incarnation,
+                    kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+                    target_epoch: None,
+                };
+                let Some((digest, actor)) = checkpoint_members.get(&key) else {
+                    return Err(
+                        "metadata-transfer staging finalized floor tombstone has no checkpoint commitment"
+                            .to_owned(),
+                    );
+                };
+                if *digest != tombstone.evidence_digest
+                    || actor.node_id() != tombstone.node_id
+                    || actor.node_incarnation() != tombstone.node_incarnation
+                    || actor.endpoint() != tombstone.endpoint
+                {
+                    return Err(
+                        "metadata-transfer staging finalized floor tombstone does not match its checkpoint commitment"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        for transition in self
+            .retained_unavailable_pg_placement_transitions
+            .values()
+            .chain(self.unavailable_pg_placement_transitions.values())
+        {
+            let Some(authorization) = transition.staging_authorization.as_ref() else {
+                continue;
+            };
+            if metadata_transfer_staging_finalized_generation(
+                &self.metadata_transfer_staging_finalized_floors,
+                transition.pg_id,
+            )
+            .is_some_and(|floor| authorization.staging_generation <= floor)
+                && !self
+                    .metadata_transfer_staging_finalized_floors
+                    .contains_key(&(transition.pg_id, authorization.staging_generation))
+            {
+                return Err(
+                    "metadata-transfer staging finalized floor skips an authorized generation"
+                        .to_owned(),
+                );
+            }
         }
         let mut publication_targets = BTreeMap::<_, BTreeSet<_>>::new();
         for (key, bytes) in &self.metadata_transfer_staging_evidence {
@@ -3637,6 +4148,57 @@ impl ClusterControlSnapshot {
             }
             self.validate_metadata_transfer_staging_evidence_authority(&evidence, false)
                 .map_err(|error| error.to_string())?;
+        }
+        for (key, expected) in &page_members {
+            if self.metadata_transfer_staging_evidence.get(key) != Some(expected) {
+                return Err(
+                    "metadata-transfer staging page member lacks exact detailed evidence"
+                        .to_owned(),
+                );
+            }
+        }
+        for (key, (expected_digest, expected_actor)) in &checkpoint_members {
+            let covered = metadata_transfer_staging_finalized_generation(
+                &self.metadata_transfer_staging_finalized_floors,
+                key.pg_id,
+            )
+            .is_some_and(|floor| key.staging_generation <= floor);
+            match (covered, self.metadata_transfer_staging_evidence.get(key)) {
+                (true, None) => {}
+                (false, Some(bytes))
+                    if *expected_digest == checksum::sha256::digest(bytes)
+                        && crate::pg_store::decode_staging_evidence(bytes)
+                            .is_ok_and(|evidence| evidence.actor() == expected_actor) => {}
+                (true, Some(_)) => {
+                    return Err(
+                        "metadata-transfer staging finalized evidence remains detailed".to_owned(),
+                    );
+                }
+                (false, _) => {
+                    return Err(
+                        "metadata-transfer staging checkpoint member lacks exact detailed evidence"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        if self.metadata_transfer_staging_evidence.len()
+            != page_members.len()
+                + checkpoint_members
+                    .keys()
+                    .filter(|key| {
+                        metadata_transfer_staging_finalized_generation(
+                            &self.metadata_transfer_staging_finalized_floors,
+                            key.pg_id,
+                        )
+                        .is_none_or(|floor| key.staging_generation > floor)
+                    })
+                    .count()
+        {
+            return Err(
+                "metadata-transfer staging detailed evidence does not exactly match retained uncovered chain membership"
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -3759,6 +4321,20 @@ impl ClusterControlSnapshot {
                 kind: evidence.kind(),
                 target_epoch: evidence.target_epoch(),
             };
+            if metadata_transfer_staging_finalized_generation(
+                &self.metadata_transfer_staging_finalized_floors,
+                key.pg_id,
+            )
+            .is_some_and(|floor| key.staging_generation <= floor)
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} staging evidence generation {} is at or below finalized floor",
+                        key.pg_id.get(),
+                        key.staging_generation
+                    ),
+                });
+            }
             if key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication {
                 let target_epoch =
                     key.target_epoch
@@ -4269,11 +4845,7 @@ impl ClusterControlSnapshot {
                     message: "receipt does not identify its page".to_owned(),
                 });
             }
-            page_links.push(MetadataTransferStagingEvidenceCheckpointPageLink {
-                page_digest: page.page_digest(),
-                previous_apply_receipt_digest: page.previous_apply_receipt_digest(),
-                apply_receipt_digest: checksum::sha256::digest(&record.apply_receipt),
-            });
+            let mut link_entries = Vec::with_capacity(page.entries().len());
             for entry in page.entries() {
                 let evidence = crate::pg_store::decode_staging_evidence(entry.evidence()).map_err(
                     |error| ControlPlaneError::SnapshotInvariantViolation {
@@ -4282,6 +4854,10 @@ impl ClusterControlSnapshot {
                     },
                 )?;
                 let key = metadata_transfer_staging_evidence_key(&evidence);
+                link_entries.push(MetadataTransferStagingEvidenceCheckpointPageEntry {
+                    sequence: entry.sequence(),
+                    evidence_key: key.clone(),
+                });
                 if commitments
                     .insert(key, checksum::sha256::digest(entry.evidence()))
                     .is_some()
@@ -4302,6 +4878,12 @@ impl ClusterControlSnapshot {
                     });
                 }
             }
+            page_links.push(MetadataTransferStagingEvidenceCheckpointPageLink {
+                page_digest: page.page_digest(),
+                previous_apply_receipt_digest: page.previous_apply_receipt_digest(),
+                apply_receipt_digest: checksum::sha256::digest(&record.apply_receipt),
+                entries: link_entries,
+            });
             expected_previous_generation = Some(generation);
             expected_previous_digest = Some(checksum::sha256::digest(&record.apply_receipt));
             tip_apply_receipt.clone_from(&record.apply_receipt);
@@ -4356,6 +4938,320 @@ impl ClusterControlSnapshot {
             first_generation,
             last_generation,
         };
+        self.apply_control_plane_command(command.clone())?;
+        Ok(command)
+    }
+
+    fn finalize_metadata_transfer_staging_generation(
+        &self,
+        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        let pg_id = cleanup.unavailable_transition.pg_id();
+        if cleanup.staging_generation == 0
+            || cleanup.staging_generation != cleanup.unavailable_transition.transition_epoch().get()
+            || cleanup.tombstones.is_empty()
+            || cleanup
+                .tombstones
+                .windows(2)
+                .any(|pair| pair[0].node_id >= pair[1].node_id)
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging cleanup has invalid generation or destination ordering",
+                    pg_id.get()
+                ),
+            });
+        }
+        let transition = self
+            .retained_unavailable_pg_placement_transitions
+            .get(&(pg_id, cleanup.unavailable_transition.transition_epoch()))
+            .filter(|transition| cleanup.unavailable_transition.matches_transition(transition))
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging cleanup requires its exact completed transition",
+                    pg_id.get()
+                ),
+            })?;
+        if transition.destination_epoch.is_none()
+            || transition.completion.is_none()
+            || transition.completion_batch_receipt.is_none()
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging cleanup requires its exact completed transition",
+                    pg_id.get()
+                ),
+            });
+        }
+        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
+            ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging cleanup has no retained authorization",
+                    pg_id.get()
+                ),
+            }
+        })?;
+        if authorization.staging_generation != cleanup.staging_generation
+            || transition.destination_acting_set.len() != cleanup.tombstones.len()
+            || transition
+                .destination_acting_set
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != cleanup
+                    .tombstones
+                    .iter()
+                    .map(|tombstone| tombstone.node_id)
+                    .collect()
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging cleanup does not match its authorization obligations",
+                    pg_id.get()
+                ),
+            });
+        }
+        let transition_binding = cleanup.unavailable_transition;
+        let staging_generation = cleanup.staging_generation;
+        let tombstones = cleanup.tombstones;
+        let tombstone_set_digest = metadata_transfer_staging_cleanup_digest(
+            &transition_binding,
+            staging_generation,
+            authorization.artifact_digest,
+            authorization.artifact_length,
+            authorization.artifact_format_version,
+            &tombstones,
+        );
+        let certificate_key = (pg_id, staging_generation);
+        if let Some(existing) = self
+            .metadata_transfer_staging_finalized_floors
+            .get(&certificate_key)
+        {
+            if existing.transition == transition_binding
+                && existing.staging_generation == staging_generation
+                && existing.artifact_digest == authorization.artifact_digest
+                && existing.artifact_length == authorization.artifact_length
+                && existing.artifact_format_version == authorization.artifact_format_version
+                && existing.tombstones == tombstones
+                && existing.tombstone_set_digest == tombstone_set_digest
+            {
+                return Ok(AppliedControlPlaneCommand::new(
+                    self.clone(),
+                    ControlPlaneCommandResponse::FinalizeMetadataTransferStagingGeneration,
+                    false,
+                ));
+            }
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging cleanup conflicts with finalized generation {}",
+                    pg_id.get(),
+                    existing.staging_generation
+                ),
+            });
+        }
+        let previous_floor = metadata_transfer_staging_finalized_generation(
+            &self.metadata_transfer_staging_finalized_floors,
+            pg_id,
+        )
+        .unwrap_or(0);
+        if previous_floor >= staging_generation {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging cleanup is older than finalized generation {}",
+                    pg_id.get(),
+                    previous_floor
+                ),
+            });
+        }
+        if self
+            .retained_unavailable_pg_placement_transitions
+            .values()
+            .chain(self.unavailable_pg_placement_transitions.values())
+            .filter(|candidate| candidate.pg_id == pg_id)
+            .filter_map(|candidate| candidate.staging_authorization.as_ref())
+            .any(|authorization| {
+                authorization.staging_generation > previous_floor
+                    && authorization.staging_generation < staging_generation
+            })
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging cleanup cannot skip an authorized generation",
+                    pg_id.get()
+                ),
+            });
+        }
+
+        for tombstone in &tombstones {
+            let key = MetadataTransferStagingEvidenceKey {
+                pg_id,
+                staging_generation,
+                actor_node_id: tombstone.node_id,
+                actor_node_incarnation: tombstone.node_incarnation,
+                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+                target_epoch: None,
+            };
+            let bytes = self
+                .metadata_transfer_staging_evidence
+                .get(&key)
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} metadata-transfer staging cleanup lacks a tombstone for node {}",
+                        pg_id.get(),
+                        tombstone.node_id.as_u32()
+                    ),
+                })?;
+            let evidence = crate::pg_store::decode_staging_evidence(bytes).map_err(|error| {
+                ControlPlaneError::SnapshotInvariantViolation {
+                    context: "retained metadata-transfer staging evidence is invalid",
+                    message: error.to_string(),
+                }
+            })?;
+            if evidence.actor().endpoint() != tombstone.endpoint
+                || checksum::sha256::digest(bytes) != tombstone.evidence_digest
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} metadata-transfer staging cleanup tombstone for node {} is not exact",
+                        pg_id.get(),
+                        tombstone.node_id.as_u32()
+                    ),
+                });
+            }
+        }
+
+        let covered_keys = self
+            .metadata_transfer_staging_evidence
+            .keys()
+            .filter(|key| {
+                key.pg_id == pg_id
+                    && key.staging_generation > previous_floor
+                    && key.staging_generation <= staging_generation
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if covered_keys
+            .iter()
+            .any(|key| key.staging_generation != staging_generation)
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} metadata-transfer staging cleanup cannot skip an unfinished generation",
+                    pg_id.get()
+                ),
+            });
+        }
+        for key in &covered_keys {
+            if !self
+                .metadata_transfer_staging_evidence_checkpoint_segments
+                .values()
+                .any(|segment| segment.commitments.contains_key(key))
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} metadata-transfer staging cleanup evidence is not checkpoint-covered",
+                        pg_id.get()
+                    ),
+                });
+            }
+            if self
+                .metadata_transfer_staging_actor_closures
+                .values()
+                .any(|closure| {
+                    (closure.source_actor.node_id() == key.actor_node_id
+                        && closure.source_actor.node_incarnation() == key.actor_node_incarnation)
+                        || (closure.destination_actor.node_id() == key.actor_node_id
+                            && closure.destination_actor.node_incarnation()
+                                == key.actor_node_incarnation)
+                })
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} metadata-transfer staging cleanup awaits actor-closure retirement",
+                        pg_id.get()
+                    ),
+                });
+            }
+        }
+
+        let mut publications = covered_keys
+            .iter()
+            .filter(|key| {
+                key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication
+            })
+            .map(|key| {
+                let bytes = self
+                    .metadata_transfer_staging_evidence
+                    .get(key)
+                    .expect("covered staging evidence key came from the detailed map");
+                let evidence =
+                    crate::pg_store::decode_staging_evidence(bytes).map_err(|error| {
+                        ControlPlaneError::SnapshotInvariantViolation {
+                            context: "retained metadata-transfer staging evidence is invalid",
+                            message: error.to_string(),
+                        }
+                    })?;
+                let target_epoch =
+                    evidence
+                        .target_epoch()
+                        .ok_or_else(|| ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} metadata-transfer staging publication lacks a target epoch",
+                                pg_id.get()
+                            ),
+                        })?;
+                let transfer =
+                    evidence
+                        .transfer()
+                        .ok_or_else(|| ControlPlaneError::CommandDecode {
+                            message: format!(
+                            "PG {} metadata-transfer staging publication lacks a transfer proof",
+                            pg_id.get()
+                        ),
+                        })?;
+                Ok(MetadataTransferStagingFinalizedPublicationBinding {
+                    node_id: evidence.actor().node_id(),
+                    node_incarnation: evidence.actor().node_incarnation(),
+                    endpoint: evidence.actor().endpoint().to_owned(),
+                    target_epoch,
+                    transfer,
+                    evidence_digest: checksum::sha256::digest(bytes),
+                })
+            })
+            .collect::<Result<Vec<_>, ControlPlaneError>>()?;
+        publications.sort_by_key(|publication| (publication.target_epoch, publication.node_id));
+        let certificate = MetadataTransferStagingFinalizedFloor {
+            transition: transition_binding,
+            staging_generation,
+            artifact_digest: authorization.artifact_digest,
+            artifact_length: authorization.artifact_length,
+            artifact_format_version: authorization.artifact_format_version,
+            publications,
+            tombstones,
+            tombstone_set_digest,
+        };
+
+        let mut next_snapshot = self.clone();
+        for key in covered_keys {
+            next_snapshot
+                .metadata_transfer_staging_evidence
+                .remove(&key);
+        }
+        next_snapshot
+            .metadata_transfer_staging_finalized_floors
+            .insert(certificate_key, certificate);
+        Ok(AppliedControlPlaneCommand::new(
+            next_snapshot,
+            ControlPlaneCommandResponse::FinalizeMetadataTransferStagingGeneration,
+            true,
+        ))
+    }
+
+    pub(crate) fn finalize_metadata_transfer_staging_generation_command(
+        &self,
+        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        let command = ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup };
         self.apply_control_plane_command(command.clone())?;
         Ok(command)
     }
@@ -7540,6 +8436,9 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 first_generation,
                 last_generation,
             ),
+            ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup } => {
+                self.finalize_metadata_transfer_staging_generation(cleanup)
+            }
             ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
                 transitions,
                 expected_destination_epoch,
@@ -9151,28 +10050,41 @@ fn validate_unavailable_pg_transition_invariant(
                 kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
                 target_epoch: Some(install.batch_receipt.target_epoch),
             };
-            let evidence = snapshot.metadata_transfer_staging_evidence.get(&key).ok_or_else(|| {
-                format!(
-                    "unavailable PG transition {} destination install references missing publication evidence",
-                    transition.pg_id.get()
-                )
-            })?;
-            if checksum::sha256::digest(evidence) != publication.evidence_digest {
-                return Err(format!(
-                    "unavailable PG transition {} destination install publication digest is invalid",
-                    transition.pg_id.get()
-                ));
-            }
-            let decoded = crate::pg_store::decode_staging_evidence(evidence)
-                .map_err(|error| error.to_string())?;
-            if decoded.actor().endpoint() != publication.endpoint
-                || decoded.target_epoch() != Some(install.batch_receipt.target_epoch)
-                || decoded.transfer() != Some(install.transfer)
-            {
-                return Err(format!(
-                    "unavailable PG transition {} destination install publication semantics are invalid",
-                    transition.pg_id.get()
-                ));
+            if let Some(evidence) = snapshot.metadata_transfer_staging_evidence.get(&key) {
+                if checksum::sha256::digest(evidence) != publication.evidence_digest {
+                    return Err(format!(
+                        "unavailable PG transition {} destination install publication digest is invalid",
+                        transition.pg_id.get()
+                    ));
+                }
+                let decoded = crate::pg_store::decode_staging_evidence(evidence)
+                    .map_err(|error| error.to_string())?;
+                if decoded.actor().endpoint() != publication.endpoint
+                    || decoded.target_epoch() != Some(install.batch_receipt.target_epoch)
+                    || decoded.transfer() != Some(install.transfer)
+                {
+                    return Err(format!(
+                        "unavailable PG transition {} destination install publication semantics are invalid",
+                        transition.pg_id.get()
+                    ));
+                }
+            } else {
+                let finalized = snapshot
+                    .metadata_transfer_staging_finalized_floors
+                    .get(&(transition.pg_id, authorization.staging_generation))
+                    .is_some_and(|floor| floor.transition.matches_transition(transition));
+                let committed = snapshot
+                    .metadata_transfer_staging_evidence_checkpoint_segments
+                    .values()
+                    .any(|segment| {
+                        segment.commitments.get(&key) == Some(&publication.evidence_digest)
+                    });
+                if !finalized || !committed {
+                    return Err(format!(
+                        "unavailable PG transition {} destination install references missing publication evidence",
+                        transition.pg_id.get()
+                    ));
+                }
             }
         }
         validate_unavailable_pg_transition_batch_receipt(
@@ -12813,6 +13725,16 @@ pub trait ControlPlaneAdmin {
         ))
     }
 
+    fn finalize_metadata_transfer_staging_generation(
+        &mut self,
+        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let _ = cleanup;
+        Err(ControlPlaneError::rpc_remote(
+            "metadata-transfer staging cleanup is not supported by this authority".to_owned(),
+        ))
+    }
+
     fn fence_pg_for_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -13170,6 +14092,12 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             format_metadata_transfer_staging_actor_closure(closure)
         ));
     }
+    for floor in snapshot.metadata_transfer_staging_finalized_floors.values() {
+        out.push_str(&format!(
+            "{METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_STATE_RECORD_PREFIX}{}\n",
+            format_metadata_transfer_staging_finalized_floor(floor)
+        ));
+    }
     for evidence in snapshot.metadata_transfer_staging_evidence.values() {
         out.push_str(&format!(
             "metadata_transfer_staging_evidence={}\n",
@@ -13188,6 +14116,267 @@ fn metadata_transfer_staging_evidence_checkpoint_state_record_len(
     METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_PREFIX.len()
         + format_metadata_transfer_staging_evidence_checkpoint_segment(segment).len()
         + 1
+}
+
+fn format_metadata_transfer_staging_finalized_floor(
+    floor: &MetadataTransferStagingFinalizedFloor,
+) -> String {
+    let publications = floor
+        .publications
+        .iter()
+        .map(|publication| {
+            let source = publication.transfer.source_metadata_proof();
+            let imported = publication.transfer.metadata_proof();
+            format!(
+                "{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                publication.node_id.as_u32(),
+                publication.node_incarnation,
+                hex_encode(publication.endpoint.as_bytes()),
+                publication.target_epoch.get(),
+                publication.transfer.source_epoch().get(),
+                source.applied_log_index,
+                source.applied_log_hash.encoding_version(),
+                source.applied_log_hash.value(),
+                source.state_digest.encoding_version(),
+                source.state_digest.value(),
+                imported.applied_log_index,
+                imported.applied_log_hash.encoding_version(),
+                imported.applied_log_hash.value(),
+                imported.state_digest.encoding_version(),
+                imported.state_digest.value(),
+                hex_encode(&publication.evidence_digest)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let tombstones = floor
+        .tombstones
+        .iter()
+        .map(|tombstone| {
+            format!(
+                "{}/{}/{}/{}",
+                tombstone.node_id.as_u32(),
+                tombstone.node_incarnation,
+                hex_encode(tombstone.endpoint.as_bytes()),
+                hex_encode(&tombstone.evidence_digest)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    [
+        floor.transition.pg_id().get().to_string(),
+        floor.transition.transition_epoch().get().to_string(),
+        floor.transition.source_epoch().get().to_string(),
+        format_node_list(floor.transition.source_acting_set()),
+        format_node_list(floor.transition.destination_acting_set()),
+        floor.staging_generation.to_string(),
+        hex_encode(&floor.artifact_digest),
+        floor.artifact_length.to_string(),
+        floor.artifact_format_version.to_string(),
+        floor.publications.len().to_string(),
+        publications,
+        hex_encode(&floor.tombstone_set_digest),
+        floor.tombstones.len().to_string(),
+        tombstones,
+    ]
+    .join(",")
+}
+
+fn parse_metadata_transfer_staging_finalized_floor(
+    line: usize,
+    value: &str,
+) -> Result<MetadataTransferStagingFinalizedFloor, ControlPlaneError> {
+    let fields = value.split(',').collect::<Vec<_>>();
+    if fields.len() != 14 {
+        return Err(parse_error(
+            line,
+            "metadata-transfer staging finalized floor must have fourteen fields",
+        ));
+    }
+    let publication_count = usize::try_from(parse_u64(
+        line,
+        fields[9],
+        "staging finalized-floor publication count",
+    )?)
+    .map_err(|_| {
+        parse_error(
+            line,
+            "staging finalized-floor publication count does not fit usize",
+        )
+    })?;
+    let publications = if fields[10].is_empty() {
+        Vec::new()
+    } else {
+        fields[10]
+            .split(';')
+            .map(|encoded| {
+                let parts = encoded.split('/').collect::<Vec<_>>();
+                if parts.len() != 16 {
+                    return Err(parse_error(
+                        line,
+                        "staging finalized-floor publication must have sixteen fields",
+                    ));
+                }
+                let source_metadata_proof = parse_optional_metadata_proof(
+                    line,
+                    &parts[5..10],
+                    "staging finalized-floor publication source proof",
+                )?
+                .ok_or_else(|| {
+                    parse_error(
+                        line,
+                        "staging finalized-floor publication source proof is required",
+                    )
+                })?;
+                let imported_metadata_proof = parse_optional_metadata_proof(
+                    line,
+                    &parts[10..15],
+                    "staging finalized-floor publication imported proof",
+                )?
+                .ok_or_else(|| {
+                    parse_error(
+                        line,
+                        "staging finalized-floor publication imported proof is required",
+                    )
+                })?;
+                Ok(MetadataTransferStagingFinalizedPublicationBinding {
+                    node_id: NodeId::new(parse_u32(
+                        line,
+                        parts[0],
+                        "staging finalized-floor publication node",
+                    )?),
+                    node_incarnation: parse_u64(
+                        line,
+                        parts[1],
+                        "staging finalized-floor publication incarnation",
+                    )?,
+                    endpoint: String::from_utf8(hex_decode(line, parts[2])?).map_err(|_| {
+                        parse_error(
+                            line,
+                            "staging finalized-floor publication endpoint is not UTF-8",
+                        )
+                    })?,
+                    target_epoch: parse_required_cluster_epoch(
+                        line,
+                        parts[3],
+                        "staging finalized-floor publication target epoch",
+                    )?,
+                    transfer: PgMetadataTransferProof::new_with_imported_metadata_proof(
+                        parse_required_cluster_epoch(
+                            line,
+                            parts[4],
+                            "staging finalized-floor publication source epoch",
+                        )?,
+                        source_metadata_proof,
+                        imported_metadata_proof,
+                    ),
+                    evidence_digest: hex_decode(line, parts[15])?.try_into().map_err(|_| {
+                        parse_error(
+                            line,
+                            "staging finalized-floor publication digest must contain 32 bytes",
+                        )
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, ControlPlaneError>>()?
+    };
+    if publications.len() != publication_count {
+        return Err(parse_error(
+            line,
+            "staging finalized-floor publication count does not match its entries",
+        ));
+    }
+    let tombstone_count = usize::try_from(parse_u64(
+        line,
+        fields[12],
+        "staging finalized-floor tombstone count",
+    )?)
+    .map_err(|_| {
+        parse_error(
+            line,
+            "staging finalized-floor tombstone count does not fit usize",
+        )
+    })?;
+    let tombstones = if fields[13].is_empty() {
+        Vec::new()
+    } else {
+        fields[13]
+            .split(';')
+            .map(|encoded| {
+                let parts = encoded.split('/').collect::<Vec<_>>();
+                if parts.len() != 4 {
+                    return Err(parse_error(
+                        line,
+                        "staging finalized-floor tombstone must have four fields",
+                    ));
+                }
+                Ok(MetadataTransferStagingTombstoneBinding {
+                    node_id: NodeId::new(parse_u32(
+                        line,
+                        parts[0],
+                        "staging finalized-floor tombstone node",
+                    )?),
+                    node_incarnation: parse_u64(
+                        line,
+                        parts[1],
+                        "staging finalized-floor tombstone incarnation",
+                    )?,
+                    endpoint: String::from_utf8(hex_decode(line, parts[2])?).map_err(|_| {
+                        parse_error(
+                            line,
+                            "staging finalized-floor tombstone endpoint is not UTF-8",
+                        )
+                    })?,
+                    evidence_digest: hex_decode(line, parts[3])?.try_into().map_err(|_| {
+                        parse_error(
+                            line,
+                            "staging finalized-floor tombstone digest must contain 32 bytes",
+                        )
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, ControlPlaneError>>()?
+    };
+    if tombstones.len() != tombstone_count {
+        return Err(parse_error(
+            line,
+            "staging finalized-floor tombstone count does not match its entries",
+        ));
+    }
+    Ok(MetadataTransferStagingFinalizedFloor {
+        transition: UnavailablePgTransitionMutationBinding::new(
+            PgId::new(parse_u32(line, fields[0], "staging finalized-floor PG")?),
+            parse_required_cluster_epoch(
+                line,
+                fields[1],
+                "staging finalized-floor transition epoch",
+            )?,
+            parse_required_cluster_epoch(line, fields[2], "staging finalized-floor source epoch")?,
+            parse_node_list(line, fields[3])?,
+            parse_node_list(line, fields[4])?,
+        ),
+        staging_generation: parse_u64(line, fields[5], "staging finalized-floor generation")?,
+        artifact_digest: hex_decode(line, fields[6])?.try_into().map_err(|_| {
+            parse_error(
+                line,
+                "staging finalized-floor artifact digest must contain 32 bytes",
+            )
+        })?,
+        artifact_length: parse_u64(line, fields[7], "staging finalized-floor artifact length")?,
+        artifact_format_version: parse_u16(
+            line,
+            fields[8],
+            "staging finalized-floor artifact format version",
+        )?,
+        publications,
+        tombstone_set_digest: hex_decode(line, fields[11])?.try_into().map_err(|_| {
+            parse_error(
+                line,
+                "staging finalized-floor tombstone-set digest must contain 32 bytes",
+            )
+        })?,
+        tombstones,
+    })
 }
 
 fn format_metadata_transfer_staging_actor_closure(
@@ -13291,7 +14480,22 @@ fn format_metadata_transfer_staging_evidence_checkpoint_segment(
             hex_encode(&link.page_digest),
             hex_encode(&link.previous_apply_receipt_digest),
             hex_encode(&link.apply_receipt_digest),
+            link.entries.len().to_string(),
         ]);
+        for entry in &link.entries {
+            fields.extend([
+                entry.sequence.to_string(),
+                entry.evidence_key.pg_id.get().to_string(),
+                entry.evidence_key.staging_generation.to_string(),
+                entry.evidence_key.actor_node_id.as_u32().to_string(),
+                entry.evidence_key.actor_node_incarnation.to_string(),
+                (entry.evidence_key.kind as u8).to_string(),
+                entry
+                    .evidence_key
+                    .target_epoch
+                    .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string()),
+            ]);
+        }
     }
     fields.push(segment.commitments.len().to_string());
     for (key, digest) in &segment.commitments {
@@ -13314,7 +14518,8 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
     value: &str,
 ) -> Result<MetadataTransferStagingEvidenceCheckpointSegment, ControlPlaneError> {
     const HEADER_FIELDS: usize = 9;
-    const PAGE_LINK_FIELDS: usize = 3;
+    const PAGE_LINK_FIELDS: usize = 4;
+    const PAGE_ENTRY_FIELDS: usize = 7;
     const COMMITMENT_FIELDS: usize = 7;
 
     let fields = value.split(',').collect::<Vec<_>>();
@@ -13343,17 +14548,136 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
             "metadata-transfer staging checkpoint has an invalid page-link count",
         ));
     }
-    let commitment_count_offset = HEADER_FIELDS
-        .checked_add(
-            page_link_count
-                .checked_mul(PAGE_LINK_FIELDS)
-                .ok_or_else(|| {
-                    parse_error(line, "staging checkpoint page-link field count overflow")
-                })?,
+    let endpoint_bytes = hex_decode(line, fields[2])?;
+    let endpoint = String::from_utf8(endpoint_bytes)
+        .map_err(|_| parse_error(line, "staging checkpoint endpoint is not UTF-8"))?;
+    let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        NodeId::new(parse_u32(line, fields[0], "staging checkpoint actor node")?),
+        parse_u64(line, fields[1], "staging checkpoint actor incarnation")?,
+        endpoint,
+    )
+    .map_err(|error| parse_error(line, &error.to_string()))?;
+    let first_generation = parse_u64(line, fields[3], "staging checkpoint first generation")?;
+    let last_generation = parse_u64(line, fields[4], "staging checkpoint last generation")?;
+    let previous_generation = parse_u64(line, fields[5], "staging checkpoint previous generation")?;
+    let previous_apply_receipt_digest = hex_decode(line, fields[6])?.try_into().map_err(|_| {
+        parse_error(
+            line,
+            "staging checkpoint previous receipt digest must contain 32 bytes",
         )
-        .ok_or_else(|| parse_error(line, "staging checkpoint field count overflow"))?;
+    })?;
+    let tip_apply_receipt = hex_decode(line, fields[7])?;
+    let parse_evidence_key = |offset: usize| {
+        let kind = match parse_u16(line, fields[offset + 4], "staging evidence kind")? {
+            0 => crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+            1 => crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
+            _ => {
+                return Err(parse_error(
+                    line,
+                    "invalid staging checkpoint evidence kind",
+                ))
+            }
+        };
+        let target_epoch = if fields[offset + 5] == "-" {
+            None
+        } else {
+            Some(parse_required_cluster_epoch(
+                line,
+                fields[offset + 5],
+                "staging checkpoint target epoch",
+            )?)
+        };
+        Ok(MetadataTransferStagingEvidenceKey {
+            pg_id: PgId::new(parse_u32(line, fields[offset], "staging checkpoint PG")?),
+            staging_generation: parse_u64(
+                line,
+                fields[offset + 1],
+                "staging checkpoint generation",
+            )?,
+            actor_node_id: NodeId::new(parse_u32(
+                line,
+                fields[offset + 2],
+                "staging checkpoint evidence actor",
+            )?),
+            actor_node_incarnation: parse_u64(
+                line,
+                fields[offset + 3],
+                "staging checkpoint evidence incarnation",
+            )?,
+            kind,
+            target_epoch,
+        })
+    };
+    let mut page_links = Vec::with_capacity(page_link_count);
+    let mut cursor = HEADER_FIELDS;
+    for _ in 0..page_link_count {
+        let link_end = cursor.checked_add(PAGE_LINK_FIELDS).ok_or_else(|| {
+            parse_error(line, "staging checkpoint page-link field count overflow")
+        })?;
+        if link_end > fields.len() {
+            return Err(parse_error(
+                line,
+                "staging checkpoint page-link fields are truncated",
+            ));
+        }
+        let decode_digest = |value: &str, field| {
+            hex_decode(line, value)?.try_into().map_err(|_| {
+                parse_error(
+                    line,
+                    &format!("staging checkpoint {field} must contain 32 bytes"),
+                )
+            })
+        };
+        let entry_count = usize::try_from(parse_u64(
+            line,
+            fields[cursor + 3],
+            "staging checkpoint page-entry count",
+        )?)
+        .map_err(|_| {
+            parse_error(
+                line,
+                "staging checkpoint page-entry count does not fit usize",
+            )
+        })?;
+        if entry_count == 0 || entry_count > crate::pg_store::MAX_STAGING_EVIDENCE_PAGE_ENTRIES {
+            return Err(parse_error(
+                line,
+                "staging checkpoint page-entry count is invalid",
+            ));
+        }
+        let page_digest = decode_digest(fields[cursor], "page digest")?;
+        let previous_apply_receipt_digest =
+            decode_digest(fields[cursor + 1], "page predecessor receipt digest")?;
+        let apply_receipt_digest = decode_digest(fields[cursor + 2], "page apply receipt digest")?;
+        cursor = link_end;
+        let entries_end = cursor
+            .checked_add(entry_count.checked_mul(PAGE_ENTRY_FIELDS).ok_or_else(|| {
+                parse_error(line, "staging checkpoint page-entry field count overflow")
+            })?)
+            .ok_or_else(|| parse_error(line, "staging checkpoint field count overflow"))?;
+        if entries_end > fields.len() {
+            return Err(parse_error(
+                line,
+                "staging checkpoint page-entry fields are truncated",
+            ));
+        }
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            entries.push(MetadataTransferStagingEvidenceCheckpointPageEntry {
+                sequence: parse_u64(line, fields[cursor], "staging checkpoint page sequence")?,
+                evidence_key: parse_evidence_key(cursor + 1)?,
+            });
+            cursor += PAGE_ENTRY_FIELDS;
+        }
+        page_links.push(MetadataTransferStagingEvidenceCheckpointPageLink {
+            page_digest,
+            previous_apply_receipt_digest,
+            apply_receipt_digest,
+            entries,
+        });
+    }
     let commitment_count = fields
-        .get(commitment_count_offset)
+        .get(cursor)
         .ok_or_else(|| parse_error(line, "staging checkpoint commitment count is missing"))?;
     let commitment_count = usize::try_from(parse_u64(
         line,
@@ -13374,8 +14698,8 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
             "metadata-transfer staging checkpoint has an invalid commitment count",
         ));
     }
-    let commitments_offset = commitment_count_offset + 1;
-    let expected_fields = commitments_offset
+    cursor += 1;
+    let expected_fields = cursor
         .checked_add(
             commitment_count
                 .checked_mul(COMMITMENT_FIELDS)
@@ -13390,87 +14714,10 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
             "metadata-transfer staging checkpoint field count does not match its commitments",
         ));
     }
-    let endpoint_bytes = hex_decode(line, fields[2])?;
-    let endpoint = String::from_utf8(endpoint_bytes)
-        .map_err(|_| parse_error(line, "staging checkpoint endpoint is not UTF-8"))?;
-    let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
-        NodeId::new(parse_u32(line, fields[0], "staging checkpoint actor node")?),
-        parse_u64(line, fields[1], "staging checkpoint actor incarnation")?,
-        endpoint,
-    )
-    .map_err(|error| parse_error(line, &error.to_string()))?;
-    let first_generation = parse_u64(line, fields[3], "staging checkpoint first generation")?;
-    let last_generation = parse_u64(line, fields[4], "staging checkpoint last generation")?;
-    let previous_generation = parse_u64(line, fields[5], "staging checkpoint previous generation")?;
-    let previous_apply_receipt_digest = hex_decode(line, fields[6])?.try_into().map_err(|_| {
-        parse_error(
-            line,
-            "staging checkpoint previous receipt digest must contain 32 bytes",
-        )
-    })?;
-    let tip_apply_receipt = hex_decode(line, fields[7])?;
-    let mut page_links = Vec::with_capacity(page_link_count);
-    for index in 0..page_link_count {
-        let offset = HEADER_FIELDS + index * PAGE_LINK_FIELDS;
-        let decode_digest = |value: &str, field| {
-            hex_decode(line, value)?.try_into().map_err(|_| {
-                parse_error(
-                    line,
-                    &format!("staging checkpoint {field} must contain 32 bytes"),
-                )
-            })
-        };
-        page_links.push(MetadataTransferStagingEvidenceCheckpointPageLink {
-            page_digest: decode_digest(fields[offset], "page digest")?,
-            previous_apply_receipt_digest: decode_digest(
-                fields[offset + 1],
-                "page predecessor receipt digest",
-            )?,
-            apply_receipt_digest: decode_digest(fields[offset + 2], "page apply receipt digest")?,
-        });
-    }
     let mut commitments = BTreeMap::new();
     for index in 0..commitment_count {
-        let offset = commitments_offset + index * COMMITMENT_FIELDS;
-        let kind = match parse_u16(line, fields[offset + 4], "staging evidence kind")? {
-            0 => crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-            1 => crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
-            _ => {
-                return Err(parse_error(
-                    line,
-                    "invalid staging checkpoint evidence kind",
-                ))
-            }
-        };
-        let target_epoch = if fields[offset + 5] == "-" {
-            None
-        } else {
-            Some(parse_required_cluster_epoch(
-                line,
-                fields[offset + 5],
-                "staging checkpoint target epoch",
-            )?)
-        };
-        let key = MetadataTransferStagingEvidenceKey {
-            pg_id: PgId::new(parse_u32(line, fields[offset], "staging checkpoint PG")?),
-            staging_generation: parse_u64(
-                line,
-                fields[offset + 1],
-                "staging checkpoint generation",
-            )?,
-            actor_node_id: NodeId::new(parse_u32(
-                line,
-                fields[offset + 2],
-                "staging checkpoint evidence actor",
-            )?),
-            actor_node_incarnation: parse_u64(
-                line,
-                fields[offset + 3],
-                "staging checkpoint evidence incarnation",
-            )?,
-            kind,
-            target_epoch,
-        };
+        let offset = cursor + index * COMMITMENT_FIELDS;
+        let key = parse_evidence_key(offset)?;
         let digest = hex_decode(line, fields[offset + 6])?
             .try_into()
             .map_err(|_| {
@@ -14170,6 +15417,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut metadata_transfer_staging_evidence_pages = BTreeMap::new();
     let mut metadata_transfer_staging_evidence_checkpoint_segments = BTreeMap::new();
     let mut metadata_transfer_staging_actor_closures = BTreeMap::new();
+    let mut metadata_transfer_staging_finalized_floors = BTreeMap::new();
     let mut metadata_transfer_staging_evidence = BTreeMap::new();
     let mut pg_lines = BTreeMap::new();
     let mut node_pg_lines = BTreeMap::<(NodeId, PgId), usize>::new();
@@ -14449,6 +15697,21 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                     "duplicate metadata-transfer staging actor closure",
                 ));
             }
+        } else if let Some(value) =
+            line.strip_prefix(METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_STATE_RECORD_PREFIX)
+        {
+            let floor = parse_metadata_transfer_staging_finalized_floor(line_number, value)?;
+            let pg_id = floor.transition.pg_id();
+            let staging_generation = floor.staging_generation;
+            if metadata_transfer_staging_finalized_floors
+                .insert((pg_id, staging_generation), floor)
+                .is_some()
+            {
+                return Err(parse_error(
+                    line_number,
+                    "duplicate metadata-transfer staging finalized floor",
+                ));
+            }
         } else if let Some(value) = line.strip_prefix("metadata_transfer_staging_evidence=") {
             let bytes = hex_decode(line_number, value)?;
             let evidence = crate::pg_store::decode_staging_evidence(&bytes)
@@ -14541,6 +15804,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         metadata_transfer_staging_evidence_pages,
         metadata_transfer_staging_evidence_checkpoint_segments,
         metadata_transfer_staging_actor_closures,
+        metadata_transfer_staging_finalized_floors,
         metadata_transfer_staging_evidence,
         max_committed_timestamp_ms,
         lease_grant_horizon,

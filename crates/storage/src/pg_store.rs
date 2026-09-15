@@ -156,7 +156,7 @@ pub(crate) use metadata_transfer_staging::{
     metadata_transfer_staging_incomplete_closure_evidence_page_for_test,
     metadata_transfer_staging_publication_evidence_page_at_epoch_for_test,
     metadata_transfer_staging_publication_evidence_page_for_test,
-    rebind_metadata_transfer_staging_evidence_actor_for_test, MAX_STAGING_EVIDENCE_PAGE_ENTRIES,
+    rebind_metadata_transfer_staging_evidence_actor_for_test,
 };
 
 #[cfg(test)]
@@ -195,15 +195,17 @@ pub(crate) fn committed_staging_authorization_for_intent_for_test(
     )
 }
 pub(crate) use metadata_transfer_staging::{
-    decode_staging_evidence, decode_staging_evidence_apply_receipt,
-    decode_staging_evidence_page_payload, decode_staging_intent,
-    encode_staged_metadata_transfer_artifact, encode_staging_intent,
+    canonical_metadata_transfer_staging_evidence, decode_staging_evidence,
+    decode_staging_evidence_apply_receipt, decode_staging_evidence_page_payload,
+    decode_staging_intent, encode_staged_metadata_transfer_artifact, encode_staging_intent,
+    metadata_transfer_staging_checkpoint_page_digest,
     metadata_transfer_staging_rebound_evidence_digest, MetadataTransferStagingError,
     MetadataTransferStagingEvidence, MetadataTransferStagingEvidenceApplyReceipt,
     MetadataTransferStagingEvidenceKind, MetadataTransferStagingEvidencePage,
     MetadataTransferStagingLimits, MetadataTransferStagingNodeIdentity,
     MetadataTransferStagingReceipt, MetadataTransferStagingStore,
-    MAX_STAGING_EPOCH_PROOFS_PER_INTENT, MAX_STAGING_EVIDENCE_BYTES, MAX_STAGING_INTENT_BYTES,
+    MAX_STAGING_EPOCH_PROOFS_PER_INTENT, MAX_STAGING_EVIDENCE_BYTES,
+    MAX_STAGING_EVIDENCE_PAGE_ENTRIES, MAX_STAGING_INTENT_BYTES,
     METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION, METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
 };
 #[path = "pg_store/rows.rs"]

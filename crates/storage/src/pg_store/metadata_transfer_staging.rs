@@ -3886,6 +3886,47 @@ fn encode_staging_evidence(
     out
 }
 
+pub(crate) fn canonical_metadata_transfer_staging_evidence(
+    actor: &MetadataTransferStagingNodeIdentity,
+    intent: &MetadataTransferStagingIntent,
+    kind: MetadataTransferStagingEvidenceKind,
+    target_epoch: Option<ClusterEpoch>,
+    transfer: Option<PgMetadataTransferProof>,
+) -> Result<Vec<u8>, MetadataTransferStagingError> {
+    let bytes = encode_staging_evidence(actor, intent, kind as u8, target_epoch, transfer);
+    decode_staging_evidence(&bytes)?;
+    Ok(bytes)
+}
+
+pub(crate) fn metadata_transfer_staging_checkpoint_page_digest(
+    actor: &MetadataTransferStagingNodeIdentity,
+    previous_generation: u64,
+    previous_apply_receipt_digest: [u8; DIGEST_LEN],
+    generation: u64,
+    entries: &[(u64, Vec<u8>)],
+) -> Result<[u8; DIGEST_LEN], MetadataTransferStagingError> {
+    let entries = entries
+        .iter()
+        .map(
+            |(sequence, evidence)| MetadataTransferStagingEvidencePageEntry {
+                sequence: *sequence,
+                evidence: evidence.clone(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let payload = encode_staging_evidence_page_payload(
+        actor,
+        None,
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
+        &entries,
+    );
+    let digest = checksum::sha256::digest(&payload);
+    decode_staging_evidence_page_payload(&payload, digest)?;
+    Ok(digest)
+}
+
 fn encode_staging_intent_evidence(out: &mut Vec<u8>, intent: &MetadataTransferStagingIntent) {
     out.extend_from_slice(&intent.pg_id.get().to_be_bytes());
     out.extend_from_slice(&intent.transition_epoch.get().to_be_bytes());

@@ -950,21 +950,27 @@ therefore pins at most one bounded segment rather than the actor's later page
 history.
 
 The implementation retains every detailed evidence byte and keeps each
-actor's complete current page tip replayable. Snapshot validation reconstructs
+actor's complete current page tip replayable. Checkpoint links retain the
+ordered `(sequence, evidence identity)` membership needed to reconstruct each
+original canonical page digest; a commitment digest alone is not accepted as
+proof that evidence appeared in that page. Snapshot validation reconstructs
 the contiguous page/segment chain keyed by exact node, incarnation, and
-endpoint, verifies every page link and tip receipt, and compares each segment
-commitment with retained canonical evidence from that exact actor.
+endpoint, verifies every page membership, link, and tip receipt, and compares
+each segment commitment with retained or finalized canonical evidence from
+that exact actor.
 Standalone restart and three-voter Raft tests cover multi-page and adjacent
 segments, epoch-neutral replication, leadership-transfer replay, and corrupted
 commitment/tip rejection. Actor-incarnation closure is implemented as described
-below. Per-PG floor pruning, covered-segment collapse, and coalescing remain
-gated follow-up slices.
+below. At that checkpoint slice, per-PG floor pruning, covered-segment collapse,
+and coalescing remained gated follow-up work.
 
-Per-PG cleanup then advances the durable finalized floor and removes detailed
-bytes independently, but retains the fixed-width commitment until its key is
-provably covered by that floor. Snapshot validation requires exact detailed
-bytes and digest for every uncovered commitment and requires covered members to
-be absent. Once every commitment in one segment is covered, a second exact CAS
+Per-PG cleanup then appends a durable finalized-generation certificate and
+advances the maximum finalized floor without replacing certificates for older
+generations. This removes detailed bytes independently, but retains the
+fixed-width commitment until its key is provably covered by its exact
+certificate. Snapshot validation requires exact detailed bytes and digest for
+every uncovered commitment and requires covered members to be absent. Once
+every commitment in one segment is covered, a second exact CAS
 collapses that segment to a tip-only chain anchor without waiting for any other
 segment. A separate coalescing CAS consumes at most 64 adjacent covered
 tip-only anchors beneath the same 120 KiB and Raft-entry ceilings. It validates
@@ -1035,8 +1041,8 @@ source. Missing,
 incomplete, or conflicting closure evidence leaves the old page fully retained
 and replayable. Response-loss, paged-prefix, checkpointed-tip, repeated-rollover,
 standalone restart, Raft restart, and exact old/current format rejection are
-covered. Floor-driven evidence removal and closure-certificate retirement are
-still gated by the next cleanup slice.
+covered. That closure slice left floor-driven evidence removal and
+closure-certificate retirement gated for cleanup.
 
 Receipt evidence has bounded low-priority admission independent of lease
 renewal. It uses a separate connection/session allowance, request-worker
@@ -1058,8 +1064,9 @@ retained page chain. Snapshot validation reconstructs every actor/incarnation
 page chain, requires its current node incarnation to be no older than the page
 actor (with an exact endpoint match at equal incarnation), and requires the
 detailed map to equal the exact union of retained page members. The control
-plane retains each node incarnation's accepted evidence-page chain and a per-PG finalized staging-generation
-floor. Receipt evidence at or below that floor is rejected even if carried in
+plane retains each node incarnation's accepted evidence-page chain, cumulative
+per-PG finalized staging-generation certificates, and their maximum floor.
+Receipt evidence at or below that floor is rejected even if carried in
 a later authenticated page; retransmission of a pre-cleanup page therefore
 cannot resurrect tombstoned state after detailed evidence is pruned. The
 install entry binds the artifact digest, expected target epoch, imported proof,
@@ -1083,9 +1090,13 @@ for that generation. Installation requires a complete receipt set for that
 same authorized destination set, so post-install cleanup retains, rather than
 narrows, the original obligation set.
 
-After that checkpoint representation lands, the global per-PG finalized floor
-advances only through an exact replicated, cluster-map-epoch-neutral cleanup
-CAS. The CAS rejects pruning any detailed member that still belongs to an
+With that checkpoint representation in place, the global per-PG finalized
+generation set advances only through an exact replicated,
+cluster-map-epoch-neutral cleanup CAS. The CAS retains each older exact
+certificate so response-loss replay remains possible after later generations
+finalize. It rejects a generation that would cross any retained staging
+authorization, including an authorized predecessor from which no evidence has
+yet arrived. The CAS also rejects pruning any detailed member that still belongs to an
 actor's current accepted page tip or to a historical page range not yet covered
 by a validated checkpoint segment. Every obligated destination must have
 committed a canonical cleanup receipt for the same transition, staging
@@ -1095,6 +1106,43 @@ evidence rejects that node's stale receipt pages while evidence for an offline
 destination remains admissible. Cleanup evidence and finalized-floor changes
 do not advance the global epoch, change a PG route, invalidate a serving
 runtime map, or request fresh PG observations.
+
+Command v28 and state v40 implement the replicated finalized-floor boundary for
+one PG at a time. `FinalizeMetadataTransferStagingGeneration` accepts only the
+exact completed retained transition, its immutable staging authorization and
+artifact tuple, and one sorted tombstone binding for every authorized
+destination. Every tombstone must match retained detailed evidence from the
+exact actor tuple and a retained checkpoint commitment; actor-closure-dependent
+evidence remains ineligible until its closure certificate has an equivalent
+compact retirement representation. Application removes only the validated
+detailed evidence, retains the checkpoint commitment, and appends a compact
+per-PG generation certificate containing the transition, generation, artifact
+tuple, every ordered historical publication binding `(actor, target epoch,
+transfer proof, evidence digest)`, ordered tombstones, and tombstone-set digest.
+This preserves publication semantics across any number of lightweight epoch
+proof rebases without retaining the complete detailed evidence bytes. The
+publication bindings are bounded by the staging store's per-intent epoch-proof
+limit, each checkpoint member reconstructs from its exact compact binding, and
+the final target set must still match the durable destination-install receipt.
+Snapshot validation builds one bounded actor-target publication index before
+checkpoint reconstruction instead of rescanning a certificate for each member.
+Older certificates remain durable when the maximum floor advances. Exact replay
+of any finalized generation is a no-op, stale evidence at or below the maximum
+floor rejects, and application is cluster-map-epoch neutral. Snapshot
+validation reconstructs every certificate against its exact retained
+transition, authorization, node identities, checkpoint page membership, and
+commitments, so coordinated resealing cannot invent evidence or a
+command-unreachable floor. Standalone restart, snapshot round-trip, multiple
+same-PG generations, old and current exact replay, publish-at-E1 then
+rebase/install-at-E2 finalization, historical-proof mutation, authorized but
+unobserved predecessor rejection, partial/uncheckpointed rejection, stale-page
+rejection, and direct/coordinated certificate-forgery cases are covered. A
+three-voter Raft
+composition additionally covers replication to
+every voter and exact cleanup replay after leadership transfer. Destination
+tombstone RPC orchestration, physical artifact deletion, pre-install
+cancellation, fenced-incarnation retirement substitutes, closure-certificate
+retirement, segment collapse, and anchor coalescing remain gated.
 
 This cleanup CAS is intentionally one per PG, not a fifth multi-PG batch
 command. Epoch-neutral cleanup does not need batching to amortize cluster-map
@@ -1254,6 +1302,19 @@ v39. Immutable store/evidence v3, RPC v21, command v26, and state v38 bytes
 remain exact rejection evidence in their direct, authenticated, snapshot,
 journal, Raft peer, restart, WAL, and compaction containers. Authentication
 envelope v2 is unchanged, and no compatibility reader is added.
+
+Finalized-floor cleanup adds command tag 22 and cumulative compact per-PG
+generation certificates, including every bounded historical epoch-publication
+binding needed to reconstruct pruned proof evidence. Checkpoint links
+additionally retain canonical page membership so pruned evidence remains bound
+to the page-chain digest. These
+changes advance command v27 to v28 and logical state v39 to v40. The
+immutable command-v27 and state-v39 aggregates and their snapshot,
+single-authority journal, Raft peer, restart, WAL, compaction, and storage-RPC
+containers remain exact rejection evidence. Storage staging format v4,
+artifact format v3, storage RPC v25, control-plane RPC v22, and authentication
+envelope v2 are unchanged because this slice adds no storage mutation or wire
+operation. No compatibility reader is added.
 
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Staging-store format v4 owns the

@@ -2851,6 +2851,17 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    pub fn finalize_metadata_transfer_staging_generation(
+        &mut self,
+        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .snapshot
+            .finalize_metadata_transfer_staging_generation_command(cleanup)?;
+        self.apply_and_commit_command(command)?;
+        Ok(self.snapshot.clone())
+    }
+
     pub fn complete_unavailable_pg_placement_transition(
         &mut self,
         work: &UnavailablePgReconciliationWork,
@@ -3940,6 +3951,13 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
             first_generation,
             last_generation,
         )
+    }
+
+    fn finalize_metadata_transfer_staging_generation(
+        &mut self,
+        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::finalize_metadata_transfer_staging_generation(self, cleanup)
     }
 
     fn fence_pg_for_metadata_transfer(

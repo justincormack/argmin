@@ -24,7 +24,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 27;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 28;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -39,6 +39,7 @@ const CONTROL_PLANE_COMMAND_EXPIRED_NODE_LEASE_MIN_LEN: usize = 12;
 const CONTROL_PLANE_COMMAND_PROMOTED_NODE_LEASE_MIN_LEN: usize = 20;
 const UNAVAILABLE_PG_STAGING_AUTHORIZATION_MIN_LEN: usize = 83;
 const UNAVAILABLE_PG_STAGING_PUBLICATION_MIN_LEN: usize = 4 + 8 + 4 + 32;
+const METADATA_TRANSFER_STAGING_TOMBSTONE_MIN_LEN: usize = 4 + 8 + 4 + 32;
 pub(crate) const MAX_UNAVAILABLE_PG_TRANSITION_COMMAND_BYTES: usize =
     crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_COMMAND_BYTES;
 
@@ -242,6 +243,21 @@ pub struct UnavailablePgStagingPublicationBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataTransferStagingTombstoneBinding {
+    pub node_id: NodeId,
+    pub node_incarnation: u64,
+    pub endpoint: String,
+    pub evidence_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeMetadataTransferStagingGenerationRequest {
+    pub unavailable_transition: UnavailablePgTransitionMutationBinding,
+    pub staging_generation: u64,
+    pub tombstones: Vec<MetadataTransferStagingTombstoneBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnavailablePgTransitionInstallRequest {
     pub unavailable_transition: UnavailablePgTransitionMutationBinding,
     pub transfer: PgMetadataTransferProof,
@@ -419,6 +435,9 @@ pub enum ControlPlaneCommand {
         first_generation: u64,
         last_generation: u64,
     },
+    FinalizeMetadataTransferStagingGeneration {
+        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
+    },
     InstallUnavailablePgPlacementTransitions {
         transitions: Vec<UnavailablePgTransitionInstallRequest>,
         expected_destination_epoch: ClusterEpoch,
@@ -573,6 +592,13 @@ impl std::fmt::Display for ControlPlaneCommand {
                 actor_node_incarnation,
                 first_generation,
                 last_generation
+            ),
+            ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup } => write!(
+                f,
+                "finalize-metadata-transfer-staging-generation(pg={},generation={},destinations={})",
+                cleanup.unavailable_transition.pg_id().get(),
+                cleanup.staging_generation,
+                cleanup.tombstones.len()
             ),
             ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
                 transitions,
@@ -1021,6 +1047,35 @@ pub(crate) fn encode_control_plane_command_without_replication_limit(
             write_u64(&mut out, *first_generation);
             write_u64(&mut out, *last_generation);
         }
+        ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup } => {
+            if cleanup.staging_generation == 0
+                || cleanup.tombstones.is_empty()
+                || cleanup
+                    .tombstones
+                    .windows(2)
+                    .any(|pair| pair[0].node_id >= pair[1].node_id)
+            {
+                return Err(command_protocol_error(
+                    "metadata-transfer staging cleanup has invalid generation or destination ordering",
+                ));
+            }
+            write_u16(&mut out, 22);
+            write_unavailable_pg_transition_mutation_binding(
+                &mut out,
+                Some(&cleanup.unavailable_transition),
+            )?;
+            write_u64(&mut out, cleanup.staging_generation);
+            write_u32(
+                &mut out,
+                len_as_u32(cleanup.tombstones.len(), "staging cleanup tombstones")?,
+            );
+            for tombstone in &cleanup.tombstones {
+                write_u32(&mut out, tombstone.node_id.as_u32());
+                write_u64(&mut out, tombstone.node_incarnation);
+                write_string(&mut out, &tombstone.endpoint)?;
+                out.extend_from_slice(&tombstone.evidence_digest);
+            }
+        }
         ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
             transitions,
             expected_destination_epoch,
@@ -1173,6 +1228,7 @@ pub fn encode_control_plane_command(
             | ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents { .. }
             | ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage { .. }
             | ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages { .. }
+            | ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { .. }
             | ControlPlaneCommand::InstallUnavailablePgPlacementTransitions { .. }
             | ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions { .. }
     ) && encoded.len() > MAX_UNAVAILABLE_PG_TRANSITION_COMMAND_BYTES
@@ -1656,6 +1712,48 @@ pub fn decode_control_plane_command(
                 last_generation,
             }
         }
+        22 => {
+            let unavailable_transition =
+                read_unavailable_pg_transition_mutation_binding(&mut reader)?.ok_or_else(|| {
+                    command_protocol_error(
+                        "metadata-transfer staging cleanup requires a transition binding",
+                    )
+                })?;
+            let staging_generation = reader.read_u64()?;
+            let count = reader.read_collection_len(
+                "staging cleanup tombstones",
+                METADATA_TRANSFER_STAGING_TOMBSTONE_MIN_LEN,
+            )?;
+            let mut tombstones = Vec::with_capacity(count);
+            for _ in 0..count {
+                tombstones.push(MetadataTransferStagingTombstoneBinding {
+                    node_id: NodeId::new(reader.read_u32()?),
+                    node_incarnation: reader.read_u64()?,
+                    endpoint: reader.read_string()?.to_owned(),
+                    evidence_digest: reader
+                        .read_exact(32)?
+                        .try_into()
+                        .expect("staging cleanup evidence digest has fixed length"),
+                });
+            }
+            if staging_generation == 0
+                || tombstones.is_empty()
+                || tombstones
+                    .windows(2)
+                    .any(|pair| pair[0].node_id >= pair[1].node_id)
+            {
+                return Err(command_protocol_error(
+                    "metadata-transfer staging cleanup has invalid generation or destination ordering",
+                ));
+            }
+            ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration {
+                cleanup: FinalizeMetadataTransferStagingGenerationRequest {
+                    unavailable_transition,
+                    staging_generation,
+                    tombstones,
+                },
+            }
+        }
         20 => {
             let expected_destination_epoch =
                 read_cluster_epoch(&mut reader, "unavailable placement destination epoch")?;
@@ -1999,6 +2097,7 @@ pub enum ControlPlaneCommandResponse {
         apply_receipt: Vec<u8>,
     },
     CheckpointMetadataTransferStagingEvidencePages,
+    FinalizeMetadataTransferStagingGeneration,
     InstallUnavailablePgPlacementTransitions,
     CompleteUnavailablePgPlacementTransitions,
     ExpireHeartbeatLeases {
@@ -3783,7 +3882,7 @@ mod tests {
             },
             ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
                 transitions: vec![UnavailablePgTransitionInstallRequest {
-                    unavailable_transition: staging_binding,
+                    unavailable_transition: staging_binding.clone(),
                     transfer,
                     expected_destination_epoch: ClusterEpoch::new(15).unwrap(),
                     publications: vec![
@@ -3812,6 +3911,26 @@ mod tests {
                 actor_node_incarnation: 8,
                 first_generation: 1,
                 last_generation: 7,
+            },
+            ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration {
+                cleanup: FinalizeMetadataTransferStagingGenerationRequest {
+                    unavailable_transition: staging_binding,
+                    staging_generation: 14,
+                    tombstones: vec![
+                        MetadataTransferStagingTombstoneBinding {
+                            node_id: NodeId::new(2),
+                            node_incarnation: 13,
+                            endpoint: "/tmp/node-2.sock".to_owned(),
+                            evidence_digest: [0x4a; 32],
+                        },
+                        MetadataTransferStagingTombstoneBinding {
+                            node_id: NodeId::new(3),
+                            node_incarnation: 8,
+                            endpoint: "/tmp/node-3.sock".to_owned(),
+                            evidence_digest: [0x5a; 32],
+                        },
+                    ],
+                },
             },
         ]
     }
@@ -4265,6 +4384,7 @@ mod tests {
                     ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage { .. }
                         | ControlPlaneCommand::InstallUnavailablePgPlacementTransitions { .. }
                         | ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages { .. }
+                        | ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { .. }
                 )
             })
             .chain(degenerate_commands())
@@ -4372,7 +4492,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_command_v27_aggregate_encoding_is_stable() {
+    fn control_plane_command_v28_aggregate_encoding_is_stable() {
         let mut aggregate = Vec::new();
         for command in sample_commands().into_iter().chain(degenerate_commands()) {
             let encoded = encode_control_plane_command(&command).unwrap();
@@ -4390,13 +4510,47 @@ mod tests {
         assert_eq!(
             (aggregate.len(), digest),
             (
-                3_680,
+                3_893,
                 [
-                    152, 188, 0, 183, 151, 175, 195, 36, 142, 227, 169, 134, 162, 183, 159, 112,
-                    116, 252, 194, 175, 205, 223, 121, 235, 170, 70, 20, 12, 202, 197, 179, 110,
+                    126, 184, 22, 174, 141, 67, 41, 145, 161, 139, 125, 19, 127, 69, 42, 63, 58,
+                    18, 79, 183, 38, 72, 87, 180, 43, 172, 255, 62, 61, 154, 185, 5,
                 ],
             )
         );
+    }
+
+    #[test]
+    fn control_plane_command_v27_aggregate_remains_rejected_evidence() {
+        const AGGREGATE: &[u8] =
+            include_bytes!("control_plane/testdata/command_v27_representative.aggregate");
+        assert_eq!(
+            (
+                AGGREGATE.len(),
+                checksum::compute_checksum(checksum::ChecksumAlgorithm::Sha256, AGGREGATE).bytes()
+            ),
+            (
+                3_680,
+                &[
+                    152, 188, 0, 183, 151, 175, 195, 36, 142, 227, 169, 134, 162, 183, 159, 112,
+                    116, 252, 194, 175, 205, 223, 121, 235, 170, 70, 20, 12, 202, 197, 179, 110,
+                ][..],
+            )
+        );
+        let mut remaining = AGGREGATE;
+        let mut count = 0;
+        while !remaining.is_empty() {
+            let (raw_len, tail) = remaining.split_at(4);
+            let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+            let (command, tail) = tail.split_at(len);
+            assert!(matches!(
+                decode_control_plane_command(command),
+                Err(ControlPlaneError::CommandDecode { message })
+                    if message == "unsupported control-plane command version 27"
+            ));
+            remaining = tail;
+            count += 1;
+        }
+        assert!(count > 1, "v27 aggregate must contain the command corpus");
     }
 
     #[test]
@@ -4517,7 +4671,7 @@ mod tests {
             Err(ControlPlaneCommandFormatError::UnknownMagic)
         );
 
-        for version in [15_u16, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28] {
+        for version in [15_u16, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29] {
             let mut unsupported = Vec::from(CONTROL_PLANE_COMMAND_MAGIC.as_slice());
             unsupported.extend_from_slice(&version.to_be_bytes());
             assert_eq!(
@@ -4757,7 +4911,7 @@ mod tests {
         append_control_plane_command_checksum(&mut bad_magic);
         assert_decode_error_contains(&bad_magic, "invalid control-plane command magic");
 
-        for version in [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28] {
+        for version in [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29] {
             let encoded = encode_control_plane_command_with_version_for_test(
                 &ControlPlaneCommand::ExpireHeartbeatLeases {
                     expire_at_ms: 1_000,
@@ -4790,8 +4944,8 @@ mod tests {
 
     #[test]
     fn control_plane_command_codec_rejects_semantic_decode_errors() {
-        let unknown_tag = command_frame(22, |_| {});
-        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 22");
+        let unknown_tag = command_frame(23, |_| {});
+        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 23");
 
         let reversed_certified_pgs = ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
             nodes: vec![(NodeId::new(1), "/tmp/node-1.sock".to_owned())],
@@ -5219,7 +5373,8 @@ mod tests {
         const PREVIOUS_V36: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=36\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xbf\xca\xcb\x2a\xc2\x83\x4c\x06";
         const PREVIOUS_V37: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=37\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x6f\x49\x16\x73\x8f\x15\x7d\x9b";
         const PREVIOUS_V38: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=38\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x0b\xb8\x77\x7a\x61\x18\x28\x0c";
-        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=39\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xdb\x3b\xaa\x23\x2c\x8e\x19\x91";
+        const PREVIOUS_V39: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=39\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xdb\x3b\xaa\x23\x2c\x8e\x19\x91";
+        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=40\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x83\x26\x64\xbe\x5e\xfd\x3d\xda";
         let encoded = encode_control_plane_snapshot(&ClusterControlSnapshot::empty()).unwrap();
 
         assert_eq!(encoded, EXPECTED);
@@ -5281,6 +5436,11 @@ mod tests {
             decode_control_plane_snapshot(PREVIOUS_V38),
             Err(ControlPlaneError::Parse { message, .. })
                 if message == "unsupported control-plane state version 38"
+        ));
+        assert!(matches!(
+            decode_control_plane_snapshot(PREVIOUS_V39),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "unsupported control-plane state version 39"
         ));
     }
 
@@ -5362,9 +5522,9 @@ mod tests {
     #[test]
     fn replicated_snapshot_install_rejects_noncurrent_state_versions_before_mutation() {
         let current_contents = format_snapshot(&sample_snapshot());
-        for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40] {
+        for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 41] {
             let unsupported_contents =
-                current_contents.replacen("version=39\n", &format!("version={version}\n"), 1);
+                current_contents.replacen("version=40\n", &format!("version={version}\n"), 1);
             let payload =
                 snapshot_frame_with_version(CONTROL_PLANE_SNAPSHOT_VERSION, &unsupported_contents);
             let mut installed = replay_sample_state_machine();
