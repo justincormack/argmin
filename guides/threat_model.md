@@ -3,153 +3,262 @@
 
 # Threat model
 
-Note this will continue to evolve as more features around users and encryption
-are added.
+This document describes current security boundaries and assumptions, not a
+certification that they are free of defects. Argmin is pre-release and not yet
+suited for production use. Implemented distributed operation does not change
+that status. Configuration requirements live in the
+[configuration guide](configuration.md); format and upgrade policy lives in
+the [versioning guide](versioning.md).
 
-## 1. Overview
-Argmin is a single-node, S3-compatible object storage server written in Rust
-(the `argmin-s3` binary). It exposes an HTTP/1 endpoint implementing a subset
-of S3 APIs (bucket/object CRUD, multipart uploads, tagging, CORS, ACLs, bucket
-policy, object lock, etc.) using path-style addressing. Requests are parsed in
-`server-http`, authenticated using AWS Signature Version 4 in the `auth`
-crate, and dispatched to `server-core`, which enforces bucket/object
-authorization and orchestrates erasure-coded storage. Object data and metadata
-are persisted locally: shard files on disk plus per-placement-group SQLite
-metadata databases (`storage` crate). Data integrity uses CRC64-NVME checksums
-and verified reads; erasure coding via native Rust backends provides
-redundancy.
-Typical deployments are local or internal S3-compatible storage for testing or
-lightweight environments, configured by environment variables. Security is
-centered on SigV4 authentication plus optional public ACL and bucket-policy
-paths. The server now has optional built-in TLS support when
-`ARGMIN_TLS_CERT_PATH` and `ARGMIN_TLS_KEY_PATH` are configured, and still
-supports plain HTTP deployments. It also supports object encryption features
-such as `SSE-C`; the HTTP layer rejects `SSE-C` requests unless the transport
-is marked secure. Confidentiality therefore depends on actually deploying with
-TLS, either directly in `argmin-s3` or via a trusted external terminator, plus
-filesystem permissions. Plain HTTP remains possible and should be treated as a
-non-confidential deployment mode.
+## 1. Deployment and assets
 
-## 2. Threat model, Trust boundaries and assumptions
-### Assets
-- Object data (payloads), metadata (tags, ACLs, versioning state), and bucket listings.
-- Access credentials (access key/secret, optional session tokens).
-- Integrity of shard files and SQLite metadata.
-- Availability of the service and storage capacity.
+Argmin exposes an S3-compatible API through `server-http`, authenticates
+requests in `auth`, evaluates S3 authorization in `server-core`, and owns
+physical storage, internal protocols, and durable formats in `storage`.
 
-### Trust boundaries
-- **Network boundary:** All HTTP request components (method, path, query string, headers, body, XML, multipart form fields, aws-chunked frames) are attacker-controlled.
-- **Authentication boundary:** `auth::authenticate_request` and `auth::authenticate_post_sigv4` are the primary gates; any bug here impacts all operations.
-- **Core/storage boundary:** `server-core` assumes validated bucket/key strings and authenticated `Requester` identity; `storage` assumes internal shard keys and well-formed metadata.
-- **Configuration boundary:** Environment variables control credentials, listen address, limits, data directory, and tracing output.
-- **Cluster-internal boundary:** Phase 11 control-plane and storage-node
-  roles communicate over local Unix sockets and trust the local host, process
-  identity, data directory ownership, and socket directory permissions. A
-  storage node heartbeat is treated as a statement from a trusted node process
-  about its locally verified durable PG state, not as an arbitrary public
-  network input.
-- **Developer boundary:** Test utilities (`crates/s3-tests`, `crates/sts-tests`,
-  `test-util`) and build scripts are not part of production runtime.
+There are two deployment shapes:
 
-### Assumptions
-- Host OS and filesystem permissions are trusted; unprivileged local users cannot modify `ARGMIN_DATA_DIR` contents.
-- Phase 11 multihost/control-plane work assumes the storage-node and
-  single-authority control-plane processes are trusted runtime components on
-  trusted hosts. It does not attempt to defend against a malicious or
-  compromised storage node forging heartbeats, corrupting its local metadata
-  database, or lying about PG metadata proofs. Local storage nodes validate
-  their command-log hash chain and metadata state digest before reporting PG
-  heartbeat proofs, and the authority uses those proofs as fencing evidence
-  from trusted nodes. Remote authenticated control-plane transport and any
-  stronger node attestation story are future work and outside the current
-  object-store threat boundary; they belong to the deployment/runtime trust
-  model rather than S3 request authorization.
-- System clock is reasonably accurate for SigV4 expiry checks.
-- Deployments that need confidentiality or `SSE-C` use secure transport. This
-  can be provided directly by `argmin-s3` via its TLS config or by a trusted
-  external terminator. Plain HTTP is still a supported deployment mode, but it
-  is not appropriate for confidential traffic. The HTTP layer rejects `SSE-C`
-  requests unless the transport is marked secure.
-- Tracing and diagnostics now have an observability-safe escaping and redaction
-  baseline for attacker-controlled text and secret-bearing values, but trace
-  output is still operationally sensitive and should be protected accordingly.
-- The server is effectively single-tenant; ACLs primarily govern public vs owner access rather than multi-user isolation.
+- **Embedded standalone:** one `argmin-s3` process contains the frontend,
+  storage engine, and single metadata/control authority. Environment-only and
+  standalone-manifest operation use one storage node and EC 1+0; neither
+  provides Argmin-managed disk or node redundancy. The current embedded
+  runtime does not activate separate internal RPC endpoints.
+- **Replicated manifest deployment:** separate frontend, storage-node, and
+  control-plane processes communicate over authenticated Unix sockets or
+  TLS/TCP. The manifest defines failure domains, erasure coding, Raft voters,
+  endpoint identities, credentials, and resource limits. Processes may share
+  hosts where permitted by that topology; separate processes alone do not
+  create independent host or disk failure domains.
 
-## 3. Attack surface, mitigations and attacker stories
-### HTTP entrypoints and request parsing
-- **Surface:** Hyper-based HTTP/1 server (`server-http/src/http/serve.rs`) accepts TCP connections; risks include request smuggling, slowloris, oversized bodies, and malformed headers.
-- **Mitigations:** configurable `max_connections`/`max_inflight_requests`, header and body idle timeouts, a non-resetting deadline for body bytes consumed before authentication, bounded buffered control-plane bodies (`MAX_BUFFERED_CONTROL_BODY_SIZE` in `request.rs`), content-length validation, and UTF‑8 validation of header values. Background maintenance yields only when admitted requests reach the process-wide request-capacity high-water mark or request admission records contention; one slow request is not itself foreground pressure.
-- **Input validation:** bucket names follow S3-style constraints and object
-  keys are limited to 1-1024 bytes with NUL-byte rejection (`router.rs`),
-  strict percent-decoding, and explicit per-surface header/body validation.
-  Other control bytes in object keys are currently accepted on the API
-  surface, so downstream XML/listing/observability paths must continue to
-  escape or encode them safely.
+Assets include object payloads and versions; names, listings, tags, ACLs,
+policies, retention and legal-hold state; S3 and internal credentials; TLS and
+encryption keys; routing and authority-clock state; and the availability and
+integrity of metadata, journals, snapshots, and shard files.
 
-### Authentication and authorization
-- **SigV4 verification:** `auth/request.rs`, `auth/sigv4.rs`, and `auth/canonical.rs` implement canonicalization, signature derivation, and constant-time comparison. Limits exist for header lengths, query sizes, signed header counts, and duplicate Authorization headers.
-- **Presigned URLs:** expiry and scope validation with explicit max TTLs.
-- **POST Object:** multipart form parsing and policy validation (`multipart.rs`, `auth/post.rs`) including JSON policy parsing and condition enforcement.
-- **Authorization:** `server-core/src/coordinator.rs` enforces owner/admin-only
-  operations, ACLs, bucket policy evaluation, public access blocks, ownership
-  controls, object-lock retention and legal-hold rules, and missing-object
-  discovery masking. Anonymous access is only permitted when ACLs or bucket
-  policy make a bucket/object public.
+Keys, control-plane state, and metadata are durable data dependencies, not
+disposable caches. Replication and erasure coding are not backups and do not
+protect against every administrative mistake or correlated failure.
 
-### Object data handling, integrity, and streaming
-- **Streaming uploads:** aws-chunked decoding and per-chunk signatures (`chunked.rs`, `serve.rs`) with chunk size validation, trailer checksum verification, and size caps (`MAX_OBJECT_SIZE`).
-- **Integrity:** CRC64-NVME checksums on writes and reads, with shard quarantine on mismatch (`storage/pg_store.rs`, `checksum` crate). ETags use CRC64.
-- **Erasure coding:** native Rust erasure coding provides redundancy with architecture-specific SIMD paths on supported CPUs.
-- **Multipart uploads and streamed writes:** XML parsing for
-  `CompleteMultipartUpload` and delete/multipart controls (`xml.rs`), plus
-  staged stream-session state in `server-core`; risks include orphaned uploads,
-  leaked staged state, or incorrect cleanup when lifetime invariants break.
+## 2. Trust boundaries and assumptions
 
-### Metadata and storage layer
-- **SQLite and shard files:** parameterized queries reduce SQL injection risk; shard paths are derived from hashed shard keys, preventing user-controlled path traversal.
-- **Durability measures:** temp-file writes + fsync/rename for shards, per-PG
-  metadata command serialization, durable bucket write reservations/drains, and
-  storage-side snapshot validation limit race conditions. Bucket locks are
-  retained only for test probes and are not production correctness boundaries.
-- **Background maintenance paths:** reclaim queues, payload leases,
-  multipart/session cleanup, and lifecycle sweeps are security-relevant even
-  though they are internal. Races or stale-state bugs here can cause resource
-  exhaustion, orphaned data, or violations of retention/deletion guarantees.
+| Boundary | Untrusted input and required protection |
+|---|---|
+| Public API → frontend | HTTP framing, headers, queries, XML, policies, forms, bodies, and signatures are attacker-controlled. Parsing, admission, authentication, and authorization must not assume a well-behaved client. |
+| S3 principal → another principal's resources | A valid credential does not authorize every operation. Ownership, policies, ACLs, public-access settings, version identity, and Object Lock rules still apply. Anonymous access is an explicit authorization outcome, not an authentication fallback. |
+| Coordinator → storage | Storage owns placement, physical identifiers, durable representations, replay, and cleanup. Logical capabilities and owner-side validation bind operations to subjects and routing authority. Data must not be assumed well formed merely because it came from disk or another crate. |
+| Internal network → cluster listener | TLS establishes server identity and confidentiality on TCP; signed messages authenticate and authorize callers. Protocol kind, cluster/principal identity, request/response binding, framing, and admission limits are separate checks. Unix transport does not replace protocol authentication in replicated deployments. |
+| Operator → cluster administration | Provisioning, initialization, topology administration, and authority-clock recovery are privileged. Public S3 credentials are not cluster-admin credentials. Recovery endpoints must remain authenticated even when ordinary serving is fenced. |
+| Process → host/filesystem | The OS, service account, mounts, and administrators are trusted. Permission, lock, path, and durable-identity checks prevent unauthorized or accidental reuse; they do not defend against root or a compromised service account. |
+
+### Trusted cluster components, not Byzantine participants
+
+Frontends, storage nodes, authorities, their hosts, and provisioning are trusted
+runtime components. A compromised frontend can act with its internal
+capabilities; a compromised storage node can lie about its state; a compromised
+authority can undermine routing and admission. Raft and metadata proofs are
+not Byzantine consensus or remote attestation.
+
+Internal authentication uses symmetric HMAC credentials. A process holding a
+verification secret can also forge messages authenticated with that secret.
+Separate scoped credentials do not make a compromised verifier trustworthy.
+Distribute only the signing and verification material required by each process,
+as described in the configuration guide.
+
+Clocks are security-relevant: S3 expiry, credential windows, leases, and
+retention depend on their respective time sources. Authority-clock continuity
+and leadership checks can fence serving and require explicit operator recovery.
+They do not defend against a hostile host controlling the process and clocks.
+
+## 3. Public API and credential security
+
+### Parsing and resource admission
+
+The public listener is Hyper-based HTTP/1. Connection and in-flight request
+limits, TLS/header timeouts, body idle timeouts, pre-authentication body
+deadlines, bounded buffered control bodies, and operation-specific parser and
+size limits constrain resource use. They do not guarantee immunity to slow
+clients, denial of service, or disk exhaustion.
+
+Bucket names, object keys, headers, queries, XML, and POST policies have
+surface-specific validation. Object keys may contain control characters
+permitted by the API; output paths must encode them safely rather than assume
+all accepted text is printable. User object keys are not filesystem paths.
+Testing must cover malformed inputs and collisions between validation,
+authentication, and authorization failures, including AWS error precedence.
+
+### Authentication, authorization, and unfinished STS support
+
+Header-signed, presigned, POST-policy, and aws-chunked requests have different
+signing rules. Verification includes scope and time validation and
+constant-time cryptographic verification. Payload modes must follow the
+selected service's AWS behavior: a valid signature is not always a claim that
+every body byte was signed. TLS remains necessary for confidentiality and for
+protecting legitimately unsigned payloads in transit.
+
+S3 authorization covers configured principals and anonymous requests,
+including cross-account and foreign-owned-object behavior. It is not merely
+owner-versus-public access. However, the normal process configuration provisions
+a single S3 account/access-key identity; it is not a complete IAM provisioning
+service or a claim of general multi-tenant operational isolation.
+
+**STS is not currently functional or supported.** Partial issuance, token, and
+identity-provider code and reference tests are unfinished implementation, not
+an available deployment capability. Assumed-role sessions remain blocked at the
+S3 authorization boundary through `auth::ConfiguredOrAnonymousAuth`; this
+includes S3 Control and upload adapters. Neither this code nor an AWS-only
+oracle establishes usable STS or IAM support. Future support requires its own
+AWS/local tests and an updated threat model; see the
+[STS issuance plan](../plans/sts-assume-role-issuance.md).
+
+Policies, ACLs, Block Public Access, ownership controls, retention, and legal
+hold must apply to the actual operation and resource version, including
+concurrent writes and cleanup. Public access is intentional when permitted;
+the security property is faithful authorization, not blanket denial of every
+anonymous request. The [AWS compatibility guide](aws-compatibility.md)
+describes API limitations separately from deployment trust assumptions.
+
+### TLS, proxies, and encryption
+
+The standalone listener defaults to loopback; public HTTPS is optional and
+must be configured explicitly. Plain HTTP does not provide confidentiality for
+objects, signatures, or presigned URLs. Presigned URLs must be handled as
+secrets within their validity and permission scope.
+
+SSE-C requires TLS on the connection accepted by Argmin itself. A proxy that
+terminates TLS and forwards plaintext HTTP does **not** satisfy this check;
+forwarded headers do not establish secure transport. Such deployments need TLS
+on the proxy-to-Argmin hop as well. Source-IP and transport-dependent policy
+context reflects the server's connection, not arbitrary client-supplied
+forwarding headers.
+
+SSE-S3 and SSE-C encrypt object payloads; they are not full-database encryption
+and do not promise to hide names, policies, tags, or all metadata from the
+storage operator. The SSE-S3 wrapping key and SSE-C validator secret must be
+preserved for existing data. Losing required material can make data
+inaccessible. A compromised live frontend can observe plaintext and request
+key material. AWS-compatible SSE-KMS is not currently implemented.
 
 ### CORS and browser-facing behavior
-- Bucket-specific CORS matching (`cors.rs`) can allow cross-origin reads/writes when misconfigured. This is an operational risk rather than a code bug, but affects confidentiality when combined with public buckets or presigned URLs.
 
-### Observability and secrets
-- Tracing now uses escaping and redaction helpers for attacker-controlled text
-  and secret-bearing values such as SigV4 material, session tokens, and
-  `SSE-C` key-derived state. Operators should still treat trace output and
-  diagnostics as sensitive operational data and avoid adding raw protocol or
-  encryption material to new logs.
+CORS controls browser access to responses; it does not grant S3 authorization.
+Broad CORS rules matter alongside public permissions or exposed presigned URLs.
+Buckets may be distinguishable through AWS-compatible errors and unauthenticated
+OPTIONS behavior, including account-regional names. Bucket existence is not a
+blanket confidentiality guarantee. Evaluate a disclosure against the operation's
+AWS behavior and the sensitivity of the actual data disclosed.
 
-### Attacker stories
-1. **Unauthenticated network attacker** exploits a canonicalization or signature verification bug to bypass SigV4 and read/write private objects (critical impact).
-2. **Authenticated malicious client** floods multipart uploads, streamed writes,
-   or cleanup-sensitive paths to exhaust disk, memory, or CPU. Timeouts and
-   size caps help, but there are still no tenant quotas.
-3. **Anonymous or unintended public access misuse:** public-read/write buckets
-   and public bucket policies intentionally allow unauthenticated access;
-   vulnerabilities here would stem from ACL, bucket-policy, ownership-control,
-   or public-access-block logic failures.
-4. **Local filesystem attacker** tampers with SQLite metadata or shard files. CRC checks can detect corruption, but confidentiality/integrity relies on OS permissions.
-5. **CORS misuse:** overly broad CORS rules combined with presigned URLs enable browser-based exfiltration.
-6. **Transport misconfiguration:** operators run plain HTTP or misconfigure TLS
-   termination, exposing credentials or object data on the wire. `SSE-C`
-   requests are rejected without secure transport, but non-`SSE-C` traffic is
-   still only as confidential as the deployed transport.
+Stored objects are attacker-controlled and may be active browser content.
+Deployments serving such content should isolate its origin from trusted web
+applications. Escaping generated XML and diagnostics does not sanitize an object
+intentionally returned byte-for-byte.
 
-### Out-of-scope or lower relevance
-- CSRF/XSS risks are limited because the API is not a session-based web app; XML responses are escaped.
-- SSRF is not applicable; the server does not perform outbound fetches.
-- SQL injection risk is low due to parameterized queries and no dynamic SQL generation.
-- Database migrations are not currently supported or implemented, and older schemas are not supported until a future date when stability will be declared.
+## 4. Cluster transport, storage, and recovery
 
-## 4. Criticality calibration (critical, high, medium, low)
-- **Critical:** remote code execution, SigV4 auth bypass allowing unauthenticated read/write/delete of private buckets, or leakage of access keys/secrets.
-- **High:** authorization bugs that allow public write/read when ACLs forbid it, path traversal allowing writes outside `ARGMIN_DATA_DIR`, or metadata corruption causing permanent data loss.
-- **Medium:** transient denial of service (CPU/memory spikes, excessive multipart uploads) or information disclosure of bucket metadata that does not expose object data.
-- **Low:** minor logging of non-sensitive metadata, incorrect error codes, or edge-case canonicalization mismatches that only affect interoperability.
+### Authenticated internal protocols
+
+Replicated manifests require credentials for every activated internal role.
+Internal TCP has no plaintext mode: it uses explicit trust bundles, server
+names, and TLS identities. Client identity is established by signed envelopes,
+not client TLS certificates. Frontend, storage-node, Raft-peer, admin, and
+maintenance principals have distinct protocol permissions.
+
+Frame-size ceilings, pre-authentication byte budgets, worker admission, and I/O
+deadlines bound exposure before and during protocol handling. Authentication and
+protocol bindings reject invalid identities and crossed responses. Freshness
+checks are not a general exactly-once execution guarantee: durable command
+identity, deduplication, and operation-specific confirmation are separate
+correctness requirements.
+
+After a mutating request may have been sent, response loss or an unverifiable
+response can leave its outcome unconfirmed. Callers and operators must not
+interpret that as proof the command was not applied or blindly retry it.
+Authority-clock re-establishment and other administration are included in this
+rule. Outbound connections to configured cluster endpoints are real attack
+surfaces: object URLs are not arbitrary fetch instructions, but endpoint
+redirection must not be dismissed as categorically irrelevant to security.
+
+### Durable state and concurrency
+
+SQLite and shard-file access are storage-owned. Values use parameterized SQL,
+physical paths derive from storage identities, and durable readers validate
+format and logical invariants. These controls reduce injection, traversal, and
+corruption risks; they do not make arbitrary locally modified data trustworthy.
+
+Journals, replication, fsync/publication ordering, reservations, route admission,
+payload leases, and subject-bound handles protect concurrent writes, reads,
+recovery, and deletion. Storage-owned reclaim, repair, backfill, scavenging,
+and abandoned-session cleanup must respect those lifetimes. S3-visible lifecycle
+and Object Lock decisions remain part of the API semantics, not permission for
+physical maintenance to delete any old-looking payload.
+
+Checksums and metadata proofs detect accidental corruption and inconsistent
+state; CRCs are not cryptographic authentication against malicious rewriting.
+Erasure coding recovers only within configured, actually independent failure
+domains. ETags are opaque API tokens, not a cryptographic security boundary or
+a promise of AWS MD5 representation.
+
+Startup binds state to configured identity and topology, checks ownership and
+locking, and rejects incompatible formats. Recovery of permitted torn or
+corrupt state follows format-specific policy; an unsupported version is not
+permission to reinterpret or overwrite it. There is currently no supported
+upgrade, downgrade, or mixed-format-version cluster. Old-format fixtures are
+rejection evidence, not compatibility readers. Do not reinitialize a lost,
+established Raft voter under its old identity.
+
+Persistence assumes the filesystem and devices honor required durability
+operations. Mount validation cannot establish power-loss safety; tmpfs tests
+are not durability evidence. Protect manifests, keys, state, and backups
+consistently rather than restore unrelated pieces and assume their identities
+or checkpoints still agree.
+
+## 5. Diagnostics, operational limits, and evidence
+
+Logging uses redacted secret carriers, escaped attacker-controlled text, and
+bounded diagnostic categories at selected boundaries. This is not a claim that
+all logs are public-safe or every internal error type is opaque. Request
+identifiers, object names, topology context, traces, and crash dumps can remain
+sensitive. Do not log raw credentials, session tokens from unfinished STS
+paths, SSE-C keys, signed URLs, or protocol bodies. Protect diagnostic files and
+operator access.
+
+Production artifacts must not enable test-only facilities. Use the default
+production build or documented OpenSSL alternative, not `--all-features`.
+Test hooks, fault injection, fixtures, and fuzzing are development surfaces,
+not supported runtime endpoints. See the [README](../README.md) and
+[testing guide](testing.md).
+
+Current limits and exclusions include:
+
+- no general per-tenant storage/CPU quotas or hostile-tenant fairness guarantee;
+- no Byzantine-node protection or defense against a compromised host/service account;
+- no functional STS, full IAM/KMS service, or assumed-role S3 authorization;
+- no supported format migration or rolling mixed-version upgrade; and
+- no assertion that test coverage alone proves production durability or security.
+
+The [security testing guide](security-testing.md),
+[finding inventory](security-findings-inventory.md), and
+[format evidence ledger](storage-format-ledger.md) identify focused tests,
+known dispositions, and format guarantees. AWS-facing tests, deterministic
+race/fault tests, model/property tests, and fuzzing provide complementary
+evidence. Historical inventory entries and incomplete mappings must not be read
+as proof of a completed independent security audit.
+
+## 6. Severity calibration
+
+Assess reachability, prerequisites, scope, and recoverability rather than only
+the subsystem or error code:
+
+- **Critical:** unauthenticated code execution, broad authentication bypass, or
+  exposure of signing/wrapping secrets enabling broad compromise.
+- **High:** cross-principal access to protected data, retention bypass, unsafe
+  acknowledged mutations, or corruption causing unrecoverable data loss.
+- **Medium:** bounded service denial or disclosure of sensitive operational
+  metadata without protected object content; impact may rise with persistence,
+  scale, or exploitability.
+- **Low:** interoperability or diagnostic defects with no demonstrated
+  confidentiality, integrity, or significant availability impact.
+
+An incorrect error classification can be high impact if it enables an unsafe
+retry; a canonicalization difference can be critical if it bypasses
+authentication. Conversely, intentional AWS-compatible public/discovery
+behavior is not automatically a security defect.
