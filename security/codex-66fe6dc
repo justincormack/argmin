@@ -1,0 +1,325 @@
+Staging RPC permits authenticated Raft write amplification
+Link: https://chatgpt.com/codex/cloud/security/findings/9d312a9cf09881919ecf68370f532ffe?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 66fe6dc
+Author: justin@specialbusservice.com
+Created: 29/08/2026, 11:26:53
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+
+Fixed in [`299aab30`](https://github.com/justincormack/argmin/commit/299aab30)
+(`Bound staging evidence before Raft submission`).
+
+The authenticated staging-evidence path now performs state-aware preflight
+inside the existing serialized low-priority evidence-update boundary. One
+shared classifier decodes the complete page and returns exactly one of:
+
+- `NewAuthorized`, for a genuinely new page whose actor, intent, evidence
+  members, chain position, and publication semantics match current committed
+  control-plane authority;
+- `ExactReplay`, carrying the original durable apply receipt; or
+- a typed rejection.
+
+Exact replays return their original receipt directly from preflight. Semantic
+rejections return before OpenRaft submission. Only `NewAuthorized` reaches
+`client_write`, so neither replays nor rejected pages advance the Raft log,
+increment command-submission metrics, or trigger restart-artifact checkpoint
+and filesystem synchronization work.
+
+The control plane now enforces the staging store's authoritative capacity
+limit of 64 distinct publication target epochs per exact logical intent
+`(pg_id, staging_generation)`. Multiple destination actors may report the same
+legitimate target without consuming additional target capacity, but a
+credential holder cannot create an unbounded chain by continually selecting
+new epochs. Publication evidence must carry both a target and transfer proof,
+the target must follow the authorized transition epoch, and the proof's source
+epoch cannot exceed the authorized staging source epoch. Tombstones must carry
+neither field. The storage node continues to derive the complete imported
+proof from the durable staged artifact; destination installation requires all
+destination evidence to match the exact requested target and transfer proof.
+
+The same classifier remains the state-machine application boundary, and
+snapshot invariant validation independently rejects retained state exceeding
+the per-intent target limit. These checks preserve race safety if committed
+state changes after preflight and ensure restart cannot admit an over-limit
+snapshot.
+
+The integrated regression
+`authenticated_staging_evidence_preflight_suppresses_invalid_pages_and_exact_replays`
+uses the authenticated Unix RPC and durable single-node OpenRaft host. It
+proves that malformed and semantically invalid pages do not advance the log or
+durability metrics; exactly 64 distinct targets each advance the log,
+submission counter, and checkpoint counter once; the 65th target is rejected
+without advancing any of them; direct state-machine application also rejects
+that excess page; and repeated exact replay returns the original receipt
+without submission or checkpointing.
+
+The validation, evidence, and attack-path sections below describe the
+pre-fix implementation and are retained as the historical basis for the
+finding.
+
+# Summary
+Introduced. The commit exposes staging-evidence publication to storage-node credentials and connects it directly to the normal high-priority Raft command submission path. It does not preflight semantic validity, suppress exact replays before proposal, rate-limit actors, or use the planned low-priority proposal path.
+The new storage-node staging-evidence RPC performs only outer page framing, digest, canonicality, actor, and HMAC checks before dispatch. Evidence members are decoded and checked against current transition authority only by the replicated state machine. In the Raft authority implementation, every authenticated request is passed directly to submit_raft_command, which invokes OpenRaft client_write before those semantic checks run. Even when application returns ControlPlaneRaftCommandOutcome::Rejected, finish_submitted_raft_command performs a durable restart-artifact checkpoint before returning the rejection. Exact replays are also deliberately returned as unchanged successful applications, but they have already been submitted through Raft. Consequently, a holder of any configured storage-node credential can repeatedly sign a canonical page containing invalid evidence bytes, unauthorized transition evidence, or an already-retained page. Each request can append and replicate a command, serialize through the shared Raft proposal path, and trigger checkpoint I/O. The per-actor evidence worker guard limits concurrent requests but provides no rate limit or proposal deduplication, so sequential requests can sustain the attack. This can starve legitimate control-plane operations, cause substantial replicated WAL/checkpoint I/O, and eventually exhaust disk on control-plane members.
+
+# Validation
+## Rubric
+- [x] Confirm a configured storage-node credential can reach the staging-evidence RPC and actor authentication does not require administrator authority; verified by authenticated Unix RPC test and verifier trace.
+- [x] Confirm canonical outer pages with semantically invalid or unauthorized member evidence pass outer decoding and fail only in replicated state-machine semantics; verified by source trace, existing transition test, and custom canonical-page reproduction.
+- [x] Confirm every admitted request, including repeated rejection and exact replay, enters the normal OpenRaft client-write path before semantic outcome or idempotence handling; verified by log-index advancement and source ordering.
+- [x] Confirm rejected/replayed commands cause durable work and that no rate limiter, proposal deduplication, or implemented low-priority path prevents sequential abuse; ten attempts caused ten checkpoints and worker admission was shown to be concurrency-only.
+- [x] Exercise the strongest bounded production-representative harness and document limitations; real authenticated Unix RPC and real durable OpenRaft host paths were tested separately, with the lack of a single integrated multi-member stress run recorded as a proof gap.
+## Report
+Confirmed one authenticated control-plane availability/resource-amplification vulnerability.
+
+Attacker input and preconditions: The input is a canonical, digest-valid metadata-transfer staging-evidence page, wrapped in a StorageStagingEvidencePublish HMAC envelope. Exploitation requires a configured storage-node credential matching the page actor and network/filesystem access to an ordinary authenticated control-plane Unix or TLS listener. It does not require an administrator credential. The verifier derives the expected storage-node principal from the outer page and accepts the configured node credential at crates/storage/src/control_plane/rpc.rs:4748-4854. The focused unmodified test `cargo test -p storage authenticated_unix_staging_evidence_publication_returns_exact_receipt -- --nocapture` passed and exercised the credential-authenticated Unix RPC interface. The project plan also explicitly says this RPC is exposed over authenticated Unix and TLS at plans/multihost-followup-plan.md:493-496. There is not yet a legitimate production outbox caller (plans/multihost-followup-plan.md:497-500), but that does not prevent a credential holder from constructing and sending the documented RPC directly.
+
+Closest controls: RPC admission validates framing and the canonical outer page/digest at crates/storage/src/control_plane/rpc.rs:10427-10443, then authenticates actor, cluster, operation, and HMAC at rpc.rs:4748-4854. It does not decode and authorize individual evidence members against current control-plane state. Authentication replay protection is only a stateless timestamp-window check at crates/storage/src/control_plane_auth.rs:672-702; it has no nonce cache or payload deduplication. Consequently, identical envelopes are acceptable while fresh, and a credential holder can also sign fresh envelopes indefinitely.
+
+Semantic-check location: RPC dispatch passes every admitted page to `apply_metadata_transfer_staging_evidence_page` at crates/storage/src/control_plane/rpc.rs:6099-6114. Member decoding, actor comparison, transition-authority validation, and duplicate-member checks occur later in the replicated state machine at crates/storage/src/control_plane.rs:2822-2855. The existing transition test passed with `cargo test -p storage unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay -- --nocapture`; its assertions show canonical duplicate evidence becoming a committed state-machine rejection at crates/storage/src/control_plane/tests/transitions.rs:830-854, unauthorized evidence being rejected at transitions.rs:1139-1172, and exact retained-page replay returning an unchanged success at transitions.rs:897-902.
+
+Vulnerable sink: The Raft host sends this command through the ordinary `submit_raft_command` path at crates/storage/src/control_plane_raft_host.rs:1250-1266. That path calls the authority submission at control_plane_raft_host.rs:785-792, which serializes submissions on the shared update gate at crates/storage/src/control_plane_raft.rs:3881-3913 and invokes `raft.client_write` at control_plane_raft.rs:4439-4461. OpenRaft applies semantic failures as committed `Rejected` responses rather than aborting the log entry at crates/storage/src/control_plane_raft/state_machine.rs:578-617 and control_plane_command.rs:1895-1915. The existing test `control_plane_openraft_triggered_single_node_client_write_applies_and_rejects` passed and asserts that a rejected command receives the next log index at crates/storage/src/control_plane_raft/tests/cluster.rs:115-129.
+
+Dynamic amplification reproduction: A temporary focused test, included as `custom_test.patch` in the artifact, constructed a canonical and digest-valid but semantically unauthorized staging page, started the real durable single-node OpenRaft authority and `ControlPlaneRaftAuthorityHost`, and submitted the identical page ten times through the host method used by RPC dispatch. Command: `cargo test -p storage validation_repeated_semantically_invalid_staging_pages_commit_and_checkpoint -- --nocapture`. It passed with: `attempts=10 log_index_before=1 log_index_after=11 command_submits_delta=10 checkpoint_stores_delta=10 checkpoint_file_syncs_delta=20 checkpoint_directory_syncs_delta=20 artifact_bytes_before=461 artifact_bytes_after=4421`. Thus every semantic rejection advanced the Raft log, counted as a proposal, performed a durable checkpoint store, caused filesystem sync work, and enlarged the restart artifact. The repository was restored after capturing the patch and output.
+
+Checkpoint ordering and I/O: `finish_submitted_raft_command` checkpoints before distinguishing Applied from Rejected at crates/storage/src/control_plane_raft_host.rs:795-807. Artifact persistence captures the state machine and log store, writes/truncates a temporary artifact, calls `sync_all`, renames it, and syncs the parent directory at crates/storage/src/control_plane_raft.rs:5252-5309 and 8141-8222. This directly explains the measured checkpoint and sync deltas. Exact successful replays hit the unchanged response only in the state machine at control_plane.rs:2757-2776, after this same proposal path has already been entered.
+
+Rate-limit and priority assessment: The evidence worker guard only limits concurrent evidence workers and allows at most one active request per actor at crates/storage/src/control_plane/rpc.rs:7017-7062 and 7422-7487. Its state is removed when a request completes, so it does not limit sequential requests. The unmodified `evidence_confirmation_saturation_does_not_consume_heartbeat_workers` test passed, confirming that this is isolated concurrency admission rather than a request-rate limit. The design document says a separate low-priority proposal queue is intended (plans/multihost-followup-plan.md:852-859) and explicitly records Raft-host low-priority scheduling as unfinished (plans/multihost-followup-plan.md:497-499). No preproposal semantic deduplication or token-bucket control was found.
+
+Counterevidence and proof gaps: Authentication prevents an unauthenticated network attacker and binds the page actor to a configured node credential. The dedicated evidence worker pool preserves ordinary RPC worker capacity against concurrent evidence connections. Production durable Raft startup also launches a checkpoint monitor with 64 MiB/4096-mutation/60-second thresholds at crates/storage/src/control_plane_raft_durability.rs:27-47 and control_plane_raft_peer_bootstrap.rs:600-603; coordinated snapshots and purges can reduce long-term retained-log growth. These controls do not suppress sequential proposals or the per-request checkpoint/fsync path, so they do not falsify the demonstrated control-plane I/O and proposal amplification. The validation did not run one fully integrated authenticated socket directly against a multi-member durable Raft cluster, did not measure starvation of a simultaneous legitimate admin command, and did not run until physical disk exhaustion. Authenticated RPC reachability and durable Raft amplification were instead exercised in separate focused production-path tests. Therefore the core vulnerability is confirmed with high confidence, while the ultimate starvation rate and disk-exhaustion time remain deployment-, storage-, topology-, and checkpoint-scheduling-dependent.
+
+# Evidence
+crates/storage/src/control_plane_raft_host.rs (L1250 to 1266)
+  Note: The newly added Raft authority implementation submits each page directly as a replicated command.
+```
+    fn apply_metadata_transfer_staging_evidence_page(
+        &mut self,
+        operation_payload: Vec<u8>,
+        page_digest: [u8; 32],
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let response = self.submit_raft_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload,
+                page_digest,
+            },
+        )?;
+        let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt } =
+            response
+        else {
+            unreachable!("staging evidence command returned the wrong response");
+        };
+        Ok(apply_receipt)
+```
+
+crates/storage/src/control_plane_raft_host.rs (L785 to 818)
+  Note: Command submission invokes Raft and then checkpoints before distinguishing an applied response from a state-machine rejection, amplifying semantically invalid requests into durable work.
+```
+    fn submit_raft_command_with_checkpoint_policy(
+        &mut self,
+        command: ControlPlaneCommand,
+        checkpoint_after_commit: bool,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        let submitted = self.block_on(self.authority.submit_control_plane_command(command))?;
+        self.finish_submitted_raft_command(submitted, checkpoint_after_commit)
+    }
+
+    fn finish_submitted_raft_command(
+        &mut self,
+        submitted: SubmittedControlPlaneRaftCommand,
+        checkpoint_after_commit: bool,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+        let outcome = submitted.into_outcome();
+        if checkpoint_after_commit {
+            self.checkpoint_committed_raft_command()?;
+        }
+        match outcome {
+            ControlPlaneRaftCommandOutcome::Applied(response) => Ok(response),
+            ControlPlaneRaftCommandOutcome::Rejected(error) => Err(error),
+        }
+    }
+
+    fn checkpoint_committed_raft_command(&self) -> Result<(), ControlPlaneError> {
+        if let Err(error) = self.store_durable_restart_artifact() {
+            self.poison_durable_authority(format!(
+                "OpenRaft control-plane durability checkpoint failed after a committed command; \
+                 refusing to serve until restart: {error}"
+            ));
+            return Err(error);
+        }
+        Ok(())
+```
+
+crates/storage/src/control_plane.rs (L2757 to 2776)
+  Note: Exact duplicate pages produce a successful unchanged response, but the new Raft host path has already replicated the command before reaching this idempotence check.
+```
+        if let Some(existing) = self.metadata_transfer_staging_evidence_pages.get(&page_key) {
+            let existing_page = crate::pg_store::decode_staging_evidence_page_payload(
+                &existing.operation_payload,
+                existing.page_digest,
+            )
+            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
+                context: "retained metadata-transfer staging evidence page is invalid",
+                message: error.to_string(),
+            })?;
+            if page.actor() == existing_page.actor()
+                && existing.operation_payload == operation_payload
+                && existing.page_digest == page_digest
+            {
+                return Ok(AppliedControlPlaneCommand::new(
+                    self.clone(),
+                    ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
+                        apply_receipt: existing.apply_receipt.clone(),
+                    },
+                    false,
+                ));
+```
+
+crates/storage/src/control_plane.rs (L2822 to 2853)
+  Note: Member decoding, actor matching, transition authorization, and duplicate checks occur in the state machine, after the Raft proposal has already been committed.
+```
+        let mut decoded_entries = Vec::with_capacity(page.entries().len());
+        let mut page_evidence_keys = BTreeSet::new();
+        for entry in page.entries() {
+            let evidence =
+                crate::pg_store::decode_staging_evidence(entry.evidence()).map_err(|error| {
+                    ControlPlaneError::CommandDecode {
+                        message: format!("invalid metadata-transfer staging evidence: {error}"),
+                    }
+                })?;
+            if evidence.actor() != page.actor() {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: "metadata-transfer staging page contains foreign actor evidence"
+                        .to_owned(),
+                });
+            }
+            self.validate_metadata_transfer_staging_evidence_authority(&evidence, true)?;
+            let key = MetadataTransferStagingEvidenceKey {
+                pg_id: evidence.intent().pg_id(),
+                staging_generation: evidence.intent().staging_generation(),
+                actor_node_id: evidence.actor().node_id(),
+                actor_node_incarnation: evidence.actor().node_incarnation(),
+                kind: evidence.kind(),
+            };
+            if self.metadata_transfer_staging_evidence.contains_key(&key)
+                || !page_evidence_keys.insert(key.clone())
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} staging evidence identity is duplicated or already retained",
+                        key.pg_id.get()
+                    ),
+                });
+```
+
+crates/storage/src/control_plane/rpc.rs (L10427 to 10443)
+  Note: RPC admission validates only the canonical outer evidence page and digest; it does not validate each evidence member against control-plane state.
+```
+fn read_staging_evidence_publication_request(
+    payload: &[u8],
+) -> Result<(Vec<u8>, [u8; 32]), ControlPlaneError> {
+    let mut reader = PayloadReader::new(payload);
+    let operation_payload_len = reader.read_len("staging evidence operation payload")?;
+    let operation_payload = reader.read_exact(operation_payload_len)?.to_vec();
+    let page_digest = reader
+        .read_exact(32)?
+        .try_into()
+        .expect("staging evidence digest width was checked");
+    reader.finish()?;
+    decode_staging_evidence_page_payload(&operation_payload, page_digest).map_err(|error| {
+        ControlPlaneError::rpc_protocol(format!(
+            "invalid staging evidence publication request: {error}"
+        ))
+    })?;
+    Ok((operation_payload, page_digest))
+```
+
+crates/storage/src/control_plane/rpc.rs (L6099 to 6114)
+  Note: Every authenticated staging-evidence request is dispatched to the authority without replay suppression or state-aware preflight.
+```
+        ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage => {
+            let (operation_payload, page_digest) =
+                read_staging_evidence_publication_request(&payload)?;
+            match control_plane
+                .apply_metadata_transfer_staging_evidence_page(operation_payload, page_digest)
+            {
+                Ok(apply_receipt) => {
+                    decode_staging_evidence_apply_receipt(&apply_receipt).map_err(|error| {
+                        ControlPlaneError::rpc_protocol(format!(
+                            "authority returned invalid staging evidence apply receipt: {error}"
+                        ))
+                    })?;
+                    Ok(apply_receipt)
+                }
+                Err(error) => Err(error),
+            }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+No hard suppression applies: the impact is not self-only, the required storage-node credential is a lower-privileged service identity rather than an administrator/operator identity, and the vulnerability is precisely the privilege delta that lets that identity force unauthorized shared control-plane work. Reachability is internal/local-network rather than public, so likelihood is medium. Impact is high because the path reaches shared OpenRaft replication and durable storage, as shown by crates/storage/src/control_plane_raft.rs:4439-4461 and crates/storage/src/control_plane_raft.rs:8141-8222, with the supplied executable test measuring one log advance and checkpoint store per rejected request. Applying the required matrix mechanically, high impact multiplied by medium likelihood results in medium severity. The finding therefore remains reportable at medium rather than being suppressed or raised to high.
+## Likelihood
+medium - Exploitation is low complexity after credential acquisition: the attacker can repeatedly sign fresh envelopes or replay an envelope during its freshness window, and sequential requests bypass the concurrency-only guard. Likelihood is reduced to medium because the endpoint is internal/private, a valid storage-node credential is mandatory, durable OpenRaft must be enabled, and the repository plan states that no legitimate production outbox caller exists yet. A compromised storage node remains a realistic lower-privileged cluster identity, and direct RPC construction does not depend on that caller.
+## Impact
+high - Each accepted request can consume the shared Raft proposal path, append and replicate a command, advance applied log state even when rejected, serialize a restart artifact, and perform durable filesystem synchronization. Repetition can delay legitimate lease or administrative control-plane operations and consume disk across control-plane members. This is high availability impact because loss of the replicated control plane can affect the cluster, although no confidentiality or object-integrity impact is shown and the validation did not run to an actual outage.
+## Assumptions
+- The deployment enables the durable OpenRaft control-plane authority and its authenticated control-plane RPC listeners.
+- The attacker controls or has compromised a configured storage node and therefore possesses that node's HMAC signing credential.
+- The attacker can reach an advertised internal TLS control-plane endpoint or a local Unix control-plane socket.
+- Port 7501 is the repository's documented multihost example; the actual control-plane TCP port is manifest-configurable.
+- Multi-member amplification follows the repository's OpenRaft client_write path; the supplied executable amplification test used a durable single-node authority rather than a complete multi-member socket deployment.
+- A valid configured storage-node HMAC credential matching the outer page actor
+- Network access to an authenticated internal TLS listener or filesystem access to an authenticated Unix listener
+- A deployment using the durable OpenRaft authority
+- Ability to repeatedly send canonical, digest-valid staging-evidence pages
+## Path
+storage-node credential -> Unix/internal TLS RPC -> outer HMAC/page checks -> shared OpenRaft client_write -> post-commit rejection or unchanged replay -> checkpoint/fsync -> control-plane starvation or disk exhaustion
+## Path evidence
+- `crates/storage/src/control_plane/rpc.rs:10427-10443` - Admission parses framing and verifies the canonical outer page and digest but does not validate evidence members against current control-plane state.
+- `crates/storage/src/control_plane/rpc.rs:4748-4854` - The operation accepts a configured storage-node credential matching the page actor and verifies cluster, source, target, operation, freshness policy, and HMAC.
+- `crates/storage/src/control_plane/rpc.rs:6099-6114` - Every admitted staging-evidence page is dispatched directly to the authority with no state-aware preflight or replay suppression.
+- `crates/storage/src/control_plane_raft_host.rs:1250-1266` - The Raft authority implementation submits the staging-evidence operation through submit_raft_command.
+- `crates/storage/src/control_plane_raft_host.rs:785-818` - Command submission invokes the authority and performs a durable checkpoint before distinguishing Applied from Rejected.
+- `crates/storage/src/control_plane.rs:2822-2853` - Evidence decoding, actor matching, transition authorization, and duplicate checks occur in the replicated state machine after proposal.
+- `crates/storage/src/control_plane.rs:2757-2776` - An exact retained-page replay returns an unchanged success only after the command has reached state-machine application.
+- `crates/storage/src/control_plane_auth.rs:672-702` - Replay protection checks only a timestamp window and contains no nonce cache or payload deduplication.
+- `crates/storage/src/control_plane/rpc.rs:7017-7062` - The evidence guard limits concurrent workers and removes the actor reservation on completion, so it does not limit sequential requests.
+- `crates/storage/src/control_plane/rpc.rs:7422-7487` - Evidence requests use a dedicated worker allowance and at most one concurrent request per actor, preserving some ordinary RPC capacity but not proposal rate.
+- `crates/storage/src/control_plane_raft.rs:3881-3913` - Control-plane commands serialize through a shared heartbeat update gate and record normal command submissions.
+- `crates/storage/src/control_plane_raft.rs:4439-4461` - The shared command path validates only replication size and then invokes OpenRaft client_write.
+- `crates/storage/src/control_plane_raft/state_machine.rs:578-617` - Normal Raft entries advance the applied log position and encode semantic failures as Rejected apply responses.
+- `crates/storage/src/control_plane_command.rs:1895-1915` - Application errors other than invariant violations become committed rejected commands while advancing last_applied.
+- `crates/storage/src/control_plane_raft.rs:8141-8222` - Restart-artifact persistence encodes the artifact, writes and truncates a temporary file, calls sync_all, renames it, and synchronizes the parent.
+- `crates/argmin-s3/src/main.rs:2113-2136` - The argmin-s3 runtime binds configured control-plane listeners and builds the authentication verifier for the durable OpenRaft service.
+- `crates/argmin-s3/src/main.rs:2779-2839` - Configured listeners become Unix sockets or TLS TCP listeners bound to the configured address.
+- `crates/argmin-s3/src/static_cluster_config.rs:1412-1471` - Static cluster endpoints support both Unix and TCP control-plane listeners, with TCP listeners receiving a configured TLS identity.
+- `guides/configuration.md:668-673` - The documented multihost deployment exposes control-plane listeners on wildcard port 7501 and advertises internal hostnames.
+- `plans/multihost-followup-plan.md:492-500` - Strongest counterevidence: the feature has no production store opener or outbox caller yet, but the same passage confirms authenticated Unix/TLS RPC exposure and unfinished low-priority scheduling.
+- `crates/storage/src/control_plane_raft_durability.rs:27-47` - Periodic durability policy uses 64 MiB, 4096-mutation, and 60-second thresholds, which can reduce retained growth but does not stop per-request proposal and checkpoint work.
+## Narrative
+Attacker story: an attacker who controls an ordinary configured storage node uses its legitimate HMAC credential to submit canonical staging-evidence pages whose members are unauthorized, malformed at the evidence layer, duplicated, or already retained. RPC admission validates framing, digest, actor binding, cluster, operation, freshness, and HMAC, but dispatches the page without current-state semantic validation. The Raft host immediately uses the normal shared proposal path; semantic rejection and exact replay handling occur only after commitment, and the host checkpoints before distinguishing Applied from Rejected. The supplied executable validation submitted the same semantically unauthorized page ten times through the real durable host and observed ten new log indexes, ten proposal submissions, ten checkpoint stores, twenty file syncs, twenty directory syncs, and restart-artifact growth from 461 to 4421 bytes. Authentication, private exposure, connection limits, and a per-actor concurrency guard are meaningful controls, but they do not rate-limit sequential signed requests. The strongest counterevidence is that the project plan calls this an incomplete slice with no production outbox caller and unfinished low-priority scheduling; this lowers likelihood but does not eliminate direct reachability through listeners bound by the production binary. No object data or credential data is disclosed or modified. The reportable impact is shared control-plane availability and durable-storage consumption.
+## Controls
+- HMAC authentication scoped to cluster, StorageNode actor, ControlPlane target, and StorageStagingEvidencePublish operation
+- Actor node ID and incarnation are derived from the canonical outer page
+- TLS is required for configured TCP control-plane listeners; Unix sockets are also supported
+- Maximum frame size, connection count, and I/O timeout controls exist
+- Authentication envelopes have a bounded timestamp freshness window
+- Dedicated evidence worker capacity preserves ordinary RPC worker slots
+- At most one evidence request per actor may be concurrent
+- OpenRaft checkpoint monitoring can snapshot and purge according to WAL-size, mutation-count, and elapsed-time thresholds
+- No per-actor request-rate limit, nonce cache, preproposal semantic validation, or preproposal exact-replay suppression exists
+- The planned low-priority proposal queue is not implemented in the affected path
+## Blindspots
+- No repository deployment manifest proves that a real installation exposes the configurable control-plane port beyond an internal network; port 7501 is a documented example.
+- The supplied executable amplification test used the real durable single-node authority but did not exercise one authenticated socket against a multi-member cluster.
+- The validation did not measure starvation of a simultaneous legitimate command or run until physical disk exhaustion.
+- Snapshot and purge scheduling can reduce long-term retained-log growth, so time to disk exhaustion depends on request rate, topology, storage performance, and durability configuration.
+- The project plan states that production store opening and outbox publication are incomplete, leaving uncertainty about current deployment prevalence.
+- Static repository analysis cannot establish credential-compromise probability, network segmentation, host filesystem permissions, external rate limiting, or operational disk quotas.
