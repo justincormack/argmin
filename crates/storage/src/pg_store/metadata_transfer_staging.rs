@@ -311,6 +311,30 @@ impl MetadataTransferStagingReceipt {
         }
         Ok(receipt)
     }
+
+    pub(crate) fn from_tombstone_bytes(
+        bytes: &[u8],
+        expected_intent: &MetadataTransferStagingIntent,
+        expected_node_id: NodeId,
+    ) -> Result<Self, MetadataTransferStagingError> {
+        let evidence = decode_staging_evidence(bytes)?;
+        if evidence.kind() != MetadataTransferStagingEvidenceKind::Tombstone
+            || evidence.target_epoch().is_some()
+            || evidence.transfer().is_some()
+        {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging tombstone response contains non-tombstone evidence".to_owned(),
+            ));
+        }
+        if evidence.intent() != expected_intent || evidence.actor().node_id != expected_node_id {
+            return Err(MetadataTransferStagingError::Invariant(
+                "staging tombstone response does not match its request subject".to_owned(),
+            ));
+        }
+        Ok(Self {
+            bytes: evidence.as_bytes().to_vec(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1709,7 +1733,7 @@ impl MetadataTransferStagingStore {
         read_artifact_file(&self.artifact_path(intent), intent)
     }
 
-    pub(crate) fn tombstone(
+    fn tombstone_inner(
         &self,
         intent: &MetadataTransferStagingIntent,
     ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
@@ -1789,6 +1813,23 @@ impl MetadataTransferStagingStore {
         remove_artifact_if_present(&self.artifact_path(intent))?;
         sync_directory(&self.artifacts_dir, "sync staged artifact removal")?;
         Ok(MetadataTransferStagingReceipt { bytes: receipt })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tombstone(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
+        self.tombstone_inner(intent)
+    }
+
+    pub(crate) fn tombstone_authorized(
+        &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
+        validate_committed_staging_authorization(&self.identity, authorization, intent)?;
+        self.tombstone_inner(intent)
     }
 
     pub(crate) fn advance_finalized_floor(
@@ -6288,6 +6329,18 @@ mod tests {
             cross_member.cross_member_intent.pg_id(),
             cross_member.cross_member_intent.staging_generation(),
         ));
+        assert!(matches!(
+            store.tombstone_authorized(
+                &cross_member.cross_member_authorization,
+                &cross_member.cross_member_intent,
+            ),
+            Err(MetadataTransferStagingError::IntentConflict(message))
+                if message.contains("not bound to this staging actor and PG")
+        ));
+        assert!(!store.has_intent_for_test(
+            cross_member.cross_member_intent.pg_id(),
+            cross_member.cross_member_intent.staging_generation(),
+        ));
 
         let valid_artifact = canonical_artifact(b"valid artifact");
         let valid = intent(valid_artifact);
@@ -6300,6 +6353,50 @@ mod tests {
             .unwrap()
             .as_bytes()
             .is_empty());
+    }
+
+    #[test]
+    fn committed_authorization_tombstones_exact_intent_and_removes_artifact() {
+        let tmp = test_util::tempdir();
+        let store = open(tmp.path());
+        let artifact = canonical_artifact(b"authorized tombstone");
+        let intent = intent(artifact);
+        let authorization =
+            crate::pg_store::committed_staging_authorization_for_intent_for_test(&intent);
+        store
+            .create_intent_authorized(&authorization, &intent)
+            .unwrap();
+        let publication = store
+            .publish_artifact_authorized(&authorization, &intent, artifact)
+            .unwrap();
+        assert!(store.artifact_path(&intent).exists());
+
+        let first = store.tombstone_authorized(&authorization, &intent).unwrap();
+        let replay = store.tombstone_authorized(&authorization, &intent).unwrap();
+
+        assert_eq!(replay, first);
+        assert!(!store.artifact_path(&intent).exists());
+        let evidence = decode_staging_evidence(first.as_bytes()).unwrap();
+        assert_eq!(
+            evidence.kind(),
+            MetadataTransferStagingEvidenceKind::Tombstone
+        );
+        assert_eq!(evidence.intent(), &intent);
+        assert_eq!(evidence.actor(), &identity());
+        assert_eq!(evidence.target_epoch(), None);
+        assert_eq!(evidence.transfer(), None);
+        assert!(MetadataTransferStagingReceipt::from_tombstone_bytes(
+            publication.as_bytes(),
+            &intent,
+            NodeId::new(4),
+        )
+        .is_err());
+        assert!(MetadataTransferStagingReceipt::from_publication_bytes(
+            first.as_bytes(),
+            &intent,
+            NodeId::new(4),
+        )
+        .is_err());
     }
 
     #[test]

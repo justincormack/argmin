@@ -5372,7 +5372,7 @@
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [24_u16, 26] {
+            for unsupported_version in [25_u16, 27] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());
@@ -6432,6 +6432,48 @@
             .unwrap();
         assert_eq!(replay, first);
         assert!(!first.as_bytes().is_empty());
+        let assert_published_artifact_retained = || {
+            let store = server.metadata_transfer_staging_store.as_ref().unwrap();
+            assert!(store.has_intent_for_test(intent.pg_id(), intent.staging_generation()));
+            assert_eq!(store.read_artifact(&intent).unwrap(), artifact);
+        };
+        let malformed_tombstone_error = client
+            .tombstone_metadata_transfer_staging_artifact_with_presentation_for_test(
+                &malformed_presentation,
+                &intent,
+            )
+            .unwrap_err();
+        assert_eq!(
+            malformed_tombstone_error.operation_failure_class(),
+            crate::error::StoreOperationFailureClass::Other
+        );
+        assert_published_artifact_retained();
+        let stale_tombstone_error = client
+            .tombstone_metadata_transfer_staging_artifact_with_presentation_for_test(
+                &stale_presentation,
+                &intent,
+            )
+            .unwrap_err();
+        assert_eq!(
+            stale_tombstone_error.operation_failure_class(),
+            crate::error::StoreOperationFailureClass::Other
+        );
+        assert_published_artifact_retained();
+        server.install_authority_runtime_map_for_test(
+            &staging.cross_member_tombstone_runtime_map,
+        );
+        let cross_member_tombstone_error = client
+            .tombstone_metadata_transfer_staging_artifact_with_presentation_for_test(
+                &staging.cross_member_tombstone_presentation,
+                &intent,
+            )
+            .unwrap_err();
+        assert_eq!(
+            cross_member_tombstone_error.operation_failure_class(),
+            crate::error::StoreOperationFailureClass::Other
+        );
+        assert_published_artifact_retained();
+        server.install_authority_runtime_map_for_test(&staging.runtime_map);
         let initial = crate::pg_store::decode_staging_evidence(first.as_bytes()).unwrap();
         assert_eq!(initial.target_epoch(), Some(initial_destination_epoch));
         let rebased = client
@@ -6458,6 +6500,33 @@
                 .unwrap(),
             rebased
         );
+        let tombstone = client
+            .tombstone_metadata_transfer_staging_artifact(&authorization, &intent)
+            .unwrap();
+        assert_eq!(
+            client
+                .tombstone_metadata_transfer_staging_artifact(&authorization, &intent)
+                .unwrap(),
+            tombstone
+        );
+        let tombstone_evidence =
+            crate::pg_store::decode_staging_evidence(tombstone.as_bytes()).unwrap();
+        assert_eq!(
+            tombstone_evidence.kind(),
+            crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone
+        );
+        assert_eq!(tombstone_evidence.intent(), &intent);
+        assert_eq!(tombstone_evidence.actor().node_id(), config.node_id);
+        assert_eq!(tombstone_evidence.target_epoch(), None);
+        assert_eq!(tombstone_evidence.transfer(), None);
+        assert!(matches!(
+            server
+                .metadata_transfer_staging_store
+                .as_ref()
+                .unwrap()
+                .read_artifact(&intent),
+            Err(crate::pg_store::MetadataTransferStagingError::GenerationRetired)
+        ));
 
         drop(client);
         assert!(join.join().unwrap().is_ok());

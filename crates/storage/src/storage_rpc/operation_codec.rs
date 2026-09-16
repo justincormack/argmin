@@ -184,6 +184,34 @@ pub(crate) fn decode_metadata_transfer_staging_proof_publish_request(
     })
 }
 
+pub(crate) fn encode_metadata_transfer_staging_tombstone_request(
+    request: &StorageRpcMetadataTransferStagingTombstoneRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let intent = encode_staging_intent(&request.intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    let mut out = Vec::new();
+    put_staging_authorization_presentation(&mut out, &request.authorization)?;
+    put_bytes(&mut out, &intent);
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_transfer_staging_tombstone_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataTransferStagingTombstoneRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let authorization = read_staging_authorization_presentation(&mut decoder)?;
+    let intent = decoder.read_bytes_with_payload_limit(MAX_STAGING_INTENT_BYTES)?;
+    decoder.finish()?;
+    let intent = decode_staging_intent(intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    Ok(StorageRpcMetadataTransferStagingTombstoneRequest {
+        authorization,
+        intent,
+    })
+}
+
 pub(crate) fn encode_metadata_transfer_staging_receipt_response(
     receipt: &MetadataTransferStagingReceipt,
 ) -> Vec<u8> {
@@ -230,6 +258,26 @@ pub(crate) fn decode_metadata_transfer_staging_epoch_bound_receipt_response(
     .map_err(|_| {
         StorageRpcPayloadError::InvalidMetadataTransferStaging(
             "receipt does not match the epoch-bound publication request",
+        )
+    })
+}
+
+pub(crate) fn decode_metadata_transfer_staging_tombstone_receipt_response(
+    bytes: &[u8],
+    expected_intent: &MetadataTransferStagingIntent,
+    expected_node_id: NodeId,
+) -> Result<MetadataTransferStagingReceipt, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let receipt = decoder.read_bytes_with_payload_limit(MAX_STAGING_EVIDENCE_BYTES)?;
+    decoder.finish()?;
+    MetadataTransferStagingReceipt::from_tombstone_bytes(
+        receipt,
+        expected_intent,
+        expected_node_id,
+    )
+    .map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "receipt does not match the tombstone request",
         )
     })
 }

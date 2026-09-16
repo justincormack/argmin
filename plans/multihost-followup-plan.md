@@ -1143,9 +1143,12 @@ unobserved predecessor rejection, partial/uncheckpointed rejection, stale-page
 rejection, and direct/coordinated certificate-forgery cases are covered. A
 three-voter Raft
 composition additionally covers replication to
-every voter and exact cleanup replay after leadership transfer. Destination
-tombstone RPC orchestration, physical artifact deletion, pre-install
-cancellation, fenced-incarnation retirement substitutes, and
+every voter and exact cleanup replay after leadership transfer. Storage RPC
+v26 exposes committed-authorization-bound exact-intent tombstoning, durable
+physical artifact deletion, canonical tombstone evidence, and exact replay
+over local, authenticated Unix, and authenticated TLS paths. Manager-driven
+all-destination tombstone orchestration, finalized-floor advancement,
+pre-install cancellation, fenced-incarnation retirement substitutes, and
 closure-certificate retirement remain gated.
 
 Command v29 and state v41 implement the first bounded segment-retirement
@@ -1355,6 +1358,21 @@ containers remain exact rejection evidence. Storage staging format v4,
 artifact format v3, storage RPC v25, control-plane RPC v22, and authentication
 envelope v2 are unchanged because this slice adds no storage mutation or wire
 operation. No compatibility reader is added.
+
+Destination tombstoning advances storage RPC v25 to v26 by adding one
+admin-only operation carrying the same untrusted complete staging-
+authorization presentation and exact intent as the other destination staging
+mutations. The storage node promotes that presentation only after exact
+authority-state comparison for the destination `(node, PG)` member, then the
+staging store repeats the committed-authorization check before deleting the
+artifact and committing canonical tombstone evidence. Publication and
+tombstone receipts have distinct validated kinds and cannot substitute for
+one another. Exact v26 intent, artifact, proof, and tombstone frames are fixed;
+v25 remains immutable rejection evidence, and authenticated Unix/TLS tests
+cover physical deletion plus exact tombstone replay. Staging-store format v4,
+artifact format v3, control-plane RPC v22, command v30, state v42, and
+authentication envelope v2 are unchanged because their existing grammars
+already represent the resulting tombstone evidence and authorization.
 
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Staging-store format v4 owns the

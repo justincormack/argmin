@@ -258,6 +258,12 @@ fn message_kind_request_max_payload_len(
                 + MAX_STAGING_INTENT_BYTES
                 + 8
         }
+        StorageRpcMessageKind::MetadataTransferStagingTombstone => {
+            STORAGE_RPC_STAGING_AUTHORIZATION_PRESENTATION_OVERHEAD
+                + STORAGE_RPC_MAX_STAGING_AUTHORIZATION_BYTES
+                + 4
+                + MAX_STAGING_INTENT_BYTES
+        }
         StorageRpcMessageKind::ReadHandlesAcquire => {
             STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN
         }

@@ -2998,6 +2998,57 @@ impl UnixStorageNodeClient {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn tombstone_metadata_transfer_staging_artifact(
+        &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<MetadataTransferStagingReceipt, StoreError> {
+        self.tombstone_metadata_transfer_staging_artifact_with_presentation(
+            authorization.presentation(),
+            intent,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tombstone_metadata_transfer_staging_artifact_with_presentation_for_test(
+        &self,
+        authorization: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<MetadataTransferStagingReceipt, StoreError> {
+        self.tombstone_metadata_transfer_staging_artifact_with_presentation(authorization, intent)
+    }
+
+    fn tombstone_metadata_transfer_staging_artifact_with_presentation(
+        &self,
+        authorization: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<MetadataTransferStagingReceipt, StoreError> {
+        let payload = encode_metadata_transfer_staging_tombstone_request(
+            &StorageRpcMetadataTransferStagingTombstoneRequest {
+                authorization: authorization.clone(),
+                intent: intent.clone(),
+            },
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "encode metadata-transfer staging tombstone request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataTransferStagingTombstone,
+            payload,
+        )?;
+        decode_metadata_transfer_staging_tombstone_receipt_response(&response, intent, self.node_id)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata-transfer staging tombstone response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    #[allow(dead_code)]
     fn install_metadata_transfer_checkpoint_base(
         &self,
         pg_id: PgId,

@@ -123,6 +123,7 @@ use crate::storage_rpc::{
     decode_metadata_transfer_staging_artifact_publish_request,
     decode_metadata_transfer_staging_intent_create_request,
     decode_metadata_transfer_staging_proof_publish_request,
+    decode_metadata_transfer_staging_tombstone_request,
     decode_multipart_completion_barrier_command_build_request,
     decode_multipart_completion_preflight_request, decode_multipart_completion_snapshot_request,
     decode_multipart_parts_list_request, decode_multipart_upload_load_request,
@@ -294,6 +295,7 @@ use crate::storage_rpc::{
     StorageRpcMetadataTransferStagingArtifactPublishRequest,
     StorageRpcMetadataTransferStagingIntentCreateRequest,
     StorageRpcMetadataTransferStagingProofPublishRequest,
+    StorageRpcMetadataTransferStagingTombstoneRequest,
     StorageRpcMultipartCompletionBarrierCommandBuildRequest,
     StorageRpcMultipartCompletionBarrierCommandBuildResponse,
     StorageRpcMultipartCompletionPreflightOutcome, StorageRpcMultipartCompletionPreflightRequest,
@@ -2442,6 +2444,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::MetadataTransferStagingProofPublish => {
                 match decode_metadata_transfer_staging_proof_publish_request(&frame.payload) {
                     Ok(request) => self.metadata_transfer_staging_proof_publish_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataTransferStagingTombstone => {
+                match decode_metadata_transfer_staging_tombstone_request(&frame.payload) {
+                    Ok(request) => self.metadata_transfer_staging_tombstone_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8378,6 +8389,34 @@ impl StorageNodeConnectionHandler {
             &request.intent,
             request.target_epoch,
         ) {
+            Ok(receipt) => Ok(encode_storage_rpc_success_response(
+                &encode_metadata_transfer_staging_receipt_response(&receipt),
+            )),
+            Err(error) => encode_storage_rpc_error_response(&staging_error_response(error)),
+        }
+    }
+
+    fn metadata_transfer_staging_tombstone_response(
+        &self,
+        request: StorageRpcMetadataTransferStagingTombstoneRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let Some(store) = self.metadata_transfer_staging_store.as_ref() else {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnsupportedOperation,
+                message: "metadata-transfer staging is not configured".to_owned(),
+            });
+        };
+        let authorization = match self
+            .verify_staging_authorization(&request.authorization, request.intent.pg_id())
+        {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&staging_authorization_error_response(
+                    error,
+                ));
+            }
+        };
+        match store.tombstone_authorized(&authorization, &request.intent) {
             Ok(receipt) => Ok(encode_storage_rpc_success_response(
                 &encode_metadata_transfer_staging_receipt_response(&receipt),
             )),

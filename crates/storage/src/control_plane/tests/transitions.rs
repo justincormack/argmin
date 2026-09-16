@@ -3217,6 +3217,9 @@ pub(crate) struct AuthenticatedStagingAuthorizationFixture {
     pub(crate) cross_member_authorization:
         crate::control_plane_command::CommittedUnavailablePgStagingAuthorization,
     pub(crate) cross_member_intent: crate::pg_store::MetadataTransferStagingIntent,
+    pub(crate) cross_member_tombstone_runtime_map: ClusterRuntimeMapSnapshot,
+    pub(crate) cross_member_tombstone_presentation:
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
 }
 
 pub(crate) fn authenticated_staging_authorization_fixture(
@@ -3297,6 +3300,38 @@ pub(crate) fn authenticated_staging_authorization_fixture(
         .unwrap();
     let mut cross_member_runtime_map = runtime_map.clone();
     cross_member_runtime_map.staging_authorizations = vec![cross_member_presentation];
+    let mut cross_member_tombstone_authorizations = authorizations;
+    let first_binding = &cross_member_tombstone_authorizations[0].unavailable_transition;
+    cross_member_tombstone_authorizations[0].unavailable_transition =
+        UnavailablePgTransitionMutationBinding::new(
+            first_binding.pg_id(),
+            first_binding.transition_epoch(),
+            first_binding.source_epoch(),
+            first_binding.source_acting_set().to_vec(),
+            vec![NodeId::new(5), NodeId::new(2), NodeId::new(3)],
+        );
+    let second_binding = &cross_member_tombstone_authorizations[1].unavailable_transition;
+    cross_member_tombstone_authorizations[1].unavailable_transition =
+        UnavailablePgTransitionMutationBinding::new(
+            second_binding.pg_id(),
+            second_binding.transition_epoch(),
+            second_binding.source_epoch(),
+            second_binding.source_acting_set().to_vec(),
+            vec![destination_node_id, NodeId::new(2), NodeId::new(3)],
+        );
+    let cross_member_tombstone_digest =
+        unavailable_pg_staging_authorization_batch_identity(&cross_member_tombstone_authorizations)
+            .members_digest;
+    let cross_member_tombstone_presentation =
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
+            cross_member_tombstone_authorizations,
+            runtime_map.cluster_epoch(),
+            cross_member_tombstone_digest,
+        )
+        .unwrap();
+    let mut cross_member_tombstone_runtime_map = runtime_map.clone();
+    cross_member_tombstone_runtime_map.staging_authorizations =
+        vec![cross_member_tombstone_presentation.clone()];
     AuthenticatedStagingAuthorizationFixture {
         destination_node_id,
         runtime_map,
@@ -3308,6 +3343,8 @@ pub(crate) fn authenticated_staging_authorization_fixture(
         cross_member_runtime_map,
         cross_member_authorization,
         cross_member_intent,
+        cross_member_tombstone_runtime_map,
+        cross_member_tombstone_presentation,
     }
 }
 
