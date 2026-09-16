@@ -16,7 +16,8 @@ use crate::control_plane_client_bootstrap::{
     ControlPlaneAdminClientBootstrap, ControlPlaneAdminCredentialBinding,
 };
 use crate::control_plane_command::{
-    CommittedUnavailablePgStagingAuthorization, UnavailablePgStagingIntentAuthorizationRequest,
+    CommittedUnavailablePgStagingAuthorization, FinalizeMetadataTransferStagingGenerationRequest,
+    MetadataTransferStagingTombstoneBinding, UnavailablePgStagingIntentAuthorizationRequest,
     UnavailablePgStagingPublicationBinding, UnavailablePgTransitionInstallRequest,
 };
 use crate::control_plane_service_client::ControlPlaneFrontendClient;
@@ -24,13 +25,13 @@ use crate::node_client::UnixStorageNodeClient;
 use crate::peering::PgMetadataTransferArtifact;
 use crate::pg_store::{
     decode_staging_evidence, encode_staged_metadata_transfer_artifact,
-    MetadataTransferStagingIntent, MetadataTransferStagingReceipt,
-    METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    MetadataTransferStagingIntent, MetadataTransferStagingNodeIdentity,
+    MetadataTransferStagingReceipt, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
 };
 #[cfg(test)]
 use crate::pg_store::{
-    MetadataTransferStagingLimits, MetadataTransferStagingNodeIdentity,
-    MetadataTransferStagingStore, METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
+    MetadataTransferStagingLimits, MetadataTransferStagingStore,
+    METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
 };
 use crate::storage_rpc_auth::StorageRpcClientAuthConfig;
 use crate::storage_rpc_transport::StorageRpcClientEndpoint;
@@ -364,6 +365,14 @@ pub(crate) struct PublishedUnavailablePgMetadataTransfer {
     publications: Vec<UnavailablePgStagingPublicationBinding>,
 }
 
+/// Exact all-destination cleanup evidence for one staged transfer. This state
+/// is constructible only after every authorization obligation has returned a
+/// canonical tombstone receipt.
+#[allow(dead_code)] // Consumed when the reconciliation worker switches to staged installation.
+pub(crate) struct TombstonedUnavailablePgMetadataTransfer {
+    cleanup: FinalizeMetadataTransferStagingGenerationRequest,
+}
+
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // Consumed through the staged reconciliation lifecycle.
 enum StagingPublication {
@@ -448,6 +457,13 @@ impl StagedUnavailablePgMetadataTransfer {
     }
 }
 
+#[allow(dead_code)] // Consumed when the reconciliation worker switches to staged installation.
+impl TombstonedUnavailablePgMetadataTransfer {
+    pub(crate) fn cleanup_request(&self) -> &FinalizeMetadataTransferStagingGenerationRequest {
+        &self.cleanup
+    }
+}
+
 /// Opaque failure from storage-owned live PG metadata transfer orchestration.
 ///
 /// Storage retains and records the implementation diagnostic, while callers
@@ -501,6 +517,7 @@ enum LivePgMetadataTransferStage {
     Export,
     Install,
     Import,
+    Cleanup,
 }
 
 impl LivePgMetadataTransferStage {
@@ -512,6 +529,7 @@ impl LivePgMetadataTransferStage {
             Self::Export => "source export",
             Self::Install => "route installation",
             Self::Import => "destination import",
+            Self::Cleanup => "destination cleanup",
         }
     }
 }
@@ -1146,6 +1164,134 @@ impl LivePgMetadataTransferAdmin {
         })
     }
 
+    #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged installation.
+    pub(crate) fn tombstone_staged_unavailable_pg_reconciliation(
+        &self,
+        staged: &StagedUnavailablePgMetadataTransfer,
+        completed_snapshot: &crate::control_plane::ClusterControlSnapshot,
+    ) -> Result<TombstonedUnavailablePgMetadataTransfer, LivePgMetadataTransferError> {
+        let result = (|| -> Result<_, LivePgMetadataTransferFailure> {
+            let prepared = &staged.authorized.prepared;
+            let cleanup_authorization = completed_snapshot
+                .validate_completed_unavailable_pg_staging_cleanup(
+                    &staged.install_request(),
+                    prepared.intent.staging_generation(),
+                )
+                .map_err(|error| {
+                    control_plane_transfer_failure(
+                        "staging cleanup is not authorized by a completed transition",
+                        error,
+                    )
+                })?;
+            let mut tombstones = Vec::with_capacity(prepared.work.destination_acting_set().len());
+            for node_id in prepared.work.destination_acting_set().iter().copied() {
+                let actor = cleanup_authorization
+                    .destination_actor(node_id)
+                    .ok_or_else(|| {
+                        LivePgMetadataTransferFailure::fatal(format!(
+                            "PG {} completed cleanup authority omits destination {}",
+                            prepared.work.pg_id().get(),
+                            node_id.as_u32()
+                        ))
+                    })?;
+                let receipt = self.tombstone_staging_artifact_on_destination(
+                    staged,
+                    cleanup_authorization.cluster_epoch(),
+                    actor,
+                )?;
+                let evidence = decode_staging_evidence(receipt.as_bytes()).map_err(|error| {
+                    LivePgMetadataTransferFailure::fatal(format!(
+                        "destination {} returned invalid PG {} staging tombstone evidence: {error}",
+                        node_id.as_u32(),
+                        prepared.work.pg_id().get()
+                    ))
+                })?;
+                if evidence.intent() != &prepared.intent
+                    || evidence.actor().node_id() != node_id
+                    || evidence.kind()
+                        != crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone
+                    || evidence.target_epoch().is_some()
+                    || evidence.transfer().is_some()
+                {
+                    return Err(LivePgMetadataTransferFailure::fatal(format!(
+                        "destination {} returned tombstone evidence for a different PG transition",
+                        node_id.as_u32()
+                    )));
+                }
+                tombstones.push(MetadataTransferStagingTombstoneBinding {
+                    node_id,
+                    node_incarnation: evidence.actor().node_incarnation(),
+                    endpoint: evidence.actor().endpoint().to_owned(),
+                    evidence_digest: checksum::sha256::digest(evidence.as_bytes()),
+                });
+            }
+            tombstones.sort_by_key(|binding| binding.node_id);
+            Ok(TombstonedUnavailablePgMetadataTransfer {
+                cleanup: FinalizeMetadataTransferStagingGenerationRequest {
+                    unavailable_transition: prepared.work.mutation_binding().clone(),
+                    staging_generation: prepared.intent.staging_generation(),
+                    tombstones,
+                },
+            })
+        })();
+        result.map_err(|error| {
+            LivePgMetadataTransferError::at_stage(LivePgMetadataTransferStage::Cleanup, error)
+        })
+    }
+
+    #[allow(dead_code)] // Consumed through staged unavailable-PG reconciliation.
+    fn tombstone_staging_artifact_on_destination(
+        &self,
+        staged: &StagedUnavailablePgMetadataTransfer,
+        cluster_epoch: ClusterEpoch,
+        actor: &MetadataTransferStagingNodeIdentity,
+    ) -> Result<MetadataTransferStagingReceipt, LivePgMetadataTransferFailure> {
+        let prepared = &staged.authorized.prepared;
+        let node_id = actor.node_id();
+        let authorization = staged
+            .authorized
+            .authorizations
+            .iter()
+            .find(|authorization| authorization.destination_node_id() == node_id)
+            .ok_or_else(|| {
+                LivePgMetadataTransferFailure::fatal(format!(
+                    "PG {} has no committed cleanup authorization for destination {}",
+                    prepared.work.pg_id().get(),
+                    node_id.as_u32()
+                ))
+            })?;
+        #[cfg(test)]
+        if let LivePgMetadataTransferStorageTransport::InProcess { data_dir, .. } = &self.transport
+        {
+            let identity = MetadataTransferStagingNodeIdentity::new(
+                node_id,
+                actor.node_incarnation(),
+                actor.endpoint().to_owned(),
+            )
+            .map_err(staging_local_failure)?;
+            let limits = MetadataTransferStagingLimits::new(
+                256,
+                METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
+                4 * 1024 * 1024 * 1024,
+            )
+            .map_err(staging_local_failure)?;
+            let store = MetadataTransferStagingStore::open(
+                &data_dir.join(format!("staging-node-{}", node_id.as_u32())),
+                identity,
+                limits,
+            )
+            .map_err(staging_local_failure)?;
+            return store
+                .tombstone_authorized(authorization, &prepared.intent)
+                .map_err(staging_local_failure);
+        }
+
+        let client = self.staging_rpc_client(cluster_epoch, node_id, actor.endpoint())?;
+        client
+            .tombstone_metadata_transfer_staging_artifact(authorization, &prepared.intent)
+            .map_err(staging_rpc_failure)
+    }
+
     pub fn inspect_object_payload_placement(
         &self,
         metadata_pg_id: u32,
@@ -1419,7 +1565,7 @@ impl LivePgMetadataTransferAdmin {
             };
         }
 
-        let client = self.staging_rpc_client(runtime, node_id, node.endpoint())?;
+        let client = self.staging_rpc_client(runtime.cluster_epoch(), node_id, node.endpoint())?;
         client
             .create_metadata_transfer_staging_intent(authorization, &prepared.intent)
             .map_err(staging_rpc_failure)?;
@@ -1444,7 +1590,7 @@ impl LivePgMetadataTransferAdmin {
     #[allow(dead_code)] // Consumed through staged unavailable-PG reconciliation.
     fn staging_rpc_client(
         &self,
-        runtime: &ClusterRuntimeMapSnapshot,
+        cluster_epoch: ClusterEpoch,
         node_id: NodeId,
         advertised_endpoint: &str,
     ) -> Result<UnixStorageNodeClient, LivePgMetadataTransferFailure> {
@@ -1497,7 +1643,7 @@ impl LivePgMetadataTransferAdmin {
         Ok(
             UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
                 node_id,
-                runtime.cluster_epoch(),
+                cluster_epoch,
                 endpoint,
                 self.admission_settings,
                 auth,
@@ -2745,12 +2891,32 @@ mod tests {
         pg_observations: Vec<NodePgHeartbeatObservation>,
         started_at_ms: u64,
     ) {
+        submit_heartbeat_with_incarnation_until_serving(
+            authority,
+            node_id,
+            1,
+            endpoint,
+            requested_lease_duration_ms,
+            pg_observations,
+            started_at_ms,
+        );
+    }
+
+    fn submit_heartbeat_with_incarnation_until_serving(
+        authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
+        node_id: NodeId,
+        node_incarnation: u64,
+        endpoint: String,
+        requested_lease_duration_ms: u64,
+        pg_observations: Vec<NodePgHeartbeatObservation>,
+        started_at_ms: u64,
+    ) {
         for offset_ms in 0..4 {
             let lease = authority
                 .submit_node_heartbeat(
                     NodeHeartbeat {
                         node_id,
-                        node_incarnation: 1,
+                        node_incarnation,
                         endpoint: endpoint.clone(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms,
@@ -3763,6 +3929,45 @@ mod tests {
             .unwrap();
         server.join().unwrap();
 
+        let staging_store = |snapshot: &crate::control_plane::ClusterControlSnapshot,
+                             node_id: u32| {
+            let node = snapshot.node(NodeId::new(node_id)).unwrap();
+            MetadataTransferStagingStore::open(
+                &tmp.path()
+                    .join("storage")
+                    .join(format!("staging-node-{node_id}")),
+                MetadataTransferStagingNodeIdentity::new(
+                    NodeId::new(node_id),
+                    node.node_incarnation(),
+                    node.endpoint().to_owned(),
+                )
+                .unwrap(),
+                MetadataTransferStagingLimits::new(
+                    256,
+                    METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
+                    4 * 1024 * 1024 * 1024,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let incomplete_snapshot = authority.lock().unwrap().snapshot().clone();
+        let incomplete_cleanup = match admin
+            .tombstone_staged_unavailable_pg_reconciliation(&staged, &incomplete_snapshot)
+        {
+            Ok(_) => panic!("uncompleted transition unexpectedly authorized staging cleanup"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            incomplete_cleanup.stage,
+            LivePgMetadataTransferStage::Cleanup
+        );
+        for node_id in [4, 2, 3] {
+            assert!(staging_store(&incomplete_snapshot, node_id)
+                .read_artifact(&staged.authorized.prepared.intent)
+                .is_ok());
+        }
+
         let imported_proof = PgMetadataProof::current(
             summary.imported_log_index(),
             summary.imported_log_hash(),
@@ -3796,6 +4001,162 @@ mod tests {
             pg.acting_set(),
             &[NodeId::new(4), NodeId::new(2), NodeId::new(3)]
         );
+        let completed_snapshot_before_rollover = authority.snapshot().clone();
+
+        let original_target_epoch = staged.target_epoch;
+        staged.target_epoch = ClusterEpoch::new(original_target_epoch.get() + 1).unwrap();
+        assert!(admin
+            .tombstone_staged_unavailable_pg_reconciliation(
+                &staged,
+                &completed_snapshot_before_rollover,
+            )
+            .is_err());
+        staged.target_epoch = original_target_epoch;
+
+        let original_transfer = staged.transfer;
+        staged.transfer = PgMetadataTransferProof::new(
+            original_transfer.source_epoch(),
+            PgMetadataProof::empty(),
+        );
+        assert_ne!(staged.transfer, original_transfer);
+        assert!(admin
+            .tombstone_staged_unavailable_pg_reconciliation(
+                &staged,
+                &completed_snapshot_before_rollover,
+            )
+            .is_err());
+        staged.transfer = original_transfer;
+
+        staged.publications[0].evidence_digest[0] ^= 0x80;
+        assert!(admin
+            .tombstone_staged_unavailable_pg_reconciliation(
+                &staged,
+                &completed_snapshot_before_rollover,
+            )
+            .is_err());
+        staged.publications[0].evidence_digest[0] ^= 0x80;
+
+        assert!(completed_snapshot_before_rollover
+            .validate_completed_unavailable_pg_staging_cleanup(
+                &staged.install_request(),
+                staged
+                    .authorized
+                    .prepared
+                    .intent
+                    .staging_generation()
+                    .checked_add(1)
+                    .unwrap(),
+            )
+            .is_err());
+        for node_id in [4, 2, 3] {
+            assert!(staging_store(&completed_snapshot_before_rollover, node_id)
+                .read_artifact(&staged.authorized.prepared.intent)
+                .is_ok());
+        }
+
+        let rolled_endpoint = tmp
+            .path()
+            .join("storage-node-4-restarted.sock")
+            .to_string_lossy()
+            .into_owned();
+        submit_heartbeat_with_incarnation_until_serving(
+            &mut authority,
+            NodeId::new(4),
+            2,
+            rolled_endpoint.clone(),
+            10_000,
+            vec![NodePgHeartbeatObservation {
+                pg_id,
+                state: PgState::Active,
+                metadata_proof: imported_proof,
+                pending_metadata_command: None,
+            }],
+            complete_at_ms + 1,
+        );
+        let completed_snapshot = authority.snapshot().clone();
+        assert_eq!(
+            completed_snapshot
+                .node(NodeId::new(4))
+                .unwrap()
+                .node_incarnation(),
+            2
+        );
+        assert_eq!(
+            completed_snapshot.node(NodeId::new(4)).unwrap().endpoint(),
+            rolled_endpoint
+        );
+        drop(authority);
+
+        let blocked_cleanup = tmp.path().join("storage").join("staging-node-2");
+        let retained_cleanup = tmp.path().join("storage").join("staging-node-2-retained");
+        std::fs::rename(&blocked_cleanup, &retained_cleanup).unwrap();
+        std::fs::write(&blocked_cleanup, b"not a staging directory").unwrap();
+        let partial_cleanup = match admin
+            .tombstone_staged_unavailable_pg_reconciliation(&staged, &completed_snapshot)
+        {
+            Ok(_) => panic!("blocked second destination unexpectedly completed cleanup"),
+            Err(error) => error,
+        };
+        assert_eq!(partial_cleanup.stage, LivePgMetadataTransferStage::Cleanup);
+        assert!(
+            partial_cleanup.retained_diagnostic_contains("prepare staging-store data directory"),
+            "unexpected partial-cleanup failure: {}",
+            partial_cleanup._diagnostic
+        );
+        std::fs::remove_file(&blocked_cleanup).unwrap();
+        std::fs::rename(&retained_cleanup, &blocked_cleanup).unwrap();
+
+        assert!(matches!(
+            staging_store(&completed_snapshot, 4).read_artifact(&staged.authorized.prepared.intent),
+            Err(crate::pg_store::MetadataTransferStagingError::GenerationRetired)
+        ));
+        assert!(staging_store(&completed_snapshot, 2)
+            .read_artifact(&staged.authorized.prepared.intent)
+            .is_ok());
+        assert!(staging_store(&completed_snapshot, 3)
+            .read_artifact(&staged.authorized.prepared.intent)
+            .is_ok());
+
+        let tombstoned = admin
+            .tombstone_staged_unavailable_pg_reconciliation(&staged, &completed_snapshot)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "retrying all-destination staging cleanup failed: {}",
+                    error._diagnostic
+                )
+            });
+        let cleanup = tombstoned.cleanup_request();
+        assert_eq!(&cleanup.unavailable_transition, work.mutation_binding());
+        assert_eq!(cleanup.staging_generation, work.transition_epoch().get());
+        assert_eq!(
+            cleanup
+                .tombstones
+                .iter()
+                .map(|binding| binding.node_id)
+                .collect::<Vec<_>>(),
+            vec![NodeId::new(2), NodeId::new(3), NodeId::new(4)]
+        );
+        let rolled_tombstone = cleanup
+            .tombstones
+            .iter()
+            .find(|binding| binding.node_id == NodeId::new(4))
+            .unwrap();
+        assert_eq!(rolled_tombstone.node_incarnation, 2);
+        assert_eq!(rolled_tombstone.endpoint, rolled_endpoint);
+        for tombstone in &cleanup.tombstones {
+            let store = staging_store(&completed_snapshot, tombstone.node_id.as_u32());
+            assert!(matches!(
+                store.read_artifact(&staged.authorized.prepared.intent),
+                Err(crate::pg_store::MetadataTransferStagingError::GenerationRetired)
+            ));
+            let page = store.next_evidence_page().unwrap().unwrap();
+            assert!(page.entries().iter().any(|entry| {
+                let evidence = decode_staging_evidence(entry.evidence()).unwrap();
+                evidence.kind() == crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone
+                    && evidence.intent() == &staged.authorized.prepared.intent
+                    && checksum::sha256::digest(evidence.as_bytes()) == tombstone.evidence_digest
+            }));
+        }
     }
 
     fn frontend_storage_rpc_capability() -> FrontendStorageRpcClientCapability {

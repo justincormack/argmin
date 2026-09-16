@@ -1147,8 +1147,17 @@ every voter and exact cleanup replay after leadership transfer. Storage RPC
 v26 exposes committed-authorization-bound exact-intent tombstoning, durable
 physical artifact deletion, canonical tombstone evidence, and exact replay
 over local, authenticated Unix, and authenticated TLS paths. Manager-driven
-all-destination tombstone orchestration, finalized-floor advancement,
-pre-install cancellation, fenced-incarnation retirement substitutes, and
+all-destination tombstone orchestration now retains the staged transfer owner,
+replays the exact committed authorization independently to every destination,
+resolves each current cleanup actor from the exact completed authority
+snapshot, validates each returned actor and intent, and constructs the
+canonical sorted finalized-floor request only after the complete obligation
+set succeeds. Destination incarnation or endpoint rollover therefore cannot
+pin retries to the pre-install route. A partial failure leaves earlier durable
+tombstones replayable and later destinations untouched, so retry converges
+without narrowing the obligation set. Production-worker handoff,
+finalized-floor advancement, pre-install
+cancellation, fenced-incarnation retirement substitutes, and
 closure-certificate retirement remain gated.
 
 Command v29 and state v41 implement the first bounded segment-retirement

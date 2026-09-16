@@ -43,6 +43,27 @@ fn authority_published_staging_authorization_seal() -> AuthorityPublishedStaging
     AuthorityPublishedStagingAuthorizationSeal { _private: () }
 }
 
+pub(crate) struct CompletedUnavailablePgStagingCleanupAuthorization {
+    cluster_epoch: ClusterEpoch,
+    destination_actors: Vec<MetadataTransferStagingNodeIdentity>,
+}
+
+impl CompletedUnavailablePgStagingCleanupAuthorization {
+    pub(crate) fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    pub(crate) fn destination_actor(
+        &self,
+        node_id: NodeId,
+    ) -> Option<&MetadataTransferStagingNodeIdentity> {
+        self.destination_actors
+            .binary_search_by_key(&node_id, MetadataTransferStagingNodeIdentity::node_id)
+            .ok()
+            .map(|index| &self.destination_actors[index])
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn committed_staging_authorization_from_presentation_for_test(
     presentation: crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
@@ -3169,6 +3190,91 @@ impl ClusterControlSnapshot {
             pg_id,
             authority_published_staging_authorization_seal(),
         ))
+    }
+
+    pub(crate) fn validate_completed_unavailable_pg_staging_cleanup(
+        &self,
+        install: &UnavailablePgTransitionInstallRequest,
+        staging_generation: u64,
+    ) -> Result<CompletedUnavailablePgStagingCleanupAuthorization, ControlPlaneError> {
+        let pg_id = install.unavailable_transition.pg_id();
+        let transition_epoch = install.unavailable_transition.transition_epoch();
+        let transition = self
+            .retained_unavailable_pg_placement_transitions
+            .get(&(pg_id, transition_epoch))
+            .filter(|transition| {
+                install
+                    .unavailable_transition
+                    .matches_transition(transition)
+            })
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} staging cleanup requires its exact retained transition",
+                    pg_id.get()
+                ),
+            })?;
+        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
+            ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} staging cleanup has no durable authorization",
+                    pg_id.get()
+                ),
+            }
+        })?;
+        let destination_install = transition.destination_install.as_ref().ok_or_else(|| {
+            ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} staging cleanup has no durable destination install",
+                    pg_id.get()
+                ),
+            }
+        })?;
+        if transition.destination_epoch != Some(install.expected_destination_epoch)
+            || authorization.staging_generation != staging_generation
+            || destination_install.transfer != install.transfer
+            || destination_install.publications != install.publications
+            || transition.completion.is_none()
+            || transition.completion_batch_receipt.is_none()
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} staging cleanup does not match its completed destination installation",
+                    pg_id.get()
+                ),
+            });
+        }
+        let mut destination_actors = install
+            .unavailable_transition
+            .destination_acting_set()
+            .iter()
+            .copied()
+            .map(|node_id| {
+                let node = self.node(node_id).ok_or_else(|| {
+                    ControlPlaneError::invariant_failure(format!(
+                        "PG {} staging cleanup destination {} is absent from authority state",
+                        pg_id.get(),
+                        node_id.as_u32()
+                    ))
+                })?;
+                MetadataTransferStagingNodeIdentity::new(
+                    node_id,
+                    node.node_incarnation(),
+                    node.endpoint().to_owned(),
+                )
+                .map_err(|error| {
+                    ControlPlaneError::invariant_failure(format!(
+                        "PG {} staging cleanup destination {} has an invalid authority identity: {error}",
+                        pg_id.get(),
+                        node_id.as_u32()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        destination_actors.sort_by_key(MetadataTransferStagingNodeIdentity::node_id);
+        Ok(CompletedUnavailablePgStagingCleanupAuthorization {
+            cluster_epoch: self.cluster_epoch,
+            destination_actors,
+        })
     }
 
     pub fn authorize_unavailable_pg_staging_intents_batch_command(
