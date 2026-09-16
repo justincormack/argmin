@@ -1790,6 +1790,10 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
             }
         }
         let reconciliation = (|| {
+            // Worker loss is process-fatal even while authority time is unavailable.
+            if let Some(reconciler) = unavailable_pg_reconciler.as_mut() {
+                reconciler.observe_transfer_workers();
+            }
             let now_ms = authority_clock
                 .lock()
                 .expect("control-plane authority clock mutex poisoned")
@@ -2282,7 +2286,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             }
         }
         if let Some(reconciler) = unavailable_pg_reconciler.as_mut() {
-            reconciler.observe_transfer_worker();
+            reconciler.observe_transfer_workers();
             if local_raft_authority_serving {
                 reconciler.poll_raft(authority_service.host_mut(), expiry_now_ms);
             }

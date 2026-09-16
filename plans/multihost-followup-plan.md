@@ -1285,6 +1285,22 @@ transition, transfer-worker, and prepared-artifact capacity can retain. A
 failed member must not discard already prepared work for unrelated members or
 monopolize the scanner.
 
+The existing singular production transfer wrapper now runs through a bounded
+four-worker pool rather than one transfer thread. One bounded scan page owns an
+exact per-PG in-flight map and pending queue; successful transfers accumulate
+for one canonical activation batch, while retryable and fatal failures defer or
+quarantine only their exact transition. A worker panic remains process-fatal,
+so loss of one lane cannot silently reduce capacity or strand its accepted
+work; standalone and Raft service loops observe worker health before any
+authority-time operation that may defer reconciliation. Composed production
+coverage prepares two real transfers at one destination epoch, forces one to
+install first, and requires the other to rebase and import before both join one
+canonical activation batch. This concurrency slice deliberately does not
+activate the staged ownership path: the later atomic worker handoff must
+replace these transfer results with durable
+prepare/authorization/stage/install/import/cleanup states without introducing
+a second production owner.
+
 Begin, install, and activation batches must all use Raft's gated command
 derivation primitive. Command construction reads the effective
 durable-plus-heartbeat-overlay snapshot while holding the heartbeat update

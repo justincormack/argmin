@@ -779,6 +779,12 @@ pub struct LivePgMetadataTransferAdmin {
     _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
     #[cfg(test)]
     after_transfer_install_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    after_transfer_prepare_hook: Option<Arc<dyn Fn(PgId, ClusterEpoch) + Send + Sync>>,
+    #[cfg(test)]
+    after_transfer_import_hook: Option<Arc<dyn Fn(PgId, ClusterEpoch) + Send + Sync>>,
+    #[cfg(test)]
+    clock_override_ms: Option<u64>,
 }
 
 impl LivePgMetadataTransferAdmin {
@@ -800,6 +806,12 @@ impl LivePgMetadataTransferAdmin {
             _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             #[cfg(test)]
             after_transfer_install_hook: None,
+            #[cfg(test)]
+            after_transfer_prepare_hook: None,
+            #[cfg(test)]
+            after_transfer_import_hook: None,
+            #[cfg(test)]
+            clock_override_ms: None,
         }
     }
 
@@ -826,6 +838,12 @@ impl LivePgMetadataTransferAdmin {
             _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             #[cfg(test)]
             after_transfer_install_hook: None,
+            #[cfg(test)]
+            after_transfer_prepare_hook: None,
+            #[cfg(test)]
+            after_transfer_import_hook: None,
+            #[cfg(test)]
+            clock_override_ms: None,
         }
     }
 
@@ -849,6 +867,12 @@ impl LivePgMetadataTransferAdmin {
             _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             #[cfg(test)]
             after_transfer_install_hook: None,
+            #[cfg(test)]
+            after_transfer_prepare_hook: None,
+            #[cfg(test)]
+            after_transfer_import_hook: None,
+            #[cfg(test)]
+            clock_override_ms: None,
         }
     }
 
@@ -875,6 +899,12 @@ impl LivePgMetadataTransferAdmin {
             _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             #[cfg(test)]
             after_transfer_install_hook: None,
+            #[cfg(test)]
+            after_transfer_prepare_hook: None,
+            #[cfg(test)]
+            after_transfer_import_hook: None,
+            #[cfg(test)]
+            clock_override_ms: None,
         }
     }
 
@@ -898,6 +928,9 @@ impl LivePgMetadataTransferAdmin {
             failpoint: None,
             _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             after_transfer_install_hook: None,
+            after_transfer_prepare_hook: None,
+            after_transfer_import_hook: None,
+            clock_override_ms: None,
         }
     }
 
@@ -935,6 +968,30 @@ impl LivePgMetadataTransferAdmin {
         self
     }
 
+    #[cfg(test)]
+    fn with_after_transfer_prepare_hook(
+        mut self,
+        hook: impl Fn(PgId, ClusterEpoch) + Send + Sync + 'static,
+    ) -> Self {
+        self.after_transfer_prepare_hook = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_after_transfer_import_hook(
+        mut self,
+        hook: impl Fn(PgId, ClusterEpoch) + Send + Sync + 'static,
+    ) -> Self {
+        self.after_transfer_import_hook = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_clock_override(mut self, now_ms: u64) -> Self {
+        self.clock_override_ms = Some(now_ms);
+        self
+    }
+
     #[must_use]
     pub fn with_failpoint(mut self, failpoint: Option<LivePgMetadataTransferFailpoint>) -> Self {
         self.failpoint = failpoint;
@@ -955,6 +1012,10 @@ impl LivePgMetadataTransferAdmin {
         &self,
         work: &UnavailablePgReconciliationWork,
     ) -> Result<LivePgMetadataTransferSummary, LivePgMetadataTransferError> {
+        #[cfg(test)]
+        let _time_override = self
+            .clock_override_ms
+            .map(crate::clock::test_time_override_guard);
         if work.stage() != crate::control_plane::UnavailablePgReconciliationStage::MetadataTransfer
         {
             return Err(LivePgMetadataTransferError::new(
@@ -1671,6 +1732,26 @@ impl LivePgMetadataTransferAdmin {
     #[cfg(not(test))]
     fn run_after_transfer_install_hook(&self) {}
 
+    #[cfg(test)]
+    fn run_after_transfer_prepare_hook(&self, pg_id: PgId, destination_epoch: ClusterEpoch) {
+        if let Some(hook) = &self.after_transfer_prepare_hook {
+            hook(pg_id, destination_epoch);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn run_after_transfer_prepare_hook(&self, _pg_id: PgId, _destination_epoch: ClusterEpoch) {}
+
+    #[cfg(test)]
+    fn run_after_transfer_import_hook(&self, pg_id: PgId, destination_epoch: ClusterEpoch) {
+        if let Some(hook) = &self.after_transfer_import_hook {
+            hook(pg_id, destination_epoch);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn run_after_transfer_import_hook(&self, _pg_id: PgId, _destination_epoch: ClusterEpoch) {}
+
     fn transfer_typed(
         &self,
         pg_id: PgId,
@@ -1692,6 +1773,10 @@ impl LivePgMetadataTransferAdmin {
                     LivePgMetadataTransferPreparation::Completed(summary) => return Ok(summary),
                     LivePgMetadataTransferPreparation::Installed(installed) => installed,
                     LivePgMetadataTransferPreparation::Prepared(prepared) => {
+                        self.run_after_transfer_prepare_hook(
+                            pg_id,
+                            prepared.install_member.expected_destination_epoch,
+                        );
                         stage = LivePgMetadataTransferStage::Install;
                         match self.install_prepared_transfer(prepared)? {
                             LivePgMetadataTransferInstallation::Completed(summary) => {
@@ -1707,7 +1792,10 @@ impl LivePgMetadataTransferAdmin {
                 stage = LivePgMetadataTransferStage::Install;
                 self.maybe_fail(LivePgMetadataTransferFailpoint::AfterTransferInstall)?;
                 stage = LivePgMetadataTransferStage::Import;
-                self.import_installed_transfer(installed)
+                let destination_epoch = installed.destination_epoch;
+                let summary = self.import_installed_transfer(installed)?;
+                self.run_after_transfer_import_hook(pg_id, destination_epoch);
+                Ok(summary)
             })();
         result.map_err(|diagnostic| LivePgMetadataTransferError::at_stage(stage, diagnostic))
     }
@@ -2845,7 +2933,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Mutex};
 
     use crate::control_plane::{
         ControlPlaneHeartbeatSink, ControlPlaneRpcServerListener, ControlPlaneRpcServerPolicy,
@@ -2868,7 +2956,7 @@ mod tests {
     };
     use crate::{
         AclGrants, BucketObjectLockConfig, BucketOwnershipControls, BucketVersioningState,
-        CreateBucketConfig, OwnerIdentity,
+        CreateBucketConfig, OwnerIdentity, UnavailablePgReconciliationWorker,
     };
     use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
 
@@ -3174,9 +3262,26 @@ mod tests {
         pg_id: PgId,
         source_epoch: ClusterEpoch,
     ) -> (PgMetadataProof, MetadataCommandEnvelope) {
+        let command =
+            composed_transfer_source_command(pg_id, source_epoch, "composed-transfer-bucket");
+        let proof = apply_composed_transfer_source_command(
+            data_dir,
+            node_id,
+            pg_id,
+            source_epoch,
+            &command,
+        );
+        (proof, command)
+    }
+
+    fn composed_transfer_source_command(
+        pg_id: PgId,
+        source_epoch: ClusterEpoch,
+        bucket_name: &str,
+    ) -> MetadataCommandEnvelope {
         let owner = OwnerIdentity::from_principal("composed-transfer-owner");
         let grants = AclGrants::default();
-        let command = MetadataCommandEnvelope::new(
+        MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 source_epoch,
                 pg_id,
@@ -3185,7 +3290,7 @@ mod tests {
             MetadataCommandPayload::CreateBucket(
                 CreateBucketCommand::from_config_for_test(
                     &CreateBucketConfig {
-                        name: "composed-transfer-bucket",
+                        name: bucket_name,
                         owner_principal: &owner.principal,
                         owner_canonical_id: &owner.canonical_id,
                         acl_grants: &grants,
@@ -3202,15 +3307,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-        );
-        let proof = apply_composed_transfer_source_command(
-            data_dir,
-            node_id,
-            pg_id,
-            source_epoch,
-            &command,
-        );
-        (proof, command)
+        )
     }
 
     fn apply_composed_transfer_source_command(
@@ -3600,6 +3697,368 @@ mod tests {
     #[test]
     fn authenticated_tls_composed_nonempty_live_transfer() {
         authenticated_composed_nonempty_live_transfer(true);
+    }
+
+    #[test]
+    fn concurrent_reconciliation_transfers_rebase_and_activate_as_one_batch() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let pg_ids = [PgId::new(19), PgId::new(20)];
+        let source_acting_set = vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+        let destination_acting_set = vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)];
+        let nodes = (1..=4)
+            .map(|node_id| {
+                (
+                    NodeId::new(node_id),
+                    tmp.path()
+                        .join(format!("node-{node_id}.sock"))
+                        .display()
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let pgs = pg_ids
+            .map(|pg_id| (pg_id, source_acting_set.clone()))
+            .to_vec();
+        let topology =
+            crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                7,
+                [0x7b; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                vec![1, 2, 3],
+                &nodes,
+                &pgs,
+                crate::control_plane::test_certified_storage_placement_policy(
+                    (1..=4).map(NodeId::new),
+                    3,
+                    50,
+                ),
+            )
+            .unwrap();
+        let snapshot = crate::control_plane::ClusterControlSnapshot::empty()
+            .apply_control_plane_command(
+                crate::control_plane_command::ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                    nodes: nodes.clone(),
+                    pg_acting_sets: pgs,
+                    topology,
+                },
+            )
+            .unwrap()
+            .into_snapshot();
+        let source_epoch = snapshot.cluster_epoch();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        store.checkpoint(None, &snapshot).unwrap();
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let storage_root = tmp.path().join("storage");
+        let commands = [
+            composed_transfer_source_command(pg_ids[0], source_epoch, "concurrent-transfer-a"),
+            composed_transfer_source_command(pg_ids[1], source_epoch, "concurrent-transfer-b"),
+        ];
+        let mut proofs = std::collections::BTreeMap::new();
+        for generation in 0..2 {
+            for node_id in 1..=3 {
+                let node = SharedStorageNode::open_with_default_ec_shape_and_epoch(
+                    &storage_root
+                        .join(format!("cluster-{generation}"))
+                        .join(format!("node-{node_id}")),
+                    &pg_ids.map(PgId::get),
+                    EcShape { k: 2, m: 1 },
+                    source_epoch,
+                )
+                .unwrap();
+                for (pg_id, command) in pg_ids.into_iter().zip(&commands) {
+                    let state = node
+                        .get_pg(pg_id.get())
+                        .unwrap()
+                        .apply_metadata_command_and_record(node_id, command)
+                        .unwrap();
+                    let proof = PgMetadataProof::current(
+                        state.applied_log_index,
+                        state.applied_log_hash,
+                        state.state_digest,
+                    );
+                    let retained = proofs.entry(pg_id).or_insert(proof);
+                    assert_eq!(*retained, proof);
+                }
+            }
+        }
+
+        let now_ms = crate::clock::current_time_millis();
+        let observations = |states: [PgState; 2]| {
+            pg_ids
+                .into_iter()
+                .zip(states)
+                .map(|(pg_id, state)| NodePgHeartbeatObservation {
+                    pg_id,
+                    state,
+                    metadata_proof: proofs[&pg_id],
+                    pending_metadata_command: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for node_id in 1..=4 {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                10_000,
+                if node_id <= 3 {
+                    observations([PgState::Peering, PgState::Peering])
+                } else {
+                    Vec::new()
+                },
+                now_ms + u64::from(node_id),
+            );
+        }
+        for node_id in 1..=3 {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                10_000,
+                observations([PgState::Peering, PgState::Peering]),
+                now_ms + 5 + u64::from(node_id),
+            );
+        }
+        authority
+            .complete_pg_peering(pg_ids[0], NodeId::new(1), 1, now_ms + 10)
+            .unwrap();
+        for node_id in 1..=3 {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                10_000,
+                observations([PgState::Active, PgState::Peering]),
+                now_ms + 11 + u64::from(node_id),
+            );
+        }
+        authority
+            .complete_pg_peering(pg_ids[1], NodeId::new(1), 1, now_ms + 20)
+            .unwrap();
+        for node_id in 1..=3 {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                if node_id == 1 { 50 } else { 10_000 },
+                observations([PgState::Active, PgState::Active]),
+                now_ms + 30 + u64::from(node_id),
+            );
+        }
+        let failed_deadline_ms = authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        authority
+            .expire_heartbeat_leases(failed_deadline_ms)
+            .unwrap();
+        for node_id in [2, 3] {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                500,
+                observations([PgState::Peering, PgState::Peering]),
+                failed_deadline_ms + u64::from(node_id),
+            );
+        }
+        submit_heartbeat_until_serving(
+            &mut authority,
+            NodeId::new(4),
+            nodes[3].1.clone(),
+            10_000,
+            Vec::new(),
+            failed_deadline_ms + 4,
+        );
+        for node_id in [2, 3] {
+            submit_heartbeat_until_serving(
+                &mut authority,
+                NodeId::new(node_id),
+                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                500,
+                observations([PgState::Peering, PgState::Peering]),
+                failed_deadline_ms + 10 + u64::from(node_id),
+            );
+        }
+        let begin_at_ms = authority
+            .snapshot()
+            .unavailable_node_observation(NodeId::new(1))
+            .unwrap()
+            .observed_at_ms()
+            + 50;
+        for pg_id in pg_ids {
+            let route = authority.snapshot().pg_route(pg_id, begin_at_ms).unwrap();
+            assert!(
+                route.metadata_read_route().is_some(),
+                "PG {} fixture has no proof-qualified transfer source",
+                pg_id.get()
+            );
+        }
+        let authority = Arc::new(Mutex::new(authority));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = spawn_composed_transfer_control_plane(
+            &socket_path,
+            Arc::clone(&authority),
+            begin_at_ms + 100,
+            Arc::clone(&stop),
+        );
+        let _time = crate::clock::test_time_override_guard(begin_at_ms + 1_000);
+        let (prepared_tx, prepared_rx) = mpsc::sync_channel(2);
+        let (release_tx, release_rx) = mpsc::sync_channel(2);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let prepare_release = Arc::clone(&release_rx);
+        let (imported_tx, imported_rx) = mpsc::sync_channel(2);
+        let admin = live_transfer_admin(tmp.path(), &socket_path)
+            .with_clock_override(begin_at_ms + 1_000)
+            .with_after_transfer_prepare_hook(move |pg_id, destination_epoch| {
+                prepared_tx.send((pg_id, destination_epoch)).unwrap();
+                prepare_release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("concurrent transfer preparation was not released");
+            })
+            .with_after_transfer_import_hook(move |pg_id, destination_epoch| {
+                imported_tx.send((pg_id, destination_epoch)).unwrap();
+            });
+        let mut worker = UnavailablePgReconciliationWorker::spawn(admin);
+        {
+            let mut authority = authority.lock().unwrap();
+            worker.poll_single_authority(&mut authority, begin_at_ms);
+        }
+        let mut receive_prepared = || {
+            prepared_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|error| {
+                    worker.observe_transfer_workers();
+                    panic!("concurrent transfer did not reach preparation gate: {error}")
+                })
+        };
+        let mut prepared = [receive_prepared(), receive_prepared()];
+        prepared.sort_by_key(|(pg_id, _)| *pg_id);
+        assert_eq!(prepared.map(|(pg_id, _)| pg_id), pg_ids);
+        assert_eq!(prepared[0].1, prepared[1].1);
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+
+        let mut imported = [
+            imported_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            imported_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        ];
+        imported.sort_by_key(|(pg_id, _)| *pg_id);
+        assert_eq!(imported.map(|(pg_id, _)| pg_id), pg_ids);
+        let mut imported_epochs = imported.map(|(_, epoch)| epoch);
+        imported_epochs.sort_unstable();
+        assert_eq!(imported_epochs[0], prepared[0].1);
+        assert_eq!(
+            imported_epochs[1],
+            ClusterEpoch::new(prepared[0].1.get() + 1).unwrap(),
+            "the losing concurrent install must rebase to the next epoch"
+        );
+
+        let readiness_at_ms = begin_at_ms + 1_100;
+        let imported_proofs = {
+            let authority = authority.lock().unwrap();
+            pg_ids.map(|pg_id| {
+                authority
+                    .snapshot()
+                    .pg(pg_id)
+                    .unwrap()
+                    .peering_metadata_transfer()
+                    .unwrap()
+                    .metadata_proof()
+            })
+        };
+        {
+            let mut authority = authority.lock().unwrap();
+            for node_id in [2, 3, 4] {
+                submit_heartbeat_until_serving(
+                    &mut authority,
+                    NodeId::new(node_id),
+                    nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                    10_000,
+                    pg_ids
+                        .into_iter()
+                        .zip(imported_proofs)
+                        .map(|(pg_id, metadata_proof)| NodePgHeartbeatObservation {
+                            pg_id,
+                            state: PgState::Peering,
+                            metadata_proof,
+                            pending_metadata_command: None,
+                        })
+                        .collect(),
+                    readiness_at_ms + u64::from(node_id),
+                );
+            }
+        }
+        {
+            let authority = authority.lock().unwrap();
+            let current_epoch = authority.snapshot().cluster_epoch();
+            for (pg_id, imported_proof) in pg_ids.into_iter().zip(imported_proofs) {
+                for node_id in &destination_acting_set {
+                    let node = authority.snapshot().node(*node_id).unwrap();
+                    assert!(node.lease_deadline_ms().unwrap() > readiness_at_ms + 10);
+                    assert!(
+                        authority
+                            .snapshot()
+                            .unavailable_node_observation(*node_id)
+                            .is_none(),
+                        "destination node {} retained an unavailable observation",
+                        node_id.as_u32()
+                    );
+                    let observation = node.pg_observation(pg_id).unwrap_or_else(|| {
+                        panic!(
+                            "destination node {} did not report PG {} at epoch {}",
+                            node_id.as_u32(),
+                            pg_id.get(),
+                            current_epoch.get()
+                        )
+                    });
+                    assert_eq!(observation.observed_epoch(), current_epoch);
+                    assert_eq!(observation.state(), PgState::Peering);
+                    assert_eq!(observation.metadata_proof(), imported_proof);
+                }
+            }
+        }
+        let epoch_before_activation = authority.lock().unwrap().snapshot().cluster_epoch();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let mut authority = authority.lock().unwrap();
+                worker.poll_single_authority(&mut authority, readiness_at_ms + 10);
+                if pg_ids.iter().all(|pg_id| {
+                    authority
+                        .snapshot()
+                        .pg(*pg_id)
+                        .is_some_and(|pg| pg.state() == PgState::Active)
+                }) {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "concurrent transfers did not reach one activation batch"
+            );
+            thread::yield_now();
+        }
+        let authority = authority.lock().unwrap();
+        assert_eq!(
+            authority.snapshot().cluster_epoch(),
+            ClusterEpoch::new(epoch_before_activation.get() + 1).unwrap(),
+            "both PGs must activate in one global epoch advance"
+        );
+        for pg_id in pg_ids {
+            let pg = authority.snapshot().pg(pg_id).unwrap();
+            assert_eq!(pg.state(), PgState::Active);
+            assert_eq!(pg.acting_set(), destination_acting_set);
+        }
+        drop(authority);
+
+        stop.store(true, Ordering::Release);
+        drop(UnixStream::connect(&socket_path).unwrap());
+        server.join().unwrap();
     }
 
     #[test]

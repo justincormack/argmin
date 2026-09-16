@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,10 +17,16 @@ use crate::control_plane::{
 use crate::{ClusterEpoch, ControlPlaneRaftAuthorityHost, LivePgMetadataTransferAdmin, PgId};
 
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const TRANSFER_WORKER_COUNT: usize = 4;
 
 struct TransferCompletion {
     work: UnavailablePgReconciliationWork,
     result: Result<(), ReconciliationTransferError>,
+}
+
+enum TransferWorkerEvent {
+    Completed(TransferCompletion),
+    Panicked,
 }
 
 enum ReconciliationTransferError {
@@ -90,10 +98,9 @@ impl ReconciliationAuthority for SingleAuthorityControlPlane<FileControlPlaneSto
 
 pub struct UnavailablePgReconciliationWorker {
     work_tx: SyncSender<UnavailablePgReconciliationWork>,
-    completion_rx: Receiver<TransferCompletion>,
+    completion_rx: Receiver<TransferWorkerEvent>,
     cursor: UnavailablePgReconciliationCursor,
-    in_flight: Option<UnavailablePgReconciliationWork>,
-    transfer_completed: bool,
+    in_flight: BTreeMap<PgId, UnavailablePgReconciliationWork>,
     pending_transfers: VecDeque<UnavailablePgReconciliationWork>,
     ready_for_activation: Vec<UnavailablePgReconciliationWork>,
     authority_retry_not_before: Instant,
@@ -127,31 +134,50 @@ impl UnavailablePgReconciliationWorker {
     fn spawn_with_transfer(
         transfer: impl Fn(&UnavailablePgReconciliationWork) -> Result<(), ReconciliationTransferError>
             + Send
+            + Sync
             + 'static,
         retry_backoff: Duration,
     ) -> Self {
-        let (work_tx, work_rx) = mpsc::sync_channel(1);
+        let (work_tx, work_rx) = mpsc::sync_channel(TRANSFER_WORKER_COUNT);
         let (completion_tx, completion_rx) = mpsc::channel();
-        thread::Builder::new()
-            .name("unavailable-pg-reconciler".to_owned())
-            .spawn(move || {
-                while let Ok(work) = work_rx.recv() {
-                    let result = transfer(&work);
-                    if completion_tx
-                        .send(TransferCompletion { work, result })
-                        .is_err()
-                    {
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let transfer = Arc::new(transfer);
+        for worker_index in 0..TRANSFER_WORKER_COUNT {
+            let work_rx = Arc::clone(&work_rx);
+            let completion_tx = completion_tx.clone();
+            let transfer = Arc::clone(&transfer);
+            thread::Builder::new()
+                .name(format!("unavailable-pg-reconciler-{worker_index}"))
+                .spawn(move || loop {
+                    let work = {
+                        let receiver = work_rx
+                            .lock()
+                            .expect("unavailable PG reconciliation work queue poisoned");
+                        receiver.recv()
+                    };
+                    let Ok(work) = work else {
+                        break;
+                    };
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| transfer(&work)));
+                    let panicked = result.is_err();
+                    let event = match result {
+                        Ok(result) => {
+                            TransferWorkerEvent::Completed(TransferCompletion { work, result })
+                        }
+                        Err(_) => TransferWorkerEvent::Panicked,
+                    };
+                    if completion_tx.send(event).is_err() || panicked {
                         break;
                     }
-                }
-            })
-            .expect("failed to spawn unavailable PG reconciliation worker");
+                })
+                .expect("failed to spawn unavailable PG reconciliation worker");
+        }
+        drop(completion_tx);
         Self {
             work_tx,
             completion_rx,
             cursor: UnavailablePgReconciliationCursor::start(),
-            in_flight: None,
-            transfer_completed: false,
+            in_flight: BTreeMap::new(),
             pending_transfers: VecDeque::new(),
             ready_for_activation: Vec::new(),
             authority_retry_not_before: Instant::now(),
@@ -175,7 +201,7 @@ impl UnavailablePgReconciliationWorker {
     }
 
     /// Observe transfer completion and fail-stop worker loss independently of authority role.
-    pub fn observe_transfer_worker(&mut self) {
+    pub fn observe_transfer_workers(&mut self) {
         self.receive_completion();
     }
 
@@ -191,21 +217,35 @@ impl UnavailablePgReconciliationWorker {
     }
 
     fn dispatch(&mut self, work: UnavailablePgReconciliationWork) {
-        if work.stage() == UnavailablePgReconciliationStage::PayloadReadiness {
-            self.in_flight = Some(work);
-            self.transfer_completed = true;
-            self.clear_diagnostic();
-            return;
-        }
+        debug_assert_eq!(
+            work.stage(),
+            UnavailablePgReconciliationStage::MetadataTransfer
+        );
+        let pg_id = work.pg_id();
+        assert!(
+            !self.in_flight.contains_key(&pg_id),
+            "unavailable PG reconciliation dispatched duplicate PG work"
+        );
         match self.work_tx.try_send(work.clone()) {
             Ok(()) => {
-                self.in_flight = Some(work);
+                self.in_flight.insert(pg_id, work);
                 self.clear_diagnostic();
             }
-            Err(error) => {
-                self.record_diagnostic(format!("transfer worker is unavailable: {error}"));
-                self.authority_retry_not_before = Instant::now() + self.retry_backoff;
+            Err(TrySendError::Full(_)) => {
+                panic!("unavailable PG reconciliation transfer queue exceeded its bound")
             }
+            Err(TrySendError::Disconnected(_)) => {
+                panic!("unavailable PG reconciliation transfer workers terminated unexpectedly")
+            }
+        }
+    }
+
+    fn dispatch_pending_transfers(&mut self) {
+        while self.in_flight.len() < TRANSFER_WORKER_COUNT {
+            let Some(work) = self.pending_transfers.pop_front() else {
+                break;
+            };
+            self.dispatch(work);
         }
     }
 
@@ -238,42 +278,47 @@ impl UnavailablePgReconciliationWorker {
     }
 
     fn receive_completion(&mut self) {
-        let completion = match self.completion_rx.try_recv() {
-            Ok(completion) => completion,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                panic!("unavailable PG reconciliation transfer worker terminated unexpectedly")
-            }
-        };
-        if self.in_flight.as_ref() != Some(&completion.work) {
-            self.record_diagnostic(
-                "transfer worker returned a result for a different transition".to_owned(),
-            );
-            self.in_flight = None;
-            self.transfer_completed = false;
-            self.authority_retry_not_before = Instant::now() + self.retry_backoff;
-            return;
-        }
-        match completion.result {
-            Ok(()) => {
-                self.transfer_completed = true;
-                self.clear_diagnostic();
-            }
-            Err(error) => {
-                let fatal = error.is_fatal();
-                let diagnostic = error.diagnostic();
-                if fatal {
-                    eprintln!(
-                        "unavailable PG reconciliation blocked by fatal transfer error: {diagnostic}"
-                    );
-                    self.blocked
-                        .insert(completion.work.pg_id(), completion.work.transition_epoch());
-                } else {
-                    self.record_diagnostic(diagnostic);
-                    self.defer(&completion.work);
+        loop {
+            let event = match self.completion_rx.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("unavailable PG reconciliation transfer workers terminated unexpectedly")
                 }
-                self.in_flight = None;
-                self.transfer_completed = false;
+            };
+            let completion = match event {
+                TransferWorkerEvent::Completed(completion) => completion,
+                TransferWorkerEvent::Panicked => {
+                    panic!("unavailable PG reconciliation transfer worker terminated unexpectedly")
+                }
+            };
+            let retained = self
+                .in_flight
+                .remove(&completion.work.pg_id())
+                .expect("transfer worker returned work that was not in flight");
+            assert_eq!(
+                retained, completion.work,
+                "transfer worker returned a result for a different transition"
+            );
+            match completion.result {
+                Ok(()) => {
+                    self.ready_for_activation.push(completion.work);
+                    self.clear_diagnostic();
+                }
+                Err(error) => {
+                    let fatal = error.is_fatal();
+                    let diagnostic = error.diagnostic();
+                    if fatal {
+                        eprintln!(
+                            "unavailable PG reconciliation blocked by fatal transfer error: {diagnostic}"
+                        );
+                        self.blocked
+                            .insert(completion.work.pg_id(), completion.work.transition_epoch());
+                    } else {
+                        self.record_diagnostic(diagnostic);
+                        self.defer(&completion.work);
+                    }
+                }
             }
         }
     }
@@ -342,30 +387,12 @@ impl UnavailablePgReconciliationWorker {
     }
 
     fn poll(&mut self, authority: &mut impl ReconciliationAuthority, now_ms: u64) {
-        self.observe_transfer_worker();
+        self.observe_transfer_workers();
         if Instant::now() < self.authority_retry_not_before {
             return;
         }
-        if self.transfer_completed {
-            let work = self
-                .in_flight
-                .take()
-                .expect("completed transfer must retain exact work");
-            self.ready_for_activation.push(work);
-            self.transfer_completed = false;
-            if let Some(work) = self.pending_transfers.pop_front() {
-                self.dispatch(work);
-                return;
-            }
-            let ready = std::mem::take(&mut self.ready_for_activation);
-            self.complete_ready_batch(authority, ready, now_ms);
-            return;
-        }
-        if self.in_flight.is_some() {
-            return;
-        }
-        if let Some(work) = self.pending_transfers.pop_front() {
-            self.dispatch(work);
+        self.dispatch_pending_transfers();
+        if !self.in_flight.is_empty() || !self.pending_transfers.is_empty() {
             return;
         }
         if !self.ready_for_activation.is_empty() {
@@ -396,9 +423,8 @@ impl UnavailablePgReconciliationWorker {
                         }
                     }
                 }
-                if let Some(work) = self.pending_transfers.pop_front() {
-                    self.dispatch(work);
-                } else {
+                self.dispatch_pending_transfers();
+                if self.in_flight.is_empty() && self.pending_transfers.is_empty() {
                     let ready = std::mem::take(&mut self.ready_for_activation);
                     self.complete_ready_batch(authority, ready, now_ms);
                 }
@@ -461,6 +487,28 @@ mod tests {
         published_batches: Vec<Vec<UnavailablePgReconciliationWork>>,
         publish_results:
             VecDeque<Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError>>,
+    }
+
+    #[derive(Default)]
+    struct TransferPoolGate {
+        state: Mutex<(usize, usize, bool)>,
+        changed: Condvar,
+    }
+
+    impl TransferPoolGate {
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.2 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct TransferPoolGateRelease(Arc<TransferPoolGate>);
+
+    impl Drop for TransferPoolGateRelease {
+        fn drop(&mut self) {
+            self.0.release();
+        }
     }
 
     impl ReconciliationAuthority for FakeAuthority {
@@ -594,7 +642,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker.observe_transfer_worker();
+                worker.observe_transfer_workers();
             }));
             if let Err(payload) = result {
                 let message = payload
@@ -616,7 +664,10 @@ mod tests {
         }
 
         assert_eq!(authority.poll_count, 1);
-        assert_eq!(worker.in_flight, Some(expected));
+        assert_eq!(
+            worker.in_flight,
+            BTreeMap::from([(expected.pg_id(), expected)])
+        );
         assert!(authority.published.is_empty());
     }
 
@@ -680,7 +731,7 @@ mod tests {
             worker.deferred.get(&deferred.pg_id()).map(|entry| entry.0),
             Some(deferred.transition_epoch())
         );
-        assert!(worker.in_flight.is_none());
+        assert!(worker.in_flight.is_empty());
     }
 
     #[test]
@@ -712,7 +763,7 @@ mod tests {
             worker.blocked.get(&blocked.pg_id()),
             Some(&blocked.transition_epoch())
         );
-        assert!(worker.in_flight.is_none());
+        assert!(worker.in_flight.is_empty());
     }
 
     #[test]
@@ -745,7 +796,7 @@ mod tests {
 
         for now_ms in 100..10_100 {
             worker.poll(&mut authority, now_ms);
-            if authority.poll_count == 5 && worker.in_flight.is_none() {
+            if authority.poll_count == 5 && worker.in_flight.is_empty() {
                 break;
             }
             thread::yield_now();
@@ -761,6 +812,53 @@ mod tests {
             worker.deferred.get(&retryable.pg_id()).map(|entry| entry.0),
             Some(retryable.transition_epoch())
         );
+    }
+
+    #[test]
+    fn failed_transfer_members_do_not_discard_successful_batch_peers() {
+        let fatal = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
+        let retryable = work(8, 11, UnavailablePgReconciliationStage::MetadataTransfer);
+        let successful = work(9, 11, UnavailablePgReconciliationStage::MetadataTransfer);
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            |work| match work.pg_id().get() {
+                7 => Err(ReconciliationTransferError::Fatal(
+                    "injected authenticated transfer integrity failure".to_owned(),
+                )),
+                8 => Err(ReconciliationTransferError::Retryable(
+                    "injected transfer timeout".to_owned(),
+                )),
+                _ => Ok(()),
+            },
+            Duration::from_secs(60),
+        );
+        let mut authority = FakeAuthority {
+            candidates: VecDeque::from([fatal.clone(), retryable.clone(), successful.clone()]),
+            poll_batch_size: 16,
+            ..FakeAuthority::default()
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while authority.published_batches.is_empty() {
+            worker.poll(&mut authority, 100);
+            assert!(
+                Instant::now() < deadline,
+                "successful transfer peer did not reach batch activation"
+            );
+            thread::yield_now();
+        }
+
+        assert_eq!(authority.published_batches, vec![vec![successful]]);
+        assert_eq!(
+            worker.blocked.get(&fatal.pg_id()),
+            Some(&fatal.transition_epoch())
+        );
+        assert_eq!(
+            worker.deferred.get(&retryable.pg_id()).map(|entry| entry.0),
+            Some(retryable.transition_epoch())
+        );
+        assert!(worker.in_flight.is_empty());
+        assert!(worker.pending_transfers.is_empty());
+        assert!(worker.ready_for_activation.is_empty());
     }
 
     #[test]
@@ -791,7 +889,7 @@ mod tests {
 
         assert_eq!(authority.poll_count, 1);
         assert_eq!(authority.published_batches, vec![vec![first, second]]);
-        assert!(worker.in_flight.is_none());
+        assert!(worker.in_flight.is_empty());
         assert!(worker.pending_transfers.is_empty());
     }
 
@@ -826,9 +924,85 @@ mod tests {
 
         assert_eq!(*transfer_count.lock().unwrap(), 2);
         assert_eq!(authority.published_batches, vec![vec![first, second]]);
-        assert!(worker.in_flight.is_none());
+        assert!(worker.in_flight.is_empty());
         assert!(worker.pending_transfers.is_empty());
         assert!(worker.ready_for_activation.is_empty());
+    }
+
+    #[test]
+    fn transfer_pool_is_bounded_and_activates_the_complete_page_as_one_batch() {
+        let expected = (0..5)
+            .map(|offset| {
+                work(
+                    7 + offset,
+                    11,
+                    UnavailablePgReconciliationStage::MetadataTransfer,
+                )
+            })
+            .collect::<Vec<_>>();
+        let transfer_gate = Arc::new(TransferPoolGate::default());
+        let observed_gate = Arc::clone(&transfer_gate);
+        let (started_tx, started_rx) = mpsc::sync_channel(expected.len());
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            move |work| {
+                let mut state = observed_gate.state.lock().unwrap();
+                state.0 += 1;
+                state.1 = state.1.max(state.0);
+                started_tx.send(work.pg_id()).unwrap();
+                while !state.2 {
+                    state = observed_gate.changed.wait(state).unwrap();
+                }
+                state.0 -= 1;
+                Ok(())
+            },
+            Duration::ZERO,
+        );
+        let _release = TransferPoolGateRelease(Arc::clone(&transfer_gate));
+        let mut authority = FakeAuthority {
+            candidates: expected.iter().cloned().collect(),
+            poll_batch_size: 16,
+            ..FakeAuthority::default()
+        };
+
+        worker.poll(&mut authority, 100);
+        let mut started = Vec::new();
+        for _ in 0..TRANSFER_WORKER_COUNT {
+            started.push(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        started.sort_unstable();
+        assert_eq!(started.len(), TRANSFER_WORKER_COUNT);
+        assert_eq!(worker.in_flight.len(), TRANSFER_WORKER_COUNT);
+        assert_eq!(worker.pending_transfers.len(), 1);
+        assert!(started_rx.try_recv().is_err());
+        {
+            let state = transfer_gate.state.lock().unwrap();
+            assert_eq!(
+                (state.0, state.1),
+                (TRANSFER_WORKER_COUNT, TRANSFER_WORKER_COUNT)
+            );
+        }
+        transfer_gate.release();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while authority.published_batches.is_empty() {
+            worker.poll(&mut authority, 101);
+            assert!(
+                Instant::now() < deadline,
+                "bounded transfer page did not reach batch activation"
+            );
+            thread::yield_now();
+        }
+
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            expected[4].pg_id()
+        );
+        assert_eq!(authority.published_batches, vec![expected]);
+        assert!(worker.in_flight.is_empty());
+        assert!(worker.pending_transfers.is_empty());
+        assert!(worker.ready_for_activation.is_empty());
+        let state = transfer_gate.state.lock().unwrap();
+        assert_eq!((state.0, state.1), (0, TRANSFER_WORKER_COUNT));
     }
 
     #[test]
@@ -857,7 +1031,7 @@ mod tests {
             authority.published_batches,
             vec![vec![transferred, already_ready]]
         );
-        assert!(worker.in_flight.is_none());
+        assert!(worker.in_flight.is_empty());
         assert!(worker.pending_transfers.is_empty());
         assert!(worker.ready_for_activation.is_empty());
     }
