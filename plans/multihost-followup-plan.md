@@ -975,13 +975,17 @@ collapses that segment to a tip-only chain anchor without waiting for any other
 segment. A separate coalescing CAS consumes at most 64 adjacent covered
 tip-only anchors beneath the same 120 KiB and Raft-entry ceilings. It validates
 their contiguous predecessor chain, atomically replaces them with one canonical
-anchor carrying the lowest predecessor, newest tip receipt, and cumulative
-digest of the consumed anchors, and leaves the immediate later segment or page
-valid because it already cites that newest tip. Repeated bounded coalescing can
-therefore retire arbitrarily long fully covered history without constructing an
-unbounded command. Snapshot validation checks the coalescing receipt, cumulative
-digest, boundary generations, and the first later citation. This keeps both
-unresolved state and fully covered chain history bounded while preserving the
+anchor carrying the lowest predecessor, newest tip receipt, and the count and
+digest of the canonical finalized source-segment vector. The source vector is
+independent of prior coalescing groupings, so recursive coalescing and exact
+replay of an absorbed checkpoint, collapse, or coalescing command preserve one
+semantic identity. The immediate later segment or page remains valid because it
+already cites the retained newest tip. Repeated bounded direct coalescing can
+therefore retire arbitrarily long fully covered anchor history without
+constructing an unbounded command. Snapshot validation reconstructs every leaf
+source segment from finalized evidence and checks the cumulative digest,
+boundary generations, predecessor and tip receipts, and first later citation.
+This keeps retained chain topology bounded while preserving the provenance and
 predecessor link needed by later segments.
 
 A page is not eligible for checkpointing, floor-driven detail removal, or
@@ -1141,8 +1145,8 @@ three-voter Raft
 composition additionally covers replication to
 every voter and exact cleanup replay after leadership transfer. Destination
 tombstone RPC orchestration, physical artifact deletion, pre-install
-cancellation, fenced-incarnation retirement substitutes, closure-certificate
-retirement, and anchor coalescing remain gated.
+cancellation, fenced-incarnation retirement substitutes, and
+closure-certificate retirement remain gated.
 
 Command v29 and state v41 implement the first bounded segment-retirement
 step. `CollapseMetadataTransferStagingEvidenceCheckpointSegment` performs an
@@ -1160,8 +1164,25 @@ advance the cluster-map epoch. Standalone tests cover mixed and fully covered
 segments, restart, exact replay, and mutation cases; a three-voter Raft test
 covers replication, leadership transfer, and replay of checkpoint, collapse,
 authorization, installation, and finalization commands after collapse.
-Bounded adjacent-anchor coalescing and closure-certificate retirement remain
-later slices.
+Command v30 and state v42 implement bounded adjacent-anchor coalescing.
+`CoalesceMetadataTransferStagingEvidenceCheckpointAnchors` performs an exact
+CAS over the actor incarnation, generation range, and canonical finalized
+source-segment count and digest. Each mutation consumes between two and 64
+adjacent retained anchors whose predecessor and apply-receipt links form one
+contiguous chain, then atomically replaces them with one anchor retaining the
+lowest predecessor and newest tip. Recursive merges remain grouping-independent
+because their durable identity is the original finalized leaf-segment vector,
+not the immediately consumed anchors. Exact checkpoint and collapse replay for
+one absorbed leaf, and semantic coalescing replay for a canonical range already
+covered by a stronger merged anchor, are epoch-neutral no-ops; stale ranges,
+forged source vectors, gaps, overlaps, and wrong actor identities reject without
+mutation. Snapshot validation reconstructs every leaf segment and its receipt
+chain from finalized canonical evidence before accepting the cumulative anchor
+commitment. Standalone restart and three-voter Raft coverage include recursive
+coalescing, replication to every voter, leadership transfer, and replay of
+checkpoint, collapse, coalescing, authorization, installation, and cleanup
+commands. Command v29/state v41 and all earlier fixed vectors remain immutable
+rejection evidence. Closure-certificate retirement remains a later slice.
 
 This cleanup CAS is intentionally one per PG, not a fifth multi-PG batch
 command. Epoch-neutral cleanup does not need batching to amortize cluster-map

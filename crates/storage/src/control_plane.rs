@@ -116,13 +116,16 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 41;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 42;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 const METADATA_TRANSFER_STAGING_CLEANUP_DIGEST_DOMAIN: &[u8] =
     b"argmin-metadata-transfer-staging-cleanup-v1";
 const METADATA_TRANSFER_STAGING_CHECKPOINT_SEGMENT_DIGEST_DOMAIN: &[u8] =
     b"argmin-metadata-transfer-staging-checkpoint-segment-v1";
+const METADATA_TRANSFER_STAGING_CHECKPOINT_SOURCE_SEGMENTS_DIGEST_DOMAIN: &[u8] =
+    b"argmin-metadata-transfer-staging-checkpoint-source-segments-v1";
+pub(crate) const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COALESCED_ANCHORS: usize = 64;
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
 const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
@@ -958,6 +961,8 @@ struct MetadataTransferStagingEvidenceCheckpointAnchor {
     previous_apply_receipt_digest: [u8; 32],
     tip_apply_receipt: Vec<u8>,
     source_segment_digest: [u8; 32],
+    source_segment_count: u64,
+    source_segments_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1031,6 +1036,15 @@ type MetadataTransferStagingFinalizedCheckpointIndex<'a> = BTreeMap<
         &'a MetadataTransferStagingFinalizedFloor,
     )>,
 >;
+
+#[derive(Debug, Clone, Copy)]
+struct MetadataTransferStagingCheckpointSourceSegmentBinding {
+    first_generation: u64,
+    last_generation: u64,
+    previous_generation: u64,
+    previous_apply_receipt_digest: [u8; 32],
+    source_segment_digest: [u8; 32],
+}
 
 fn metadata_transfer_staging_finalized_evidence_index(
     floors: &BTreeMap<(PgId, u64), MetadataTransferStagingFinalizedFloor>,
@@ -1138,6 +1152,59 @@ fn metadata_transfer_staging_finalized_checkpoint_index(
         }
     }
     Ok(index)
+}
+
+fn metadata_transfer_staging_checkpoint_source_segments(
+    finalized_checkpoints: &MetadataTransferStagingFinalizedCheckpointIndex<'_>,
+    actor_node_id: NodeId,
+    actor_node_incarnation: u64,
+    first_generation: u64,
+    last_generation: u64,
+) -> Result<Vec<(u64, u64, [u8; 32])>, String> {
+    let start = (
+        actor_node_id,
+        actor_node_incarnation,
+        first_generation,
+        0,
+        [0; 32],
+    );
+    let end = (
+        actor_node_id,
+        actor_node_incarnation,
+        last_generation,
+        u64::MAX,
+        [u8::MAX; 32],
+    );
+    let mut sources = Vec::new();
+    let mut next_generation = first_generation;
+    for ((_, _, source_first, source_last, source_digest), _) in
+        finalized_checkpoints.range(start..=end)
+    {
+        if *source_first != next_generation || *source_last < *source_first {
+            return Err(
+                "metadata-transfer staging checkpoint source ranges are not contiguous".to_owned(),
+            );
+        }
+        sources.push((*source_first, *source_last, *source_digest));
+        if *source_last == last_generation {
+            break;
+        }
+        next_generation = source_last.checked_add(1).ok_or_else(|| {
+            "metadata-transfer staging checkpoint source range overflows".to_owned()
+        })?;
+    }
+    if sources.is_empty()
+        || sources.first().map(|source| source.0) != Some(first_generation)
+        || sources.last().map(|source| source.1) != Some(last_generation)
+        || sources
+            .windows(2)
+            .any(|pair| pair[0].1.checked_add(1) != Some(pair[1].0))
+    {
+        return Err(
+            "metadata-transfer staging checkpoint source ranges do not cover the anchor".to_owned(),
+        );
+    }
+    Ok(sources)
 }
 
 #[derive(Clone)]
@@ -1754,6 +1821,50 @@ fn metadata_transfer_staging_checkpoint_segment_digest(
         .bytes()
         .try_into()
         .expect("SHA-256 staging checkpoint segment digest must contain 32 bytes")
+}
+
+fn metadata_transfer_staging_checkpoint_source_segments_digest(
+    segments: &[(u64, u64, [u8; 32])],
+) -> [u8; 32] {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(
+        &mut hasher,
+        METADATA_TRANSFER_STAGING_CHECKPOINT_SOURCE_SEGMENTS_DIGEST_DOMAIN,
+    );
+    digest_u64(
+        &mut hasher,
+        u64::try_from(segments.len()).expect("source segment count fits u64"),
+    );
+    for (first_generation, last_generation, segment_digest) in segments {
+        digest_u64(&mut hasher, *first_generation);
+        digest_u64(&mut hasher, *last_generation);
+        digest_bytes(&mut hasher, segment_digest);
+    }
+    hasher
+        .finalize()
+        .bytes()
+        .try_into()
+        .expect("SHA-256 staging checkpoint source-segment digest must contain 32 bytes")
+}
+
+fn validate_metadata_transfer_staging_checkpoint_coalescing_source_count(
+    source_count: usize,
+) -> Result<(), ControlPlaneError> {
+    if source_count < 2 {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "metadata-transfer staging checkpoint anchor coalescing source does not match"
+                .to_owned(),
+        });
+    }
+    if source_count > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COALESCED_ANCHORS {
+        return Err(ControlPlaneError::CommandDecode {
+            message: format!(
+                "metadata-transfer staging checkpoint anchor coalescing exceeds the {} direct-anchor limit",
+                MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COALESCED_ANCHORS
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3650,15 +3761,22 @@ impl ClusterControlSnapshot {
         Ok(bytes)
     }
 
-    fn reconstruct_metadata_transfer_staging_checkpoint_segment_from_anchor(
+    fn reconstruct_metadata_transfer_staging_checkpoint_source_segment(
         &self,
-        anchor: &MetadataTransferStagingEvidenceCheckpointAnchor,
+        actor: &crate::pg_store::MetadataTransferStagingNodeIdentity,
+        binding: MetadataTransferStagingCheckpointSourceSegmentBinding,
         finalized_evidence: &MetadataTransferStagingFinalizedEvidenceIndex<'_>,
         finalized_checkpoints: &MetadataTransferStagingFinalizedCheckpointIndex<'_>,
     ) -> Result<MetadataTransferStagingEvidenceCheckpointSegment, String> {
-        let page_count = anchor
-            .last_generation
-            .checked_sub(anchor.first_generation)
+        let MetadataTransferStagingCheckpointSourceSegmentBinding {
+            first_generation,
+            last_generation,
+            previous_generation,
+            previous_apply_receipt_digest,
+            source_segment_digest,
+        } = binding;
+        let page_count = last_generation
+            .checked_sub(first_generation)
             .and_then(|distance| distance.checked_add(1))
             .ok_or_else(|| {
                 "metadata-transfer staging checkpoint anchor generation range overflows".to_owned()
@@ -3677,11 +3795,11 @@ impl ClusterControlSnapshot {
         let mut commitments = BTreeMap::new();
         let finalized_members = finalized_checkpoints
             .get(&(
-                anchor.actor.node_id(),
-                anchor.actor.node_incarnation(),
-                anchor.first_generation,
-                anchor.last_generation,
-                anchor.source_segment_digest,
+                actor.node_id(),
+                actor.node_incarnation(),
+                first_generation,
+                last_generation,
+                source_segment_digest,
             ))
             .ok_or_else(|| {
                 "metadata-transfer staging checkpoint anchor has no finalized members".to_owned()
@@ -3690,8 +3808,8 @@ impl ClusterControlSnapshot {
             let binding = floor.checkpoint_bindings.get(*key).ok_or_else(|| {
                 "metadata-transfer staging checkpoint anchor member lost its binding".to_owned()
             })?;
-            if binding.page_generation < anchor.first_generation
-                || binding.page_generation > anchor.last_generation
+            if binding.page_generation < first_generation
+                || binding.page_generation > last_generation
                 || binding.page_sequence == 0
             {
                 return Err(
@@ -3712,7 +3830,7 @@ impl ClusterControlSnapshot {
             let evidence_digest = finalized.evidence_digest;
             let evidence = self.metadata_transfer_staging_checkpoint_evidence_bytes(
                 key,
-                &anchor.actor,
+                actor,
                 finalized_evidence,
                 evidence_digest,
             )?;
@@ -3744,12 +3862,13 @@ impl ClusterControlSnapshot {
             );
         }
 
-        let mut preceding_generation = anchor.previous_generation;
-        let mut preceding_digest = anchor.previous_apply_receipt_digest;
+        let mut preceding_generation = previous_generation;
+        let mut preceding_digest = previous_apply_receipt_digest;
         let mut page_links = Vec::with_capacity(usize::try_from(page_count).map_err(|_| {
             "metadata-transfer staging checkpoint anchor page count does not fit usize".to_owned()
         })?);
-        for generation in anchor.first_generation..=anchor.last_generation {
+        let mut tip_apply_receipt = None;
+        for generation in first_generation..=last_generation {
             let mut members = page_members.remove(&generation).ok_or_else(|| {
                 "metadata-transfer staging checkpoint anchor has an empty page".to_owned()
             })?;
@@ -3765,7 +3884,7 @@ impl ClusterControlSnapshot {
                 .map(|(sequence, _, _, evidence)| (*sequence, evidence.clone()))
                 .collect::<Vec<_>>();
             let page_digest = crate::pg_store::metadata_transfer_staging_checkpoint_page_digest(
-                &anchor.actor,
+                actor,
                 preceding_generation,
                 preceding_digest,
                 generation,
@@ -3774,7 +3893,7 @@ impl ClusterControlSnapshot {
             .map_err(|error| error.to_string())?;
             let receipt =
                 crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_checkpoint_link(
-                    anchor.actor.clone(),
+                    actor.clone(),
                     preceding_generation,
                     preceding_digest,
                     generation,
@@ -3797,13 +3916,8 @@ impl ClusterControlSnapshot {
             });
             preceding_generation = generation;
             preceding_digest = receipt_digest;
-            if generation == anchor.last_generation
-                && receipt.as_bytes() != anchor.tip_apply_receipt.as_slice()
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor tip receipt is not reconstructible"
-                        .to_owned(),
-                );
+            if generation == last_generation {
+                tip_apply_receipt = Some(receipt.as_bytes().to_vec());
             }
         }
         if !page_members.is_empty() {
@@ -3813,15 +3927,76 @@ impl ClusterControlSnapshot {
             );
         }
         Ok(MetadataTransferStagingEvidenceCheckpointSegment {
-            actor: anchor.actor.clone(),
-            first_generation: anchor.first_generation,
-            last_generation: anchor.last_generation,
-            previous_generation: anchor.previous_generation,
-            previous_apply_receipt_digest: anchor.previous_apply_receipt_digest,
+            actor: actor.clone(),
+            first_generation,
+            last_generation,
+            previous_generation,
+            previous_apply_receipt_digest,
             page_links,
-            tip_apply_receipt: anchor.tip_apply_receipt.clone(),
+            tip_apply_receipt: tip_apply_receipt.ok_or_else(|| {
+                "metadata-transfer staging checkpoint source segment has no tip receipt".to_owned()
+            })?,
             commitments,
         })
+    }
+
+    fn reconstruct_metadata_transfer_staging_checkpoint_anchor_sources(
+        &self,
+        anchor: &MetadataTransferStagingEvidenceCheckpointAnchor,
+        finalized_evidence: &MetadataTransferStagingFinalizedEvidenceIndex<'_>,
+        finalized_checkpoints: &MetadataTransferStagingFinalizedCheckpointIndex<'_>,
+    ) -> Result<Vec<(u64, u64, [u8; 32])>, String> {
+        let sources = metadata_transfer_staging_checkpoint_source_segments(
+            finalized_checkpoints,
+            anchor.actor.node_id(),
+            anchor.actor.node_incarnation(),
+            anchor.first_generation,
+            anchor.last_generation,
+        )?;
+        let mut preceding_generation = anchor.previous_generation;
+        let mut preceding_digest = anchor.previous_apply_receipt_digest;
+        let mut tip_apply_receipt = None;
+        for (first_generation, last_generation, source_digest) in &sources {
+            let segment = self.reconstruct_metadata_transfer_staging_checkpoint_source_segment(
+                &anchor.actor,
+                MetadataTransferStagingCheckpointSourceSegmentBinding {
+                    first_generation: *first_generation,
+                    last_generation: *last_generation,
+                    previous_generation: preceding_generation,
+                    previous_apply_receipt_digest: preceding_digest,
+                    source_segment_digest: *source_digest,
+                },
+                finalized_evidence,
+                finalized_checkpoints,
+            )?;
+            if metadata_transfer_staging_checkpoint_segment_digest(&segment) != *source_digest {
+                return Err(
+                    "metadata-transfer staging checkpoint anchor source digest is not reconstructible"
+                        .to_owned(),
+                );
+            }
+            preceding_generation = *last_generation;
+            preceding_digest = checksum::sha256::digest(&segment.tip_apply_receipt);
+            tip_apply_receipt = Some(segment.tip_apply_receipt);
+        }
+        if sources.is_empty()
+            || sources.len()
+                != usize::try_from(anchor.source_segment_count).map_err(|_| {
+                    "metadata-transfer staging checkpoint source count does not fit usize"
+                        .to_owned()
+                })?
+            || sources.first().map(|source| source.0) != Some(anchor.first_generation)
+            || sources.last().map(|source| source.1) != Some(anchor.last_generation)
+            || metadata_transfer_staging_checkpoint_source_segments_digest(&sources)
+                != anchor.source_segments_digest
+            || tip_apply_receipt.as_deref() != Some(anchor.tip_apply_receipt.as_slice())
+        {
+            return Err(
+                "metadata-transfer staging checkpoint anchor cumulative source is invalid"
+                    .to_owned(),
+            );
+        }
+        Ok(sources)
     }
 
     fn validate_metadata_transfer_staging_finalized_checkpoint_binding(
@@ -3883,14 +4058,23 @@ impl ClusterControlSnapshot {
         }
         let anchor = self
             .metadata_transfer_staging_evidence_checkpoint_anchors
-            .get(&segment_key)
+            .range(
+                (binding.actor_node_id, binding.actor_node_incarnation, 0)
+                    ..=(
+                        binding.actor_node_id,
+                        binding.actor_node_incarnation,
+                        binding.first_generation,
+                    ),
+            )
+            .next_back()
+            .map(|(_, anchor)| anchor)
             .ok_or_else(|| {
                 "metadata-transfer staging finalized checkpoint binding has no retained segment or anchor"
                     .to_owned()
             })?;
-        if anchor.last_generation != binding.last_generation
+        if anchor.first_generation > binding.first_generation
+            || anchor.last_generation < binding.last_generation
             || anchor.actor.endpoint() != expected_endpoint
-            || anchor.source_segment_digest != binding.segment_digest
         {
             return Err(
                 "metadata-transfer staging finalized checkpoint binding does not match its anchor"
@@ -4212,18 +4396,18 @@ impl ClusterControlSnapshot {
                     .to_owned(),
                 );
             }
-            let reconstructed = self
-                .reconstruct_metadata_transfer_staging_checkpoint_segment_from_anchor(
-                    anchor,
-                    &finalized_evidence,
-                    &finalized_checkpoints,
-                )?;
-            if metadata_transfer_staging_checkpoint_segment_digest(&reconstructed)
-                != anchor.source_segment_digest
+            let sources = self.reconstruct_metadata_transfer_staging_checkpoint_anchor_sources(
+                anchor,
+                &finalized_evidence,
+                &finalized_checkpoints,
+            )?;
+            let leaf_anchor = anchor.source_segment_count == 1;
+            if anchor.source_segment_count == 0
+                || (leaf_anchor && anchor.source_segment_digest != sources[0].2)
+                || (!leaf_anchor && anchor.source_segment_digest != [0; 32])
             {
                 return Err(
-                    "metadata-transfer staging checkpoint anchor source digest is not reconstructible"
-                        .to_owned(),
+                    "metadata-transfer staging checkpoint anchor provenance is invalid".to_owned(),
                 );
             }
             let tip_receipt =
@@ -5174,21 +5358,49 @@ impl ClusterControlSnapshot {
             });
         }
         let segment_key = (actor_node_id, actor_node_incarnation, first_generation);
-        if let Some(existing) = self
+        if let Some((_, existing)) = self
             .metadata_transfer_staging_evidence_checkpoint_anchors
-            .get(&segment_key)
+            .range(
+                (actor_node_id, actor_node_incarnation, 0)
+                    ..=(actor_node_id, actor_node_incarnation, first_generation),
+            )
+            .next_back()
         {
-            if existing.last_generation == last_generation {
-                return Ok(AppliedControlPlaneCommand::new(
-                    self.clone(),
-                    ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages,
-                    false,
-                ));
+            if existing.last_generation >= first_generation {
+                let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
+                    &self.metadata_transfer_staging_finalized_floors,
+                )
+                .map_err(|message| {
+                    ControlPlaneError::SnapshotInvariantViolation {
+                        context: "metadata-transfer staging finalized checkpoint index",
+                        message,
+                    }
+                })?;
+                let sources = metadata_transfer_staging_checkpoint_source_segments(
+                    &finalized_checkpoints,
+                    actor_node_id,
+                    actor_node_incarnation,
+                    first_generation,
+                    last_generation,
+                )
+                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+                if existing.first_generation <= first_generation
+                    && existing.last_generation >= last_generation
+                    && sources.len() == 1
+                    && sources[0].0 == first_generation
+                    && sources[0].1 == last_generation
+                {
+                    return Ok(AppliedControlPlaneCommand::new(
+                        self.clone(),
+                        ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages,
+                        false,
+                    ));
+                }
+                return Err(ControlPlaneError::CommandDecode {
+                    message: "metadata-transfer staging checkpoint conflicts with retained anchor"
+                        .to_owned(),
+                });
             }
-            return Err(ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint conflicts with retained anchor"
-                    .to_owned(),
-            });
         }
         if let Some(existing) = self
             .metadata_transfer_staging_evidence_checkpoint_segments
@@ -5431,24 +5643,49 @@ impl ClusterControlSnapshot {
             });
         }
         let segment_key = (actor_node_id, actor_node_incarnation, first_generation);
-        if let Some(anchor) = self
+        if let Some((_, anchor)) = self
             .metadata_transfer_staging_evidence_checkpoint_anchors
-            .get(&segment_key)
+            .range(
+                (actor_node_id, actor_node_incarnation, 0)
+                    ..=(actor_node_id, actor_node_incarnation, first_generation),
+            )
+            .next_back()
         {
-            if anchor.last_generation == last_generation
-                && anchor.source_segment_digest == source_segment_digest
-            {
-                return Ok(AppliedControlPlaneCommand::new(
-                    self.clone(),
-                    ControlPlaneCommandResponse::CollapseMetadataTransferStagingEvidenceCheckpointSegment,
-                    false,
-                ));
+            if anchor.last_generation >= first_generation {
+                let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
+                    &self.metadata_transfer_staging_finalized_floors,
+                )
+                .map_err(|message| {
+                    ControlPlaneError::SnapshotInvariantViolation {
+                        context: "metadata-transfer staging finalized checkpoint index",
+                        message,
+                    }
+                })?;
+                let sources = metadata_transfer_staging_checkpoint_source_segments(
+                    &finalized_checkpoints,
+                    actor_node_id,
+                    actor_node_incarnation,
+                    first_generation,
+                    last_generation,
+                )
+                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+                if anchor.first_generation <= first_generation
+                    && anchor.last_generation >= last_generation
+                    && sources.as_slice()
+                        == [(first_generation, last_generation, source_segment_digest)]
+                {
+                    return Ok(AppliedControlPlaneCommand::new(
+                        self.clone(),
+                        ControlPlaneCommandResponse::CollapseMetadataTransferStagingEvidenceCheckpointSegment,
+                        false,
+                    ));
+                }
+                return Err(ControlPlaneError::CommandDecode {
+                    message:
+                        "metadata-transfer staging checkpoint collapse conflicts with retained anchor"
+                            .to_owned(),
+                });
             }
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "metadata-transfer staging checkpoint collapse conflicts with retained anchor"
-                        .to_owned(),
-            });
         }
         let segment = self
             .metadata_transfer_staging_evidence_checkpoint_segments
@@ -5514,6 +5751,7 @@ impl ClusterControlSnapshot {
                 });
             }
         }
+        let source_segments = [(first_generation, last_generation, source_segment_digest)];
         let anchor = MetadataTransferStagingEvidenceCheckpointAnchor {
             actor: segment.actor.clone(),
             first_generation,
@@ -5522,6 +5760,10 @@ impl ClusterControlSnapshot {
             previous_apply_receipt_digest: segment.previous_apply_receipt_digest,
             tip_apply_receipt: segment.tip_apply_receipt.clone(),
             source_segment_digest,
+            source_segment_count: 1,
+            source_segments_digest: metadata_transfer_staging_checkpoint_source_segments_digest(
+                &source_segments,
+            ),
         };
         let mut next_snapshot = self.clone();
         next_snapshot
@@ -5551,13 +5793,28 @@ impl ClusterControlSnapshot {
         {
             metadata_transfer_staging_checkpoint_segment_digest(segment)
         } else {
-            self.metadata_transfer_staging_evidence_checkpoint_anchors
-                .get(&key)
-                .map(|anchor| anchor.source_segment_digest)
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
+            let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
+                &self.metadata_transfer_staging_finalized_floors,
+            )
+            .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata-transfer staging finalized checkpoint index",
+                message,
+            })?;
+            let sources = metadata_transfer_staging_checkpoint_source_segments(
+                &finalized_checkpoints,
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+            )
+            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+            if sources.len() != 1 {
+                return Err(ControlPlaneError::CommandDecode {
                     message: "metadata-transfer staging checkpoint collapse source is not retained"
                         .to_owned(),
-                })?
+                });
+            }
+            sources[0].2
         };
         let command =
             ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment {
@@ -5566,6 +5823,200 @@ impl ClusterControlSnapshot {
                 first_generation,
                 last_generation,
                 source_segment_digest,
+            };
+        self.apply_control_plane_command(command.clone())?;
+        Ok(command)
+    }
+
+    fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
+        &self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+        source_segment_count: u64,
+        source_segments_digest: [u8; 32],
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        if first_generation == 0 || first_generation > last_generation || source_segment_count < 2 {
+            return Err(ControlPlaneError::CommandDecode {
+                message:
+                    "metadata-transfer staging checkpoint anchor coalescing bounds are invalid"
+                        .to_owned(),
+            });
+        }
+
+        let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
+            &self.metadata_transfer_staging_finalized_floors,
+        )
+        .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
+            context: "metadata-transfer staging finalized checkpoint index",
+            message,
+        })?;
+        let source_segments = metadata_transfer_staging_checkpoint_source_segments(
+            &finalized_checkpoints,
+            actor_node_id,
+            actor_node_incarnation,
+            first_generation,
+            last_generation,
+        )
+        .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+        if u64::try_from(source_segments.len()).expect("source segment count fits u64")
+            != source_segment_count
+            || metadata_transfer_staging_checkpoint_source_segments_digest(&source_segments)
+                != source_segments_digest
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message:
+                    "metadata-transfer staging checkpoint anchor coalescing source segments do not match"
+                        .to_owned(),
+            });
+        }
+
+        if let Some((_, covering)) = self
+            .metadata_transfer_staging_evidence_checkpoint_anchors
+            .range(
+                (actor_node_id, actor_node_incarnation, 0)
+                    ..=(actor_node_id, actor_node_incarnation, first_generation),
+            )
+            .next_back()
+        {
+            if covering.first_generation <= first_generation
+                && covering.last_generation >= last_generation
+            {
+                return Ok(AppliedControlPlaneCommand::new(
+                    self.clone(),
+                    ControlPlaneCommandResponse::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors,
+                    false,
+                ));
+            }
+        }
+
+        let mut source_keys = Vec::new();
+        let mut source_anchors = Vec::new();
+        let mut next_generation = first_generation;
+        let mut preceding_generation = None;
+        let mut preceding_digest = None;
+        while next_generation <= last_generation {
+            let key = (actor_node_id, actor_node_incarnation, next_generation);
+            let anchor = self
+                .metadata_transfer_staging_evidence_checkpoint_anchors
+                .get(&key)
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message:
+                        "metadata-transfer staging checkpoint anchor coalescing source is not retained"
+                            .to_owned(),
+                })?;
+            if anchor.actor.node_id() != actor_node_id
+                || anchor.actor.node_incarnation() != actor_node_incarnation
+                || anchor.last_generation > last_generation
+                || preceding_generation.is_some_and(|generation| {
+                    anchor.previous_generation != generation
+                        || anchor.previous_apply_receipt_digest
+                            != preceding_digest.expect("preceding digest accompanies generation")
+                })
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message:
+                        "metadata-transfer staging checkpoint anchors are not one contiguous chain"
+                            .to_owned(),
+                });
+            }
+            source_keys.push(key);
+            source_anchors.push(anchor);
+            preceding_generation = Some(anchor.last_generation);
+            preceding_digest = Some(checksum::sha256::digest(&anchor.tip_apply_receipt));
+            if anchor.last_generation == last_generation {
+                break;
+            }
+            next_generation = anchor.last_generation.checked_add(1).ok_or_else(|| {
+                ControlPlaneError::CommandDecode {
+                    message:
+                        "metadata-transfer staging checkpoint anchor coalescing range overflows"
+                            .to_owned(),
+                }
+            })?;
+        }
+        validate_metadata_transfer_staging_checkpoint_coalescing_source_count(
+            source_anchors.len(),
+        )?;
+        if source_anchors.last().map(|anchor| anchor.last_generation) != Some(last_generation) {
+            return Err(ControlPlaneError::CommandDecode {
+                message:
+                    "metadata-transfer staging checkpoint anchor coalescing source does not match"
+                        .to_owned(),
+            });
+        }
+
+        let first = source_anchors
+            .first()
+            .expect("coalescing requires at least two anchors");
+        let last = source_anchors
+            .last()
+            .expect("coalescing requires at least two anchors");
+        let anchor = MetadataTransferStagingEvidenceCheckpointAnchor {
+            actor: first.actor.clone(),
+            first_generation,
+            last_generation,
+            previous_generation: first.previous_generation,
+            previous_apply_receipt_digest: first.previous_apply_receipt_digest,
+            tip_apply_receipt: last.tip_apply_receipt.clone(),
+            source_segment_digest: [0; 32],
+            source_segment_count,
+            source_segments_digest,
+        };
+
+        let mut next_snapshot = self.clone();
+        for key in source_keys {
+            next_snapshot
+                .metadata_transfer_staging_evidence_checkpoint_anchors
+                .remove(&key);
+        }
+        next_snapshot
+            .metadata_transfer_staging_evidence_checkpoint_anchors
+            .insert(
+                (actor_node_id, actor_node_incarnation, first_generation),
+                anchor,
+            );
+        Ok(AppliedControlPlaneCommand::new(
+            next_snapshot,
+            ControlPlaneCommandResponse::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors,
+            true,
+        ))
+    }
+
+    pub(crate) fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors_command(
+        &self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
+            &self.metadata_transfer_staging_finalized_floors,
+        )
+        .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
+            context: "metadata-transfer staging finalized checkpoint index",
+            message,
+        })?;
+        let source_segments = metadata_transfer_staging_checkpoint_source_segments(
+            &finalized_checkpoints,
+            actor_node_id,
+            actor_node_incarnation,
+            first_generation,
+            last_generation,
+        )
+        .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+        let command =
+            ControlPlaneCommand::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors {
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+                source_segment_count: u64::try_from(source_segments.len())
+                    .expect("source segment count fits u64"),
+                source_segments_digest: metadata_transfer_staging_checkpoint_source_segments_digest(
+                    &source_segments,
+                ),
             };
         self.apply_control_plane_command(command.clone())?;
         Ok(command)
@@ -9133,6 +9584,21 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 first_generation,
                 last_generation,
                 source_segment_digest,
+            ),
+            ControlPlaneCommand::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors {
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+                source_segment_count,
+                source_segments_digest,
+            } => self.coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+                source_segment_count,
+                source_segments_digest,
             ),
             ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup } => {
                 self.finalize_metadata_transfer_staging_generation(cleanup)
@@ -14448,6 +14914,25 @@ pub trait ControlPlaneAdmin {
         ))
     }
 
+    fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let _ = (
+            actor_node_id,
+            actor_node_incarnation,
+            first_generation,
+            last_generation,
+        );
+        Err(ControlPlaneError::rpc_remote(
+            "metadata-transfer staging checkpoint anchor coalescing is not supported by this authority"
+                .to_owned(),
+        ))
+    }
+
     fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,
@@ -15349,6 +15834,8 @@ fn format_metadata_transfer_staging_evidence_checkpoint_anchor(
         hex_encode(&anchor.previous_apply_receipt_digest),
         hex_encode(&anchor.tip_apply_receipt),
         hex_encode(&anchor.source_segment_digest),
+        anchor.source_segment_count.to_string(),
+        hex_encode(&anchor.source_segments_digest),
     ]
     .join(",")
 }
@@ -15358,10 +15845,10 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_anchor(
     value: &str,
 ) -> Result<MetadataTransferStagingEvidenceCheckpointAnchor, ControlPlaneError> {
     let fields = value.split(',').collect::<Vec<_>>();
-    if fields.len() != 9 {
+    if fields.len() != 11 {
         return Err(parse_error(
             line,
-            "metadata-transfer staging checkpoint anchor must have nine fields",
+            "metadata-transfer staging checkpoint anchor must have eleven fields",
         ));
     }
     let actor = MetadataTransferStagingNodeIdentity::new(
@@ -15399,6 +15886,17 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_anchor(
             parse_error(
                 line,
                 "staging checkpoint anchor source segment digest must contain 32 bytes",
+            )
+        })?,
+        source_segment_count: parse_u64(
+            line,
+            fields[9],
+            "staging checkpoint anchor source segment count",
+        )?,
+        source_segments_digest: hex_decode(line, fields[10])?.try_into().map_err(|_| {
+            parse_error(
+                line,
+                "staging checkpoint anchor source segments digest must contain 32 bytes",
             )
         })?,
     })

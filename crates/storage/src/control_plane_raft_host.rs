@@ -659,6 +659,33 @@ impl ControlPlaneRaftAuthorityHost {
         self.current_snapshot()
     }
 
+    pub fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .current_snapshot()?
+            .coalesce_metadata_transfer_staging_evidence_checkpoint_anchors_command(
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+            )?;
+        let response = self.submit_low_priority_raft_command(command)?;
+        if !matches!(
+            response,
+            ControlPlaneCommandResponse::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors
+        ) {
+            return Err(ControlPlaneError::invariant_failure(
+                "staging evidence checkpoint anchor coalescing returned the wrong response",
+            ));
+        }
+        self.current_snapshot()
+    }
+
     pub fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,
@@ -1449,6 +1476,22 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
         last_generation: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         ControlPlaneRaftAuthorityHost::collapse_metadata_transfer_staging_evidence_checkpoint_segment(
+            self,
+            actor_node_id,
+            actor_node_incarnation,
+            first_generation,
+            last_generation,
+        )
+    }
+
+    fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        ControlPlaneRaftAuthorityHost::coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
             self,
             actor_node_id,
             actor_node_incarnation,
