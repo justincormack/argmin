@@ -3467,15 +3467,19 @@ fn bucket_subresource_transfers_published_unrelated_command_to_recovery() {
     assert_eq!(trailing_failures.load(Ordering::SeqCst), 1);
 
     drop(hook_guard);
-    assert_eq!(
-        cluster
-            .drain_pending_metadata_command_with_authorized_recovery_route(
-                pg_id, &command, &cluster,
-            )
-            .unwrap(),
-        PendingMetadataCommandOutcome::Applied
-    );
-    assert!(pending_metadata_command_for_test(&map, pg_id, &barrier_bucket).is_none());
+    let recovery_handle =
+        crate::StorageClusterRouteHandle::from_static_cluster(Arc::clone(&cluster)).unwrap();
+    let _recovery_sweeper =
+        crate::StoragePendingMetadataCommandRecoverySweeper::acquire_shared(&recovery_handle)
+            .unwrap();
+    let recovery_deadline = Instant::now() + Duration::from_secs(5);
+    while pending_metadata_command_for_test(&map, pg_id, &barrier_bucket).is_some() {
+        assert!(
+            Instant::now() < recovery_deadline,
+            "the static recovery owner did not converge the transferred command"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]

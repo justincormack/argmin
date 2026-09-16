@@ -5135,31 +5135,140 @@ impl StorageCluster {
             .pending_metadata_command_envelope_until(deadline)
     }
 
-    fn drain_pending_metadata_commands_for_current_map(
+    pub(crate) fn drain_pending_metadata_commands_for_current_map(
         &self,
     ) -> Result<usize, ObjectPgActionError> {
+        self.drain_pending_metadata_commands_for_current_map_inner(false)
+    }
+
+    pub(crate) fn drain_pending_metadata_commands_for_static_map(
+        &self,
+    ) -> Result<usize, ObjectPgActionError> {
+        if !self.has_static_route_authority() {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "static pending metadata command recovery scan",
+                },
+            ));
+        }
+        self.drain_pending_metadata_commands_for_current_map_inner(true)
+    }
+
+    fn drain_pending_metadata_commands_for_current_map_inner(
+        &self,
+        authorize_static_recovery: bool,
+    ) -> Result<usize, ObjectPgActionError> {
+        self.drain_pending_metadata_commands_for_current_map_with(
+            authorize_static_recovery,
+            |_| Ok(()),
+        )
+    }
+
+    fn drain_pending_metadata_commands_for_current_map_with(
+        &self,
+        authorize_static_recovery: bool,
+        mut before_attempt: impl FnMut(PgId) -> Result<(), ObjectPgActionError>,
+    ) -> Result<usize, ObjectPgActionError> {
         let mut drained = 0usize;
+        let mut first_error = None;
         for raw_pg_id in self.local_map.pg_ids() {
             let pg_id = PgId::new(*raw_pg_id);
-            let primary = self
-                .local_map
-                .metadata_pg_primary_node_for_metadata_command_recovery(
-                    self.operation_epoch(),
-                    pg_id,
-                )
-                .map_err(ObjectPgActionError::Store)?;
-            let Some(command) = primary
-                .metadata_command_client()
-                .pending_metadata_command_envelope(pg_id, self.operation_epoch())
-                .map_err(ObjectPgActionError::Store)?
-            else {
-                continue;
-            };
-            let outcome =
-                self.drain_pending_metadata_command_with_local_recovery_route(pg_id, &command)?;
-            drained += usize::from(outcome.is_terminal());
+            let attempt = (|| {
+                before_attempt(pg_id)?;
+                let primary = self
+                    .local_map
+                    .metadata_pg_primary_node_for_metadata_command_recovery(
+                        self.operation_epoch(),
+                        pg_id,
+                    )
+                    .map_err(ObjectPgActionError::Store)?;
+                let Some(command) = primary
+                    .metadata_command_client()
+                    .pending_metadata_command_envelope(pg_id, self.operation_epoch())
+                    .map_err(ObjectPgActionError::Store)?
+                else {
+                    return Ok(0usize);
+                };
+                let outcome = if authorize_static_recovery {
+                    self.drain_pending_metadata_command_with_static_recovery_route(pg_id, &command)?
+                } else {
+                    self.drain_pending_metadata_command_with_local_recovery_route(pg_id, &command)?
+                };
+                Ok(usize::from(outcome.is_terminal()))
+            })();
+            match attempt {
+                Ok(count) => drained += count,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(drained)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drain_pending_metadata_commands_for_static_map_with_attempt_hook(
+        &self,
+        before_attempt: impl FnMut(PgId) -> Result<(), ObjectPgActionError>,
+    ) -> Result<usize, ObjectPgActionError> {
+        if !self.has_static_route_authority() {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "static pending metadata command recovery scan test",
+                },
+            ));
+        }
+        self.drain_pending_metadata_commands_for_current_map_with(true, before_attempt)
+    }
+
+    pub(crate) fn has_static_route_authority(&self) -> bool {
+        self.route_authority.is_static()
+    }
+
+    fn relinquish_metadata_command_recovery_guard(
+        &self,
+        guard: MetadataCommandRecoveryGuard,
+    ) {
+        guard.relinquish_for_authorized_recovery();
+        crate::maintenance::wake_pending_metadata_command_recovery_for(self);
+    }
+
+    fn relinquish_metadata_command_recovery_leader(
+        &self,
+        leader: MetadataCommandRecoveryLeader<'_>,
+    ) {
+        leader.relinquish_for_authorized_recovery();
+        crate::maintenance::wake_pending_metadata_command_recovery_for(self);
+    }
+
+    fn complete_metadata_command_recovery_leader(
+        &self,
+        leader: MetadataCommandRecoveryLeader<'_>,
+        outcome: PendingMetadataCommandOutcome,
+    ) -> bool {
+        let relinquished =
+            leader.complete_with_outcome_and_relinquish_if_requested(outcome);
+        if relinquished {
+            crate::maintenance::wake_pending_metadata_command_recovery_for(self);
+        }
+        relinquished
+    }
+
+    fn complete_metadata_command_recovery_guard(
+        &self,
+        guard: MetadataCommandRecoveryGuard,
+        outcome: PendingMetadataCommandOutcome,
+    ) -> bool {
+        let relinquished = guard.complete_with_outcome_and_relinquish_if_requested(outcome);
+        if relinquished {
+            crate::maintenance::wake_pending_metadata_command_recovery_for(self);
+        }
+        relinquished
     }
 
     fn remove_pending_metadata_command_for_bucket(

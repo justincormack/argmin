@@ -259,6 +259,20 @@ outage generation and starts or clears its retry cooldown.
 This prevents route unavailability from amplifying into continuous all-PG
 storage RPC traffic.
 
+Standalone static route maps have no control-plane refresh worker. A shared
+storage-owned static recovery worker therefore performs the same bounded
+current-map scan periodically. It reads the exact durable pending envelope from
+the trusted current primary and supplies that envelope as the authorized
+recovery source, allowing it to take over a detached foreground flight. An
+unrelated foreground request still cannot mint that authority and continues to
+return retryable contention promptly. This prevents a recoverable trailing
+replica or terminal-cleanup failure from poisoning the PG until process restart.
+The dynamic refresh-outage fallback remains deliberately non-authorizing:
+dynamic recovery authority comes only from the control plane's PG-scoped
+listing. Both scans attempt every PG, retain the first error for their caller,
+and continue converging later PGs so one broken route cannot starve unrelated
+pending commands.
+
 Cross-PG reservation routes are stored in a fixed-width sidecar in the same
 transaction as the pending slot. Its integrity checksum binds the complete
 command ID, command checksum, and every retained route dependency, so heartbeat

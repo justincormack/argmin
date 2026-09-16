@@ -178,6 +178,7 @@ pub(crate) fn setup_coordinator_with_pg_count_without_background_sweepers(
         Some(test_sse_s3_provider()),
         (
             false,
+            false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
@@ -261,6 +262,7 @@ pub(crate) fn setup_same_process_coordinator_with_storage_cluster_without_backgr
         None,
         Some(test_sse_s3_provider()),
         (
+            false,
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),

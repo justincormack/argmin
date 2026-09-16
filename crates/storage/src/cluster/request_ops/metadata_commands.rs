@@ -2564,7 +2564,7 @@ impl super::StorageCluster {
                                 bucket_metadata_command_irreversible_resolution(&error)
                                     .expect("guard requires typed irreversible uncertainty"),
                             );
-                            guard.relinquish_for_authorized_recovery();
+                            self.relinquish_metadata_command_recovery_guard(guard);
                             if admission_policy
                                 == MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
                             {
@@ -2575,13 +2575,13 @@ impl super::StorageCluster {
                             continue;
                         }
                         Err(error) if guard.lineage_advanced_from(&command) => {
-                            guard.relinquish_for_authorized_recovery();
+                            self.relinquish_metadata_command_recovery_guard(guard);
                             return Err(error);
                         }
                         Err(error)
                             if metadata_command_observation_requires_recovery_route(&error) =>
                         {
-                            guard.relinquish_for_authorized_recovery();
+                            self.relinquish_metadata_command_recovery_guard(guard);
                             if admission_policy
                                 == MetadataCommandRecoveryAdmissionPolicy::UnrelatedDrainer
                             {
@@ -2593,7 +2593,8 @@ impl super::StorageCluster {
                         }
                         Err(error) => return Err(error),
                     };
-                    let relinquished = guard.complete_with_outcome_and_relinquish_if_requested(
+                    let relinquished = self.complete_metadata_command_recovery_guard(
+                        guard,
                         metadata_command_recovery_outcome_from_finish_result(outcome),
                     );
                     self.emit_metadata_command_recovery_outcome_for_command(

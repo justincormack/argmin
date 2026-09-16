@@ -1167,16 +1167,19 @@ fn stream_put_append_published_log_gap_keeps_payload_for_pending_retry() {
         PgId::new(object_pg),
         &pending_command,
     ));
-    assert_eq!(
-        cluster
-            .drain_pending_metadata_command_with_authorized_recovery_route(
-                PgId::new(object_pg),
-                &pending_command,
-                &cluster,
-            )
-            .unwrap(),
-        PendingMetadataCommandOutcome::Applied
-    );
+    let recovery_handle =
+        crate::StorageClusterRouteHandle::from_static_cluster(Arc::clone(&cluster)).unwrap();
+    let _recovery_sweeper =
+        crate::StoragePendingMetadataCommandRecoverySweeper::acquire_shared(&recovery_handle)
+            .unwrap();
+    let recovery_deadline = Instant::now() + Duration::from_secs(5);
+    while pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some() {
+        assert!(
+            Instant::now() < recovery_deadline,
+            "the static recovery owner did not converge the stream append"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
     cluster
         .commit_stream_segment_append(
             &bucket,

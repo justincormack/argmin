@@ -14,8 +14,9 @@ use super::read_core::ReadRuntime;
 use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::{BucketSummary, ModernBucketSummary};
 use super::runtime::{
-    acquire_shard_backfill_sweeper, acquire_shard_repair_sweeper, acquire_shard_scavenger_sweeper,
-    acquire_stream_session_sweeper, LifecycleSweeper, ReclaimSweeper, ShardBackfillSweeper,
+    acquire_pending_metadata_command_recovery_sweeper, acquire_shard_backfill_sweeper,
+    acquire_shard_repair_sweeper, acquire_shard_scavenger_sweeper, acquire_stream_session_sweeper,
+    LifecycleSweeper, PendingMetadataCommandRecoverySweeper, ReclaimSweeper, ShardBackfillSweeper,
     ShardRepairSweeper, ShardScavengerSweeper, StreamSessionSweeper,
 };
 #[cfg(test)]
@@ -49,6 +50,7 @@ pub struct BackgroundWorkerMode {
     pub shard_repair: bool,
     pub shard_backfill: bool,
     pub stream_session: bool,
+    pub pending_metadata_command_recovery: bool,
 }
 
 impl BackgroundWorkerMode {
@@ -60,6 +62,7 @@ impl BackgroundWorkerMode {
             shard_repair: true,
             shard_backfill: true,
             stream_session: true,
+            pending_metadata_command_recovery: true,
         }
     }
 
@@ -71,6 +74,7 @@ impl BackgroundWorkerMode {
             shard_repair: false,
             shard_backfill: false,
             stream_session: false,
+            pending_metadata_command_recovery: false,
         }
     }
 
@@ -82,6 +86,9 @@ impl BackgroundWorkerMode {
             shard_repair: true,
             shard_backfill: true,
             stream_session: true,
+            // Dynamic route-map handles already own the control-plane-
+            // authorized recovery worker.
+            pending_metadata_command_recovery: false,
         }
     }
 }
@@ -457,6 +464,7 @@ impl Coordinator {
             Some(managed_key_provider),
             (
                 background_worker_mode.object_reclaim_and_bucket_finalize,
+                background_worker_mode.pending_metadata_command_recovery,
                 lifecycle_sweeper_factory,
                 shard_scavenger_sweeper_factory,
                 shard_repair_sweeper_factory,
@@ -496,7 +504,7 @@ impl Coordinator {
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: Option<StaticManagedKeyProvider>,
-        background_sweepers: (bool, F, G, H, I, J),
+        background_sweepers: (bool, bool, F, G, H, I, J),
     ) -> Result<Self, ServerError>
     where
         F: FnOnce(
@@ -542,6 +550,7 @@ impl Coordinator {
             managed_key_provider,
             (
                 BackgroundWorkerMode::all().object_reclaim_and_bucket_finalize,
+                BackgroundWorkerMode::all().pending_metadata_command_recovery,
                 lifecycle_sweeper_factory,
                 acquire_shard_scavenger_sweeper,
                 acquire_shard_repair_sweeper,
@@ -558,7 +567,7 @@ impl Coordinator {
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: Option<StaticManagedKeyProvider>,
-        background_sweepers: (bool, F, G, H, I, J),
+        background_sweepers: (bool, bool, F, G, H, I, J),
     ) -> Result<Self, ServerError>
     where
         F: FnOnce(
@@ -586,7 +595,7 @@ impl Coordinator {
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
         managed_key_provider: Option<StaticManagedKeyProvider>,
-        background_sweepers: (bool, F, G, H, I, J),
+        background_sweepers: (bool, bool, F, G, H, I, J),
     ) -> Result<Self, ServerError>
     where
         F: FnOnce(
@@ -616,6 +625,7 @@ impl Coordinator {
         };
         let (
             start_reclaim_worker,
+            start_pending_metadata_command_recovery_worker,
             lifecycle_sweeper_factory,
             shard_scavenger_sweeper_factory,
             shard_repair_sweeper_factory,
@@ -631,6 +641,12 @@ impl Coordinator {
         } else {
             ReclaimSweeper::disabled(background_storage_handle.clone())
         };
+        let pending_metadata_command_recovery_sweeper =
+            if start_pending_metadata_command_recovery_worker {
+                acquire_pending_metadata_command_recovery_sweeper(&background_storage_handle)?
+            } else {
+                PendingMetadataCommandRecoverySweeper::disabled(background_storage_handle.clone())
+            };
         let lifecycle_sweeper =
             lifecycle_sweeper_factory(&background_storage_handle, read_runtime.clone())?;
         let shard_scavenger_sweeper = shard_scavenger_sweeper_factory(&background_storage_handle)?;
@@ -649,6 +665,7 @@ impl Coordinator {
             _shard_repair_sweeper: shard_repair_sweeper,
             _shard_backfill_sweeper: shard_backfill_sweeper,
             _stream_session_sweeper: stream_session_sweeper,
+            _pending_metadata_command_recovery_sweeper: pending_metadata_command_recovery_sweeper,
             _lifecycle_sweeper: lifecycle_sweeper,
         })
     }
@@ -759,6 +776,9 @@ impl Coordinator {
             shard_repair: self._shard_repair_sweeper.test_is_enabled(),
             shard_backfill: self._shard_backfill_sweeper.test_is_enabled(),
             stream_session: self._stream_session_sweeper.test_is_enabled(),
+            pending_metadata_command_recovery: self
+                ._pending_metadata_command_recovery_sweeper
+                .test_is_enabled(),
         }
     }
 

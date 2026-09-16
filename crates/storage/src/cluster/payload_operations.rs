@@ -1795,6 +1795,40 @@ impl StorageCluster {
         )
     }
 
+    fn drain_pending_metadata_command_with_static_recovery_route(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        if !self.has_static_route_authority() {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "static pending metadata command recovery",
+                },
+            ));
+        }
+        let mut work_budget = RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
+            .for_operation("metadata_command_static_recovery")
+            .for_pg(pg_id);
+        let mut recovery_authority =
+            MetadataCommandRecoveryDrainAuthority::new(&mut work_budget);
+        let mut authority = MetadataCommandDrainAuthority::for_recovery(&mut recovery_authority);
+        self.drain_pending_metadata_command_with_authority_inner(
+            pg_id,
+            command,
+            &mut authority,
+            self,
+            // A static route map has no external recovery authority. Its
+            // storage-owned worker loaded this exact durable envelope from
+            // the trusted primary, which is the authority needed to take over
+            // a detached foreground flight.
+            PendingMetadataCommandDrainContext::recovery(
+                Some(command),
+                request_ops::MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+            ),
+        )
+    }
+
     #[cfg(test)]
     fn drain_pending_metadata_command_with_authorized_recovery_route(
         &self,
@@ -2175,7 +2209,7 @@ impl StorageCluster {
                         outcome.metric_label(),
                     );
                     let relinquished =
-                        leader.complete_with_outcome_and_relinquish_if_requested(outcome);
+                        self.complete_metadata_command_recovery_leader(leader, outcome);
                     if outcome.retains_pending_slot()
                         && admission_policy.requests_authorized_recovery_handoff()
                     {
@@ -2200,11 +2234,11 @@ impl StorageCluster {
                         metadata_command_irreversible_resolution(&error)
                             .expect("guard requires typed irreversible uncertainty"),
                     );
-                    leader.relinquish_for_authorized_recovery();
+                    self.relinquish_metadata_command_recovery_leader(leader);
                     return Err(ObjectPgActionError::MetadataCommandRecoveryTransferred);
                 }
                 Err(error) if leader.lineage_advanced_from(&command) => {
-                    leader.relinquish_for_authorized_recovery();
+                    self.relinquish_metadata_command_recovery_leader(leader);
                     return Err(error);
                 }
                 Err(error)
@@ -2213,7 +2247,7 @@ impl StorageCluster {
                             &error,
                         ) =>
                 {
-                    leader.relinquish_for_authorized_recovery();
+                    self.relinquish_metadata_command_recovery_leader(leader);
                     return Err(ObjectPgActionError::MetadataCommandRecoveryTransferred);
                 }
                 Err(error)
@@ -2223,7 +2257,7 @@ impl StorageCluster {
                             &error,
                         ) || metadata_command_irreversible_resolution(&error).is_some()) =>
                 {
-                    leader.relinquish_for_authorized_recovery();
+                    self.relinquish_metadata_command_recovery_leader(leader);
                     return Err(error);
                 }
                 Err(error) => return Err(error),
@@ -5661,7 +5695,7 @@ impl StorageCluster {
                             .is_err()
                         {
                             recovery_guard.mark_irreversible_handoff(resolution);
-                            recovery_guard.relinquish_for_authorized_recovery();
+                            self.relinquish_metadata_command_recovery_guard(recovery_guard);
                             continue 'direct_recovery;
                         }
                         apply = self
@@ -5681,14 +5715,14 @@ impl StorageCluster {
                         if request_ops::object_pg_action_error_is_retryable_command_observation(
                             &error,
                         ) {
-                            recovery_guard.relinquish_for_authorized_recovery();
+                            self.relinquish_metadata_command_recovery_guard(recovery_guard);
                             continue 'direct_recovery;
                         }
-                        recovery_guard.relinquish_for_authorized_recovery();
+                        self.relinquish_metadata_command_recovery_guard(recovery_guard);
                         return Err(error);
                     }
                     Err(error) if recovery_guard.lineage_advanced_from(&command) => {
-                        recovery_guard.relinquish_for_authorized_recovery();
+                        self.relinquish_metadata_command_recovery_guard(recovery_guard);
                         return Err(error);
                     }
                     Err(error) => return Err(error),
@@ -5708,7 +5742,7 @@ impl StorageCluster {
                         outcome.metric_label(),
                     );
                     if outcome.retains_pending_slot() {
-                        recovery_guard.relinquish_for_authorized_recovery();
+                        self.relinquish_metadata_command_recovery_guard(recovery_guard);
                     }
                     break command;
                 }

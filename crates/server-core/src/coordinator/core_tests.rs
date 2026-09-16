@@ -638,6 +638,7 @@ fn setup_coordinator_with_only_reclaim_worker(
         Some(test_sse_s3_provider()),
         (
             true,
+            false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
@@ -12466,6 +12467,7 @@ fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
             shard_repair: true,
             shard_backfill: true,
             stream_session: true,
+            pending_metadata_command_recovery: false,
         }
     );
 }
@@ -20132,6 +20134,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         Some(test_sse_s3_provider()),
         (
             false,
+            false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
@@ -20237,6 +20240,7 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
         Some(test_sse_s3_provider()),
         (
             false,
+            false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
@@ -20340,6 +20344,7 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
         None,
         Some(test_sse_s3_provider()),
         (
+            false,
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),

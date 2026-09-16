@@ -76,6 +76,11 @@ static SHARD_BACKFILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<Mutex<Vec<Weak<StorageStreamSessionSweeper>>>> =
     OnceLock::new();
+static PENDING_METADATA_COMMAND_RECOVERY_SWEEPER_REGISTRY: OnceLock<
+    Mutex<Vec<Weak<StoragePendingMetadataCommandRecoverySweeper>>>,
+> = OnceLock::new();
+
+const PENDING_METADATA_COMMAND_RECOVERY_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StorageMaintenanceClass {
@@ -1971,6 +1976,195 @@ impl Drop for StorageStreamSessionSweeper {
             .take()
         {
             let _ = handle.join();
+        }
+    }
+}
+
+/// Opaque storage-owned recovery worker for pending metadata commands in a
+/// static route map.
+///
+/// Dynamic route maps have a control-plane-authorized recovery worker. Static
+/// deployments have no control-plane refresh loop, so this worker supplies the
+/// corresponding trusted recovery owner after a foreground request transfers
+/// an already-published command out of request ownership.
+pub struct StoragePendingMetadataCommandRecoverySweeper {
+    storage_handle: StorageClusterRouteHandle,
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    wake_count: AtomicU64,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl StoragePendingMetadataCommandRecoverySweeper {
+    pub fn acquire_shared(
+        storage_handle: &StorageClusterRouteHandle,
+    ) -> Result<Arc<Self>, StorageMaintenanceStartError> {
+        if !storage_handle.current().has_static_route_authority() {
+            return Ok(Self::disabled(storage_handle.clone()));
+        }
+        let registry = PENDING_METADATA_COMMAND_RECOVERY_SWEEPER_REGISTRY
+            .get_or_init(|| Mutex::new(Vec::new()));
+        let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
+        registry.retain(|sweeper| sweeper.upgrade().is_some());
+
+        if let Some(existing) = registry.iter().filter_map(Weak::upgrade).find(|sweeper| {
+            sweeper
+                .storage_handle
+                .shares_route_admission_with(storage_handle)
+        }) {
+            return Ok(existing);
+        }
+
+        let sweeper = Self::spawn(storage_handle.clone())?;
+        registry.push(Arc::downgrade(&sweeper));
+        Ok(sweeper)
+    }
+
+    fn spawn(
+        storage_handle: StorageClusterRouteHandle,
+    ) -> Result<Arc<Self>, StorageMaintenanceStartError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let sweeper = Arc::new(Self {
+            storage_handle: storage_handle.clone(),
+            stop: Arc::clone(&stop),
+            wake: Arc::clone(&wake),
+            wake_count: AtomicU64::new(0),
+            handle: Mutex::new(None),
+        });
+        let handle = std::thread::Builder::new()
+            .name("argmin-pending-metadata-command-recovery".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    recover_static_pending_metadata_commands(&storage_handle);
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let requested = wake.0.lock().unwrap_or_else(|error| error.into_inner());
+                    let (mut requested, _) = wake
+                        .1
+                        .wait_timeout_while(
+                            requested,
+                            PENDING_METADATA_COMMAND_RECOVERY_SWEEP_INTERVAL,
+                            |requested| !*requested && !stop.load(Ordering::SeqCst),
+                        )
+                        .unwrap_or_else(|error| error.into_inner());
+                    *requested = false;
+                }
+            })
+            .map_err(|error| {
+                StorageMaintenanceStartError::worker_spawn(
+                    "pending metadata command recovery sweeper",
+                    error,
+                )
+            })?;
+        *sweeper
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(handle);
+        Ok(sweeper)
+    }
+
+    #[must_use]
+    pub fn disabled(storage_handle: StorageClusterRouteHandle) -> Arc<Self> {
+        Arc::new(Self {
+            storage_handle,
+            stop: Arc::new(AtomicBool::new(true)),
+            wake: Arc::new((Mutex::new(true), Condvar::new())),
+            wake_count: AtomicU64::new(0),
+            handle: Mutex::new(None),
+        })
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub(crate) fn test_is_enabled(&self) -> bool {
+        !self.stop.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub(crate) fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
+        Arc::ptr_eq(&self.storage_handle.current(), expected)
+    }
+
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) fn test_wake_count(&self) -> u64 {
+        self.wake_count.load(Ordering::SeqCst)
+    }
+
+    fn wake(&self) {
+        self.wake_count.fetch_add(1, Ordering::SeqCst);
+        *self
+            .wake
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.wake.1.notify_one();
+    }
+}
+
+impl Drop for StoragePendingMetadataCommandRecoverySweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        *self
+            .wake
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.wake.1.notify_all();
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+pub(crate) fn wake_pending_metadata_command_recovery_for(storage_cluster: &crate::StorageCluster) {
+    let Some(registry) = PENDING_METADATA_COMMAND_RECOVERY_SWEEPER_REGISTRY.get() else {
+        return;
+    };
+    let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
+    registry.retain(|sweeper| sweeper.upgrade().is_some());
+    for sweeper in registry.iter().filter_map(Weak::upgrade) {
+        let current = sweeper.storage_handle.current();
+        if std::ptr::eq(Arc::as_ptr(&current), storage_cluster) {
+            sweeper.wake();
+        }
+    }
+}
+
+fn recover_static_pending_metadata_commands(storage_handle: &StorageClusterRouteHandle) {
+    let cluster = storage_handle.current();
+    if !cluster.has_static_route_authority() {
+        return;
+    }
+    match cluster.drain_pending_metadata_commands_for_static_map() {
+        Ok(recovered) if recovered > 0 => {
+            let _ = observability::event(
+                TRACE_TARGET,
+                "static_pending_metadata_command_recovery",
+                Some(format_args!("recovered={recovered}")),
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let _ = observability::emit_flight_event(
+                TRACE_TARGET,
+                "static_pending_metadata_command_recovery_error",
+                format!("kind={}", error.diagnostic_cause_label()),
+            );
+            let _ = observability::event(
+                TRACE_TARGET,
+                "static_pending_metadata_command_recovery_error",
+                Some(format_args!("kind={}", error.diagnostic_cause_label())),
+            );
         }
     }
 }

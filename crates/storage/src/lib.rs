@@ -174,8 +174,9 @@ pub use live_pg_transfer::{
 };
 pub use maintenance::{
     StorageMaintenanceAdmission, StorageMaintenancePermit, StorageMaintenanceStartError,
-    StorageReclaimSweeper, StorageShardBackfillSweeper, StorageShardRepairSweeper,
-    StorageShardScavengerSweeper, StorageStreamSessionSweeper,
+    StoragePendingMetadataCommandRecoverySweeper, StorageReclaimSweeper,
+    StorageShardBackfillSweeper, StorageShardRepairSweeper, StorageShardScavengerSweeper,
+    StorageStreamSessionSweeper,
 };
 pub use metadata_transfer_staging_outbox::{
     StorageNodeMetadataTransferStagingOutbox, StorageNodeMetadataTransferStagingOutboxStatus,
@@ -1184,6 +1185,17 @@ pub mod test_support {
 
         fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool {
             StorageStreamSessionSweeper::test_routes_to(self, expected)
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl StorageMaintenanceSweeperTestSupport for StoragePendingMetadataCommandRecoverySweeper {
+        fn test_is_enabled(&self) -> bool {
+            StoragePendingMetadataCommandRecoverySweeper::test_is_enabled(self)
+        }
+
+        fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool {
+            StoragePendingMetadataCommandRecoverySweeper::test_routes_to(self, expected)
         }
     }
 

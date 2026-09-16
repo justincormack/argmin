@@ -2341,6 +2341,10 @@ impl PreparedStandaloneEmbeddedTopology {
 }
 
 impl StorageClusterRouteAuthority {
+    fn is_static(self) -> bool {
+        matches!(self, Self::Static(_))
+    }
+
     fn static_for(local_map: &LocalClusterMap) -> Result<Self, ClusterBuildError> {
         if local_map.route_map_validity() != RouteMapValidity::Forever {
             return Err(ClusterBuildError::StaticRouteAuthorityBoundedValidity);

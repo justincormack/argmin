@@ -5363,7 +5363,7 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
 }
 
 #[test]
-fn direct_put_retains_irreversible_handoff_until_authorized_recovery() {
+fn direct_put_irreversible_handoff_wakes_static_authorized_recovery() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -5382,6 +5382,12 @@ fn direct_put_retains_irreversible_handoff_until_authorized_recovery() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
+    let recovery_handle =
+        crate::StorageClusterRouteHandle::from_static_cluster(Arc::clone(&cluster)).unwrap();
+    let recovery_sweeper =
+        crate::StoragePendingMetadataCommandRecoverySweeper::acquire_shared(&recovery_handle)
+            .unwrap();
+    let wake_count_before_commit = recovery_sweeper.test_wake_count();
 
     let reservation_id = crate::tests::stream_session_id("route-shift");
     let generation_id = cluster
@@ -5448,8 +5454,34 @@ fn direct_put_retains_irreversible_handoff_until_authorized_recovery() {
         error,
         crate::ObjectPgActionError::Store(StoreError::MetadataCommandOutcomeUnconfirmed { .. })
     ));
-    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some());
-    assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 1);
+    assert!(
+        recovery_sweeper.test_wake_count() > wake_count_before_commit,
+        "direct PUT recovery handoff must wake the static recovery owner"
+    );
+    let recovery_deadline = Instant::now() + Duration::from_secs(2);
+    while pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some() {
+        assert!(
+            Instant::now() < recovery_deadline,
+            "woken static recovery owner did not converge the direct PUT"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 0);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        let live = stored
+            .as_live()
+            .expect("recovered direct PUT must publish a live object");
+        assert_eq!(live.generation_id, generation_id);
+        assert_eq!(live.size, payload.len() as u64);
+    }
+    assert_bucket_write_reservations_released(&map, &bucket);
 }
 
 #[test]

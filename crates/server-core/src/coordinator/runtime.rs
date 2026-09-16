@@ -38,6 +38,7 @@ pub(super) struct LifecycleSweeper {
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+pub(super) use storage::StoragePendingMetadataCommandRecoverySweeper as PendingMetadataCommandRecoverySweeper;
 pub(super) use storage::StorageReclaimSweeper as ReclaimSweeper;
 pub(super) use storage::StorageShardBackfillSweeper as ShardBackfillSweeper;
 pub(super) use storage::StorageShardRepairSweeper as ShardRepairSweeper;
@@ -160,6 +161,16 @@ pub(super) fn acquire_stream_session_sweeper(
     storage_handle: &StorageClusterRouteHandle,
 ) -> Result<Arc<StreamSessionSweeper>, ServerError> {
     StreamSessionSweeper::acquire_shared(storage_handle).map_err(|error| {
+        ServerError::InternalError {
+            reason: error.to_string(),
+        }
+    })
+}
+
+pub(super) fn acquire_pending_metadata_command_recovery_sweeper(
+    storage_handle: &StorageClusterRouteHandle,
+) -> Result<Arc<PendingMetadataCommandRecoverySweeper>, ServerError> {
+    PendingMetadataCommandRecoverySweeper::acquire_shared(storage_handle).map_err(|error| {
         ServerError::InternalError {
             reason: error.to_string(),
         }

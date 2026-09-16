@@ -114,6 +114,71 @@ fn repeated_runtime_map_failure_triggers_one_fallback_scan_per_outage() {
     refresh_loop.stop();
 }
 
+#[test]
+fn static_recovery_scan_continues_after_an_earlier_pg_fails() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &[NodeId::new(0)],
+            &[1, 2],
+            EcShape { k: 1, m: 0 },
+        )
+        .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let later_pg_id = PgId::new(2);
+    let bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        later_pg_id.get(),
+        "static-recovery-later-pg-",
+    );
+    let command = create_bucket_metadata_command(later_pg_id, 1, bucket.clone());
+    insert_pending_metadata_command_for_test(&map, later_pg_id, &bucket, &command);
+
+    let later_pg_attempted = Arc::new(AtomicBool::new(false));
+    let later_pg_attempted_for_hook = Arc::clone(&later_pg_attempted);
+    let error = cluster
+        .test_drain_pending_metadata_commands_for_static_map_with_attempt_hook(move |pg_id| {
+            if pg_id == PgId::new(1) {
+                return Err(ObjectPgActionError::Store(
+                    StoreError::RouteCapabilitySubjectMismatch {
+                        operation: "injected earlier PG recovery failure",
+                    },
+                ));
+            }
+            if pg_id == later_pg_id {
+                later_pg_attempted_for_hook.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "injected earlier PG recovery failure"
+        })
+    ));
+    assert!(
+        later_pg_attempted.load(Ordering::SeqCst),
+        "a failing earlier PG must not prevent later PG attempts"
+    );
+    assert!(pending_metadata_command_for_test(&map, later_pg_id, &bucket).is_none());
+    let state = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(later_pg_id.get())
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
+    assert_eq!(state.applied_log_index, 1);
+}
+
 impl<S: crate::control_plane::ControlPlaneStore> ControlPlaneRuntimeMapSource
     for UnrelatedFullMapFailureSource<S>
 {
