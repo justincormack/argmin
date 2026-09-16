@@ -453,17 +453,23 @@ fn opaque_object_segment_fault_rejects_a_replaced_null_generation_without_mutati
 
 fn retained_read_with_unavailable_lease_nodes(
     unavailable_node_ids: &[NodeId],
-) -> Result<Vec<u8>, crate::ObjectReadFailure> {
+) -> Result<RetainedReadTestOutcome, crate::ObjectReadFailure> {
     retained_read_with_unavailable_lease_nodes_and_failure(
         unavailable_node_ids,
         PayloadLeaseUnavailableFailure::Transport,
     )
 }
 
+#[derive(Debug)]
+struct RetainedReadTestOutcome {
+    bytes: Vec<u8>,
+    read_shard_indices: Vec<u8>,
+}
+
 fn retained_read_with_unavailable_lease_nodes_and_failure(
     unavailable_node_ids: &[NodeId],
     failure: PayloadLeaseUnavailableFailure,
-) -> Result<Vec<u8>, crate::ObjectReadFailure> {
+) -> Result<RetainedReadTestOutcome, crate::ObjectReadFailure> {
     let tmp = test_util::tempdir();
     let mut map = LocalClusterMap::open(
         tmp.path(),
@@ -529,12 +535,18 @@ fn retained_read_with_unavailable_lease_nodes_and_failure(
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
+    let read_shard_indices = Arc::new(Mutex::new(Vec::new()));
+    let observed_read_shard_indices = Arc::clone(&read_shard_indices);
     let _read_guard =
         cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |location, _| {
             assert!(
                 !unavailable.contains(&location.node_id()),
                 "retained read must not access an unleased shard location"
             );
+            observed_read_shard_indices
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(location.shard_index().get());
             Ok(())
         }));
     let mut bytes = Vec::new();
@@ -545,15 +557,36 @@ fn retained_read_with_unavailable_lease_nodes_and_failure(
         0,
         "retained read must release every successfully acquired node lease"
     );
-    Ok(bytes)
+    let read_shard_indices = read_shard_indices
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    Ok(RetainedReadTestOutcome {
+        bytes,
+        read_shard_indices,
+    })
+}
+
+#[test]
+fn retained_read_healthy_path_reads_only_the_data_shards() {
+    let outcome = retained_read_with_unavailable_lease_nodes(&[]).unwrap();
+    assert_eq!(
+        outcome.bytes,
+        b"retained EC read excludes every unleased shard location"
+    );
+    assert_eq!(
+        outcome.read_shard_indices,
+        (0..SharedStorageNode::DEFAULT_EC_SHAPE.k).collect::<Vec<_>>(),
+        "healthy retained reads must not materialize parity shards"
+    );
 }
 
 #[test]
 fn retained_read_reconstructs_from_exact_successfully_leased_node_subset() {
-    let bytes =
+    let outcome =
         retained_read_with_unavailable_lease_nodes(&[NodeId::new(0), NodeId::new(1)]).unwrap();
     assert_eq!(
-        bytes,
+        outcome.bytes,
         b"retained EC read excludes every unleased shard location"
     );
 }

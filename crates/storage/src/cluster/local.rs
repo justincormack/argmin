@@ -43,9 +43,9 @@ use crate::node_client::{
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
     PlacedShardRoute, RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
     RetainedObjectMutationMetadataNodeClient, RetainedObjectPayloadReclaimNodeClient,
-    RetainedObjectPayloadReclaimRoute, RetainedPlacedShardNodeClient, RetainedShardAckNodeClient,
-    ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
-    ShardScavengerObservationNodeClient, UnixStorageNodeClient,
+    RetainedObjectPayloadReclaimRoute, RetainedPlacedShardNodeClient, RetainedPlacedShardRoute,
+    RetainedShardAckNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
+    ShardScavengerNodeClient, ShardScavengerObservationNodeClient, UnixStorageNodeClient,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
@@ -6198,11 +6198,11 @@ impl LocalClusterMap {
         self.read_payload_shard(operation_epoch, location, key, expected)
     }
 
-    pub(crate) fn read_payload_shard_for_historical_inspection(
+    fn retained_payload_shard_route(
         &self,
         location: ShardLocation,
         key: &ShardKey,
-    ) -> Result<(Vec<u8>, WriteAck), ShardIoError> {
+    ) -> Result<Box<dyn RetainedPlacedShardRoute + '_>, ShardIoError> {
         if location.shard_index() != key.shard_index() {
             return Err(ShardIoError::ShardIndexMismatch {
                 node_id: location.node_id().as_u32(),
@@ -6261,17 +6261,30 @@ impl LocalClusterMap {
                 pg_id: location.data_pg_id().get(),
                 cluster_epoch: location.cluster_epoch(),
             })?;
-        let data = node
-            .retained_shard_client()
+        node.retained_shard_client()
             .open_retained_placed_shard_route(location, key)
-            .and_then(|route| route.read_placed_shard_for_historical_inspection())
+            .map_err(|source| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source,
+            })
+    }
+
+    pub(crate) fn read_payload_shard_for_historical_inspection(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+    ) -> Result<(Vec<u8>, WriteAck), ShardIoError> {
+        let (data, ack) = self
+            .retained_payload_shard_route(location, key)?
+            .read_placed_shard_for_historical_inspection()
             .map_err(|source| ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
                 pg_id: location.data_pg_id().get(),
                 cluster_epoch: location.cluster_epoch(),
                 source,
             })?;
-        let (data, ack) = data;
         if data.len() as u64 != ack.stored_size {
             return Err(ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
@@ -6296,6 +6309,47 @@ impl LocalClusterMap {
             });
         }
         Ok((data, ack))
+    }
+
+    pub(crate) fn read_payload_shard_for_historical_inspection_into(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        dst: &mut [u8],
+    ) -> Result<WriteAck, ShardIoError> {
+        let ack = self
+            .retained_payload_shard_route(location, key)?
+            .read_placed_shard_for_historical_inspection_into(dst)
+            .map_err(|source| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source,
+            })?;
+        if dst.len() as u64 != ack.stored_size {
+            return Err(ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source: StoreError::Io {
+                    context: "read payload shard size mismatch",
+                    source: std::io::Error::from(std::io::ErrorKind::InvalidData),
+                },
+            });
+        }
+        let actual = checksum::crc64::checksum(dst);
+        if actual != ack.crc64 {
+            return Err(ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source: StoreError::IntegrityError {
+                    expected: ack.crc64,
+                    actual,
+                },
+            });
+        }
+        Ok(ack)
     }
 
     #[cfg(test)]

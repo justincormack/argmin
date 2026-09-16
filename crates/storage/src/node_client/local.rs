@@ -548,6 +548,18 @@ impl RetainedPlacedShardRoute for LocalRetainedPlacedShardRoute {
         Ok((payload, ack))
     }
 
+    fn read_placed_shard_for_historical_inspection_into(
+        &self,
+        dst: &mut [u8],
+    ) -> Result<WriteAck, StoreError> {
+        self.storage_node
+            .read_shard_file_into(self.location.data_pg_id().get(), &self.key, dst)?;
+        Ok(WriteAck {
+            stored_size: dst.len() as u64,
+            crc64: checksum::crc64::checksum(dst),
+        })
+    }
+
     fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError> {
         self.storage_node
             .delete_shard_file(self.location.data_pg_id().get(), &self.key)

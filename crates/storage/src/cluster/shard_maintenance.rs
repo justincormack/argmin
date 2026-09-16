@@ -2401,9 +2401,22 @@ impl StorageCluster {
         let locations = self
             .place_payload_shards_for_pg_route_snapshot(route, data_pg, req.ec, &placement_key)
             .map_err(cluster_build_error_to_store)?;
+        let temporarily_unavailable =
+            match self.try_read_placed_segment_direct_for_pg_route_snapshot_into(
+                req,
+                &locations,
+                leased_node_ids,
+                shard_size,
+                dst,
+            )? {
+                PlacedSegmentDirectReadOutcome::Complete => return Ok(true),
+                PlacedSegmentDirectReadOutcome::Recover {
+                    temporarily_unavailable,
+                } => temporarily_unavailable,
+            };
         let mut all_shards = vec![None; total_shards];
         let mut present_count = 0usize;
-        let mut temporarily_unavailable = None;
+        let mut temporarily_unavailable = temporarily_unavailable;
 
         for shard_index in 0..total_shards {
             self.try_load_placed_segment_shard_for_historical_inspection(
@@ -2483,6 +2496,78 @@ impl StorageCluster {
             expected: req.segment_crc64,
             actual: initial_crc64,
         })
+    }
+
+    fn try_read_placed_segment_direct_for_pg_route_snapshot_into(
+        &self,
+        req: SegmentStoredBytesRequest,
+        locations: &[ShardLocation],
+        leased_node_ids: Option<&BTreeSet<NodeId>>,
+        shard_size: usize,
+        dst: &mut Vec<u8>,
+    ) -> Result<PlacedSegmentDirectReadOutcome, StoreError> {
+        let k = usize::from(req.ec.k);
+        let padded = shard_size * k;
+        dst.clear();
+        dst.resize(padded, 0);
+
+        for shard_index in 0..k {
+            let Some(location) = locations.get(shard_index).copied() else {
+                return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                    temporarily_unavailable: None,
+                });
+            };
+            if leased_node_ids.is_some_and(|node_ids| !node_ids.contains(&location.node_id())) {
+                return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                    temporarily_unavailable: None,
+                });
+            }
+            let shard_key = ShardKey::new(
+                &req.segment_okh,
+                req.segment_vid.get(),
+                shard_index as u8,
+            );
+            if let Err(error) =
+                self.maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
+            {
+                let temporarily_unavailable = match placed_segment_recoverable_shard_error(error)? {
+                    RecoverableShardReadFailure::RepairRequired => None,
+                    RecoverableShardReadFailure::TemporarilyUnavailable(error) => Some(error),
+                };
+                return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                    temporarily_unavailable,
+                });
+            }
+
+            let start = shard_index * shard_size;
+            let end = start + shard_size;
+            let read = self.read_payload_shard_for_historical_inspection_self_validating_into(
+                location,
+                &shard_key,
+                &mut dst[start..end],
+            );
+            if let Err(error) = read {
+                let temporarily_unavailable = match placed_segment_recoverable_shard_error(error)? {
+                    RecoverableShardReadFailure::RepairRequired => None,
+                    RecoverableShardReadFailure::TemporarilyUnavailable(error) => Some(error),
+                };
+                return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                    temporarily_unavailable,
+                });
+            }
+        }
+
+        dst.truncate(req.stored_size);
+        if checksum::crc64::checksum(dst) == req.segment_crc64 {
+            Ok(PlacedSegmentDirectReadOutcome::Complete)
+        } else {
+            // A checksum mismatch needs the full shard set so recovery can
+            // identify a corrupt data shard and substitute parity. Keep that
+            // exceptional path in the existing reconstruction machinery.
+            Ok(PlacedSegmentDirectReadOutcome::Recover {
+                temporarily_unavailable: None,
+            })
+        }
     }
 
     fn record_placed_segment_repair_target(

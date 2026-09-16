@@ -680,6 +680,14 @@ fn local_retained_placed_shard_route_is_bound_to_exact_placement() {
         route.read_placed_shard_for_historical_inspection().unwrap(),
         (bound_data.to_vec(), bound_ack)
     );
+    let mut direct = vec![0; bound_data.len()];
+    assert_eq!(
+        route
+            .read_placed_shard_for_historical_inspection_into(&mut direct)
+            .unwrap(),
+        bound_ack
+    );
+    assert_eq!(direct, bound_data);
     route.delete_placed_shard_for_historical_cleanup().unwrap();
     assert!(storage_node.read_shard_file(0, &bound_key).is_err());
     assert_eq!(

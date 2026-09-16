@@ -460,6 +460,16 @@ impl StorageCluster {
             .read_payload_shard_for_historical_inspection(location, key)
     }
 
+    fn read_payload_shard_for_historical_inspection_self_validating_into(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        dst: &mut [u8],
+    ) -> Result<WriteAck, ShardIoError> {
+        self.local_map
+            .read_payload_shard_for_historical_inspection_into(location, key, dst)
+    }
+
     fn read_payload_shard_for_historical_inspection(
         &self,
         location: ShardLocation,

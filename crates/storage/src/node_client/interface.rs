@@ -1256,6 +1256,21 @@ pub(crate) trait RetainedPlacedShardRoute: Send {
         &self,
     ) -> Result<(Vec<u8>, WriteAck), StoreError>;
 
+    fn read_placed_shard_for_historical_inspection_into(
+        &self,
+        dst: &mut [u8],
+    ) -> Result<WriteAck, StoreError> {
+        let (payload, ack) = self.read_placed_shard_for_historical_inspection()?;
+        if payload.len() != dst.len() {
+            return Err(StoreError::Io {
+                context: "read payload shard size mismatch",
+                source: std::io::Error::from(std::io::ErrorKind::InvalidData),
+            });
+        }
+        dst.copy_from_slice(&payload);
+        Ok(ack)
+    }
+
     fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError>;
 }
 
