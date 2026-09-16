@@ -1312,7 +1312,7 @@ fn stream_append_publish_validation_fails_closed_when_acknowledged_shard_file_is
 }
 
 #[test]
-fn stream_put_append_command_id_race_retries_recovery_owner_before_ack_publish() {
+fn stream_append_command_id_race_accepts_matching_applied_contender() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1400,21 +1400,6 @@ fn stream_put_append_command_id_race_retries_recovery_owner_before_ack_publish()
         );
         insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
     }));
-    let awaiting_once = Arc::new(AtomicBool::new(true));
-    let awaiting_once_for_hook = Arc::clone(&awaiting_once);
-    let _drain_guard = cluster.test_install_pending_object_metadata_command_drain_attempt_hook(
-        Arc::new(move |command, _work_budget| {
-            if matches!(
-                command.payload(),
-                MetadataCommandPayload::AppendStreamSegment(_)
-            ) && awaiting_once_for_hook.swap(false, Ordering::SeqCst)
-            {
-                return Err(crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery);
-            }
-            Ok(())
-        }),
-    );
-
     cluster
         .commit_stream_segment_append(
             &bucket,
@@ -1427,7 +1412,6 @@ fn stream_put_append_command_id_race_retries_recovery_owner_before_ack_publish()
         .unwrap();
 
     assert!(!hook_once.load(Ordering::SeqCst));
-    assert!(!awaiting_once.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     assert_clean_metadata_command_stream(&map, &[object_pg]);
     for node_id in node_ids {
@@ -1436,6 +1420,397 @@ fn stream_put_append_command_id_race_retries_recovery_owner_before_ack_publish()
         assert_eq!(
             crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
             vec![segment.clone()]
+        );
+    }
+}
+
+#[test]
+fn stream_append_abandoned_command_does_not_reuse_staged_payload() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("75".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"abandoned stream append payload";
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+
+    let matching_bucket = bucket.clone();
+    let matching_key = key.clone();
+    let apply_attempts = Arc::new(AtomicUsize::new(0));
+    let apply_attempts_for_hook = Arc::clone(&apply_attempts);
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = Arc::clone(&fail_once);
+    let _apply_guard =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            let MetadataCommandPayload::AppendStreamSegment(append) = command.payload() else {
+                return Ok(());
+            };
+            if append.bucket != matching_bucket || append.key != matching_key {
+                return Ok(());
+            }
+            apply_attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+            if fail_once_for_hook.swap(false, Ordering::SeqCst) {
+                return Err(StoreError::StaleMetadataOperation {
+                    pg_id: command.id().pg_id().get(),
+                    operation_epoch: command.id().cluster_epoch(),
+                    current_epoch: ClusterEpoch::new(command.id().cluster_epoch().get() + 1)
+                        .unwrap(),
+                });
+            }
+            Ok(())
+        }));
+
+    let error = cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .expect_err("an abandoned append must be retried from payload preparation");
+    assert!(
+        matches!(
+            error,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation { .. })
+        ),
+        "unexpected abandoned append error: {error:?}"
+    );
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert_eq!(
+        apply_attempts.load(Ordering::SeqCst),
+        1,
+        "the append commit must not reuse an abandoned command's staged payload"
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::list_stream_segments(&*pg, &session_id)
+                .unwrap()
+                .is_empty(),
+            "an abandoned append must not publish segment metadata"
+        );
+    }
+    let placement_key = segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
+    let locations = cluster
+        .place_payload_shards(
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
+            ec_shape,
+            &placement_key,
+        )
+        .unwrap();
+    for (location, written) in locations.iter().zip(&written_shards) {
+        assert!(
+            cluster
+                .read_payload_shard(*location, &written.key, written.ack)
+                .is_err(),
+            "abandoned staged shard {} must be deleted",
+            written.key
+        );
+    }
+}
+
+#[test]
+fn stream_append_command_id_race_authorized_abandonment_requires_payload_restart() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    let contender = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("76".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"authorized recovery abandoned stream append";
+    let (target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .register_payload_shard_acks(segment.data_pg_id, &shard_batch)
+        .unwrap();
+
+    let pg_id = PgId::new(object_pg);
+    let inserted_command = Arc::new(Mutex::new(None));
+    let inserted_command_for_hook = Arc::clone(&inserted_command);
+    let insert_map = Arc::clone(&map);
+    let insert_bucket = bucket.clone();
+    let insert_key = key.clone();
+    let insert_target = target.clone();
+    let insert_segment = segment.clone();
+    let insert_once = Arc::new(AtomicBool::new(true));
+    let insert_once_for_hook = Arc::clone(&insert_once);
+    let _command_id_hook =
+        cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
+            if !insert_once_for_hook.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let command = MetadataCommandEnvelope::new(
+                contender.next_object_metadata_command_id(pg_id).unwrap(),
+                MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+                    bucket: insert_bucket.clone(),
+                    key: insert_key.clone(),
+                    target: insert_target.clone(),
+                    segment: insert_segment.clone(),
+                })),
+            );
+            insert_pending_metadata_command_for_test(&insert_map, pg_id, &insert_bucket, &command);
+            *inserted_command_for_hook.lock().unwrap() = Some(command);
+        }));
+
+    let abandon_once = Arc::new(AtomicBool::new(true));
+    let abandon_once_for_hook = Arc::clone(&abandon_once);
+    let abandon_cluster = Arc::clone(&cluster);
+    let abandon_bucket = bucket.clone();
+    let abandon_key = key.clone();
+    let _drain_hook = cluster.test_install_pending_object_metadata_command_drain_attempt_hook(
+        Arc::new(move |candidate, _work_budget| {
+            if matches!(
+                candidate.payload(),
+                MetadataCommandPayload::AppendStreamSegment(append)
+                    if append.bucket == abandon_bucket && append.key == abandon_key
+            ) && abandon_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                abandon_cluster
+                    .test_record_abandoned_metadata_command_to_acting_set_until(
+                        candidate,
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .unwrap();
+            }
+            Ok(())
+        }),
+    );
+    let defer_terminal_cleanup_once = Arc::new(AtomicBool::new(true));
+    let defer_terminal_cleanup_once_for_hook = Arc::clone(&defer_terminal_cleanup_once);
+    let terminal_bucket = bucket.clone();
+    let terminal_key = key.clone();
+    let _terminal_cleanup_hook = cluster
+        .test_install_global_metadata_command_terminal_slot_removal_hook(Arc::new(
+            move |candidate| {
+                matches!(
+                    candidate.payload(),
+                    MetadataCommandPayload::AppendStreamSegment(append)
+                        if append.bucket == terminal_bucket && append.key == terminal_key
+                ) && defer_terminal_cleanup_once_for_hook.swap(false, Ordering::SeqCst)
+            },
+        ));
+    let apply_attempts = Arc::new(AtomicUsize::new(0));
+    let apply_attempts_for_hook = Arc::clone(&apply_attempts);
+    let matching_bucket = bucket.clone();
+    let matching_key = key.clone();
+    let _apply_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if matches!(
+                candidate.payload(),
+                MetadataCommandPayload::AppendStreamSegment(append)
+                    if append.bucket == matching_bucket && append.key == matching_key
+            ) {
+                apply_attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }));
+
+    let error = thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let commit_cluster = Arc::clone(&cluster);
+        let commit_bucket = bucket.clone();
+        let commit_key = key.clone();
+        let commit_session = session_id.clone();
+        let commit_segment = segment.clone();
+        let commit_written = written_shards.clone();
+        scope.spawn(move || {
+            let commit_batch = commit_written
+                .iter()
+                .map(|written| (&written.key, written.ack))
+                .collect::<Vec<_>>();
+            result_tx
+                .send(commit_cluster.commit_stream_segment_append(
+                    &commit_bucket,
+                    &commit_key,
+                    &commit_session,
+                    commit_segment.segment_index,
+                    &commit_segment,
+                    &commit_batch,
+                ))
+                .unwrap();
+        });
+
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        let command = loop {
+            if let Some(command) = inserted_command.lock().unwrap().clone() {
+                break command;
+            }
+            assert!(
+                Instant::now() < handoff_deadline,
+                "matching append was not inserted in the command-ID race window"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        while !cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "stream append did not relinquish abandoned cleanup to authorized recovery"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let recovery_source = map
+            .runtime_state()
+            .metadata_command_recovery_handoff_source(pg_id, &command)
+            .expect("authorized recovery handoff must retain its lineage root");
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_source(
+                    pg_id,
+                    &command,
+                    &recovery_source,
+                    cluster.as_ref(),
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Abandoned
+        );
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream append did not return after authorized abandonment")
+            .expect_err("authorized abandonment must require a caller-level payload restart")
+    });
+
+    assert!(
+        matches!(
+            &error,
+            crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                context: "stream append install contender was abandoned by authorized recovery"
+            })
+        ),
+        "unexpected authorized-abandonment error: {error:?}"
+    );
+    assert!(!insert_once.load(Ordering::SeqCst));
+    assert!(!abandon_once.load(Ordering::SeqCst));
+    assert!(!defer_terminal_cleanup_once.load(Ordering::SeqCst));
+    assert_eq!(
+        apply_attempts.load(Ordering::SeqCst),
+        0,
+        "the foreground append must not reinstall with acknowledgements from abandoned shards"
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::list_stream_segments(&*pg, &session_id)
+                .unwrap()
+                .is_empty(),
+            "authorized abandonment must not publish segment metadata"
+        );
+    }
+    let placement_key = segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
+    let locations = cluster
+        .place_payload_shards(
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
+            ec_shape,
+            &placement_key,
+        )
+        .unwrap();
+    for (location, written) in locations.iter().zip(&written_shards) {
+        assert!(
+            cluster
+                .read_payload_shard(*location, &written.key, written.ack)
+                .is_err(),
+            "authorized abandonment must delete staged shard {}",
+            written.key
         );
     }
 }
@@ -1694,7 +2069,7 @@ fn stream_append_yields_after_one_pending_drain_before_budget_recheck() {
 }
 
 #[test]
-fn stream_append_budget_exhaustion_after_competing_publish_preserves_payload() {
+fn stream_append_matching_competing_publish_succeeds_without_payload_cleanup() {
     let _cleanup_serial = lock_payload_cleanup_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1792,7 +2167,7 @@ fn stream_append_budget_exhaustion_after_competing_publish_preserves_payload() {
             Ok(())
         }));
 
-    let error = cluster
+    cluster
         .test_commit_stream_segment_append_with_max_attempts(
             StreamAppendCommitRequest {
                 bucket: &bucket,
@@ -1804,21 +2179,12 @@ fn stream_append_budget_exhaustion_after_competing_publish_preserves_payload() {
             },
             1,
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
-                context: "stream append pending retry budget exhausted"
-            })
-        ),
-        "expected deterministic post-drain budget exhaustion, got {error:?}"
-    );
+        .expect("a matching published contender is the successful append outcome");
     assert!(!hook_once.load(Ordering::SeqCst));
     assert_eq!(
         cleanup_attempts.load(Ordering::SeqCst),
         0,
-        "the timed-out caller must not delete payload adopted by the competing command"
+        "the caller must not delete payload adopted by the matching command"
     );
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     assert_clean_metadata_command_stream(&map, &[object_pg]);

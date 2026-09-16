@@ -325,7 +325,14 @@ enum MatchingOutcomeRetryInstallOutcome {
 #[must_use = "apply-validated contention outcomes must restart publication deliberately"]
 enum ApplyValidatedFreshInstallOutcome {
     Installed(Box<MetadataCommandEnvelope>),
-    PendingContenderDrained,
+    ContenderDrained {
+        command: Box<MetadataCommandEnvelope>,
+        outcome: PendingMetadataCommandOutcome,
+    },
+    ContenderAwaitingRecovery {
+        command: Box<MetadataCommandEnvelope>,
+        error: ObjectPgActionError,
+    },
     LogConflictHandled,
 }
 
@@ -339,7 +346,9 @@ enum ApplyValidatedPendingInstallOutcome {
 enum ObjectPgPendingCommandInstall {
     Installed(MetadataCommandEnvelope),
     Pending(MetadataCommandEnvelope),
-    LogConflict { pending_visible: bool },
+    LogConflict {
+        pending: Option<MetadataCommandEnvelope>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,15 +359,15 @@ enum BucketWriteReservationDisposition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamAppendCommandApplyOutcome {
-    Applied,
-    RetryFromFreshSnapshot,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamAppendPayloadCleanup {
     EagerAllowed,
     ReferenceCheckRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamAppendRecoveryOutcome {
+    Applied,
+    Abandoned,
 }
 
 struct StreamAppendCommitRequest<'a> {

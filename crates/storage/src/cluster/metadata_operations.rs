@@ -4563,9 +4563,7 @@ impl StorageCluster {
             Ok(command_id) => command_id,
             Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
                 return Ok(ObjectPgPendingCommandInstall::LogConflict {
-                    pending_visible: self
-                        .pending_metadata_command_for_bucket(pg_id, bucket)?
-                        .is_some(),
+                    pending: self.pending_metadata_command_for_bucket(pg_id, bucket)?,
                 });
             }
             Err(error) => return Err(error),
@@ -4588,51 +4586,11 @@ impl StorageCluster {
             }
             Err(StoreError::MetadataCommandLogConflict { .. }) => {
                 Ok(ObjectPgPendingCommandInstall::LogConflict {
-                    pending_visible: self
-                        .pending_metadata_command_for_bucket(pg_id, bucket)?
-                        .is_some(),
+                    pending: self.pending_metadata_command_for_bucket(pg_id, bucket)?,
                 })
             }
             Err(error) => Err(error.into()),
         }
-    }
-
-    fn drain_after_object_pg_log_conflict(
-        &self,
-        publisher: impl crate::metadata_command::MetadataCommandPublisher,
-        pg_id: PgId,
-        bucket: &BucketName,
-        pending_visible: bool,
-    ) -> Result<(), ObjectPgActionError> {
-        let mut work_budget = RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
-            .for_operation("object_pg_log_conflict_drain")
-            .for_pg(pg_id);
-        self.drain_after_object_pg_log_conflict_with_work_budget(
-            publisher,
-            pg_id,
-            bucket,
-            pending_visible,
-            &mut work_budget,
-        )
-    }
-
-    fn drain_after_object_pg_log_conflict_with_work_budget(
-        &self,
-        publisher: impl crate::metadata_command::MetadataCommandPublisher,
-        pg_id: PgId,
-        bucket: &BucketName,
-        pending_visible: bool,
-        work_budget: &mut RequestWorkBudget,
-    ) -> Result<(), ObjectPgActionError> {
-        if pending_visible {
-            self.drain_one_pending_object_metadata_command_with_work_budget(
-                publisher,
-                pg_id,
-                bucket,
-                work_budget,
-            )?;
-        }
-        Ok(())
     }
 
     fn install_snapshot_sensitive_metadata_command_or_drain(
@@ -4884,11 +4842,8 @@ impl StorageCluster {
                 command,
                 AllocatorCleanupFreshInstallOutcome::PendingContenderDrained,
             ),
-            ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
-                if !pending_visible {
-                    return Ok(AllocatorCleanupFreshInstallOutcome::LogConflictHandled);
-                }
-                let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
+            ObjectPgPendingCommandInstall::LogConflict { pending } => {
+                let Some(command) = pending else {
                     return Ok(AllocatorCleanupFreshInstallOutcome::LogConflictHandled);
                 };
                 (
@@ -5014,24 +4969,37 @@ impl StorageCluster {
         effect_fence: Option<AdmittedRouteEffectFence>,
         build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
     ) -> Result<ApplyValidatedFreshInstallOutcome, ObjectPgActionError> {
-        match self.try_install_object_pg_pending_command_with_fresh_id(
+        let command = match self.try_install_object_pg_pending_command_with_fresh_id(
             pg_id,
             bucket,
             completion_admission,
             effect_fence,
             build_command,
         )? {
-            ObjectPgPendingCommandInstall::Installed(command) => Ok(
-                ApplyValidatedFreshInstallOutcome::Installed(Box::new(command)),
-            ),
-            ObjectPgPendingCommandInstall::Pending(command) => {
-                self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
-                Ok(ApplyValidatedFreshInstallOutcome::PendingContenderDrained)
+            ObjectPgPendingCommandInstall::Installed(command) => {
+                return Ok(ApplyValidatedFreshInstallOutcome::Installed(Box::new(command)));
             }
-            ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
-                self.drain_after_object_pg_log_conflict(publisher, pg_id, bucket, pending_visible)?;
-                Ok(ApplyValidatedFreshInstallOutcome::LogConflictHandled)
+            ObjectPgPendingCommandInstall::Pending(command) => command,
+            ObjectPgPendingCommandInstall::LogConflict { pending } => {
+                let Some(command) = pending else {
+                    return Ok(ApplyValidatedFreshInstallOutcome::LogConflictHandled);
+                };
+                command
             }
+        };
+        match self.drain_pending_object_metadata_command_outcome(publisher, pg_id, &command) {
+            Ok(outcome) => Ok(ApplyValidatedFreshInstallOutcome::ContenderDrained {
+                command: Box::new(command),
+                outcome,
+            }),
+            Err(error @ ObjectPgActionError::MetadataCommandRecoveryTransferred)
+            | Err(error @ ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery) => {
+                Ok(ApplyValidatedFreshInstallOutcome::ContenderAwaitingRecovery {
+                    command: Box::new(command),
+                    error,
+                })
+            }
+            Err(error) => Err(error),
         }
     }
 

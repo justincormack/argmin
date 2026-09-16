@@ -1571,6 +1571,16 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
+        self.drain_pending_object_metadata_command_outcome(publisher, pg_id, command)
+            .map(|_| ())
+    }
+
+    fn drain_pending_object_metadata_command_outcome(
+        &self,
+        publisher: impl crate::metadata_command::MetadataCommandPublisher,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         let mut work_budget = RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
             .for_operation("metadata_command_publisher_drain")
             .for_pg(pg_id);
@@ -1580,7 +1590,6 @@ impl StorageCluster {
             command,
             &mut work_budget,
         )
-        .map(|_| ())
     }
 
     fn drain_pending_object_metadata_command_with_work_budget(
@@ -2680,6 +2689,20 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         work_budget: &mut RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
+        self.wait_for_metadata_command_recovery_resolution_with_work_budget(
+            pg_id,
+            command,
+            work_budget,
+        )
+        .map(|_| ())
+    }
+
+    fn wait_for_metadata_command_recovery_resolution_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<MetadataCommandRecoveryWaiterOutcome, ObjectPgActionError> {
         loop {
             work_budget
                 .check("transferred metadata command recovery wait budget exhausted")
@@ -2721,7 +2744,9 @@ impl StorageCluster {
                 }
                 MetadataCommandRecoveryWaiterOutcome::Applied
                 | MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
-                | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => return Ok(()),
+                | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
+                    return Ok(outcome);
+                }
             }
         }
     }
@@ -4039,7 +4064,7 @@ impl StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         work_budget: &mut RequestWorkBudget,
-    ) -> Result<StreamAppendCommandApplyOutcome, ObjectPgActionError> {
+    ) -> Result<(), ObjectPgActionError> {
         match self.apply_new_object_metadata_command_for_bucket_or_reinspect(
             pg_id,
             bucket,
@@ -4049,12 +4074,56 @@ impl StorageCluster {
             request_ops::NewObjectMetadataCommandApplyOutcome::Applied
             | request_ops::NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
             | request_ops::NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => {
-                Ok(StreamAppendCommandApplyOutcome::Applied)
+                Ok(())
             }
-            request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(_) => {
-                Ok(StreamAppendCommandApplyOutcome::RetryFromFreshSnapshot)
+            // Reinspection is safe only after this command was proven
+            // unapplied and abandoned. That abandonment makes its staged
+            // payload eligible for authorized recovery cleanup, so this
+            // commit cannot reuse the original shard acknowledgements. The
+            // caller must restart append preparation and payload writes.
+            request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(error)
+            | request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
+        }
+    }
+
+    fn stream_append_command_matches_request(
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        target: &StreamUploadTarget,
+        segment_record: &StreamUploadSegmentRecord,
+    ) -> bool {
+        matches!(
+            command.payload(),
+            MetadataCommandPayload::AppendStreamSegment(append)
+                if append.bucket == *bucket
+                    && append.key == *key
+                    && append.target == *target
+                    && append.segment == *segment_record
+        )
+    }
+
+    fn wait_for_stream_append_recovery_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<StreamAppendRecoveryOutcome, ObjectPgActionError> {
+        match self.wait_for_metadata_command_recovery_resolution_with_work_budget(
+            pg_id,
+            command,
+            work_budget,
+        )? {
+            MetadataCommandRecoveryWaiterOutcome::Applied => {
+                Ok(StreamAppendRecoveryOutcome::Applied)
             }
-            request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
+            MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+            | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
+                Ok(StreamAppendRecoveryOutcome::Abandoned)
+            }
+            MetadataCommandRecoveryWaiterOutcome::StillPending => {
+                unreachable!("recovery resolution wait cannot return a pending outcome")
+            }
         }
     }
 
@@ -6884,8 +6953,54 @@ impl StorageCluster {
                 // shard keys. Any later cleanup must first resolve whether the
                 // payload is now referenced.
                 payload_cleanup = StreamAppendPayloadCleanup::ReferenceCheckRequired;
-                match self.drain_pending_object_metadata_command(publisher, pg_id, &command) {
+                let matching_append = Self::stream_append_command_matches_request(
+                    &command,
+                    bucket,
+                    key,
+                    target,
+                    segment_record,
+                );
+                match self.drain_pending_object_metadata_command_outcome(
+                    publisher, pg_id, &command,
+                ) {
+                    Ok(outcome) if matching_append && outcome.is_logically_applied() => {
+                        return Ok(());
+                    }
+                    Ok(
+                        PendingMetadataCommandOutcome::Abandoned
+                        | PendingMetadataCommandOutcome::TerminalCleanupPending {
+                            applied: false,
+                        },
+                    ) if matching_append => {
+                        cleanup_stream_append_payload!();
+                        return Err(conflicting_pending_object_metadata_command(
+                            "stream append command was abandoned by recovery",
+                        ));
+                    }
                     Ok(_) => {}
+                    Err(
+                        ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+                        | ObjectPgActionError::MetadataCommandRecoveryTransferred,
+                    ) if matching_append =>
+                    {
+                        match self.wait_for_stream_append_recovery_with_work_budget(
+                            pg_id,
+                            &command,
+                            &mut work_budget,
+                        ) {
+                            Ok(StreamAppendRecoveryOutcome::Applied) => return Ok(()),
+                            Ok(StreamAppendRecoveryOutcome::Abandoned) => {
+                                cleanup_stream_append_payload!();
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "stream append command was abandoned by authorized recovery",
+                                ));
+                            }
+                            Err(error) => {
+                                cleanup_stream_append_payload!();
+                                return Err(error);
+                            }
+                        }
+                    }
                     Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery) => {
                         if let Err(error) = work_budget.sleep_after_contention(
                             "stream append pending recovery retry budget exhausted",
@@ -6982,7 +7097,33 @@ impl StorageCluster {
                 },
             ) {
                 Ok(ApplyValidatedFreshInstallOutcome::Installed(command)) => *command,
-                Ok(ApplyValidatedFreshInstallOutcome::PendingContenderDrained) => {
+                Ok(ApplyValidatedFreshInstallOutcome::ContenderDrained {
+                    command,
+                    outcome,
+                }) => {
+                    if Self::stream_append_command_matches_request(
+                        &command,
+                        bucket,
+                        key,
+                        target,
+                        segment_record,
+                    ) {
+                        if outcome.is_logically_applied() {
+                            return Ok(());
+                        }
+                        if matches!(
+                            outcome,
+                            PendingMetadataCommandOutcome::Abandoned
+                                | PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                    applied: false
+                                }
+                        ) {
+                            cleanup_stream_append_payload!();
+                            return Err(conflicting_pending_object_metadata_command(
+                                "stream append install contender was abandoned by recovery",
+                            ));
+                        }
+                    }
                     if let Err(error) = work_budget
                         .sleep_after_contention("stream append pending retry budget exhausted")
                     {
@@ -6990,6 +7131,50 @@ impl StorageCluster {
                         return Err(ObjectPgActionError::Store(error));
                     }
                     continue;
+                }
+                Ok(ApplyValidatedFreshInstallOutcome::ContenderAwaitingRecovery {
+                    command,
+                    error,
+                }) => {
+                    if Self::stream_append_command_matches_request(
+                        &command,
+                        bucket,
+                        key,
+                        target,
+                        segment_record,
+                    ) {
+                        match self.wait_for_stream_append_recovery_with_work_budget(
+                            pg_id,
+                            &command,
+                            &mut work_budget,
+                        ) {
+                            Ok(StreamAppendRecoveryOutcome::Applied) => return Ok(()),
+                            Ok(StreamAppendRecoveryOutcome::Abandoned) => {
+                                cleanup_stream_append_payload!();
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "stream append install contender was abandoned by authorized recovery",
+                                ));
+                            }
+                            Err(error) => {
+                                cleanup_stream_append_payload!();
+                                return Err(error);
+                            }
+                        }
+                    }
+                    if matches!(
+                        error,
+                        ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+                    ) {
+                        if let Err(error) = work_budget.sleep_after_contention(
+                            "stream append install pending recovery retry budget exhausted",
+                        ) {
+                            cleanup_stream_append_payload!();
+                            return Err(ObjectPgActionError::Store(error));
+                        }
+                        continue;
+                    }
+                    cleanup_stream_append_payload!();
+                    return Err(error);
                 }
                 Ok(ApplyValidatedFreshInstallOutcome::LogConflictHandled) => {
                     if let Err(error) = work_budget
@@ -7000,52 +7185,43 @@ impl StorageCluster {
                     }
                     continue;
                 }
-                Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery) => {
-                    if let Err(error) = work_budget.sleep_after_contention(
-                        "stream append install pending recovery retry budget exhausted",
-                    ) {
-                        cleanup_stream_append_payload!();
-                        return Err(ObjectPgActionError::Store(error));
-                    }
-                    continue;
-                }
                 Err(error) => {
                     cleanup_stream_append_payload!();
                     return Err(error);
                 }
             };
-            let apply_outcome = match self.apply_new_stream_append_command(
+            match self.apply_new_stream_append_command(
                 pg_id,
                 bucket,
                 &command,
                 &mut work_budget,
             ) {
-                Ok(outcome) => outcome,
-                Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery) => {
-                    if let Err(error) = work_budget.sleep_after_contention(
-                        "stream append apply pending recovery retry budget exhausted",
+                Ok(()) => return Ok(()),
+                Err(
+                    ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+                    | ObjectPgActionError::MetadataCommandRecoveryTransferred,
+                ) => {
+                    match self.wait_for_stream_append_recovery_with_work_budget(
+                        pg_id,
+                        &command,
+                        &mut work_budget,
                     ) {
-                        cleanup_stream_append_payload!();
-                        return Err(ObjectPgActionError::Store(error));
+                        Ok(StreamAppendRecoveryOutcome::Applied) => return Ok(()),
+                        Ok(StreamAppendRecoveryOutcome::Abandoned) => {
+                            cleanup_stream_append_payload!();
+                            return Err(conflicting_pending_object_metadata_command(
+                                "stream append command was abandoned by authorized recovery",
+                            ));
+                        }
+                        Err(error) => {
+                            cleanup_stream_append_payload!();
+                            return Err(error);
+                        }
                     }
-                    continue;
                 }
                 Err(error) => {
                     cleanup_stream_append_payload!();
                     return Err(error);
-                }
-            };
-            match apply_outcome {
-                StreamAppendCommandApplyOutcome::Applied => return Ok(()),
-                StreamAppendCommandApplyOutcome::RetryFromFreshSnapshot => {
-                    payload_cleanup = StreamAppendPayloadCleanup::ReferenceCheckRequired;
-                    if let Err(error) = work_budget.sleep_after_contention(
-                        "stream append fresh snapshot retry budget exhausted",
-                    ) {
-                        cleanup_stream_append_payload!();
-                        return Err(ObjectPgActionError::Store(error));
-                    }
-                    continue;
                 }
             }
         }
