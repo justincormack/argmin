@@ -134,10 +134,6 @@ impl PayloadBufferPool {
 }
 
 impl PooledPayloadBuffer {
-    pub(super) fn resize_zeroed(&mut self, len: usize) {
-        self.buf.as_mut().unwrap().resize(len, 0);
-    }
-
     pub(super) fn into_shared(mut self) -> Arc<SharedPayloadBuffer> {
         Arc::new(SharedPayloadBuffer {
             pool: Some(Arc::clone(&self.pool)),

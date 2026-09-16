@@ -22,8 +22,8 @@ use super::TRACE_TARGET;
 use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS};
 use crate::error::ServerError;
 use crate::sse::{
-    decrypt_managed_encryption_segment, decrypt_sse_customer_segment, SseCustomerRequest,
-    SseCustomerSegmentScope,
+    decrypt_managed_encryption_segment_in_place, decrypt_sse_customer_segment_in_place,
+    SseCustomerRequest, SseCustomerSegmentScope,
 };
 
 static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<
@@ -1077,26 +1077,24 @@ impl ReadRuntime {
                 }
             };
         read_result.map_err(super::map_object_read_failure)?;
-        if matches!(segment.encryption, ObjectEncryption::None) {
-            Ok(buf.into_shared())
-        } else {
-            let plaintext =
-                self.decrypt_segment_if_needed(segment, part_number, sse_customer_request, &buf)?;
-            buf.resize_zeroed(0);
-            buf.extend_from_slice(&plaintext);
-            Ok(buf.into_shared())
-        }
+        self.decrypt_segment_if_needed_in_place(
+            segment,
+            part_number,
+            sse_customer_request,
+            &mut buf,
+        )?;
+        Ok(buf.into_shared())
     }
 
-    fn decrypt_segment_if_needed(
+    fn decrypt_segment_if_needed_in_place(
         &self,
         segment: &SegmentPayloadRecord,
         part_number: Option<u32>,
         sse_customer_request: Option<&SseCustomerRequest>,
-        stored_bytes: &[u8],
-    ) -> Result<Vec<u8>, ServerError> {
+        stored_bytes: &mut Vec<u8>,
+    ) -> Result<(), ServerError> {
         match &segment.encryption {
-            ObjectEncryption::None => Ok(stored_bytes.to_vec()),
+            ObjectEncryption::None => Ok(()),
             ObjectEncryption::SseCustomer(state) => {
                 let request = sse_customer_request.ok_or(ServerError::InvalidRequest {
                     reason: "SSE-C headers are required for this object".to_string(),
@@ -1111,7 +1109,7 @@ impl ReadRuntime {
                     .map_or(Ok(SseCustomerSegmentScope::object()), |p| {
                         SseCustomerSegmentScope::multipart_part(p)
                     })?;
-                decrypt_sse_customer_segment(
+                decrypt_sse_customer_segment_in_place(
                     validator,
                     state,
                     request,
@@ -1132,7 +1130,7 @@ impl ReadRuntime {
                     .map_or(Ok(SseCustomerSegmentScope::object()), |p| {
                         SseCustomerSegmentScope::multipart_part(p)
                     })?;
-                decrypt_managed_encryption_segment(
+                decrypt_managed_encryption_segment_in_place(
                     provider,
                     state,
                     segment_scope,

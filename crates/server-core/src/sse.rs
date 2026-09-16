@@ -661,14 +661,14 @@ pub(crate) fn resume_managed_encryption_write(
     })
 }
 
-pub(crate) fn decrypt_managed_encryption_segment(
+pub(crate) fn decrypt_managed_encryption_segment_in_place(
     provider: &impl ManagedKeyProvider,
     state: &SseS3ObjectState,
     segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
-    ciphertext: &[u8],
+    ciphertext: &mut Vec<u8>,
     plaintext_len: usize,
-) -> Result<Vec<u8>, ServerError> {
+) -> Result<(), ServerError> {
     let wrapping_key =
         provider
             .lookup_key(state.wrapping_key_id())
@@ -682,7 +682,7 @@ pub(crate) fn decrypt_managed_encryption_segment(
         MANAGED_WRAP_AAD,
         MANAGED_ENCRYPTION_LABEL,
     )?;
-    decrypt_segment_with_dek_and_prefix(
+    decrypt_segment_with_dek_and_prefix_in_place(
         &dek,
         state.segment_nonce_prefix(),
         segment_scope,
@@ -749,15 +749,15 @@ fn sse_customer_validator_key_unavailable() -> ServerError {
     }
 }
 
-pub(crate) fn decrypt_sse_customer_segment(
+pub(crate) fn decrypt_sse_customer_segment_in_place(
     validator: &SseCustomerValidatorConfig,
     state: &SseCustomerObjectState,
     request: &SseCustomerRequest,
     segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
-    ciphertext: &[u8],
+    ciphertext: &mut Vec<u8>,
     plaintext_len: usize,
-) -> Result<Vec<u8>, ServerError> {
+) -> Result<(), ServerError> {
     validate_sse_customer_read(validator, state, request)?;
     let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
     let dek = unwrap_managed_dek(
@@ -767,7 +767,7 @@ pub(crate) fn decrypt_sse_customer_segment(
         SSE_C_WRAP_AAD,
         "SSE-C",
     )?;
-    decrypt_segment_with_dek_and_prefix(
+    decrypt_segment_with_dek_and_prefix_in_place(
         &dek,
         state.segment_nonce_prefix(),
         segment_scope,
@@ -918,39 +918,38 @@ fn encrypt_segment_with_dek_and_prefix(
     Ok(buf)
 }
 
-fn decrypt_segment_with_dek_and_prefix(
+fn decrypt_segment_with_dek_and_prefix_in_place(
     dek: &[u8; SSE_C_DEK_LEN],
     segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
     segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
-    ciphertext: &[u8],
+    ciphertext: &mut Vec<u8>,
     plaintext_len: usize,
     descriptor: AeadDescriptor<'_>,
-) -> Result<Vec<u8>, ServerError> {
+) -> Result<(), ServerError> {
     let opening_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
         reason: format!("failed to create {} segment opening key", descriptor.label),
     })?;
-    let mut buf = ciphertext.to_vec();
-    let plaintext = opening_key
+    let actual_plaintext_len = opening_key
         .open_in_place(
             segment_nonce(segment_nonce_prefix, segment_scope, segment_index),
             descriptor.aad,
-            &mut buf,
+            ciphertext,
         )
         .map_err(|_| ServerError::InternalError {
             reason: format!("failed to decrypt {} segment", descriptor.label),
-        })?;
-    if plaintext.len() != plaintext_len {
+        })?
+        .len();
+    if actual_plaintext_len != plaintext_len {
         return Err(ServerError::InternalError {
             reason: format!(
                 "decrypted {} segment length {} did not match expected {}",
-                descriptor.label,
-                plaintext.len(),
-                plaintext_len
+                descriptor.label, actual_plaintext_len, plaintext_len
             ),
         });
     }
-    Ok(plaintext.to_vec())
+    ciphertext.truncate(plaintext_len);
+    Ok(())
 }
 
 fn segment_nonce(
@@ -1355,18 +1354,22 @@ mod tests {
         let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
             panic!("expected SSE-C object state");
         };
-        let ciphertext = ctx.encrypt_segment(3, b"hello world").unwrap();
-        let plaintext = decrypt_sse_customer_segment(
+        let mut ciphertext = ctx.encrypt_segment(3, b"hello world").unwrap();
+        let allocation = ciphertext.as_ptr();
+        let capacity = ciphertext.capacity();
+        decrypt_sse_customer_segment_in_place(
             &validator,
             state,
             &req,
             SseCustomerSegmentScope::object(),
             3,
-            &ciphertext,
+            &mut ciphertext,
             11,
         )
         .unwrap();
-        assert_eq!(plaintext, b"hello world");
+        assert_eq!(ciphertext, b"hello world");
+        assert_eq!(ciphertext.as_ptr(), allocation);
+        assert_eq!(ciphertext.capacity(), capacity);
     }
 
     #[test]
@@ -1377,15 +1380,15 @@ mod tests {
         let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
             panic!("expected SSE-C object state");
         };
-        let ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
+        let mut ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
         let wrong = SseCustomerRequest::new([1u8; SSE_C_CUSTOMER_KEY_LEN], "wrong".to_string());
-        let err = decrypt_sse_customer_segment(
+        let err = decrypt_sse_customer_segment_in_place(
             &validator,
             state,
             &wrong,
             SseCustomerSegmentScope::object(),
             0,
-            &ciphertext,
+            &mut ciphertext,
             3,
         )
         .unwrap_err();
@@ -1400,14 +1403,14 @@ mod tests {
         let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
             panic!("expected SSE-C object state");
         };
-        let ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
-        let err = decrypt_sse_customer_segment(
+        let mut ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
+        let err = decrypt_sse_customer_segment_in_place(
             &missing_validator(),
             state,
             &req,
             SseCustomerSegmentScope::object(),
             0,
-            &ciphertext,
+            &mut ciphertext,
             3,
         )
         .unwrap_err();
@@ -1437,29 +1440,30 @@ mod tests {
         )
         .unwrap();
 
-        let part1_ciphertext = part1_ctx.encrypt_segment(0, b"same-data").unwrap();
+        let mut part1_ciphertext = part1_ctx.encrypt_segment(0, b"same-data").unwrap();
         let part2_ciphertext = part2_ctx.encrypt_segment(0, b"same-data").unwrap();
         assert_ne!(part1_ciphertext, part2_ciphertext);
+        let mut wrong_scope_ciphertext = part1_ciphertext.clone();
 
-        let part1_plaintext = decrypt_sse_customer_segment(
+        decrypt_sse_customer_segment_in_place(
             &validator,
             state,
             &req,
             SseCustomerSegmentScope::multipart_part(1).unwrap(),
             0,
-            &part1_ciphertext,
+            &mut part1_ciphertext,
             9,
         )
         .unwrap();
-        assert_eq!(part1_plaintext, b"same-data");
+        assert_eq!(part1_ciphertext, b"same-data");
 
-        let err = decrypt_sse_customer_segment(
+        let err = decrypt_sse_customer_segment_in_place(
             &validator,
             state,
             &req,
             SseCustomerSegmentScope::multipart_part(2).unwrap(),
             0,
-            &part1_ciphertext,
+            &mut wrong_scope_ciphertext,
             9,
         )
         .unwrap_err();
@@ -1768,17 +1772,21 @@ mod tests {
         let ObjectEncryption::SseS3(state) = ctx.encryption() else {
             panic!("expected SSE-S3 object state");
         };
-        let ciphertext = ctx.encrypt_segment(4, b"hello sse-s3").unwrap();
-        let plaintext = decrypt_managed_encryption_segment(
+        let mut ciphertext = ctx.encrypt_segment(4, b"hello sse-s3").unwrap();
+        let allocation = ciphertext.as_ptr();
+        let capacity = ciphertext.capacity();
+        decrypt_managed_encryption_segment_in_place(
             &provider,
             state,
             SseCustomerSegmentScope::object(),
             4,
-            &ciphertext,
+            &mut ciphertext,
             12,
         )
         .unwrap();
-        assert_eq!(plaintext, b"hello sse-s3");
+        assert_eq!(ciphertext, b"hello sse-s3");
+        assert_eq!(ciphertext.as_ptr(), allocation);
+        assert_eq!(ciphertext.capacity(), capacity);
     }
 
     #[test]
@@ -1794,17 +1802,17 @@ mod tests {
             SseCustomerSegmentScope::multipart_part(2).unwrap(),
         )
         .unwrap();
-        let ciphertext = resumed.encrypt_segment(1, b"part-data").unwrap();
-        let plaintext = decrypt_managed_encryption_segment(
+        let mut ciphertext = resumed.encrypt_segment(1, b"part-data").unwrap();
+        decrypt_managed_encryption_segment_in_place(
             &provider,
             state,
             SseCustomerSegmentScope::multipart_part(2).unwrap(),
             1,
-            &ciphertext,
+            &mut ciphertext,
             9,
         )
         .unwrap();
-        assert_eq!(plaintext, b"part-data");
+        assert_eq!(ciphertext, b"part-data");
     }
 
     #[test]
@@ -1861,12 +1869,13 @@ mod tests {
                 0x7d,
             ]
         );
-        let decrypted_segment = decrypt_segment_with_dek_and_prefix(
+        let mut decrypted_segment = fixture.segment_ciphertext.clone();
+        decrypt_segment_with_dek_and_prefix_in_place(
             &fixture.dek,
             &fixture.segment_nonce_prefix,
             SseCustomerSegmentScope::object(),
             7,
-            &fixture.segment_ciphertext,
+            &mut decrypted_segment,
             fixture.segment_plaintext.len(),
             AeadDescriptor {
                 aad: MANAGED_SEGMENT_AAD,
@@ -1945,17 +1954,17 @@ mod tests {
         let ObjectEncryption::SseS3(state) = ctx.encryption() else {
             panic!("expected SSE-S3 object state");
         };
-        let ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
+        let mut ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
         let missing_provider = StaticManagedKeyProvider::single(ManagedWrappingKeyConfig {
             key_id: 8,
             wrapping_key: [12u8; 32],
         });
-        let err = decrypt_managed_encryption_segment(
+        let err = decrypt_managed_encryption_segment_in_place(
             &missing_provider,
             state,
             SseCustomerSegmentScope::object(),
             0,
-            &ciphertext,
+            &mut ciphertext,
             3,
         )
         .unwrap_err();
