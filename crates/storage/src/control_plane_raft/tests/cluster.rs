@@ -5980,6 +5980,44 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 finalized
             );
         }
+        let mut collapsed = None;
+        for actor in &evidence_actors {
+            collapsed = Some(<crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::collapse_metadata_transfer_staging_evidence_checkpoint_segment(
+                &mut leader,
+                actor.node_id(),
+                actor.node_incarnation(),
+                1,
+                1,
+            ).unwrap());
+        }
+        let collapsed = collapsed.unwrap();
+        assert_eq!(collapsed.cluster_epoch(), cleanup_epoch);
+        let collapse_applied = authority1.status().await.unwrap().applied().unwrap();
+        authority2
+            .wait_for_applied_log_id(
+                collapse_applied,
+                Duration::from_secs(1),
+                "second voter applied staging checkpoint collapse",
+            )
+            .await
+            .unwrap();
+        authority3
+            .wait_for_applied_log_id(
+                collapse_applied,
+                Duration::from_secs(1),
+                "third voter applied staging checkpoint collapse",
+            )
+            .await
+            .unwrap();
+        for authority in [&authority1, &authority2, &authority3] {
+            assert_eq!(
+                authority
+                    .durable_state_machine_snapshot_for_test()
+                    .await
+                    .unwrap(),
+                collapsed
+            );
+        }
 
         authority1.transfer_leadership_to(1202).await.unwrap();
         authority2
@@ -6013,27 +6051,35 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 1,
             )
             .unwrap();
-            assert_eq!(replayed_checkpoint, finalized);
+            assert_eq!(replayed_checkpoint, collapsed);
+            let replayed_collapse = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::collapse_metadata_transfer_staging_evidence_checkpoint_segment(
+                &mut successor,
+                actor.node_id(),
+                actor.node_incarnation(),
+                1,
+                1,
+            ).unwrap();
+            assert_eq!(replayed_collapse, collapsed);
         }
         let replayed_authorization = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::authorize_unavailable_pg_staging_intents_batch(
             &mut successor,
             &authorizations,
         )
         .unwrap();
-        assert_eq!(replayed_authorization, finalized);
+        assert_eq!(replayed_authorization, collapsed);
         let replayed_install = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::install_unavailable_pg_placement_transitions_batch(
             &mut successor,
             &install_requests,
             destination_epoch,
         )
         .unwrap();
-        assert_eq!(replayed_install, finalized);
+        assert_eq!(replayed_install, collapsed);
         let replayed_cleanup = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::finalize_metadata_transfer_staging_generation(
             &mut successor,
             cleanup,
         )
         .unwrap();
-        assert_eq!(replayed_cleanup, finalized);
+        assert_eq!(replayed_cleanup, collapsed);
 
         let replay_applied = authority2.status().await.unwrap().applied().unwrap();
         authority1
@@ -6058,7 +6104,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                     .durable_state_machine_snapshot_for_test()
                     .await
                     .unwrap(),
-                finalized
+                    collapsed
             );
         }
 

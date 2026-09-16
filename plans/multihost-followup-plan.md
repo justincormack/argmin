@@ -1142,7 +1142,26 @@ composition additionally covers replication to
 every voter and exact cleanup replay after leadership transfer. Destination
 tombstone RPC orchestration, physical artifact deletion, pre-install
 cancellation, fenced-incarnation retirement substitutes, closure-certificate
-retirement, segment collapse, and anchor coalescing remain gated.
+retirement, and anchor coalescing remain gated.
+
+Command v29 and state v41 implement the first bounded segment-retirement
+step. `CollapseMetadataTransferStagingEvidenceCheckpointSegment` performs an
+exact CAS over the actor incarnation, generation range, and canonical source
+segment digest. It requires every commitment in that segment to have been
+pruned through a matching finalized-generation certificate, then atomically
+replaces the segment with a compact anchor retaining its predecessor, exact
+tip apply receipt, range, and source digest. Each finalized checkpoint binding
+retains the original page generation and entry sequence, allowing snapshot
+validation to reconstruct every retired page digest, apply receipt, and the
+complete source-segment digest from canonical finalized evidence. Exact replay
+through the anchor is a no-op; stale digests, partial coverage, retained detail,
+and coordinated anchor, binding, or membership forgeries reject without mutation. The operation does not
+advance the cluster-map epoch. Standalone tests cover mixed and fully covered
+segments, restart, exact replay, and mutation cases; a three-voter Raft test
+covers replication, leadership transfer, and replay of checkpoint, collapse,
+authorization, installation, and finalization commands after collapse.
+Bounded adjacent-anchor coalescing and closure-certificate retirement remain
+later slices.
 
 This cleanup CAS is intentionally one per PG, not a fifth multi-PG batch
 command. Epoch-neutral cleanup does not need batching to amortize cluster-map

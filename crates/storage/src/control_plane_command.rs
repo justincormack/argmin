@@ -24,7 +24,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 28;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 29;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -435,6 +435,13 @@ pub enum ControlPlaneCommand {
         first_generation: u64,
         last_generation: u64,
     },
+    CollapseMetadataTransferStagingEvidenceCheckpointSegment {
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+        source_segment_digest: [u8; 32],
+    },
     FinalizeMetadataTransferStagingGeneration {
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,
     },
@@ -588,6 +595,20 @@ impl std::fmt::Display for ControlPlaneCommand {
             } => write!(
                 f,
                 "checkpoint-metadata-transfer-staging-evidence-pages(node={},incarnation={},generations={}..={})",
+                actor_node_id.as_u32(),
+                actor_node_incarnation,
+                first_generation,
+                last_generation
+            ),
+            ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment {
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+                ..
+            } => write!(
+                f,
+                "collapse-metadata-transfer-staging-evidence-checkpoint-segment(node={},incarnation={},generations={}..={})",
                 actor_node_id.as_u32(),
                 actor_node_incarnation,
                 first_generation,
@@ -1047,6 +1068,25 @@ pub(crate) fn encode_control_plane_command_without_replication_limit(
             write_u64(&mut out, *first_generation);
             write_u64(&mut out, *last_generation);
         }
+        ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment {
+            actor_node_id,
+            actor_node_incarnation,
+            first_generation,
+            last_generation,
+            source_segment_digest,
+        } => {
+            if *first_generation == 0 || first_generation > last_generation {
+                return Err(command_protocol_error(
+                    "metadata-transfer staging checkpoint collapse generation range is invalid",
+                ));
+            }
+            write_u16(&mut out, 23);
+            write_u32(&mut out, actor_node_id.as_u32());
+            write_u64(&mut out, *actor_node_incarnation);
+            write_u64(&mut out, *first_generation);
+            write_u64(&mut out, *last_generation);
+            out.extend_from_slice(source_segment_digest);
+        }
         ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup } => {
             if cleanup.staging_generation == 0
                 || cleanup.tombstones.is_empty()
@@ -1228,6 +1268,7 @@ pub fn encode_control_plane_command(
             | ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents { .. }
             | ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage { .. }
             | ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages { .. }
+            | ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment { .. }
             | ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { .. }
             | ControlPlaneCommand::InstallUnavailablePgPlacementTransitions { .. }
             | ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions { .. }
@@ -1754,6 +1795,28 @@ pub fn decode_control_plane_command(
                 },
             }
         }
+        23 => {
+            let actor_node_id = NodeId::new(reader.read_u32()?);
+            let actor_node_incarnation = reader.read_u64()?;
+            let first_generation = reader.read_u64()?;
+            let last_generation = reader.read_u64()?;
+            let source_segment_digest = reader
+                .read_exact(32)?
+                .try_into()
+                .expect("staging checkpoint segment digest has fixed length");
+            if first_generation == 0 || first_generation > last_generation {
+                return Err(command_protocol_error(
+                    "metadata-transfer staging checkpoint collapse generation range is invalid",
+                ));
+            }
+            ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment {
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+                source_segment_digest,
+            }
+        }
         20 => {
             let expected_destination_epoch =
                 read_cluster_epoch(&mut reader, "unavailable placement destination epoch")?;
@@ -2097,6 +2160,7 @@ pub enum ControlPlaneCommandResponse {
         apply_receipt: Vec<u8>,
     },
     CheckpointMetadataTransferStagingEvidencePages,
+    CollapseMetadataTransferStagingEvidenceCheckpointSegment,
     FinalizeMetadataTransferStagingGeneration,
     InstallUnavailablePgPlacementTransitions,
     CompleteUnavailablePgPlacementTransitions,
@@ -3912,6 +3976,13 @@ mod tests {
                 first_generation: 1,
                 last_generation: 7,
             },
+            ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment {
+                actor_node_id: NodeId::new(3),
+                actor_node_incarnation: 8,
+                first_generation: 1,
+                last_generation: 7,
+                source_segment_digest: [0x6a; 32],
+            },
             ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration {
                 cleanup: FinalizeMetadataTransferStagingGenerationRequest {
                     unavailable_transition: staging_binding,
@@ -4384,6 +4455,7 @@ mod tests {
                     ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage { .. }
                         | ControlPlaneCommand::InstallUnavailablePgPlacementTransitions { .. }
                         | ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages { .. }
+                        | ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment { .. }
                         | ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { .. }
                 )
             })
@@ -4492,7 +4564,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_command_v28_aggregate_encoding_is_stable() {
+    fn control_plane_command_v29_aggregate_encoding_is_stable() {
         let mut aggregate = Vec::new();
         for command in sample_commands().into_iter().chain(degenerate_commands()) {
             let encoded = encode_control_plane_command(&command).unwrap();
@@ -4510,13 +4582,44 @@ mod tests {
         assert_eq!(
             (aggregate.len(), digest),
             (
-                3_893,
+                3_977,
                 [
-                    126, 184, 22, 174, 141, 67, 41, 145, 161, 139, 125, 19, 127, 69, 42, 63, 58,
-                    18, 79, 183, 38, 72, 87, 180, 43, 172, 255, 62, 61, 154, 185, 5,
+                    72, 68, 210, 130, 254, 85, 233, 174, 69, 57, 222, 85, 200, 170, 236, 165, 67,
+                    254, 87, 222, 241, 91, 180, 66, 158, 132, 49, 140, 206, 252, 204, 190,
                 ],
             )
         );
+    }
+
+    #[test]
+    fn control_plane_command_v28_aggregate_remains_rejected_evidence() {
+        const AGGREGATE: &[u8] =
+            include_bytes!("control_plane/testdata/command_v28_representative.aggregate");
+        assert_eq!(
+            (
+                AGGREGATE.len(),
+                checksum::compute_checksum(checksum::ChecksumAlgorithm::Sha256, AGGREGATE).bytes()
+            ),
+            (
+                3_893,
+                &[
+                    126, 184, 22, 174, 141, 67, 41, 145, 161, 139, 125, 19, 127, 69, 42, 63, 58,
+                    18, 79, 183, 38, 72, 87, 180, 43, 172, 255, 62, 61, 154, 185, 5,
+                ][..],
+            )
+        );
+        let mut remaining = AGGREGATE;
+        while !remaining.is_empty() {
+            let (raw_len, tail) = remaining.split_at(4);
+            let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
+            let (command, tail) = tail.split_at(len);
+            assert!(matches!(
+                decode_control_plane_command(command),
+                Err(ControlPlaneError::CommandDecode { message })
+                    if message == "unsupported control-plane command version 28"
+            ));
+            remaining = tail;
+        }
     }
 
     #[test]
@@ -4671,7 +4774,9 @@ mod tests {
             Err(ControlPlaneCommandFormatError::UnknownMagic)
         );
 
-        for version in [15_u16, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29] {
+        for version in [
+            15_u16, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30,
+        ] {
             let mut unsupported = Vec::from(CONTROL_PLANE_COMMAND_MAGIC.as_slice());
             unsupported.extend_from_slice(&version.to_be_bytes());
             assert_eq!(
@@ -4911,7 +5016,9 @@ mod tests {
         append_control_plane_command_checksum(&mut bad_magic);
         assert_decode_error_contains(&bad_magic, "invalid control-plane command magic");
 
-        for version in [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29] {
+        for version in [
+            14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30,
+        ] {
             let encoded = encode_control_plane_command_with_version_for_test(
                 &ControlPlaneCommand::ExpireHeartbeatLeases {
                     expire_at_ms: 1_000,
@@ -4944,8 +5051,8 @@ mod tests {
 
     #[test]
     fn control_plane_command_codec_rejects_semantic_decode_errors() {
-        let unknown_tag = command_frame(23, |_| {});
-        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 23");
+        let unknown_tag = command_frame(24, |_| {});
+        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 24");
 
         let reversed_certified_pgs = ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
             nodes: vec![(NodeId::new(1), "/tmp/node-1.sock".to_owned())],
@@ -5302,6 +5409,48 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_command_checkpoint_collapse_codec_enforces_exact_range() {
+        let command =
+            ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment {
+                actor_node_id: NodeId::new(7),
+                actor_node_incarnation: 11,
+                first_generation: 13,
+                last_generation: 17,
+                source_segment_digest: [19; 32],
+            };
+        let encoded = encode_control_plane_command(&command).unwrap();
+        assert_eq!(decode_control_plane_command(&encoded).unwrap(), command);
+
+        for (first_generation, last_generation) in [(0, 1), (2, 1)] {
+            let malformed = command_frame(23, |body| {
+                write_u32(body, 7);
+                write_u64(body, 11);
+                write_u64(body, first_generation);
+                write_u64(body, last_generation);
+                body.extend_from_slice(&[19; 32]);
+            });
+            assert_decode_error_contains(
+                &malformed,
+                "checkpoint collapse generation range is invalid",
+            );
+
+            assert!(matches!(
+                encode_control_plane_command(
+                    &ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment {
+                        actor_node_id: NodeId::new(7),
+                        actor_node_incarnation: 11,
+                        first_generation,
+                        last_generation,
+                        source_segment_digest: [19; 32],
+                    }
+                ),
+                Err(ControlPlaneError::CommandDecode { message })
+                    if message.contains("checkpoint collapse generation range is invalid")
+            ));
+        }
+    }
+
+    #[test]
     fn control_plane_command_codec_rejects_valid_frame_bit_flip() {
         let command = ControlPlaneCommand::SetNodeMembership {
             node_id: NodeId::new(7),
@@ -5374,7 +5523,8 @@ mod tests {
         const PREVIOUS_V37: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=37\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x6f\x49\x16\x73\x8f\x15\x7d\x9b";
         const PREVIOUS_V38: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=38\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x0b\xb8\x77\x7a\x61\x18\x28\x0c";
         const PREVIOUS_V39: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=39\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xdb\x3b\xaa\x23\x2c\x8e\x19\x91";
-        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=40\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x83\x26\x64\xbe\x5e\xfd\x3d\xda";
+        const PREVIOUS_V40: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=40\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x83\x26\x64\xbe\x5e\xfd\x3d\xda";
+        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=41\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x53\xa5\xb9\xe7\x13\x6b\x0c\x47";
         let encoded = encode_control_plane_snapshot(&ClusterControlSnapshot::empty()).unwrap();
 
         assert_eq!(encoded, EXPECTED);
@@ -5441,6 +5591,11 @@ mod tests {
             decode_control_plane_snapshot(PREVIOUS_V39),
             Err(ControlPlaneError::Parse { message, .. })
                 if message == "unsupported control-plane state version 39"
+        ));
+        assert!(matches!(
+            decode_control_plane_snapshot(PREVIOUS_V40),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "unsupported control-plane state version 40"
         ));
     }
 
@@ -5522,9 +5677,9 @@ mod tests {
     #[test]
     fn replicated_snapshot_install_rejects_noncurrent_state_versions_before_mutation() {
         let current_contents = format_snapshot(&sample_snapshot());
-        for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 41] {
+        for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42] {
             let unsupported_contents =
-                current_contents.replacen("version=40\n", &format!("version={version}\n"), 1);
+                current_contents.replacen("version=41\n", &format!("version={version}\n"), 1);
             let payload =
                 snapshot_frame_with_version(CONTROL_PLANE_SNAPSHOT_VERSION, &unsupported_contents);
             let mut installed = replay_sample_state_machine();

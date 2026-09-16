@@ -2851,6 +2851,25 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    pub fn collapse_metadata_transfer_staging_evidence_checkpoint_segment(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .snapshot
+            .collapse_metadata_transfer_staging_evidence_checkpoint_segment_command(
+                actor_node_id,
+                actor_node_incarnation,
+                first_generation,
+                last_generation,
+            )?;
+        self.apply_and_commit_command(command)?;
+        Ok(self.snapshot.clone())
+    }
+
     pub fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,
@@ -3945,6 +3964,22 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         last_generation: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         SingleAuthorityControlPlane::checkpoint_metadata_transfer_staging_evidence_pages(
+            self,
+            actor_node_id,
+            actor_node_incarnation,
+            first_generation,
+            last_generation,
+        )
+    }
+
+    fn collapse_metadata_transfer_staging_evidence_checkpoint_segment(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        first_generation: u64,
+        last_generation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::collapse_metadata_transfer_staging_evidence_checkpoint_segment(
             self,
             actor_node_id,
             actor_node_incarnation,
