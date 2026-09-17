@@ -2697,6 +2697,26 @@ impl StorageCluster {
         .map(|_| ())
     }
 
+    fn wait_for_same_object_direct_put_recovery_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<bool, ObjectPgActionError> {
+        match self.wait_for_metadata_command_recovery_resolution_with_work_budget(
+            pg_id,
+            command,
+            work_budget,
+        )? {
+            MetadataCommandRecoveryWaiterOutcome::Applied => Ok(true),
+            MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+            | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => Ok(false),
+            MetadataCommandRecoveryWaiterOutcome::StillPending => {
+                unreachable!("non-owning recovery wait must return only after the slot advances")
+            }
+        }
+    }
+
     fn wait_for_metadata_command_recovery_resolution_with_work_budget(
         &self,
         pg_id: PgId,
@@ -4764,6 +4784,24 @@ impl StorageCluster {
 
         let mut snapshot_retry_phase = SnapshotSensitiveRetryPhase::default();
         let mut same_object_publication_observed = false;
+        macro_rules! wait_for_same_object_direct_put_recovery {
+            ($command:expr) => {{
+                let applied = match self
+                    .wait_for_same_object_direct_put_recovery_with_work_budget(
+                        pg_id,
+                        $command,
+                        &mut work_budget,
+                    ) {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        cleanup_direct_put_attempt_before_command_ownership!();
+                        return Err(error);
+                    }
+                };
+                same_object_publication_observed |= applied;
+                snapshot_retry_phase.require_snapshot_reinspection();
+            }};
+        }
         let (command, new_pending_command) = loop {
             require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
@@ -4968,20 +5006,11 @@ impl StorageCluster {
                                         self.metadata_command_apply_test_hook_scope_id(),
                                         &mut work_budget,
                                     );
-                                    if let Err(error) = self
-                                        .wait_for_transferred_metadata_command_with_work_budget(
-                                            pg_id,
-                                            late_conflict_command
-                                                .as_ref()
-                                                .expect("guard requires a pending command"),
-                                            &mut work_budget,
-                                        )
-                                    {
-                                        cleanup_direct_put_attempt_before_command_ownership!();
-                                        return Err(error);
-                                    }
-                                    same_object_publication_observed = true;
-                                    snapshot_retry_phase.require_snapshot_reinspection();
+                                    wait_for_same_object_direct_put_recovery!(
+                                        late_conflict_command
+                                            .as_ref()
+                                            .expect("guard requires a pending command")
+                                    );
                                     continue;
                                 }
                                 Err(error)
@@ -5171,20 +5200,46 @@ impl StorageCluster {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
-                    if let Err(error) = self.drain_pending_object_metadata_command_with_work_budget(
+                    match self.drain_pending_object_metadata_command_with_work_budget(
                         publisher,
                         pg_id,
                         &command,
                         &mut work_budget,
                     ) {
-                        if request_ops::object_pg_action_error_is_retryable_pending_drain(&error) {
+                        Ok(PendingMetadataCommandOutcome::TerminalCleanupPending {
+                            applied: false,
+                        }) if is_same_object_direct_put => {
+                            wait_for_same_object_direct_put_recovery!(&command);
+                            continue;
+                        }
+                        Ok(outcome)
+                            if is_same_object_direct_put && outcome.is_logically_applied() =>
+                        {
+                            same_object_publication_observed = true;
+                            snapshot_retry_phase.require_snapshot_reinspection();
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
+                            if is_same_object_direct_put =>
+                        {
+                            wait_for_same_object_direct_put_recovery!(&command);
+                            continue;
+                        }
+                        Err(error)
+                            if request_ops::object_pg_action_error_is_retryable_pending_drain(
+                                &error,
+                            ) =>
+                        {
                             retry_direct_put_pending_drain_error!(
                                 error,
                                 "direct PUT abandoned pending drain retry budget exhausted"
                             );
                         }
-                        cleanup_direct_put_attempt_before_command_ownership!();
-                        return Err(error);
+                        Err(error) => {
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(error);
+                        }
                     }
                     sleep_direct_put_before_command_ownership_after_contention!(
                         "direct PUT abandoned pending drain retry budget exhausted"
@@ -5209,10 +5264,13 @@ impl StorageCluster {
                             | PendingMetadataCommandOutcome::TerminalCleanupPending {
                                 applied: true,
                             },
-                        )
-                        | Err(ObjectPgActionError::MetadataCommandRecoveryTransferred) => {
+                        ) => {
                             same_object_publication_observed = true;
                             snapshot_retry_phase.require_snapshot_reinspection();
+                            continue;
+                        }
+                        Err(ObjectPgActionError::MetadataCommandRecoveryTransferred) => {
+                            wait_for_same_object_direct_put_recovery!(&command);
                             continue;
                         }
                         Ok(PendingMetadataCommandOutcome::Abandoned) => {}
@@ -5222,16 +5280,7 @@ impl StorageCluster {
                             // Outcome projection relinquishes this unrelated drainer's recovery
                             // flight. Wait without trying to reacquire it; an authorized recovery
                             // worker must remove the abandoned command's retained terminal slot.
-                            if let Err(error) = self
-                                .wait_for_transferred_metadata_command_with_work_budget(
-                                    pg_id,
-                                    &command,
-                                    &mut work_budget,
-                                )
-                            {
-                                cleanup_direct_put_attempt_before_command_ownership!();
-                                return Err(error);
-                            }
+                            wait_for_same_object_direct_put_recovery!(&command);
                             continue;
                         }
                         Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {

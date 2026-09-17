@@ -4524,10 +4524,12 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
                         recovery_result_rx.try_recv()
                     )
                 });
-            assert!(matches!(
-                result_rx.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ));
+            match result_rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                early => panic!(
+                    "contender completed before authorized terminal cleanup advanced the command: {early:?}"
+                ),
+            }
             assert_eq!(
                 pending_metadata_command_for_test(&first_map, pg_id, &bucket),
                 Some(retained_terminal_command),
