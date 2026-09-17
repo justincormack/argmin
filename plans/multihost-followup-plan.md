@@ -1160,6 +1160,28 @@ finalized-floor advancement, pre-install
 cancellation, fenced-incarnation retirement substitutes, and
 closure-certificate retirement remain gated.
 
+Storage RPC v27 adds committed-authorization-bound exact-artifact retrieval.
+The request carries the same complete authority presentation and exact intent
+as publication and tombstoning plus an exact offset and bounded length; both
+the storage-node handler and staging store verify the destination-specific
+capability before reading bytes. Each independently authenticated response is
+bounded to 1 MiB. Responses use one protocol-wide 60-second authentication
+window, independent of endpoint-local I/O timeouts; transport limits cannot
+exceed that bound, and heterogeneous profiles therefore accept the same signed
+response language. One absolute artifact deadline covers admission,
+connection, and every chunk rather than granting a
+fresh transport timeout per chunk. The client applies the operation-specific
+authenticated-envelope cap before allocating the response body, then
+reassembles the chunks and revalidates the complete exact length and SHA-256
+digest against the durable intent before decoding or import.
+Retrieval is admin-only, succeeds over authenticated Unix and TLS,
+fails closed for malformed, stale, cross-member, absent, or tombstoned state,
+and leaves immutable v26 request frames as rejection evidence. This closes the
+durable source needed for production reconciliation to resume after authority
+or worker restart without re-exporting from the historical primary. Staging
+store, artifact, command, control-plane state/RPC, and authentication-envelope
+versions are unchanged because retrieval adds no durable semantics.
+
 Command v29 and state v41 implement the first bounded segment-retirement
 step. `CollapseMetadataTransferStagingEvidenceCheckpointSegment` performs an
 exact CAS over the actor incarnation, generation range, and canonical source
@@ -1398,6 +1420,15 @@ cover physical deletion plus exact tombstone replay. Staging-store format v4,
 artifact format v3, control-plane RPC v22, command v30, state v42, and
 authentication envelope v2 are unchanged because their existing grammars
 already represent the resulting tombstone evidence and authorization.
+Durable artifact retrieval then advances storage RPC v26 to v27 with one
+admin-only read operation carrying the same complete committed authorization
+presentation, exact intent, offset, and one-MiB maximum chunk length. Exact v27
+frames cover all five staging operations, and complete v26 frames remain
+immutable rejection evidence. The chunk response payload has fixed byte
+evidence; authentication tests cover a maximum chunk verified beyond five
+seconds, while transport tests cover a delayed signed chunk, rejection before
+allocation above the response envelope cap, and one absolute multi-chunk
+operation deadline.
 
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Staging-store format v4 owns the

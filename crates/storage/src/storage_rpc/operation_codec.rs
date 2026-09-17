@@ -212,6 +212,108 @@ pub(crate) fn decode_metadata_transfer_staging_tombstone_request(
     })
 }
 
+pub(crate) fn encode_metadata_transfer_staging_artifact_read_request(
+    request: &StorageRpcMetadataTransferStagingArtifactReadRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_metadata_transfer_staging_artifact_read_range(
+        &request.intent,
+        request.offset,
+        request.max_bytes,
+    )?;
+    let intent = encode_staging_intent(&request.intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    let mut out = Vec::new();
+    put_staging_authorization_presentation(&mut out, &request.authorization)?;
+    put_bytes(&mut out, &intent);
+    put_u64(&mut out, request.offset);
+    put_u32(&mut out, request.max_bytes);
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_transfer_staging_artifact_read_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataTransferStagingArtifactReadRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let authorization = read_staging_authorization_presentation(&mut decoder)?;
+    let intent = decoder.read_bytes_with_payload_limit(MAX_STAGING_INTENT_BYTES)?;
+    let offset = decoder.read_u64()?;
+    let max_bytes = decoder.read_u32()?;
+    decoder.finish()?;
+    let intent = decode_staging_intent(intent).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging("intent is invalid")
+    })?;
+    validate_metadata_transfer_staging_artifact_read_range(&intent, offset, max_bytes)?;
+    Ok(StorageRpcMetadataTransferStagingArtifactReadRequest {
+        authorization,
+        intent,
+        offset,
+        max_bytes,
+    })
+}
+
+fn validate_metadata_transfer_staging_artifact_read_range(
+    intent: &MetadataTransferStagingIntent,
+    offset: u64,
+    max_bytes: u32,
+) -> Result<usize, StorageRpcPayloadError> {
+    if max_bytes == 0 || max_bytes > METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES {
+        return Err(StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "artifact read chunk bound is invalid",
+        ));
+    }
+    let remaining = intent.artifact_length().checked_sub(offset).ok_or(
+        StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "artifact read offset exceeds artifact length",
+        ),
+    )?;
+    if remaining == 0 {
+        return Err(StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "artifact read offset is at end of artifact",
+        ));
+    }
+    usize::try_from(remaining.min(u64::from(max_bytes))).map_err(|_| {
+        StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "artifact read chunk length is not representable",
+        )
+    })
+}
+
+pub(crate) fn encode_metadata_transfer_staging_artifact_read_response(
+    artifact: &[u8],
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if artifact.len() > METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES as usize {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: artifact.len(),
+            limit: METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES as usize,
+        });
+    }
+    let mut out = Vec::new();
+    put_bytes(&mut out, artifact);
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_transfer_staging_artifact_read_response(
+    bytes: &[u8],
+    expected_intent: &MetadataTransferStagingIntent,
+    offset: u64,
+    max_bytes: u32,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let expected_len =
+        validate_metadata_transfer_staging_artifact_read_range(expected_intent, offset, max_bytes)?;
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let artifact = decoder
+        .read_bytes_with_payload_limit(METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES as usize)?
+        .to_vec();
+    decoder.finish()?;
+    if artifact.len() != expected_len {
+        return Err(StorageRpcPayloadError::InvalidMetadataTransferStaging(
+            "artifact read response has the wrong chunk length",
+        ));
+    }
+    Ok(artifact)
+}
+
 pub(crate) fn encode_metadata_transfer_staging_receipt_response(
     receipt: &MetadataTransferStagingReceipt,
 ) -> Vec<u8> {

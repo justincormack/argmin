@@ -121,6 +121,7 @@ use crate::storage_rpc::{
     decode_metadata_command_transfer_empty_state_request,
     decode_metadata_command_transfer_matching_state_request,
     decode_metadata_transfer_staging_artifact_publish_request,
+    decode_metadata_transfer_staging_artifact_read_request,
     decode_metadata_transfer_staging_intent_create_request,
     decode_metadata_transfer_staging_proof_publish_request,
     decode_metadata_transfer_staging_tombstone_request,
@@ -188,6 +189,7 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
+    encode_metadata_transfer_staging_artifact_read_response,
     encode_metadata_transfer_staging_receipt_response,
     encode_multipart_completion_barrier_command_build_response,
     encode_multipart_completion_preflight_response, encode_multipart_completion_snapshot_response,
@@ -293,6 +295,7 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandTransferEmptyStateRequest,
     StorageRpcMetadataCommandTransferMatchingStateRequest,
     StorageRpcMetadataTransferStagingArtifactPublishRequest,
+    StorageRpcMetadataTransferStagingArtifactReadRequest,
     StorageRpcMetadataTransferStagingIntentCreateRequest,
     StorageRpcMetadataTransferStagingProofPublishRequest,
     StorageRpcMetadataTransferStagingTombstoneRequest,
@@ -2453,6 +2456,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::MetadataTransferStagingTombstone => {
                 match decode_metadata_transfer_staging_tombstone_request(&frame.payload) {
                     Ok(request) => self.metadata_transfer_staging_tombstone_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataTransferStagingArtifactRead => {
+                match decode_metadata_transfer_staging_artifact_read_request(&frame.payload) {
+                    Ok(request) => self.metadata_transfer_staging_artifact_read_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8419,6 +8431,39 @@ impl StorageNodeConnectionHandler {
         match store.tombstone_authorized(&authorization, &request.intent) {
             Ok(receipt) => Ok(encode_storage_rpc_success_response(
                 &encode_metadata_transfer_staging_receipt_response(&receipt),
+            )),
+            Err(error) => encode_storage_rpc_error_response(&staging_error_response(error)),
+        }
+    }
+
+    fn metadata_transfer_staging_artifact_read_response(
+        &self,
+        request: StorageRpcMetadataTransferStagingArtifactReadRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let Some(store) = self.metadata_transfer_staging_store.as_ref() else {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnsupportedOperation,
+                message: "metadata-transfer staging is not configured".to_owned(),
+            });
+        };
+        let authorization = match self
+            .verify_staging_authorization(&request.authorization, request.intent.pg_id())
+        {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&staging_authorization_error_response(
+                    error,
+                ));
+            }
+        };
+        match store.read_artifact_chunk_authorized(
+            &authorization,
+            &request.intent,
+            request.offset,
+            request.max_bytes,
+        ) {
+            Ok(artifact) => Ok(encode_storage_rpc_success_response(
+                &encode_metadata_transfer_staging_artifact_read_response(&artifact)?,
             )),
             Err(error) => encode_storage_rpc_error_response(&staging_error_response(error)),
         }

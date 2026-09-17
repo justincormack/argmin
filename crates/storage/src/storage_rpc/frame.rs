@@ -182,6 +182,19 @@ pub(crate) fn read_storage_rpc_frame_from_with_limit<R: Read>(
     read_storage_rpc_frame_from_with_limit_and_caps(reader, max_payload_len, |_, limit| limit)
 }
 
+pub(crate) fn storage_rpc_response_max_payload_len(
+    kind: StorageRpcMessageKind,
+    generic_max_payload_len: usize,
+) -> usize {
+    let kind_max_payload_len = match kind {
+        StorageRpcMessageKind::MetadataTransferStagingArtifactRead => {
+            STORAGE_RPC_STAGING_ARTIFACT_READ_MAX_RESPONSE_PAYLOAD_LEN
+        }
+        _ => generic_max_payload_len,
+    };
+    kind_max_payload_len.min(generic_max_payload_len)
+}
+
 fn read_storage_rpc_frame_from_with_limit_and_caps<R: Read>(
     reader: &mut R,
     max_payload_len: usize,
@@ -258,11 +271,20 @@ fn message_kind_request_max_payload_len(
                 + MAX_STAGING_INTENT_BYTES
                 + 8
         }
-        StorageRpcMessageKind::MetadataTransferStagingTombstone => {
+        StorageRpcMessageKind::MetadataTransferStagingTombstone
+        => {
             STORAGE_RPC_STAGING_AUTHORIZATION_PRESENTATION_OVERHEAD
                 + STORAGE_RPC_MAX_STAGING_AUTHORIZATION_BYTES
                 + 4
                 + MAX_STAGING_INTENT_BYTES
+        }
+        StorageRpcMessageKind::MetadataTransferStagingArtifactRead => {
+            STORAGE_RPC_STAGING_AUTHORIZATION_PRESENTATION_OVERHEAD
+                + STORAGE_RPC_MAX_STAGING_AUTHORIZATION_BYTES
+                + 4
+                + MAX_STAGING_INTENT_BYTES
+                + 8
+                + 4
         }
         StorageRpcMessageKind::ReadHandlesAcquire => {
             STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN

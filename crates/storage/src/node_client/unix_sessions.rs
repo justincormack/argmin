@@ -494,6 +494,7 @@ impl UnixStorageNodeReadHandleSession {
             self.node_id,
             self.rpc_auth.as_deref(),
             request_proof.as_ref(),
+            kind,
             "read read-handle RPC response",
         )?;
         if response.request_id != request_id || response.kind != kind {
@@ -900,6 +901,7 @@ impl UnixStorageNodeMetadataCommandSession {
             self.node_id,
             self.rpc_auth.as_deref(),
             request_proof.as_ref(),
+            kind,
             "read metadata command session RPC response",
         )
         .map_err(StorageRpcRequestDispatchFailure::MayHaveApplied)?;

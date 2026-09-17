@@ -62,6 +62,7 @@ const STAGING_EVIDENCE_APPLY_RECEIPT_MAGIC: &[u8] = b"ARGMIN-STAGING-EVIDENCE-AP
 const STAGED_ARTIFACT_MAGIC: &[u8] = b"ARGMIN-METADATA-TRANSFER-ARTIFACT-V3\0";
 pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 3;
 pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES: u64 = 63 * 1_024 * 1_024;
+pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES: u32 = 1_024 * 1_024;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MetadataTransferStagingError {
@@ -1705,10 +1706,22 @@ impl MetadataTransferStagingStore {
         }
     }
 
-    pub(crate) fn read_artifact(
+    fn read_artifact_chunk_inner(
         &self,
         intent: &MetadataTransferStagingIntent,
+        offset: u64,
+        max_bytes: u32,
     ) -> Result<Vec<u8>, MetadataTransferStagingError> {
+        let chunk_len = staged_artifact_read_chunk_len(intent, offset, max_bytes)?;
+        let _state = self.lock_readable_artifact(intent)?;
+        read_artifact_file_chunk(&self.artifact_path(intent), intent, offset, chunk_len)
+    }
+
+    fn lock_readable_artifact(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<std::sync::MutexGuard<'_, MetadataTransferStagingState>, MetadataTransferStagingError>
+    {
         let state = self.lock_state()?;
         let existing =
             load_staging_row(&state.connection, intent.pg_id, intent.staging_generation)?
@@ -1730,6 +1743,26 @@ impl MetadataTransferStagingStore {
                 )
             });
         }
+        Ok(state)
+    }
+
+    pub(crate) fn read_artifact_chunk_authorized(
+        &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
+        intent: &MetadataTransferStagingIntent,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<Vec<u8>, MetadataTransferStagingError> {
+        validate_committed_staging_authorization(&self.identity, authorization, intent)?;
+        self.read_artifact_chunk_inner(intent, offset, max_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_artifact(
+        &self,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<Vec<u8>, MetadataTransferStagingError> {
+        let _state = self.lock_readable_artifact(intent)?;
         read_artifact_file(&self.artifact_path(intent), intent)
     }
 
@@ -4892,6 +4925,54 @@ fn read_artifact_file(
     Ok(bytes)
 }
 
+fn staged_artifact_read_chunk_len(
+    intent: &MetadataTransferStagingIntent,
+    offset: u64,
+    max_bytes: u32,
+) -> Result<usize, MetadataTransferStagingError> {
+    if max_bytes == 0 || max_bytes > METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staged artifact read chunk bound is invalid".to_owned(),
+        ));
+    }
+    let remaining = intent.artifact_length.checked_sub(offset).ok_or_else(|| {
+        MetadataTransferStagingError::Invariant(
+            "staged artifact read offset exceeds artifact length".to_owned(),
+        )
+    })?;
+    if remaining == 0 {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staged artifact read offset is at end of artifact".to_owned(),
+        ));
+    }
+    usize::try_from(remaining.min(u64::from(max_bytes))).map_err(|_| {
+        MetadataTransferStagingError::Invariant(
+            "staged artifact read chunk length is not representable".to_owned(),
+        )
+    })
+}
+
+fn read_artifact_file_chunk(
+    path: &Path,
+    intent: &MetadataTransferStagingIntent,
+    offset: u64,
+    chunk_len: usize,
+) -> Result<Vec<u8>, MetadataTransferStagingError> {
+    let mut file = open_regular_nofollow(path, "open staged artifact chunk for read")?;
+    let metadata = file.metadata().map_err(|source| {
+        MetadataTransferStagingError::io("inspect staged artifact chunk", source)
+    })?;
+    if metadata.len() != intent.artifact_length {
+        return Err(MetadataTransferStagingError::ArtifactMismatch);
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| MetadataTransferStagingError::io("seek staged artifact", source))?;
+    let mut bytes = vec![0; chunk_len];
+    file.read_exact(&mut bytes)
+        .map_err(|source| MetadataTransferStagingError::io("read staged artifact chunk", source))?;
+    Ok(bytes)
+}
+
 fn sync_artifact_file(path: &Path) -> Result<(), MetadataTransferStagingError> {
     open_regular_nofollow(path, "open staged artifact for sync")?
         .sync_all()
@@ -6397,6 +6478,73 @@ mod tests {
             NodeId::new(4),
         )
         .is_err());
+    }
+
+    #[test]
+    fn committed_authorization_reads_only_the_exact_published_intent() {
+        let tmp = test_util::tempdir();
+        let store = open(tmp.path());
+        let artifact = canonical_artifact(b"authorized artifact read");
+        let intent = intent(artifact);
+        let authorization =
+            crate::pg_store::committed_staging_authorization_for_intent_for_test(&intent);
+        store
+            .create_intent_authorized(&authorization, &intent)
+            .unwrap();
+        store
+            .publish_artifact_authorized(&authorization, &intent, artifact)
+            .unwrap();
+
+        let first_chunk = store
+            .read_artifact_chunk_authorized(&authorization, &intent, 0, 17)
+            .unwrap();
+        assert_eq!(first_chunk, artifact[..17]);
+        let second_chunk = store
+            .read_artifact_chunk_authorized(
+                &authorization,
+                &intent,
+                17,
+                METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES,
+            )
+            .unwrap();
+        assert_eq!([first_chunk, second_chunk].concat(), artifact);
+        for (offset, max_bytes) in [
+            (0, 0),
+            (0, METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES + 1),
+            (intent.artifact_length(), 1),
+        ] {
+            assert!(matches!(
+                store.read_artifact_chunk_authorized(&authorization, &intent, offset, max_bytes,),
+                Err(MetadataTransferStagingError::Invariant(_))
+            ));
+        }
+
+        let other_binding = binding_for_pg(PgId::new(20), NodeId::new(4));
+        let other_artifact = canonical_artifact_for_binding(b"other artifact", &other_binding);
+        let other_intent = intent_for_binding(other_artifact, &other_binding);
+        let other_authorization =
+            crate::pg_store::committed_staging_authorization_for_intent_for_test(&other_intent);
+        assert!(matches!(
+            store.read_artifact_chunk_authorized(
+                &other_authorization,
+                &intent,
+                0,
+                METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES,
+            ),
+            Err(MetadataTransferStagingError::IntentConflict(_))
+        ));
+        assert!(store.artifact_path(&intent).exists());
+
+        store.tombstone_authorized(&authorization, &intent).unwrap();
+        assert!(matches!(
+            store.read_artifact_chunk_authorized(
+                &authorization,
+                &intent,
+                0,
+                METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES,
+            ),
+            Err(MetadataTransferStagingError::GenerationRetired)
+        ));
     }
 
     #[test]

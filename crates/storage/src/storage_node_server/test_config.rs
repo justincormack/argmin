@@ -388,14 +388,24 @@
     fn live_pg_metadata_transfer_storage_rpc_client_auth(
         credential: ControlPlaneScopedCredential,
     ) -> Arc<StorageRpcClientAuthConfig> {
+        live_pg_metadata_transfer_storage_rpc_client_auth_with_transport_limits(
+            credential,
+            storage_rpc_test_transport_limits(
+                crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+            ),
+        )
+    }
+
+    fn live_pg_metadata_transfer_storage_rpc_client_auth_with_transport_limits(
+        credential: ControlPlaneScopedCredential,
+        transport_limits: crate::StorageRpcTransportLimits,
+    ) -> Arc<StorageRpcClientAuthConfig> {
         Arc::new(
             crate::LivePgMetadataTransferStorageRpcClientCapability::new_with_transport_limits(
                 credential,
                 9,
                 STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
-                storage_rpc_test_transport_limits(
-                    crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
-                ),
+                transport_limits,
             )
             .unwrap()
             .into(),
@@ -5372,7 +5382,7 @@
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [25_u16, 27] {
+            for unsupported_version in [26_u16, 28] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());
@@ -6218,7 +6228,11 @@
         authenticated_live_pg_transfer_replays_nonempty_suffix(true);
     }
 
-    fn authenticated_metadata_transfer_staging_publication_round_trip(tcp: bool) {
+    fn authenticated_metadata_transfer_staging_publication_round_trip(
+        tcp: bool,
+        delay_artifact_chunks_past_auth_window: bool,
+        enforce_absolute_artifact_read_deadline: bool,
+    ) {
         let tmp = test_util::tempdir();
         let staging =
             crate::control_plane::tests::transitions::authenticated_staging_authorization_fixture();
@@ -6232,8 +6246,20 @@
         let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Admin {
             instance_id: "metadata-transfer-staging-1".to_owned(),
         });
+        let transport_limits = storage_rpc_test_transport_limits_with_io_timeout(
+            crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+            if delay_artifact_chunks_past_auth_window {
+                Duration::from_secs(7)
+            } else if enforce_absolute_artifact_read_deadline {
+                Duration::from_secs(2)
+            } else {
+                crate::StorageRpcTransportLimits::DEFAULT.io_timeout()
+            },
+        );
         let mut prepared = PreparedStorageNodeServer::new(config.clone())
-            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .with_rpc_auth(
+                storage_rpc_server_auth(&credential).with_transport_limits(transport_limits),
+            )
             .with_metadata_transfer_staging_node_incarnation(11);
         if tcp {
             prepared = prepared.with_rpc_listeners(vec![
@@ -6263,9 +6289,12 @@
             config.cluster_epoch,
             endpoint,
             LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
-            Some(live_pg_metadata_transfer_storage_rpc_client_auth(
-                credential,
-            )),
+            Some(
+                live_pg_metadata_transfer_storage_rpc_client_auth_with_transport_limits(
+                    credential,
+                    transport_limits,
+                ),
+            ),
         );
         let transition_epoch = staging.intent.transition_epoch();
         let initial_destination_epoch = staging.initial_destination_epoch;
@@ -6432,6 +6461,77 @@
             .unwrap();
         assert_eq!(replay, first);
         assert!(!first.as_bytes().is_empty());
+        assert_eq!(
+            client
+                .read_metadata_transfer_staging_artifact(&authorization, &intent)
+                .unwrap(),
+            artifact
+        );
+        if delay_artifact_chunks_past_auth_window {
+            let response_count = Arc::new(AtomicUsize::new(0));
+            let response_count_for_hook = Arc::clone(&response_count);
+            server.set_response_envelope_test_hook(Arc::new(move |kind, _envelope| {
+                if kind == StorageRpcMessageKind::MetadataTransferStagingArtifactRead {
+                    response_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(
+                        crate::storage_rpc_auth::STORAGE_RPC_AUTH_REPLAY_WINDOW_MS + 100,
+                    ));
+                }
+            }));
+            let started = Instant::now();
+            assert_eq!(
+                client
+                    .read_metadata_transfer_staging_artifact(&authorization, &intent)
+                    .unwrap(),
+                artifact
+            );
+            assert_eq!(response_count.load(Ordering::SeqCst), 1);
+            assert!(
+                started.elapsed()
+                    > Duration::from_millis(
+                        crate::storage_rpc_auth::STORAGE_RPC_AUTH_REPLAY_WINDOW_MS,
+                    ),
+                "one signed chunk response must cross the fixed authentication window"
+            );
+            server.set_response_envelope_test_hook(Arc::new(|_, _| {}));
+        }
+        if enforce_absolute_artifact_read_deadline {
+            let response_count = Arc::new(AtomicUsize::new(0));
+            let response_count_for_hook = Arc::clone(&response_count);
+            server.set_response_envelope_test_hook(Arc::new(move |kind, _envelope| {
+                if kind == StorageRpcMessageKind::MetadataTransferStagingArtifactRead {
+                    let response_index = response_count_for_hook.fetch_add(1, Ordering::SeqCst);
+                    if response_index == 1 {
+                        thread::sleep(Duration::from_millis(1_200));
+                    }
+                }
+            }));
+            let chunk_bytes = artifact.len().div_ceil(2);
+            assert!(client
+                .read_metadata_transfer_staging_artifact_with_deadline_for_test(
+                    &authorization,
+                    &intent,
+                    u32::try_from(chunk_bytes).unwrap(),
+                    Duration::from_secs(1),
+                )
+                .is_err());
+            server.set_response_envelope_test_hook(Arc::new(|_, _| {}));
+            assert_eq!(response_count.load(Ordering::SeqCst), 2);
+            drop(client);
+            let _connection_result = join.join().expect("storage server thread must not panic");
+            return;
+        }
+        for invalid in [&malformed_presentation, &stale_presentation] {
+            let error = client
+                .read_metadata_transfer_staging_artifact_with_presentation_for_test(
+                    invalid, &intent,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.operation_failure_class(),
+                crate::error::StoreOperationFailureClass::Other
+            );
+        }
         let assert_published_artifact_retained = || {
             let store = server.metadata_transfer_staging_store.as_ref().unwrap();
             assert!(store.has_intent_for_test(intent.pg_id(), intent.staging_generation()));
@@ -6470,6 +6570,16 @@
             .unwrap_err();
         assert_eq!(
             cross_member_tombstone_error.operation_failure_class(),
+            crate::error::StoreOperationFailureClass::Other
+        );
+        assert_eq!(
+            client
+                .read_metadata_transfer_staging_artifact_with_presentation_for_test(
+                    &staging.cross_member_tombstone_presentation,
+                    &intent,
+                )
+                .unwrap_err()
+                .operation_failure_class(),
             crate::error::StoreOperationFailureClass::Other
         );
         assert_published_artifact_retained();
@@ -6527,6 +6637,13 @@
                 .read_artifact(&intent),
             Err(crate::pg_store::MetadataTransferStagingError::GenerationRetired)
         ));
+        assert_eq!(
+            client
+                .read_metadata_transfer_staging_artifact(&authorization, &intent)
+                .unwrap_err()
+                .operation_failure_class(),
+            crate::error::StoreOperationFailureClass::Other
+        );
 
         drop(client);
         assert!(join.join().unwrap().is_ok());
@@ -6534,12 +6651,22 @@
 
     #[test]
     fn authenticated_unix_metadata_transfer_staging_publication_round_trip() {
-        authenticated_metadata_transfer_staging_publication_round_trip(false);
+        authenticated_metadata_transfer_staging_publication_round_trip(false, false, false);
     }
 
     #[test]
     fn authenticated_tls_metadata_transfer_staging_publication_round_trip() {
-        authenticated_metadata_transfer_staging_publication_round_trip(true);
+        authenticated_metadata_transfer_staging_publication_round_trip(true, false, false);
+    }
+
+    #[test]
+    fn authenticated_chunked_artifact_read_remains_fresh_past_single_response_window() {
+        authenticated_metadata_transfer_staging_publication_round_trip(false, true, false);
+    }
+
+    #[test]
+    fn authenticated_chunked_artifact_read_uses_one_absolute_deadline() {
+        authenticated_metadata_transfer_staging_publication_round_trip(false, false, true);
     }
 
     #[test]

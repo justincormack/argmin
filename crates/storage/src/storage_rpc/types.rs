@@ -57,6 +57,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataTransferStagingArtifactPublish = 176,
     MetadataTransferStagingProofPublish = 177,
     MetadataTransferStagingTombstone = 178,
+    MetadataTransferStagingArtifactRead = 179,
     ShardScavengerReferenceMatch = 173,
     ObjectPayloadReclaimCommandBuild = 170,
     MetadataCommandRetainedAbortApply = 165,
@@ -368,6 +369,9 @@ impl StorageRpcMessageKind {
             Self::MetadataTransferStagingTombstone => {
                 "metadata transfer staging tombstone"
             }
+            Self::MetadataTransferStagingArtifactRead => {
+                "metadata transfer staging artifact read"
+            }
             Self::ShardScavengerReferenceMatch => "shard scavenger reference match",
             Self::ShardScavengerObservationRecord => "shard scavenger observation record",
             Self::ShardScavengerObservations => "shard scavenger observations",
@@ -630,6 +634,7 @@ impl StorageRpcMessageKind {
             176 => Ok(Self::MetadataTransferStagingArtifactPublish),
             177 => Ok(Self::MetadataTransferStagingProofPublish),
             178 => Ok(Self::MetadataTransferStagingTombstone),
+            179 => Ok(Self::MetadataTransferStagingArtifactRead),
             173 => Ok(Self::ShardScavengerReferenceMatch),
             170 => Ok(Self::ObjectPayloadReclaimCommandBuild),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
@@ -2717,6 +2722,15 @@ pub(crate) struct StorageRpcMetadataTransferStagingTombstoneRequest {
     pub(crate) authorization:
         crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
     pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataTransferStagingArtifactReadRequest {
+    pub(crate) authorization:
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
+    pub(crate) offset: u64,
+    pub(crate) max_bytes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

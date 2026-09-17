@@ -2120,6 +2120,7 @@ impl UnixStorageNodeClient {
             self.node_id,
             self.rpc_auth.as_deref(),
             request_proof.as_ref(),
+            kind,
             "read storage RPC response",
         ) {
             Ok(response) => {
@@ -2995,6 +2996,125 @@ impl UnixStorageNodeClient {
                 error.to_string(),
             )
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn read_metadata_transfer_staging_artifact(
+        &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.read_metadata_transfer_staging_artifact_with_presentation(
+            authorization.presentation(),
+            intent,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_metadata_transfer_staging_artifact_with_presentation_for_test(
+        &self,
+        authorization: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.read_metadata_transfer_staging_artifact_with_presentation(authorization, intent)
+    }
+
+    fn read_metadata_transfer_staging_artifact_with_presentation(
+        &self,
+        authorization: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+        intent: &MetadataTransferStagingIntent,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.read_metadata_transfer_staging_artifact_chunks(
+            authorization,
+            intent,
+            METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES,
+            storage_rpc_io_timeout(self.rpc_auth.as_deref()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_metadata_transfer_staging_artifact_with_deadline_for_test(
+        &self,
+        authorization: &CommittedUnavailablePgStagingAuthorization,
+        intent: &MetadataTransferStagingIntent,
+        max_bytes: u32,
+        operation_timeout: Duration,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.read_metadata_transfer_staging_artifact_chunks(
+            authorization.presentation(),
+            intent,
+            max_bytes,
+            operation_timeout,
+        )
+    }
+
+    fn read_metadata_transfer_staging_artifact_chunks(
+        &self,
+        authorization: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
+        intent: &MetadataTransferStagingIntent,
+        max_bytes: u32,
+        operation_timeout: Duration,
+    ) -> Result<Vec<u8>, StoreError> {
+        let capacity = usize::try_from(intent.artifact_length()).map_err(|_| {
+            self.rpc_payload_error(
+                "decode metadata-transfer staging artifact read response",
+                "artifact length is not representable".to_owned(),
+            )
+        })?;
+        let deadline = Instant::now()
+            .checked_add(operation_timeout)
+            .ok_or_else(|| StoreError::Io {
+                context: "compute metadata-transfer artifact read deadline",
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "metadata-transfer artifact read deadline overflowed",
+                ),
+            })?;
+        let mut artifact = Vec::with_capacity(capacity);
+        while artifact.len() < capacity {
+            let offset = u64::try_from(artifact.len()).map_err(|_| {
+                self.rpc_payload_error(
+                    "encode metadata-transfer staging artifact read request",
+                    "artifact offset is not representable".to_owned(),
+                )
+            })?;
+            let payload = encode_metadata_transfer_staging_artifact_read_request(
+                &StorageRpcMetadataTransferStagingArtifactReadRequest {
+                    authorization: authorization.clone(),
+                    intent: intent.clone(),
+                    offset,
+                    max_bytes,
+                },
+            )
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "encode metadata-transfer staging artifact read request",
+                    error.to_string(),
+                )
+            })?;
+            let response = self.rpc_request_until(
+                StorageRpcMessageKind::MetadataTransferStagingArtifactRead,
+                payload,
+                deadline,
+            )?;
+            let chunk = decode_metadata_transfer_staging_artifact_read_response(
+                &response, intent, offset, max_bytes,
+            )
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata-transfer staging artifact read response",
+                    error.to_string(),
+                )
+            })?;
+            artifact.extend_from_slice(&chunk);
+        }
+        if checksum::sha256::digest(&artifact) != intent.artifact_digest() {
+            return Err(self.rpc_payload_error(
+                "decode metadata-transfer staging artifact read response",
+                "assembled artifact does not match its durable intent".to_owned(),
+            ));
+        }
+        Ok(artifact)
     }
 
     #[allow(dead_code)]

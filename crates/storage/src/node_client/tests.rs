@@ -68,6 +68,76 @@ fn private_socket_dir(path: &std::path::Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+#[test]
+fn authenticated_artifact_read_rejects_oversized_envelope_before_body_allocation() {
+    const TOPOLOGY_DIGEST: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let credential = crate::control_plane_auth::ControlPlaneScopedCredential::new(
+        crate::control_plane_auth::ControlPlaneScopedCredentialInput {
+            cluster_id: "artifact-read-envelope-limit".to_owned(),
+            credential_id: "artifact-read-admin".to_owned(),
+            credential_version: 1,
+            principal: crate::control_plane_auth::ControlPlaneAuthPrincipal::Admin {
+                instance_id: "artifact-read-admin-1".to_owned(),
+            },
+            secret: b"artifact-read-envelope-limit-secret".to_vec(),
+        },
+    )
+    .unwrap();
+    let auth = StorageRpcClientAuthConfig::from(
+        crate::LivePgMetadataTransferStorageRpcClientCapability::new(
+            credential,
+            1,
+            TOPOLOGY_DIGEST,
+        )
+        .unwrap(),
+    );
+    let kind = StorageRpcMessageKind::MetadataTransferStagingArtifactRead;
+    let request = StorageRpcFrame {
+        request_id: 7,
+        kind,
+        payload: Vec::new(),
+    };
+    let request_proof = auth
+        .sign_request(NodeId::new(7), 1_000, &request)
+        .unwrap()
+        .into_parts()
+        .1;
+    let response_limit = crate::storage_rpc_auth::storage_rpc_auth_response_envelope_limit(
+        kind,
+        auth.transport_limits().max_frame_bytes(),
+    );
+    assert!(response_limit < auth.transport_limits().max_frame_bytes());
+    let declared_len = u32::try_from(response_limit + 1).unwrap();
+    let mut header = b"ARGSRPCA".to_vec();
+    header.extend_from_slice(&1_u16.to_be_bytes());
+    header.extend_from_slice(&declared_len.to_be_bytes());
+    header.extend_from_slice(&(!declared_len).to_be_bytes());
+
+    let error = read_unix_storage_rpc_response(
+        &mut std::io::Cursor::new(header),
+        NodeId::new(7),
+        Some(&auth),
+        Some(&request_proof),
+        kind,
+        "read bounded artifact response",
+    )
+    .unwrap_err();
+    let StoreError::StorageRpc {
+        failure, detail, ..
+    } = error
+    else {
+        panic!("oversized authenticated response returned the wrong error: {error:?}");
+    };
+    assert_eq!(
+        failure,
+        crate::storage_rpc::StorageRpcErrorCode::PayloadDecode
+    );
+    assert!(detail
+        .as_str()
+        .contains("exceeds the configured transport limit"));
+}
+
 struct TestStorageNodeServerGuard {
     stop: Arc<std::sync::atomic::AtomicBool>,
     socket_path: std::path::PathBuf,
