@@ -3937,6 +3937,207 @@ fn insert_delete_marker_abandons_persistent_local_contention_at_retry_deadline()
 }
 
 #[test]
+fn insert_delete_marker_abandonment_waits_for_existing_recovery_owner() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let apply_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::InsertDeleteMarker(marker)
+                    if marker.bucket == hook_bucket && marker.key == hook_key
+            ) {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected delete-marker publication contention",
+                });
+            }
+            Ok(())
+        }));
+
+    let held_recovery = Arc::new(Mutex::new(None));
+    let held_recovery_for_hook = Arc::clone(&held_recovery);
+    let recovery_cluster = cluster.clone();
+    let recovery_bucket = bucket.clone();
+    let recovery_key = key.clone();
+    let budget_hook = cluster.test_install_object_metadata_command_definitive_retry_hook(Arc::new(
+        move |command, source| {
+            if !matches!(
+                command.payload(),
+                MetadataCommandPayload::InsertDeleteMarker(marker)
+                    if marker.bucket == recovery_bucket && marker.key == recovery_key
+            ) || !crate::cluster::request_ops::metadata_command_apply_error_is_contention(source)
+            {
+                return false;
+            }
+            let mut held = held_recovery_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if held.is_none() {
+                *held = Some(
+                    recovery_cluster
+                        .test_begin_metadata_command_recovery_leader(PgId::new(object_pg), command),
+                );
+            }
+            true
+        },
+    ));
+
+    let error = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            crate::OwnerIdentity::from_principal("owner"),
+            |_| Ok::<(), ()>(()),
+        )
+        .expect_err("foreground abandonment must defer to the existing recovery owner");
+
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+    ));
+    let pg_id = PgId::new(object_pg);
+    let pending = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("the recovery-owned command must remain pending");
+    assert!(matches!(
+        pending.payload(),
+        MetadataCommandPayload::InsertDeleteMarker(marker)
+            if marker.bucket == bucket && marker.key == key
+    ));
+
+    drop(
+        held_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take(),
+    );
+    drop(budget_hook);
+    drop(apply_hook);
+    cluster
+        .drain_pending_metadata_commands_for_static_map()
+        .unwrap();
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn stale_object_version_abandonment_waits_for_existing_recovery_owner() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(object_pg);
+    let stale_version = crate::VersionId::from_u64(1);
+    let advance = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            key.clone(),
+            stale_version,
+        )),
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        pg.apply_metadata_command(&advance).unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    let stale = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            key,
+            stale_version,
+        )),
+    );
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &stale);
+    let recovery = cluster.test_begin_metadata_command_recovery_leader(pg_id, &stale);
+
+    let error = cluster
+        .test_apply_new_object_metadata_command_for_bucket_with_budget(
+            pg_id,
+            &bucket,
+            &stale,
+            Duration::from_millis(20),
+        )
+        .expect_err("stale-version abandonment must defer to the existing recovery owner");
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(stale.clone()),
+        "the recovery-owned stale reservation must remain pending"
+    );
+
+    drop(recovery);
+    let error = cluster
+        .test_apply_new_object_metadata_command_for_bucket_with_budget(
+            pg_id,
+            &bucket,
+            &stale,
+            Duration::from_millis(20),
+        )
+        .expect_err("the authorized retry must report the stale reservation for reinspection");
+    assert!(
+        matches!(
+            &error,
+            crate::ObjectPgActionError::Metadata(
+                crate::MetadataError::ObjectVersionReservationConflict { version_id }
+            ) if *version_id == stale_version
+        ),
+        "unexpected authorized stale-version cleanup result: {error:?}"
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
 fn suspended_delete_marker_reinspects_replacement_after_transported_contention() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

@@ -2330,6 +2330,7 @@ impl StorageCluster {
             bucket,
             command,
             fallback_error,
+            None,
         )
     }
 
@@ -2436,6 +2437,7 @@ impl StorageCluster {
                             bucket,
                             command,
                             fallback_error,
+                            None,
                             confirmation_deadline,
                         )
                         .map_err(|error| {
@@ -2479,6 +2481,7 @@ impl StorageCluster {
                         bucket,
                         command,
                         fallback_error,
+                        None,
                         confirmation_deadline,
                     )
                     .map_err(|error| {

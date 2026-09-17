@@ -808,8 +808,37 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
         work_budget: Option<&mut super::RequestWorkBudget>,
     ) -> Result<(), ObjectPgActionError> {
+        let owned_recovery_guard = if let Some(recovery_guard) = recovery_guard {
+            if !recovery_guard.owns_lineage_command(pg_id, command) {
+                return Err(ObjectPgActionError::Store(
+                    StoreError::RouteCapabilitySubjectMismatch {
+                        operation: "abandon-object-metadata-command",
+                    },
+                ));
+            }
+            None
+        } else {
+            let deadline = Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+            match self
+                .local_map
+                .runtime_state()
+                .join_metadata_command_recovery_until(pg_id, command, deadline)
+            {
+                MetadataCommandRecoveryAdmission::Leader(recovery_guard) => {
+                    Some(recovery_guard)
+                }
+                MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery { .. }
+                | MetadataCommandRecoveryAdmission::Waited { .. }
+                | MetadataCommandRecoveryAdmission::TimedOut { .. } => {
+                    return Err(
+                        ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery,
+                    );
+                }
+            }
+        };
         self.record_abandoned_metadata_command_to_acting_set(command)
             .map_err(|error| {
                 super::bucket_snapshot_error_to_object_pg_action_error(error.source)
@@ -835,6 +864,13 @@ impl super::StorageCluster {
                 .remove_pending_metadata_command_for_bucket(pg_id, bucket, command)
                 .map_err(ObjectPgActionError::from)?,
         };
+        if let Some(recovery_guard) = owned_recovery_guard {
+            let relinquished = self.complete_metadata_command_recovery_guard(
+                recovery_guard,
+                PendingMetadataCommandOutcome::Abandoned,
+            );
+            debug_assert!(!relinquished, "abandoned command cannot retain its pending slot");
+        }
         Ok(())
     }
 
@@ -843,8 +879,42 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
         deadline: Instant,
     ) -> Result<(), ObjectPgActionError> {
+        let owned_recovery_guard = if let Some(recovery_guard) = recovery_guard {
+            if !recovery_guard.owns_lineage_command(pg_id, command) {
+                return Err(ObjectPgActionError::Store(
+                    StoreError::RouteCapabilitySubjectMismatch {
+                        operation: "abandon-object-metadata-command-until",
+                    },
+                ));
+            }
+            None
+        } else {
+            let recovery_admission_deadline =
+                Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+            match self
+                .local_map
+                .runtime_state()
+                .join_metadata_command_recovery_until(
+                    pg_id,
+                    command,
+                    recovery_admission_deadline,
+                )
+            {
+                MetadataCommandRecoveryAdmission::Leader(recovery_guard) => {
+                    Some(recovery_guard)
+                }
+                MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery { .. }
+                | MetadataCommandRecoveryAdmission::Waited { .. }
+                | MetadataCommandRecoveryAdmission::TimedOut { .. } => {
+                    return Err(
+                        ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery,
+                    );
+                }
+            }
+        };
         self.record_abandoned_metadata_command_to_acting_set_until(command, deadline)
             .map_err(|error| {
                 super::bucket_snapshot_error_to_object_pg_action_error(error.source)
@@ -877,6 +947,13 @@ impl super::StorageCluster {
                 },
             ));
         }
+        if let Some(recovery_guard) = owned_recovery_guard {
+            let relinquished = self.complete_metadata_command_recovery_guard(
+                recovery_guard,
+                PendingMetadataCommandOutcome::Abandoned,
+            );
+            debug_assert!(!relinquished, "abandoned command cannot retain its pending slot");
+        }
         Ok(())
     }
 
@@ -886,11 +963,16 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         source: ObjectPgActionError,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
         deadline: Instant,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         let can_reinspect = object_pg_action_error_is_retryable_command_observation(&source);
         match self.abandon_definitively_unapplied_object_metadata_command_until(
-            pg_id, bucket, command, deadline,
+            pg_id,
+            bucket,
+            command,
+            recovery_guard,
+            deadline,
         ) {
             Ok(()) if can_reinspect => {
                 Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(source))
@@ -917,7 +999,7 @@ impl super::StorageCluster {
         deadline: Instant,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         self.finish_definitively_not_reissued_object_metadata_command_until(
-            pg_id, bucket, command, source, deadline,
+            pg_id, bucket, command, source, None, deadline,
         )
     }
 
@@ -950,7 +1032,11 @@ impl super::StorageCluster {
             {
                 if retrying_definitively_unapplied_contention {
                     self.abandon_definitively_unapplied_object_metadata_command(
-                        pg_id, bucket, &command, None,
+                        pg_id,
+                        bucket,
+                        &command,
+                        recovery_guard,
+                        None,
                     )?;
                     return Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
                         ObjectPgActionError::Store(error),
@@ -961,6 +1047,7 @@ impl super::StorageCluster {
                     bucket,
                     &command,
                     error,
+                    recovery_guard,
                 );
             }
             retrying_definitively_unapplied_contention = false;
@@ -1056,7 +1143,11 @@ impl super::StorageCluster {
                         ) {
                             if !command_is_irrevocable {
                                 self.abandon_definitively_unapplied_object_metadata_command(
-                                    pg_id, bucket, &command, None,
+                                    pg_id,
+                                    bucket,
+                                    &command,
+                                    recovery_guard,
+                                    None,
                                 )?;
                                 return Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
                                     ObjectPgActionError::Store(error),
@@ -1067,6 +1158,7 @@ impl super::StorageCluster {
                                 bucket,
                                 &command,
                                 error,
+                                recovery_guard,
                             );
                         }
                         retrying_definitively_unapplied_contention = !command_is_irrevocable;
@@ -1089,7 +1181,11 @@ impl super::StorageCluster {
                         ) {
                             if !command_is_irrevocable {
                                 self.abandon_definitively_unapplied_object_metadata_command(
-                                    pg_id, bucket, &command, None,
+                                    pg_id,
+                                    bucket,
+                                    &command,
+                                    recovery_guard,
+                                    None,
                                 )?;
                                 return Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
                                     ObjectPgActionError::Store(error),
@@ -1100,6 +1196,7 @@ impl super::StorageCluster {
                                 bucket,
                                 &command,
                                 error,
+                                recovery_guard,
                             );
                         }
                         retrying_definitively_unapplied_contention = !command_is_irrevocable;
@@ -1117,6 +1214,7 @@ impl super::StorageCluster {
                                 bucket,
                                 &command,
                                 error,
+                                recovery_guard,
                             );
                         }
                         continue;
@@ -1177,6 +1275,7 @@ impl super::StorageCluster {
                                         bucket,
                                         &command,
                                         error,
+                                        recovery_guard,
                                     );
                             }
                             continue;
@@ -1240,6 +1339,7 @@ impl super::StorageCluster {
                                         bucket,
                                         &command,
                                         source,
+                                        recovery_guard,
                                         work_budget.deadline(),
                                     );
                             }
@@ -1254,6 +1354,7 @@ impl super::StorageCluster {
                                     bucket,
                                     &lineage_tip,
                                     super::bucket_snapshot_error_to_object_pg_action_error(source),
+                                    recovery_guard,
                                 );
                             }
                             Err(super::ReissuePendingMetadataCommandFailure::MayHaveReissued {
@@ -1265,6 +1366,7 @@ impl super::StorageCluster {
                                     bucket,
                                     &lineage_tip,
                                     super::bucket_snapshot_error_to_object_pg_action_error(source),
+                                    recovery_guard,
                                 );
                             }
                         };
@@ -1284,25 +1386,13 @@ impl super::StorageCluster {
                             &command, &source,
                         )
                     {
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
-                            .map_err(|error| {
-                                super::bucket_snapshot_error_to_object_pg_action_error(error.source)
-                            })?;
-                        let pending = self.pending_metadata_command_for_bucket(pg_id, bucket)?;
-                        if pending.as_ref() != Some(&command) {
-                            return Err(super::conflicting_pending_object_metadata_command(
-                                "pending object metadata command changed before stale version cleanup",
-                            ));
-                        }
-                        self.release_metadata_command_bucket_write_reservation(&command)
-                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                        self.remove_pending_metadata_command_for_bucket_with_work_budget(
+                        self.abandon_definitively_unapplied_object_metadata_command(
                             pg_id,
                             bucket,
                             &command,
-                            work_budget,
-                        )
-                        .map_err(ObjectPgActionError::from)?;
+                            recovery_guard,
+                            Some(work_budget),
+                        )?;
                         return Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
                             super::bucket_snapshot_error_to_object_pg_action_error(source),
                         ));
@@ -1314,6 +1404,7 @@ impl super::StorageCluster {
                             pg_id,
                             bucket,
                             &command,
+                            recovery_guard,
                             Some(work_budget),
                         )?;
                         if can_reinspect {
@@ -1339,12 +1430,14 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         budget_error: StoreError,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         self.finish_new_object_metadata_command_after_uncertainty(
             pg_id,
             bucket,
             command,
             ObjectPgActionError::Store(budget_error),
+            recovery_guard,
         )
     }
 
@@ -1354,6 +1447,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         fallback_error: ObjectPgActionError,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         let confirmation_deadline =
             Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
@@ -1362,6 +1456,7 @@ impl super::StorageCluster {
             bucket,
             command,
             fallback_error,
+            recovery_guard,
             confirmation_deadline,
         )
     }
@@ -1372,6 +1467,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         fallback_error: ObjectPgActionError,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
         confirmation_deadline: Instant,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         let can_reinspect =
@@ -1412,6 +1508,7 @@ impl super::StorageCluster {
                         pg_id,
                         bucket,
                         command,
+                        recovery_guard,
                         confirmation_deadline,
                     )
                 {

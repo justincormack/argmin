@@ -1615,6 +1615,20 @@ impl MetadataCommandRecoveryGuard {
         self.root_key == MetadataCommandRecoveryKey::new(pg_id, command)
     }
 
+    pub(crate) fn owns_lineage_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> bool {
+        let key = MetadataCommandRecoveryKey::new(pg_id, command);
+        let state = self
+            .flight
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.in_progress && state.keys.contains(&key)
+    }
+
     pub(crate) fn lineage_tip(&self) -> MetadataCommandEnvelope {
         self.flight
             .state

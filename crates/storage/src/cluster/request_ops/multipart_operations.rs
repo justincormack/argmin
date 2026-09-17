@@ -2875,6 +2875,7 @@ impl super::StorageCluster {
             bucket,
             command,
             fallback_error,
+            None,
         )? {
             NewObjectMetadataCommandApplyOutcome::Applied
             | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
