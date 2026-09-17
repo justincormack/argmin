@@ -1252,10 +1252,15 @@ pub(crate) trait RetainedPlacedShardNodeClient: Send + Sync {
 }
 
 pub(crate) trait RetainedPlacedShardRoute: Send {
+    /// Read the exact retained shard and return an acknowledgement computed
+    /// from those returned bytes. Implementations crossing a transport must
+    /// reject a response whose payload does not match its acknowledgement.
     fn read_placed_shard_for_historical_inspection(
         &self,
     ) -> Result<(Vec<u8>, WriteAck), StoreError>;
 
+    /// Read into the caller's buffer with the same self-validation contract as
+    /// `read_placed_shard_for_historical_inspection`.
     fn read_placed_shard_for_historical_inspection_into(
         &self,
         dst: &mut [u8],

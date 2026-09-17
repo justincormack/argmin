@@ -1,6 +1,120 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+fn systematic_data_shard_acks_match_segment(
+    shard_acks: &[WriteAck],
+    stored_size: usize,
+    segment_crc64: u64,
+) -> bool {
+    let Some((first, remaining)) = shard_acks.split_first() else {
+        return false;
+    };
+    let mut combined_crc64 = first.crc64;
+    let mut padded_size = first.stored_size;
+    for ack in remaining {
+        combined_crc64 = checksum::crc64::combine(combined_crc64, ack.crc64, ack.stored_size);
+        let Some(next_size) = padded_size.checked_add(ack.stored_size) else {
+            return false;
+        };
+        padded_size = next_size;
+    }
+
+    let Ok(stored_size) = u64::try_from(stored_size) else {
+        return false;
+    };
+    let Some(padding_size) = padded_size.checked_sub(stored_size) else {
+        return false;
+    };
+    let Ok(padding_size) = usize::try_from(padding_size) else {
+        return false;
+    };
+    // Erasure coding pads the concatenated systematic shards only at the end,
+    // by fewer than k bytes. Extend the segment checksum over those zeros so
+    // it can be compared with the composed shard acknowledgements
+    // without rescanning the assembled payload.
+    const ZERO_PADDING: [u8; u8::MAX as usize] = [0; u8::MAX as usize];
+    let Some(padding) = ZERO_PADDING.get(..padding_size) else {
+        return false;
+    };
+    let padded_segment_crc64 = checksum::crc64::combine(
+        segment_crc64,
+        checksum::crc64::checksum(padding),
+        padding_size as u64,
+    );
+    combined_crc64 == padded_segment_crc64
+}
+
+#[cfg(test)]
+mod systematic_data_shard_crc_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn write_ack(bytes: &[u8]) -> WriteAck {
+        WriteAck {
+            crc64: checksum::crc64::checksum(bytes),
+            stored_size: bytes.len() as u64,
+        }
+    }
+
+    #[test]
+    fn one_data_shard_ack_matches_exact_segment_without_payload_input() {
+        let payload = b"one-plus-zero benchmark payload";
+        assert!(systematic_data_shard_acks_match_segment(
+            &[write_ack(payload)],
+            payload.len(),
+            checksum::crc64::checksum(payload),
+        ));
+    }
+
+    #[test]
+    fn systematic_shard_acks_match_zero_padded_segment() {
+        let payload = b"four data shards need padding";
+        let padded_size = payload.len().div_ceil(4) * 4;
+        let mut padded = payload.to_vec();
+        padded.resize(padded_size, 0);
+        let shard_size = padded_size / 4;
+        let shard_acks: Vec<_> = padded.chunks_exact(shard_size).map(write_ack).collect();
+
+        assert!(systematic_data_shard_acks_match_segment(
+            &shard_acks,
+            payload.len(),
+            checksum::crc64::checksum(payload),
+        ));
+    }
+
+    #[test]
+    fn systematic_shard_ack_mismatch_does_not_authorize_fast_path() {
+        let payload = b"durable shard acknowledgement mismatch";
+        let mut ack = write_ack(payload);
+        ack.crc64 ^= 1;
+        assert!(!systematic_data_shard_acks_match_segment(
+            &[ack],
+            payload.len(),
+            checksum::crc64::checksum(payload),
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn composed_systematic_shard_evidence_matches_whole_segment_crc(
+            payload in prop::collection::vec(any::<u8>(), 1..4096),
+            data_shards in 1usize..=16,
+        ) {
+            let padded_size = payload.len().div_ceil(data_shards) * data_shards;
+            let mut padded = payload.clone();
+            padded.resize(padded_size, 0);
+            let shard_size = padded_size / data_shards;
+            let shard_acks: Vec<_> = padded.chunks_exact(shard_size).map(write_ack).collect();
+
+            prop_assert!(systematic_data_shard_acks_match_segment(
+                &shard_acks,
+                payload.len(),
+                checksum::crc64::checksum(&payload),
+            ));
+        }
+    }
+}
+
 impl StorageCluster {
     #[cfg(test)]
     pub(crate) fn audit_shard_storage_for_scavenger(
@@ -2510,6 +2624,7 @@ impl StorageCluster {
         let padded = shard_size * k;
         dst.clear();
         dst.resize(padded, 0);
+        let mut direct_acks = Vec::with_capacity(k);
 
         for shard_index in 0..k {
             let Some(location) = locations.get(shard_index).copied() else {
@@ -2546,19 +2661,33 @@ impl StorageCluster {
                 &shard_key,
                 &mut dst[start..end],
             );
-            if let Err(error) = read {
-                let temporarily_unavailable = match placed_segment_recoverable_shard_error(error)? {
-                    RecoverableShardReadFailure::RepairRequired => None,
-                    RecoverableShardReadFailure::TemporarilyUnavailable(error) => Some(error),
-                };
-                return Ok(PlacedSegmentDirectReadOutcome::Recover {
-                    temporarily_unavailable,
-                });
+            match read {
+                Ok(ack) => direct_acks.push(ack),
+                Err(error) => {
+                    let temporarily_unavailable =
+                        match placed_segment_recoverable_shard_error(error)? {
+                            RecoverableShardReadFailure::RepairRequired => None,
+                            RecoverableShardReadFailure::TemporarilyUnavailable(error) => {
+                                Some(error)
+                            }
+                        };
+                    return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                        temporarily_unavailable,
+                    });
+                }
             }
         }
 
         dst.truncate(req.stored_size);
-        if checksum::crc64::checksum(dst) == req.segment_crc64 {
+        // Each exact owner computes its acknowledgement from the returned
+        // shard bytes, and authenticated transports validate that binding.
+        // Compose that evidence rather than hashing the assembled segment for
+        // a second full pass.
+        if systematic_data_shard_acks_match_segment(
+            &direct_acks,
+            req.stored_size,
+            req.segment_crc64,
+        ) {
             Ok(PlacedSegmentDirectReadOutcome::Complete)
         } else {
             // A checksum mismatch needs the full shard set so recovery can
@@ -2732,6 +2861,15 @@ impl StorageCluster {
             }
             direct_acks.push(ack);
         }
+        // Each read below checks the exact stored bytes against these durable
+        // per-shard acknowledgements. CRC composition therefore proves the
+        // assembled systematic payload against the segment checksum without a
+        // second full pass over dst.
+        let shard_acks_match_segment = systematic_data_shard_acks_match_segment(
+            &direct_acks,
+            req.stored_size,
+            req.segment_crc64,
+        );
         let mut read_handles = match reader.acquire_read_handles(0..k) {
             Ok(read_handles) => read_handles,
             Err(error) => {
@@ -2788,8 +2926,7 @@ impl StorageCluster {
         read_handles.release().map_err(shard_io_error_to_store)?;
 
         dst.truncate(req.stored_size);
-        let actual_crc64 = checksum::crc64::checksum(dst);
-        if actual_crc64 == req.segment_crc64 {
+        if shard_acks_match_segment {
             Ok(PlacedSegmentDirectReadOutcome::Complete)
         } else {
             Ok(PlacedSegmentDirectReadOutcome::Recover {

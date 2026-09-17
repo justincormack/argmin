@@ -6310,18 +6310,6 @@ impl LocalClusterMap {
                 },
             });
         }
-        let actual = checksum::crc64::checksum(&data);
-        if actual != ack.crc64 {
-            return Err(ShardIoError::Store {
-                node_id: location.node_id().as_u32(),
-                pg_id: location.data_pg_id().get(),
-                cluster_epoch: location.cluster_epoch(),
-                source: StoreError::IntegrityError {
-                    expected: ack.crc64,
-                    actual,
-                },
-            });
-        }
         Ok((data, ack))
     }
 
@@ -6348,18 +6336,6 @@ impl LocalClusterMap {
                 source: StoreError::Io {
                     context: "read payload shard size mismatch",
                     source: std::io::Error::from(std::io::ErrorKind::InvalidData),
-                },
-            });
-        }
-        let actual = checksum::crc64::checksum(dst);
-        if actual != ack.crc64 {
-            return Err(ShardIoError::Store {
-                node_id: location.node_id().as_u32(),
-                pg_id: location.data_pg_id().get(),
-                cluster_epoch: location.cluster_epoch(),
-                source: StoreError::IntegrityError {
-                    expected: ack.crc64,
-                    actual,
                 },
             });
         }
