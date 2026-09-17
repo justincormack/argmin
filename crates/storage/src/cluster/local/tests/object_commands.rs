@@ -3024,7 +3024,7 @@ fn lifecycle_noncurrent_and_delete_marker_expiration_use_object_commands() {
 }
 
 #[test]
-fn lifecycle_noncurrent_pending_install_race_reruns_selector() {
+fn lifecycle_noncurrent_pending_install_recovery_handoff_reruns_selector() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3131,6 +3131,25 @@ fn lifecycle_noncurrent_pending_install_race_reruns_selector() {
             .unwrap();
         }),
     );
+    let recovery_handoff_injected = Arc::new(AtomicBool::new(false));
+    let recovery_handoff_injected_for_hook = Arc::clone(&recovery_handoff_injected);
+    let handoff_version_id = older.version_id;
+    let _drain_hook = first_cluster
+        .test_install_pending_object_metadata_command_drain_attempt_hook(Arc::new(
+            move |command, _work_budget| {
+                if matches!(
+                    command.payload(),
+                    MetadataCommandPayload::PutObjectMetadata(put)
+                        if put.object.version_id == handoff_version_id
+                ) && !recovery_handoff_injected_for_hook.swap(true, Ordering::SeqCst)
+                {
+                    return Err(
+                        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery,
+                    );
+                }
+                Ok(())
+            },
+        ));
 
     let calls_for_selector = Arc::clone(&selector_calls);
     let reclaimed = first_cluster
@@ -3157,6 +3176,7 @@ fn lifecycle_noncurrent_pending_install_race_reruns_selector() {
         .unwrap();
     assert!(reclaimed.is_empty());
     assert!(hook_ran.load(Ordering::SeqCst));
+    assert!(recovery_handoff_injected.load(Ordering::SeqCst));
     assert_eq!(
         selector_calls.load(Ordering::SeqCst),
         2,

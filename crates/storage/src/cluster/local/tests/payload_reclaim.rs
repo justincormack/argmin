@@ -850,6 +850,184 @@ fn object_payload_reclaim_retry_releases_surviving_terminal_claim() {
 }
 
 #[test]
+fn lifecycle_delete_marker_waits_for_authorized_payload_reclaim_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, marker_key, reclaim_key, object_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "lifecycle-reclaim-handoff-");
+        let marker_key = key_for_object_pg(topology, &bucket, 2, "marker-");
+        let reclaim_key = key_for_object_pg(topology, &bucket, 2, "reclaim-");
+        (bucket, marker_key, reclaim_key, 2)
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, 0, NodeId::new(2));
+    set_route_primary(&mut map, 3, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+    put_test_lifecycle(&cluster, &bucket);
+    let marker = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &marker_key,
+            crate::BucketVersioningState::Enabled,
+            crate::OwnerIdentity::from_principal("owner"),
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    let committed = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &reclaim_key,
+        crate::BucketVersioningState::Enabled,
+        [0xc1; 16],
+        [0xc2; 16],
+        b"payload reclaim before lifecycle marker cleanup",
+    );
+    cluster
+        .delete_current_object_if(&bucket, &reclaim_key, |_| Ok::<(), ()>(()))
+        .unwrap()
+        .unwrap();
+
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let hook_bucket = bucket.clone();
+    let hook_key = reclaim_key.clone();
+    let generation_id = committed.generation_id;
+    let fail_once_hook = Arc::clone(&fail_once);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::DeleteObjectPayloadReclaim(reclaim)
+                    if reclaim.matches_request(&hook_bucket, &hook_key, generation_id)
+                        && node_id == NodeId::new(2)
+                        && fail_once_hook.swap(false, Ordering::SeqCst)
+            ) {
+                return Err(StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "injected lifecycle payload reclaim apply failure",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "injected lifecycle payload reclaim apply failure".to_owned(),
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ));
+    assert!(cluster
+        .reclaim_object_payload_if_unleased(&bucket, &reclaim_key, generation_id)
+        .expect("published reclaim must retain its incomplete command"));
+    drop(hook_guard);
+    assert!(!fail_once.load(Ordering::SeqCst));
+
+    let pg_id = PgId::new(object_pg);
+    let pending = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("partial payload reclaim must remain pending");
+    assert!(matches!(
+        pending.payload(),
+        MetadataCommandPayload::DeleteObjectPayloadReclaim(reclaim)
+            if reclaim.matches_request(&bucket, &reclaim_key, generation_id)
+    ));
+    let crate::cluster::MetadataCommandRecoveryAdmission::Leader(owner) = map
+        .runtime_state()
+        .join_metadata_command_recovery(pg_id, &pending)
+    else {
+        panic!("test must acquire the payload reclaim recovery flight");
+    };
+    owner.mark_irreversible_handoff(
+        crate::cluster::MetadataCommandRecoveryResolution::IrrevocableConvergencePending,
+    );
+    owner.relinquish_for_authorized_recovery();
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &pending));
+
+    let (recovery_wait_tx, recovery_wait_rx) = std::sync::mpsc::sync_channel(1);
+    let pending_id = pending.id();
+    let signalled = Arc::new(AtomicBool::new(false));
+    let signalled_hook = Arc::clone(&signalled);
+    let _recovery_wait_hook = cluster
+        .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+            move |command| {
+                if command.id() == pending_id && !signalled_hook.swap(true, Ordering::SeqCst) {
+                    recovery_wait_tx.send(()).unwrap();
+                }
+            },
+        ));
+
+    thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let lifecycle_cluster = Arc::clone(&cluster);
+        let lifecycle_bucket = bucket.clone();
+        let lifecycle_key = marker_key.clone();
+        scope.spawn(move || {
+            result_tx
+                .send(lifecycle_cluster.delete_expired_delete_marker_if_due_raw(
+                    &lifecycle_bucket,
+                    &lifecycle_key,
+                    marker.version_id,
+                    current_bucket_incarnation(&lifecycle_cluster, &lifecycle_bucket),
+                    |_, _| Ok::<_, ()>(true),
+                ))
+                .unwrap();
+        });
+
+        recovery_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lifecycle marker cleanup did not wait for authorized reclaim recovery");
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &pending));
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &pending, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lifecycle marker cleanup did not resume after authorized recovery")
+            .unwrap()
+            .unwrap());
+    });
+
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let object_pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_version(
+                &*object_pg,
+                &bucket,
+                &marker_key,
+                marker.version_id,
+            ),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+    assert_clean_metadata_command_stream(&map, &[1, object_pg]);
+}
+
+#[test]
 fn durable_reclaim_scan_recovers_lost_local_queue_after_reopen() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
