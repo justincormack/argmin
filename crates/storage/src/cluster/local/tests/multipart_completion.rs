@@ -755,7 +755,7 @@ fn object_generation_reservation_transfers_pending_direct_put_commit_to_recovery
 }
 
 #[test]
-fn object_delete_transfers_pending_direct_put_commit_to_recovery_before_delete() {
+fn object_delete_waits_for_pending_direct_put_authorized_recovery_before_delete() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -855,39 +855,75 @@ fn object_delete_transfers_pending_direct_put_commit_to_recovery_before_delete()
         assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
     }
 
-    let error = cluster
-        .delete_current_object_if(&bucket, &key, |_stored| -> Result<(), ()> {
-            panic!("unrelated delete must not run its condition before recovery")
-        })
-        .expect_err("unrelated delete must leave published trailing work to recovery");
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
-    ));
     let pending_command = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
         .expect("transferred direct PUT command must remain pending");
-    assert_eq!(
-        cluster
-            .drain_pending_metadata_command_with_authorized_recovery_route(
-                PgId::new(object_pg),
-                &pending_command,
-                &cluster,
-            )
-            .unwrap(),
-        PendingMetadataCommandOutcome::Applied
-    );
+    let pg_id = PgId::new(object_pg);
+    let (recovery_wait_tx, recovery_wait_rx) = std::sync::mpsc::sync_channel(1);
+    let pending_id = pending_command.id();
+    let signalled = Arc::new(AtomicBool::new(false));
+    let signalled_hook = Arc::clone(&signalled);
+    let _recovery_wait_hook = cluster
+        .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+            move |command| {
+                if command.id() == pending_id && !signalled_hook.swap(true, Ordering::SeqCst) {
+                    recovery_wait_tx.send(()).unwrap();
+                }
+            },
+        ));
+    let condition_ran = Arc::new(AtomicBool::new(false));
+    let outcome = thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let delete_cluster = Arc::clone(&cluster);
+        let delete_bucket = bucket.clone();
+        let delete_key = key.clone();
+        let condition_ran_for_delete = Arc::clone(&condition_ran);
+        scope.spawn(move || {
+            result_tx
+                .send(delete_cluster.delete_current_object_if(
+                    &delete_bucket,
+                    &delete_key,
+                    |stored| {
+                        let stored =
+                            stored.expect("pending direct PUT should be applied before delete");
+                        let live = stored
+                            .as_live()
+                            .expect("pending direct PUT should publish a live object");
+                        assert_eq!(live.generation_id, generation_id);
+                        condition_ran_for_delete.store(true, Ordering::SeqCst);
+                        Ok::<(), ()>(())
+                    },
+                ))
+                .unwrap();
+        });
 
-    let outcome = cluster
-        .delete_current_object_if(&bucket, &key, |stored| {
-            let stored = stored.expect("pending direct PUT should be applied before delete");
-            let live = stored
-                .as_live()
-                .expect("pending direct PUT should publish a live object");
-            assert_eq!(live.generation_id, generation_id);
-            Ok::<(), ()>(())
-        })
-        .unwrap()
-        .unwrap();
+        recovery_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("object delete did not wait for authorized direct PUT recovery");
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(
+            !condition_ran.load(Ordering::SeqCst),
+            "delete condition must not run before the pending direct PUT converges"
+        );
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id,
+                    &pending_command,
+                    &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("object delete did not resume after authorized direct PUT recovery")
+            .unwrap()
+            .unwrap()
+    });
+    assert!(condition_ran.load(Ordering::SeqCst));
     assert!(matches!(
         outcome.deleted,
         crate::DeletedCurrentObject::Live {

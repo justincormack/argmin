@@ -1028,6 +1028,165 @@ fn lifecycle_delete_marker_waits_for_authorized_payload_reclaim_recovery() {
 }
 
 #[test]
+fn current_delete_waits_for_authorized_overwrite_reclaim_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    let old = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [0xd1; 16],
+        [0xd2; 16],
+        b"same payload",
+    );
+    let replacement = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [0xd3; 16],
+        [0xd4; 16],
+        b"same payload",
+    );
+    assert!(cluster
+        .payload_reclaim_exists(&bucket, &key, old.generation_id)
+        .unwrap());
+
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let old_generation_id = old.generation_id;
+    let fail_once_hook = Arc::clone(&fail_once);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::DeleteObjectPayloadReclaim(reclaim)
+                    if reclaim.matches_request(&hook_bucket, &hook_key, old_generation_id)
+                        && node_id == NodeId::new(2)
+                        && fail_once_hook.swap(false, Ordering::SeqCst)
+            ) {
+                return Err(StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "injected overwrite reclaim apply failure",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "injected overwrite reclaim apply failure".to_owned(),
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ));
+    assert!(cluster
+        .reclaim_object_payload_if_unleased(&bucket, &key, old_generation_id)
+        .expect("published overwrite reclaim must retain its incomplete command"));
+    drop(hook_guard);
+    assert!(!fail_once.load(Ordering::SeqCst));
+
+    let pg_id = PgId::new(object_pg);
+    let pending = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("partial overwrite reclaim must remain pending");
+    assert!(matches!(
+        pending.payload(),
+        MetadataCommandPayload::DeleteObjectPayloadReclaim(reclaim)
+            if reclaim.matches_request(&bucket, &key, old_generation_id)
+    ));
+    let crate::cluster::MetadataCommandRecoveryAdmission::Leader(owner) = map
+        .runtime_state()
+        .join_metadata_command_recovery(pg_id, &pending)
+    else {
+        panic!("test must acquire the overwrite reclaim recovery flight");
+    };
+    owner.mark_irreversible_handoff(
+        crate::cluster::MetadataCommandRecoveryResolution::IrrevocableConvergencePending,
+    );
+    owner.relinquish_for_authorized_recovery();
+    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &pending));
+
+    let (recovery_wait_tx, recovery_wait_rx) = std::sync::mpsc::sync_channel(1);
+    let pending_id = pending.id();
+    let signalled = Arc::new(AtomicBool::new(false));
+    let signalled_hook = Arc::clone(&signalled);
+    let _recovery_wait_hook = cluster
+        .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+            move |command| {
+                if command.id() == pending_id && !signalled_hook.swap(true, Ordering::SeqCst) {
+                    recovery_wait_tx.send(()).unwrap();
+                }
+            },
+        ));
+
+    thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let delete_cluster = Arc::clone(&cluster);
+        let delete_bucket = bucket.clone();
+        let delete_key = key.clone();
+        scope.spawn(move || {
+            result_tx
+                .send(delete_cluster.delete_current_object_if(
+                    &delete_bucket,
+                    &delete_key,
+                    |stored| {
+                        assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                        Ok::<_, ()>(())
+                    },
+                ))
+                .unwrap();
+        });
+
+        recovery_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("current delete did not wait for authorized overwrite reclaim recovery");
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &pending));
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &pending, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        let deleted = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("current delete did not resume after authorized reclaim recovery")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            deleted.deleted,
+            crate::DeletedCurrentObject::Live { generation_id, .. }
+                if generation_id == replacement.generation_id
+        ));
+    });
+
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert!(cluster.test_get_object_meta(&bucket, &key).is_err());
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
 fn durable_reclaim_scan_recovers_lost_local_queue_after_reopen() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
