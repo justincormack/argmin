@@ -119,6 +119,8 @@ const METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_ANCHOR_STATE_RECORD_PREFIX: 
     "metadata_transfer_staging_evidence_checkpoint_anchor=";
 const METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_STATE_RECORD_PREFIX: &str =
     "metadata_transfer_staging_actor_closure=";
+const METADATA_TRANSFER_STAGING_RETIRED_ACTOR_CLOSURE_STATE_RECORD_PREFIX: &str =
+    "metadata_transfer_staging_retired_actor_closure=";
 const METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_STATE_RECORD_PREFIX: &str =
     "metadata_transfer_staging_finalized_floor=";
 pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
@@ -137,7 +139,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 42;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 43;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 const METADATA_TRANSFER_STAGING_CLEANUP_DIGEST_DOMAIN: &[u8] =
@@ -146,6 +148,8 @@ const METADATA_TRANSFER_STAGING_CHECKPOINT_SEGMENT_DIGEST_DOMAIN: &[u8] =
     b"argmin-metadata-transfer-staging-checkpoint-segment-v1";
 const METADATA_TRANSFER_STAGING_CHECKPOINT_SOURCE_SEGMENTS_DIGEST_DOMAIN: &[u8] =
     b"argmin-metadata-transfer-staging-checkpoint-source-segments-v1";
+const METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_CERTIFICATE_DIGEST_DOMAIN: &[u8] =
+    b"argmin-metadata-transfer-staging-actor-closure-certificate-v1";
 pub(crate) const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COALESCED_ANCHORS: usize = 64;
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
@@ -923,6 +927,8 @@ pub struct ClusterControlSnapshot {
         BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidenceCheckpointAnchor>,
     metadata_transfer_staging_actor_closures:
         BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureCertificate>,
+    metadata_transfer_staging_retired_actor_closures:
+        BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureCertificate>,
     metadata_transfer_staging_finalized_floors:
         BTreeMap<(PgId, u64), MetadataTransferStagingFinalizedFloor>,
     metadata_transfer_staging_evidence: BTreeMap<MetadataTransferStagingEvidenceKey, Vec<u8>>,
@@ -964,6 +970,7 @@ struct MetadataTransferStagingEvidenceCheckpointPageLink {
     page_digest: [u8; 32],
     previous_apply_receipt_digest: [u8; 32],
     apply_receipt_digest: [u8; 32],
+    actor_closure_candidate: Option<crate::pg_store::MetadataTransferStagingActorClosureCandidate>,
     entries: Vec<MetadataTransferStagingEvidenceCheckpointPageEntry>,
 }
 
@@ -990,11 +997,13 @@ struct MetadataTransferStagingEvidenceCheckpointAnchor {
 struct MetadataTransferStagingFinalizedCheckpointBinding {
     actor_node_id: NodeId,
     actor_node_incarnation: u64,
+    actor_endpoint: String,
     first_generation: u64,
     last_generation: u64,
     page_generation: u64,
     page_sequence: u64,
     segment_digest: [u8; 32],
+    actor_closure_candidate: Option<crate::pg_store::MetadataTransferStagingActorClosureCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1008,6 +1017,42 @@ struct MetadataTransferStagingActorClosureCertificate {
     rebound_entry_count: u64,
     rebound_max_sequence: u64,
     rebound_evidence_digest: [u8; 32],
+}
+
+type MetadataTransferStagingActorClosureTip =
+    (MetadataTransferStagingNodeIdentity, u64, [u8; 32], [u8; 32]);
+
+struct MetadataTransferStagingActorClosureValidationIndex {
+    actor_tips: BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureTip>,
+    actor_genesis: BTreeMap<(NodeId, u64), (String, [u8; 32])>,
+    actor_entries: BTreeMap<(NodeId, u64), BTreeMap<u64, Vec<u8>>>,
+}
+
+fn metadata_transfer_staging_actor_closure_certificate_digest(
+    certificate: &MetadataTransferStagingActorClosureCertificate,
+) -> [u8; 32] {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(
+        &mut hasher,
+        METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_CERTIFICATE_DIGEST_DOMAIN,
+    );
+    for actor in [&certificate.source_actor, &certificate.destination_actor] {
+        digest_u32(&mut hasher, actor.node_id().as_u32());
+        digest_u64(&mut hasher, actor.node_incarnation());
+        digest_bytes(&mut hasher, actor.endpoint().as_bytes());
+    }
+    digest_u64(&mut hasher, certificate.source_tip_generation);
+    digest_bytes(&mut hasher, &certificate.source_tip_page_digest);
+    digest_bytes(&mut hasher, &certificate.source_tip_apply_receipt_digest);
+    digest_bytes(&mut hasher, &certificate.destination_genesis_page_digest);
+    digest_u64(&mut hasher, certificate.rebound_entry_count);
+    digest_u64(&mut hasher, certificate.rebound_max_sequence);
+    digest_bytes(&mut hasher, &certificate.rebound_evidence_digest);
+    hasher
+        .finalize()
+        .bytes()
+        .try_into()
+        .expect("SHA-256 actor-closure certificate digest has fixed length")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1144,8 +1189,134 @@ fn metadata_transfer_staging_finalized_evidence_index(
                 );
             }
         }
+        for (key, binding) in &floor.checkpoint_bindings {
+            if index.contains_key(key) {
+                continue;
+            }
+            let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+                key.actor_node_id,
+                key.actor_node_incarnation,
+                binding.actor_endpoint.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let bytes = metadata_transfer_staging_finalized_semantic_evidence_bytes(
+                floor,
+                &actor,
+                key.kind,
+                key.target_epoch,
+            )?;
+            let evidence = crate::pg_store::decode_staging_evidence(&bytes)
+                .map_err(|error| error.to_string())?;
+            if index
+                .insert(
+                    key.clone(),
+                    MetadataTransferStagingFinalizedEvidenceIndexEntry {
+                        floor,
+                        endpoint: &binding.actor_endpoint,
+                        evidence_digest: checksum::sha256::digest(&bytes),
+                        target_epoch: evidence.target_epoch(),
+                        transfer: evidence.transfer(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(
+                    "metadata-transfer staging finalized replay evidence has a duplicate identity"
+                        .to_owned(),
+                );
+            }
+        }
     }
     Ok(index)
+}
+
+fn metadata_transfer_staging_finalized_semantic_evidence_bytes(
+    floor: &MetadataTransferStagingFinalizedFloor,
+    actor: &crate::pg_store::MetadataTransferStagingNodeIdentity,
+    kind: crate::pg_store::MetadataTransferStagingEvidenceKind,
+    target_epoch: Option<ClusterEpoch>,
+) -> Result<Vec<u8>, String> {
+    let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+        &floor.transition,
+        floor.artifact_digest,
+        floor.artifact_length,
+        floor.artifact_format_version,
+    )
+    .map_err(|error| error.to_string())?;
+    let (source_actor, transfer, expected_digest) = match kind {
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Publication => {
+            let target_epoch = target_epoch.ok_or_else(|| {
+                "metadata-transfer staging finalized publication replay has no target epoch"
+                    .to_owned()
+            })?;
+            let publication = floor
+                .publications
+                .iter()
+                .find(|publication| {
+                    publication.node_id == actor.node_id()
+                        && publication.target_epoch == target_epoch
+                })
+                .ok_or_else(|| {
+                    "metadata-transfer staging finalized publication replay has no semantic source"
+                        .to_owned()
+                })?;
+            let source_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+                publication.node_id,
+                publication.node_incarnation,
+                publication.endpoint.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            (
+                source_actor,
+                Some(publication.transfer),
+                publication.evidence_digest,
+            )
+        }
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone => {
+            if target_epoch.is_some() {
+                return Err(
+                    "metadata-transfer staging finalized tombstone replay has a target epoch"
+                        .to_owned(),
+                );
+            }
+            let tombstone = floor
+                .tombstones
+                .iter()
+                .find(|tombstone| tombstone.node_id == actor.node_id())
+                .ok_or_else(|| {
+                    "metadata-transfer staging finalized tombstone replay has no semantic source"
+                        .to_owned()
+                })?;
+            let source_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+                tombstone.node_id,
+                tombstone.node_incarnation,
+                tombstone.endpoint.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            (source_actor, None, tombstone.evidence_digest)
+        }
+    };
+    let source_bytes = crate::pg_store::canonical_metadata_transfer_staging_evidence(
+        &source_actor,
+        &intent,
+        kind,
+        target_epoch,
+        transfer,
+    )
+    .map_err(|error| error.to_string())?;
+    if checksum::sha256::digest(&source_bytes) != expected_digest {
+        return Err(
+            "metadata-transfer staging finalized semantic source is not canonical".to_owned(),
+        );
+    }
+    crate::pg_store::canonical_metadata_transfer_staging_evidence(
+        actor,
+        &intent,
+        kind,
+        target_epoch,
+        transfer,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn metadata_transfer_staging_finalized_checkpoint_index(
@@ -2163,6 +2334,7 @@ impl ClusterControlSnapshot {
             metadata_transfer_staging_evidence_checkpoint_segments: BTreeMap::new(),
             metadata_transfer_staging_evidence_checkpoint_anchors: BTreeMap::new(),
             metadata_transfer_staging_actor_closures: BTreeMap::new(),
+            metadata_transfer_staging_retired_actor_closures: BTreeMap::new(),
             metadata_transfer_staging_finalized_floors: BTreeMap::new(),
             metadata_transfer_staging_evidence: BTreeMap::new(),
             history: Vec::new(),
@@ -3898,6 +4070,7 @@ impl ClusterControlSnapshot {
 
         type FinalizedPageMember = (u64, MetadataTransferStagingEvidenceKey, [u8; 32], Vec<u8>);
         let mut page_members = BTreeMap::<u64, Vec<FinalizedPageMember>>::new();
+        let mut page_candidates = BTreeMap::new();
         let mut commitments = BTreeMap::new();
         let finalized_members = finalized_checkpoints
             .get(&(
@@ -3949,6 +4122,19 @@ impl ClusterControlSnapshot {
                         .to_owned(),
                 );
             }
+            if let Some(existing) = page_candidates.get(&binding.page_generation) {
+                if existing != &binding.actor_closure_candidate {
+                    return Err(
+                        "metadata-transfer staging checkpoint anchor page has conflicting actor-closure candidates"
+                            .to_owned(),
+                    );
+                }
+            } else {
+                page_candidates.insert(
+                    binding.page_generation,
+                    binding.actor_closure_candidate.clone(),
+                );
+            }
             page_members
                 .entry(binding.page_generation)
                 .or_default()
@@ -3989,14 +4175,19 @@ impl ClusterControlSnapshot {
                 .iter()
                 .map(|(sequence, _, _, evidence)| (*sequence, evidence.clone()))
                 .collect::<Vec<_>>();
-            let page_digest = crate::pg_store::metadata_transfer_staging_checkpoint_page_digest(
-                actor,
-                preceding_generation,
-                preceding_digest,
-                generation,
-                &entries,
-            )
-            .map_err(|error| error.to_string())?;
+            let actor_closure_candidate = page_candidates.remove(&generation).ok_or_else(|| {
+                "metadata-transfer staging checkpoint anchor page has no closure binding".to_owned()
+            })?;
+            let page_digest = crate::pg_store::
+                metadata_transfer_staging_checkpoint_page_digest_with_actor_closure(
+                    actor,
+                    actor_closure_candidate.as_ref(),
+                    preceding_generation,
+                    preceding_digest,
+                    generation,
+                    &entries,
+                )
+                .map_err(|error| error.to_string())?;
             let receipt =
                 crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_checkpoint_link(
                     actor.clone(),
@@ -4010,6 +4201,7 @@ impl ClusterControlSnapshot {
                 page_digest,
                 previous_apply_receipt_digest: preceding_digest,
                 apply_receipt_digest: receipt_digest,
+                actor_closure_candidate,
                 entries: members
                     .into_iter()
                     .map(|(sequence, evidence_key, _, _)| {
@@ -4029,6 +4221,12 @@ impl ClusterControlSnapshot {
         if !page_members.is_empty() {
             return Err(
                 "metadata-transfer staging checkpoint anchor has out-of-range page members"
+                    .to_owned(),
+            );
+        }
+        if !page_candidates.is_empty() {
+            return Err(
+                "metadata-transfer staging checkpoint anchor has out-of-range closure bindings"
                     .to_owned(),
             );
         }
@@ -4114,6 +4312,7 @@ impl ClusterControlSnapshot {
     ) -> Result<(), String> {
         if binding.actor_node_id != key.actor_node_id
             || binding.actor_node_incarnation != key.actor_node_incarnation
+            || binding.actor_endpoint != expected_endpoint
             || binding.first_generation == 0
             || binding.first_generation > binding.last_generation
             || binding.page_generation < binding.first_generation
@@ -4135,7 +4334,7 @@ impl ClusterControlSnapshot {
             .get(&segment_key)
         {
             if segment.last_generation != binding.last_generation
-                || segment.actor.endpoint() != expected_endpoint
+                || segment.actor.endpoint() != binding.actor_endpoint
                 || metadata_transfer_staging_checkpoint_segment_digest(segment)
                     != binding.segment_digest
                 || segment.commitments.get(key) != Some(&evidence_digest)
@@ -4149,10 +4348,11 @@ impl ClusterControlSnapshot {
                             })?,
                     )
                     .is_none_or(|link| {
-                        !link.entries.iter().any(|entry| {
-                            entry.sequence == binding.page_sequence
-                                && entry.evidence_key == *key
-                        })
+                        link.actor_closure_candidate != binding.actor_closure_candidate
+                            || !link.entries.iter().any(|entry| {
+                                entry.sequence == binding.page_sequence
+                                    && entry.evidence_key == *key
+                            })
                     })
             {
                 return Err(
@@ -4180,7 +4380,7 @@ impl ClusterControlSnapshot {
             })?;
         if anchor.first_generation > binding.first_generation
             || anchor.last_generation < binding.last_generation
-            || anchor.actor.endpoint() != expected_endpoint
+            || anchor.actor.endpoint() != binding.actor_endpoint
         {
             return Err(
                 "metadata-transfer staging finalized checkpoint binding does not match its anchor"
@@ -4192,6 +4392,7 @@ impl ClusterControlSnapshot {
 
     fn validate_metadata_transfer_staging_evidence_invariants(&self) -> Result<(), String> {
         let mut page_members = BTreeMap::new();
+        let mut finalized_page_members = BTreeSet::new();
         let mut checkpoint_members = BTreeMap::new();
         let finalized_evidence = metadata_transfer_staging_finalized_evidence_index(
             &self.metadata_transfer_staging_finalized_floors,
@@ -4199,6 +4400,11 @@ impl ClusterControlSnapshot {
         let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
             &self.metadata_transfer_staging_finalized_floors,
         )?;
+        let retired_closure_destinations = self
+            .metadata_transfer_staging_retired_actor_closures
+            .values()
+            .map(|closure| closure.destination_actor.clone())
+            .collect::<BTreeSet<_>>();
         type ChainRange = (u64, u64, u64, [u8; 32], [u8; 32], bool);
         let mut actor_chains: BTreeMap<(NodeId, u64, String), Vec<ChainRange>> = BTreeMap::new();
         for (key, record) in &self.metadata_transfer_staging_evidence_pages {
@@ -4252,6 +4458,19 @@ impl ClusterControlSnapshot {
                     checksum::sha256::digest(&record.apply_receipt),
                     true,
                 ));
+            let actor_has_closure_candidate = page.actor_closure_candidate().is_some()
+                || self
+                    .metadata_transfer_staging_evidence_pages
+                    .get(&(page.actor().node_id(), page.actor().node_incarnation(), 1))
+                    .and_then(|record| {
+                        decode_staging_evidence_page_payload(
+                            &record.operation_payload,
+                            record.page_digest,
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|genesis| genesis.actor_closure_candidate().is_some())
+                || retired_closure_destinations.contains(page.actor());
             for entry in page.entries() {
                 let evidence = crate::pg_store::decode_staging_evidence(entry.evidence())
                     .map_err(|error| error.to_string())?;
@@ -4268,18 +4487,39 @@ impl ClusterControlSnapshot {
                     kind: evidence.kind(),
                     target_epoch: evidence.target_epoch(),
                 };
-                if metadata_transfer_staging_finalized_generation(
+                let finalized_replay = metadata_transfer_staging_finalized_generation(
                     &self.metadata_transfer_staging_finalized_floors,
                     evidence_key.pg_id,
                 )
-                .is_some_and(|floor| evidence_key.staging_generation <= floor)
-                {
-                    return Err(
-                        "metadata-transfer staging page retains evidence at or below its finalized floor"
-                            .to_owned(),
-                    );
-                }
-                if page_members
+                .is_some_and(|floor| evidence_key.staging_generation <= floor);
+                if finalized_replay {
+                    if !actor_has_closure_candidate {
+                        return Err(
+                            "metadata-transfer staging page retains evidence at or below its finalized floor without actor rollover"
+                                .to_owned(),
+                        );
+                    }
+                    let floor = self
+                        .metadata_transfer_staging_finalized_floors
+                        .get(&(evidence_key.pg_id, evidence_key.staging_generation))
+                        .ok_or_else(|| {
+                            "metadata-transfer staging page replay has no exact finalized certificate"
+                                .to_owned()
+                        })?;
+                    let expected = metadata_transfer_staging_finalized_semantic_evidence_bytes(
+                        floor,
+                        evidence.actor(),
+                        evidence.kind(),
+                        evidence.target_epoch(),
+                    )?;
+                    if expected != entry.evidence() || !finalized_page_members.insert(evidence_key)
+                    {
+                        return Err(
+                            "metadata-transfer staging page does not exactly replay unique finalized evidence"
+                                .to_owned(),
+                        );
+                    }
+                } else if page_members
                     .insert(evidence_key, entry.evidence().to_vec())
                     .is_some()
                 {
@@ -4399,6 +4639,7 @@ impl ClusterControlSnapshot {
                         )
                         .is_some()
                         || page_members.contains_key(&entry.evidence_key)
+                        || finalized_page_members.contains(&entry.evidence_key)
                     {
                         return Err(
                             "metadata-transfer staging evidence appears in more than one retained chain range"
@@ -4406,9 +4647,10 @@ impl ClusterControlSnapshot {
                         );
                     }
                 }
-                let reconstructed_page_digest =
-                    crate::pg_store::metadata_transfer_staging_checkpoint_page_digest(
+                let reconstructed_page_digest = crate::pg_store::
+                    metadata_transfer_staging_checkpoint_page_digest_with_actor_closure(
                         &segment.actor,
+                        link.actor_closure_candidate.as_ref(),
                         preceding_generation,
                         preceding_digest,
                         generation,
@@ -4420,6 +4662,31 @@ impl ClusterControlSnapshot {
                         "metadata-transfer staging checkpoint page membership does not match its digest"
                             .to_owned(),
                     );
+                }
+                if link.actor_closure_candidate.is_some() {
+                    let closures = self
+                        .metadata_transfer_staging_actor_closures
+                        .values()
+                        .filter(|closure| {
+                            closure.destination_actor == segment.actor
+                                && closure.destination_genesis_page_digest == link.page_digest
+                        })
+                        .collect::<Vec<_>>();
+                    if generation != 1
+                        || segment.first_generation != 1
+                        || closures.is_empty()
+                        || closures.iter().any(|closure| {
+                            self.metadata_transfer_staging_retired_actor_closures.get(&(
+                                closure.source_actor.node_id(),
+                                closure.source_actor.node_incarnation(),
+                            )) != Some(*closure)
+                        })
+                    {
+                        return Err(
+                            "metadata-transfer staging checkpoint has an unretired actor-closure candidate"
+                                .to_owned(),
+                        );
+                    }
                 }
                 let expected_receipt = crate::pg_store::
                     MetadataTransferStagingEvidenceApplyReceipt::for_checkpoint_link(
@@ -4543,11 +4810,46 @@ impl ClusterControlSnapshot {
         let reconstructed_actor_closures = self
             .reconstruct_metadata_transfer_staging_actor_closures()
             .map_err(|error| error.to_string())?;
-        if reconstructed_actor_closures != self.metadata_transfer_staging_actor_closures {
+        if reconstructed_actor_closures.iter().any(|(key, closure)| {
+            self.metadata_transfer_staging_actor_closures.get(key) != Some(closure)
+        }) || self
+            .metadata_transfer_staging_actor_closures
+            .iter()
+            .any(|(key, closure)| {
+                !reconstructed_actor_closures.contains_key(key)
+                    && self
+                        .metadata_transfer_staging_retired_actor_closures
+                        .get(key)
+                        != Some(closure)
+            })
+            || self
+                .metadata_transfer_staging_retired_actor_closures
+                .iter()
+                .any(|(key, closure)| {
+                    self.metadata_transfer_staging_actor_closures.get(key) != Some(closure)
+                })
+        {
             return Err(
                 "metadata-transfer staging actor closures do not match retained chain evidence"
                     .to_owned(),
             );
+        }
+        if !self
+            .metadata_transfer_staging_retired_actor_closures
+            .is_empty()
+        {
+            let closure_validation_index = self
+                .metadata_transfer_staging_actor_closure_validation_index(
+                    &finalized_evidence,
+                    &finalized_checkpoints,
+                )?;
+            for (key, certificate) in &self.metadata_transfer_staging_retired_actor_closures {
+                Self::validate_retired_metadata_transfer_staging_actor_closure(
+                    *key,
+                    certificate,
+                    &closure_validation_index,
+                )?;
+            }
         }
 
         for ((node_id, incarnation, endpoint), ranges) in &mut actor_chains {
@@ -4778,13 +5080,34 @@ impl ClusterControlSnapshot {
                     binding,
                 )?;
             }
-            if floor.checkpoint_bindings.keys().collect::<BTreeSet<_>>()
-                != expected_checkpoint_keys.iter().collect()
+            if !expected_checkpoint_keys
+                .iter()
+                .all(|key| floor.checkpoint_bindings.contains_key(key))
             {
                 return Err(
-                    "metadata-transfer staging finalized floor checkpoint bindings do not exactly match its evidence"
+                    "metadata-transfer staging finalized floor lacks an original evidence checkpoint binding"
                         .to_owned(),
                 );
+            }
+            for (key, binding) in &floor.checkpoint_bindings {
+                if key.pg_id != *pg_id || key.staging_generation != *staging_generation {
+                    return Err(
+                        "metadata-transfer staging finalized floor has a foreign checkpoint binding"
+                            .to_owned(),
+                    );
+                }
+                let finalized = finalized_evidence.get(key).filter(|entry| {
+                    std::ptr::eq(entry.floor, floor)
+                }).ok_or_else(|| {
+                    "metadata-transfer staging finalized checkpoint binding has no canonical evidence"
+                        .to_owned()
+                })?;
+                self.validate_metadata_transfer_staging_finalized_checkpoint_binding(
+                    key,
+                    finalized.evidence_digest,
+                    finalized.endpoint,
+                    binding,
+                )?;
             }
         }
         for transition in self
@@ -5007,6 +5330,18 @@ impl ClusterControlSnapshot {
         }
         let mut decoded_entries = Vec::with_capacity(page.entries().len());
         let mut page_evidence_keys = BTreeSet::new();
+        let actor_has_closure_candidate = page.actor_closure_candidate().is_some()
+            || self
+                .metadata_transfer_staging_evidence_pages
+                .get(&(page.actor().node_id(), page.actor().node_incarnation(), 1))
+                .and_then(|record| {
+                    decode_staging_evidence_page_payload(
+                        &record.operation_payload,
+                        record.page_digest,
+                    )
+                    .ok()
+                })
+                .is_some_and(|genesis| genesis.actor_closure_candidate().is_some());
         for entry in page.entries() {
             let evidence =
                 crate::pg_store::decode_staging_evidence(entry.evidence()).map_err(|error| {
@@ -5029,19 +5364,47 @@ impl ClusterControlSnapshot {
                 kind: evidence.kind(),
                 target_epoch: evidence.target_epoch(),
             };
-            if metadata_transfer_staging_finalized_generation(
+            let finalized_replay = metadata_transfer_staging_finalized_generation(
                 &self.metadata_transfer_staging_finalized_floors,
                 key.pg_id,
             )
-            .is_some_and(|floor| key.staging_generation <= floor)
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} staging evidence generation {} is at or below finalized floor",
-                        key.pg_id.get(),
-                        key.staging_generation
-                    ),
-                });
+            .is_some_and(|floor| key.staging_generation <= floor);
+            if finalized_replay {
+                if !actor_has_closure_candidate {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging evidence generation {} is at or below finalized floor",
+                            key.pg_id.get(),
+                            key.staging_generation
+                        ),
+                    });
+                }
+                let floor = self
+                    .metadata_transfer_staging_finalized_floors
+                    .get(&(key.pg_id, key.staging_generation))
+                    .ok_or_else(|| ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging evidence generation {} has no exact finalized certificate",
+                            key.pg_id.get(),
+                            key.staging_generation
+                        ),
+                    })?;
+                let expected = metadata_transfer_staging_finalized_semantic_evidence_bytes(
+                    floor,
+                    evidence.actor(),
+                    evidence.kind(),
+                    evidence.target_epoch(),
+                )
+                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+                if expected != entry.evidence() {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging evidence generation {} does not exactly replay finalized semantics",
+                            key.pg_id.get(),
+                            key.staging_generation
+                        ),
+                    });
+                }
             }
             if key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication {
                 let target_epoch =
@@ -5078,7 +5441,9 @@ impl ClusterControlSnapshot {
                     ),
                 });
             }
-            decoded_entries.push((key, evidence.as_bytes().to_vec()));
+            if !finalized_replay {
+                decoded_entries.push((key, evidence.as_bytes().to_vec()));
+            }
         }
 
         let apply_receipt =
@@ -5133,8 +5498,21 @@ impl ClusterControlSnapshot {
                     apply_receipt: apply_receipt.clone(),
                 },
             );
-        next_snapshot.metadata_transfer_staging_actor_closures =
+        let mut reconstructed =
             next_snapshot.reconstruct_metadata_transfer_staging_actor_closures()?;
+        for (key, retired) in &next_snapshot.metadata_transfer_staging_retired_actor_closures {
+            if reconstructed
+                .insert(*key, retired.clone())
+                .is_some_and(|active| active != *retired)
+            {
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
+                    context: "metadata-transfer staging retired actor closure",
+                    message: "reconstructed certificate conflicts with a retired certificate"
+                        .to_owned(),
+                });
+            }
+        }
+        next_snapshot.metadata_transfer_staging_actor_closures = reconstructed;
         Ok(AppliedControlPlaneCommand::new(
             next_snapshot,
             ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt },
@@ -5238,6 +5616,12 @@ impl ClusterControlSnapshot {
         }
 
         let mut evidence_by_actor = BTreeMap::<(NodeId, u64), Vec<Vec<u8>>>::new();
+        for (actor_key, entries) in &page_entries {
+            evidence_by_actor
+                .entry(*actor_key)
+                .or_default()
+                .extend(entries.values().cloned());
+        }
         for bytes in self.metadata_transfer_staging_evidence.values() {
             let evidence = crate::pg_store::decode_staging_evidence(bytes).map_err(|error| {
                 ControlPlaneError::SnapshotInvariantViolation {
@@ -5253,9 +5637,50 @@ impl ClusterControlSnapshot {
                 .or_default()
                 .push(bytes.clone());
         }
+        let finalized_evidence = metadata_transfer_staging_finalized_evidence_index(
+            &self.metadata_transfer_staging_finalized_floors,
+        )
+        .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
+            context: "metadata-transfer staging finalized evidence index",
+            message,
+        })?;
+        for (key, finalized) in finalized_evidence {
+            let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+                key.actor_node_id,
+                key.actor_node_incarnation,
+                finalized.endpoint.to_owned(),
+            )
+            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata-transfer staging finalized evidence actor",
+                message: error.to_string(),
+            })?;
+            let bytes = metadata_transfer_staging_finalized_semantic_evidence_bytes(
+                finalized.floor,
+                &actor,
+                key.kind,
+                key.target_epoch,
+            )
+            .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata-transfer staging finalized evidence",
+                message,
+            })?;
+            if checksum::sha256::digest(&bytes) != finalized.evidence_digest {
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
+                    context: "metadata-transfer staging finalized evidence",
+                    message: "canonical evidence digest does not match its certificate".to_owned(),
+                });
+            }
+            evidence_by_actor
+                .entry((key.actor_node_id, key.actor_node_incarnation))
+                .or_default()
+                .push(bytes);
+        }
 
         candidates.sort_by_key(|(actor, _, _)| (actor.node_id(), actor.node_incarnation()));
         let mut unclosed_actor_tips = actor_tips.clone();
+        for retired_key in self.metadata_transfer_staging_retired_actor_closures.keys() {
+            unclosed_actor_tips.remove(retired_key);
+        }
         let mut closures =
             BTreeMap::<(NodeId, u64), MetadataTransferStagingActorClosureCertificate>::new();
         for (destination_actor, candidate, destination_genesis_page_digest) in candidates {
@@ -5412,6 +5837,246 @@ impl ClusterControlSnapshot {
         Ok(closures)
     }
 
+    fn metadata_transfer_staging_actor_closure_validation_index(
+        &self,
+        finalized_evidence: &MetadataTransferStagingFinalizedEvidenceIndex<'_>,
+        finalized_checkpoints: &MetadataTransferStagingFinalizedCheckpointIndex<'_>,
+    ) -> Result<MetadataTransferStagingActorClosureValidationIndex, String> {
+        let mut actor_tips =
+            BTreeMap::<(NodeId, u64), MetadataTransferStagingActorClosureTip>::new();
+        let mut actor_genesis = BTreeMap::<(NodeId, u64), (String, [u8; 32])>::new();
+        let mut actor_entries = BTreeMap::<(NodeId, u64), BTreeMap<u64, Vec<u8>>>::new();
+
+        fn retain_segment(
+            snapshot: &ClusterControlSnapshot,
+            segment: &MetadataTransferStagingEvidenceCheckpointSegment,
+            finalized_evidence: &MetadataTransferStagingFinalizedEvidenceIndex<'_>,
+            actor_tips: &mut BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureTip>,
+            actor_genesis: &mut BTreeMap<(NodeId, u64), (String, [u8; 32])>,
+            actor_entries: &mut BTreeMap<(NodeId, u64), BTreeMap<u64, Vec<u8>>>,
+        ) -> Result<(), String> {
+            let actor_key = (segment.actor.node_id(), segment.actor.node_incarnation());
+            let tip_link = segment
+                .page_links
+                .last()
+                .ok_or_else(|| "retired actor closure references an empty checkpoint".to_owned())?;
+            let tip = (
+                segment.actor.clone(),
+                segment.last_generation,
+                tip_link.page_digest,
+                checksum::sha256::digest(&segment.tip_apply_receipt),
+            );
+            if actor_tips
+                .get(&actor_key)
+                .is_none_or(|existing| existing.1 < tip.1)
+            {
+                actor_tips.insert(actor_key, tip);
+            }
+            if segment.first_generation == 1 {
+                let genesis = segment
+                    .page_links
+                    .first()
+                    .expect("nonempty checkpoint has a first link");
+                if actor_genesis
+                    .insert(
+                        actor_key,
+                        (segment.actor.endpoint().to_owned(), genesis.page_digest),
+                    )
+                    .is_some()
+                {
+                    return Err(
+                        "retired actor closure actor has duplicate genesis evidence".to_owned()
+                    );
+                }
+            }
+            let entries = actor_entries.entry(actor_key).or_default();
+            for link in &segment.page_links {
+                for entry in &link.entries {
+                    let digest =
+                        *segment
+                            .commitments
+                            .get(&entry.evidence_key)
+                            .ok_or_else(|| {
+                                "retired actor closure checkpoint member has no commitment"
+                                    .to_owned()
+                            })?;
+                    let evidence = snapshot.metadata_transfer_staging_checkpoint_evidence_bytes(
+                        &entry.evidence_key,
+                        &segment.actor,
+                        finalized_evidence,
+                        digest,
+                    )?;
+                    if entries.insert(entry.sequence, evidence).is_some() {
+                        return Err(
+                            "retired actor closure actor has duplicate evidence sequence"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        for record in self.metadata_transfer_staging_evidence_pages.values() {
+            let page =
+                decode_staging_evidence_page_payload(&record.operation_payload, record.page_digest)
+                    .map_err(|error| error.to_string())?;
+            let actor_key = (page.actor().node_id(), page.actor().node_incarnation());
+            let tip = (
+                page.actor().clone(),
+                page.generation(),
+                page.page_digest(),
+                checksum::sha256::digest(&record.apply_receipt),
+            );
+            if actor_tips
+                .get(&actor_key)
+                .is_none_or(|existing| existing.1 < tip.1)
+            {
+                actor_tips.insert(actor_key, tip);
+            }
+            if page.generation() == 1
+                && actor_genesis
+                    .insert(
+                        actor_key,
+                        (page.actor().endpoint().to_owned(), page.page_digest()),
+                    )
+                    .is_some()
+            {
+                return Err("retired actor closure actor has duplicate genesis evidence".to_owned());
+            }
+            let entries = actor_entries.entry(actor_key).or_default();
+            for entry in page.entries() {
+                if entries
+                    .insert(entry.sequence(), entry.evidence().to_vec())
+                    .is_some()
+                {
+                    return Err(
+                        "retired actor closure actor has duplicate evidence sequence".to_owned(),
+                    );
+                }
+            }
+        }
+        for segment in self
+            .metadata_transfer_staging_evidence_checkpoint_segments
+            .values()
+        {
+            retain_segment(
+                self,
+                segment,
+                finalized_evidence,
+                &mut actor_tips,
+                &mut actor_genesis,
+                &mut actor_entries,
+            )?;
+        }
+        for anchor in self
+            .metadata_transfer_staging_evidence_checkpoint_anchors
+            .values()
+        {
+            let sources = self.reconstruct_metadata_transfer_staging_checkpoint_anchor_sources(
+                anchor,
+                finalized_evidence,
+                finalized_checkpoints,
+            )?;
+            let mut previous_generation = anchor.previous_generation;
+            let mut previous_apply_receipt_digest = anchor.previous_apply_receipt_digest;
+            for (first_generation, last_generation, source_segment_digest) in sources {
+                let segment = self
+                    .reconstruct_metadata_transfer_staging_checkpoint_source_segment(
+                        &anchor.actor,
+                        MetadataTransferStagingCheckpointSourceSegmentBinding {
+                            first_generation,
+                            last_generation,
+                            previous_generation,
+                            previous_apply_receipt_digest,
+                            source_segment_digest,
+                        },
+                        finalized_evidence,
+                        finalized_checkpoints,
+                    )?;
+                previous_generation = segment.last_generation;
+                previous_apply_receipt_digest =
+                    checksum::sha256::digest(&segment.tip_apply_receipt);
+                retain_segment(
+                    self,
+                    &segment,
+                    finalized_evidence,
+                    &mut actor_tips,
+                    &mut actor_genesis,
+                    &mut actor_entries,
+                )?;
+            }
+        }
+
+        Ok(MetadataTransferStagingActorClosureValidationIndex {
+            actor_tips,
+            actor_genesis,
+            actor_entries,
+        })
+    }
+
+    fn validate_retired_metadata_transfer_staging_actor_closure(
+        key: (NodeId, u64),
+        certificate: &MetadataTransferStagingActorClosureCertificate,
+        index: &MetadataTransferStagingActorClosureValidationIndex,
+    ) -> Result<(), String> {
+        if key
+            != (
+                certificate.source_actor.node_id(),
+                certificate.source_actor.node_incarnation(),
+            )
+            || certificate.source_actor.node_id() != certificate.destination_actor.node_id()
+            || certificate.source_actor.node_incarnation()
+                >= certificate.destination_actor.node_incarnation()
+        {
+            return Err("retired actor closure has an invalid actor identity".to_owned());
+        }
+        let source_tip = index
+            .actor_tips
+            .get(&key)
+            .ok_or_else(|| "retired actor closure has no retained source actor chain".to_owned())?;
+        if source_tip.0 != certificate.source_actor
+            || source_tip.1 != certificate.source_tip_generation
+            || source_tip.2 != certificate.source_tip_page_digest
+            || source_tip.3 != certificate.source_tip_apply_receipt_digest
+        {
+            return Err("retired actor closure does not match its source actor tip".to_owned());
+        }
+        let destination_key = (
+            certificate.destination_actor.node_id(),
+            certificate.destination_actor.node_incarnation(),
+        );
+        let destination_genesis = index.actor_genesis.get(&destination_key).ok_or_else(|| {
+            "retired actor closure has no retained destination genesis".to_owned()
+        })?;
+        if destination_genesis.0 != certificate.destination_actor.endpoint()
+            || destination_genesis.1 != certificate.destination_genesis_page_digest
+        {
+            return Err("retired actor closure does not match its destination genesis".to_owned());
+        }
+        let rebound_entries = index
+            .actor_entries
+            .get(&destination_key)
+            .into_iter()
+            .flat_map(|entries| entries.range(..=certificate.rebound_max_sequence))
+            .map(|(sequence, evidence)| (*sequence, evidence.as_slice()))
+            .collect::<Vec<_>>();
+        let (entry_count, max_sequence, evidence_digest) =
+            crate::pg_store::metadata_transfer_staging_rebound_evidence_digest(
+                rebound_entries.iter().copied(),
+            )
+            .map_err(|error| error.to_string())?;
+        if entry_count != certificate.rebound_entry_count
+            || max_sequence != certificate.rebound_max_sequence
+            || evidence_digest != certificate.rebound_evidence_digest
+        {
+            return Err(
+                "retired actor closure does not match its rebound evidence prefix".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     fn checkpoint_metadata_transfer_staging_evidence_pages(
         &self,
         actor_node_id: NodeId,
@@ -5439,10 +6104,27 @@ impl ClusterControlSnapshot {
                 message: error.to_string(),
             })?;
             if genesis.actor_closure_candidate().is_some() {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging checkpoint cannot consume an actor-closure chain before certificate retirement"
-                        .to_owned(),
-                });
+                let closures = self
+                    .metadata_transfer_staging_actor_closures
+                    .values()
+                    .filter(|closure| {
+                        closure.destination_actor == *genesis.actor()
+                            && closure.destination_genesis_page_digest == genesis.page_digest()
+                    })
+                    .collect::<Vec<_>>();
+                if closures.is_empty()
+                    || closures.iter().any(|closure| {
+                        self.metadata_transfer_staging_retired_actor_closures.get(&(
+                            closure.source_actor.node_id(),
+                            closure.source_actor.node_incarnation(),
+                        )) != Some(*closure)
+                    })
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: "metadata-transfer staging checkpoint cannot consume an actor-closure chain before certificate retirement"
+                            .to_owned(),
+                    });
+                }
             }
         }
         let page_count = last_generation
@@ -5673,6 +6355,7 @@ impl ClusterControlSnapshot {
                 page_digest: page.page_digest(),
                 previous_apply_receipt_digest: page.previous_apply_receipt_digest(),
                 apply_receipt_digest: checksum::sha256::digest(&record.apply_receipt),
+                actor_closure_candidate: page.actor_closure_candidate().cloned(),
                 entries: link_entries,
             });
             expected_previous_generation = Some(generation);
@@ -5700,6 +6383,77 @@ impl ClusterControlSnapshot {
             });
         }
 
+        let segment_digest = metadata_transfer_staging_checkpoint_segment_digest(&segment);
+        let mut finalized_replay_bindings = Vec::new();
+        for (key, evidence_digest) in &segment.commitments {
+            if self.metadata_transfer_staging_evidence.contains_key(key) {
+                continue;
+            }
+            let floor = self
+                .metadata_transfer_staging_finalized_floors
+                .get(&(key.pg_id, key.staging_generation))
+                .ok_or_else(|| ControlPlaneError::SnapshotInvariantViolation {
+                    context: "retained metadata-transfer staging evidence page",
+                    message: "page member lacks detailed or exact finalized evidence".to_owned(),
+                })?;
+            let expected = metadata_transfer_staging_finalized_semantic_evidence_bytes(
+                floor,
+                &segment.actor,
+                key.kind,
+                key.target_epoch,
+            )
+            .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
+                context: "retained metadata-transfer staging finalized replay",
+                message,
+            })?;
+            if checksum::sha256::digest(&expected) != *evidence_digest {
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
+                    context: "retained metadata-transfer staging finalized replay",
+                    message: "page member does not match finalized semantics".to_owned(),
+                });
+            }
+            let (page_offset, page_sequence, actor_closure_candidate) = segment
+                .page_links
+                .iter()
+                .enumerate()
+                .find_map(|(offset, link)| {
+                    link.entries
+                        .iter()
+                        .find(|entry| entry.evidence_key == *key)
+                        .map(|entry| (offset, entry.sequence, link.actor_closure_candidate.clone()))
+                })
+                .ok_or_else(|| ControlPlaneError::SnapshotInvariantViolation {
+                    context: "retained metadata-transfer staging finalized replay",
+                    message: "checkpoint commitment has no page membership".to_owned(),
+                })?;
+            let page_generation = first_generation
+                .checked_add(u64::try_from(page_offset).map_err(|_| {
+                    ControlPlaneError::invariant_failure(
+                        "metadata-transfer staging checkpoint page offset does not fit u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    ControlPlaneError::invariant_failure(
+                        "metadata-transfer staging checkpoint page generation overflows",
+                    )
+                })?;
+            finalized_replay_bindings.push((
+                (key.pg_id, key.staging_generation),
+                key.clone(),
+                MetadataTransferStagingFinalizedCheckpointBinding {
+                    actor_node_id,
+                    actor_node_incarnation,
+                    actor_endpoint: segment.actor.endpoint().to_owned(),
+                    first_generation,
+                    last_generation,
+                    page_generation,
+                    page_sequence,
+                    segment_digest,
+                    actor_closure_candidate,
+                },
+            ));
+        }
+
         let mut next_snapshot = self.clone();
         for generation in first_generation..=last_generation {
             next_snapshot
@@ -5709,6 +6463,22 @@ impl ClusterControlSnapshot {
         next_snapshot
             .metadata_transfer_staging_evidence_checkpoint_segments
             .insert(segment_key, segment);
+        for (floor_key, evidence_key, binding) in finalized_replay_bindings {
+            let floor = next_snapshot
+                .metadata_transfer_staging_finalized_floors
+                .get_mut(&floor_key)
+                .expect("finalized replay floor validated before checkpoint mutation");
+            if floor
+                .checkpoint_bindings
+                .insert(evidence_key, binding)
+                .is_some()
+            {
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
+                    context: "metadata-transfer staging finalized replay checkpoint",
+                    message: "replay binding already exists".to_owned(),
+                });
+            }
+        }
         Ok(AppliedControlPlaneCommand::new(
             next_snapshot,
             ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages,
@@ -5728,6 +6498,78 @@ impl ClusterControlSnapshot {
             actor_node_incarnation,
             first_generation,
             last_generation,
+        };
+        self.apply_control_plane_command(command.clone())?;
+        Ok(command)
+    }
+
+    fn retire_metadata_transfer_staging_actor_closure(
+        &self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+        certificate_digest: [u8; 32],
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        let key = (actor_node_id, actor_node_incarnation);
+        let certificate = self
+            .metadata_transfer_staging_actor_closures
+            .get(&key)
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "metadata-transfer staging actor closure does not exist".to_owned(),
+            })?;
+        if certificate.source_actor.node_id() != actor_node_id
+            || certificate.source_actor.node_incarnation() != actor_node_incarnation
+            || metadata_transfer_staging_actor_closure_certificate_digest(certificate)
+                != certificate_digest
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "metadata-transfer staging actor-closure retirement does not match the exact certificate"
+                    .to_owned(),
+            });
+        }
+        if let Some(retired) = self
+            .metadata_transfer_staging_retired_actor_closures
+            .get(&key)
+        {
+            if retired == certificate {
+                return Ok(AppliedControlPlaneCommand::new(
+                    self.clone(),
+                    ControlPlaneCommandResponse::RetireMetadataTransferStagingActorClosure,
+                    false,
+                ));
+            }
+            return Err(ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata-transfer staging retired actor closure",
+                message: "retired certificate conflicts with the active certificate".to_owned(),
+            });
+        }
+        let mut next_snapshot = self.clone();
+        next_snapshot
+            .metadata_transfer_staging_retired_actor_closures
+            .insert(key, certificate.clone());
+        Ok(AppliedControlPlaneCommand::new(
+            next_snapshot,
+            ControlPlaneCommandResponse::RetireMetadataTransferStagingActorClosure,
+            true,
+        ))
+    }
+
+    pub(crate) fn retire_metadata_transfer_staging_actor_closure_command(
+        &self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        let certificate = self
+            .metadata_transfer_staging_actor_closures
+            .get(&(actor_node_id, actor_node_incarnation))
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "metadata-transfer staging actor closure does not exist".to_owned(),
+            })?;
+        let command = ControlPlaneCommand::RetireMetadataTransferStagingActorClosure {
+            actor_node_id,
+            actor_node_incarnation,
+            certificate_digest: metadata_transfer_staging_actor_closure_certificate_digest(
+                certificate,
+            ),
         };
         self.apply_control_plane_command(command.clone())?;
         Ok(command)
@@ -6354,7 +7196,7 @@ impl ClusterControlSnapshot {
                     ),
                 });
             }
-            let (page_offset, page_sequence) = segment
+            let (page_offset, page_sequence, actor_closure_candidate) = segment
                 .page_links
                 .iter()
                 .enumerate()
@@ -6362,7 +7204,7 @@ impl ClusterControlSnapshot {
                     link.entries
                         .iter()
                         .find(|entry| entry.evidence_key == *key)
-                        .map(|entry| (offset, entry.sequence))
+                        .map(|entry| (offset, entry.sequence, link.actor_closure_candidate.clone()))
                 })
                 .ok_or_else(|| ControlPlaneError::SnapshotInvariantViolation {
                     context: "metadata-transfer staging cleanup checkpoint membership",
@@ -6388,22 +7230,29 @@ impl ClusterControlSnapshot {
                 MetadataTransferStagingFinalizedCheckpointBinding {
                     actor_node_id: segment_key.0,
                     actor_node_incarnation: segment_key.1,
+                    actor_endpoint: segment.actor.endpoint().to_owned(),
                     first_generation: segment_key.2,
                     last_generation: segment.last_generation,
                     page_generation,
                     page_sequence,
                     segment_digest: metadata_transfer_staging_checkpoint_segment_digest(segment),
+                    actor_closure_candidate,
                 },
             );
             if self
                 .metadata_transfer_staging_actor_closures
                 .values()
                 .any(|closure| {
-                    (closure.source_actor.node_id() == key.actor_node_id
+                    let depends_on_closure = (closure.source_actor.node_id() == key.actor_node_id
                         && closure.source_actor.node_incarnation() == key.actor_node_incarnation)
                         || (closure.destination_actor.node_id() == key.actor_node_id
                             && closure.destination_actor.node_incarnation()
-                                == key.actor_node_incarnation)
+                                == key.actor_node_incarnation);
+                    depends_on_closure
+                        && self.metadata_transfer_staging_retired_actor_closures.get(&(
+                            closure.source_actor.node_id(),
+                            closure.source_actor.node_incarnation(),
+                        )) != Some(closure)
                 })
             {
                 return Err(ControlPlaneError::CommandDecode {
@@ -9705,6 +10554,15 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 last_generation,
                 source_segment_count,
                 source_segments_digest,
+            ),
+            ControlPlaneCommand::RetireMetadataTransferStagingActorClosure {
+                actor_node_id,
+                actor_node_incarnation,
+                certificate_digest,
+            } => self.retire_metadata_transfer_staging_actor_closure(
+                actor_node_id,
+                actor_node_incarnation,
+                certificate_digest,
             ),
             ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup } => {
                 self.finalize_metadata_transfer_staging_generation(cleanup)
@@ -15039,6 +15897,18 @@ pub trait ControlPlaneAdmin {
         ))
     }
 
+    fn retire_metadata_transfer_staging_actor_closure(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let _ = (actor_node_id, actor_node_incarnation);
+        Err(ControlPlaneError::rpc_remote(
+            "metadata-transfer staging actor-closure retirement is not supported by this authority"
+                .to_owned(),
+        ))
+    }
+
     fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,
@@ -15415,6 +16285,15 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             format_metadata_transfer_staging_actor_closure(closure)
         ));
     }
+    for closure in snapshot
+        .metadata_transfer_staging_retired_actor_closures
+        .values()
+    {
+        out.push_str(&format!(
+            "{METADATA_TRANSFER_STAGING_RETIRED_ACTOR_CLOSURE_STATE_RECORD_PREFIX}{}\n",
+            format_metadata_transfer_staging_actor_closure(closure)
+        ));
+    }
     for floor in snapshot.metadata_transfer_staging_finalized_floors.values() {
         out.push_str(&format!(
             "{METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_STATE_RECORD_PREFIX}{}\n",
@@ -15491,7 +16370,7 @@ fn format_metadata_transfer_staging_finalized_floor(
         .iter()
         .map(|(key, binding)| {
             format!(
-                "{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                "{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                 key.pg_id.get(),
                 key.staging_generation,
                 key.actor_node_id.as_u32(),
@@ -15501,11 +16380,23 @@ fn format_metadata_transfer_staging_finalized_floor(
                     .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string()),
                 binding.actor_node_id.as_u32(),
                 binding.actor_node_incarnation,
+                hex_encode(binding.actor_endpoint.as_bytes()),
                 binding.first_generation,
                 binding.last_generation,
                 binding.page_generation,
                 binding.page_sequence,
-                hex_encode(&binding.segment_digest)
+                hex_encode(&binding.segment_digest),
+                binding.actor_closure_candidate.as_ref().map_or_else(
+                    || "-".to_owned(),
+                    |candidate| {
+                        hex_encode(
+                            &crate::pg_store::encode_staging_evidence_actor_closure_candidate_bytes(
+                                candidate,
+                            )
+                            .expect("finalized closure candidate is validated before encoding"),
+                        )
+                    },
+                )
             )
         })
         .collect::<Vec<_>>()
@@ -15707,10 +16598,10 @@ fn parse_metadata_transfer_staging_finalized_floor(
     if !fields[15].is_empty() {
         for encoded in fields[15].split(';') {
             let parts = encoded.split('/').collect::<Vec<_>>();
-            if parts.len() != 13 {
+            if parts.len() != 15 {
                 return Err(parse_error(
                     line,
-                    "staging finalized-floor checkpoint binding must have thirteen fields",
+                    "staging finalized-floor checkpoint binding must have fifteen fields",
                 ));
             }
             let kind = match parse_u16(line, parts[4], "staging checkpoint evidence kind")? {
@@ -15767,32 +16658,48 @@ fn parse_metadata_transfer_staging_finalized_floor(
                     parts[7],
                     "staging finalized-floor checkpoint segment incarnation",
                 )?,
+                actor_endpoint: String::from_utf8(hex_decode(line, parts[8])?).map_err(|_| {
+                    parse_error(
+                        line,
+                        "staging finalized-floor checkpoint segment endpoint is not UTF-8",
+                    )
+                })?,
                 first_generation: parse_u64(
                     line,
-                    parts[8],
+                    parts[9],
                     "staging finalized-floor checkpoint first generation",
                 )?,
                 last_generation: parse_u64(
                     line,
-                    parts[9],
+                    parts[10],
                     "staging finalized-floor checkpoint last generation",
                 )?,
                 page_generation: parse_u64(
                     line,
-                    parts[10],
+                    parts[11],
                     "staging finalized-floor checkpoint page generation",
                 )?,
                 page_sequence: parse_u64(
                     line,
-                    parts[11],
+                    parts[12],
                     "staging finalized-floor checkpoint page sequence",
                 )?,
-                segment_digest: hex_decode(line, parts[12])?.try_into().map_err(|_| {
+                segment_digest: hex_decode(line, parts[13])?.try_into().map_err(|_| {
                     parse_error(
                         line,
                         "staging finalized-floor checkpoint segment digest must contain 32 bytes",
                     )
                 })?,
+                actor_closure_candidate: if parts[14] == "-" {
+                    None
+                } else {
+                    Some(
+                        crate::pg_store::decode_staging_evidence_actor_closure_candidate_bytes(
+                            &hex_decode(line, parts[14])?,
+                        )
+                        .map_err(|error| parse_error(line, &error.to_string()))?,
+                    )
+                },
             };
             if checkpoint_bindings.insert(key, binding).is_some() {
                 return Err(parse_error(
@@ -16027,6 +16934,17 @@ fn format_metadata_transfer_staging_evidence_checkpoint_segment(
             hex_encode(&link.page_digest),
             hex_encode(&link.previous_apply_receipt_digest),
             hex_encode(&link.apply_receipt_digest),
+            link.actor_closure_candidate.as_ref().map_or_else(
+                || "-".to_owned(),
+                |candidate| {
+                    hex_encode(
+                        &crate::pg_store::encode_staging_evidence_actor_closure_candidate_bytes(
+                            candidate,
+                        )
+                        .expect("retained actor-closure candidate is validated before encoding"),
+                    )
+                },
+            ),
             link.entries.len().to_string(),
         ]);
         for entry in &link.entries {
@@ -16065,7 +16983,7 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
     value: &str,
 ) -> Result<MetadataTransferStagingEvidenceCheckpointSegment, ControlPlaneError> {
     const HEADER_FIELDS: usize = 9;
-    const PAGE_LINK_FIELDS: usize = 4;
+    const PAGE_LINK_FIELDS: usize = 5;
     const PAGE_ENTRY_FIELDS: usize = 7;
     const COMMITMENT_FIELDS: usize = 7;
 
@@ -16177,7 +17095,7 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
         };
         let entry_count = usize::try_from(parse_u64(
             line,
-            fields[cursor + 3],
+            fields[cursor + 4],
             "staging checkpoint page-entry count",
         )?)
         .map_err(|_| {
@@ -16196,6 +17114,16 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
         let previous_apply_receipt_digest =
             decode_digest(fields[cursor + 1], "page predecessor receipt digest")?;
         let apply_receipt_digest = decode_digest(fields[cursor + 2], "page apply receipt digest")?;
+        let actor_closure_candidate = if fields[cursor + 3] == "-" {
+            None
+        } else {
+            Some(
+                crate::pg_store::decode_staging_evidence_actor_closure_candidate_bytes(
+                    &hex_decode(line, fields[cursor + 3])?,
+                )
+                .map_err(|error| parse_error(line, &error.to_string()))?,
+            )
+        };
         cursor = link_end;
         let entries_end = cursor
             .checked_add(entry_count.checked_mul(PAGE_ENTRY_FIELDS).ok_or_else(|| {
@@ -16220,6 +17148,7 @@ fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
             page_digest,
             previous_apply_receipt_digest,
             apply_receipt_digest,
+            actor_closure_candidate,
             entries,
         });
     }
@@ -16965,6 +17894,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut metadata_transfer_staging_evidence_checkpoint_segments = BTreeMap::new();
     let mut metadata_transfer_staging_evidence_checkpoint_anchors = BTreeMap::new();
     let mut metadata_transfer_staging_actor_closures = BTreeMap::new();
+    let mut metadata_transfer_staging_retired_actor_closures = BTreeMap::new();
     let mut metadata_transfer_staging_finalized_floors = BTreeMap::new();
     let mut metadata_transfer_staging_evidence = BTreeMap::new();
     let mut pg_lines = BTreeMap::new();
@@ -17248,6 +18178,23 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                 ));
             }
         } else if let Some(value) =
+            line.strip_prefix(METADATA_TRANSFER_STAGING_RETIRED_ACTOR_CLOSURE_STATE_RECORD_PREFIX)
+        {
+            let closure = parse_metadata_transfer_staging_actor_closure(line_number, value)?;
+            let key = (
+                closure.source_actor.node_id(),
+                closure.source_actor.node_incarnation(),
+            );
+            if metadata_transfer_staging_retired_actor_closures
+                .insert(key, closure)
+                .is_some()
+            {
+                return Err(parse_error(
+                    line_number,
+                    "duplicate metadata-transfer staging retired actor closure",
+                ));
+            }
+        } else if let Some(value) =
             line.strip_prefix(METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_STATE_RECORD_PREFIX)
         {
             let closure = parse_metadata_transfer_staging_actor_closure(line_number, value)?;
@@ -17372,6 +18319,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         metadata_transfer_staging_evidence_checkpoint_segments,
         metadata_transfer_staging_evidence_checkpoint_anchors,
         metadata_transfer_staging_actor_closures,
+        metadata_transfer_staging_retired_actor_closures,
         metadata_transfer_staging_finalized_floors,
         metadata_transfer_staging_evidence,
         max_committed_timestamp_ms,

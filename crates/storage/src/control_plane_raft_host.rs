@@ -686,6 +686,29 @@ impl ControlPlaneRaftAuthorityHost {
         self.current_snapshot()
     }
 
+    pub fn retire_metadata_transfer_staging_actor_closure(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .current_snapshot()?
+            .retire_metadata_transfer_staging_actor_closure_command(
+                actor_node_id,
+                actor_node_incarnation,
+            )?;
+        let response = self.submit_low_priority_raft_command(command)?;
+        if !matches!(
+            response,
+            ControlPlaneCommandResponse::RetireMetadataTransferStagingActorClosure
+        ) {
+            return Err(ControlPlaneError::invariant_failure(
+                "staging actor-closure retirement returned the wrong response",
+            ));
+        }
+        self.current_snapshot()
+    }
+
     pub fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,
@@ -1497,6 +1520,18 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
             actor_node_incarnation,
             first_generation,
             last_generation,
+        )
+    }
+
+    fn retire_metadata_transfer_staging_actor_closure(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        ControlPlaneRaftAuthorityHost::retire_metadata_transfer_staging_actor_closure(
+            self,
+            actor_node_id,
+            actor_node_incarnation,
         )
     }
 

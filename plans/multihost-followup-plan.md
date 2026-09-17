@@ -1218,6 +1218,42 @@ checkpoint, collapse, coalescing, authorization, installation, and cleanup
 commands. Command v29/state v41 and all earlier fixed vectors remain immutable
 rejection evidence. Closure-certificate retirement remains a later slice.
 
+Command v31 and state v43 implement exact actor-closure certificate
+retirement. `RetireMetadataTransferStagingActorClosure` compare-and-swaps the
+source actor identity and canonical certificate digest, copies the complete
+certificate into a distinct retired set, and leaves the cluster-map epoch
+unchanged. Exact replay is a no-op; absent, stale, or divergent certificates
+reject before mutation. Only an exact retired certificate permits a
+candidate-bearing destination genesis page to enter a checkpoint. Checkpoint
+page links and finalized checkpoint bindings retain the canonical closure
+candidate, so later finalization, segment collapse, and anchor reconstruction
+continue to reproduce the original page digest after detailed evidence is
+pruned. Snapshot validation builds one compact page/segment/anchor actor-chain
+index and independently revalidates every retired certificate's source tip,
+destination genesis, and complete rebound prefix against that index; it does
+not rescan all retained evidence once per incarnation. Later evidence-page
+application merges exact retired certificates back into the reconstructed
+active closure set, so unrelated publication cannot discard retirement
+authority. Once the candidate-bearing destination genesis is checkpointed,
+the exact retired certificate remains the rollover provenance for later raw
+pages already retained from that destination actor; snapshot validation
+resolves it through the certificate's independently validated
+checkpoint/anchor chain rather than requiring the removed raw genesis page.
+Command admission does not use retirement as authority for new finalized
+evidence: retirement requires the complete rebound prefix to have already been
+admitted. If a node incarnation advances after a staging generation is
+finalized, its closure genesis must semantically replay the complete finalized
+prefix as well as every still-live row. The authority validates those rows
+against the exact finalized certificate without restoring detailed evidence;
+an omitted finalized member rejects once the committed prefix boundary is
+observable. Checkpoint bindings for such replay rows retain the exact rebound
+actor endpoint and closure candidate so later segment and anchor reconstruction
+remains canonical. The immutable command v30/state v42 aggregates and their
+snapshot, standalone-journal, Raft-peer, restart, WAL, and storage-RPC
+containers remain exact rejection evidence. Production manager selection and
+retirement scheduling remain gated; this slice exposes only the exact
+state-machine and admin primitive needed by that worker.
+
 This cleanup CAS is intentionally one per PG, not a fifth multi-PG batch
 command. Epoch-neutral cleanup does not need batching to amortize cluster-map
 epoch changes, and independent commands avoid cross-PG failure coupling. The
@@ -1417,7 +1453,7 @@ tombstone receipts have distinct validated kinds and cannot substitute for
 one another. Exact v26 intent, artifact, proof, and tombstone frames are fixed;
 v25 remains immutable rejection evidence, and authenticated Unix/TLS tests
 cover physical deletion plus exact tombstone replay. Staging-store format v4,
-artifact format v3, control-plane RPC v22, command v30, state v42, and
+artifact format v3, control-plane RPC v22, command v31, state v43, and
 authentication envelope v2 are unchanged because their existing grammars
 already represent the resulting tombstone evidence and authorization.
 Durable artifact retrieval then advances storage RPC v26 to v27 with one

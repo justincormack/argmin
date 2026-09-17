@@ -2889,6 +2889,21 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    pub fn retire_metadata_transfer_staging_actor_closure(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .snapshot
+            .retire_metadata_transfer_staging_actor_closure_command(
+                actor_node_id,
+                actor_node_incarnation,
+            )?;
+        self.apply_and_commit_command(command)?;
+        Ok(self.snapshot.clone())
+    }
+
     pub fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,
@@ -4020,6 +4035,18 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
             actor_node_incarnation,
             first_generation,
             last_generation,
+        )
+    }
+
+    fn retire_metadata_transfer_staging_actor_closure(
+        &mut self,
+        actor_node_id: NodeId,
+        actor_node_incarnation: u64,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::retire_metadata_transfer_staging_actor_closure(
+            self,
+            actor_node_id,
+            actor_node_incarnation,
         )
     }
 

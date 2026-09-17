@@ -312,6 +312,14 @@ pub(super) fn staging_actor_closure_snapshot_fixture() -> ClusterControlSnapshot
     )
     .unwrap();
     old_store.tombstone(&intent).unwrap();
+    let second_authorization = &authorizations[1];
+    let second_intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+        &second_authorization.unavailable_transition,
+        second_authorization.artifact_digest,
+        second_authorization.artifact_length,
+        second_authorization.artifact_format_version,
+    )
+    .unwrap();
     let old_page = old_store.next_evidence_page().unwrap().unwrap();
     let old_committed = authorized
         .apply_control_plane_command(
@@ -358,11 +366,28 @@ pub(super) fn staging_actor_closure_snapshot_fixture() -> ClusterControlSnapshot
         crate::pg_store::MetadataTransferStagingStore::open(staging_tmp.path(), next_actor, limits)
             .unwrap();
     let rebound_page = rebound_store.next_evidence_page().unwrap().unwrap();
-    actor_advanced
+    let rebound_committed = actor_advanced
         .apply_control_plane_command(
             ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
                 operation_payload: rebound_page.operation_payload().to_vec(),
                 page_digest: rebound_page.page_digest(),
+            },
+        )
+        .unwrap()
+        .into_snapshot();
+    rebound_store
+        .record_evidence_apply_receipt(
+            &rebound_page,
+            &crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&rebound_page),
+        )
+        .unwrap();
+    rebound_store.tombstone(&second_intent).unwrap();
+    let rebound_successor = rebound_store.next_evidence_page().unwrap().unwrap();
+    rebound_committed
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: rebound_successor.operation_payload().to_vec(),
+                page_digest: rebound_successor.page_digest(),
             },
         )
         .unwrap()
@@ -1815,6 +1840,7 @@ fn collapsed_checkpoint_anchor_reconstructs_maximum_commitment_page_from_index()
             page_digest,
             previous_apply_receipt_digest: [0; 32],
             apply_receipt_digest: checksum::sha256::digest(receipt.as_bytes()),
+            actor_closure_candidate: None,
             entries: keys
                 .iter()
                 .map(
@@ -1835,11 +1861,13 @@ fn collapsed_checkpoint_anchor_reconstructs_maximum_commitment_page_from_index()
             MetadataTransferStagingFinalizedCheckpointBinding {
                 actor_node_id: actor.node_id(),
                 actor_node_incarnation: actor.node_incarnation(),
+                actor_endpoint: actor.endpoint().to_owned(),
                 first_generation: 1,
                 last_generation: 1,
                 page_generation: 1,
                 page_sequence: sequence,
                 segment_digest,
+                actor_closure_candidate: None,
             },
         );
     }
@@ -2953,6 +2981,325 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
             .contains("page membership does not match its digest"),
         "unexpected checkpoint membership forgery error: {membership_error}"
     );
+}
+
+#[test]
+fn actor_rollover_replays_complete_finalized_prefix_without_restoring_detail() {
+    let (_tmp, _store, authority, _installs, cleanup) = finalized_staging_floor_authority_fixture();
+    let finalized = authority.snapshot().clone();
+    let source_binding = cleanup.tombstones.first().unwrap();
+    let source_key = (source_binding.node_id, source_binding.node_incarnation);
+    let finalized_evidence = metadata_transfer_staging_finalized_evidence_index(
+        &finalized.metadata_transfer_staging_finalized_floors,
+    )
+    .unwrap();
+    let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
+        &finalized.metadata_transfer_staging_finalized_floors,
+    )
+    .unwrap();
+    let closure_index = finalized
+        .metadata_transfer_staging_actor_closure_validation_index(
+            &finalized_evidence,
+            &finalized_checkpoints,
+        )
+        .unwrap();
+    let source_tip = closure_index.actor_tips.get(&source_key).unwrap().clone();
+    let source_entries = closure_index
+        .actor_entries
+        .get(&source_key)
+        .unwrap()
+        .iter()
+        .map(|(sequence, evidence)| (*sequence, evidence.clone()))
+        .collect::<Vec<_>>();
+    assert!(source_entries.len() > 1);
+    drop(closure_index);
+    drop(finalized_checkpoints);
+    drop(finalized_evidence);
+
+    let destination_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        source_binding.node_id,
+        source_binding.node_incarnation.checked_add(1).unwrap(),
+        format!("{}-restarted", source_binding.endpoint),
+    )
+    .unwrap();
+    let heartbeat_at_ms = finalized.max_committed_timestamp_ms().unwrap_or(0).max(
+        finalized
+            .node(source_binding.node_id)
+            .and_then(NodeControlRecord::lease_deadline_ms)
+            .unwrap_or(0),
+    ) + 1;
+    let mut heartbeat = heartbeat_from_snapshot(
+        &finalized,
+        source_binding.node_id.as_u32(),
+        finalized.cluster_epoch(),
+        heartbeat_at_ms,
+    );
+    heartbeat.node_incarnation = destination_actor.node_incarnation();
+    heartbeat.endpoint = destination_actor.endpoint().to_owned();
+    heartbeat.requested_lease_duration_ms = 10_000;
+    let actor_advanced = finalized
+        .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            heartbeat_at_ms,
+            lease_deadline_ms: heartbeat_at_ms + 10_000,
+            lease_horizon_authority: None,
+        })
+        .unwrap()
+        .into_snapshot();
+
+    let all_sequences = source_entries
+        .iter()
+        .map(|(sequence, _)| *sequence)
+        .collect::<Vec<_>>();
+    let complete_page =
+        crate::pg_store::metadata_transfer_staging_closure_page_from_entries_for_test(
+            source_tip.0.clone(),
+            source_tip.1,
+            source_tip.3,
+            source_tip.0.clone(),
+            destination_actor.clone(),
+            &source_entries,
+            &all_sequences,
+        );
+    let complete = actor_advanced
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: complete_page.operation_payload().to_vec(),
+                page_digest: complete_page.page_digest(),
+            },
+        )
+        .unwrap()
+        .into_snapshot();
+    assert!(complete
+        .metadata_transfer_staging_actor_closures
+        .contains_key(&source_key));
+    assert!(!complete
+        .metadata_transfer_staging_evidence
+        .keys()
+        .any(|key| {
+            key.pg_id == cleanup.unavailable_transition.pg_id()
+                && key.staging_generation == cleanup.staging_generation
+        }));
+    complete.validate_current_state_invariants().unwrap();
+
+    let omitted_finalized_sequence = source_entries
+        .iter()
+        .find_map(|(sequence, bytes)| {
+            let evidence = crate::pg_store::decode_staging_evidence(bytes).unwrap();
+            (evidence.intent().pg_id() == cleanup.unavailable_transition.pg_id()
+                && evidence.intent().staging_generation() == cleanup.staging_generation
+                && Some(*sequence) != all_sequences.last().copied())
+            .then_some(*sequence)
+        })
+        .expect("the finalized prefix has a nonterminal member to omit");
+    let omitted_sequences = all_sequences
+        .iter()
+        .copied()
+        .filter(|sequence| *sequence != omitted_finalized_sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        omitted_sequences.last(),
+        all_sequences.last(),
+        "the incomplete prefix must reach the committed maximum sequence"
+    );
+    let omitted_page =
+        crate::pg_store::metadata_transfer_staging_closure_page_from_entries_for_test(
+            source_tip.0.clone(),
+            source_tip.1,
+            source_tip.3,
+            source_tip.0,
+            destination_actor,
+            &source_entries,
+            &omitted_sequences,
+        );
+    let unchanged = actor_advanced.clone();
+    let error = actor_advanced
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: omitted_page.operation_payload().to_vec(),
+                page_digest: omitted_page.page_digest(),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot complete its committed prefix"),
+        "unexpected incomplete finalized-prefix error: {error}"
+    );
+    assert_eq!(actor_advanced, unchanged);
+}
+
+#[test]
+fn checkpointed_rollover_genesis_authorizes_later_finalized_page() {
+    let (_tmp, _store, authority, source_actor) = checkpoint_anchor_direct_boundary_fixture();
+    let finalized = authority.snapshot().clone();
+    let source_key = (source_actor.node_id(), source_actor.node_incarnation());
+    let finalized_evidence = metadata_transfer_staging_finalized_evidence_index(
+        &finalized.metadata_transfer_staging_finalized_floors,
+    )
+    .unwrap();
+    let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
+        &finalized.metadata_transfer_staging_finalized_floors,
+    )
+    .unwrap();
+    let closure_index = finalized
+        .metadata_transfer_staging_actor_closure_validation_index(
+            &finalized_evidence,
+            &finalized_checkpoints,
+        )
+        .unwrap();
+    let source_tip = closure_index.actor_tips.get(&source_key).unwrap().clone();
+    let source_entries = closure_index
+        .actor_entries
+        .get(&source_key)
+        .unwrap()
+        .iter()
+        .map(|(sequence, evidence)| (*sequence, evidence.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        source_entries.len(),
+        crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT + 2
+    );
+    let finalized_entry_count = source_entries
+        .iter()
+        .filter(|(_, bytes)| {
+            let evidence = crate::pg_store::decode_staging_evidence(bytes).unwrap();
+            metadata_transfer_staging_finalized_generation(
+                &finalized.metadata_transfer_staging_finalized_floors,
+                evidence.intent().pg_id(),
+            )
+            .is_some_and(|floor| evidence.intent().staging_generation() <= floor)
+        })
+        .count();
+    assert_eq!(
+        finalized_entry_count,
+        crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT + 1
+    );
+    drop(closure_index);
+    drop(finalized_checkpoints);
+    drop(finalized_evidence);
+
+    let destination_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+        source_actor.node_id(),
+        source_actor.node_incarnation().checked_add(1).unwrap(),
+        format!("{}-restarted", source_actor.endpoint()),
+    )
+    .unwrap();
+    let heartbeat_at_ms = finalized.max_committed_timestamp_ms().unwrap_or(0).max(
+        finalized
+            .node(source_actor.node_id())
+            .and_then(NodeControlRecord::lease_deadline_ms)
+            .unwrap_or(0),
+    ) + 1;
+    let mut heartbeat = heartbeat_from_snapshot(
+        &finalized,
+        source_actor.node_id().as_u32(),
+        finalized.cluster_epoch(),
+        heartbeat_at_ms,
+    );
+    heartbeat.node_incarnation = destination_actor.node_incarnation();
+    heartbeat.endpoint = destination_actor.endpoint().to_owned();
+    heartbeat.requested_lease_duration_ms = 10_000;
+    let actor_advanced = finalized
+        .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            heartbeat_at_ms,
+            lease_deadline_ms: heartbeat_at_ms + 10_000,
+            lease_horizon_authority: None,
+        })
+        .unwrap()
+        .into_snapshot();
+
+    let first_page_sequences = source_entries
+        .iter()
+        .take(crate::pg_store::MAX_STAGING_EVIDENCE_PAGE_ENTRIES)
+        .map(|(sequence, _)| *sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        first_page_sequences.len(),
+        crate::pg_store::MAX_STAGING_EVIDENCE_PAGE_ENTRIES
+    );
+    let first_page = crate::pg_store::metadata_transfer_staging_closure_page_from_entries_for_test(
+        source_tip.0.clone(),
+        source_tip.1,
+        source_tip.3,
+        source_tip.0.clone(),
+        destination_actor.clone(),
+        &source_entries,
+        &first_page_sequences,
+    );
+    let first_applied = actor_advanced
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: first_page.operation_payload().to_vec(),
+                page_digest: first_page.page_digest(),
+            },
+        )
+        .unwrap()
+        .into_snapshot();
+    assert!(!first_applied
+        .metadata_transfer_staging_actor_closures
+        .contains_key(&source_key));
+
+    let first_receipt =
+        crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&first_page);
+    let second_page =
+        crate::pg_store::metadata_transfer_staging_successor_page_from_entries_for_test(
+            &source_actor,
+            &destination_actor,
+            &source_entries[crate::pg_store::MAX_STAGING_EVIDENCE_PAGE_ENTRIES..],
+            &first_receipt,
+        );
+    assert_eq!(second_page.generation(), 2);
+    assert!(second_page.entries().iter().any(|entry| {
+        let evidence = crate::pg_store::decode_staging_evidence(entry.evidence()).unwrap();
+        metadata_transfer_staging_finalized_generation(
+            &first_applied.metadata_transfer_staging_finalized_floors,
+            evidence.intent().pg_id(),
+        )
+        .is_some_and(|floor| evidence.intent().staging_generation() <= floor)
+    }));
+    let complete = first_applied
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: second_page.operation_payload().to_vec(),
+                page_digest: second_page.page_digest(),
+            },
+        )
+        .unwrap()
+        .into_snapshot();
+    let retirement = complete
+        .retire_metadata_transfer_staging_actor_closure_command(source_key.0, source_key.1)
+        .unwrap();
+    let retired = complete
+        .apply_control_plane_command(retirement)
+        .unwrap()
+        .into_snapshot();
+    let checkpointed = retired
+        .checkpoint_metadata_transfer_staging_evidence_pages(
+            destination_actor.node_id(),
+            destination_actor.node_incarnation(),
+            1,
+            1,
+        )
+        .unwrap()
+        .into_snapshot();
+    assert!(!checkpointed
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(
+            destination_actor.node_id(),
+            destination_actor.node_incarnation(),
+            1,
+        )));
+    assert!(checkpointed
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(
+            destination_actor.node_id(),
+            destination_actor.node_incarnation(),
+            2,
+        )));
+    checkpointed.validate_current_state_invariants().unwrap();
 }
 
 #[test]
@@ -4880,6 +5227,68 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         parse_snapshot(&format_snapshot(final_page_committed.snapshot())).unwrap(),
         *final_page_committed.snapshot()
     );
+    let closure_keys = final_page_committed
+        .snapshot()
+        .metadata_transfer_staging_actor_closures
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(closure_keys.len(), 2);
+    let mut retired_chain = final_page_committed.snapshot().clone();
+    for (node_id, incarnation) in closure_keys {
+        let command = retired_chain
+            .retire_metadata_transfer_staging_actor_closure_command(node_id, incarnation)
+            .unwrap();
+        retired_chain = retired_chain
+            .apply_control_plane_command(command)
+            .unwrap()
+            .into_snapshot();
+    }
+    for actor in [&response_loss_old_actor, &evidence_actor] {
+        let last_generation = retired_chain
+            .metadata_transfer_staging_evidence_pages
+            .keys()
+            .filter_map(|(node_id, incarnation, generation)| {
+                (*node_id == actor.node_id() && *incarnation == actor.node_incarnation())
+                    .then_some(*generation)
+            })
+            .max()
+            .unwrap();
+        retired_chain = retired_chain
+            .checkpoint_metadata_transfer_staging_evidence_pages(
+                actor.node_id(),
+                actor.node_incarnation(),
+                1,
+                last_generation,
+            )
+            .unwrap()
+            .into_snapshot();
+    }
+    assert_eq!(
+        retired_chain
+            .metadata_transfer_staging_evidence_pages
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![(final_actor.node_id(), final_actor.node_incarnation(), 1)]
+    );
+    let reconstructed_closures = retired_chain
+        .reconstruct_metadata_transfer_staging_actor_closures()
+        .unwrap();
+    for (key, reconstructed) in &reconstructed_closures {
+        assert_eq!(
+            retired_chain
+                .metadata_transfer_staging_actor_closures
+                .get(key),
+            Some(reconstructed),
+            "compacted closure {key:?} changed during reconstruction"
+        );
+    }
+    retired_chain.validate_current_state_invariants().unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(&retired_chain)).unwrap(),
+        retired_chain
+    );
     let old_page_replay = rebound_page_committed
         .snapshot()
         .apply_control_plane_command(
@@ -5826,6 +6235,193 @@ fn actor_chain_closure_waits_for_the_complete_rebound_page_prefix() {
             .reconstruct_metadata_transfer_staging_actor_closures()
             .unwrap(),
         compacted_source.metadata_transfer_staging_actor_closures
+    );
+}
+
+#[test]
+fn actor_closure_retirement_is_exact_epoch_neutral_and_enables_compaction() {
+    let snapshot = staging_actor_closure_snapshot_fixture();
+    let (closure_key, closure) = snapshot
+        .metadata_transfer_staging_actor_closures
+        .iter()
+        .next()
+        .map(|(key, closure)| (*key, closure.clone()))
+        .unwrap();
+    let retirement = snapshot
+        .retire_metadata_transfer_staging_actor_closure_command(closure_key.0, closure_key.1)
+        .unwrap();
+    let ControlPlaneCommand::RetireMetadataTransferStagingActorClosure {
+        certificate_digest, ..
+    } = retirement.clone()
+    else {
+        unreachable!("closure retirement builder returned the wrong command");
+    };
+    let mut wrong_digest = certificate_digest;
+    wrong_digest[0] ^= 1;
+    let unchanged = snapshot.clone();
+    let mismatch = snapshot
+        .apply_control_plane_command(
+            ControlPlaneCommand::RetireMetadataTransferStagingActorClosure {
+                actor_node_id: closure_key.0,
+                actor_node_incarnation: closure_key.1,
+                certificate_digest: wrong_digest,
+            },
+        )
+        .unwrap_err();
+    assert!(mismatch.to_string().contains("exact certificate"));
+    assert_eq!(snapshot, unchanged);
+
+    let retired = snapshot
+        .apply_control_plane_command(retirement.clone())
+        .unwrap();
+    assert!(retired.changed());
+    assert_eq!(
+        retired
+            .snapshot()
+            .metadata_transfer_staging_retired_actor_closures
+            .get(&closure_key),
+        retired
+            .snapshot()
+            .metadata_transfer_staging_actor_closures
+            .get(&closure_key)
+    );
+    assert_eq!(retired.snapshot().cluster_epoch(), snapshot.cluster_epoch());
+    let replayed = retired
+        .snapshot()
+        .apply_control_plane_command(retirement)
+        .unwrap();
+    assert!(!replayed.changed());
+    assert!(matches!(
+        replayed.response(),
+        ControlPlaneCommandResponse::RetireMetadataTransferStagingActorClosure
+    ));
+
+    let transition = replayed
+        .snapshot()
+        .unavailable_pg_placement_transitions
+        .values()
+        .chain(
+            replayed
+                .snapshot()
+                .retained_unavailable_pg_placement_transitions
+                .values(),
+        )
+        .find(|transition| {
+            transition
+                .destination_acting_set
+                .contains(&closure.destination_actor.node_id())
+        })
+        .unwrap();
+    let authorization = transition.staging_authorization.as_ref().unwrap();
+    let binding = UnavailablePgTransitionMutationBinding::new(
+        transition.pg_id,
+        transition.transition_epoch,
+        transition.source_epoch,
+        transition.source_acting_set.clone(),
+        transition.destination_acting_set.clone(),
+    );
+    let latest_destination_page = replayed
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .range(
+            (
+                closure.destination_actor.node_id(),
+                closure.destination_actor.node_incarnation(),
+                0,
+            )
+                ..=(
+                    closure.destination_actor.node_id(),
+                    closure.destination_actor.node_incarnation(),
+                    u64::MAX,
+                ),
+        )
+        .next_back()
+        .unwrap()
+        .1;
+    let latest_destination_receipt = crate::pg_store::decode_staging_evidence_apply_receipt(
+        &latest_destination_page.apply_receipt,
+    )
+    .unwrap();
+    let successor_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
+        closure.destination_actor.clone(),
+        &binding,
+        authorization.artifact_digest,
+        authorization.artifact_length,
+        authorization.artifact_format_version,
+        crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+        Some(&latest_destination_receipt),
+    );
+    let after_successor = replayed
+        .snapshot()
+        .apply_control_plane_command(
+            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
+                operation_payload: successor_page.operation_payload().to_vec(),
+                page_digest: successor_page.page_digest(),
+            },
+        )
+        .unwrap()
+        .into_snapshot();
+    assert_eq!(
+        after_successor
+            .metadata_transfer_staging_actor_closures
+            .get(&closure_key),
+        Some(&closure)
+    );
+    assert_eq!(
+        after_successor
+            .metadata_transfer_staging_retired_actor_closures
+            .get(&closure_key),
+        Some(&closure)
+    );
+
+    let compacted_source = after_successor
+        .checkpoint_metadata_transfer_staging_evidence_pages(
+            closure.source_actor.node_id(),
+            closure.source_actor.node_incarnation(),
+            1,
+            1,
+        )
+        .unwrap()
+        .into_snapshot();
+    let compacted_destination = compacted_source
+        .checkpoint_metadata_transfer_staging_evidence_pages(
+            closure.destination_actor.node_id(),
+            closure.destination_actor.node_incarnation(),
+            1,
+            1,
+        )
+        .unwrap()
+        .into_snapshot();
+    assert!(!compacted_destination
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(
+            closure.destination_actor.node_id(),
+            closure.destination_actor.node_incarnation(),
+            1,
+        )));
+    compacted_destination
+        .validate_current_state_invariants()
+        .unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(&compacted_destination)).unwrap(),
+        compacted_destination
+    );
+
+    let mut forged = compacted_destination.clone();
+    forged
+        .metadata_transfer_staging_actor_closures
+        .get_mut(&closure_key)
+        .unwrap()
+        .rebound_evidence_digest[0] ^= 1;
+    forged
+        .metadata_transfer_staging_retired_actor_closures
+        .get_mut(&closure_key)
+        .unwrap()
+        .rebound_evidence_digest[0] ^= 1;
+    let error = parse_snapshot(&format_snapshot(&forged)).unwrap_err();
+    assert!(
+        error.to_string().contains("rebound evidence prefix"),
+        "unexpected coordinated forgery error: {error}"
     );
 }
 

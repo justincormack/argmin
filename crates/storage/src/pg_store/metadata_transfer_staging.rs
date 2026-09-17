@@ -3979,6 +3979,24 @@ pub(crate) fn metadata_transfer_staging_checkpoint_page_digest(
     generation: u64,
     entries: &[(u64, Vec<u8>)],
 ) -> Result<[u8; DIGEST_LEN], MetadataTransferStagingError> {
+    metadata_transfer_staging_checkpoint_page_digest_with_actor_closure(
+        actor,
+        None,
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
+        entries,
+    )
+}
+
+pub(crate) fn metadata_transfer_staging_checkpoint_page_digest_with_actor_closure(
+    actor: &MetadataTransferStagingNodeIdentity,
+    actor_closure_candidate: Option<&MetadataTransferStagingActorClosureCandidate>,
+    previous_generation: u64,
+    previous_apply_receipt_digest: [u8; DIGEST_LEN],
+    generation: u64,
+    entries: &[(u64, Vec<u8>)],
+) -> Result<[u8; DIGEST_LEN], MetadataTransferStagingError> {
     let entries = entries
         .iter()
         .map(
@@ -3990,7 +4008,7 @@ pub(crate) fn metadata_transfer_staging_checkpoint_page_digest(
         .collect::<Vec<_>>();
     let payload = encode_staging_evidence_page_payload(
         actor,
-        None,
+        actor_closure_candidate,
         previous_generation,
         previous_apply_receipt_digest,
         generation,
@@ -3999,6 +4017,28 @@ pub(crate) fn metadata_transfer_staging_checkpoint_page_digest(
     let digest = checksum::sha256::digest(&payload);
     decode_staging_evidence_page_payload(&payload, digest)?;
     Ok(digest)
+}
+
+pub(crate) fn encode_staging_evidence_actor_closure_candidate_bytes(
+    candidate: &MetadataTransferStagingActorClosureCandidate,
+) -> Result<Vec<u8>, MetadataTransferStagingError> {
+    validate_staging_evidence_actor_closure_candidate(candidate)?;
+    let mut out = Vec::new();
+    encode_staging_evidence_actor_closure_candidate(&mut out, candidate);
+    Ok(out)
+}
+
+pub(crate) fn decode_staging_evidence_actor_closure_candidate_bytes(
+    bytes: &[u8],
+) -> Result<MetadataTransferStagingActorClosureCandidate, MetadataTransferStagingError> {
+    let mut offset = 0;
+    let candidate = decode_staging_evidence_actor_closure_candidate(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(MetadataTransferStagingError::Invariant(
+            "staging actor closure candidate has trailing bytes".to_owned(),
+        ));
+    }
+    Ok(candidate)
 }
 
 fn encode_staging_intent_evidence(out: &mut Vec<u8>, intent: &MetadataTransferStagingIntent) {
@@ -4521,6 +4561,95 @@ pub(crate) fn metadata_transfer_staging_incomplete_closure_evidence_page_for_tes
         0,
         [0; DIGEST_LEN],
         1,
+        &entries,
+    );
+    let page_digest = checksum::sha256::digest(&operation_payload);
+    decode_staging_evidence_page_payload(&operation_payload, page_digest).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_transfer_staging_closure_page_from_entries_for_test(
+    first_actor: MetadataTransferStagingNodeIdentity,
+    first_accepted_generation: u64,
+    first_accepted_apply_receipt_digest: [u8; DIGEST_LEN],
+    through_actor: MetadataTransferStagingNodeIdentity,
+    destination_actor: MetadataTransferStagingNodeIdentity,
+    source_entries: &[(u64, Vec<u8>)],
+    included_sequences: &[u64],
+) -> MetadataTransferStagingEvidencePage {
+    let rebound_entries = source_entries
+        .iter()
+        .map(|(sequence, bytes)| {
+            let evidence = decode_staging_evidence(bytes).unwrap();
+            assert_eq!(evidence.actor(), &through_actor);
+            MetadataTransferStagingEvidencePageEntry {
+                sequence: *sequence,
+                evidence: evidence.rebound_for_actor(&destination_actor),
+            }
+        })
+        .collect::<Vec<_>>();
+    let (rebound_entry_count, rebound_max_sequence, rebound_evidence_digest) =
+        metadata_transfer_staging_rebound_evidence_digest(
+            rebound_entries
+                .iter()
+                .map(|entry| (entry.sequence(), entry.evidence())),
+        )
+        .unwrap();
+    let entries = rebound_entries
+        .into_iter()
+        .filter(|entry| included_sequences.contains(&entry.sequence()))
+        .collect::<Vec<_>>();
+    assert!(!entries.is_empty());
+    let candidate = MetadataTransferStagingActorClosureCandidate {
+        first_actor,
+        first_accepted_generation,
+        first_accepted_apply_receipt_digest,
+        first_ambiguous_page: None,
+        through_actor,
+        rebound_entry_count,
+        rebound_max_sequence,
+        rebound_evidence_digest,
+    };
+    let operation_payload = encode_staging_evidence_page_payload(
+        &destination_actor,
+        Some(&candidate),
+        0,
+        [0; DIGEST_LEN],
+        1,
+        &entries,
+    );
+    let page_digest = checksum::sha256::digest(&operation_payload);
+    decode_staging_evidence_page_payload(&operation_payload, page_digest).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn metadata_transfer_staging_successor_page_from_entries_for_test(
+    through_actor: &MetadataTransferStagingNodeIdentity,
+    destination_actor: &MetadataTransferStagingNodeIdentity,
+    source_entries: &[(u64, Vec<u8>)],
+    previous_receipt: &MetadataTransferStagingEvidenceApplyReceipt,
+) -> MetadataTransferStagingEvidencePage {
+    let entries = source_entries
+        .iter()
+        .map(|(sequence, bytes)| {
+            let evidence = decode_staging_evidence(bytes).unwrap();
+            assert_eq!(evidence.actor(), through_actor);
+            MetadataTransferStagingEvidencePageEntry {
+                sequence: *sequence,
+                evidence: evidence.rebound_for_actor(destination_actor),
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(!entries.is_empty());
+    let previous_generation = previous_receipt.generation();
+    let previous_apply_receipt_digest = checksum::sha256::digest(previous_receipt.as_bytes());
+    let generation = previous_generation.checked_add(1).unwrap();
+    let operation_payload = encode_staging_evidence_page_payload(
+        destination_actor,
+        None,
+        previous_generation,
+        previous_apply_receipt_digest,
+        generation,
         &entries,
     );
     let page_digest = checksum::sha256::digest(&operation_payload);

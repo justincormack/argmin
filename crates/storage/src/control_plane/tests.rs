@@ -1645,15 +1645,17 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         require_current_control_plane_state_version(None),
         Err(ControlPlaneStateVersionError::Missing)
     );
-    for version in [28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43] {
+    for version in [
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44,
+    ] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
             Err(ControlPlaneStateVersionError::Unsupported(version))
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(42)),
-        Ok(42)
+        require_current_control_plane_state_version(Some(43)),
+        Ok(43)
     );
 
     assert!(matches!(
@@ -1976,11 +1978,29 @@ fn canonical_control_plane_state_v41_text_remains_rejected_evidence() {
 }
 
 #[test]
-fn canonical_control_plane_state_v42_text_is_exact() {
+fn canonical_control_plane_state_v42_text_remains_rejected_evidence() {
+    const V42: &str = concat!(
+        "version=42\n",
+        "authority_incarnation=1\n",
+        "cluster_epoch=1\n",
+        "initial_topology=-\n",
+        "max_committed_timestamp_ms=123\n",
+        "lease_grant_horizon=-\n",
+        "node=1,active,1,healthy,11,1,100,200,-,6e6f64652d312e736f636b\n",
+    );
+    assert!(matches!(
+        parse_snapshot(V42),
+        Err(ControlPlaneError::Parse { line: 1, message })
+            if message == "unsupported control-plane state version 42"
+    ));
+}
+
+#[test]
+fn canonical_control_plane_state_v43_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=42\n",
+            "version=43\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -2146,7 +2166,7 @@ fn canonical_control_plane_state_v36_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v42_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v43_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -2799,7 +2819,22 @@ fn canonical_control_plane_state_v42_representative_aggregate_is_stable() {
         .unwrap()
         .into_snapshot();
     snapshots.push(checkpointed);
-    snapshots.push(transitions::staging_actor_closure_snapshot_fixture());
+    let actor_closure = transitions::staging_actor_closure_snapshot_fixture();
+    let closure_key = *actor_closure
+        .metadata_transfer_staging_actor_closures
+        .keys()
+        .next()
+        .unwrap();
+    let retirement = actor_closure
+        .retire_metadata_transfer_staging_actor_closure_command(closure_key.0, closure_key.1)
+        .unwrap();
+    snapshots.push(actor_closure.clone());
+    snapshots.push(
+        actor_closure
+            .apply_control_plane_command(retirement)
+            .unwrap()
+            .into_snapshot(),
+    );
     snapshots.push(transitions::finalized_staging_floor_snapshot_fixture());
     snapshots.push(transitions::collapsed_staging_checkpoint_snapshot_fixture());
 
@@ -2814,7 +2849,7 @@ fn canonical_control_plane_state_v42_representative_aggregate_is_stable() {
         aggregate_text.push_str(&formatted);
     }
     for required_record in [
-        "version=42\n",
+        "version=43\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -2833,6 +2868,7 @@ fn canonical_control_plane_state_v42_representative_aggregate_is_stable() {
         "metadata_transfer_staging_evidence_checkpoint=",
         "metadata_transfer_staging_evidence_checkpoint_anchor=",
         "metadata_transfer_staging_actor_closure=",
+        "metadata_transfer_staging_retired_actor_closure=",
         "metadata_transfer_staging_finalized_floor=",
         "metadata_transfer_staging_evidence=",
     ] {
@@ -2866,14 +2902,39 @@ fn canonical_control_plane_state_v42_representative_aggregate_is_stable() {
         ));
         historical = tail;
     }
+    const HISTORICAL_V42_AGGREGATE: &[u8] =
+        include_bytes!("testdata/state_v42_representative.aggregate");
+    assert_eq!(
+        (
+            HISTORICAL_V42_AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(HISTORICAL_V42_AGGREGATE))
+        ),
+        (
+            115_667,
+            "e821fe62500f41870faad9f6e8a43efde3c38dabe2a79a4a162805ab79c25225".to_owned()
+        )
+    );
+    let mut historical = HISTORICAL_V42_AGGREGATE;
+    while !historical.is_empty() {
+        let (raw_length, tail) = historical.split_at(8);
+        let snapshot_length =
+            usize::try_from(u64::from_be_bytes(raw_length.try_into().unwrap())).unwrap();
+        let (snapshot, tail) = tail.split_at(snapshot_length);
+        assert!(matches!(
+            parse_snapshot(std::str::from_utf8(snapshot).unwrap()),
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 42"
+        ));
+        historical = tail;
+    }
     assert_eq!(
         (
             aggregate.len(),
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            115_667,
-            "e821fe62500f41870faad9f6e8a43efde3c38dabe2a79a4a162805ab79c25225".to_owned()
+            130_078,
+            "9434b2ae07e55307b850ec4c2a98998d33e9994a375552170c3dc6de611bf325".to_owned()
         )
     );
 }
