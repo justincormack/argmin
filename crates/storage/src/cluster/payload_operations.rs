@@ -1960,6 +1960,7 @@ impl StorageCluster {
                     wait_us,
                     lineage_tip,
                     resolution,
+                    ..
                 } => {
                     command = lineage_tip;
                     self.emit_metadata_command_recovery_admission_for_command(
@@ -1991,6 +1992,7 @@ impl StorageCluster {
                     wait_us,
                     lineage_tip,
                     resolution,
+                    ..
                 } => {
                     command = lineage_tip;
                     self.emit_metadata_command_recovery_admission_for_command(
@@ -2123,6 +2125,7 @@ impl StorageCluster {
                     wait_us,
                     lineage_tip,
                     resolution,
+                    ..
                 } => {
                     command = lineage_tip;
                     self.emit_metadata_command_recovery_admission_for_command(
@@ -5535,6 +5538,7 @@ impl StorageCluster {
                     wait_us,
                     lineage_tip,
                     resolution,
+                    ..
                 } => {
                     command = lineage_tip;
                     self.emit_metadata_command_recovery_admission_for_command(
@@ -5567,6 +5571,7 @@ impl StorageCluster {
                     wait_us,
                     lineage_tip,
                     resolution,
+                    ..
                 } => {
                     command = lineage_tip;
                     apply_as_new = false;
@@ -5689,6 +5694,7 @@ impl StorageCluster {
                     wait_us,
                     lineage_tip,
                     resolution,
+                    ..
                 } => {
                     command = lineage_tip;
                     apply_as_new = false;

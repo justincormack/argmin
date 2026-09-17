@@ -656,16 +656,12 @@ impl super::StorageCluster {
         )
         .for_operation("new_object_metadata_command_apply")
         .for_pg(pg_id);
-        match self.apply_new_object_metadata_command_for_bucket_inner(
+        match self.apply_new_object_metadata_command_for_bucket_with_owned_recovery(
             pg_id,
             bucket,
             command,
             &mut work_budget,
-            ObjectMetadataCommandApplyContext {
-                return_metadata_command_contention: false,
-                provenance: ObjectMetadataCommandApplyProvenance::New,
-                recovery_guard: None,
-            },
+            false,
         )? {
             NewObjectMetadataCommandApplyOutcome::Applied
             | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
@@ -682,16 +678,12 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
-        self.apply_new_object_metadata_command_for_bucket_inner(
+        self.apply_new_object_metadata_command_for_bucket_with_owned_recovery(
             pg_id,
             bucket,
             command,
             work_budget,
-            ObjectMetadataCommandApplyContext {
-                return_metadata_command_contention: false,
-                provenance: ObjectMetadataCommandApplyProvenance::New,
-                recovery_guard: None,
-            },
+            false,
         )
     }
 
@@ -758,16 +750,12 @@ impl super::StorageCluster {
         let mut work_budget = super::RequestWorkBudget::new(retry_budget, None)
             .for_operation("test_new_object_metadata_command_apply")
             .for_pg(pg_id);
-        match self.apply_new_object_metadata_command_for_bucket_inner(
+        match self.apply_new_object_metadata_command_for_bucket_with_owned_recovery(
             pg_id,
             bucket,
             command,
             &mut work_budget,
-            ObjectMetadataCommandApplyContext {
-                return_metadata_command_contention: false,
-                provenance: ObjectMetadataCommandApplyProvenance::New,
-                recovery_guard: None,
-            },
+            false,
         )? {
             NewObjectMetadataCommandApplyOutcome::Applied
             | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
@@ -784,16 +772,12 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
-        match self.apply_new_object_metadata_command_for_bucket_inner(
+        match self.apply_new_object_metadata_command_for_bucket_with_owned_recovery(
             pg_id,
             bucket,
             command,
             work_budget,
-            ObjectMetadataCommandApplyContext {
-                return_metadata_command_contention: true,
-                provenance: ObjectMetadataCommandApplyProvenance::New,
-                recovery_guard: None,
-            },
+            true,
         )? {
             NewObjectMetadataCommandApplyOutcome::Applied
             | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
@@ -801,6 +785,180 @@ impl super::StorageCluster {
             NewObjectMetadataCommandApplyOutcome::Reinspect(error)
             | NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
         }
+    }
+
+    fn apply_new_object_metadata_command_for_bucket_with_owned_recovery(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+        return_metadata_command_contention: bool,
+    ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
+        let mut recovery_command = command.clone();
+        let mut provenance = ObjectMetadataCommandApplyProvenance::New;
+        loop {
+            work_budget
+                .check("new object metadata command recovery admission budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
+            let admission = self
+                .local_map
+                .runtime_state()
+                .join_metadata_command_recovery_until(
+                    pg_id,
+                    &recovery_command,
+                    work_budget.deadline(),
+                );
+            let recovery_guard = match admission {
+                MetadataCommandRecoveryAdmission::Leader(guard) => guard,
+                MetadataCommandRecoveryAdmission::Waited {
+                    lineage_tip,
+                    root_disposition,
+                    resolution,
+                    ..
+                } => {
+                    recovery_command = lineage_tip;
+                    provenance = ObjectMetadataCommandApplyProvenance::RecoveredPending;
+                    if let Some(outcome) = Self::new_object_metadata_command_outcome_from_recovery(
+                        &recovery_command,
+                        &root_disposition,
+                        resolution,
+                    )? {
+                        return Ok(outcome);
+                    }
+                    continue;
+                }
+                MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
+                    lineage_tip,
+                    root_disposition,
+                    resolution,
+                    ..
+                }
+                | MetadataCommandRecoveryAdmission::TimedOut {
+                    lineage_tip,
+                    root_disposition,
+                    resolution,
+                    ..
+                } => {
+                    if let Some(outcome) = Self::new_object_metadata_command_outcome_from_recovery(
+                        &lineage_tip,
+                        &root_disposition,
+                        resolution,
+                    )? {
+                        return Ok(outcome);
+                    }
+                    return Err(
+                        ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery,
+                    );
+                }
+            };
+            let result = self.apply_new_object_metadata_command_for_bucket_inner(
+                pg_id,
+                bucket,
+                &recovery_command,
+                work_budget,
+                ObjectMetadataCommandApplyContext {
+                    return_metadata_command_contention,
+                    provenance,
+                    recovery_guard: Some(&recovery_guard),
+                },
+            );
+            match result {
+                Ok(outcome) => {
+                    let recovery_outcome = outcome
+                        .pending_metadata_command_outcome()
+                        .unwrap_or(PendingMetadataCommandOutcome::Abandoned);
+                    self.complete_metadata_command_recovery_guard(
+                        recovery_guard,
+                        recovery_outcome,
+                    );
+                    return Ok(outcome);
+                }
+                Err(error) => {
+                    let resolution = match &error {
+                        ObjectPgActionError::Store(
+                            StoreError::MetadataCommandOutcomeUnconfirmed { .. },
+                        ) => Some(MetadataCommandRecoveryResolution::OutcomeUnconfirmed),
+                        ObjectPgActionError::Store(
+                            StoreError::MetadataCommandIrrevocableConvergencePending { .. },
+                        ) => Some(
+                            MetadataCommandRecoveryResolution::IrrevocableConvergencePending,
+                        ),
+                        _ => None,
+                    };
+                    if let Some(resolution) = resolution {
+                        recovery_guard.mark_irreversible_handoff(resolution);
+                        self.relinquish_metadata_command_recovery_guard(recovery_guard);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn new_object_metadata_command_outcome_from_recovery(
+        command: &MetadataCommandEnvelope,
+        root_disposition: &MetadataCommandRecoveryRootDisposition,
+        resolution: Option<MetadataCommandRecoveryResolution>,
+    ) -> Result<Option<NewObjectMetadataCommandApplyOutcome>, ObjectPgActionError> {
+        if matches!(
+            root_disposition,
+            MetadataCommandRecoveryRootDisposition::Abandoned { .. }
+        ) {
+            return match resolution {
+                None | Some(MetadataCommandRecoveryResolution::Outcome(_)) => {
+                    Ok(Some(NewObjectMetadataCommandApplyOutcome::Reinspect(
+                        ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                            context: "new object metadata command was abandoned by a recovery derivative",
+                        }),
+                    )))
+                }
+                Some(MetadataCommandRecoveryResolution::OutcomeUnconfirmed) => {
+                    Err(Self::object_metadata_command_outcome_unconfirmed_error(command))
+                }
+                Some(MetadataCommandRecoveryResolution::IrrevocableConvergencePending) => {
+                    Err(Self::object_metadata_command_irrevocable_error(command))
+                }
+            };
+        }
+        let Some(resolution) = resolution else {
+            return Ok(None);
+        };
+        let outcome = match resolution {
+            MetadataCommandRecoveryResolution::Outcome(PendingMetadataCommandOutcome::Applied) => {
+                NewObjectMetadataCommandApplyOutcome::Applied
+            }
+            MetadataCommandRecoveryResolution::Outcome(
+                PendingMetadataCommandOutcome::PublishedPendingRecovery,
+            ) => NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery,
+            MetadataCommandRecoveryResolution::Outcome(
+                PendingMetadataCommandOutcome::TerminalCleanupPending { applied: true },
+            ) => NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending,
+            MetadataCommandRecoveryResolution::Outcome(
+                PendingMetadataCommandOutcome::Abandoned,
+            ) => NewObjectMetadataCommandApplyOutcome::Reinspect(ObjectPgActionError::Store(
+                StoreError::MetadataCommandContention {
+                    context: "new object metadata command was abandoned by recovery",
+                },
+            )),
+            MetadataCommandRecoveryResolution::Outcome(
+                PendingMetadataCommandOutcome::TerminalCleanupPending { applied: false },
+            ) => {
+                return Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery);
+            }
+            MetadataCommandRecoveryResolution::Outcome(
+                PendingMetadataCommandOutcome::RetryPartialExactConflict,
+            ) => return Ok(None),
+            MetadataCommandRecoveryResolution::OutcomeUnconfirmed => {
+                return Err(Self::object_metadata_command_outcome_unconfirmed_error(
+                    command,
+                ));
+            }
+            MetadataCommandRecoveryResolution::IrrevocableConvergencePending => {
+                return Err(Self::object_metadata_command_irrevocable_error(command));
+            }
+        };
+        Ok(Some(outcome))
     }
 
     fn abandon_definitively_unapplied_object_metadata_command(

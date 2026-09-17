@@ -3937,7 +3937,7 @@ fn insert_delete_marker_abandons_persistent_local_contention_at_retry_deadline()
 }
 
 #[test]
-fn insert_delete_marker_abandonment_waits_for_existing_recovery_owner() {
+fn insert_delete_marker_foreground_apply_owns_recovery_until_abandonment() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3973,8 +3973,8 @@ fn insert_delete_marker_abandonment_waits_for_existing_recovery_owner() {
             Ok(())
         }));
 
-    let held_recovery = Arc::new(Mutex::new(None));
-    let held_recovery_for_hook = Arc::clone(&held_recovery);
+    let ownership_observed = Arc::new(AtomicBool::new(false));
+    let ownership_observed_for_hook = Arc::clone(&ownership_observed);
     let recovery_cluster = cluster.clone();
     let recovery_bucket = bucket.clone();
     let recovery_key = key.clone();
@@ -3988,14 +3988,22 @@ fn insert_delete_marker_abandonment_waits_for_existing_recovery_owner() {
             {
                 return false;
             }
-            let mut held = held_recovery_for_hook
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if held.is_none() {
-                *held = Some(
-                    recovery_cluster
-                        .test_begin_metadata_command_recovery_leader(PgId::new(object_pg), command),
-                );
+            if !ownership_observed_for_hook.swap(true, Ordering::SeqCst) {
+                let admission = recovery_cluster
+                    .local_map
+                    .runtime_state()
+                    .join_metadata_command_recovery_until(
+                        PgId::new(object_pg),
+                        command,
+                        Instant::now(),
+                    );
+                assert!(matches!(
+                    admission,
+                    crate::cluster::local::MetadataCommandRecoveryAdmission::TimedOut {
+                        resolution: None,
+                        ..
+                    }
+                ));
             }
             true
         },
@@ -4009,34 +4017,277 @@ fn insert_delete_marker_abandonment_waits_for_existing_recovery_owner() {
             crate::OwnerIdentity::from_principal("owner"),
             |_| Ok::<(), ()>(()),
         )
-        .expect_err("foreground abandonment must defer to the existing recovery owner");
+        .expect_err("persistent contention must abandon the foreground-owned command");
 
     assert!(matches!(
         error,
-        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
     ));
+    assert!(ownership_observed.load(Ordering::SeqCst));
     let pg_id = PgId::new(object_pg);
-    let pending = pending_metadata_command_for_test(&map, pg_id, &bucket)
-        .expect("the recovery-owned command must remain pending");
-    assert!(matches!(
-        pending.payload(),
-        MetadataCommandPayload::InsertDeleteMarker(marker)
-            if marker.bucket == bucket && marker.key == key
-    ));
-
-    drop(
-        held_recovery
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take(),
-    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
     drop(budget_hook);
     drop(apply_hook);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+fn assert_new_object_foreground_waiter_reinspects_cleanup_derivative(
+    recovery_outcome: Option<PendingMetadataCommandOutcome>,
+    session_octet: &str,
+) {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let session_id = crate::SessionId::try_from(session_octet.repeat(16)).unwrap();
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let source = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::CreateStreamUpload(Box::new(
+            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::ObjectEncryption::None,
+                },
+                123,
+                proof.clone(),
+            ),
+        )),
+    );
+    let derivative = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            source.id().cluster_epoch(),
+            pg_id,
+            MetadataCommandLogIndex::new(source.id().log_index().get() + 1).unwrap(),
+        ),
+        source
+            .payload()
+            .abandoned_recovery_follow_up()
+            .expect("abandoned stream creation must require generation cleanup"),
+    );
+    let MetadataCommandRecoveryAdmission::Leader(owner) = map
+        .runtime_state()
+        .join_metadata_command_recovery(pg_id, &source)
+    else {
+        panic!("cleanup recovery must own the source command flight")
+    };
+    owner
+        .bind_reissued_command(pg_id, &source, &derivative)
+        .unwrap();
+
+    let waiter_selected = Arc::new(Barrier::new(2));
+    cluster.test_install_metadata_command_recovery_owner_completion_hook(
+        pg_id,
+        &source,
+        Arc::clone(&waiter_selected),
+    );
+    let outcome = thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let mut work_budget = RequestWorkBudget::new(Duration::from_secs(1), None)
+                .for_operation("test foreground cleanup derivative projection")
+                .for_pg(pg_id);
+            cluster.apply_new_object_metadata_command_for_bucket_or_reinspect(
+                pg_id,
+                &bucket,
+                &source,
+                &mut work_budget,
+            )
+        });
+        waiter_selected.wait();
+        if let Some(recovery_outcome) = recovery_outcome {
+            assert!(!owner.complete_with_outcome_and_relinquish_if_requested(recovery_outcome));
+        } else {
+            drop(owner);
+        }
+        waiter.join().unwrap()
+    })
+    .expect("the foreground waiter must receive the recovery resolution");
+
+    assert!(matches!(
+        outcome,
+        crate::cluster::request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(
+            crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
+        )
+    ));
+    assert_eq!(
+        cluster.test_take_metadata_command_recovery_wait_hook_observation(),
+        (1, 0),
+        "the foreground command must consume the cleanup derivative's recorded resolution"
+    );
+    assert!(matches!(
+        derivative.payload(),
+        MetadataCommandPayload::ReleaseObjectGeneration(release)
+            if release.matches_request(&bucket, &key, &session_id)
+    ));
     cluster
-        .drain_pending_metadata_commands_for_static_map()
+        .release_bucket_write_reservation_proof(&proof)
         .unwrap();
     assert_clean_metadata_command_stream(&map, &[object_pg]);
     assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn new_object_foreground_waiter_does_not_project_applied_cleanup_derivative() {
+    assert_new_object_foreground_waiter_reinspects_cleanup_derivative(
+        Some(PendingMetadataCommandOutcome::Applied),
+        "7d",
+    );
+}
+
+#[test]
+fn new_object_foreground_waiter_does_not_retry_root_after_partial_cleanup_derivative() {
+    assert_new_object_foreground_waiter_reinspects_cleanup_derivative(
+        Some(PendingMetadataCommandOutcome::RetryPartialExactConflict),
+        "7e",
+    );
+}
+
+#[test]
+fn new_object_foreground_waiter_does_not_retry_abandoned_root_without_resolution() {
+    assert_new_object_foreground_waiter_reinspects_cleanup_derivative(None, "7f");
+}
+
+#[test]
+fn new_object_foreground_waiter_continues_partial_equivalent_reissue_from_lineage_tip() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let source = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            key,
+            crate::VersionId::from_u64(1),
+        )),
+    );
+    let replacement = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            source.id().cluster_epoch(),
+            pg_id,
+            MetadataCommandLogIndex::new(source.id().log_index().get() + 1).unwrap(),
+        ),
+        source.payload().clone(),
+    );
+    let MetadataCommandRecoveryAdmission::Leader(owner) = map
+        .runtime_state()
+        .join_metadata_command_recovery(pg_id, &source)
+    else {
+        panic!("equivalent reissue recovery must own the source command flight")
+    };
+    owner
+        .bind_reissued_command(pg_id, &source, &replacement)
+        .unwrap();
+
+    let observed_reconstruction = Arc::new(Mutex::new(None));
+    let observed_reconstruction_for_hook = Arc::clone(&observed_reconstruction);
+    let reconstruction_hook = cluster.test_install_metadata_command_progress_reconstruction_hook(
+        Arc::new(move |command| {
+            *observed_reconstruction_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(command.clone());
+            Err(StoreError::StorageRpc {
+                node_id: 2,
+                operation: "injected equivalent reissue progress reconstruction",
+                failure: crate::storage_rpc::StorageRpcErrorCode::PayloadDecode,
+                detail: crate::StorageNodeFailureDetail::new(
+                    "equivalent reissue must reconstruct recovered progress",
+                ),
+            })
+        }),
+    );
+    let waiter_selected = Arc::new(Barrier::new(2));
+    cluster.test_install_metadata_command_recovery_owner_completion_hook(
+        pg_id,
+        &source,
+        Arc::clone(&waiter_selected),
+    );
+    let result = thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            let mut work_budget = RequestWorkBudget::new(Duration::from_secs(1), None)
+                .for_operation("test foreground equivalent reissue continuation")
+                .for_pg(pg_id);
+            cluster.apply_new_object_metadata_command_for_bucket_or_reinspect(
+                pg_id,
+                &bucket,
+                &source,
+                &mut work_budget,
+            )
+        });
+        waiter_selected.wait();
+        assert!(!owner.complete_with_outcome_and_relinquish_if_requested(
+            PendingMetadataCommandOutcome::RetryPartialExactConflict,
+        ));
+        waiter.join().unwrap()
+    });
+    drop(reconstruction_hook);
+
+    assert!(matches!(
+        result,
+        Err(crate::ObjectPgActionError::Store(StoreError::StorageRpc {
+            operation: "injected equivalent reissue progress reconstruction",
+            failure: crate::storage_rpc::StorageRpcErrorCode::PayloadDecode,
+            ..
+        }))
+    ));
+    assert_eq!(
+        observed_reconstruction
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref(),
+        Some(&replacement),
+        "the equivalent lineage tip must reconstruct recovered-pending progress"
+    );
+    assert_eq!(
+        cluster.test_take_metadata_command_recovery_wait_hook_observation(),
+        (1, 0),
+    );
+    assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 0);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
 }
 
 #[test]

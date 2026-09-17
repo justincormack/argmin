@@ -2670,6 +2670,7 @@ impl super::StorageCluster {
                     wait_us,
                     lineage_tip,
                     resolution,
+                    ..
                 } => {
                     command = lineage_tip;
                     policy.progress_provenance =
@@ -2745,6 +2746,7 @@ impl super::StorageCluster {
                     wait_us,
                     lineage_tip,
                     resolution,
+                    ..
                 } => {
                     command = lineage_tip;
                     policy.progress_provenance =

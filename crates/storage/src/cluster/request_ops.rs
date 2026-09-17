@@ -18,8 +18,8 @@ use super::{
     MetadataCommandCheckpointRecordSummary, MetadataCommandExecutionRoute,
     MetadataCommandPublicationState, MetadataCommandRecoveryAdmission,
     MetadataCommandRecoveryGuard, MetadataCommandRecoveryLeader, MetadataCommandRecoveryProof,
-    MetadataCommandRecoveryResolution, MetadataCommandRecoveryWaiterOutcome,
-    MetadataCommandRouteMode, PendingMetadataCommandOutcome,
+    MetadataCommandRecoveryResolution, MetadataCommandRecoveryRootDisposition,
+    MetadataCommandRecoveryWaiterOutcome, MetadataCommandRouteMode, PendingMetadataCommandOutcome,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use super::{

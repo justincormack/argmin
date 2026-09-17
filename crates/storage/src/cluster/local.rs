@@ -1588,16 +1588,19 @@ pub(crate) enum MetadataCommandRecoveryAdmission {
     AwaitingAuthorizedRecovery {
         wait_us: u128,
         lineage_tip: MetadataCommandEnvelope,
+        root_disposition: MetadataCommandRecoveryRootDisposition,
         resolution: Option<MetadataCommandRecoveryResolution>,
     },
     Waited {
         wait_us: u128,
         lineage_tip: MetadataCommandEnvelope,
+        root_disposition: MetadataCommandRecoveryRootDisposition,
         resolution: Option<MetadataCommandRecoveryResolution>,
     },
     TimedOut {
         wait_us: u128,
         lineage_tip: MetadataCommandEnvelope,
+        root_disposition: MetadataCommandRecoveryRootDisposition,
         resolution: Option<MetadataCommandRecoveryResolution>,
     },
 }
@@ -2298,12 +2301,14 @@ impl LocalClusterRuntimeState {
                     return MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
                         wait_us: 0,
                         lineage_tip: command.clone(),
+                        root_disposition: MetadataCommandRecoveryRootDisposition::TipOutcome,
                         resolution: None,
                     };
                 }
                 return MetadataCommandRecoveryAdmission::TimedOut {
                     wait_us: 0,
                     lineage_tip: command.clone(),
+                    root_disposition: MetadataCommandRecoveryRootDisposition::TipOutcome,
                     resolution: None,
                 };
             } else {
@@ -2345,6 +2350,7 @@ impl LocalClusterRuntimeState {
                 return MetadataCommandRecoveryAdmission::Waited {
                     wait_us: 0,
                     lineage_tip: state.lineage_tip.clone(),
+                    root_disposition: state.root_disposition.clone(),
                     resolution: state.resolution,
                 };
             }
@@ -2359,6 +2365,7 @@ impl LocalClusterRuntimeState {
                 return MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
                     wait_us: 0,
                     lineage_tip: state.lineage_tip.clone(),
+                    root_disposition: state.root_disposition.clone(),
                     resolution: state.resolution,
                 };
             }
@@ -2368,6 +2375,7 @@ impl LocalClusterRuntimeState {
             return MetadataCommandRecoveryAdmission::TimedOut {
                 wait_us: 0,
                 lineage_tip: state.lineage_tip.clone(),
+                root_disposition: state.root_disposition.clone(),
                 resolution: state.resolution,
             };
         }
@@ -2405,6 +2413,7 @@ impl LocalClusterRuntimeState {
                     return MetadataCommandRecoveryAdmission::TimedOut {
                         wait_us: 0,
                         lineage_tip: state.lineage_tip.clone(),
+                        root_disposition: state.root_disposition.clone(),
                         resolution: state.resolution,
                     };
                 }
@@ -2432,6 +2441,7 @@ impl LocalClusterRuntimeState {
             .unwrap_or_else(|e| e.into_inner());
         let wait_us = wait_started.elapsed().as_micros();
         let lineage_tip = guard.lineage_tip.clone();
+        let root_disposition = guard.root_disposition.clone();
         let resolution = guard.resolution;
         if guard.awaiting_authorized_recovery
             && !guard.in_progress
@@ -2444,6 +2454,7 @@ impl LocalClusterRuntimeState {
             MetadataCommandRecoveryAdmission::AwaitingAuthorizedRecovery {
                 wait_us,
                 lineage_tip,
+                root_disposition,
                 resolution,
             }
         } else if guard.in_progress || guard.awaiting_authorized_recovery {
@@ -2451,12 +2462,14 @@ impl LocalClusterRuntimeState {
             MetadataCommandRecoveryAdmission::TimedOut {
                 wait_us,
                 lineage_tip,
+                root_disposition,
                 resolution,
             }
         } else {
             MetadataCommandRecoveryAdmission::Waited {
                 wait_us,
                 lineage_tip,
+                root_disposition,
                 resolution,
             }
         }
