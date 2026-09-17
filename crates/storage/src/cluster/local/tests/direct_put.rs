@@ -5459,10 +5459,12 @@ fn direct_put_irreversible_handoff_wakes_static_authorized_recovery() {
         "direct PUT recovery handoff must wake the static recovery owner"
     );
     let recovery_deadline = Instant::now() + Duration::from_secs(2);
-    while pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some() {
+    while pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some()
+        || cluster.test_metadata_command_recovery_flight_count() != 0
+    {
         assert!(
             Instant::now() < recovery_deadline,
-            "woken static recovery owner did not converge the direct PUT"
+            "woken static recovery owner did not converge the direct PUT and retire its recovery flight"
         );
         thread::sleep(Duration::from_millis(1));
     }
