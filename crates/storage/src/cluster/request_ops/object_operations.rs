@@ -1854,9 +1854,18 @@ impl super::StorageCluster {
             });
         };
         let pg_id = object_pg_id.pg_id();
+        let mut work_budget = super::RequestWorkBudget::new(
+            super::BUCKET_WRITE_DRAIN_RETRY_BUDGET,
+            None,
+        )
+        .for_operation("delete_specific_object_version")
+        .for_pg(pg_id);
         let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
 
-        loop {
+        'request: loop {
+            work_budget
+                .check("delete specific object version retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let storage_client = self.object_delete_metadata_primary_route(bucket, key)?;
             let pending_command = if snapshot_retry_phase.pending_drain_allowed() {
@@ -1875,17 +1884,45 @@ impl super::StorageCluster {
                             Err(error) => return Ok(Err(error)),
                         };
                         require_valid_route().map_err(ObjectPgActionError::Store)?;
-                        self.apply_exact_pending_object_metadata_command(
-                            pg_id,
-                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
-                        )?;
-                        return Ok(Ok(DeleteSpecificObjectVersionOutcome {
-                            value,
-                            deleted: Self::deleted_specific_from_command_target(&delete.target),
-                        }));
+                        loop {
+                            match self
+                                .apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
+                                    pg_id,
+                                    super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                        &command,
+                                    ),
+                                    &mut work_budget,
+                                )
+                            {
+                                Ok(super::ExactPendingObjectMetadataCommandOutcome::Applied) => {
+                                    return Ok(Ok(DeleteSpecificObjectVersionOutcome {
+                                        value,
+                                        deleted: Self::deleted_specific_from_command_target(
+                                            &delete.target,
+                                        ),
+                                    }));
+                                }
+                                Ok(
+                                    super::ExactPendingObjectMetadataCommandOutcome::Reinspect,
+                                ) => break,
+                                Err(error) => self
+                                    .retry_exact_snapshot_sensitive_metadata_command_after_error(
+                                        pg_id,
+                                        &command,
+                                        error,
+                                        &mut work_budget,
+                                    )?,
+                            }
+                        }
+                        continue;
                     }
                 }
-                self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
+                self.drain_snapshot_sensitive_pending_object_metadata_command(
+                    publisher,
+                    pg_id,
+                    &command,
+                    &mut work_budget,
+                )?;
                 continue;
             }
 
@@ -1972,14 +2009,30 @@ impl super::StorageCluster {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
-                    self.drain_one_pending_object_metadata_command(publisher, pg_id, bucket)?;
+                    if let Err(error) = self
+                        .drain_one_pending_object_metadata_command_with_work_budget(
+                            publisher,
+                            pg_id,
+                            bucket,
+                            &mut work_budget,
+                        )
+                    {
+                        self.retry_snapshot_sensitive_metadata_command_install_after_error(
+                            error,
+                            &mut work_budget,
+                        )?;
+                    }
                     continue;
                 }
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
-                    return Err(error);
+                    self.retry_snapshot_sensitive_metadata_command_install_after_error(
+                        error,
+                        &mut work_budget,
+                    )?;
+                    continue;
                 }
             };
             if let Err(error) = require_valid_route() {
@@ -1988,20 +2041,40 @@ impl super::StorageCluster {
                 )?;
                 return Err(ObjectPgActionError::Store(error));
             }
-            let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
-                publisher,
-                pg_id,
-                bucket,
-                &command,
-                Some(effect_fence),
-                &mut evaluated_attempt,
-            ) {
+            let mut install_may_have_applied = false;
+            let install = match self
+                .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    &command,
+                    Some(effect_fence),
+                    &mut work_budget,
+                    &mut install_may_have_applied,
+                    &mut evaluated_attempt,
+                )
+            {
                 Ok(install) => install,
                 Err(error) => {
-                    self.release_bucket_write_proof_for_object_metadata_command(
-                        &bucket_write_reservation,
+                    let pending_owns_reservation = if install_may_have_applied {
+                        self.pending_metadata_command_uses_bucket_write_reservation(
+                            pg_id,
+                            bucket,
+                            &bucket_write_reservation,
+                        )?
+                    } else {
+                        false
+                    };
+                    if !pending_owns_reservation {
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                    }
+                    self.retry_snapshot_sensitive_metadata_command_install_after_error(
+                        error,
+                        &mut work_budget,
                     )?;
-                    return Err(error);
+                    continue 'request;
                 }
             };
             match install {
@@ -2014,7 +2087,31 @@ impl super::StorageCluster {
                     continue;
                 }
             }
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            loop {
+                match self.apply_new_object_metadata_command_for_bucket_or_reinspect(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                ) {
+                    Ok(
+                        NewObjectMetadataCommandApplyOutcome::Applied
+                        | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+                        | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending,
+                    ) => break,
+                    Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(_)) => continue 'request,
+                    Ok(NewObjectMetadataCommandApplyOutcome::Abandoned(error)) => {
+                        return Err(error)
+                    }
+                    Err(error) => self
+                        .retry_exact_snapshot_sensitive_metadata_command_after_error(
+                            pg_id,
+                            &command,
+                            error,
+                            &mut work_budget,
+                        )?,
+                }
+            }
             let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
                 unreachable!("new delete object command changed payload kind");
             };
@@ -2023,6 +2120,27 @@ impl super::StorageCluster {
                 deleted: Self::deleted_specific_from_command_target(&delete.target),
             }));
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_specific_object_version_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
+        self.delete_specific_object_version_if_with_route_validation(
+            super::ObjectMetadataMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                requested_version_id: Some(version_id),
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            action,
+        )
     }
 
     pub(super) fn delete_current_object_if_with_route_validation<T, E>(

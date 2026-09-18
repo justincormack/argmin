@@ -3068,7 +3068,11 @@ fn test_object_lock_multi_delete_object_with_retention() {
             .send()
             .await
             .unwrap();
-        assert!(response.errors().is_empty());
+        assert!(
+            response.errors().is_empty(),
+            "bypass-governance multi-delete returned embedded errors: {:?}",
+            response.errors()
+        );
         assert_eq!(response.deleted().len(), 1);
         let deleted = &response.deleted()[0];
         assert_eq!(deleted.key(), Some(key1));

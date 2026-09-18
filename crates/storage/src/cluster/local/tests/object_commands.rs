@@ -5891,6 +5891,167 @@ fn delete_current_object_retries_install_time_recovery_handoff() {
 }
 
 #[test]
+fn delete_specific_object_version_retries_install_time_recovery_handoff() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, contender_key, object_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let (bucket, key, object_pg, _) = bucket_key_with_distinct_object_and_data_pg(topology);
+        let contender_key = key_for_object_pg(
+            topology,
+            &bucket,
+            object_pg,
+            "specific-delete-install-contender-",
+        );
+        (bucket, key, contender_key, object_pg)
+    };
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+    let committed = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Enabled,
+        [0x91; 16],
+        [0x92; 16],
+        b"specific delete install handoff",
+    );
+    let version_id = committed.version_id;
+    let expected_generation_id = committed.generation_id;
+
+    let pg_id = PgId::new(object_pg);
+    let contender = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            contender_key,
+            crate::SessionId::try_from("75".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+
+    let install_once = Arc::new(AtomicBool::new(true));
+    let install_once_for_hook = Arc::clone(&install_once);
+    let install_map = Arc::clone(&map);
+    let install_bucket = bucket.clone();
+    let install_contender = contender.clone();
+    let _install_hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            if !install_once_for_hook.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let primary = install_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                primary.node_id().as_u32(),
+                &install_contender,
+                Some(&install_bucket),
+            )
+            .expect("test contender must win the specific-delete pending-slot race");
+            let crate::cluster::MetadataCommandRecoveryAdmission::Leader(owner) = install_map
+                .runtime_state()
+                .join_metadata_command_recovery(pg_id, &install_contender)
+            else {
+                panic!("test must acquire the specific-delete contender recovery flight");
+            };
+            owner.mark_irreversible_handoff(
+                crate::cluster::MetadataCommandRecoveryResolution::IrrevocableConvergencePending,
+            );
+            owner.relinquish_for_authorized_recovery();
+        }));
+
+    let (recovery_wait_tx, recovery_wait_rx) = std::sync::mpsc::sync_channel(1);
+    let contender_id = contender.id();
+    let signalled = Arc::new(AtomicBool::new(false));
+    let signalled_hook = Arc::clone(&signalled);
+    let _recovery_wait_hook = cluster
+        .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+            move |command| {
+                if command.id() == contender_id && !signalled_hook.swap(true, Ordering::SeqCst) {
+                    recovery_wait_tx.send(()).unwrap();
+                }
+            },
+        ));
+
+    let action_attempts = Arc::new(AtomicUsize::new(0));
+    thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let delete_cluster = Arc::clone(&cluster);
+        let delete_bucket = bucket.clone();
+        let delete_key = key.clone();
+        let delete_action_attempts = Arc::clone(&action_attempts);
+        scope.spawn(move || {
+            result_tx
+                .send(delete_cluster.delete_specific_object_version_if(
+                    &delete_bucket,
+                    &delete_key,
+                    version_id,
+                    |stored| {
+                        assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+                        delete_action_attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, ()>(())
+                    },
+                ))
+                .unwrap();
+        });
+
+        recovery_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("specific delete did not wait for the install-time recovery handoff");
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &contender));
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &contender, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        let deleted = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("specific delete did not resume after install-time authorized recovery")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            deleted.deleted,
+            crate::DeletedSpecificObjectVersion::Live { generation_id, .. }
+                if generation_id == expected_generation_id
+        ));
+    });
+
+    assert!(!install_once.load(Ordering::SeqCst));
+    assert!(signalled.load(Ordering::SeqCst));
+    assert!(action_attempts.load(Ordering::SeqCst) >= 2);
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert!(cluster
+        .test_get_object_version(&bucket, &key, version_id)
+        .is_err());
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn insert_delete_marker_partial_apply_reopens_and_releases_bucket_write_reservation() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
