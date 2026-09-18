@@ -89,7 +89,7 @@ replicated control plane.
 
 ### Environment-only Raft process harness
 
-The process and UAT harnesses can configure the pre-manifest experimental Raft
+The process and UAT harnesses can configure the pre-manifest Raft
 path directly through environment variables. This is test configuration, not
 the operator interface for a new replicated deployment:
 
@@ -103,7 +103,7 @@ the environment-shaped split-process topology.
 
 | Variable | Description |
 |---|---|
-| `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` | Enables the environment-only Raft path; default `false` |
+| `ARGMIN_CONTROL_PLANE_RAFT_ENABLED` | Enables the environment-only Raft path; default `false` |
 | `ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME` | Test cluster identity |
 | `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` | Local Raft node id; zero is valid and the value defaults to `1` when enabled |
 | `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH` | Local absolute Raft peer Unix socket |

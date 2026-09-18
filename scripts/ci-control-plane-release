@@ -21,6 +21,8 @@ cargo nextest run --release -p storage \
     file_backed_authority_checkpoint_is_due_at_time_bound \
     file_backed_authority_checkpoints_at_command_and_byte_bounds \
     stale_captured_checkpoint_is_rejected_before_publication \
+    control_plane_raft_captured_checkpoint_persists_outside_state_machine_boundary \
+    control_plane_raft_wal_monitor_does_not_enter_state_machine \
     open_validates_control_plane_invariants_before_saving \
     replicated_control_plane_state_machine_fatal_invariant_does_not_advance \
     replicated_state_machine_constructor_validates_control_plane_invariants \
@@ -29,16 +31,14 @@ cargo nextest run --release -p storage \
 echo
 echo "== release control-plane write-amplification boundary =="
 cargo nextest run --release -p argmin-s3 --bin argmin-s3 \
-    experimental_raft_captured_checkpoint_persists_outside_state_machine_boundary \
-    experimental_raft_production_shaped_heartbeat_write_amplification_gate \
-    experimental_raft_peer_vote_acks_from_wal_then_bounded_checkpoint_compacts \
-    experimental_raft_wal_monitor_does_not_enter_state_machine \
-    experimental_raft_wal_checkpoint_observer_captures_local_election_without_peer_rpc \
+    raft_production_shaped_heartbeat_write_amplification_gate \
+    raft_peer_vote_acks_from_wal_then_bounded_checkpoint_compacts \
+    raft_wal_checkpoint_observer_captures_local_election_without_peer_rpc \
     --success-output immediate
 
 echo
 echo "== release control-plane process suite =="
 # Release binaries accept the environment-shaped split-process fixture only
 # through its explicit test compatibility feature.
-cargo nextest run --release -p argmin-s3 --test experimental_raft_process \
+cargo nextest run --release -p argmin-s3 --test raft_process \
     --features test-unauthenticated-internal-rpc

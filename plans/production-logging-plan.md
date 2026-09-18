@@ -190,7 +190,7 @@ Initial audit targets:
 - `crates/argmin-s3/src/main.rs`
   - process startup and configuration errors
   - control-plane socket accept/worker errors
-  - OpenRaft experimental control-plane errors
+  - OpenRaft control-plane errors
   - storage-node server startup/runtime failures
   - frontend listener startup failures
 - `crates/server-http/src/http/serve.rs`

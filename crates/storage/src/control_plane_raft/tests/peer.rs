@@ -92,7 +92,7 @@ fn control_plane_raft_peer_rpc_rejects_noncurrent_nested_command_versions() {
         .unwrap();
     let authority = runtime
         .block_on(
-            ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+            ControlPlaneRaftAuthority::new_single_node_in_memory(
                 "nested-command-version-peer-dispatch",
                 1,
             ),
@@ -778,7 +778,7 @@ fn assert_peer_server_rejects_snapshot_before_publication(
     let authority = Arc::new(
         runtime
             .block_on(
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1),
+                ControlPlaneRaftAuthority::new_single_node_in_memory(cluster_name, 1),
             )
             .unwrap(),
     );
@@ -2709,7 +2709,7 @@ fn control_plane_raft_peer_server_snapshots_checkpoint_before_acknowledgement() 
     let authority = Arc::new(
         runtime
             .block_on(
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                ControlPlaneRaftAuthority::new_single_node_in_memory(
                     "peer-server-checkpoint-order",
                     1,
                 ),
@@ -2776,7 +2776,7 @@ fn control_plane_raft_peer_server_poison_after_validation_prevents_dispatch() {
     let authority = Arc::new(
         runtime
             .block_on(
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1),
+                ControlPlaneRaftAuthority::new_single_node_in_memory(cluster_name, 1),
             )
             .unwrap(),
     );
@@ -2838,7 +2838,7 @@ fn control_plane_raft_peer_server_rejects_resigned_auth_versions_before_dispatch
         let authority = Arc::new(
             runtime
                 .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                    ControlPlaneRaftAuthority::new_single_node_in_memory(
                         cluster_name,
                         1,
                     ),
@@ -2923,7 +2923,7 @@ fn control_plane_raft_peer_server_rejects_authenticated_peer_rpc_versions_before
     let authority = Arc::new(
         runtime
             .block_on(
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1),
+                ControlPlaneRaftAuthority::new_single_node_in_memory(cluster_name, 1),
             )
             .unwrap(),
     );
@@ -3030,7 +3030,7 @@ fn control_plane_raft_peer_server_rejects_malformed_transport_before_auth_or_dis
     let authority = Arc::new(
         runtime
             .block_on(
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1),
+                ControlPlaneRaftAuthority::new_single_node_in_memory(cluster_name, 1),
             )
             .unwrap(),
     );
@@ -3141,7 +3141,7 @@ fn control_plane_raft_peer_server_storage_owned_publication_publishes_once() {
         .unwrap();
     let authority = runtime
         .block_on(
-            ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+            ControlPlaneRaftAuthority::new_single_node_in_memory(
                 "peer-server-publication-once",
                 1,
             ),
@@ -3169,7 +3169,7 @@ fn control_plane_raft_peer_server_checkpoint_failure_poisons_bound_authority() {
         .unwrap();
     let authority = runtime
         .block_on(
-            ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+            ControlPlaneRaftAuthority::new_single_node_in_memory(
                 "peer-server-checkpoint-failure-poison",
                 1,
             ),
@@ -3200,7 +3200,7 @@ fn control_plane_raft_peer_server_response_deadline_starts_after_publication() {
     let authority = Arc::new(
         runtime
             .block_on(
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1),
+                ControlPlaneRaftAuthority::new_single_node_in_memory(cluster_name, 1),
             )
             .unwrap(),
     );
@@ -3280,7 +3280,7 @@ fn control_plane_raft_peer_server_response_failure_preserves_durable_mutation() 
     let authority = Arc::new(
         runtime
             .block_on(
-                ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                ControlPlaneRaftAuthority::new_single_node_durable_with_wal(
                     cluster_name,
                     1,
                     &artifact_path,
@@ -3350,7 +3350,7 @@ fn control_plane_raft_peer_server_pre_auth_budget_is_held_until_frame_read_finis
     let authority = Arc::new(
         runtime
             .block_on(
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                ControlPlaneRaftAuthority::new_single_node_in_memory(
                     "peer-server-pre-auth-budget",
                     1,
                 ),
@@ -3419,7 +3419,7 @@ fn control_plane_raft_tls_peer_server_authenticates_dispatches_and_requires_alpn
     let authority = Arc::new(
         runtime
             .block_on(
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1),
+                ControlPlaneRaftAuthority::new_single_node_in_memory(cluster_name, 1),
             )
             .unwrap(),
     );
@@ -4130,7 +4130,7 @@ fn control_plane_openraft_unix_peer_two_node_client_write_replicates_to_follower
             ControlPlaneRaftPeerTransportLimits::default(),
         );
         let authority1 = Arc::new(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_unix_peer_durable(
                 cluster_name,
                 1,
                 &tmp.path().join("node-1.state"),
@@ -4141,7 +4141,7 @@ fn control_plane_openraft_unix_peer_two_node_client_write_replicates_to_follower
             .unwrap(),
         );
         let authority2 = Arc::new(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_unix_peer_durable(
                 cluster_name,
                 2,
                 &tmp.path().join("node-2.state"),
@@ -4400,7 +4400,7 @@ fn control_plane_raft_peer_unix_stream_handler_dispatches_vote() {
     ControlPlaneRaftTypeConfig::run(async {
         let source_node_id = 7_001;
         let target_node_id = 7_002;
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_single_node_in_memory(
             "control-plane-raft-unix-peer-handler-vote-test",
             target_node_id,
         )
@@ -4465,7 +4465,7 @@ fn control_plane_raft_peer_unix_stream_handler_dispatches_snapshot() {
     ControlPlaneRaftTypeConfig::run(async {
         let source_node_id = 7_011;
         let target_node_id = 7_012;
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_single_node_in_memory(
             "control-plane-raft-unix-peer-handler-snapshot-test",
             target_node_id,
         )
@@ -4559,7 +4559,7 @@ fn control_plane_raft_peer_unix_stream_handler_auto_dispatches_vote() {
     ControlPlaneRaftTypeConfig::run(async {
         let source_node_id = 7_021;
         let target_node_id = 7_022;
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_single_node_in_memory(
             "control-plane-raft-unix-peer-auto-handler-vote-test",
             target_node_id,
         )
@@ -4624,7 +4624,7 @@ fn control_plane_raft_peer_unix_stream_handler_accepts_configured_source() {
         let source_node_id = 7_025;
         let target_node_id = 7_026;
         let cluster_name = "control-plane-raft-unix-configured-handler";
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_single_node_in_memory(
             cluster_name,
             target_node_id,
         )
@@ -4694,7 +4694,7 @@ fn control_plane_raft_peer_unix_stream_handler_rejects_unconfigured_source() {
         let source_node_id = 7_027;
         let target_node_id = 7_028;
         let cluster_name = "control-plane-raft-unix-configured-handler-reject";
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_single_node_in_memory(
             cluster_name,
             target_node_id,
         )
@@ -4754,7 +4754,7 @@ fn control_plane_raft_peer_unix_stream_handler_auto_dispatches_snapshot() {
     ControlPlaneRaftTypeConfig::run(async {
         let source_node_id = 7_031;
         let target_node_id = 7_032;
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_single_node_in_memory(
             "control-plane-raft-unix-peer-auto-handler-snapshot-test",
             target_node_id,
         )
@@ -4818,10 +4818,10 @@ fn test_raft_config(cluster_name: &'static str) -> Arc<Config> {
 }
 
 #[test]
-fn experimental_raft_replication_batch_fits_peer_transport_limit() {
-    let config = experimental_raft_config(
+fn raft_replication_batch_fits_peer_transport_limit() {
+    let config = raft_config(
         "control-plane-raft-batch-limit-test",
-        ExperimentalRaftTimerMode::Automatic,
+        RaftTimerMode::Automatic,
     )
     .unwrap();
 
@@ -4852,7 +4852,7 @@ fn experimental_raft_replication_batch_fits_peer_transport_limit() {
 }
 
 #[test]
-fn experimental_raft_replication_rejects_undersized_peer_policy() {
+fn raft_replication_rejects_undersized_peer_policy() {
     let policy = ControlPlaneRaftPeerTransportPolicy::new(
         "control-plane-raft-undersized-policy-test",
         BTreeMap::from([(1, BasicNode::new("node-1"))]),

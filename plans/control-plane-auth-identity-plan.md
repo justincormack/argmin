@@ -731,6 +731,9 @@ Do not expose secrets, MACs, raw credential material, or full internal payloads.
 
 ## Phase Relationship
 
+- **Completed naming cleanup:** Raft process, log, test, and API names no longer
+  use the `experimental_` label. The environment-only selector is now
+  `ARGMIN_CONTROL_PLANE_RAFT_ENABLED`.
 - **Phase 12.4:** design and implement the shared foundation; enforce it first
   on Raft peer RPCs, then extend the same envelope/credential model to
   storage-node heartbeat refresh, frontend runtime-map reads, admin
@@ -740,9 +743,8 @@ Do not expose secrets, MACs, raw credential material, or full internal payloads.
   and plain framing is available only to explicit test builds. Add external secret
   distribution/rotation automation, move complex control-plane auth/transport
   config into an optional or required config-file surface, remove or replace the
-  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` flag and associated
-  `experimental_` process/log/test/API naming as one dedicated replicated
-  control-plane graduation slice, and revisit asymmetric or mTLS-backed
+  `ARGMIN_CONTROL_PLANE_RAFT_ENABLED` flag as part of replicated control-plane
+  graduation, and revisit asymmetric or mTLS-backed
   credential primitives if symmetric cluster credentials become too broad.
   Admin API formalization can remain a later production-readiness slice unless
   TCP/config-file work exposes ambiguity in the admin operation surface.

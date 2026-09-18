@@ -1272,7 +1272,7 @@ fn control_plane_raft_durable_authority_applies_committed_restart_suffix() {
             .expect("committed-ahead restart artifact should store");
 
     ControlPlaneRaftTypeConfig::run(async {
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+        let authority = ControlPlaneRaftAuthority::new_single_node_durable(
             cluster_name,
             1,
             &artifact_path,
@@ -1302,7 +1302,7 @@ fn control_plane_raft_public_durable_authority_applies_wal_only_committed_comman
     let cluster_name = "control-plane-raft-wal-only-committed-command";
 
     ControlPlaneRaftTypeConfig::run(async {
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+        let authority = ControlPlaneRaftAuthority::new_single_node_durable(
             cluster_name,
             1,
             &artifact_path,
@@ -1415,7 +1415,7 @@ fn control_plane_raft_public_durable_authority_applies_wal_only_committed_comman
         )))
         .unwrap();
 
-        let restarted = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+        let restarted = ControlPlaneRaftAuthority::new_single_node_durable(
             cluster_name,
             1,
             &artifact_path,
@@ -1490,7 +1490,7 @@ fn control_plane_raft_startup_rejects_semantically_inconsistent_artifact() {
     .unwrap();
 
     assert_error_contains(
-        restore_experimental_raft_durable_artifact("test-cluster", 1, &path, None, |_| Ok(())),
+        restore_raft_durable_artifact("test-cluster", 1, &path, None, |_| Ok(())),
         "does not match log-store log id",
     );
 }
@@ -1658,7 +1658,7 @@ fn control_plane_openraft_durable_startup_rejects_unsupported_sentinel_without_m
                 let wal_bytes = artifact_present.then(|| std::fs::read(&wal_path).unwrap());
 
                 assert_error_contains(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    ControlPlaneRaftAuthority::new_single_node_durable(
                         cluster_name,
                         1,
                         &path,
@@ -1731,7 +1731,7 @@ fn control_plane_openraft_durable_startup_rejects_unsupported_wal_file_without_m
             assert!(!durable_artifact_tmp_path(&path).exists());
 
             assert_error_contains(
-                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                ControlPlaneRaftAuthority::new_single_node_durable(
                     cluster_name,
                     1,
                     &path,
@@ -1806,7 +1806,7 @@ fn control_plane_openraft_durable_startup_rejects_unsupported_wal_frame_without_
             reset_control_plane_raft_wal_replay_attempts();
 
             assert_error_contains(
-                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                ControlPlaneRaftAuthority::new_single_node_durable(
                     cluster_name,
                     1,
                     &path,
@@ -1868,7 +1868,7 @@ fn control_plane_openraft_durable_startup_rejects_unsupported_restart_artifact_w
             reset_control_plane_raft_restore_attempts();
 
             assert_error_contains(
-                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                ControlPlaneRaftAuthority::new_single_node_durable(
                     cluster_name,
                     1,
                     &path,
@@ -1924,7 +1924,7 @@ fn control_plane_openraft_durable_single_node_starts_empty_without_artifact() {
     ControlPlaneRaftTypeConfig::run(async {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("missing").join("raft.state");
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+        let authority = ControlPlaneRaftAuthority::new_single_node_durable(
             "control-plane-raft-durable-empty-start-test",
             1,
             &path,
@@ -1954,7 +1954,7 @@ fn control_plane_openraft_durable_single_node_rejects_missing_artifact_with_sent
         .unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+            ControlPlaneRaftAuthority::new_single_node_durable(
                 "control-plane-raft-missing-artifact-sentinel-test",
                 1,
                 &path,
@@ -1981,7 +1981,7 @@ fn control_plane_openraft_durable_single_node_rejects_artifact_without_sentinel(
         std::fs::write(&path, artifact.encode_durable_artifact().unwrap()).unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(cluster_name, 1, &path)
+            ControlPlaneRaftAuthority::new_single_node_durable(cluster_name, 1, &path)
                 .await,
             "is missing for existing artifact",
         );
@@ -2010,7 +2010,7 @@ fn control_plane_openraft_durable_single_node_rejects_wrong_sentinel_identity() 
         .unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(cluster_name, 1, &path)
+            ControlPlaneRaftAuthority::new_single_node_durable(cluster_name, 1, &path)
                 .await,
             "durable restart sentinel belongs to local OpenRaft node 2",
         );
@@ -2058,7 +2058,7 @@ fn control_plane_openraft_durable_single_node_restores_artifact() {
             .unwrap();
 
         let authority =
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(cluster_name, 1, &path)
+            ControlPlaneRaftAuthority::new_single_node_durable(cluster_name, 1, &path)
                 .await
                 .unwrap();
         assert!(authority.is_initialized().await.unwrap());
@@ -2095,7 +2095,7 @@ fn control_plane_openraft_durable_single_node_rejects_wrong_cluster_artifact() {
         artifact.store_durable_artifact(&path).unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+            ControlPlaneRaftAuthority::new_single_node_durable(
                 "new-cluster",
                 1,
                 &path,
@@ -2152,7 +2152,7 @@ fn control_plane_openraft_durable_single_node_restores_current_snapshot_cache() 
             .unwrap();
 
         let authority =
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(cluster_name, 1, &path)
+            ControlPlaneRaftAuthority::new_single_node_durable(cluster_name, 1, &path)
                 .await
                 .unwrap();
 
@@ -2230,7 +2230,7 @@ fn control_plane_openraft_durable_single_node_refreshes_cached_snapshot_after_pu
             .unwrap();
 
         let authority =
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(cluster_name, 1, &path)
+            ControlPlaneRaftAuthority::new_single_node_durable(cluster_name, 1, &path)
                 .await
                 .unwrap();
         authority
@@ -2297,7 +2297,7 @@ fn control_plane_openraft_durable_single_node_rejects_multi_voter_artifact() {
         artifact.store_durable_artifact(&path).unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(cluster_name, 1, &path)
+            ControlPlaneRaftAuthority::new_single_node_durable(cluster_name, 1, &path)
                 .await,
             "must be single-node membership for local node 1",
         );
@@ -2333,7 +2333,7 @@ fn control_plane_openraft_durable_single_node_rejects_unpositioned_multi_voter_m
         artifact.store_durable_artifact(&path).unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(cluster_name, 1, &path)
+            ControlPlaneRaftAuthority::new_single_node_durable(cluster_name, 1, &path)
                 .await,
             "without log id must be empty uninitialized membership",
         );
@@ -2364,7 +2364,7 @@ fn control_plane_openraft_durable_single_node_rejects_wrong_node_artifact() {
         artifact.store_durable_artifact(&path).unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(cluster_name, 2, &path)
+            ControlPlaneRaftAuthority::new_single_node_durable(cluster_name, 2, &path)
                 .await,
             "belongs to local OpenRaft node 1, not configured local node 2",
         );
@@ -2386,7 +2386,7 @@ fn control_plane_openraft_unix_peer_durable_starts_empty_without_artifact() {
             ControlPlaneRaftPeerTransportLimits::default(),
         );
 
-        let authority = ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+        let authority = ControlPlaneRaftAuthority::new_unix_peer_durable(
             cluster_name,
             1,
             &path,
@@ -2427,7 +2427,7 @@ fn control_plane_openraft_unix_peer_durable_rejects_missing_artifact_with_sentin
         .unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_unix_peer_durable(
                 cluster_name,
                 1,
                 &path,
@@ -2515,7 +2515,7 @@ fn control_plane_openraft_static_restore_requires_certificate_before_raft_start(
         .store_durable_artifact(&changed_path)
         .unwrap();
 
-        let authority = ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+        let authority = ControlPlaneRaftAuthority::new_unix_peer_durable(
             cluster_name,
             1,
             &changed_path,
@@ -2586,7 +2586,7 @@ fn control_plane_openraft_static_restore_requires_certificate_before_raft_start(
         .store_durable_artifact(&wrong_path)
         .unwrap();
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_unix_peer_durable(
                 cluster_name,
                 1,
                 &wrong_path,
@@ -2630,7 +2630,7 @@ fn control_plane_openraft_static_restore_requires_certificate_before_raft_start(
         .unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_unix_peer_durable(
                 cluster_name,
                 1,
                 &missing_path,
@@ -2699,7 +2699,7 @@ fn control_plane_openraft_static_pending_restore_accepts_only_expected_bootstrap
         .store_durable_artifact(&path)
         .unwrap();
 
-        let authority = ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
+        let authority = ControlPlaneRaftAuthority::new_unix_peer_durable_with_wal_pending_static_initialization(
                 cluster_name,
                 1,
                 &path,
@@ -2747,7 +2747,7 @@ fn control_plane_openraft_static_pending_restore_accepts_only_expected_bootstrap
         .store_durable_artifact(&unexpected_path)
         .unwrap();
         assert_error_contains(
-                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
+                ControlPlaneRaftAuthority::new_unix_peer_durable_with_wal_pending_static_initialization(
                     cluster_name,
                     1,
                     &unexpected_path,
@@ -2769,7 +2769,7 @@ fn control_plane_openraft_static_pending_restore_accepts_only_expected_bootstrap
             ControlPlaneRaftPeerTransportLimits::default(),
         );
         assert_error_contains(
-                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
+                ControlPlaneRaftAuthority::new_unix_peer_durable_with_wal_pending_static_initialization(
                     cluster_name,
                     1,
                     &tmp.path().join("fresh.state"),
@@ -2824,7 +2824,7 @@ fn control_plane_openraft_unix_peer_durable_rejects_wrong_local_node_artifact() 
         );
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_unix_peer_durable(
                 cluster_name,
                 2,
                 &path,
@@ -2864,7 +2864,7 @@ fn control_plane_openraft_unix_peer_durable_rejects_retained_membership_mismatch
         );
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_unix_peer_durable(
                 cluster_name,
                 1,
                 &path,
@@ -2911,7 +2911,7 @@ fn control_plane_openraft_unix_peer_durable_rejects_wal_membership_mismatch() {
         .expect("WAL-only membership suffix should persist");
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal(
+            ControlPlaneRaftAuthority::new_unix_peer_durable_with_wal(
                 cluster_name,
                 1,
                 &path,
@@ -2956,7 +2956,7 @@ fn control_plane_openraft_unix_peer_durable_rejects_applied_membership_mismatch(
         artifact.store_durable_artifact(&path).unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_unix_peer_durable(
                 cluster_name,
                 1,
                 &path,
@@ -2984,7 +2984,7 @@ fn control_plane_openraft_unix_peer_durable_rejects_static_peer_reconfiguration(
             ControlPlaneRaftPeerTransportLimits::default(),
         );
 
-        let authority = ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+        let authority = ControlPlaneRaftAuthority::new_unix_peer_durable(
             cluster_name,
             1,
             &path,
@@ -3017,7 +3017,7 @@ fn control_plane_openraft_durable_single_node_rejects_corrupt_artifact() {
         std::fs::write(&path, b"not a durable artifact").unwrap();
 
         assert_error_contains(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+            ControlPlaneRaftAuthority::new_single_node_durable(
                 "control-plane-raft-durable-corrupt-start-test",
                 1,
                 &path,

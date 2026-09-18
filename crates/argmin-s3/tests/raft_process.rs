@@ -305,7 +305,7 @@ impl ChildGuard {
             .env("ARGMIN_STORAGE_NODE_SOCKETS", storage_node_sockets)
             .env("ARGMIN_CONTROL_PLANE_STATE_PATH", state_path)
             .env("ARGMIN_CONTROL_PLANE_SOCKET_PATH", control_socket)
-            .env("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "1")
+            .env("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "1")
             .env("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", cluster_name)
             .env(
                 "ARGMIN_CONTROL_PLANE_RAFT_NODE_ID",
@@ -1778,9 +1778,9 @@ fn static_manifest_tcp_three_authorities_bootstrap_route_admin_and_restart() {
 }
 
 #[test]
-fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower_artifact() {
+fn raft_two_control_plane_processes_replicate_bootstrap_to_follower_artifact() {
     let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-two-node");
+    let test_dir = TestDir::new("raft-process-two-node");
     let cluster_name = format!(
         "process-two-node-{}-{}",
         std::process::id(),
@@ -1862,9 +1862,9 @@ fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower
 }
 
 #[test]
-fn experimental_raft_full_auth_composition_smoke() {
+fn raft_full_auth_composition_smoke() {
     let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-full-auth-composition");
+    let test_dir = TestDir::new("raft-full-auth-composition");
     let cluster_name = format!(
         "process-full-auth-{}-{}",
         std::process::id(),
@@ -2030,9 +2030,9 @@ fn experimental_raft_full_auth_composition_smoke() {
 }
 
 #[test]
-fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_state() {
+fn raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_state() {
     let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-peer-append-wal-crash");
+    let test_dir = TestDir::new("raft-process-peer-append-wal-crash");
     let cluster_name = format!(
         "process-peer-append-wal-crash-{}-{}",
         std::process::id(),
@@ -2068,7 +2068,7 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     wait_for_socket_file(&follower_peer_socket, &mut restarted103);
     wait_for_child_stderr_log_contains(
         &mut restarted103,
-        "argmin-s3 experimental durable OpenRaft control-plane manager using state",
+        "argmin-s3 durable OpenRaft control-plane manager using state",
     );
     let follower_log_before_crash = artifact_log_state(&follower_state_path)
         .expect("follower artifact plus WAL should expose log state before crash");
@@ -2211,7 +2211,7 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     wait_for_socket_file(&follower_peer_socket, &mut recovered103);
     wait_for_child_stderr_log_contains(
         &mut recovered103,
-        "argmin-s3 experimental durable OpenRaft control-plane manager using state",
+        "argmin-s3 durable OpenRaft control-plane manager using state",
     );
     // Artifact publication and WAL compaction are crash ordered, but they are
     // separate files. Stop the writer before direct inspection so the test
@@ -2227,9 +2227,9 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
 }
 
 #[test]
-fn experimental_raft_restarted_control_plane_follower_catches_up_process_state() {
+fn raft_restarted_control_plane_follower_catches_up_process_state() {
     let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-follower-restart");
+    let test_dir = TestDir::new("raft-process-follower-restart");
     let cluster_name = format!(
         "process-follower-restart-{}-{}",
         std::process::id(),
@@ -2282,9 +2282,9 @@ fn experimental_raft_restarted_control_plane_follower_catches_up_process_state()
 }
 
 #[test]
-fn experimental_raft_transferred_process_leader_requires_explicit_clock_reestablishment() {
+fn raft_transferred_process_leader_requires_explicit_clock_reestablishment() {
     let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-transferred-leader");
+    let test_dir = TestDir::new("raft-process-transferred-leader");
     let cluster_name = format!(
         "process-transferred-leader-{}-{}",
         std::process::id(),
@@ -2426,9 +2426,9 @@ fn experimental_raft_transferred_process_leader_requires_explicit_clock_reestabl
 }
 
 #[test]
-fn experimental_raft_triggered_process_election_requires_clock_reestablishment() {
+fn raft_triggered_process_election_requires_clock_reestablishment() {
     let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-triggered-election");
+    let test_dir = TestDir::new("raft-process-triggered-election");
     let cluster_name = format!(
         "process-triggered-election-{}-{}",
         std::process::id(),
@@ -2492,9 +2492,9 @@ fn experimental_raft_triggered_process_election_requires_clock_reestablishment()
 }
 
 #[test]
-fn experimental_raft_process_natural_election_requires_clock_reestablishment() {
+fn raft_process_natural_election_requires_clock_reestablishment() {
     let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-natural-election");
+    let test_dir = TestDir::new("raft-process-natural-election");
     let cluster_name = format!(
         "process-natural-election-{}-{}",
         std::process::id(),
@@ -2545,9 +2545,9 @@ fn experimental_raft_process_natural_election_requires_clock_reestablishment() {
 }
 
 #[test]
-fn experimental_raft_restarted_process_follower_catches_up_from_leader_snapshot() {
+fn raft_restarted_process_follower_catches_up_from_leader_snapshot() {
     let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-snapshot-catchup");
+    let test_dir = TestDir::new("raft-process-snapshot-catchup");
     let cluster_name = format!(
         "process-snapshot-catchup-{}-{}",
         std::process::id(),

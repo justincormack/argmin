@@ -2104,7 +2104,7 @@ impl ValidatedStaticClusterManifest {
             "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
             local_control_path.clone(),
         );
-        manifest_values.insert("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "1".to_string());
+        manifest_values.insert("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "1".to_string());
         manifest_values.insert(
             "ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME",
             self.raft_cluster_identity(),
@@ -8095,7 +8095,7 @@ private_key_ref = "file:/run/argmin-secrets/public.key"
         assert!(config
             .storage_rpc_live_pg_metadata_transfer_client_auth
             .is_some());
-        assert!(config.control_plane_experimental_raft);
+        assert!(config.control_plane_raft_enabled);
         assert_eq!(config.control_plane_raft_node_id, Some(101));
         assert_eq!(config.control_plane_raft_peer_max_connections, 17);
         assert_eq!(config.control_plane_raft_peer_listeners.len(), 1);

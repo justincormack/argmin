@@ -507,7 +507,7 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_frontend_auth_signing_credential: Option<(String, u64)>,
     pub(crate) control_plane_admin_auth_instance_id: Option<String>,
     pub(crate) control_plane_admin_auth_credentials: Vec<ConfiguredControlPlaneAdminAuthCredential>,
-    pub(crate) control_plane_experimental_raft: bool,
+    pub(crate) control_plane_raft_enabled: bool,
     pub(crate) control_plane_raft_cluster_name: Option<String>,
     pub(crate) control_plane_raft_node_id: Option<u64>,
     pub(crate) control_plane_raft_peer_socket_path: Option<String>,
@@ -774,8 +774,8 @@ impl ServerConfig {
         let control_plane_admin_auth_credentials = parse_control_plane_admin_auth_credentials(
             get("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS"),
         )?;
-        let control_plane_experimental_raft = match get("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT") {
-            Some(value) => parse_bool_env("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", &value)?,
+        let control_plane_raft_enabled = match get("ARGMIN_CONTROL_PLANE_RAFT_ENABLED") {
+            Some(value) => parse_bool_env("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", &value)?,
             None => false,
         };
         let control_plane_raft_cluster_name = get("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME");
@@ -786,7 +786,7 @@ impl ServerConfig {
                     .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_RAFT_NODE_ID: {e}"))?;
                 Some(node_id)
             }
-            None if control_plane_experimental_raft => Some(1),
+            None if control_plane_raft_enabled => Some(1),
             None => None,
         };
         let control_plane_raft_peer_socket_path = get("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH");
@@ -935,7 +935,7 @@ impl ServerConfig {
                 "ARGMIN_CONTROL_PLANE_SOCKET_PATH is required for control-plane role".to_string(),
             );
         }
-        if !control_plane_experimental_raft
+        if !control_plane_raft_enabled
             && (control_plane_raft_cluster_name.is_some()
                 || control_plane_raft_node_id.is_some()
                 || control_plane_raft_peer_socket_path.is_some()
@@ -943,7 +943,7 @@ impl ServerConfig {
                 || !control_plane_raft_auth_credentials.is_empty())
         {
             return Err(
-                "ARGMIN_CONTROL_PLANE_RAFT_* requires ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT"
+                "ARGMIN_CONTROL_PLANE_RAFT_* requires ARGMIN_CONTROL_PLANE_RAFT_ENABLED"
                     .to_string(),
             );
         }
@@ -977,9 +977,8 @@ impl ServerConfig {
             }
         }
         if !control_plane_raft_peer_sockets.is_empty() {
-            let local_node_id = control_plane_raft_node_id.expect(
-                "experimental raft node id is set when experimental raft config is enabled",
-            );
+            let local_node_id = control_plane_raft_node_id
+                .expect("raft node id is set when raft config is enabled");
             let local_peer_socket_path = control_plane_raft_peer_socket_path.as_deref().ok_or_else(
                 || {
                     "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH is required when ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS is set"
@@ -1024,9 +1023,8 @@ impl ServerConfig {
                         .to_string(),
                 );
             }
-            let local_node_id = control_plane_raft_node_id.expect(
-                "experimental raft node id is set when experimental raft config is enabled",
-            );
+            let local_node_id = control_plane_raft_node_id
+                .expect("raft node id is set when raft config is enabled");
             validate_control_plane_raft_auth_credentials_match_peer_policy(
                 local_node_id,
                 &control_plane_raft_peer_sockets,
@@ -1218,7 +1216,7 @@ impl ServerConfig {
             control_plane_frontend_auth_signing_credential: None,
             control_plane_admin_auth_instance_id,
             control_plane_admin_auth_credentials,
-            control_plane_experimental_raft,
+            control_plane_raft_enabled,
             control_plane_raft_cluster_name,
             control_plane_raft_node_id,
             control_plane_raft_peer_socket_path,
@@ -2242,7 +2240,7 @@ mod tests {
         assert!(cfg.control_plane_frontend_auth_credentials.is_empty());
         assert_eq!(cfg.control_plane_admin_auth_instance_id, None);
         assert!(cfg.control_plane_admin_auth_credentials.is_empty());
-        assert!(!cfg.control_plane_experimental_raft);
+        assert!(!cfg.control_plane_raft_enabled);
         assert_eq!(cfg.control_plane_raft_cluster_name, None);
         assert_eq!(cfg.control_plane_raft_node_id, None);
         assert_eq!(cfg.control_plane_raft_peer_socket_path, None);
@@ -2379,7 +2377,7 @@ mod tests {
                 "admin-b=admin:6:admin-b-secret,admin-a=admin:6:admin-a-secret",
             ),
             ("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "125"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-control"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "7"),
             (
@@ -2480,7 +2478,7 @@ mod tests {
                 },
             ]
         );
-        assert!(cfg.control_plane_experimental_raft);
+        assert!(cfg.control_plane_raft_enabled);
         assert_eq!(
             cfg.control_plane_raft_cluster_name.as_deref(),
             Some("raft-control")
@@ -3187,16 +3185,16 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_defaults_local_node_id() {
+    fn raft_control_plane_defaults_local_node_id() {
         let cfg = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
         ]))
         .unwrap();
 
-        assert!(cfg.control_plane_experimental_raft);
+        assert!(cfg.control_plane_raft_enabled);
         assert_eq!(cfg.control_plane_raft_node_id, Some(1));
         assert_eq!(cfg.control_plane_raft_cluster_name, None);
         assert_eq!(cfg.control_plane_raft_peer_socket_path, None);
@@ -3204,12 +3202,12 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_parses_peer_socket_map_with_zero_node_id() {
+    fn raft_control_plane_parses_peer_socket_map_with_zero_node_id() {
         let cfg = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "0"),
             (
@@ -3253,12 +3251,12 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_parses_peer_auth_credentials() {
+    fn raft_control_plane_parses_peer_auth_credentials() {
         let cfg = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
             (
@@ -3307,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_rejects_config_without_flag() {
+    fn raft_control_plane_rejects_config_without_flag() {
         let err = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
@@ -3333,12 +3331,12 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_rejects_invalid_peer_config() {
+    fn raft_control_plane_rejects_invalid_peer_config() {
         let err = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
                 "relative.sock",
@@ -3351,7 +3349,7 @@ mod tests {
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
                 "1=/tmp/argmin-cp-raft-1.sock",
@@ -3364,7 +3362,7 @@ mod tests {
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
@@ -3382,7 +3380,7 @@ mod tests {
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
@@ -3398,12 +3396,12 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_rejects_invalid_peer_auth_config() {
+    fn raft_control_plane_rejects_invalid_peer_auth_config() {
         let err = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
             (
@@ -3422,7 +3420,7 @@ mod tests {
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
                 "1=raft-peer:1:secret",
@@ -3435,7 +3433,7 @@ mod tests {
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
             (
@@ -3450,7 +3448,7 @@ mod tests {
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
             (
@@ -3465,7 +3463,7 @@ mod tests {
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
             (
@@ -3488,7 +3486,7 @@ mod tests {
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
@@ -3502,7 +3500,7 @@ mod tests {
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_ENABLED", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
             (

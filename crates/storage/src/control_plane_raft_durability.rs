@@ -773,13 +773,11 @@ mod tests {
         let runtime = runtime();
         let authority = Arc::new(
             runtime
-                .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                        secret_cluster_name,
-                        1,
-                        &artifact_path,
-                    ),
-                )
+                .block_on(ControlPlaneRaftAuthority::new_single_node_durable(
+                    secret_cluster_name,
+                    1,
+                    &artifact_path,
+                ))
                 .expect("durable authority should initialize"),
         );
         let durability = authority
@@ -820,13 +818,11 @@ mod tests {
         let runtime = runtime();
         let authority = Arc::new(
             runtime
-                .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                        "single-checkpoint-monitor",
-                        1,
-                        &artifact_path,
-                    ),
-                )
+                .block_on(ControlPlaneRaftAuthority::new_single_node_durable(
+                    "single-checkpoint-monitor",
+                    1,
+                    &artifact_path,
+                ))
                 .expect("durable authority should initialize"),
         );
         let durability = authority
@@ -883,12 +879,10 @@ mod tests {
         let runtime = runtime();
         let authority = Arc::new(
             runtime
-                .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
-                        "in-memory-durability",
-                        1,
-                    ),
-                )
+                .block_on(ControlPlaneRaftAuthority::new_single_node_in_memory(
+                    "in-memory-durability",
+                    1,
+                ))
                 .expect("in-memory authority should initialize"),
         );
         let error = authority

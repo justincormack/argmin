@@ -1295,7 +1295,7 @@ fn static_initial_topology_for_submission_test(
 #[test]
 fn raft_durability_publication_allows_concurrent_responses_before_exclusive_poison() {
     ControlPlaneRaftTypeConfig::run(async {
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_single_node_in_memory(
             "control-plane-raft-durability-publication-test",
             1,
         )
@@ -1390,7 +1390,7 @@ fn durable_uncertified_topology_establishment_publishes_before_resolution_and_re
         let directory = test_util::tempdir();
         let artifact_path = directory.path().join("raft.state");
         let cluster_name = "control-plane-raft-durable-uncertified-topology-test";
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+        let authority = ControlPlaneRaftAuthority::new_single_node_durable(
             cluster_name,
             1,
             &artifact_path,
@@ -1441,7 +1441,7 @@ fn durable_uncertified_topology_establishment_publishes_before_resolution_and_re
         );
         authority.shutdown().await.unwrap();
 
-        let restarted = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+        let restarted = ControlPlaneRaftAuthority::new_single_node_durable(
             cluster_name,
             1,
             &artifact_path,
@@ -1611,7 +1611,7 @@ fn durable_uncertified_topology_checkpoint_failure_poisons_response_publication(
     ControlPlaneRaftTypeConfig::run(async {
         let directory = test_util::tempdir();
         let artifact_path = directory.path().join("raft.state");
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+        let authority = ControlPlaneRaftAuthority::new_single_node_durable(
             "control-plane-raft-uncertified-checkpoint-failure-test",
             1,
             &artifact_path,
@@ -1676,7 +1676,7 @@ fn durable_uncertified_topology_checkpoint_failure_poisons_response_publication(
 fn uncertified_topology_submission_owns_empty_state_and_concurrent_success_classification() {
     ControlPlaneRaftTypeConfig::run(async {
         let node_id = 1;
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_single_node_in_memory(
             "control-plane-raft-uncertified-topology-test",
             node_id,
         )
@@ -1777,13 +1777,13 @@ fn uncertified_topology_submission_owns_empty_state_and_concurrent_success_class
 #[test]
 fn uncertified_topology_submission_rejects_a_different_raft_authority() {
     ControlPlaneRaftTypeConfig::run(async {
-        let authority_a = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority_a = ControlPlaneRaftAuthority::new_single_node_in_memory(
             "control-plane-raft-uncertified-authority-a",
             1,
         )
         .await
         .unwrap();
-        let authority_b = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority_b = ControlPlaneRaftAuthority::new_single_node_in_memory(
             "control-plane-raft-uncertified-authority-b",
             2,
         )
@@ -2110,7 +2110,7 @@ fn control_plane_raft_wal_monitor_does_not_enter_state_machine() {
         let artifact_path = directory.path().join("raft.state");
         let wal_path = durable_artifact_wal_path(&artifact_path);
         let authority = Arc::new(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+            ControlPlaneRaftAuthority::new_single_node_durable_with_wal(
                 "wal-monitor-state-machine-isolation",
                 1,
                 &artifact_path,
@@ -2158,7 +2158,7 @@ fn control_plane_raft_captured_checkpoint_persists_outside_state_machine_boundar
         let artifact_path = directory.path().join("raft.state");
         let wal_path = durable_artifact_wal_path(&artifact_path);
         let authority = Arc::new(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+            ControlPlaneRaftAuthority::new_single_node_durable_with_wal(
                 "captured-checkpoint-state-machine-isolation",
                 1,
                 &artifact_path,

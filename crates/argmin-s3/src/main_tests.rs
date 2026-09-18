@@ -682,7 +682,7 @@ mod tests {
             control_plane_frontend_auth_signing_credential: None,
             control_plane_admin_auth_instance_id: None,
             control_plane_admin_auth_credentials: Vec::new(),
-            control_plane_experimental_raft: false,
+            control_plane_raft_enabled: false,
             control_plane_raft_cluster_name: None,
             control_plane_raft_node_id: None,
             control_plane_raft_peer_socket_path: None,
@@ -764,7 +764,7 @@ mod tests {
             process_identity_digest: "b".repeat(64),
         });
 
-        let bootstrap = build_experimental_raft_peer_bootstrap(&config, "cluster-a", 1)
+        let bootstrap = build_raft_peer_bootstrap(&config, "cluster-a", 1)
             .expect("static Raft peer bootstrap should build");
         assert!(bootstrap.is_multi_node());
         let debug = format!("{bootstrap:?}");
@@ -802,7 +802,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let state_path = tmp.path().join("control-plane.state");
         let cluster_name = format!(
-            "argmin-s3-experimental-raft-static-membership-establishment-{}",
+            "argmin-s3-raft-static-membership-establishment-{}",
             std::process::id()
         );
         let static_identity = ConfiguredStaticClusterIdentity {
@@ -1366,7 +1366,7 @@ mod tests {
 
     #[test]
     fn raft_lease_expiry_classifier_covers_term_change() {
-        assert!(experimental_raft_lease_expiry_error_is_transient(
+        assert!(raft_lease_expiry_error_is_transient(
             &ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
                 authority_term: Some(2),
                 committed_term: Some(3),
@@ -1433,18 +1433,18 @@ mod tests {
         }
     }
 
-    struct ExperimentalRaftTestHarness {
+    struct RaftTestHarness {
         runtime: tokio::runtime::Runtime,
         authority: Arc<ControlPlaneRaftAuthority>,
         control_plane: ControlPlaneRaftAuthorityHost,
         _owned_state_dir: Option<test_util::TempDir>,
     }
 
-    impl ExperimentalRaftTestHarness {
+    impl RaftTestHarness {
         fn shutdown(self) {
             self.runtime
                 .block_on(self.authority.shutdown())
-                .expect("experimental raft authority should shut down");
+                .expect("raft authority should shut down");
         }
     }
 
@@ -1457,7 +1457,7 @@ mod tests {
             .expect("test authority clock should initialize");
     }
 
-    fn experimental_raft_test_harness(name: &str) -> ExperimentalRaftTestHarness {
+    fn raft_test_harness(name: &str) -> RaftTestHarness {
         let state_dir = test_util::tempdir();
         let artifact_path = state_dir.path().join("control-plane-raft.state");
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1466,14 +1466,14 @@ mod tests {
             .expect("test runtime should build");
         let handle = runtime.handle().clone();
         let authority = runtime.block_on(async {
-            let cluster_name = format!("argmin-s3-experimental-raft-{name}-{}", std::process::id());
-            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory_with_checkpoint_for_test(
+            let cluster_name = format!("argmin-s3-raft-{name}-{}", std::process::id());
+            let authority = ControlPlaneRaftAuthority::new_single_node_in_memory_with_checkpoint_for_test(
                 cluster_name,
                 1,
                 &artifact_path,
             )
             .await
-            .expect("experimental raft authority should initialize");
+            .expect("raft authority should initialize");
             authority
                 .initialize_configured_membership_if_needed_for_test()
                 .await
@@ -1482,14 +1482,14 @@ mod tests {
                 .wait_for_current_leader_for_test(
                     1,
                     Duration::from_secs(1),
-                    "experimental process test leadership",
+                    "process test leadership",
                 )
                 .await
                 .expect("single-node raft should become leader");
-            wait_for_experimental_raft_local_authority_serving(
+            wait_for_raft_local_authority_serving(
                 &authority,
                 Duration::from_secs(1),
-                "experimental process test committed membership",
+                "process test committed membership",
             )
             .await
             .expect("single-node raft should apply committed membership and become serving");
@@ -1498,7 +1498,7 @@ mod tests {
         let control_plane =
             ControlPlaneRaftAuthorityHost::new_for_test(handle, Arc::clone(&authority), false)
                 .expect("in-memory test authority host should initialize");
-        ExperimentalRaftTestHarness {
+        RaftTestHarness {
             runtime,
             authority,
             control_plane,
@@ -1508,7 +1508,7 @@ mod tests {
 
     #[test]
     fn cloned_raft_wrapper_suppresses_response_publication_after_concurrent_poison() {
-        let harness = experimental_raft_test_harness("cloned-response-poison");
+        let harness = raft_test_harness("cloned-response-poison");
         let in_flight = harness.control_plane.clone();
         let poisoner = harness.control_plane.clone();
         let publication = in_flight
@@ -1555,18 +1555,18 @@ mod tests {
         harness.shutdown();
     }
 
-    fn experimental_raft_durable_test_harness(
+    fn raft_durable_test_harness(
         name: &str,
         state_path: &Path,
-    ) -> ExperimentalRaftTestHarness {
-        experimental_raft_durable_test_harness_inner(name, state_path, 1)
+    ) -> RaftTestHarness {
+        raft_durable_test_harness_inner(name, state_path, 1)
     }
 
-    fn experimental_raft_durable_wal_test_harness(
+    fn raft_durable_wal_test_harness(
         name: &str,
         state_path: &Path,
-    ) -> ExperimentalRaftTestHarness {
-        experimental_raft_durable_test_harness_inner(name, state_path, 1)
+    ) -> RaftTestHarness {
+        raft_durable_test_harness_inner(name, state_path, 1)
     }
 
     #[test]
@@ -1603,7 +1603,7 @@ mod tests {
                 &state_path,
             )
             .unwrap();
-            let harness = experimental_raft_durable_test_harness(
+            let harness = raft_durable_test_harness(
                 &format!("static-outer-identity-version-{version}"),
                 &state_path,
             );
@@ -1646,11 +1646,11 @@ mod tests {
         }
     }
 
-    fn experimental_raft_durable_test_harness_inner(
+    fn raft_durable_test_harness_inner(
         name: &str,
         state_path: &Path,
         node_id: ControlPlaneRaftNodeId,
-    ) -> ExperimentalRaftTestHarness {
+    ) -> RaftTestHarness {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1658,17 +1658,17 @@ mod tests {
         let handle = runtime.handle().clone();
         let authority = runtime.block_on(async {
             let cluster_name = format!(
-                "argmin-s3-experimental-durable-raft-{name}-{}",
+                "argmin-s3-durable-raft-{name}-{}",
                 std::process::id()
             );
             let authority =
-                ControlPlaneRaftAuthority::new_experimental_single_node_durable_for_test(
+                ControlPlaneRaftAuthority::new_single_node_durable_for_test(
                     cluster_name,
                     node_id,
                     state_path,
                 )
                 .await
-                .expect("durable experimental raft authority should initialize");
+                .expect("durable raft authority should initialize");
             if !authority
                 .is_initialized()
                 .await
@@ -1687,14 +1687,14 @@ mod tests {
                 .wait_for_current_leader_for_test(
                     node_id,
                     Duration::from_secs(1),
-                    "durable experimental process test leadership",
+                    "durable process test leadership",
                 )
                 .await
                 .expect("single-node durable raft should become leader");
-            wait_for_experimental_raft_local_authority_serving(
+            wait_for_raft_local_authority_serving(
                 &authority,
                 Duration::from_secs(1),
-                "durable experimental process test committed replay",
+                "durable process test committed replay",
             )
             .await
             .expect("single-node durable raft should apply committed prefix");
@@ -1707,7 +1707,7 @@ mod tests {
         let control_plane =
             ControlPlaneRaftAuthorityHost::new_for_test(handle, Arc::clone(&authority), true)
                 .expect("durable test authority host should initialize");
-        ExperimentalRaftTestHarness {
+        RaftTestHarness {
             runtime,
             authority,
             control_plane,
@@ -1716,20 +1716,20 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_node_zero_initializes_leads_and_reloads_durable_state() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-node-zero-lifecycle");
+    fn raft_node_zero_initializes_leads_and_reloads_durable_state() {
+        let state_dir = short_unix_socket_test_dir("raft-node-zero-lifecycle");
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).unwrap();
         let state_path = state_dir.join("control-plane.state");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 7,
-            socket_path: "/tmp/argmin-experimental-raft-node-zero-storage-7.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-zero-storage-7.sock".to_string(),
         }];
         config.storage_pg_ids = vec![11];
 
         let harness =
-            experimental_raft_durable_test_harness_inner("node-zero-lifecycle", &state_path, 0);
+            raft_durable_test_harness_inner("node-zero-lifecycle", &state_path, 0);
         let status = harness
             .control_plane
             .block_on(harness.authority.status())
@@ -1740,7 +1740,7 @@ mod tests {
         assert_eq!(status.applied_voters(), &BTreeSet::from([0]));
         assert!(status.linearized_authority_serving());
 
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
             .expect("node-zero Raft control-plane bootstrap should succeed");
         let before_restart = harness
             .control_plane
@@ -1758,7 +1758,7 @@ mod tests {
         harness.shutdown();
 
         let restarted =
-            experimental_raft_durable_test_harness_inner("node-zero-lifecycle", &state_path, 0);
+            raft_durable_test_harness_inner("node-zero-lifecycle", &state_path, 0);
         let restarted_status = restarted
             .control_plane
             .block_on(restarted.authority.status())
@@ -1768,7 +1768,7 @@ mod tests {
         assert_eq!(restarted_status.effective_voters(), &BTreeSet::from([0]));
         assert_eq!(restarted_status.applied_voters(), &BTreeSet::from([0]));
         assert!(restarted_status.linearized_authority_serving());
-        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
+        bootstrap_empty_raft_control_plane(&restarted.control_plane, &config)
             .expect("restarted node-zero Raft bootstrap should be a no-op");
         assert_eq!(
             restarted
@@ -1782,16 +1782,16 @@ mod tests {
         fs::remove_dir_all(state_dir).unwrap();
     }
 
-    fn spawn_experimental_raft_unix_rpc_server(
-        harness: &ExperimentalRaftTestHarness,
+    fn spawn_raft_unix_rpc_server(
+        harness: &RaftTestHarness,
         socket_path: &Path,
         authority_now_ms: u64,
     ) -> std::thread::JoinHandle<()> {
-        spawn_experimental_raft_unix_rpc_server_requests(harness, socket_path, authority_now_ms, 1)
+        spawn_raft_unix_rpc_server_requests(harness, socket_path, authority_now_ms, 1)
     }
 
-    fn spawn_experimental_raft_unix_rpc_server_requests(
-        harness: &ExperimentalRaftTestHarness,
+    fn spawn_raft_unix_rpc_server_requests(
+        harness: &RaftTestHarness,
         socket_path: &Path,
         authority_now_ms: u64,
         request_count: usize,
@@ -1813,26 +1813,26 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_bootstraps_runtime_map() {
-        let harness = experimental_raft_test_harness("process-bootstrap-test");
+    fn raft_control_plane_bootstraps_runtime_map() {
+        let harness = raft_test_harness("process-bootstrap-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![0];
 
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         let runtime_map = harness
             .control_plane
             .runtime_map_snapshot(10_000)
-            .expect("experimental raft runtime map should serve");
+            .expect("raft runtime map should serve");
         assert_eq!(runtime_map.nodes().len(), 1);
         assert_eq!(runtime_map.nodes()[0].node_id(), NodeId::new(1));
         assert_eq!(
             runtime_map.nodes()[0].endpoint(),
-            "/tmp/argmin-experimental-raft-node-1.sock"
+            "/tmp/argmin-raft-node-1.sock"
         );
         assert_eq!(runtime_map.pg_routes().len(), 1);
         assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(0));
@@ -1841,13 +1841,13 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_binds_configured_peer_listener() {
+    fn raft_control_plane_binds_configured_peer_listener() {
         let test_dir = short_unix_socket_test_dir("raft-peer-listener");
         let _ = fs::remove_dir_all(&test_dir);
         let peer_socket_path = test_dir.join("control-plane-raft-peer.sock");
         let peer_socket = peer_socket_path.display().to_string();
         let mut config = test_server_config();
-        config.control_plane_experimental_raft = true;
+        config.control_plane_raft_enabled = true;
         config.control_plane_raft_cluster_name = Some("process-peer-listener-test".to_string());
         config.control_plane_raft_node_id = Some(1);
         config.control_plane_raft_peer_socket_path = Some(peer_socket.clone());
@@ -1865,7 +1865,7 @@ mod tests {
             }];
 
         let listeners =
-            bind_experimental_raft_peer_listener(&config, "process-peer-listener-test", 1)
+            bind_raft_peer_listener(&config, "process-peer-listener-test", 1)
                 .expect("peer listener should bind");
 
         assert_eq!(listeners.len(), 1);
@@ -1876,9 +1876,9 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_binds_configured_tcp_peer_listener() {
+    fn raft_control_plane_binds_configured_tcp_peer_listener() {
         let mut config = test_server_config();
-        config.control_plane_experimental_raft = true;
+        config.control_plane_raft_enabled = true;
         config.control_plane_raft_cluster_name = Some("process-tcp-peer-listener-test".to_string());
         config.control_plane_raft_node_id = Some(1);
         config.control_plane_raft_peer_sockets =
@@ -1917,7 +1917,7 @@ mod tests {
             }];
 
         let listeners =
-            bind_experimental_raft_peer_listener(&config, "process-tcp-peer-listener-test", 1)
+            bind_raft_peer_listener(&config, "process-tcp-peer-listener-test", 1)
                 .expect("TCP peer listener should bind");
 
         assert_eq!(listeners.len(), 1);
@@ -1930,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_startup_leader_wait_tracks_peer_bootstrap_size() {
+    fn raft_startup_leader_wait_tracks_peer_bootstrap_size() {
         let standalone =
             ControlPlaneRaftPeerBootstrap::single_node("process-peer-startup-leader-wait-test", 1);
         assert!(standalone.startup_requires_local_leader());
@@ -1970,32 +1970,32 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_bootstrap_does_not_rewrite_existing_state() {
-        let harness = experimental_raft_test_harness("process-bootstrap-idempotence-test");
+    fn raft_control_plane_bootstrap_does_not_rewrite_existing_state() {
+        let harness = raft_test_harness("process-bootstrap-idempotence-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![0];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         let initial_snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after bootstrap");
+            .expect("snapshot should read after bootstrap");
 
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 2,
-            socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-2.sock".to_string(),
         }];
         config.storage_pg_ids = vec![1];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap retry should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap retry should succeed");
         let retried_snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after bootstrap retry");
+            .expect("snapshot should read after bootstrap retry");
 
         assert_eq!(
             retried_snapshot.cluster_epoch(),
@@ -2010,21 +2010,21 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_heartbeat_completes_ready_peering() {
-        let mut harness = experimental_raft_test_harness("heartbeat-peering-test");
+    fn raft_control_plane_heartbeat_completes_ready_peering() {
+        let mut harness = raft_test_harness("heartbeat-peering-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -2032,7 +2032,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -2040,11 +2040,11 @@ mod tests {
                 },
                 20_000,
             )
-            .expect("experimental raft startup heartbeat should refresh");
+            .expect("raft startup heartbeat should refresh");
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after startup heartbeat")
+            .expect("snapshot should read after startup heartbeat")
             .cluster_epoch();
         let proof = PgMetadataProof::for_test(42, 0xabc, 0xdef);
         let peering_refresh = harness
@@ -2053,7 +2053,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -2066,7 +2066,7 @@ mod tests {
                 },
                 20_100,
             )
-            .expect("experimental raft heartbeat should refresh");
+            .expect("raft heartbeat should refresh");
         assert_eq!(peering_refresh.lease().lease_deadline_ms(), 20_600);
         let peering_route = &peering_refresh.runtime_map().pg_routes()[0];
         assert_eq!(peering_route.pg_id(), PgId::new(7));
@@ -2077,7 +2077,7 @@ mod tests {
         let active_snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after peering completion");
+            .expect("snapshot should read after peering completion");
         let pg = active_snapshot.pg(PgId::new(7)).expect("PG should exist");
         assert_eq!(pg.state(), PgState::Active);
         assert_eq!(pg.active_primary(), Some(NodeId::new(1)));
@@ -2087,7 +2087,7 @@ mod tests {
         let applied_before_active_observation = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read before active observation")
+            .expect("Raft status should read before active observation")
             .applied();
 
         let active_refresh = harness
@@ -2096,7 +2096,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -2109,7 +2109,7 @@ mod tests {
                 },
                 20_200,
             )
-            .expect("experimental raft active heartbeat should refresh");
+            .expect("raft active heartbeat should refresh");
         assert!(active_refresh.lease().serving());
         assert_eq!(active_refresh.lease().lease_deadline_ms(), 20_800);
         let active_route = &active_refresh.runtime_map().pg_routes()[0];
@@ -2118,7 +2118,7 @@ mod tests {
         let applied_after_active_observation = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read after active observation")
+            .expect("Raft status should read after active observation")
             .applied();
         assert_ne!(
             applied_after_active_observation, applied_before_active_observation,
@@ -2131,7 +2131,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -2144,7 +2144,7 @@ mod tests {
                 },
                 20_300,
             )
-            .expect("unchanged experimental raft active heartbeat should refresh");
+            .expect("unchanged raft active heartbeat should refresh");
         assert!(steady_active_refresh.lease().serving());
         assert_eq!(steady_active_refresh.lease().lease_deadline_ms(), 20_900);
         let frontend_runtime_map = harness
@@ -2159,7 +2159,7 @@ mod tests {
             harness
                 .control_plane
                 .block_on(harness.authority.status())
-                .expect("experimental Raft status should read after active renewal")
+                .expect("Raft status should read after active renewal")
                 .applied(),
             applied_after_active_observation,
             "an unchanged active heartbeat must update the runtime map without log progress"
@@ -2197,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_production_shaped_heartbeat_write_amplification_gate() {
+    fn raft_production_shaped_heartbeat_write_amplification_gate() {
         const STORAGE_NODE_COUNT: u32 = 3;
         const PG_COUNT: u32 = 116;
         const RETAINED_HISTORY_EPOCHS: usize = 256;
@@ -2231,7 +2231,7 @@ mod tests {
         }
 
         fn durable_wal_offsets(
-            harness: &ExperimentalRaftTestHarness,
+            harness: &RaftTestHarness,
         ) -> storage::control_plane_raft::ControlPlaneRaftWalOffsets {
             harness
                 .authority
@@ -2240,7 +2240,7 @@ mod tests {
                 .offsets()
         }
 
-        fn durable_snapshot(harness: &ExperimentalRaftTestHarness) -> ClusterControlSnapshot {
+        fn durable_snapshot(harness: &RaftTestHarness) -> ClusterControlSnapshot {
             harness
                 .control_plane
                 .block_on(harness.authority.durable_state_machine_snapshot_for_test())
@@ -2289,11 +2289,11 @@ mod tests {
             .collect();
         config.storage_pg_ids = (0..PG_COUNT).collect();
 
-        let mut harness = experimental_raft_durable_wal_test_harness(
+        let mut harness = raft_durable_wal_test_harness(
             "production-shaped-write-amplification",
             &state_path,
         );
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
             .expect("production-shaped Raft bootstrap should succeed");
 
         let acting_set_a = vec![NodeId::new(0), NodeId::new(1)];
@@ -2407,7 +2407,7 @@ mod tests {
         );
         let expected_before_restart = durable_snapshot(&harness);
         harness.shutdown();
-        harness = experimental_raft_durable_wal_test_harness(
+        harness = raft_durable_wal_test_harness(
             "production-shaped-write-amplification",
             &state_path,
         );
@@ -3197,28 +3197,28 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_durably_accumulates_multi_node_peering_evidence() {
-        let mut harness = experimental_raft_test_harness("multi-node-heartbeat-peering-test");
+    fn raft_control_plane_durably_accumulates_multi_node_peering_evidence() {
+        let mut harness = raft_test_harness("multi-node-heartbeat-peering-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
                 node_id: 1,
-                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
             },
             config::ConfiguredStorageNodeSocket {
                 node_id: 2,
-                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-2.sock".to_string(),
             },
         ];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
         for (node_id, now_ms) in [(1, 20_000), (2, 20_010)] {
             let observed_epoch = harness
                 .control_plane
                 .current_snapshot()
-                .expect("experimental snapshot should read before startup heartbeat")
+                .expect("snapshot should read before startup heartbeat")
                 .cluster_epoch();
             harness
                 .control_plane
@@ -3226,7 +3226,7 @@ mod tests {
                     node_heartbeat! {
                         node_id: NodeId::new(node_id),
                         node_incarnation: 1,
-                        endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
+                        endpoint: format!("/tmp/argmin-raft-node-{node_id}.sock"),
                         observed_epoch,
                         requested_lease_duration_ms: 500,
                         cluster_map_history_route_references: Default::default(),
@@ -3234,19 +3234,19 @@ mod tests {
                     },
                     now_ms,
                 )
-                .expect("experimental raft startup heartbeat should refresh");
+                .expect("raft startup heartbeat should refresh");
         }
 
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read before peering heartbeats")
+            .expect("snapshot should read before peering heartbeats")
             .cluster_epoch();
         let proof = PgMetadataProof::for_test(42, 0xabc, 0xdef);
         let applied_before_peering = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read before peering heartbeats")
+            .expect("Raft status should read before peering heartbeats")
             .applied();
 
         let first = harness
@@ -3255,7 +3255,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -3274,7 +3274,7 @@ mod tests {
             harness
                 .control_plane
                 .block_on(harness.authority.status())
-                .expect("experimental Raft status should read after first peering heartbeat")
+                .expect("Raft status should read after first peering heartbeat")
                 .applied(),
             applied_before_peering,
             "Peering evidence must advance the durable applied cursor"
@@ -3286,7 +3286,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(2),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-2.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -3308,20 +3308,20 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_resamples_heartbeat_time_when_enabled() {
-        let mut harness = experimental_raft_test_harness("heartbeat-resample-test");
+    fn raft_control_plane_resamples_heartbeat_time_when_enabled() {
+        let mut harness = raft_test_harness("heartbeat-resample-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         let refresh = storage::clock::with_time_override(30_000, || {
             enable_resampled_authority_time(&mut harness.control_plane, 30_000);
@@ -3329,7 +3329,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -3338,13 +3338,13 @@ mod tests {
                 20_000,
             )
         })
-        .expect("experimental raft heartbeat should refresh");
+        .expect("raft heartbeat should refresh");
 
         assert_eq!(refresh.lease().lease_deadline_ms(), 30_500);
         let status = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read");
+            .expect("Raft status should read");
         let lease_horizon_authority = harness
             .control_plane
             .lease_horizon_authority_for_test(status.current_term())
@@ -3352,7 +3352,7 @@ mod tests {
         assert!(harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after horizon establishment")
+            .expect("snapshot should read after horizon establishment")
             .lease_grant_horizon_covers(
                 lease_horizon_authority,
                 refresh.lease().lease_deadline_ms(),
@@ -3362,26 +3362,26 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_heartbeat_rechecks_leadership_after_commit() {
-        let mut harness = experimental_raft_test_harness("heartbeat-post-commit-term-change-test");
+    fn raft_heartbeat_rechecks_leadership_after_commit() {
+        let mut harness = raft_test_harness("heartbeat-post-commit-term-change-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         enable_resampled_authority_time(&mut harness.control_plane, 31_000);
         let initial_term = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read")
+            .expect("Raft status should read")
             .current_term()
             .expect("single-node leader should have a term");
         harness
@@ -3393,7 +3393,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -3436,21 +3436,21 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_heartbeat_clamps_shorter_requested_lease() {
-        let mut harness = experimental_raft_test_harness("heartbeat-lease-clamp-test");
+    fn raft_control_plane_heartbeat_clamps_shorter_requested_lease() {
+        let mut harness = raft_test_harness("heartbeat-lease-clamp-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         let first = harness
             .control_plane
@@ -3458,7 +3458,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
@@ -3466,18 +3466,18 @@ mod tests {
                 },
                 40_000,
             )
-            .expect("experimental raft initial heartbeat should refresh");
+            .expect("raft initial heartbeat should refresh");
         assert_eq!(first.lease().lease_deadline_ms(), 41_000);
 
         let refreshed_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after initial heartbeat")
+            .expect("snapshot should read after initial heartbeat")
             .cluster_epoch();
         let applied_before_epoch_acknowledgement = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read before epoch acknowledgement")
+            .expect("Raft status should read before epoch acknowledgement")
             .applied();
         let shortened = harness
             .control_plane
@@ -3485,7 +3485,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: refreshed_epoch,
                     requested_lease_duration_ms: 100,
                     cluster_map_history_route_references: Default::default(),
@@ -3493,12 +3493,12 @@ mod tests {
                 },
                 40_100,
             )
-            .expect("experimental raft heartbeat should preserve longer existing lease");
+            .expect("raft heartbeat should preserve longer existing lease");
         assert_eq!(shortened.lease().lease_deadline_ms(), 41_000);
         let applied_after_epoch_acknowledgement = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read after epoch acknowledgement")
+            .expect("Raft status should read after epoch acknowledgement")
             .applied();
         assert_ne!(
             applied_after_epoch_acknowledgement, applied_before_epoch_acknowledgement,
@@ -3508,7 +3508,7 @@ mod tests {
             harness
                 .control_plane
                 .current_snapshot()
-                .expect("experimental snapshot should read after shortened heartbeat")
+                .expect("snapshot should read after shortened heartbeat")
                 .node(NodeId::new(1))
                 .expect("node should exist")
                 .lease_deadline_ms(),
@@ -3521,7 +3521,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: refreshed_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
@@ -3529,13 +3529,13 @@ mod tests {
                 },
                 40_200,
             )
-            .expect("covered experimental raft heartbeat should renew volatile lease");
+            .expect("covered raft heartbeat should renew volatile lease");
         assert_eq!(renewed.lease().lease_deadline_ms(), 41_200);
         assert_eq!(
             harness
                 .control_plane
                 .block_on(harness.authority.status())
-                .expect("experimental Raft status should read after volatile renewal")
+                .expect("Raft status should read after volatile renewal")
                 .applied(),
             applied_after_epoch_acknowledgement,
             "repeated covered renewal must retain the same applied cursor"
@@ -3628,21 +3628,21 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_restart_refresh_uses_control_plane_last_observed_epoch() {
-        let mut harness = experimental_raft_test_harness("restart-observed-epoch-test");
+    fn raft_restart_refresh_uses_control_plane_last_observed_epoch() {
+        let mut harness = raft_test_harness("restart-observed-epoch-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![30];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -3650,7 +3650,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
@@ -3658,11 +3658,11 @@ mod tests {
                 },
                 60_000,
             )
-            .expect("experimental raft startup heartbeat should refresh");
+            .expect("raft startup heartbeat should refresh");
         let protected_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after startup")
+            .expect("snapshot should read after startup")
             .cluster_epoch();
         for node_id in 10..18 {
             harness
@@ -3671,12 +3671,12 @@ mod tests {
                     node_id: NodeId::new(node_id),
                     membership: NodeMembershipState::Active,
                 })
-                .expect("experimental raft node membership should update");
+                .expect("raft node membership should update");
         }
         let observed_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after churn")
+            .expect("snapshot should read after churn")
             .cluster_epoch();
         harness
             .control_plane
@@ -3684,7 +3684,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
@@ -3692,12 +3692,12 @@ mod tests {
                 },
                 61_000,
             )
-            .expect("experimental raft observed heartbeat should refresh");
+            .expect("raft observed heartbeat should refresh");
 
         let restart_heartbeat = node_heartbeat! {
             node_id: NodeId::new(1),
             node_incarnation: 2,
-            endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
             observed_epoch: ClusterEpoch::INITIAL,
             requested_lease_duration_ms: 1_000,
             cluster_map_history_route_references: Default::default(),
@@ -3706,7 +3706,7 @@ mod tests {
         let lease_horizon_authority = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should expose its lease horizon")
+            .expect("snapshot should expose its lease horizon")
             .lease_grant_horizon_authority();
         harness
             .control_plane
@@ -3716,12 +3716,12 @@ mod tests {
                 lease_deadline_ms: 63_000,
                 lease_horizon_authority,
             })
-            .expect("lost experimental raft restart heartbeat response should still apply");
+            .expect("lost raft restart heartbeat response should still apply");
         assert_eq!(
             harness
                 .control_plane
                 .current_snapshot()
-                .expect("experimental snapshot should read after lost heartbeat")
+                .expect("snapshot should read after lost heartbeat")
                 .node(NodeId::new(1))
                 .and_then(|node| node.last_observed_epoch()),
             Some(observed_epoch),
@@ -3731,7 +3731,7 @@ mod tests {
         let restart_refresh = harness
             .control_plane
             .refresh_node_heartbeat(restart_heartbeat, 63_000)
-            .expect("experimental raft restart heartbeat should refresh");
+            .expect("raft restart heartbeat should refresh");
 
         assert!(restart_refresh
             .runtime_map()
@@ -3748,7 +3748,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_peer_bootstrap_maps_auth_configuration_and_redacts_diagnostics() {
+    fn raft_peer_bootstrap_maps_auth_configuration_and_redacts_diagnostics() {
         let mut config = test_server_config();
         config.control_plane_raft_peer_socket_path = Some("/tmp/raft-2.sock".to_owned());
         config.control_plane_raft_peer_sockets = vec![
@@ -3761,7 +3761,7 @@ mod tests {
                 socket_path: "/tmp/raft-2.sock".to_owned(),
             },
         ];
-        let unauthenticated = build_experimental_raft_peer_bootstrap(&config, "auth-cluster", 2)
+        let unauthenticated = build_raft_peer_bootstrap(&config, "auth-cluster", 2)
             .expect_err("unauthenticated peer bootstrap must fail closed");
         assert!(
             unauthenticated.contains("authentication configuration is invalid"),
@@ -3788,7 +3788,7 @@ mod tests {
             },
         ];
 
-        let bootstrap = build_experimental_raft_peer_bootstrap(&config, "auth-cluster", 2)
+        let bootstrap = build_raft_peer_bootstrap(&config, "auth-cluster", 2)
             .expect("authenticated peer bootstrap should build");
         let diagnostics = bootstrap
             .auth_diagnostics()
@@ -3813,18 +3813,18 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_peer_vote_acks_from_wal_then_bounded_checkpoint_compacts() {
+    fn raft_peer_vote_acks_from_wal_then_bounded_checkpoint_compacts() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("test runtime should build");
-        let state_dir = short_unix_socket_test_dir("experimental-raft-peer-default-checkpoint");
+        let state_dir = short_unix_socket_test_dir("raft-peer-default-checkpoint");
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).expect("durable test directory should exist");
         let state_path = state_dir.join("control-plane.state");
         let peer_socket_path = state_dir.join("peer.sock");
         let cluster_name = format!(
-            "argmin-s3-experimental-raft-peer-wal-ack-{}",
+            "argmin-s3-raft-peer-wal-ack-{}",
             std::process::id()
         );
         let peer_bootstrap = ControlPlaneRaftPeerBootstrap::replicated(
@@ -4029,22 +4029,22 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_wal_checkpoint_observer_captures_local_election_without_peer_rpc() {
+    fn raft_wal_checkpoint_observer_captures_local_election_without_peer_rpc() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("test runtime should build");
-        let state_dir = short_unix_socket_test_dir("experimental-raft-local-election-checkpoint");
+        let state_dir = short_unix_socket_test_dir("raft-local-election-checkpoint");
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).expect("durable test directory should exist");
         let state_path = state_dir.join("control-plane.state");
         let cluster_name = format!(
-            "argmin-s3-experimental-raft-local-election-checkpoint-{}",
+            "argmin-s3-raft-local-election-checkpoint-{}",
             std::process::id()
         );
         let (authority, initial_vote) = runtime.block_on(async {
             let authority =
-                ControlPlaneRaftAuthority::new_experimental_single_node_durable_for_test(
+                ControlPlaneRaftAuthority::new_single_node_durable_for_test(
                     cluster_name,
                     1,
                     &state_path,
@@ -4063,7 +4063,7 @@ mod tests {
                 )
                 .await
                 .expect("single-node authority should become leader");
-            wait_for_experimental_raft_local_authority_serving(
+            wait_for_raft_local_authority_serving(
                 &authority,
                 Duration::from_secs(1),
                 "local-election checkpoint baseline",
@@ -4164,26 +4164,26 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_durable_restart_restores_heartbeat_refresh() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-durable-heartbeat");
+    fn raft_control_plane_durable_restart_restores_heartbeat_refresh() {
+        let state_dir = short_unix_socket_test_dir("raft-durable-heartbeat");
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).unwrap();
         let state_path = state_dir.join("control-plane.state");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![7];
 
-        let mut harness = experimental_raft_durable_test_harness("heartbeat-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("durable experimental raft control-plane bootstrap should succeed");
+        let mut harness = raft_durable_test_harness("heartbeat-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("durable raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read")
+            .expect("durable snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -4191,7 +4191,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -4199,12 +4199,12 @@ mod tests {
                 },
                 20_000,
             )
-            .expect("durable experimental startup heartbeat should checkpoint");
+            .expect("durable startup heartbeat should checkpoint");
 
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read after startup heartbeat")
+            .expect("durable snapshot should read after startup heartbeat")
             .cluster_epoch();
         let proof = PgMetadataProof::for_test(42, 0xabc, 0xdef);
         let peering_refresh = harness
@@ -4213,7 +4213,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -4226,7 +4226,7 @@ mod tests {
                 },
                 20_100,
             )
-            .expect("durable experimental peering heartbeat should checkpoint");
+            .expect("durable peering heartbeat should checkpoint");
         assert_eq!(peering_refresh.lease().lease_deadline_ms(), 20_600);
         let peering_route = &peering_refresh.runtime_map().pg_routes()[0];
         assert_eq!(peering_route.state(), PgState::Active);
@@ -4235,7 +4235,7 @@ mod tests {
         let active_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read after peering completion")
+            .expect("durable snapshot should read after peering completion")
             .cluster_epoch();
         let active_refresh = harness
             .control_plane
@@ -4243,7 +4243,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -4256,7 +4256,7 @@ mod tests {
                 },
                 20_200,
             )
-            .expect("durable experimental active heartbeat should checkpoint");
+            .expect("durable active heartbeat should checkpoint");
         assert!(active_refresh.lease().serving());
         assert_eq!(active_refresh.lease().lease_deadline_ms(), 20_800);
         let steady_refresh = harness
@@ -4265,7 +4265,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -4278,12 +4278,12 @@ mod tests {
                 },
                 20_300,
             )
-            .expect("unchanged durable experimental active heartbeat should stay live");
+            .expect("unchanged durable active heartbeat should stay live");
         assert_eq!(steady_refresh.lease().lease_deadline_ms(), 20_900);
         let live_before_restart = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read before restart");
+            .expect("durable snapshot should read before restart");
         assert_eq!(
             live_before_restart
                 .node(NodeId::new(1))
@@ -4295,13 +4295,13 @@ mod tests {
         harness.shutdown();
 
         let mut restarted =
-            experimental_raft_durable_test_harness("heartbeat-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
-            .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
+            raft_durable_test_harness("heartbeat-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&restarted.control_plane, &config)
+            .expect("durable raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
             .control_plane
             .current_snapshot()
-            .expect("durable experimental raft snapshot should read after restart");
+            .expect("durable raft snapshot should read after restart");
         assert_eq!(
             restored.node(NodeId::new(1)).unwrap().lease_deadline_ms(),
             Some(20_800),
@@ -4319,7 +4319,7 @@ mod tests {
         let applied_before_refresh = restarted
             .control_plane
             .block_on(restarted.authority.status())
-            .expect("restarted experimental Raft status should read")
+            .expect("restarted Raft status should read")
             .applied();
         let refreshed = restarted
             .control_plane
@@ -4327,7 +4327,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: restored.cluster_epoch(),
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -4347,14 +4347,14 @@ mod tests {
             restarted
                 .control_plane
                 .block_on(restarted.authority.status())
-                .expect("restarted experimental Raft status should read after refresh")
+                .expect("restarted Raft status should read after refresh")
                 .applied(),
             applied_before_refresh,
             "post-restart heartbeat covered by the restored horizon should remain volatile"
         );
         let runtime_map =
             ControlPlaneRuntimeMapSource::runtime_map_snapshot(&restarted.control_plane, 20_400)
-                .expect("durable experimental raft runtime map should read after fresh heartbeat");
+                .expect("durable raft runtime map should read after fresh heartbeat");
         let restored_route = runtime_map
             .pg_routes()
             .iter()
@@ -4369,8 +4369,8 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_wal_recovers_heartbeat_acknowledged_before_checkpoint() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-wal-heartbeat-restart");
+    fn raft_wal_recovers_heartbeat_acknowledged_before_checkpoint() {
+        let state_dir = short_unix_socket_test_dir("raft-wal-heartbeat-restart");
         let state_path = state_dir.0.path().join("control-plane.state");
         let endpoint = state_dir.0.path().join("node-1.sock");
         let mut config = test_server_config();
@@ -4381,8 +4381,8 @@ mod tests {
         config.storage_pg_ids = vec![7];
 
         let mut harness =
-            experimental_raft_durable_wal_test_harness("wal-heartbeat-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
+            raft_durable_wal_test_harness("wal-heartbeat-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
             .expect("WAL-backed control-plane bootstrap should succeed");
         let checkpoint_before = harness
             .authority
@@ -4446,7 +4446,7 @@ mod tests {
         harness.shutdown();
 
         let restarted =
-            experimental_raft_durable_wal_test_harness("wal-heartbeat-restart", &state_path);
+            raft_durable_wal_test_harness("wal-heartbeat-restart", &state_path);
         let restored = restarted
             .control_plane
             .current_snapshot()
@@ -4468,8 +4468,8 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_wal_recovers_purge_after_snapshot_checkpoint() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-wal-snapshot-purge-restart");
+    fn raft_wal_recovers_purge_after_snapshot_checkpoint() {
+        let state_dir = short_unix_socket_test_dir("raft-wal-snapshot-purge-restart");
         let state_path = state_dir.0.path().join("control-plane.state");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
@@ -4479,8 +4479,8 @@ mod tests {
         config.storage_pg_ids = vec![7];
 
         let harness =
-            experimental_raft_durable_wal_test_harness("wal-snapshot-purge-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
+            raft_durable_wal_test_harness("wal-snapshot-purge-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
             .expect("WAL-backed control-plane bootstrap should succeed");
         let snapshot_log_id = harness
             .control_plane
@@ -4527,7 +4527,7 @@ mod tests {
         harness.shutdown();
 
         let restarted =
-            experimental_raft_durable_wal_test_harness("wal-snapshot-purge-restart", &state_path);
+            raft_durable_wal_test_harness("wal-snapshot-purge-restart", &state_path);
         let restored = restarted
             .control_plane
             .block_on(
@@ -4549,21 +4549,21 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_expires_heartbeat_leases() {
-        let mut harness = experimental_raft_test_harness("lease-expiry-test");
+    fn raft_control_plane_expires_heartbeat_leases() {
+        let mut harness = raft_test_harness("lease-expiry-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![17];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -4571,7 +4571,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -4579,11 +4579,11 @@ mod tests {
                 },
                 50_000,
             )
-            .expect("experimental raft startup heartbeat should refresh");
+            .expect("raft startup heartbeat should refresh");
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after startup heartbeat")
+            .expect("snapshot should read after startup heartbeat")
             .cluster_epoch();
         let proof = PgMetadataProof::for_test(92, 0x1234, 0x5678);
         harness
@@ -4592,7 +4592,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -4605,11 +4605,11 @@ mod tests {
                 },
                 50_100,
             )
-            .expect("experimental raft peering heartbeat should refresh");
+            .expect("raft peering heartbeat should refresh");
         let active_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after peering completion")
+            .expect("snapshot should read after peering completion")
             .cluster_epoch();
         let active_refresh = harness
             .control_plane
@@ -4617,7 +4617,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
@@ -4630,12 +4630,12 @@ mod tests {
                 },
                 50_200,
             )
-            .expect("experimental raft active heartbeat should refresh");
+            .expect("raft active heartbeat should refresh");
         assert_eq!(active_refresh.lease().lease_deadline_ms(), 50_900);
         let active_snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental active snapshot should read");
+            .expect("active snapshot should read");
         let active_cluster_epoch = active_snapshot.cluster_epoch();
         assert_eq!(
             active_snapshot.pg(PgId::new(17)).unwrap().state(),
@@ -4647,7 +4647,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_cluster_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
@@ -4683,7 +4683,7 @@ mod tests {
         let applied_before_empty_scan = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read before empty expiry scan")
+            .expect("Raft status should read before empty expiry scan")
             .applied();
 
         let no_expiry = harness
@@ -4697,7 +4697,7 @@ mod tests {
             harness
                 .control_plane
                 .block_on(harness.authority.status())
-                .expect("experimental Raft status should read after empty expiry scan")
+                .expect("Raft status should read after empty expiry scan")
                 .applied(),
             applied_before_empty_scan,
             "an empty expiry scan must not append a timestamp-only Raft command"
@@ -4713,7 +4713,7 @@ mod tests {
         let expired_snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental expired snapshot should read");
+            .expect("expired snapshot should read");
         let node = expired_snapshot
             .node(NodeId::new(1))
             .expect("expired node should remain recorded");
@@ -4727,7 +4727,7 @@ mod tests {
         assert_eq!(pg.peering_metadata_proof_floor(), Some(proof));
         assert_eq!(pg.previous_primary_lease_deadline_ms(), Some(51_100));
 
-        let successor_endpoint = "/tmp/argmin-experimental-raft-node-1.sock".to_string();
+        let successor_endpoint = "/tmp/argmin-raft-node-1.sock".to_string();
         let first_successor = harness
             .control_plane
             .refresh_node_heartbeat(
@@ -4803,28 +4803,28 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_targeted_expiry_preserves_unlisted_volatile_renewal() {
-        let mut harness = experimental_raft_test_harness("targeted-lease-expiry-overlay-test");
+    fn raft_targeted_expiry_preserves_unlisted_volatile_renewal() {
+        let mut harness = raft_test_harness("targeted-lease-expiry-overlay-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
                 node_id: 1,
-                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
             },
             config::ConfiguredStorageNodeSocket {
                 node_id: 2,
-                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-2.sock".to_string(),
             },
         ];
         config.storage_pg_ids.clear();
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
         for (node_id, now_ms, lease_ms) in [(1, 50_000, 900), (2, 50_010, 1_000)] {
             let observed_epoch = harness
                 .control_plane
                 .current_snapshot()
-                .expect("experimental snapshot should read before startup heartbeat")
+                .expect("snapshot should read before startup heartbeat")
                 .cluster_epoch();
             harness
                 .control_plane
@@ -4832,7 +4832,7 @@ mod tests {
                     node_heartbeat! {
                         node_id: NodeId::new(node_id),
                         node_incarnation: 1,
-                        endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
+                        endpoint: format!("/tmp/argmin-raft-node-{node_id}.sock"),
                         observed_epoch,
                         requested_lease_duration_ms: lease_ms,
                         cluster_map_history_route_references: Default::default(),
@@ -4840,13 +4840,13 @@ mod tests {
                     },
                     now_ms,
                 )
-                .expect("experimental raft startup heartbeat should refresh");
+                .expect("raft startup heartbeat should refresh");
         }
 
         let observed_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read before volatile renewals")
+            .expect("snapshot should read before volatile renewals")
             .cluster_epoch();
         for (node_id, lease_ms) in [(1, 800), (2, 1_000)] {
             harness
@@ -4855,7 +4855,7 @@ mod tests {
                     node_heartbeat! {
                         node_id: NodeId::new(node_id),
                         node_incarnation: 1,
-                        endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
+                        endpoint: format!("/tmp/argmin-raft-node-{node_id}.sock"),
                         observed_epoch,
                         requested_lease_duration_ms: lease_ms,
                         cluster_map_history_route_references: Default::default(),
@@ -4863,12 +4863,12 @@ mod tests {
                     },
                     50_100,
                 )
-                .expect("experimental raft heartbeat should acknowledge the current epoch");
+                .expect("raft heartbeat should acknowledge the current epoch");
         }
         let applied_before_volatile_renewals = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read before volatile renewals")
+            .expect("Raft status should read before volatile renewals")
             .applied();
         for (node_id, lease_ms) in [(1, 700), (2, 1_000)] {
             harness
@@ -4877,7 +4877,7 @@ mod tests {
                     node_heartbeat! {
                         node_id: NodeId::new(node_id),
                         node_incarnation: 1,
-                        endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
+                        endpoint: format!("/tmp/argmin-raft-node-{node_id}.sock"),
                         observed_epoch,
                         requested_lease_duration_ms: lease_ms,
                         cluster_map_history_route_references: Default::default(),
@@ -4885,13 +4885,13 @@ mod tests {
                     },
                     50_200,
                 )
-                .expect("covered experimental raft heartbeat should renew volatile lease");
+                .expect("covered raft heartbeat should renew volatile lease");
         }
         assert_eq!(
             harness
                 .control_plane
                 .block_on(harness.authority.status())
-                .expect("experimental Raft status should read after volatile renewals")
+                .expect("Raft status should read after volatile renewals")
                 .applied(),
             applied_before_volatile_renewals,
             "steady covered renewals must not append OpenRaft commands"
@@ -4899,7 +4899,7 @@ mod tests {
         let before_expiry = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should include volatile renewals");
+            .expect("snapshot should include volatile renewals");
         assert_eq!(
             before_expiry
                 .node(NodeId::new(1))
@@ -4923,7 +4923,7 @@ mod tests {
         let after_expiry = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should retain unexpired overlay lease");
+            .expect("snapshot should retain unexpired overlay lease");
         assert_eq!(
             after_expiry
                 .node(NodeId::new(1))
@@ -4942,21 +4942,21 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_elapsed_expiry_advances_timestamp() {
-        let mut harness = experimental_raft_test_harness("lease-expiry-far-forward-test");
+    fn raft_control_plane_elapsed_expiry_advances_timestamp() {
+        let mut harness = raft_test_harness("lease-expiry-far-forward-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![17];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -4964,7 +4964,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -4972,11 +4972,11 @@ mod tests {
                 },
                 50_000,
             )
-            .expect("experimental raft startup heartbeat should refresh");
+            .expect("raft startup heartbeat should refresh");
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after startup heartbeat")
+            .expect("snapshot should read after startup heartbeat")
             .cluster_epoch();
         let proof = PgMetadataProof::for_test(92, 0x1234, 0x5678);
         harness
@@ -4985,7 +4985,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -4998,11 +4998,11 @@ mod tests {
                 },
                 50_100,
             )
-            .expect("experimental raft peering heartbeat should refresh");
+            .expect("raft peering heartbeat should refresh");
         let active_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after peering completion")
+            .expect("snapshot should read after peering completion")
             .cluster_epoch();
         harness
             .control_plane
@@ -5010,7 +5010,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
@@ -5023,7 +5023,7 @@ mod tests {
                 },
                 50_200,
             )
-            .expect("experimental raft active heartbeat should refresh");
+            .expect("raft active heartbeat should refresh");
 
         let far_future_now_ms =
             50_201 + storage::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 123;
@@ -5036,7 +5036,7 @@ mod tests {
         let expired_snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental far-forward expired snapshot should read");
+            .expect("far-forward expired snapshot should read");
         assert_eq!(
             expired_snapshot.max_committed_timestamp_ms(),
             Some(far_future_now_ms)
@@ -5057,7 +5057,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: expired_snapshot.cluster_epoch(),
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -5069,7 +5069,7 @@ mod tests {
         let recovered_snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental recovered snapshot should read");
+            .expect("recovered snapshot should read");
         assert_eq!(
             recovered_snapshot.max_committed_timestamp_ms(),
             Some(recovery_now_ms)
@@ -5090,21 +5090,21 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_resamples_expiry_time_when_enabled() {
-        let mut harness = experimental_raft_test_harness("lease-expiry-resample-test");
+    fn raft_control_plane_resamples_expiry_time_when_enabled() {
+        let mut harness = raft_test_harness("lease-expiry-resample-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![17];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -5112,7 +5112,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -5120,11 +5120,11 @@ mod tests {
                 },
                 50_000,
             )
-            .expect("experimental raft startup heartbeat should refresh");
+            .expect("raft startup heartbeat should refresh");
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after startup heartbeat")
+            .expect("snapshot should read after startup heartbeat")
             .cluster_epoch();
         let proof = PgMetadataProof::for_test(92, 0x1234, 0x5678);
         harness
@@ -5133,7 +5133,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -5146,11 +5146,11 @@ mod tests {
                 },
                 50_100,
             )
-            .expect("experimental raft peering heartbeat should refresh");
+            .expect("raft peering heartbeat should refresh");
         let active_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after peering completion")
+            .expect("snapshot should read after peering completion")
             .cluster_epoch();
         harness
             .control_plane
@@ -5158,7 +5158,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
@@ -5171,7 +5171,7 @@ mod tests {
                 },
                 50_200,
             )
-            .expect("experimental raft active heartbeat should refresh");
+            .expect("raft active heartbeat should refresh");
         let expiry = storage::clock::with_time_override(50_900, || {
             enable_resampled_authority_time(&mut harness.control_plane, 50_900);
             harness.control_plane.expire_heartbeat_leases(50_000)
@@ -5182,7 +5182,7 @@ mod tests {
         let expired_snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental expired snapshot should read");
+            .expect("expired snapshot should read");
         assert_eq!(
             expired_snapshot
                 .node(NodeId::new(1))
@@ -5195,34 +5195,34 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_serves_unix_heartbeat_refresh() {
-        let harness = experimental_raft_test_harness("unix-heartbeat-test");
+    fn raft_control_plane_serves_unix_heartbeat_refresh() {
+        let harness = raft_test_harness("unix-heartbeat-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![9];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
-        let tmp = short_unix_socket_test_dir("experimental-raft-unix-heartbeat");
+        let tmp = short_unix_socket_test_dir("raft-unix-heartbeat");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
         let startup_server =
-            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 30_000);
+            spawn_raft_unix_rpc_server(&harness, &socket_path, 30_000);
         let mut client = UnixControlPlaneClient::new(&socket_path);
         let startup_refresh = client
             .refresh_node_heartbeat(
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -5238,18 +5238,18 @@ mod tests {
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after startup heartbeat")
+            .expect("snapshot should read after startup heartbeat")
             .cluster_epoch();
         let proof = PgMetadataProof::for_test(77, 0x123, 0x456);
         let peering_server =
-            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 30_100);
+            spawn_raft_unix_rpc_server(&harness, &socket_path, 30_100);
         let mut client = UnixControlPlaneClient::new(&socket_path);
         let peering_refresh = client
             .refresh_node_heartbeat(
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -5277,32 +5277,32 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_unix_heartbeat_rejects_unknown_node() {
-        let harness = experimental_raft_test_harness("unix-heartbeat-reject-test");
+    fn raft_control_plane_unix_heartbeat_rejects_unknown_node() {
+        let harness = raft_test_harness("unix-heartbeat-reject-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![9];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         let before = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read before rejected heartbeat");
+            .expect("snapshot should read before rejected heartbeat");
 
-        let tmp = short_unix_socket_test_dir("experimental-raft-unix-heartbeat-reject");
+        let tmp = short_unix_socket_test_dir("raft-unix-heartbeat-reject");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
-        let server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 30_050);
+        let server = spawn_raft_unix_rpc_server(&harness, &socket_path, 30_050);
         let mut client = UnixControlPlaneClient::new(&socket_path);
         let error = client
             .refresh_node_heartbeat(
                 node_heartbeat! {
                     node_id: NodeId::new(99),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-99.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-99.sock".to_string(),
                     observed_epoch: before.cluster_epoch(),
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -5320,7 +5320,7 @@ mod tests {
         let after = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after rejected heartbeat");
+            .expect("snapshot should read after rejected heartbeat");
         assert_eq!(after, before);
 
         std::fs::remove_file(&socket_path).unwrap();
@@ -5329,21 +5329,21 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_serves_unix_runtime_map_read_index() {
-        let harness = experimental_raft_test_harness("unix-runtime-map-test");
+    fn raft_control_plane_serves_unix_runtime_map_read_index() {
+        let harness = raft_test_harness("unix-runtime-map-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![11];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
 
-        let tmp = short_unix_socket_test_dir("experimental-raft-unix-runtime-map");
+        let tmp = short_unix_socket_test_dir("raft-unix-runtime-map");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
-        let server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 31_000);
+        let server = spawn_raft_unix_rpc_server(&harness, &socket_path, 31_000);
         let client = UnixControlPlaneClient::new(&socket_path);
         let runtime_map = client
             .runtime_map_snapshot(0)
@@ -5354,7 +5354,7 @@ mod tests {
         assert_eq!(runtime_map.nodes()[0].node_id(), NodeId::new(1));
         assert_eq!(
             runtime_map.nodes()[0].endpoint(),
-            "/tmp/argmin-experimental-raft-node-1.sock"
+            "/tmp/argmin-raft-node-1.sock"
         );
         assert_eq!(runtime_map.pg_routes().len(), 1);
         assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(11));
@@ -5362,7 +5362,7 @@ mod tests {
         let read_index = runtime_map
             .freshness_proof()
             .read_index()
-            .expect("experimental raft runtime-map proof should carry a read index");
+            .expect("raft runtime-map proof should carry a read index");
         assert_ne!(read_index.term(), 0);
         assert_ne!(read_index.index(), 0);
         assert!(runtime_map.freshness_proof().is_serving_authority_read());
@@ -5373,28 +5373,28 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_serves_runtime_map_admin_helpers() {
-        let harness = experimental_raft_test_harness("runtime-map-admin-helpers-test");
+    fn raft_control_plane_serves_runtime_map_admin_helpers() {
+        let harness = raft_test_harness("runtime-map-admin-helpers-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![12];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         let before = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read before diagnostic helpers");
+            .expect("snapshot should read before diagnostic helpers");
 
-        let tmp = short_unix_socket_test_dir("experimental-raft-runtime-map-admin");
+        let tmp = short_unix_socket_test_dir("raft-runtime-map-admin");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
-        let ready_server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 31_100);
+        let ready_server = spawn_raft_unix_rpc_server(&harness, &socket_path, 31_100);
         let (ready_epoch, pg_routes, active_serving_pg_routes) =
             control_plane_runtime_map_ready(&socket_path)
-                .expect("runtime-map ready helper should read experimental raft map");
+                .expect("runtime-map ready helper should read raft map");
         ready_server.join().unwrap();
 
         assert_eq!(ready_epoch, before.cluster_epoch());
@@ -5403,9 +5403,9 @@ mod tests {
 
         std::fs::remove_file(&socket_path).unwrap();
         let diagnostics_server =
-            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 31_200);
+            spawn_raft_unix_rpc_server(&harness, &socket_path, 31_200);
         let diagnostics = control_plane_runtime_map_diagnostics(&socket_path)
-            .expect("runtime-map diagnostics helper should read experimental raft map");
+            .expect("runtime-map diagnostics helper should read raft map");
         diagnostics_server.join().unwrap();
 
         assert!(
@@ -5420,14 +5420,14 @@ mod tests {
         );
         assert!(
             diagnostics.contains(
-                "node_id=1 incarnation=0 endpoint=/tmp/argmin-experimental-raft-node-1.sock"
+                "node_id=1 incarnation=0 endpoint=/tmp/argmin-raft-node-1.sock"
             ),
             "{diagnostics}"
         );
         let after = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after diagnostic helpers");
+            .expect("snapshot should read after diagnostic helpers");
         assert_eq!(after, before);
 
         std::fs::remove_file(&socket_path).unwrap();
@@ -5436,32 +5436,32 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_serves_unix_acting_set_admin() {
-        let harness = experimental_raft_test_harness("unix-acting-set-admin-test");
+    fn raft_control_plane_serves_unix_acting_set_admin() {
+        let harness = raft_test_harness("unix-acting-set-admin-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
                 node_id: 1,
-                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
             },
             config::ConfiguredStorageNodeSocket {
                 node_id: 2,
-                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-2.sock".to_string(),
             },
         ];
         config.storage_pg_ids = vec![19];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
 
-        let tmp = short_unix_socket_test_dir("experimental-raft-unix-acting-set");
+        let tmp = short_unix_socket_test_dir("raft-unix-acting-set");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
-        let server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 32_000);
+        let server = spawn_raft_unix_rpc_server(&harness, &socket_path, 32_000);
         let client = UnixControlPlaneClient::new(&socket_path);
         let changed_epoch = client
             .set_pg_acting_set(PgId::new(19), vec![NodeId::new(2)])
@@ -5472,7 +5472,7 @@ mod tests {
         let snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after acting-set change");
+            .expect("snapshot should read after acting-set change");
         assert_eq!(snapshot.cluster_epoch(), changed_epoch);
         let pg = snapshot
             .pg(PgId::new(19))
@@ -5487,33 +5487,33 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_serves_live_acting_set_helper() {
-        let harness = experimental_raft_test_harness("live-acting-set-helper-test");
+    fn raft_control_plane_serves_live_acting_set_helper() {
+        let harness = raft_test_harness("live-acting-set-helper-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
                 node_id: 1,
-                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
             },
             config::ConfiguredStorageNodeSocket {
                 node_id: 2,
-                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-2.sock".to_string(),
             },
         ];
         config.storage_pg_ids = vec![19];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
 
-        let tmp = short_unix_socket_test_dir("experimental-raft-live-acting-set");
+        let tmp = short_unix_socket_test_dir("raft-live-acting-set");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
         let server =
-            spawn_experimental_raft_unix_rpc_server_requests(&harness, &socket_path, 32_050, 2);
+            spawn_raft_unix_rpc_server_requests(&harness, &socket_path, 32_050, 2);
         let changed_epoch = set_control_plane_pg_acting_set_live(&socket_path, 19, vec![2])
             .expect("live acting-set helper should succeed");
         server.join().unwrap();
@@ -5522,7 +5522,7 @@ mod tests {
         let snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after acting-set helper");
+            .expect("snapshot should read after acting-set helper");
         assert_eq!(snapshot.cluster_epoch().get(), changed_epoch);
         let pg = snapshot
             .pg(PgId::new(19))
@@ -5536,25 +5536,25 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_unix_acting_set_admin_rejects_unknown_node() {
-        let harness = experimental_raft_test_harness("unix-acting-set-admin-reject-test");
+    fn raft_control_plane_unix_acting_set_admin_rejects_unknown_node() {
+        let harness = raft_test_harness("unix-acting-set-admin-reject-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![19];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         let before = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read before rejected admin command");
+            .expect("snapshot should read before rejected admin command");
 
-        let tmp = short_unix_socket_test_dir("experimental-raft-unix-acting-set-reject");
+        let tmp = short_unix_socket_test_dir("raft-unix-acting-set-reject");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
-        let server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 32_100);
+        let server = spawn_raft_unix_rpc_server(&harness, &socket_path, 32_100);
         let client = UnixControlPlaneClient::new(&socket_path);
         let error = client
             .set_pg_acting_set(PgId::new(19), vec![NodeId::new(99)])
@@ -5571,7 +5571,7 @@ mod tests {
         let after = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after rejected admin command");
+            .expect("snapshot should read after rejected admin command");
         assert_eq!(after, before);
 
         std::fs::remove_file(&socket_path).unwrap();
@@ -5580,8 +5580,8 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_durable_restart_restores_acting_set_admin() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-durable-acting-set");
+    fn raft_control_plane_durable_restart_restores_acting_set_admin() {
+        let state_dir = short_unix_socket_test_dir("raft-durable-acting-set");
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).unwrap();
         let state_path = state_dir.join("control-plane.state");
@@ -5589,18 +5589,18 @@ mod tests {
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
                 node_id: 1,
-                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
             },
             config::ConfiguredStorageNodeSocket {
                 node_id: 2,
-                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-2.sock".to_string(),
             },
         ];
         config.storage_pg_ids = vec![19];
 
-        let mut harness = experimental_raft_durable_test_harness("acting-set-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("durable experimental raft control-plane bootstrap should succeed");
+        let mut harness = raft_durable_test_harness("acting-set-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("durable raft control-plane bootstrap should succeed");
         let changed = harness
             .control_plane
             .set_pg_acting_set(PgId::new(19), vec![NodeId::new(2)])
@@ -5614,13 +5614,13 @@ mod tests {
         assert!(state_path.exists());
         harness.shutdown();
 
-        let restarted = experimental_raft_durable_test_harness("acting-set-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
-            .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
+        let restarted = raft_durable_test_harness("acting-set-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&restarted.control_plane, &config)
+            .expect("durable raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
             .control_plane
             .current_snapshot()
-            .expect("durable experimental raft snapshot should read after restart");
+            .expect("durable raft snapshot should read after restart");
         assert_eq!(restored.cluster_epoch(), changed_epoch);
         let restored_pg = restored
             .pg(PgId::new(19))
@@ -5634,29 +5634,29 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_durable_restart_preserves_rejected_admin_entry() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-durable-reject");
+    fn raft_control_plane_durable_restart_preserves_rejected_admin_entry() {
+        let state_dir = short_unix_socket_test_dir("raft-durable-reject");
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).unwrap();
         let state_path = state_dir.join("control-plane.state");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![19];
 
-        let mut harness = experimental_raft_durable_test_harness("reject-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("durable experimental raft control-plane bootstrap should succeed");
+        let mut harness = raft_durable_test_harness("reject-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("durable raft control-plane bootstrap should succeed");
         let before = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read before rejected admin command");
+            .expect("durable snapshot should read before rejected admin command");
         let before_status = harness
             .runtime
             .block_on(harness.authority.status())
-            .expect("durable experimental status should read before rejection");
+            .expect("durable status should read before rejection");
         let before_applied_index = before_status
             .applied_index()
             .expect("bootstrapped durable authority should have an applied index");
@@ -5671,12 +5671,12 @@ mod tests {
         let after = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read after rejected admin command");
+            .expect("durable snapshot should read after rejected admin command");
         assert_eq!(after, before);
         let after_status = harness
             .runtime
             .block_on(harness.authority.status())
-            .expect("durable experimental status should read after rejection");
+            .expect("durable status should read after rejection");
         let after_applied_index = after_status
             .applied_index()
             .expect("rejected command should still advance the applied index");
@@ -5685,18 +5685,18 @@ mod tests {
         assert!(state_path.exists());
         harness.shutdown();
 
-        let restarted = experimental_raft_durable_test_harness("reject-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
-            .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
+        let restarted = raft_durable_test_harness("reject-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&restarted.control_plane, &config)
+            .expect("durable raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read after rejected-entry restart");
+            .expect("durable snapshot should read after rejected-entry restart");
         assert_eq!(restored, before);
         let restored_status = restarted
             .runtime
             .block_on(restarted.authority.status())
-            .expect("restarted durable experimental status should read");
+            .expect("restarted durable status should read");
         assert_eq!(restored_status.applied_index(), Some(after_applied_index));
         assert_eq!(restored_status.committed_index(), Some(after_applied_index));
 
@@ -5705,22 +5705,22 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_serves_unix_metadata_transfer_admin() {
-        let mut harness = experimental_raft_test_harness("unix-transfer-admin-test");
+    fn raft_control_plane_serves_unix_metadata_transfer_admin() {
+        let mut harness = raft_test_harness("unix-transfer-admin-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
                 node_id: 1,
-                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
             },
             config::ConfiguredStorageNodeSocket {
                 node_id: 2,
-                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-2.sock".to_string(),
             },
         ];
         config.storage_pg_ids = vec![13];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         harness
             .control_plane
             .set_pg_acting_set(PgId::new(13), vec![NodeId::new(1)])
@@ -5729,7 +5729,7 @@ mod tests {
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -5737,7 +5737,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -5745,11 +5745,11 @@ mod tests {
                 },
                 40_000,
             )
-            .expect("experimental raft startup heartbeat should refresh");
+            .expect("raft startup heartbeat should refresh");
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after startup heartbeat")
+            .expect("snapshot should read after startup heartbeat")
             .cluster_epoch();
         let active_proof = PgMetadataProof::for_test(91, 0xabc, 0xdef);
         harness
@@ -5758,7 +5758,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -5771,11 +5771,11 @@ mod tests {
                 },
                 40_100,
             )
-            .expect("experimental raft peering heartbeat should refresh");
+            .expect("raft peering heartbeat should refresh");
         let active_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after peering completion")
+            .expect("snapshot should read after peering completion")
             .cluster_epoch();
         harness
             .control_plane
@@ -5783,7 +5783,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
@@ -5796,16 +5796,16 @@ mod tests {
                 },
                 40_200,
             )
-            .expect("experimental raft active heartbeat should refresh");
+            .expect("raft active heartbeat should refresh");
         let live_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental active snapshot should read before volatile renewal")
+            .expect("active snapshot should read before volatile renewal")
             .cluster_epoch();
         let applied_before_volatile_renewal = harness
             .control_plane
             .block_on(harness.authority.status())
-            .expect("experimental Raft status should read before volatile renewal")
+            .expect("Raft status should read before volatile renewal")
             .applied();
         let renewed = harness
             .control_plane
@@ -5813,7 +5813,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: live_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
@@ -5832,16 +5832,16 @@ mod tests {
             harness
                 .control_plane
                 .block_on(harness.authority.status())
-                .expect("experimental Raft status should read after volatile renewal")
+                .expect("Raft status should read after volatile renewal")
                 .applied(),
             applied_before_volatile_renewal,
             "covered source renewal must remain leader-local before fencing"
         );
 
-        let tmp = short_unix_socket_test_dir("experimental-raft-unix-transfer-admin");
+        let tmp = short_unix_socket_test_dir("raft-unix-transfer-admin");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
-        let fence_server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 40_500);
+        let fence_server = spawn_raft_unix_rpc_server(&harness, &socket_path, 40_500);
         let admin_bootstrap = storage::ControlPlaneAdminClientBootstrap::with_socket_paths(
             [socket_path.clone()],
             storage::ControlPlaneAdminCredentialBinding::new(None, None, Vec::new()).unwrap(),
@@ -5882,7 +5882,7 @@ mod tests {
         std::fs::remove_file(&socket_path).unwrap();
         let transfer = PgMetadataTransferProof::new(active_epoch, active_proof);
         let install_server =
-            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 40_600);
+            spawn_raft_unix_rpc_server(&harness, &socket_path, 40_600);
         let expected_destination_epoch = ClusterEpoch::new(
             fenced_epoch.get().checked_add(1).unwrap(),
         )
@@ -5934,7 +5934,7 @@ mod tests {
         let snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after transfer install");
+            .expect("snapshot should read after transfer install");
         let pg = snapshot
             .pg(PgId::new(13))
             .expect("transferred PG should remain present");
@@ -5949,8 +5949,8 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_durable_restart_restores_metadata_transfer_admin() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-durable-transfer-admin");
+    fn raft_control_plane_durable_restart_restores_metadata_transfer_admin() {
+        let state_dir = short_unix_socket_test_dir("raft-durable-transfer-admin");
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).unwrap();
         let state_path = state_dir.join("control-plane.state");
@@ -5958,18 +5958,18 @@ mod tests {
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
                 node_id: 1,
-                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
             },
             config::ConfiguredStorageNodeSocket {
                 node_id: 2,
-                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-2.sock".to_string(),
             },
         ];
         config.storage_pg_ids = vec![13];
 
-        let mut harness = experimental_raft_durable_test_harness("transfer-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("durable experimental raft control-plane bootstrap should succeed");
+        let mut harness = raft_durable_test_harness("transfer-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("durable raft control-plane bootstrap should succeed");
         harness
             .control_plane
             .set_pg_acting_set(PgId::new(13), vec![NodeId::new(1)])
@@ -5978,7 +5978,7 @@ mod tests {
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read")
+            .expect("durable snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -5986,7 +5986,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -5994,11 +5994,11 @@ mod tests {
                 },
                 40_000,
             )
-            .expect("durable experimental startup heartbeat should checkpoint");
+            .expect("durable startup heartbeat should checkpoint");
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read after startup heartbeat")
+            .expect("durable snapshot should read after startup heartbeat")
             .cluster_epoch();
         let active_proof = PgMetadataProof::for_test(91, 0xabc, 0xdef);
         harness
@@ -6007,7 +6007,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -6020,11 +6020,11 @@ mod tests {
                 },
                 40_100,
             )
-            .expect("durable experimental peering heartbeat should checkpoint");
+            .expect("durable peering heartbeat should checkpoint");
         let active_snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read after peering completion");
+            .expect("durable snapshot should read after peering completion");
         let active_epoch = active_snapshot.cluster_epoch();
         assert_eq!(
             active_snapshot
@@ -6039,7 +6039,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
@@ -6052,7 +6052,7 @@ mod tests {
                 },
                 40_200,
             )
-            .expect("durable experimental active heartbeat should checkpoint");
+            .expect("durable active heartbeat should checkpoint");
 
         let fenced = harness
             .control_plane
@@ -6103,18 +6103,18 @@ mod tests {
         assert!(state_path.exists());
         harness.shutdown();
 
-        let restarted = experimental_raft_durable_test_harness("transfer-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
-            .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
+        let restarted = raft_durable_test_harness("transfer-restart", &state_path);
+        bootstrap_empty_raft_control_plane(&restarted.control_plane, &config)
+            .expect("durable raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
             .control_plane
             .current_snapshot()
-            .expect("durable experimental raft snapshot should read after restart");
+            .expect("durable raft snapshot should read after restart");
         assert_eq!(restored, transfer_snapshot);
 
         let runtime_map =
             ControlPlaneRuntimeMapSource::runtime_map_snapshot(&restarted.control_plane, 40_500)
-                .expect("durable experimental raft runtime map should read after restart");
+                .expect("durable raft runtime map should read after restart");
         let restored_route = runtime_map
             .pg_routes()
             .iter()
@@ -6137,22 +6137,22 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_serves_metadata_transfer_live_helpers() {
-        let mut harness = experimental_raft_test_harness("transfer-live-helper-test");
+    fn raft_control_plane_serves_metadata_transfer_live_helpers() {
+        let mut harness = raft_test_harness("transfer-live-helper-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
                 node_id: 1,
-                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-1.sock".to_string(),
             },
             config::ConfiguredStorageNodeSocket {
                 node_id: 2,
-                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                socket_path: "/tmp/argmin-raft-node-2.sock".to_string(),
             },
         ];
         config.storage_pg_ids = vec![14];
-        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
+        bootstrap_empty_raft_control_plane(&harness.control_plane, &config)
+            .expect("raft control-plane bootstrap should succeed");
         harness
             .control_plane
             .set_pg_acting_set(PgId::new(14), vec![NodeId::new(1)])
@@ -6161,7 +6161,7 @@ mod tests {
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read")
+            .expect("snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -6169,7 +6169,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
@@ -6177,11 +6177,11 @@ mod tests {
                 },
                 41_000,
             )
-            .expect("experimental raft startup heartbeat should refresh");
+            .expect("raft startup heartbeat should refresh");
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after startup heartbeat")
+            .expect("snapshot should read after startup heartbeat")
             .cluster_epoch();
         let active_proof = PgMetadataProof::for_test(101, 0xabc, 0xdef);
         harness
@@ -6190,7 +6190,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
@@ -6203,11 +6203,11 @@ mod tests {
                 },
                 41_100,
             )
-            .expect("experimental raft peering heartbeat should refresh");
+            .expect("raft peering heartbeat should refresh");
         let active_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after peering completion")
+            .expect("snapshot should read after peering completion")
             .cluster_epoch();
         harness
             .control_plane
@@ -6215,7 +6215,7 @@ mod tests {
                 node_heartbeat! {
                     node_id: NodeId::new(1),
                     node_incarnation: 1,
-                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    endpoint: "/tmp/argmin-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
@@ -6228,12 +6228,12 @@ mod tests {
                 },
                 41_150,
             )
-            .expect("experimental raft active heartbeat should refresh");
+            .expect("raft active heartbeat should refresh");
 
-        let tmp = short_unix_socket_test_dir("experimental-raft-transfer-live-helper");
+        let tmp = short_unix_socket_test_dir("raft-transfer-live-helper");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
-        let fence_server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 41_200);
+        let fence_server = spawn_raft_unix_rpc_server(&harness, &socket_path, 41_200);
         let fenced_epoch = fence_control_plane_pg_for_metadata_transfer_live(&socket_path, 14)
             .expect("live metadata-transfer fence helper should succeed");
         fence_server.join().unwrap();
@@ -6259,7 +6259,7 @@ mod tests {
         )
         .unwrap();
         let install_server =
-            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 41_300);
+            spawn_raft_unix_rpc_server(&harness, &socket_path, 41_300);
         let installed_epoch =
             set_control_plane_pg_acting_set_with_metadata_transfer_live(&socket_path, install)
                 .expect("live metadata-transfer acting-set helper should succeed");
@@ -6269,7 +6269,7 @@ mod tests {
         let snapshot = harness
             .control_plane
             .current_snapshot()
-            .expect("experimental snapshot should read after transfer helper install");
+            .expect("snapshot should read after transfer helper install");
         let pg = snapshot
             .pg(PgId::new(14))
             .expect("transferred PG should remain present");
@@ -7795,8 +7795,8 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_durable_restart_serves_frontend_runtime_map_refresh_loop() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-durable-runtime-refresh");
+    fn raft_durable_restart_serves_frontend_runtime_map_refresh_loop() {
+        let state_dir = short_unix_socket_test_dir("raft-durable-runtime-refresh");
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).unwrap();
         let state_path = state_dir.join("control-plane.state");
@@ -7810,16 +7810,16 @@ mod tests {
         control_plane_config.storage_pg_ids = vec![0];
 
         let mut harness =
-            experimental_raft_durable_test_harness("runtime-refresh-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(
+            raft_durable_test_harness("runtime-refresh-restart", &state_path);
+        bootstrap_empty_raft_control_plane(
             &harness.control_plane,
             &control_plane_config,
         )
-        .expect("durable experimental raft control-plane bootstrap should succeed");
+        .expect("durable raft control-plane bootstrap should succeed");
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read")
+            .expect("durable snapshot should read")
             .cluster_epoch();
         harness
             .control_plane
@@ -7835,11 +7835,11 @@ mod tests {
                 },
                 61_000,
             )
-            .expect("durable experimental startup heartbeat should checkpoint");
+            .expect("durable startup heartbeat should checkpoint");
         let peering_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read after startup heartbeat")
+            .expect("durable snapshot should read after startup heartbeat")
             .cluster_epoch();
         harness
             .control_plane
@@ -7860,11 +7860,11 @@ mod tests {
                 },
                 61_100,
             )
-            .expect("durable experimental Peering heartbeat should checkpoint");
+            .expect("durable Peering heartbeat should checkpoint");
         let active_epoch = harness
             .control_plane
             .current_snapshot()
-            .expect("durable experimental snapshot should read after peering completion")
+            .expect("durable snapshot should read after peering completion")
             .cluster_epoch();
         harness
             .control_plane
@@ -7885,18 +7885,18 @@ mod tests {
                 },
                 61_200,
             )
-            .expect("durable experimental Active heartbeat should checkpoint");
+            .expect("durable Active heartbeat should checkpoint");
         harness.shutdown();
 
         let restarted =
-            experimental_raft_durable_test_harness("runtime-refresh-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(
+            raft_durable_test_harness("runtime-refresh-restart", &state_path);
+        bootstrap_empty_raft_control_plane(
             &restarted.control_plane,
             &control_plane_config,
         )
-        .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
+        .expect("durable raft control-plane restart bootstrap should be a no-op");
         let server =
-            spawn_experimental_raft_unix_rpc_server_requests(&restarted, &socket_path, 61_300, 3);
+            spawn_raft_unix_rpc_server_requests(&restarted, &socket_path, 61_300, 3);
 
         let ec_config = EcConfig::new(1, 0).unwrap();
         let mut frontend_config = test_server_config();

@@ -1977,12 +1977,15 @@ credentials or object identities.
 
 ## Phase 4: Replicated-Mode Production Graduation
 
-### 4.1 Remove Experimental Selection And Naming
+### 4.1 Deployment Mode Selection
 
-Replace `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` with the validated deployment
-mode and static/dynamic authority configuration. Rename experimental process,
-log, test, and wrapper labels in one auditable change. Standalone retains its
-single authority; replicated mode always uses the replicated authority.
+The experimental process, log, test, and wrapper labels have been removed.
+The environment-only selector is now `ARGMIN_CONTROL_PLANE_RAFT_ENABLED`;
+this naming cleanup does not complete production graduation.
+
+Replace that selector with the validated deployment mode and static/dynamic
+authority configuration. Standalone retains its single authority; replicated
+mode always uses the replicated authority.
 
 ### 4.2 Keep OpenRaft Integration Auditable
 

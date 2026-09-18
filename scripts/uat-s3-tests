@@ -535,7 +535,7 @@ start_control_plane_node() {
         ARGMIN_CONTROL_PLANE_STATE_PATH="$state_path" \
         ARGMIN_CONTROL_PLANE_SOCKET_PATH="$socket_path" \
         ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS="$control_plane_client_socket_paths" \
-        ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT=1 \
+        ARGMIN_CONTROL_PLANE_RAFT_ENABLED=1 \
         ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME=uat-control-plane-raft \
         ARGMIN_CONTROL_PLANE_RAFT_NODE_ID="$raft_node_id" \
         ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH="$peer_socket_path" \

@@ -2762,7 +2762,7 @@ fn control_plane_openraft_snapshot_purge_requires_serving_authority() {
 fn control_plane_openraft_manual_snapshot_does_not_purge_before_explicit_trigger() {
     ControlPlaneRaftTypeConfig::run(async {
         let node_id = 121;
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_single_node_in_memory(
             "control-plane-raft-manual-snapshot-no-implicit-purge-test",
             node_id,
         )
@@ -2835,7 +2835,7 @@ fn control_plane_openraft_snapshot_purge_waits_for_durable_publication() {
         let artifact_path = tmp.path().join("raft.state");
         let wal_path = tmp.path().join("raft.wal");
         let node_id = 122;
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+        let authority = ControlPlaneRaftAuthority::new_single_node_durable_with_wal(
             "control-plane-raft-purge-durable-publication-test",
             node_id,
             &artifact_path,
@@ -2897,7 +2897,7 @@ fn control_plane_openraft_snapshot_purge_reports_post_sync_poison() {
         let artifact_path = tmp.path().join("raft.state");
         let wal_path = tmp.path().join("raft.wal");
         let node_id = 123;
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+        let authority = ControlPlaneRaftAuthority::new_single_node_durable_with_wal(
             "control-plane-raft-purge-post-sync-poison-test",
             node_id,
             &artifact_path,
@@ -4400,9 +4400,9 @@ fn control_plane_openraft_restarted_follower_catches_up_committed_prefix() {
             authority2,
             authority3,
         } = initialized_three_node_voter_authorities_with_config(
-            experimental_raft_config(
+            raft_config(
                 "control-plane-raft-follower-restart-catch-up-test",
-                ExperimentalRaftTimerMode::Manual,
+                RaftTimerMode::Manual,
             )
             .unwrap(),
             801,
@@ -6202,7 +6202,7 @@ fn authenticated_staging_evidence_preflight_suppresses_invalid_pages_and_exact_r
         let artifact_path = tmp.path().join("authority.state");
         let wal_path = tmp.path().join("authority.wal");
         let authority = Arc::new(
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+            ControlPlaneRaftAuthority::new_single_node_durable_with_wal(
                 cluster_id,
                 authority_node_id,
                 &artifact_path,

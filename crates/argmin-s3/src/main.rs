@@ -1595,8 +1595,8 @@ fn initialize_standalone_control_plane_before_binding<Ready, Listeners>(
 }
 
 fn run_control_plane_process(config: &ServerConfig) -> ! {
-    if config.control_plane_experimental_raft {
-        run_experimental_raft_control_plane_process(config);
+    if config.control_plane_raft_enabled {
+        run_raft_control_plane_process(config);
     }
 
     let state_path = config
@@ -1828,7 +1828,7 @@ fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Out
     }
 }
 
-fn build_experimental_raft_peer_bootstrap(
+fn build_raft_peer_bootstrap(
     config: &ServerConfig,
     cluster_name: &str,
     local_node_id: ControlPlaneRaftNodeId,
@@ -1894,7 +1894,7 @@ fn build_experimental_raft_peer_bootstrap(
 }
 
 #[cfg(test)]
-async fn experimental_raft_local_authority_serving_within(
+async fn raft_local_authority_serving_within(
     authority: &ControlPlaneRaftAuthority,
     timeout: Duration,
 ) -> Result<bool, ControlPlaneError> {
@@ -1911,12 +1911,12 @@ async fn experimental_raft_local_authority_serving_within(
 }
 
 #[cfg(test)]
-async fn wait_for_experimental_raft_local_authority_serving(
+async fn wait_for_raft_local_authority_serving(
     authority: &ControlPlaneRaftAuthority,
     timeout: Duration,
     message: &'static str,
 ) -> Result<(), ControlPlaneError> {
-    if experimental_raft_local_authority_serving_within(authority, timeout).await? {
+    if raft_local_authority_serving_within(authority, timeout).await? {
         return Ok(());
     }
     Err(ControlPlaneError::startup_timeout(format!(
@@ -1925,16 +1925,16 @@ async fn wait_for_experimental_raft_local_authority_serving(
 }
 
 #[cfg(test)]
-fn bind_experimental_raft_peer_listener(
+fn bind_raft_peer_listener(
     config: &ServerConfig,
     cluster_name: &str,
     local_node_id: ControlPlaneRaftNodeId,
 ) -> Result<Vec<ControlPlaneRaftPeerServerListenerInput>, String> {
-    let _bootstrap = build_experimental_raft_peer_bootstrap(config, cluster_name, local_node_id)?;
-    bind_experimental_raft_peer_listener_inputs(config)
+    let _bootstrap = build_raft_peer_bootstrap(config, cluster_name, local_node_id)?;
+    bind_raft_peer_listener_inputs(config)
 }
 
-fn bind_experimental_raft_peer_listener_inputs(
+fn bind_raft_peer_listener_inputs(
     config: &ServerConfig,
 ) -> Result<Vec<ControlPlaneRaftPeerServerListenerInput>, String> {
     let configured_listeners = if config.control_plane_raft_peer_listeners.is_empty() {
@@ -2026,7 +2026,7 @@ fn classify_static_control_plane_identity_establishment_error(
     }
 }
 
-fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
+fn run_raft_control_plane_process(config: &ServerConfig) -> ! {
     let state_path = config
         .control_plane_state_path
         .as_deref()
@@ -2053,14 +2053,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let cluster_name = config
         .control_plane_raft_cluster_name
         .clone()
-        .unwrap_or_else(|| format!("argmin-s3-experimental-control-plane-{socket_path}"));
-    let raft_peer_bootstrap =
-        build_experimental_raft_peer_bootstrap(config, &cluster_name, node_id).unwrap_or_else(
-            |error| {
-                eprintln!("{error}");
-                std::process::exit(1);
-            },
-        );
+        .unwrap_or_else(|| format!("argmin-s3-control-plane-{socket_path}"));
+    let raft_peer_bootstrap = build_raft_peer_bootstrap(config, &cluster_name, node_id)
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
     let raft_peer_auth_diagnostics = raft_peer_bootstrap.auth_diagnostics();
     let outer_identity_publisher = config
         .static_cluster_identity
@@ -2087,11 +2085,9 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                         outer_identity,
                     ),
                 )
-                .map_err(|error| {
-                    format!("failed to prepare experimental OpenRaft control-plane: {error}")
-                })
+                .map_err(|error| format!("failed to prepare OpenRaft control-plane: {error}"))
             },
-            || bind_experimental_raft_peer_listener_inputs(config),
+            || bind_raft_peer_listener_inputs(config),
         )
         .unwrap_or_else(|error| {
             eprintln!("{error}");
@@ -2108,16 +2104,17 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         ),
     )
     .unwrap_or_else(|error| {
-        eprintln!("failed to start experimental OpenRaft control-plane: {error}");
+        eprintln!("failed to start OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
     let multi_node_raft_peer_mode = authority_service.is_multi_node();
     if config.static_initial_cluster_map.is_none() {
-        bootstrap_empty_experimental_raft_control_plane(authority_service.host(), config)
-            .unwrap_or_else(|error| {
-                eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
+        bootstrap_empty_raft_control_plane(authority_service.host(), config).unwrap_or_else(
+            |error| {
+                eprintln!("failed to bootstrap OpenRaft control-plane state: {error}");
                 std::process::exit(1);
-            });
+            },
+        );
     }
     let listeners = bind_configured_control_plane_rpc_listeners(
         &config.control_plane_rpc_listeners,
@@ -2148,7 +2145,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .as_deref()
         .unwrap_or("-");
     process_info!(
-        "argmin-s3 experimental durable OpenRaft control-plane manager using state {} on {} (clock recovery {}, raft node {}, peer socket {}, configured peers {}, configured auth credentials {}, lease scan {} ms)",
+        "argmin-s3 durable OpenRaft control-plane manager using state {} on {} (clock recovery {}, raft node {}, peer socket {}, configured peers {}, configured auth credentials {}, lease scan {} ms)",
         state_path,
         socket_path,
         recovery_socket_path.display(),
@@ -2182,7 +2179,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .host()
         .serve_rpc(rpc_server, fatal_error_handler)
         .unwrap_or_else(|error| {
-            eprintln!("failed to start experimental OpenRaft RPC server: {error}");
+            eprintln!("failed to start OpenRaft RPC server: {error}");
             std::process::exit(1);
         });
     let mut unavailable_pg_reconciler = config.static_initial_cluster_map.as_ref().map(|_| {
@@ -2202,7 +2199,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 .host()
                 .linearized_authority_serving()
                 .unwrap_or_else(|error| {
-                    eprintln!("experimental OpenRaft control-plane status check failed: {error}");
+                    eprintln!("OpenRaft control-plane status check failed: {error}");
                     std::process::exit(1);
                 })
         } else {
@@ -2211,11 +2208,9 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         let expiry_now_ms = storage::clock::current_time_millis();
         let expiry = if local_raft_authority_serving {
             if multi_node_raft_peer_mode && config.static_initial_cluster_map.is_none() {
-                bootstrap_empty_experimental_raft_control_plane(authority_service.host(), config)
+                bootstrap_empty_raft_control_plane(authority_service.host(), config)
                     .unwrap_or_else(|error| {
-                        eprintln!(
-                            "failed to bootstrap experimental OpenRaft control-plane state: {error}"
-                        );
+                        eprintln!("failed to bootstrap OpenRaft control-plane state: {error}");
                         std::process::exit(1);
                     });
             }
@@ -2236,14 +2231,14 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             .invalidate_blocked_authority_clock_checkpoint()
             .unwrap_or_else(|error| {
                 eprintln!(
-                    "failed to invalidate blocked experimental OpenRaft authority clock checkpoint: {error}"
+                    "failed to invalidate blocked OpenRaft authority clock checkpoint: {error}"
                 );
                 std::process::exit(1);
             });
         match expiry {
             Ok(Some(expiry)) if expiry.expired_nodes() > 0 => {
                 process_info!(
-                    "experimental OpenRaft control-plane expired {} node leases at epoch {} and moved {} PGs to peering",
+                    "OpenRaft control-plane expired {} node leases at epoch {} and moved {} PGs to peering",
                     expiry.expired_nodes(),
                     expiry.cluster_epoch(),
                     expiry.peering_pgs()
@@ -2252,7 +2247,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             Ok(_) => {}
             Err(error @ ControlPlaneError::AuthorityClockSampleWindowTooWide { .. }) => {
                 eprintln!(
-                    "experimental OpenRaft control-plane lease expiry deferred because a coherent clock sample was unavailable: {error}"
+                    "OpenRaft control-plane lease expiry deferred because a coherent clock sample was unavailable: {error}"
                 );
             }
             Err(
@@ -2265,9 +2260,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                     fenced_until_ms,
                 )
                 .unwrap_or_else(|error| {
-                    eprintln!(
-                        "experimental OpenRaft successor heartbeat renewal window failed: {error}"
-                    );
+                    eprintln!("OpenRaft successor heartbeat renewal window failed: {error}");
                     std::process::exit(1);
                 });
                 lease_expiry_not_before_ms = Some(
@@ -2276,17 +2269,17 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                     }),
                 );
                 eprintln!(
-                    "experimental OpenRaft control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
+                    "OpenRaft control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
                 );
             }
-            Err(error) if experimental_raft_lease_expiry_error_is_transient(&error) => {}
+            Err(error) if raft_lease_expiry_error_is_transient(&error) => {}
             Err(error) if control_plane_lease_expiry_error_is_clock_wait(&error) => {
                 eprintln!(
-                    "experimental OpenRaft control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
+                    "OpenRaft control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
                 );
             }
             Err(error) => {
-                eprintln!("experimental OpenRaft control-plane lease expiry failed: {error}");
+                eprintln!("OpenRaft control-plane lease expiry failed: {error}");
                 std::process::exit(1);
             }
         }
@@ -2343,19 +2336,19 @@ fn control_plane_lease_expiry_error_is_clock_wait(error: &ControlPlaneError) -> 
     error.is_retryable_authority_clock_wait_error()
 }
 
-fn experimental_raft_error_is_non_local_leader(error: &ControlPlaneError) -> bool {
+fn raft_error_is_non_local_leader(error: &ControlPlaneError) -> bool {
     error.is_control_plane_leader_routing_rejection()
 }
 
-fn experimental_raft_lease_expiry_error_is_transient(error: &ControlPlaneError) -> bool {
-    experimental_raft_error_is_non_local_leader(error)
+fn raft_lease_expiry_error_is_transient(error: &ControlPlaneError) -> bool {
+    raft_error_is_non_local_leader(error)
         || matches!(
             error,
             ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch { .. }
         )
 }
 
-fn bootstrap_empty_experimental_raft_control_plane(
+fn bootstrap_empty_raft_control_plane(
     authority: &ControlPlaneRaftAuthorityHost,
     config: &ServerConfig,
 ) -> Result<(), ControlPlaneError> {
@@ -2368,7 +2361,7 @@ fn bootstrap_empty_experimental_raft_control_plane(
         return Ok(());
     };
     process_info!(
-        "experimental OpenRaft control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
+        "OpenRaft control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
         topology.node_count(),
         topology.pg_count(),
         epoch

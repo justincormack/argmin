@@ -229,7 +229,7 @@ fn configured_membership_initialization_waits_when_raft_state_wins_the_check_rac
         );
         let configured_members = policy.peers();
         let authority = Arc::new(
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_unix_peer_durable(
                 cluster_name,
                 node_id,
                 &tmp.path().join("authority.state"),

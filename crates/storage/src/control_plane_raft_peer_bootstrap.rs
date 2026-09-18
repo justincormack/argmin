@@ -467,7 +467,7 @@ impl ControlPlaneRaftPeerBootstrap {
         static_identity_established: bool,
     ) -> Result<ControlPlaneRaftAuthority, ControlPlaneError> {
         let Some(peer) = &self.replicated else {
-            return ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+            return ControlPlaneRaftAuthority::new_single_node_durable(
                 self.cluster_name.clone(),
                 self.local_node_id,
                 artifact_path,
@@ -476,7 +476,7 @@ impl ControlPlaneRaftPeerBootstrap {
         };
         if !static_identity_established {
             if let Some(topology) = &peer.static_initial_topology {
-                return ControlPlaneRaftAuthority::new_experimental_peer_durable_pending_static_initialization_network(
+                return ControlPlaneRaftAuthority::new_peer_durable_pending_static_initialization_network(
                     self.cluster_name.clone(),
                     self.local_node_id,
                     artifact_path,
@@ -487,7 +487,7 @@ impl ControlPlaneRaftPeerBootstrap {
                 .await;
             }
         }
-        ControlPlaneRaftAuthority::new_experimental_peer_durable_network(
+        ControlPlaneRaftAuthority::new_peer_durable_network(
             self.cluster_name.clone(),
             self.local_node_id,
             artifact_path,
@@ -1463,13 +1463,11 @@ mod tests {
         // rather than opening an authority and invoking the host directly.
         let seed_authority = Arc::new(
             runtime
-                .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                        "test-cluster",
-                        1,
-                        &artifact_path,
-                    ),
-                )
+                .block_on(ControlPlaneRaftAuthority::new_single_node_durable(
+                    "test-cluster",
+                    1,
+                    &artifact_path,
+                ))
                 .expect("seed authority should initialize"),
         );
         let seed_durability = seed_authority
@@ -1860,12 +1858,9 @@ mod tests {
             let standalone = ControlPlaneRaftPeerBootstrap::single_node("test-cluster", 1);
             assert!(standalone.startup_requires_local_leader());
             let standalone_authority = Arc::new(
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
-                    "test-cluster",
-                    1,
-                )
-                .await
-                .unwrap(),
+                ControlPlaneRaftAuthority::new_single_node_in_memory("test-cluster", 1)
+                    .await
+                    .unwrap(),
             );
             assert!(standalone_authority
                 .initialize_configured_membership_if_needed()

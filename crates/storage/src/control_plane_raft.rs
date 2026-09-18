@@ -2568,35 +2568,35 @@ fn validate_static_initial_raft_membership(
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct ExperimentalSingleNodeRaftNetworkFactory;
+struct SingleNodeRaftNetworkFactory;
 
-impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNetworkFactory {
-    type Network = ExperimentalSingleNodeRaftNetwork;
+impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for SingleNodeRaftNetworkFactory {
+    type Network = SingleNodeRaftNetwork;
 
     async fn new_client(
         &mut self,
         target: ControlPlaneRaftNodeId,
         _node: &BasicNode,
     ) -> Self::Network {
-        ExperimentalSingleNodeRaftNetwork { target }
+        SingleNodeRaftNetwork { target }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ExperimentalSingleNodeRaftNetwork {
+struct SingleNodeRaftNetwork {
     target: ControlPlaneRaftNodeId,
 }
 
-impl ExperimentalSingleNodeRaftNetwork {
+impl SingleNodeRaftNetwork {
     fn unreachable(&self, rpc_name: &'static str) -> Unreachable<ControlPlaneRaftTypeConfig> {
         Unreachable::new(&AnyError::error(format!(
-            "experimental single-node control-plane raft network has no remote target {} for {rpc_name}",
+            "single-node control-plane raft network has no remote target {} for {rpc_name}",
             self.target
         )))
     }
 }
 
-impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNetwork {
+impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for SingleNodeRaftNetwork {
     type SnapshotData = ControlPlaneRaftSnapshotData;
 
     async fn append_entries(
@@ -2636,7 +2636,7 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNet
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExperimentalRaftTimerMode {
+enum RaftTimerMode {
     Manual,
     Automatic,
 }
@@ -2664,11 +2664,11 @@ const _: () = assert!(
         <= ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES_BYTES
 );
 
-fn experimental_raft_config(
+fn raft_config(
     cluster_name: impl Into<String>,
-    timer_mode: ExperimentalRaftTimerMode,
+    timer_mode: RaftTimerMode,
 ) -> Result<Arc<Config>, ControlPlaneError> {
-    let timers_enabled = matches!(timer_mode, ExperimentalRaftTimerMode::Automatic);
+    let timers_enabled = matches!(timer_mode, RaftTimerMode::Automatic);
     Ok(Arc::new(
         Config {
             cluster_name: cluster_name.into(),
@@ -2697,18 +2697,18 @@ fn experimental_raft_config(
         }
         .validate()
         .map_err(|error| {
-            ControlPlaneError::rpc_remote(format!("OpenRaft experimental config failed: {error}"))
+            ControlPlaneError::rpc_remote(format!("OpenRaft config failed: {error}"))
         })?,
     ))
 }
 
-fn experimental_single_node_raft_config(
+fn single_node_raft_config(
     cluster_name: impl Into<String>,
 ) -> Result<Arc<Config>, ControlPlaneError> {
-    experimental_raft_config(cluster_name, ExperimentalRaftTimerMode::Manual)
+    raft_config(cluster_name, RaftTimerMode::Manual)
 }
 
-fn restore_experimental_raft_durable_artifact(
+fn restore_raft_durable_artifact(
     cluster_name: &str,
     node_id: ControlPlaneRaftNodeId,
     artifact_path: &Path,
@@ -2861,89 +2861,77 @@ impl ControlPlaneRaftAuthority {
         self.authority_clock_checkpoint_binding()
     }
 
-    pub async fn new_experimental_single_node_in_memory(
+    pub async fn new_single_node_in_memory(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
     ) -> Result<Self, ControlPlaneError> {
         let cluster_name = cluster_name.into();
-        let config = experimental_single_node_raft_config(cluster_name.clone())?;
+        let config = single_node_raft_config(cluster_name.clone())?;
         let log_store = ControlPlaneRaftLogStore::empty();
         let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node_id,
             config,
-            ExperimentalSingleNodeRaftNetworkFactory,
+            SingleNodeRaftNetworkFactory,
             log_store.clone(),
             ControlPlaneRaftStateMachine::empty(),
         )
         .await
-        .map_err(|error| openraft_remote_error("new experimental single-node authority", error))?;
+        .map_err(|error| openraft_remote_error("new single-node authority", error))?;
         Ok(Self::new_with_log_store(raft, log_store, cluster_name))
     }
 
     /// Construct an in-memory Raft authority whose explicit checkpoint
     /// publication is durable, for cross-crate behavioral tests.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub async fn new_experimental_single_node_in_memory_with_checkpoint_for_test(
+    pub async fn new_single_node_in_memory_with_checkpoint_for_test(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
     ) -> Result<Self, ControlPlaneError> {
-        Ok(
-            Self::new_experimental_single_node_in_memory(cluster_name, node_id)
-                .await?
-                .with_durable_artifact_path(artifact_path),
-        )
+        Ok(Self::new_single_node_in_memory(cluster_name, node_id)
+            .await?
+            .with_durable_artifact_path(artifact_path))
     }
 
-    pub(crate) async fn new_experimental_single_node_durable(
+    pub(crate) async fn new_single_node_durable(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
     ) -> Result<Self, ControlPlaneError> {
         let wal_path = durable_artifact_wal_path(artifact_path);
-        Self::new_experimental_single_node_durable_inner(
-            cluster_name,
-            node_id,
-            artifact_path,
-            Some(&wal_path),
-        )
-        .await
+        Self::new_single_node_durable_inner(cluster_name, node_id, artifact_path, Some(&wal_path))
+            .await
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub async fn new_experimental_single_node_durable_for_test(
+    pub async fn new_single_node_durable_for_test(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
     ) -> Result<Self, ControlPlaneError> {
-        Self::new_experimental_single_node_durable(cluster_name, node_id, artifact_path).await
+        Self::new_single_node_durable(cluster_name, node_id, artifact_path).await
     }
 
     #[cfg(test)]
-    async fn new_experimental_single_node_durable_with_wal(
+    async fn new_single_node_durable_with_wal(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
         wal_path: &Path,
     ) -> Result<Self, ControlPlaneError> {
-        Self::new_experimental_single_node_durable_inner(
-            cluster_name,
-            node_id,
-            artifact_path,
-            Some(wal_path),
-        )
-        .await
+        Self::new_single_node_durable_inner(cluster_name, node_id, artifact_path, Some(wal_path))
+            .await
     }
 
-    async fn new_experimental_single_node_durable_inner(
+    async fn new_single_node_durable_inner(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
         wal_path: Option<&Path>,
     ) -> Result<Self, ControlPlaneError> {
         let cluster_name = cluster_name.into();
-        let config = experimental_single_node_raft_config(cluster_name.clone())?;
-        let (log_store, state_machine) = restore_experimental_raft_durable_artifact(
+        let config = single_node_raft_config(cluster_name.clone())?;
+        let (log_store, state_machine) = restore_raft_durable_artifact(
             &cluster_name,
             node_id,
             artifact_path,
@@ -2953,20 +2941,18 @@ impl ControlPlaneRaftAuthority {
         let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node_id,
             config,
-            ExperimentalSingleNodeRaftNetworkFactory,
+            SingleNodeRaftNetworkFactory,
             log_store.clone(),
             state_machine,
         )
         .await
-        .map_err(|error| {
-            openraft_remote_error("new experimental durable single-node authority", error)
-        })?;
+        .map_err(|error| openraft_remote_error("new durable single-node authority", error))?;
         Ok(Self::new_with_log_store(raft, log_store, cluster_name)
             .with_durable_artifact_path(artifact_path))
     }
 
     #[cfg(test)]
-    pub(crate) async fn new_experimental_unix_peer_durable(
+    pub(crate) async fn new_unix_peer_durable(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -2974,7 +2960,7 @@ impl ControlPlaneRaftAuthority {
         rpc_timeout: Duration,
     ) -> Result<Self, ControlPlaneError> {
         let wal_path = durable_artifact_wal_path(artifact_path);
-        Self::new_experimental_peer_durable_inner(
+        Self::new_peer_durable_inner(
             cluster_name,
             node_id,
             artifact_path,
@@ -2987,7 +2973,7 @@ impl ControlPlaneRaftAuthority {
     }
 
     #[cfg(test)]
-    async fn new_experimental_unix_peer_durable_with_wal(
+    async fn new_unix_peer_durable_with_wal(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -2995,7 +2981,7 @@ impl ControlPlaneRaftAuthority {
         peer_policy: ControlPlaneRaftPeerTransportPolicy,
         rpc_timeout: Duration,
     ) -> Result<Self, ControlPlaneError> {
-        Self::new_experimental_peer_durable_inner(
+        Self::new_peer_durable_inner(
             cluster_name,
             node_id,
             artifact_path,
@@ -3008,7 +2994,7 @@ impl ControlPlaneRaftAuthority {
     }
 
     #[cfg(test)]
-    async fn new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
+    async fn new_unix_peer_durable_with_wal_pending_static_initialization(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -3017,7 +3003,7 @@ impl ControlPlaneRaftAuthority {
         expected_bootstrap: ControlPlaneCommand,
         rpc_timeout: Duration,
     ) -> Result<Self, ControlPlaneError> {
-        Self::new_experimental_peer_durable_inner(
+        Self::new_peer_durable_inner(
             cluster_name,
             node_id,
             artifact_path,
@@ -3029,7 +3015,7 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
-    pub(crate) async fn new_experimental_peer_durable_network(
+    pub(crate) async fn new_peer_durable_network(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -3037,7 +3023,7 @@ impl ControlPlaneRaftAuthority {
         network: ControlPlaneRaftPeerNetworkConfig,
     ) -> Result<Self, ControlPlaneError> {
         let wal_path = durable_artifact_wal_path(artifact_path);
-        Self::new_experimental_peer_durable_inner(
+        Self::new_peer_durable_inner(
             cluster_name,
             node_id,
             artifact_path,
@@ -3049,7 +3035,7 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
-    pub(crate) async fn new_experimental_peer_durable_pending_static_initialization_network(
+    pub(crate) async fn new_peer_durable_pending_static_initialization_network(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -3058,7 +3044,7 @@ impl ControlPlaneRaftAuthority {
         network: ControlPlaneRaftPeerNetworkConfig,
     ) -> Result<Self, ControlPlaneError> {
         let wal_path = durable_artifact_wal_path(artifact_path);
-        Self::new_experimental_peer_durable_inner(
+        Self::new_peer_durable_inner(
             cluster_name,
             node_id,
             artifact_path,
@@ -3070,7 +3056,7 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
-    async fn new_experimental_peer_durable_inner(
+    async fn new_peer_durable_inner(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -3095,10 +3081,9 @@ impl ControlPlaneRaftAuthority {
                 .into_snapshot();
             validate_captured_static_initial_topology(&expected_snapshot, &peer_policy)?;
         }
-        let config =
-            experimental_raft_config(cluster_name.clone(), ExperimentalRaftTimerMode::Automatic)?;
+        let config = raft_config(cluster_name.clone(), RaftTimerMode::Automatic)?;
         let policy_for_restore = peer_policy.clone();
-        let (log_store, state_machine) = restore_experimental_raft_durable_artifact(
+        let (log_store, state_machine) = restore_raft_durable_artifact(
             &cluster_name,
             node_id,
             artifact_path,
@@ -3125,7 +3110,7 @@ impl ControlPlaneRaftAuthority {
             state_machine,
         )
         .await
-        .map_err(|error| openraft_remote_error("new experimental peer authority", error))?;
+        .map_err(|error| openraft_remote_error("new peer authority", error))?;
         Ok(Self::new_with_log_store_and_static_peer_policy(
             raft,
             log_store,

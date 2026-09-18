@@ -2040,13 +2040,11 @@ mod tests {
         let runtime = runtime();
         let authority = Arc::new(
             runtime
-                .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                        "unavailable-pg-reconciliation-raft-host",
-                        1,
-                        &artifact_path,
-                    ),
-                )
+                .block_on(ControlPlaneRaftAuthority::new_single_node_durable(
+                    "unavailable-pg-reconciliation-raft-host",
+                    1,
+                    &artifact_path,
+                ))
                 .unwrap(),
         );
         runtime
@@ -2541,13 +2539,11 @@ mod tests {
         let runtime = runtime();
         let authority = Arc::new(
             runtime
-                .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                        secret_cluster_name,
-                        1,
-                        &artifact_path,
-                    ),
-                )
+                .block_on(ControlPlaneRaftAuthority::new_single_node_durable(
+                    secret_cluster_name,
+                    1,
+                    &artifact_path,
+                ))
                 .expect("durable authority should initialize"),
         );
         let first = ControlPlaneRaftAuthorityHost::start_durable(
@@ -2583,13 +2579,11 @@ mod tests {
         let authority_runtime = runtime();
         let authority = Arc::new(
             authority_runtime
-                .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                        "crossed-runtime-authority-host",
-                        1,
-                        &artifact_path,
-                    ),
-                )
+                .block_on(ControlPlaneRaftAuthority::new_single_node_durable(
+                    "crossed-runtime-authority-host",
+                    1,
+                    &artifact_path,
+                ))
                 .expect("durable authority should initialize"),
         );
         authority
@@ -2618,12 +2612,10 @@ mod tests {
         let runtime = runtime();
         let authority = Arc::new(
             runtime
-                .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
-                        "in-memory-authority-host",
-                        1,
-                    ),
-                )
+                .block_on(ControlPlaneRaftAuthority::new_single_node_in_memory(
+                    "in-memory-authority-host",
+                    1,
+                ))
                 .expect("in-memory authority should initialize"),
         );
         let error = ControlPlaneRaftAuthorityHost::start_durable(
@@ -2669,13 +2661,11 @@ mod tests {
         let runtime = runtime();
         let authority = Arc::new(
             runtime
-                .block_on(
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                        "clock-checkpoint-format-boundary",
-                        1,
-                        &artifact_path,
-                    ),
-                )
+                .block_on(ControlPlaneRaftAuthority::new_single_node_durable(
+                    "clock-checkpoint-format-boundary",
+                    1,
+                    &artifact_path,
+                ))
                 .expect("durable authority should initialize"),
         );
         authority
