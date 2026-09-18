@@ -1181,6 +1181,26 @@ or worker restart without re-exporting from the historical primary. Staging
 store, artifact, command, control-plane state/RPC, and authentication-envelope
 versions are unchanged because retrieval adds no durable semantics.
 
+The restart-safe ownership prerequisite now removes the staged transfer's
+dependency on its original in-memory preparation. After destination install,
+storage reconstructs the exact authorization and install from the retained
+transition, upgrades one capability per destination from the complete durable
+batch receipt, and retrieves canonical bytes from any authorized destination.
+The decoder independently rechecks the intent digest and length and the full
+artifact grammar. Because proof rebasing deliberately leaves the original
+artifact bytes unchanged, reconstruction derives the imported proof at the
+durable install epoch and requires it to equal the retained install proof; it
+does not confuse the artifact's first encoded target with the later rebased
+target. The reconstructed linear owner retains only the exact work binding,
+intent, destination capabilities, decoded artifact, install epoch/proof, and
+publication commitments needed for import, activation, and cleanup. Proof
+republishing resolves current authority-certified destination identities, so a
+resumed owner does not retain the pre-install endpoint or incarnation. Composed
+coverage drops the original prepared owner after an unrelated epoch rebase,
+reconstructs from destination storage, imports, activates, and completes the
+existing all-destination cleanup path. The production worker remains on the
+singular wrapper until the atomic state-machine handoff consumes this owner.
+
 Command v29 and state v41 implement the first bounded segment-retirement
 step. `CollapseMetadataTransferStagingEvidenceCheckpointSegment` performs an
 exact CAS over the actor incarnation, generation range, and canonical source

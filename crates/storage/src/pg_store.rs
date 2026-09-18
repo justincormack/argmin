@@ -199,10 +199,10 @@ pub(crate) fn committed_staging_authorization_for_intent_for_test(
 #[cfg(test)]
 pub(crate) use metadata_transfer_staging::metadata_transfer_staging_checkpoint_page_digest;
 pub(crate) use metadata_transfer_staging::{
-    canonical_metadata_transfer_staging_evidence, decode_staging_evidence,
-    decode_staging_evidence_actor_closure_candidate_bytes, decode_staging_evidence_apply_receipt,
-    decode_staging_evidence_page_payload, decode_staging_intent,
-    encode_staged_metadata_transfer_artifact,
+    canonical_metadata_transfer_staging_evidence, decode_staged_metadata_transfer_artifact,
+    decode_staging_evidence, decode_staging_evidence_actor_closure_candidate_bytes,
+    decode_staging_evidence_apply_receipt, decode_staging_evidence_page_payload,
+    decode_staging_intent, encode_staged_metadata_transfer_artifact,
     encode_staging_evidence_actor_closure_candidate_bytes, encode_staging_intent,
     metadata_transfer_staging_checkpoint_page_digest_with_actor_closure,
     metadata_transfer_staging_rebound_evidence_digest,

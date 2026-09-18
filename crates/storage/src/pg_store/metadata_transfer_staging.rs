@@ -720,6 +720,34 @@ fn validate_staged_metadata_transfer_artifact(
     })
 }
 
+pub(crate) fn decode_staged_metadata_transfer_artifact(
+    bytes: &[u8],
+    intent: &MetadataTransferStagingIntent,
+) -> Result<
+    (
+        PgMetadataTransferArtifact,
+        ClusterEpoch,
+        PgMetadataTransferProof,
+    ),
+    MetadataTransferStagingError,
+> {
+    if u64::try_from(bytes.len()).ok() != Some(intent.artifact_length())
+        || checksum::sha256::digest(bytes) != intent.artifact_digest()
+    {
+        return Err(MetadataTransferStagingError::ArtifactMismatch);
+    }
+    let validated = validate_staged_metadata_transfer_artifact(
+        bytes,
+        intent,
+        &MetadataCommandDecodeAuthority::new(),
+    )?;
+    Ok((
+        validated.artifact,
+        validated.destination_epoch,
+        validated.transfer,
+    ))
+}
+
 fn validate_staged_artifact_for_publication(
     bytes: &[u8],
     intent: &MetadataTransferStagingIntent,
@@ -6345,6 +6373,30 @@ mod tests {
         let destination_epoch = ClusterEpoch::new(13).unwrap();
         let bytes = encode_staged_metadata_transfer_artifact(&artifact, destination_epoch).unwrap();
         let staged_intent = intent(&bytes);
+        let (decoded, decoded_epoch, decoded_transfer) =
+            decode_staged_metadata_transfer_artifact(&bytes, &staged_intent).unwrap();
+        assert_eq!(decoded, artifact);
+        assert_eq!(decoded_epoch, destination_epoch);
+        assert_eq!(
+            decoded_transfer,
+            PgMetadataTransferProof::new_with_imported_metadata_proof(
+                artifact.cluster_epoch,
+                artifact.proof,
+                PgMetadataProof::empty(),
+            )
+        );
+        let mut wrong_digest_intent = staged_intent.clone();
+        wrong_digest_intent.artifact_digest[0] ^= 1;
+        assert!(matches!(
+            decode_staged_metadata_transfer_artifact(&bytes, &wrong_digest_intent),
+            Err(MetadataTransferStagingError::ArtifactMismatch)
+        ));
+        let mut wrong_length_intent = staged_intent.clone();
+        wrong_length_intent.artifact_length += 1;
+        assert!(matches!(
+            decode_staged_metadata_transfer_artifact(&bytes, &wrong_length_intent),
+            Err(MetadataTransferStagingError::ArtifactMismatch)
+        ));
         let store = open(tmp.path());
         store.create_intent(&staged_intent).unwrap();
 

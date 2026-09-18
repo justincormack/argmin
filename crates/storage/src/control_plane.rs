@@ -3422,6 +3422,58 @@ impl ClusterControlSnapshot {
         ))
     }
 
+    #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged ownership.
+    pub(crate) fn committed_unavailable_pg_staged_transfer(
+        &self,
+        work: &UnavailablePgReconciliationWork,
+    ) -> Result<
+        (
+            UnavailablePgStagingIntentAuthorizationRequest,
+            UnavailablePgTransitionInstallRequest,
+        ),
+        ControlPlaneError,
+    > {
+        let pg_id = work.pg_id();
+        let transition_epoch = work.transition_epoch();
+        let transition = self
+            .retained_unavailable_pg_placement_transitions
+            .get(&(pg_id, transition_epoch))
+            .or_else(|| {
+                self.unavailable_pg_placement_transitions
+                    .get(&pg_id)
+                    .filter(|transition| transition.transition_epoch == transition_epoch)
+            })
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} has no exact unavailable transition for staged transfer recovery",
+                    pg_id.get()
+                ),
+            })?;
+        if !work.mutation_binding().matches_transition(transition) {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} staged transfer recovery does not match its unavailable transition",
+                    pg_id.get()
+                ),
+            });
+        }
+        let authorization = unavailable_pg_staging_authorization_request_from_durable(transition)
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+            message: format!(
+                "PG {} staged transfer recovery has no durable staging authorization",
+                pg_id.get()
+            ),
+        })?;
+        let install = unavailable_pg_destination_install_request_from_durable(transition)
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} staged transfer recovery has no durable destination install",
+                    pg_id.get()
+                ),
+            })?;
+        Ok((authorization, install))
+    }
+
     pub(crate) fn validate_completed_unavailable_pg_staging_cleanup(
         &self,
         install: &UnavailablePgTransitionInstallRequest,

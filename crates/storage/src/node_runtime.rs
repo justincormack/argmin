@@ -505,7 +505,8 @@ pub(super) mod pg_store_facade {
     pub(crate) use super::pg_store::PgStore;
     pub(crate) use super::pg_store::{
         canonical_empty_metadata_state_digest, canonical_metadata_transfer_staging_evidence,
-        decode_staging_evidence, decode_staging_evidence_actor_closure_candidate_bytes,
+        decode_staged_metadata_transfer_artifact, decode_staging_evidence,
+        decode_staging_evidence_actor_closure_candidate_bytes,
         decode_staging_evidence_apply_receipt, decode_staging_evidence_page_payload,
         decode_staging_intent, encode_staged_metadata_transfer_artifact,
         encode_staging_evidence_actor_closure_candidate_bytes, encode_staging_intent,
