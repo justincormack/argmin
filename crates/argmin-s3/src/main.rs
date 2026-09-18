@@ -1327,6 +1327,12 @@ fn format_control_plane_runtime_map_diagnostics(
             diagnostics.raft_wal_metrics(),
             diagnostics.raft_command_metrics(),
         ),
+        (
+            diagnostics.unavailable_pg_batch_metrics(),
+            diagnostics.unavailable_pg_worker_stage_metrics(),
+            diagnostics.unavailable_pg_worker_queue_metrics(),
+            diagnostics.metadata_transfer_staging_retention_metrics(),
+        ),
         diagnostics.history_reference_samples(),
     )
 }
@@ -1344,10 +1350,18 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         observability::ControlPlaneRaftWalMetricSnapshot,
         observability::ControlPlaneRaftCommandMetricSnapshot,
     ),
+    reconciliation_metrics: (
+        &[observability::UnavailablePgBatchMetricSample],
+        &[observability::UnavailablePgWorkerStageMetricSample],
+        observability::UnavailablePgWorkerQueueMetricSnapshot,
+        observability::MetadataTransferStagingRetentionMetricSnapshot,
+    ),
     history_reference_samples: &[observability::ControlPlaneHistoryReferenceSample],
 ) -> String {
     let (runtime_map, node_leases) = runtime_map;
     let (snapshot, journal, raft_checkpoint, raft_wal, raft_command) = durability_metrics;
+    let (batch_metrics, worker_stage_metrics, worker_queue_metrics, retention_metrics) =
+        reconciliation_metrics;
     let active_serving_pg_routes = runtime_map
         .pg_routes()
         .iter()
@@ -1540,6 +1554,64 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         raft_command.queue_wait_us_max,
         raft_command.operation_us_total,
         raft_command.operation_us_max,
+    ));
+    for metric in batch_metrics {
+        output.push('\n');
+        output.push_str(&format!(
+            "unavailable_pg_batch stage={} submitted_total={} applied_total={} replayed_total={} rejected_total={} members_total={} members_max={} encoded_bytes_total={} encoded_bytes_max={} encoded_fill_ppm_total={} encoded_fill_ppm_max={} epoch_advance_total={} recovered_pg_total={}",
+            metric.stage.as_str(),
+            metric.submitted_total,
+            metric.applied_total,
+            metric.replayed_total,
+            metric.rejected_total,
+            metric.members_total,
+            metric.members_max,
+            metric.encoded_bytes_total,
+            metric.encoded_bytes_max,
+            metric.encoded_fill_ppm_total,
+            metric.encoded_fill_ppm_max,
+            metric.epoch_advance_total,
+            metric.recovered_pg_total,
+        ));
+    }
+    for metric in worker_stage_metrics {
+        output.push('\n');
+        output.push_str(&format!(
+            "unavailable_pg_worker stage={} total={} succeeded_total={} deferred_total={} fatal_total={} elapsed_us_total={} elapsed_us_max={}",
+            metric.stage.as_str(),
+            metric.total,
+            metric.succeeded_total,
+            metric.deferred_total,
+            metric.fatal_total,
+            metric.elapsed_us_total,
+            metric.elapsed_us_max,
+        ));
+    }
+    output.push('\n');
+    output.push_str(&format!(
+        "unavailable_pg_queue pending_transfer_depth={} in_flight_transfer_depth={} prepared_artifact_depth={} prepared_artifact_bytes={} staged_install_depth={} staged_install_bytes={} ready_activation_depth={} pending_finalization_depth={} deferred_depth={} blocked_depth={}",
+        worker_queue_metrics.pending_transfer_depth,
+        worker_queue_metrics.in_flight_transfer_depth,
+        worker_queue_metrics.prepared_artifact_depth,
+        worker_queue_metrics.prepared_artifact_bytes,
+        worker_queue_metrics.staged_install_depth,
+        worker_queue_metrics.staged_install_bytes,
+        worker_queue_metrics.ready_activation_depth,
+        worker_queue_metrics.pending_finalization_depth,
+        worker_queue_metrics.deferred_depth,
+        worker_queue_metrics.blocked_depth,
+    ));
+    output.push('\n');
+    output.push_str(&format!(
+        "metadata_transfer_staging_retention retained_page_depth={} retained_segment_depth={} retained_anchor_depth={} retained_evidence_depth={} finalized_floor_depth={} active_closure_depth={} retired_closure_depth={} prune_applied_total={}",
+        retention_metrics.retained_page_depth,
+        retention_metrics.retained_segment_depth,
+        retention_metrics.retained_anchor_depth,
+        retention_metrics.retained_evidence_depth,
+        retention_metrics.finalized_floor_depth,
+        retention_metrics.active_closure_depth,
+        retention_metrics.retired_closure_depth,
+        retention_metrics.prune_applied_total,
     ));
     output
 }

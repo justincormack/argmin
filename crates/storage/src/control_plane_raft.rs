@@ -5001,7 +5001,12 @@ impl ControlPlaneRaftAuthority {
             ordinary_update_guard.is_some(),
             evidence_update_guard.is_none()
         );
-        validate_control_plane_command_replication_size_detailed(&command)?;
+        let encoded_len = validate_control_plane_command_replication_size_detailed(&command)?;
+        if let Some(batch_metric) =
+            crate::control_plane_command::unavailable_pg_batch_metric_descriptor(&command)
+        {
+            batch_metric.record_submission_with_encoded_bytes(encoded_len);
+        }
         let retry_deadline = self.writable_proposal_retry_deadline();
         loop {
             let attempt = match evidence_update_guard.as_deref() {
@@ -6641,15 +6646,16 @@ pub fn validate_control_plane_command_replication_size(
     command: &ControlPlaneCommand,
 ) -> Result<(), ControlPlaneCommandReplicationSafetyError> {
     validate_control_plane_command_replication_size_detailed(command)
+        .map(|_| ())
         .map_err(|_| ControlPlaneCommandReplicationSafetyError { _private: () })
 }
 
 fn validate_control_plane_command_replication_size_detailed(
     command: &ControlPlaneCommand,
-) -> Result<(), ControlPlaneError> {
+) -> Result<usize, ControlPlaneError> {
     let encoded_len = control_plane_command_replication_encoded_len(command)?;
     if encoded_len <= CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
-        return Ok(());
+        return Ok(encoded_len);
     }
     Err(ControlPlaneError::rpc_protocol(format!(
             "control-plane command encodes to {encoded_len} OpenRaft entry bytes, exceeding the replication-safe per-entry limit {CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES}"

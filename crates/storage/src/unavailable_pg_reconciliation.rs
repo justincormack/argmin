@@ -61,6 +61,21 @@ impl TransferJob {
             Self::Tombstone(cleanup, _) => cleanup.work(),
         }
     }
+
+    fn metric_stage(&self) -> observability::UnavailablePgWorkerStage {
+        match self {
+            Self::Legacy(_) | Self::Prepare(_) => observability::UnavailablePgWorkerStage::Prepare,
+            Self::ResumeAuthorized(_, _) | Self::Stage(_) | Self::Rebase(_, _) => {
+                observability::UnavailablePgWorkerStage::Stage
+            }
+            Self::ResumeInstalled(_, _) | Self::Import(_) => {
+                observability::UnavailablePgWorkerStage::Import
+            }
+            Self::ResumeCleanup(_, _) | Self::Tombstone(_, _) => {
+                observability::UnavailablePgWorkerStage::Tombstone
+            }
+        }
+    }
 }
 
 enum TransferOutcome {
@@ -157,6 +172,29 @@ fn reconciliation_transfer_error(
     } else {
         ReconciliationTransferError::Retryable(diagnostic)
     }
+}
+
+fn record_authority_stage_result<T>(
+    stage: observability::UnavailablePgWorkerStage,
+    started_at: Instant,
+    result: &Result<T, ControlPlaneError>,
+) {
+    let outcome = match result {
+        Ok(_) => observability::UnavailablePgWorkerStageOutcome::Succeeded,
+        Err(error) if reconciliation_completion_error_is_fatal(error) => {
+            observability::UnavailablePgWorkerStageOutcome::Fatal
+        }
+        Err(_) => observability::UnavailablePgWorkerStageOutcome::Deferred,
+    };
+    record_worker_stage_outcome(stage, started_at, outcome);
+}
+
+fn record_worker_stage_outcome(
+    stage: observability::UnavailablePgWorkerStage,
+    started_at: Instant,
+    outcome: observability::UnavailablePgWorkerStageOutcome,
+) {
+    observability::record_unavailable_pg_worker_stage(stage, outcome, started_at.elapsed());
 }
 
 enum TransferWorkerEvent {
@@ -426,16 +464,39 @@ impl UnavailablePgReconciliationWorker {
                         break;
                     };
                     let work = job.work().clone();
+                    let metric_stage = job.metric_stage();
+                    let started_at = Instant::now();
                     let result = panic::catch_unwind(AssertUnwindSafe(|| executor.execute(job)));
                     let panicked = result.is_err();
                     let event = match result {
                         Ok(result) => {
+                            let outcome = match &result {
+                                Ok(_) => observability::UnavailablePgWorkerStageOutcome::Succeeded,
+                                Err(ReconciliationTransferError::Retryable(_)) => {
+                                    observability::UnavailablePgWorkerStageOutcome::Deferred
+                                }
+                                Err(ReconciliationTransferError::Fatal(_)) => {
+                                    observability::UnavailablePgWorkerStageOutcome::Fatal
+                                }
+                            };
+                            observability::record_unavailable_pg_worker_stage(
+                                metric_stage,
+                                outcome,
+                                started_at.elapsed(),
+                            );
                             TransferWorkerEvent::Completed(Box::new(TransferCompletion {
                                 work,
                                 result,
                             }))
                         }
-                        Err(_) => TransferWorkerEvent::Panicked,
+                        Err(_) => {
+                            record_worker_stage_outcome(
+                                metric_stage,
+                                started_at,
+                                observability::UnavailablePgWorkerStageOutcome::Fatal,
+                            );
+                            TransferWorkerEvent::Panicked
+                        }
                     };
                     if completion_tx.send(event).is_err() || panicked {
                         break;
@@ -444,7 +505,7 @@ impl UnavailablePgReconciliationWorker {
                 .expect("failed to spawn unavailable PG reconciliation worker");
         }
         drop(completion_tx);
-        Self {
+        let worker = Self {
             work_tx,
             completion_rx,
             staged_protocol,
@@ -471,7 +532,9 @@ impl UnavailablePgReconciliationWorker {
             next_install_preparation_rejection: None,
             #[cfg(test)]
             next_finalization_error: None,
-        }
+        };
+        worker.record_queue_metrics();
+        worker
     }
 
     pub fn poll_single_authority(
@@ -493,6 +556,39 @@ impl UnavailablePgReconciliationWorker {
     /// Observe transfer completion and fail-stop worker loss independently of authority role.
     pub fn observe_transfer_workers(&mut self) {
         self.receive_completion();
+        self.record_queue_metrics();
+    }
+
+    fn record_queue_metrics(&self) {
+        let prepared_artifact_bytes = self
+            .prepared_for_authorization
+            .iter()
+            .map(PreparedUnavailablePgMetadataTransfer::artifact_length)
+            .fold(0_u64, u64::saturating_add);
+        let staged_install_bytes = self
+            .staged_for_install
+            .iter()
+            .map(StagedUnavailablePgMetadataTransfer::artifact_length)
+            .fold(0_u64, u64::saturating_add);
+        observability::record_unavailable_pg_worker_queue(
+            observability::UnavailablePgWorkerQueueMetricSnapshot {
+                pending_transfer_depth: u64::try_from(self.pending_transfers.len())
+                    .unwrap_or(u64::MAX),
+                in_flight_transfer_depth: u64::try_from(self.in_flight.len()).unwrap_or(u64::MAX),
+                prepared_artifact_depth: u64::try_from(self.prepared_for_authorization.len())
+                    .unwrap_or(u64::MAX),
+                prepared_artifact_bytes,
+                staged_install_depth: u64::try_from(self.staged_for_install.len())
+                    .unwrap_or(u64::MAX),
+                staged_install_bytes,
+                ready_activation_depth: u64::try_from(self.ready_for_activation.len())
+                    .unwrap_or(u64::MAX),
+                pending_finalization_depth: u64::try_from(self.tombstoned_for_finalization.len())
+                    .unwrap_or(u64::MAX),
+                deferred_depth: u64::try_from(self.deferred.len()).unwrap_or(u64::MAX),
+                blocked_depth: u64::try_from(self.blocked.len()).unwrap_or(u64::MAX),
+            },
+        );
     }
 
     #[cfg(test)]
@@ -794,9 +890,11 @@ impl UnavailablePgReconciliationWorker {
             .iter()
             .map(|owner| owner.work().clone())
             .collect::<Vec<_>>();
-        match authority.complete_reconciliation_batch(&work, now_ms) {
+        let started_at = Instant::now();
+        let result = authority.complete_reconciliation_batch(&work, now_ms);
+        match result {
             Ok(outcome) => {
-                let completed_cleanly = outcome.rejected.is_empty() && outcome.rederive.is_empty();
+                let mut metric_outcome = observability::UnavailablePgWorkerStageOutcome::Succeeded;
                 let mut owners = owners
                     .into_iter()
                     .map(|owner| (owner.work().pg_id(), owner))
@@ -819,8 +917,13 @@ impl UnavailablePgReconciliationWorker {
                 for (work, error) in outcome.rejected {
                     let owner = owners.remove(&work.pg_id());
                     if reconciliation_completion_error_is_fatal(&error) {
+                        metric_outcome = observability::UnavailablePgWorkerStageOutcome::Fatal;
                         self.record_completion_error(&work, error);
                     } else {
+                        if metric_outcome != observability::UnavailablePgWorkerStageOutcome::Fatal {
+                            metric_outcome =
+                                observability::UnavailablePgWorkerStageOutcome::Deferred;
+                        }
                         self.record_diagnostic(error.to_string());
                         if let Some(owner) = owner {
                             match owner {
@@ -830,16 +933,31 @@ impl UnavailablePgReconciliationWorker {
                         }
                     }
                 }
+                if !outcome.rederive.is_empty()
+                    && metric_outcome != observability::UnavailablePgWorkerStageOutcome::Fatal
+                {
+                    metric_outcome = observability::UnavailablePgWorkerStageOutcome::Deferred;
+                }
                 for work in outcome.rederive {
                     owners.remove(&work.pg_id());
                     self.defer(&work);
                 }
+                if !owners.is_empty()
+                    && metric_outcome != observability::UnavailablePgWorkerStageOutcome::Fatal
+                {
+                    metric_outcome = observability::UnavailablePgWorkerStageOutcome::Deferred;
+                }
                 for (_, owner) in owners {
                     self.defer(owner.work());
                 }
-                if completed_cleanly {
+                if metric_outcome == observability::UnavailablePgWorkerStageOutcome::Succeeded {
                     self.clear_diagnostic();
                 }
+                record_worker_stage_outcome(
+                    observability::UnavailablePgWorkerStage::Activation,
+                    started_at,
+                    metric_outcome,
+                );
             }
             Err(error) => {
                 let diagnostic = error.to_string();
@@ -862,6 +980,15 @@ impl UnavailablePgReconciliationWorker {
                 } else {
                     self.record_diagnostic(diagnostic);
                 }
+                record_worker_stage_outcome(
+                    observability::UnavailablePgWorkerStage::Activation,
+                    started_at,
+                    if fatal {
+                        observability::UnavailablePgWorkerStageOutcome::Fatal
+                    } else {
+                        observability::UnavailablePgWorkerStageOutcome::Deferred
+                    },
+                );
             }
         }
     }
@@ -876,6 +1003,7 @@ impl UnavailablePgReconciliationWorker {
             .iter()
             .map(PreparedUnavailablePgMetadataTransfer::authorization_request)
             .collect::<Vec<_>>();
+        let started_at = Instant::now();
         let authorization_result = authority.authorize_staging_batch(&requests);
         #[cfg(test)]
         let authorization_result = if authorization_result.is_ok() {
@@ -885,6 +1013,11 @@ impl UnavailablePgReconciliationWorker {
         } else {
             authorization_result
         };
+        record_authority_stage_result(
+            observability::UnavailablePgWorkerStage::Authorization,
+            started_at,
+            &authorization_result,
+        );
         match authorization_result {
             Ok(snapshot) => {
                 for owner in prepared {
@@ -988,12 +1121,19 @@ impl UnavailablePgReconciliationWorker {
         if let Some(error) = self.next_install_preparation_rejection.take() {
             if !prepared.included.is_empty() {
                 let rejected = prepared.included.remove(0);
-                prepared = snapshot
-                    .prepare_unavailable_pg_placement_install_batch(
-                        &prepared.included,
-                        target_epoch,
-                    )
-                    .expect("test install-preparation remainder must remain valid");
+                let mut existing_rejections = std::mem::take(&mut prepared.rejected);
+                if prepared.included.is_empty() {
+                    prepared.command = None;
+                } else {
+                    prepared = snapshot
+                        .prepare_unavailable_pg_placement_install_batch(
+                            &prepared.included,
+                            target_epoch,
+                        )
+                        .expect("test install-preparation remainder must remain valid");
+                }
+                existing_rejections.append(&mut prepared.rejected);
+                prepared.rejected = existing_rejections;
                 prepared.rejected.push((rejected, error));
             }
         }
@@ -1030,6 +1170,7 @@ impl UnavailablePgReconciliationWorker {
         if prepared.command.is_none() {
             return;
         }
+        let started_at = Instant::now();
         let install_result = authority.install_staged_batch(&prepared.included, target_epoch);
         #[cfg(test)]
         let install_result = if install_result.is_ok() {
@@ -1039,6 +1180,11 @@ impl UnavailablePgReconciliationWorker {
         } else {
             install_result
         };
+        record_authority_stage_result(
+            observability::UnavailablePgWorkerStage::Install,
+            started_at,
+            &install_result,
+        );
         match install_result {
             Ok(_) => {
                 for owner in included {
@@ -1069,6 +1215,7 @@ impl UnavailablePgReconciliationWorker {
         let tombstoned = std::mem::take(&mut self.tombstoned_for_finalization);
         for owner in tombstoned {
             let work = owner.work().clone();
+            let started_at = Instant::now();
             #[cfg(test)]
             let result = if let Some(error) = self.next_finalization_error.take() {
                 Err(error)
@@ -1077,6 +1224,11 @@ impl UnavailablePgReconciliationWorker {
             };
             #[cfg(not(test))]
             let result = authority.finalize_staging_generation(owner.cleanup_request().clone());
+            record_authority_stage_result(
+                observability::UnavailablePgWorkerStage::Finalization,
+                started_at,
+                &result,
+            );
             match result {
                 Ok(_) => {
                     self.clear_work_retry_state(&work);
@@ -1143,7 +1295,9 @@ impl UnavailablePgReconciliationWorker {
         now_ms: u64,
     ) -> Result<(), ControlPlaneError> {
         self.poll_reconciliation(authority, now_ms);
-        self.poll_staging_maintenance(authority)
+        let result = self.poll_staging_maintenance(authority);
+        self.record_queue_metrics();
+        result
     }
 
     fn poll_reconciliation(&mut self, authority: &mut impl ReconciliationAuthority, now_ms: u64) {
@@ -1519,6 +1673,10 @@ mod tests {
     #[test]
     fn transfer_thread_panic_fails_stop_after_dequeue() {
         let expected = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
+        let prepare_before = observability::unavailable_pg_worker_stage_metrics_snapshot()
+            .into_iter()
+            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Prepare)
+            .unwrap();
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
             move |work| {
@@ -1568,6 +1726,17 @@ mod tests {
             BTreeMap::from([(expected.pg_id(), expected)])
         );
         assert!(authority.published.is_empty());
+        let prepare_after = observability::unavailable_pg_worker_stage_metrics_snapshot()
+            .into_iter()
+            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Prepare)
+            .unwrap();
+        assert_eq!(prepare_after.total, prepare_before.total + 1);
+        assert_eq!(prepare_after.fatal_total, prepare_before.fatal_total + 1);
+        assert_eq!(
+            prepare_after.succeeded_total,
+            prepare_before.succeeded_total
+        );
+        assert_eq!(prepare_after.deferred_total, prepare_before.deferred_total);
     }
 
     #[test]
@@ -1845,6 +2014,14 @@ mod tests {
             poll_batch_size: 16,
             ..FakeAuthority::default()
         };
+        let metric = |stage| {
+            observability::unavailable_pg_worker_stage_metrics_snapshot()
+                .into_iter()
+                .find(|sample| sample.stage == stage)
+                .unwrap()
+        };
+        let prepare_before = metric(observability::UnavailablePgWorkerStage::Prepare);
+        let activation_before = metric(observability::UnavailablePgWorkerStage::Activation);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while authority.published_batches.is_empty() {
@@ -1861,6 +2038,18 @@ mod tests {
         assert!(worker.in_flight.is_empty());
         assert!(worker.pending_transfers.is_empty());
         assert!(worker.ready_for_activation.is_empty());
+        let prepare_after = metric(observability::UnavailablePgWorkerStage::Prepare);
+        let activation_after = metric(observability::UnavailablePgWorkerStage::Activation);
+        assert_eq!(prepare_after.total, prepare_before.total + 2);
+        assert_eq!(
+            prepare_after.succeeded_total,
+            prepare_before.succeeded_total + 2
+        );
+        assert_eq!(activation_after.total, activation_before.total + 1);
+        assert_eq!(
+            activation_after.succeeded_total,
+            activation_before.succeeded_total + 1
+        );
     }
 
     #[test]
@@ -1907,6 +2096,12 @@ mod tests {
         assert_eq!(started.len(), TRANSFER_WORKER_COUNT);
         assert_eq!(worker.in_flight.len(), TRANSFER_WORKER_COUNT);
         assert_eq!(worker.pending_transfers.len(), 1);
+        let saturated_queue = observability::unavailable_pg_worker_queue_metrics_snapshot();
+        assert_eq!(
+            saturated_queue.in_flight_transfer_depth,
+            u64::try_from(TRANSFER_WORKER_COUNT).unwrap()
+        );
+        assert_eq!(saturated_queue.pending_transfer_depth, 1);
         assert!(started_rx.try_recv().is_err());
         {
             let state = transfer_gate.state.lock().unwrap();
@@ -1935,6 +2130,9 @@ mod tests {
         assert!(worker.in_flight.is_empty());
         assert!(worker.pending_transfers.is_empty());
         assert!(worker.ready_for_activation.is_empty());
+        let drained_queue = observability::unavailable_pg_worker_queue_metrics_snapshot();
+        assert_eq!(drained_queue.in_flight_transfer_depth, 0);
+        assert_eq!(drained_queue.pending_transfer_depth, 0);
         let state = transfer_gate.state.lock().unwrap();
         assert_eq!((state.0, state.1), (0, TRANSFER_WORKER_COUNT));
     }
@@ -2001,6 +2199,10 @@ mod tests {
     fn rejected_ready_batch_is_classified_per_member() {
         let stale = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
         let ready = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let activation_before = observability::unavailable_pg_worker_stage_metrics_snapshot()
+            .into_iter()
+            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Activation)
+            .unwrap();
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
             |_| panic!("activation-stage work must not invoke metadata transfer"),
             Duration::from_secs(60),
@@ -2031,6 +2233,83 @@ mod tests {
         assert!(worker
             .deferred
             .contains_key(&reconciliation_retry_key(&stale)));
+        let activation_after = observability::unavailable_pg_worker_stage_metrics_snapshot()
+            .into_iter()
+            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Activation)
+            .unwrap();
+        assert_eq!(activation_after.total, activation_before.total + 1);
+        assert_eq!(
+            activation_after.deferred_total,
+            activation_before.deferred_total + 1
+        );
+        assert_eq!(
+            activation_after.succeeded_total,
+            activation_before.succeeded_total
+        );
+        assert_eq!(activation_after.fatal_total, activation_before.fatal_total);
+    }
+
+    #[test]
+    fn activation_metrics_give_fatal_member_precedence_over_deferred_member() {
+        let stale = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let corrupt = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let ready = work(9, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let activation_before = observability::unavailable_pg_worker_stage_metrics_snapshot()
+            .into_iter()
+            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Activation)
+            .unwrap();
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            |_| panic!("activation-stage work must not invoke metadata transfer"),
+            Duration::from_secs(60),
+        );
+        let mut authority = FakeAuthority {
+            candidates: VecDeque::from([stale.clone(), corrupt.clone(), ready.clone()]),
+            poll_batch_size: 16,
+            publish_results: VecDeque::from([Ok(UnavailablePgReconciliationCompletionBatch {
+                completed: vec![ready],
+                rejected: vec![
+                    (
+                        stale.clone(),
+                        ControlPlaneError::CommandDecode {
+                            message: "stale destination lease".to_owned(),
+                        },
+                    ),
+                    (
+                        corrupt.clone(),
+                        ControlPlaneError::durability_failure(
+                            "injected activation durability failure",
+                        ),
+                    ),
+                ],
+                rederive: Vec::new(),
+                snapshot: ClusterControlSnapshot::empty(),
+            })]),
+            ..FakeAuthority::default()
+        };
+
+        worker.poll(&mut authority, 100).unwrap();
+
+        assert!(worker
+            .deferred
+            .contains_key(&reconciliation_retry_key(&stale)));
+        assert!(worker.blocked.contains(&reconciliation_retry_key(&corrupt)));
+        let activation_after = observability::unavailable_pg_worker_stage_metrics_snapshot()
+            .into_iter()
+            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Activation)
+            .unwrap();
+        assert_eq!(activation_after.total, activation_before.total + 1);
+        assert_eq!(
+            activation_after.fatal_total,
+            activation_before.fatal_total + 1
+        );
+        assert_eq!(
+            activation_after.succeeded_total,
+            activation_before.succeeded_total
+        );
+        assert_eq!(
+            activation_after.deferred_total,
+            activation_before.deferred_total
+        );
     }
 
     #[test]

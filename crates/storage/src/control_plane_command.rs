@@ -513,6 +513,87 @@ pub enum ControlPlaneCommand {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct UnavailablePgBatchMetricDescriptor {
+    stage: observability::UnavailablePgBatchStage,
+    members: usize,
+}
+
+impl UnavailablePgBatchMetricDescriptor {
+    pub(crate) fn record_submission(
+        self,
+        command: &ControlPlaneCommand,
+    ) -> Result<(), ControlPlaneError> {
+        let encoded_bytes =
+            crate::control_plane_raft::control_plane_command_replication_encoded_len(command)?;
+        self.record_submission_with_encoded_bytes(encoded_bytes);
+        Ok(())
+    }
+
+    pub(crate) fn record_submission_with_encoded_bytes(self, encoded_bytes: usize) {
+        observability::record_unavailable_pg_batch_submission(
+            self.stage,
+            self.members,
+            encoded_bytes,
+            crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES,
+        );
+    }
+
+    pub(crate) fn record_committed(
+        self,
+        changed: bool,
+        previous_epoch: ClusterEpoch,
+        next_epoch: ClusterEpoch,
+    ) {
+        observability::record_unavailable_pg_batch_committed(
+            self.stage,
+            changed,
+            next_epoch.get().saturating_sub(previous_epoch.get()),
+            self.members,
+        );
+    }
+
+    pub(crate) fn record_rejected(self) {
+        observability::record_unavailable_pg_batch_rejected(self.stage);
+    }
+}
+
+pub(crate) fn unavailable_pg_batch_metric_descriptor(
+    command: &ControlPlaneCommand,
+) -> Option<UnavailablePgBatchMetricDescriptor> {
+    let (stage, members) = match command {
+        ControlPlaneCommand::BeginUnavailablePgPlacementTransitions { transitions, .. } => (
+            observability::UnavailablePgBatchStage::Begin,
+            transitions.len(),
+        ),
+        ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents { authorizations } => (
+            observability::UnavailablePgBatchStage::Authorization,
+            authorizations.len(),
+        ),
+        ControlPlaneCommand::InstallUnavailablePgPlacementTransitions { transitions, .. } => (
+            observability::UnavailablePgBatchStage::Install,
+            transitions.len(),
+        ),
+        ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions { transitions, .. } => (
+            observability::UnavailablePgBatchStage::Activation,
+            transitions.len(),
+        ),
+        _ => return None,
+    };
+    Some(UnavailablePgBatchMetricDescriptor { stage, members })
+}
+
+pub(crate) fn is_metadata_transfer_staging_prune_command(command: &ControlPlaneCommand) -> bool {
+    matches!(
+        command,
+        ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages { .. }
+            | ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment { .. }
+            | ControlPlaneCommand::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors { .. }
+            | ControlPlaneCommand::RetireMetadataTransferStagingActorClosure { .. }
+            | ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { .. }
+    )
+}
+
 impl std::fmt::Display for ControlPlaneCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2527,6 +2608,10 @@ impl ReplicatedControlPlaneStateMachine {
             "attempted to create replicated state machine from invalid control-plane snapshot",
             &snapshot,
         )?;
+        observability::record_metadata_transfer_staging_retention(
+            snapshot.metadata_transfer_staging_retention_metrics(),
+            false,
+        );
         Ok(Self {
             snapshot: Arc::new(snapshot),
             last_applied,
@@ -2576,18 +2661,45 @@ impl ReplicatedControlPlaneStateMachine {
         command: ControlPlaneCommand,
     ) -> Result<CommittedControlPlaneLogCommand, ControlPlaneError> {
         self.validate_next_log_id(log_id)?;
+        let batch_metric = unavailable_pg_batch_metric_descriptor(&command);
+        let staging_prune = is_metadata_transfer_staging_prune_command(&command);
+        let previous_epoch = self.snapshot.cluster_epoch();
         if let Err(error) = validate_committed_command_authority(log_id, &command) {
+            if let Some(batch_metric) = batch_metric {
+                batch_metric.record_rejected();
+            }
             self.last_applied = Some(log_id);
             return Ok(CommittedControlPlaneLogCommand::rejected(log_id, error));
         }
         match self.snapshot.apply_control_plane_command(command) {
             Ok(applied) => {
+                if let Some(batch_metric) = batch_metric {
+                    batch_metric.record_committed(
+                        applied.changed(),
+                        previous_epoch,
+                        applied.snapshot().cluster_epoch(),
+                    );
+                }
+                observability::record_metadata_transfer_staging_retention(
+                    applied
+                        .snapshot()
+                        .metadata_transfer_staging_retention_metrics(),
+                    staging_prune && applied.changed(),
+                );
                 self.last_applied = Some(log_id);
                 self.snapshot = Arc::new(applied.snapshot().clone());
                 Ok(CommittedControlPlaneLogCommand::applied(log_id, applied))
             }
-            Err(error @ ControlPlaneError::SnapshotInvariantViolation { .. }) => Err(error),
+            Err(error @ ControlPlaneError::SnapshotInvariantViolation { .. }) => {
+                if let Some(batch_metric) = batch_metric {
+                    batch_metric.record_rejected();
+                }
+                Err(error)
+            }
             Err(error) => {
+                if let Some(batch_metric) = batch_metric {
+                    batch_metric.record_rejected();
+                }
                 self.last_applied = Some(log_id);
                 Ok(CommittedControlPlaneLogCommand::rejected(log_id, error))
             }
@@ -2623,6 +2735,10 @@ impl ReplicatedControlPlaneStateMachine {
         // (payload, last_applied) pair. This adapter guards only against
         // rollback relative to the current applied position.
         let snapshot = decode_control_plane_snapshot_for_install(artifact.payload())?;
+        observability::record_metadata_transfer_staging_retention(
+            snapshot.metadata_transfer_staging_retention_metrics(),
+            false,
+        );
         self.snapshot = Arc::new(snapshot);
         self.last_applied = artifact.last_applied();
         self.snapshot_last_applied = artifact.last_applied();

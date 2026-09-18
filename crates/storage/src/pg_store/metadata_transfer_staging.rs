@@ -6,6 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -970,6 +972,8 @@ pub(crate) struct MetadataTransferStagingStore {
     temp_sequence: AtomicU64,
     publication_durability_observer: Option<StagingDurabilityObserver>,
     evidence_page_assignment_observer: Option<StagingDurabilityObserver>,
+    #[cfg(test)]
+    fail_next_capacity_metric_refresh: AtomicBool,
 }
 
 impl MetadataTransferStagingStore {
@@ -979,6 +983,18 @@ impl MetadataTransferStagingStore {
         load_staging_row(&state.connection, pg_id, staging_generation)
             .unwrap()
             .is_some()
+    }
+
+    #[cfg(test)]
+    fn fail_next_capacity_metric_refresh_for_test(&self) {
+        self.fail_next_capacity_metric_refresh
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn capacity_metric_refresh_failure_is_pending_for_test(&self) -> bool {
+        self.fail_next_capacity_metric_refresh
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn open(
@@ -1123,9 +1139,15 @@ impl MetadataTransferStagingStore {
             temp_sequence: AtomicU64::new(0),
             publication_durability_observer,
             evidence_page_assignment_observer,
+            #[cfg(test)]
+            fail_next_capacity_metric_refresh: AtomicBool::new(false),
         };
         store.reconcile_startup_inventory()?;
         store.rebind_staging_evidence_actor(identity)?;
+        {
+            let state = store.lock_state()?;
+            record_staging_capacity_metrics(&state.connection)?;
+        }
         Ok(store)
     }
 
@@ -1400,6 +1422,7 @@ impl MetadataTransferStagingStore {
         transaction.commit().map_err(|source| {
             MetadataTransferStagingError::sql("commit staging intent creation", source)
         })?;
+        self.refresh_staging_capacity_metrics_best_effort(&state.connection);
         Ok(MetadataTransferStagingIntentOutcome::Created)
     }
 
@@ -1879,9 +1902,33 @@ impl MetadataTransferStagingStore {
         transaction.commit().map_err(|source| {
             MetadataTransferStagingError::sql("commit staging tombstone", source)
         })?;
+        self.refresh_staging_capacity_metrics_best_effort(&state.connection);
         remove_artifact_if_present(&self.artifact_path(intent))?;
         sync_directory(&self.artifacts_dir, "sync staged artifact removal")?;
         Ok(MetadataTransferStagingReceipt { bytes: receipt })
+    }
+
+    fn refresh_staging_capacity_metrics_best_effort(&self, connection: &Connection) {
+        let refresh_result = {
+            #[cfg(test)]
+            {
+                if self
+                    .fail_next_capacity_metric_refresh
+                    .swap(false, Ordering::Relaxed)
+                {
+                    Err(MetadataTransferStagingError::Invariant(
+                        "injected post-commit staging capacity metric failure".to_owned(),
+                    ))
+                } else {
+                    record_staging_capacity_metrics(connection)
+                }
+            }
+            #[cfg(not(test))]
+            {
+                record_staging_capacity_metrics(connection)
+            }
+        };
+        let _ = refresh_result;
     }
 
     #[cfg(test)]
@@ -3964,6 +4011,14 @@ fn staging_capacity(connection: &Connection) -> Result<(usize, u64), MetadataTra
             MetadataTransferStagingError::Invariant("negative staging byte count".to_owned())
         })?,
     ))
+}
+
+fn record_staging_capacity_metrics(
+    connection: &Connection,
+) -> Result<(), MetadataTransferStagingError> {
+    let (entry_depth, artifact_bytes) = staging_capacity(connection)?;
+    observability::record_metadata_transfer_staging_capacity(entry_depth, artifact_bytes);
+    Ok(())
 }
 
 fn encode_staging_evidence(
@@ -6644,11 +6699,18 @@ mod tests {
         let store = open(tmp.path());
         let artifact = canonical_artifact(b"authorized tombstone");
         let intent = intent(artifact);
+        let capacity_before = observability::metadata_transfer_staging_capacity_metrics_snapshot();
+        assert_eq!(capacity_before.entry_depth, 0);
+        assert_eq!(capacity_before.artifact_bytes, 0);
         let authorization =
             crate::pg_store::committed_staging_authorization_for_intent_for_test(&intent);
         store
             .create_intent_authorized(&authorization, &intent)
             .unwrap();
+        let capacity_after_intent =
+            observability::metadata_transfer_staging_capacity_metrics_snapshot();
+        assert_eq!(capacity_after_intent.entry_depth, 1);
+        assert_eq!(capacity_after_intent.artifact_bytes, intent.artifact_length);
         let publication = store
             .publish_artifact_authorized(&authorization, &intent, artifact)
             .unwrap();
@@ -6656,8 +6718,12 @@ mod tests {
 
         let first = store.tombstone_authorized(&authorization, &intent).unwrap();
         let replay = store.tombstone_authorized(&authorization, &intent).unwrap();
+        let capacity_after_tombstone =
+            observability::metadata_transfer_staging_capacity_metrics_snapshot();
 
         assert_eq!(replay, first);
+        assert_eq!(capacity_after_tombstone.entry_depth, 1);
+        assert_eq!(capacity_after_tombstone.artifact_bytes, 0);
         assert!(!store.artifact_path(&intent).exists());
         let evidence = decode_staging_evidence(first.as_bytes()).unwrap();
         assert_eq!(
@@ -6680,6 +6746,40 @@ mod tests {
             NodeId::new(4),
         )
         .is_err());
+    }
+
+    #[test]
+    fn post_commit_capacity_metric_failure_does_not_change_staging_semantics() {
+        let tmp = test_util::tempdir();
+        let store = open(tmp.path());
+        let artifact = canonical_artifact(b"post-commit metric failure");
+        let intent = intent(artifact);
+        let authorization =
+            crate::pg_store::committed_staging_authorization_for_intent_for_test(&intent);
+
+        store.fail_next_capacity_metric_refresh_for_test();
+        assert_eq!(
+            store
+                .create_intent_authorized(&authorization, &intent)
+                .unwrap(),
+            MetadataTransferStagingIntentOutcome::Created
+        );
+        assert!(!store.capacity_metric_refresh_failure_is_pending_for_test());
+        assert!(store.has_intent_for_test(intent.pg_id(), intent.staging_generation()));
+
+        store
+            .publish_artifact_authorized(&authorization, &intent, artifact)
+            .unwrap();
+        assert!(store.artifact_path(&intent).exists());
+
+        store.fail_next_capacity_metric_refresh_for_test();
+        let receipt = store.tombstone_authorized(&authorization, &intent).unwrap();
+        assert!(!store.capacity_metric_refresh_failure_is_pending_for_test());
+        assert!(!store.artifact_path(&intent).exists());
+        assert_eq!(
+            decode_staging_evidence(receipt.as_bytes()).unwrap().kind(),
+            MetadataTransferStagingEvidenceKind::Tombstone
+        );
     }
 
     #[test]

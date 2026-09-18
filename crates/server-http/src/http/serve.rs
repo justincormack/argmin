@@ -1471,6 +1471,86 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
     for (name, value) in snapshot.iter_named() {
         let _ = writeln!(body, "{name} {value}");
     }
+    for sample in observability::unavailable_pg_batch_metrics_snapshot() {
+        let stage = sample.stage.as_str();
+        for (name, value) in [
+            ("submitted_total", sample.submitted_total),
+            ("applied_total", sample.applied_total),
+            ("replayed_total", sample.replayed_total),
+            ("rejected_total", sample.rejected_total),
+            ("members_total", sample.members_total),
+            ("members_max", sample.members_max),
+            ("encoded_bytes_total", sample.encoded_bytes_total),
+            ("encoded_bytes_max", sample.encoded_bytes_max),
+            ("encoded_fill_ppm_total", sample.encoded_fill_ppm_total),
+            ("encoded_fill_ppm_max", sample.encoded_fill_ppm_max),
+            ("epoch_advance_total", sample.epoch_advance_total),
+            ("recovered_pg_total", sample.recovered_pg_total),
+        ] {
+            let _ = writeln!(
+                body,
+                "unavailable_pg_batch_{name}{{stage=\"{stage}\"}} {value}"
+            );
+        }
+    }
+    for sample in observability::unavailable_pg_worker_stage_metrics_snapshot() {
+        let stage = sample.stage.as_str();
+        for (name, value) in [
+            ("total", sample.total),
+            ("succeeded_total", sample.succeeded_total),
+            ("deferred_total", sample.deferred_total),
+            ("fatal_total", sample.fatal_total),
+            ("elapsed_us_total", sample.elapsed_us_total),
+            ("elapsed_us_max", sample.elapsed_us_max),
+        ] {
+            let _ = writeln!(
+                body,
+                "unavailable_pg_worker_{name}{{stage=\"{stage}\"}} {value}"
+            );
+        }
+    }
+    let queue = observability::unavailable_pg_worker_queue_metrics_snapshot();
+    for (name, value) in [
+        ("pending_transfer_depth", queue.pending_transfer_depth),
+        ("in_flight_transfer_depth", queue.in_flight_transfer_depth),
+        ("prepared_artifact_depth", queue.prepared_artifact_depth),
+        ("prepared_artifact_bytes", queue.prepared_artifact_bytes),
+        ("staged_install_depth", queue.staged_install_depth),
+        ("staged_install_bytes", queue.staged_install_bytes),
+        ("ready_activation_depth", queue.ready_activation_depth),
+        (
+            "pending_finalization_depth",
+            queue.pending_finalization_depth,
+        ),
+        ("deferred_depth", queue.deferred_depth),
+        ("blocked_depth", queue.blocked_depth),
+    ] {
+        let _ = writeln!(body, "unavailable_pg_queue_{name} {value}");
+    }
+    let staging = observability::metadata_transfer_staging_capacity_metrics_snapshot();
+    let _ = writeln!(
+        body,
+        "metadata_transfer_staging_entry_depth {}",
+        staging.entry_depth
+    );
+    let _ = writeln!(
+        body,
+        "metadata_transfer_staging_artifact_bytes {}",
+        staging.artifact_bytes
+    );
+    let retention = observability::metadata_transfer_staging_retention_metrics_snapshot();
+    for (name, value) in [
+        ("retained_page_depth", retention.retained_page_depth),
+        ("retained_segment_depth", retention.retained_segment_depth),
+        ("retained_anchor_depth", retention.retained_anchor_depth),
+        ("retained_evidence_depth", retention.retained_evidence_depth),
+        ("finalized_floor_depth", retention.finalized_floor_depth),
+        ("active_closure_depth", retention.active_closure_depth),
+        ("retired_closure_depth", retention.retired_closure_depth),
+        ("prune_applied_total", retention.prune_applied_total),
+    ] {
+        let _ = writeln!(body, "metadata_transfer_staging_{name} {value}");
+    }
     for sample in observability::metadata_command_conflict_dimension_snapshot() {
         let _ = writeln!(
             body,

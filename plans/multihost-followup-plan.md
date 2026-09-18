@@ -1594,7 +1594,7 @@ plural receipt-bound tag 20 as the only command that can install an unavailable
 transition. The same uncommitted command-v32 grammar now binds each staging
 authorization to its exact prepared artifact target epoch and records terminal
 cleanup as either completed or superseded by one exact direct successor.
-Control-plane RPC v23 removes the corresponding singular runtime-
+Control-plane RPC v23 removed the corresponding singular runtime-
 map install operation and its authenticated operation catalogue entry. State
 v44 persists those target epochs and cleanup dispositions and permits finalized
 cleanup to retain the exact raw page-tip detail when no
@@ -1603,7 +1603,7 @@ replaces the detail with exact page-membership bindings. Immutable command-v31,
 RPC-v22, and state-v43 aggregates remain rejection evidence, including nested
 journal, Raft WAL, peer, restart, snapshot, and storage-RPC containers. The
 current coordinated version vector is staging-store/evidence/page/apply-receipt
-v4, staged-artifact v3, storage RPC v27, control-plane RPC v23, command v32,
+v4, staged-artifact v3, storage RPC v27, control-plane RPC v24, command v32,
 state v44, and authentication envelope v2.
 
 Durable artifact staging uses a separate storage-owned format rather than
@@ -1784,6 +1784,23 @@ and encoded-byte fill ratios; queue, prepared-artifact, and durable-staging
 depth and bytes; per-stage latency and deferrals; receipt retention/pruning;
 and global epochs consumed per recovered PG. These metrics are part of the
 release evidence, not optional diagnostics.
+
+The first observability slice is implemented. Control-plane RPC v24 exposes
+fixed-order begin, authorization, install, and activation batch counters,
+member and replication-entry byte totals/maxima, encoded fill in parts per
+million, epoch advances, and recovered-PG totals. The reconciliation worker
+publishes bounded per-stage success/deferral/fatal latency counters plus exact
+queue, in-flight, prepared-artifact, install, activation, finalization,
+deferred, and blocked gauges. Storage-local metrics expose durable staging
+entry and reserved-artifact byte usage. Authority diagnostics additionally
+expose retained page, segment, anchor, detailed-evidence, finalized-floor,
+active-closure, and retired-closure depth plus state-changing pruning totals;
+those gauges are restored from durable state on authority open or snapshot
+installation. Submission accounting occurs only at
+the standalone/Raft proposal boundary, while apply/replay/reject accounting
+occurs only after durable state-machine classification, so speculative command
+construction cannot inflate release evidence. The four-host outage release
+gate and its quantitative epoch/fill assertions remain the next slice.
 
 The first implementation may use the committed static topology and the existing
 metadata-transfer and payload-backfill primitives. It does not depend on adding

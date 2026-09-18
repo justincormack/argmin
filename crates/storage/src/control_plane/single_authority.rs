@@ -2657,6 +2657,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             &snapshot,
         )?;
         store.checkpoint(previous_snapshot.as_ref(), &snapshot)?;
+        observability::record_metadata_transfer_staging_retention(
+            snapshot.metadata_transfer_staging_retention_metrics(),
+            false,
+        );
         Ok(Self {
             store,
             durable_snapshot: snapshot.clone(),
@@ -2679,18 +2683,71 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         command = self
             .snapshot
             .bind_metadata_transfer_fence_command(&self.durable_snapshot, command)?;
-        let live_applied = self.snapshot.apply_control_plane_command(command.clone())?;
-        let durable_applied = self
+        let batch_metric = unavailable_pg_batch_metric_descriptor(&command);
+        let staging_prune =
+            crate::control_plane_command::is_metadata_transfer_staging_prune_command(&command);
+        if let Some(batch_metric) = batch_metric {
+            batch_metric.record_submission(&command)?;
+        }
+        let previous_epoch = self.durable_snapshot.cluster_epoch();
+        let live_applied = match self.snapshot.apply_control_plane_command(command.clone()) {
+            Ok(applied) => applied,
+            Err(error) => {
+                if let Some(batch_metric) = batch_metric {
+                    batch_metric.record_rejected();
+                }
+                return Err(error);
+            }
+        };
+        let durable_applied = match self
             .durable_snapshot
-            .apply_control_plane_command(command.clone())?;
+            .apply_control_plane_command(command.clone())
+        {
+            Ok(applied) => applied,
+            Err(error) => {
+                if let Some(batch_metric) = batch_metric {
+                    batch_metric.record_rejected();
+                }
+                return Err(error);
+            }
+        };
         if live_applied.changed() != durable_applied.changed() {
+            if let Some(batch_metric) = batch_metric {
+                batch_metric.record_rejected();
+            }
             return Err(ControlPlaneError::SnapshotInvariantViolation {
                 context: "single-authority volatile heartbeat command rebase",
                 message: "command mutation outcome differs between live and durable state"
                     .to_owned(),
             });
         }
-        self.commit_rebased_command(command, live_applied, durable_applied)
+        let changed = durable_applied.changed();
+        let expected_durable_snapshot = durable_applied.snapshot().clone();
+        let result = self.commit_rebased_command(command, live_applied, durable_applied);
+        let committed = result.is_ok() || self.durable_snapshot == expected_durable_snapshot;
+        if committed {
+            if let Some(batch_metric) = batch_metric {
+                batch_metric.record_committed(
+                    changed,
+                    previous_epoch,
+                    self.durable_snapshot.cluster_epoch(),
+                );
+            }
+            observability::record_metadata_transfer_staging_retention(
+                self.durable_snapshot
+                    .metadata_transfer_staging_retention_metrics(),
+                staging_prune && changed,
+            );
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_control_plane_command_for_test(
+        &mut self,
+        command: ControlPlaneCommand,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        self.apply_and_commit_command(command)
     }
 
     fn apply_heartbeat_command(

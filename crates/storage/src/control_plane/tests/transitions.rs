@@ -1021,13 +1021,14 @@ fn adjacent_checkpoint_anchors_coalesce_recursively_and_preserve_chain_tip() {
 
 #[test]
 fn coalesced_checkpoint_anchor_does_not_block_a_successor_checkpoint() {
-    let (_tmp, _store, mut authority) = adjacent_collapsed_staging_checkpoint_authority_fixture();
+    let (_tmp, store, mut authority) = adjacent_collapsed_staging_checkpoint_authority_fixture();
     let first_key = *authority
         .snapshot()
         .metadata_transfer_staging_evidence_checkpoint_anchors
         .keys()
         .next()
         .unwrap();
+    let metrics_before = observability::metadata_transfer_staging_retention_metrics_snapshot();
 
     ControlPlaneAdmin::coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
         &mut authority,
@@ -1037,6 +1038,21 @@ fn coalesced_checkpoint_anchor_does_not_block_a_successor_checkpoint() {
         3,
     )
     .unwrap();
+    let metrics_after_coalesce =
+        observability::metadata_transfer_staging_retention_metrics_snapshot();
+    assert_eq!(
+        metrics_after_coalesce.prune_applied_total,
+        metrics_before.prune_applied_total + 1
+    );
+    assert_eq!(
+        metrics_after_coalesce,
+        observability::MetadataTransferStagingRetentionMetricSnapshot {
+            prune_applied_total: metrics_after_coalesce.prune_applied_total,
+            ..authority
+                .snapshot()
+                .metadata_transfer_staging_retention_metrics()
+        }
+    );
     let checkpointed = ControlPlaneAdmin::checkpoint_metadata_transfer_staging_evidence_pages(
         &mut authority,
         first_key.0,
@@ -1045,6 +1061,19 @@ fn coalesced_checkpoint_anchor_does_not_block_a_successor_checkpoint() {
         4,
     )
     .unwrap();
+    let metrics_after_checkpoint =
+        observability::metadata_transfer_staging_retention_metrics_snapshot();
+    assert_eq!(
+        metrics_after_checkpoint.prune_applied_total,
+        metrics_before.prune_applied_total + 2
+    );
+    assert_eq!(
+        metrics_after_checkpoint,
+        observability::MetadataTransferStagingRetentionMetricSnapshot {
+            prune_applied_total: metrics_after_checkpoint.prune_applied_total,
+            ..checkpointed.metadata_transfer_staging_retention_metrics()
+        }
+    );
 
     assert!(checkpointed
         .metadata_transfer_staging_evidence_checkpoint_anchors
@@ -1056,6 +1085,19 @@ fn coalesced_checkpoint_anchor_does_not_block_a_successor_checkpoint() {
         .metadata_transfer_staging_evidence_pages
         .contains_key(&(first_key.0, first_key.1, 4)));
     checkpointed.validate_current_state_invariants().unwrap();
+    drop(authority);
+    let restarted = SingleAuthorityControlPlane::open(store).unwrap();
+    let metrics_after_restart =
+        observability::metadata_transfer_staging_retention_metrics_snapshot();
+    assert_eq!(
+        metrics_after_restart,
+        observability::MetadataTransferStagingRetentionMetricSnapshot {
+            prune_applied_total: metrics_after_restart.prune_applied_total,
+            ..restarted
+                .snapshot()
+                .metadata_transfer_staging_retention_metrics()
+        }
+    );
 }
 
 #[test]
@@ -5575,10 +5617,39 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         true,
     )
     .into_snapshot();
+    let exact_replay_command = ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
+        transitions: requests.clone(),
+        expected_transition_epoch: target_epoch,
+        begin_at_ms,
+    };
     let mut reconciliation_cursor = UnavailablePgReconciliationCursor::start();
+    let begin_metrics_before = observability::unavailable_pg_batch_metrics_snapshot()
+        .into_iter()
+        .find(|sample| sample.stage == observability::UnavailablePgBatchStage::Begin)
+        .unwrap();
     let begun_work = authority
         .poll_unavailable_pg_reconciliation_batch(&mut reconciliation_cursor, begin_at_ms)
         .unwrap();
+    let begin_metrics_after_apply = observability::unavailable_pg_batch_metrics_snapshot()
+        .into_iter()
+        .find(|sample| sample.stage == observability::UnavailablePgBatchStage::Begin)
+        .unwrap();
+    assert_eq!(
+        begin_metrics_after_apply.submitted_total,
+        begin_metrics_before.submitted_total + 1
+    );
+    assert_eq!(
+        begin_metrics_after_apply.applied_total,
+        begin_metrics_before.applied_total + 1
+    );
+    assert_eq!(
+        begin_metrics_after_apply.members_total,
+        begin_metrics_before.members_total + 2
+    );
+    assert_eq!(
+        begin_metrics_after_apply.epoch_advance_total,
+        begin_metrics_before.epoch_advance_total + 1
+    );
     assert!(begun_work.rejected.is_empty());
     assert_eq!(
         begun_work
@@ -5588,6 +5659,64 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
             .collect::<Vec<_>>(),
         pg_ids
     );
+    let replayed_at_durable_boundary = authority
+        .apply_control_plane_command_for_test(exact_replay_command.clone())
+        .unwrap();
+    assert!(!replayed_at_durable_boundary.changed());
+    let begin_metrics_after_replay = observability::unavailable_pg_batch_metrics_snapshot()
+        .into_iter()
+        .find(|sample| sample.stage == observability::UnavailablePgBatchStage::Begin)
+        .unwrap();
+    assert_eq!(
+        begin_metrics_after_replay.submitted_total,
+        begin_metrics_before.submitted_total + 2
+    );
+    assert_eq!(
+        begin_metrics_after_replay.replayed_total,
+        begin_metrics_before.replayed_total + 1
+    );
+    assert_eq!(
+        begin_metrics_after_replay.members_total,
+        begin_metrics_before.members_total + 4
+    );
+    assert_eq!(
+        begin_metrics_after_replay.epoch_advance_total,
+        begin_metrics_after_apply.epoch_advance_total
+    );
+    let subset_replay = ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
+        transitions: vec![requests[0].clone()],
+        expected_transition_epoch: target_epoch,
+        begin_at_ms,
+    };
+    let rejected_at_durable_boundary = authority
+        .apply_control_plane_command_for_test(subset_replay.clone())
+        .unwrap_err();
+    assert!(
+        rejected_at_durable_boundary
+            .to_string()
+            .contains("does not consume the active transition tip"),
+        "unexpected subset replay error: {rejected_at_durable_boundary}"
+    );
+    let begin_metrics_after_rejection = observability::unavailable_pg_batch_metrics_snapshot()
+        .into_iter()
+        .find(|sample| sample.stage == observability::UnavailablePgBatchStage::Begin)
+        .unwrap();
+    assert_eq!(
+        begin_metrics_after_rejection.submitted_total,
+        begin_metrics_before.submitted_total + 3
+    );
+    assert_eq!(
+        begin_metrics_after_rejection.rejected_total,
+        begin_metrics_before.rejected_total + 1
+    );
+    assert_eq!(
+        begin_metrics_after_rejection.members_total,
+        begin_metrics_before.members_total + 5
+    );
+    assert_eq!(
+        begin_metrics_after_rejection.epoch_advance_total,
+        begin_metrics_after_apply.epoch_advance_total
+    );
     let recorded = authority.snapshot().clone();
     assert_eq!(recorded, expected_recorded);
     recorded.validate_current_state_invariants().unwrap();
@@ -5596,20 +5725,12 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
         recorded
     );
 
-    let exact_replay = ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
-        transitions: requests.clone(),
-        expected_transition_epoch: target_epoch,
-        begin_at_ms,
-    };
-    let replayed = recorded.apply_control_plane_command(exact_replay).unwrap();
+    let replayed = recorded
+        .apply_control_plane_command(exact_replay_command)
+        .unwrap();
     assert!(!replayed.changed());
     assert_eq!(replayed.snapshot(), &recorded);
 
-    let subset_replay = ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
-        transitions: vec![requests[0].clone()],
-        expected_transition_epoch: target_epoch,
-        begin_at_ms,
-    };
     let subset_error = recorded
         .apply_control_plane_command(subset_replay)
         .unwrap_err();

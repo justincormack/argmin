@@ -26,9 +26,10 @@ use crate::control_plane_auth::{
     ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{
-    decode_control_plane_command, encode_control_plane_command, AppliedControlPlaneCommand,
-    ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneCommandStateMachine,
-    ControlPlaneLogId, ExpiredNodeHeartbeatLease, FinalizeMetadataTransferStagingGenerationRequest,
+    decode_control_plane_command, encode_control_plane_command,
+    unavailable_pg_batch_metric_descriptor, AppliedControlPlaneCommand, ControlPlaneCommand,
+    ControlPlaneCommandResponse, ControlPlaneCommandStateMachine, ControlPlaneLogId,
+    ExpiredNodeHeartbeatLease, FinalizeMetadataTransferStagingGenerationRequest,
     MetadataTransferStagingCleanupDisposition, MetadataTransferStagingTombstoneBinding,
     PromotedNodeHeartbeatLease, ReadyPgPeeringCompletion,
     UnavailablePgStagingIntentAuthorizationRequest, UnavailablePgStagingPublicationBinding,
@@ -129,7 +130,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 23;
+const CONTROL_PLANE_RPC_VERSION: u16 = 24;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -2401,6 +2402,32 @@ impl UnavailablePgPlacementTransition {
 }
 
 impl ClusterControlSnapshot {
+    pub(crate) fn metadata_transfer_staging_retention_metrics(
+        &self,
+    ) -> observability::MetadataTransferStagingRetentionMetricSnapshot {
+        let bounded_len = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+        observability::MetadataTransferStagingRetentionMetricSnapshot {
+            retained_page_depth: bounded_len(self.metadata_transfer_staging_evidence_pages.len()),
+            retained_segment_depth: bounded_len(
+                self.metadata_transfer_staging_evidence_checkpoint_segments
+                    .len(),
+            ),
+            retained_anchor_depth: bounded_len(
+                self.metadata_transfer_staging_evidence_checkpoint_anchors
+                    .len(),
+            ),
+            retained_evidence_depth: bounded_len(self.metadata_transfer_staging_evidence.len()),
+            finalized_floor_depth: bounded_len(
+                self.metadata_transfer_staging_finalized_floors.len(),
+            ),
+            active_closure_depth: bounded_len(self.metadata_transfer_staging_actor_closures.len()),
+            retired_closure_depth: bounded_len(
+                self.metadata_transfer_staging_retired_actor_closures.len(),
+            ),
+            prune_applied_total: 0,
+        }
+    }
+
     pub(crate) fn next_cluster_epoch(&self) -> Result<ClusterEpoch, ControlPlaneError> {
         next_epoch(self.cluster_epoch)
     }
@@ -16409,6 +16436,11 @@ pub struct ControlPlaneRuntimeMapDiagnostics {
     raft_checkpoint_metrics: observability::ControlPlaneRaftCheckpointMetricSnapshot,
     raft_wal_metrics: observability::ControlPlaneRaftWalMetricSnapshot,
     raft_command_metrics: observability::ControlPlaneRaftCommandMetricSnapshot,
+    unavailable_pg_batch_metrics: Vec<observability::UnavailablePgBatchMetricSample>,
+    unavailable_pg_worker_stage_metrics: Vec<observability::UnavailablePgWorkerStageMetricSample>,
+    unavailable_pg_worker_queue_metrics: observability::UnavailablePgWorkerQueueMetricSnapshot,
+    metadata_transfer_staging_retention_metrics:
+        observability::MetadataTransferStagingRetentionMetricSnapshot,
     history_reference_samples: Vec<observability::ControlPlaneHistoryReferenceSample>,
     node_leases: Vec<ControlPlaneRuntimeMapNodeLeaseDiagnostic>,
 }
@@ -16513,6 +16545,32 @@ impl ControlPlaneRuntimeMapDiagnostics {
     #[must_use]
     pub fn raft_command_metrics(&self) -> observability::ControlPlaneRaftCommandMetricSnapshot {
         self.raft_command_metrics
+    }
+
+    #[must_use]
+    pub fn unavailable_pg_batch_metrics(&self) -> &[observability::UnavailablePgBatchMetricSample] {
+        &self.unavailable_pg_batch_metrics
+    }
+
+    #[must_use]
+    pub fn unavailable_pg_worker_stage_metrics(
+        &self,
+    ) -> &[observability::UnavailablePgWorkerStageMetricSample] {
+        &self.unavailable_pg_worker_stage_metrics
+    }
+
+    #[must_use]
+    pub fn unavailable_pg_worker_queue_metrics(
+        &self,
+    ) -> observability::UnavailablePgWorkerQueueMetricSnapshot {
+        self.unavailable_pg_worker_queue_metrics
+    }
+
+    #[must_use]
+    pub fn metadata_transfer_staging_retention_metrics(
+        &self,
+    ) -> observability::MetadataTransferStagingRetentionMetricSnapshot {
+        self.metadata_transfer_staging_retention_metrics
     }
 
     #[must_use]

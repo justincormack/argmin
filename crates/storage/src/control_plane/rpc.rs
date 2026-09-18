@@ -8850,6 +8850,13 @@ fn write_control_plane_runtime_map_diagnostics(
         raft_checkpoint_metrics: observability::control_plane_raft_checkpoint_metrics_snapshot(),
         raft_wal_metrics: observability::control_plane_raft_wal_metrics_snapshot(),
         raft_command_metrics: observability::control_plane_raft_command_metrics_snapshot(),
+        unavailable_pg_batch_metrics: observability::unavailable_pg_batch_metrics_snapshot(),
+        unavailable_pg_worker_stage_metrics:
+            observability::unavailable_pg_worker_stage_metrics_snapshot(),
+        unavailable_pg_worker_queue_metrics:
+            observability::unavailable_pg_worker_queue_metrics_snapshot(),
+        metadata_transfer_staging_retention_metrics:
+            observability::metadata_transfer_staging_retention_metrics_snapshot(),
         history_reference_samples: observability::control_plane_history_reference_samples()
             .into_iter()
             .filter(|sample| runtime_node_ids.contains(&sample.node_id))
@@ -8982,6 +8989,70 @@ fn write_control_plane_runtime_map_diagnostics_value(
     write_u64(out, raft_command.queue_wait_us_max);
     write_u64(out, raft_command.operation_us_total);
     write_u64(out, raft_command.operation_us_max);
+    let batch_metrics = diagnostics.unavailable_pg_batch_metrics();
+    if batch_metrics.len() != observability::UnavailablePgBatchStage::ALL.len()
+        || !batch_metrics
+            .iter()
+            .zip(observability::UnavailablePgBatchStage::ALL)
+            .all(|(metric, expected)| metric.stage == expected)
+    {
+        return Err(ControlPlaneError::rpc_protocol(
+            "unavailable-PG batch metrics are not complete and canonical".to_owned(),
+        ));
+    }
+    for metric in batch_metrics {
+        write_u64(out, metric.submitted_total);
+        write_u64(out, metric.applied_total);
+        write_u64(out, metric.replayed_total);
+        write_u64(out, metric.rejected_total);
+        write_u64(out, metric.members_total);
+        write_u64(out, metric.members_max);
+        write_u64(out, metric.encoded_bytes_total);
+        write_u64(out, metric.encoded_bytes_max);
+        write_u64(out, metric.encoded_fill_ppm_total);
+        write_u64(out, metric.encoded_fill_ppm_max);
+        write_u64(out, metric.epoch_advance_total);
+        write_u64(out, metric.recovered_pg_total);
+    }
+    let worker_stage_metrics = diagnostics.unavailable_pg_worker_stage_metrics();
+    if worker_stage_metrics.len() != observability::UnavailablePgWorkerStage::ALL.len()
+        || !worker_stage_metrics
+            .iter()
+            .zip(observability::UnavailablePgWorkerStage::ALL)
+            .all(|(metric, expected)| metric.stage == expected)
+    {
+        return Err(ControlPlaneError::rpc_protocol(
+            "unavailable-PG worker metrics are not complete and canonical".to_owned(),
+        ));
+    }
+    for metric in worker_stage_metrics {
+        write_u64(out, metric.total);
+        write_u64(out, metric.succeeded_total);
+        write_u64(out, metric.deferred_total);
+        write_u64(out, metric.fatal_total);
+        write_u64(out, metric.elapsed_us_total);
+        write_u64(out, metric.elapsed_us_max);
+    }
+    let queue = diagnostics.unavailable_pg_worker_queue_metrics();
+    write_u64(out, queue.pending_transfer_depth);
+    write_u64(out, queue.in_flight_transfer_depth);
+    write_u64(out, queue.prepared_artifact_depth);
+    write_u64(out, queue.prepared_artifact_bytes);
+    write_u64(out, queue.staged_install_depth);
+    write_u64(out, queue.staged_install_bytes);
+    write_u64(out, queue.ready_activation_depth);
+    write_u64(out, queue.pending_finalization_depth);
+    write_u64(out, queue.deferred_depth);
+    write_u64(out, queue.blocked_depth);
+    let retention = diagnostics.metadata_transfer_staging_retention_metrics();
+    write_u64(out, retention.retained_page_depth);
+    write_u64(out, retention.retained_segment_depth);
+    write_u64(out, retention.retained_anchor_depth);
+    write_u64(out, retention.retained_evidence_depth);
+    write_u64(out, retention.finalized_floor_depth);
+    write_u64(out, retention.active_closure_depth);
+    write_u64(out, retention.retired_closure_depth);
+    write_u64(out, retention.prune_applied_total);
     let history_reference_samples = diagnostics.history_reference_samples();
     write_u32(
         out,
@@ -9153,6 +9224,64 @@ fn read_control_plane_runtime_map_diagnostics(
         operation_us_total: reader.read_u64()?,
         operation_us_max: reader.read_u64()?,
     };
+    let unavailable_pg_batch_metrics = observability::UnavailablePgBatchStage::ALL
+        .into_iter()
+        .map(|stage| {
+            Ok(observability::UnavailablePgBatchMetricSample {
+                stage,
+                submitted_total: reader.read_u64()?,
+                applied_total: reader.read_u64()?,
+                replayed_total: reader.read_u64()?,
+                rejected_total: reader.read_u64()?,
+                members_total: reader.read_u64()?,
+                members_max: reader.read_u64()?,
+                encoded_bytes_total: reader.read_u64()?,
+                encoded_bytes_max: reader.read_u64()?,
+                encoded_fill_ppm_total: reader.read_u64()?,
+                encoded_fill_ppm_max: reader.read_u64()?,
+                epoch_advance_total: reader.read_u64()?,
+                recovered_pg_total: reader.read_u64()?,
+            })
+        })
+        .collect::<Result<Vec<_>, ControlPlaneError>>()?;
+    let unavailable_pg_worker_stage_metrics = observability::UnavailablePgWorkerStage::ALL
+        .into_iter()
+        .map(|stage| {
+            Ok(observability::UnavailablePgWorkerStageMetricSample {
+                stage,
+                total: reader.read_u64()?,
+                succeeded_total: reader.read_u64()?,
+                deferred_total: reader.read_u64()?,
+                fatal_total: reader.read_u64()?,
+                elapsed_us_total: reader.read_u64()?,
+                elapsed_us_max: reader.read_u64()?,
+            })
+        })
+        .collect::<Result<Vec<_>, ControlPlaneError>>()?;
+    let unavailable_pg_worker_queue_metrics =
+        observability::UnavailablePgWorkerQueueMetricSnapshot {
+            pending_transfer_depth: reader.read_u64()?,
+            in_flight_transfer_depth: reader.read_u64()?,
+            prepared_artifact_depth: reader.read_u64()?,
+            prepared_artifact_bytes: reader.read_u64()?,
+            staged_install_depth: reader.read_u64()?,
+            staged_install_bytes: reader.read_u64()?,
+            ready_activation_depth: reader.read_u64()?,
+            pending_finalization_depth: reader.read_u64()?,
+            deferred_depth: reader.read_u64()?,
+            blocked_depth: reader.read_u64()?,
+        };
+    let metadata_transfer_staging_retention_metrics =
+        observability::MetadataTransferStagingRetentionMetricSnapshot {
+            retained_page_depth: reader.read_u64()?,
+            retained_segment_depth: reader.read_u64()?,
+            retained_anchor_depth: reader.read_u64()?,
+            retained_evidence_depth: reader.read_u64()?,
+            finalized_floor_depth: reader.read_u64()?,
+            active_closure_depth: reader.read_u64()?,
+            retired_closure_depth: reader.read_u64()?,
+            prune_applied_total: reader.read_u64()?,
+        };
     let history_reference_count =
         reader.read_collection_len("control-plane history reference samples", 31)?;
     if history_reference_count > runtime_map.nodes().len() {
@@ -9271,6 +9400,10 @@ fn read_control_plane_runtime_map_diagnostics(
         raft_checkpoint_metrics,
         raft_wal_metrics,
         raft_command_metrics,
+        unavailable_pg_batch_metrics,
+        unavailable_pg_worker_stage_metrics,
+        unavailable_pg_worker_queue_metrics,
+        metadata_transfer_staging_retention_metrics,
         history_reference_samples,
         node_leases,
     })

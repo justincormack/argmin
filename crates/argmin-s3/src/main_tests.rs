@@ -6610,6 +6610,30 @@ mod tests {
             response_write_timeout_total: 1,
             response_write_other_error_total: 1,
         }];
+        let batch_metrics = [observability::UnavailablePgBatchMetricSample {
+            stage: observability::UnavailablePgBatchStage::Install,
+            submitted_total: 2,
+            applied_total: 1,
+            members_total: 7,
+            encoded_fill_ppm_max: 500_000,
+            epoch_advance_total: 1,
+            ..observability::UnavailablePgBatchMetricSample::default()
+        }];
+        let worker_metrics = [observability::UnavailablePgWorkerStageMetricSample {
+            stage: observability::UnavailablePgWorkerStage::Stage,
+            total: 3,
+            succeeded_total: 2,
+            deferred_total: 1,
+            elapsed_us_total: 40,
+            elapsed_us_max: 30,
+            ..observability::UnavailablePgWorkerStageMetricSample::default()
+        }];
+        let queue_metrics = observability::UnavailablePgWorkerQueueMetricSnapshot {
+            pending_transfer_depth: 4,
+            prepared_artifact_depth: 2,
+            prepared_artifact_bytes: 8_192,
+            ..observability::UnavailablePgWorkerQueueMetricSnapshot::default()
+        };
         let diagnostics = format_control_plane_runtime_map_diagnostics_parts(
             (
                 diagnostic_snapshot.runtime_map(),
@@ -6665,6 +6689,21 @@ mod tests {
                     operation_us_max: 19,
                 },
             ),
+            (
+                &batch_metrics,
+                &worker_metrics,
+                queue_metrics,
+                observability::MetadataTransferStagingRetentionMetricSnapshot {
+                    retained_page_depth: 31,
+                    retained_segment_depth: 32,
+                    retained_anchor_depth: 33,
+                    retained_evidence_depth: 34,
+                    finalized_floor_depth: 35,
+                    active_closure_depth: 36,
+                    retired_closure_depth: 37,
+                    prune_applied_total: 38,
+                },
+            ),
             &[observability::ControlPlaneHistoryReferenceSample {
                 node_id: 2,
                 observed_epoch: floor_epoch.get(),
@@ -6706,6 +6745,30 @@ mod tests {
         assert!(
             diagnostics.contains(
                 "control_plane_raft_command submit_total=15 submit_error_total=1 queue_wait_us_total=16 queue_wait_us_max=17 operation_us_total=18 operation_us_max=19"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "unavailable_pg_batch stage=install submitted_total=2 applied_total=1 replayed_total=0 rejected_total=0 members_total=7 members_max=0 encoded_bytes_total=0 encoded_bytes_max=0 encoded_fill_ppm_total=0 encoded_fill_ppm_max=500000 epoch_advance_total=1 recovered_pg_total=0"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "unavailable_pg_worker stage=stage total=3 succeeded_total=2 deferred_total=1 fatal_total=0 elapsed_us_total=40 elapsed_us_max=30"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "unavailable_pg_queue pending_transfer_depth=4 in_flight_transfer_depth=0 prepared_artifact_depth=2 prepared_artifact_bytes=8192"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "metadata_transfer_staging_retention retained_page_depth=31 retained_segment_depth=32 retained_anchor_depth=33 retained_evidence_depth=34 finalized_floor_depth=35 active_closure_depth=36 retired_closure_depth=37 prune_applied_total=38"
             ),
             "{diagnostics}"
         );

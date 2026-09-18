@@ -401,6 +401,10 @@ impl PreparedUnavailablePgMetadataTransfer {
         &self.work
     }
 
+    pub(crate) fn artifact_length(&self) -> u64 {
+        self.intent.artifact_length()
+    }
+
     pub(crate) fn authorization_request(&self) -> UnavailablePgStagingIntentAuthorizationRequest {
         UnavailablePgStagingIntentAuthorizationRequest {
             unavailable_transition: self.work.mutation_binding().clone(),
@@ -507,6 +511,10 @@ impl AuthorizedUnavailablePgMetadataTransfer {
 impl StagedUnavailablePgMetadataTransfer {
     pub(crate) fn work(&self) -> &UnavailablePgReconciliationWork {
         &self.work
+    }
+
+    pub(crate) fn artifact_length(&self) -> u64 {
+        self.intent.artifact_length()
     }
 
     pub(crate) fn target_epoch(&self) -> ClusterEpoch {
@@ -3845,6 +3853,20 @@ mod tests {
         }
     }
 
+    fn poll_composed_reconciliation_after_publishing_staging(
+        root: &std::path::Path,
+        worker: &mut UnavailablePgReconciliationWorker,
+        authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
+        now_ms: u64,
+    ) {
+        worker.observe_transfer_workers();
+        publish_staging_pages_for_test(root, authority, &[2, 3, 4]);
+        if worker.retained_test_state().0 == 0 {
+            worker.poll_single_authority(authority, now_ms).unwrap();
+        }
+        publish_staging_pages_for_test(root, authority, &[2, 3, 4]);
+    }
+
     const COMPOSED_TRANSFER_TOPOLOGY_DIGEST: &str =
         "89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567";
 
@@ -4701,10 +4723,12 @@ mod tests {
             {
                 {
                     let mut authority = authority.lock().unwrap();
-                    worker
-                        .poll_single_authority(&mut authority, begin_at_ms + 1)
-                        .unwrap();
-                    publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+                    poll_composed_reconciliation_after_publishing_staging(
+                        tmp.path(),
+                        &mut worker,
+                        &mut authority,
+                        begin_at_ms + 1,
+                    );
                     observed_committed_authorization |= pg_ids.iter().all(|pg_id| {
                         let snapshot = authority.snapshot();
                         let transition = snapshot
@@ -4752,13 +4776,16 @@ mod tests {
             let failed_pg = pg_ids[0];
             let successful_pg = pg_ids[1];
             let fairness_deadline = Instant::now() + Duration::from_secs(5);
+            let mut observed_failed_deferral = false;
             loop {
                 let successful_imported = {
                     let mut authority = authority.lock().unwrap();
-                    worker
-                        .poll_single_authority(&mut authority, begin_at_ms + 1)
-                        .unwrap();
-                    publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+                    poll_composed_reconciliation_after_publishing_staging(
+                        tmp.path(),
+                        &mut worker,
+                        &mut authority,
+                        begin_at_ms + 1,
+                    );
                     authority
                         .snapshot()
                         .pg(successful_pg)
@@ -4766,12 +4793,15 @@ mod tests {
                         .peering_metadata_transfer()
                         .is_some()
                 };
-                if worker.pg_is_deferred_for_test(failed_pg) && successful_imported {
+                if worker.pg_is_deferred_for_test(failed_pg) && !observed_failed_deferral {
                     assert!(
                         !worker.foreground_owns_pg_for_test(failed_pg),
                         "rejected install member retained PG {} in a foreground queue",
                         failed_pg.get()
                     );
+                    observed_failed_deferral = true;
+                }
+                if observed_failed_deferral && successful_imported {
                     break;
                 }
                 assert!(
@@ -4790,10 +4820,12 @@ mod tests {
         while imported.len() < 2 {
             {
                 let mut authority = authority.lock().unwrap();
-                worker
-                    .poll_single_authority(&mut authority, begin_at_ms + 1)
-                    .unwrap();
-                publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+                poll_composed_reconciliation_after_publishing_staging(
+                    tmp.path(),
+                    &mut worker,
+                    &mut authority,
+                    begin_at_ms + 1,
+                );
             }
             while let Ok(value) = imported_rx.try_recv() {
                 import_callback_count += 1;
@@ -4933,10 +4965,12 @@ mod tests {
                     }
                 }
                 let activation_now_ms = readiness_at_ms + 100 + readiness_round * 10 + 9;
-                worker
-                    .poll_single_authority(&mut authority, activation_now_ms)
-                    .unwrap();
-                publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+                poll_composed_reconciliation_after_publishing_staging(
+                    tmp.path(),
+                    &mut worker,
+                    &mut authority,
+                    activation_now_ms,
+                );
                 if pg_ids.iter().all(|pg_id| {
                     authority
                         .snapshot()
@@ -4991,11 +5025,12 @@ mod tests {
         loop {
             let finalized = {
                 let mut authority = authority.lock().unwrap();
-                publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
-                worker
-                    .poll_single_authority(&mut authority, readiness_at_ms + 11)
-                    .unwrap();
-                publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+                poll_composed_reconciliation_after_publishing_staging(
+                    tmp.path(),
+                    &mut worker,
+                    &mut authority,
+                    readiness_at_ms + 11,
+                );
                 pg_ids.iter().all(|pg_id| {
                     let work = UnavailablePgReconciliationWork::new(
                         *pg_id,

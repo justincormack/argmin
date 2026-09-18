@@ -341,7 +341,22 @@ fn control_plane_rpc_v22_frame_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v23_frame_encoding_is_exact() {
+fn control_plane_rpc_v23_frame_remains_rejected_evidence() {
+    const FRAME: &[u8] = &[
+        97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97, 110,
+        101, 45, 114, 112, 99, 0, 23, 0, 12, 0, 0, 0, 3, 35, 90, 173, 115, 191, 176, 149, 50, 1, 2,
+        3,
+    ];
+    let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(FRAME)).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str() == "unsupported control-plane RPC version 23"
+    ));
+}
+
+#[test]
+fn control_plane_rpc_v24_frame_encoding_is_exact() {
     let frame =
         encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
             .unwrap();
@@ -350,8 +365,8 @@ fn control_plane_rpc_v23_frame_encoding_is_exact() {
         frame,
         [
             97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
-            110, 101, 45, 114, 112, 99, 0, 23, 0, 12, 0, 0, 0, 3, 35, 90, 173, 115, 191, 176, 149,
-            50, 1, 2, 3,
+            110, 101, 45, 114, 112, 99, 0, 24, 0, 12, 0, 0, 0, 3, 82, 243, 91, 242, 218, 207, 55,
+            131, 1, 2, 3,
         ]
     );
 }
