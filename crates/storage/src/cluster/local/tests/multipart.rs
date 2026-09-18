@@ -3894,6 +3894,120 @@ fn upload_part_stream_create_pending_install_race_reloads_after_abort() {
 }
 
 #[test]
+fn upload_part_stream_create_install_error_preserves_pending_owner_proof() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "upload-part-create-proof-owner-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let owned_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let unowned_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let ambiguous_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let pg_id = PgId::new(2);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::CreateStreamUpload(Box::new(
+            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                crate::CreateStreamUploadReq {
+                    session_id: crate::SessionId::try_from("54".repeat(16)).unwrap(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::UploadPart {
+                        upload_id: upload_id_from_label("proofowner"),
+                        part_number: 1,
+                    },
+                    encryption: crate::ObjectEncryption::None,
+                },
+                456,
+                owned_proof.clone(),
+            ),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    cluster
+        .test_release_upload_part_stream_create_proof_unless_pending_owner(
+            pg_id,
+            &bucket,
+            &owned_proof,
+        )
+        .unwrap();
+    cluster
+        .test_release_upload_part_stream_create_proof_unless_pending_owner(
+            pg_id,
+            &bucket,
+            &unowned_proof,
+        )
+        .unwrap();
+    let object_primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    object_primary
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .fail_next_pending_slot_inspection();
+    let ownership_error = cluster
+        .test_release_upload_part_stream_create_proof_unless_pending_owner(
+            pg_id,
+            &bucket,
+            &ambiguous_proof,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        ownership_error,
+        crate::ObjectPgActionError::Store(_)
+    ));
+
+    let bucket_primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+        .unwrap();
+    let bucket_pg = bucket_primary.storage_node().get_pg(1).unwrap();
+    let reservations =
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket).unwrap();
+    let retained_ids = reservations
+        .iter()
+        .map(|reservation| reservation.reservation_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(retained_ids.len(), 2);
+    assert!(retained_ids.contains(owned_proof.reservation_id.as_str()));
+    assert!(retained_ids.contains(ambiguous_proof.reservation_id.as_str()));
+    assert!(!retained_ids.contains(unowned_proof.reservation_id.as_str()));
+}
+
+#[test]
 fn begin_upload_part_stream_pending_install_race_reruns_action() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

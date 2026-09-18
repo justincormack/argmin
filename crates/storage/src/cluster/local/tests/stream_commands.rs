@@ -1967,6 +1967,137 @@ fn stream_append_commit_retries_awaiting_authorized_recovery() {
 }
 
 #[test]
+fn stream_append_commit_waits_for_relinquished_unrelated_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("77".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"stream append commit transferred recovery";
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+
+    let pg_id = PgId::new(object_pg);
+    let pending = pending_release_command(&cluster, &map, pg_id, &bucket, &key, "78");
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending);
+    let pending_for_hook = pending.clone();
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = Arc::clone(&fail_once);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if command == &pending_for_hook && fail_once_for_hook.swap(false, Ordering::SeqCst) {
+                let id = command.id();
+                return Err(StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                });
+            }
+            Ok(())
+        }));
+
+    thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let commit_cluster = &cluster;
+        let commit_bucket = &bucket;
+        let commit_key = &key;
+        let commit_session_id = &session_id;
+        let commit_segment = &segment;
+        let commit_written_shards = &written_shards;
+        scope.spawn(move || {
+            let shard_batch = commit_written_shards
+                .iter()
+                .map(|written| (&written.key, written.ack))
+                .collect::<Vec<_>>();
+            result_tx
+                .send(commit_cluster.commit_stream_segment_append(
+                    commit_bucket,
+                    commit_key,
+                    commit_session_id,
+                    commit_segment.segment_index,
+                    commit_segment,
+                    &shard_batch,
+                ))
+                .unwrap();
+        });
+
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &pending) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "stream append commit did not relinquish unrelated recovery"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &pending, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream append commit did not resume after authorized recovery")
+            .expect("stream append commit must succeed after unrelated recovery");
+    });
+
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
+            vec![segment.clone()]
+        );
+    }
+}
+
+#[test]
 fn stream_append_yields_after_one_pending_drain_before_budget_recheck() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -3916,7 +4047,350 @@ fn stream_put_waits_for_unrelated_abort_authorized_recovery() {
 }
 
 #[test]
-fn stream_append_maps_unrelated_abort_convergence_to_contention_before_preparation() {
+fn stream_put_create_waits_for_unrelated_abort_authorized_recovery() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let waiter_key = key_for_object_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        &bucket,
+        object_pg,
+        "stream-create-abort-convergence-waiter-",
+    );
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("5c".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let waiter_session_id = crate::SessionId::try_from("5d".repeat(16)).unwrap();
+    let stream_create_bucket_write_reservation = {
+        let pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        crate::PgMetadataStore::get_stream_upload(&*pg, &session_id)
+            .unwrap()
+            .bucket_write_reservation
+    };
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+            bucket: bucket.clone(),
+            key,
+            session_id,
+            staged_segments: Vec::new(),
+            stream_create_bucket_write_reservation,
+        })),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_command = command.clone();
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = Arc::clone(&fail_once);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate == &hook_command && fail_once_for_hook.swap(false, Ordering::SeqCst) {
+                let id = candidate.id();
+                return Err(StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                });
+            }
+            Ok(())
+        }));
+
+    thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let create_cluster = &cluster;
+        let create_bucket = &bucket;
+        let create_key = &waiter_key;
+        let create_session_id = &waiter_session_id;
+        scope.spawn(move || {
+            result_tx
+                .send(create_cluster.create_put_object_stream_session_record(
+                    create_bucket,
+                    create_key,
+                    create_session_id,
+                    crate::ObjectEncryption::None,
+                ))
+                .unwrap();
+        });
+
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "stream create did not relinquish the unrelated abort to authorized recovery"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream create did not resume after authorized abort recovery")
+            .expect("stream create must succeed after unrelated recovery");
+    });
+
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        crate::PgMetadataStore::get_stream_upload(&*pg, &waiter_session_id).unwrap();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StreamCreatePostSnapshotRecoveryRace {
+    CommandId,
+    PendingInstall,
+}
+
+fn assert_stream_create_post_snapshot_race_waits_for_authorized_recovery(
+    race: StreamCreatePostSnapshotRecoveryRace,
+) {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(object_pg);
+    let session_id = crate::SessionId::try_from("6e".repeat(16)).unwrap();
+    let injected = Arc::new(AtomicBool::new(false));
+    let captured_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let command = Arc::new(Mutex::new(None::<MetadataCommandEnvelope>));
+    let inject_action: Arc<dyn Fn() + Send + Sync> = {
+        let cluster = cluster.clone();
+        let map = map.clone();
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let session_id = session_id.clone();
+        let injected = injected.clone();
+        let captured_generation = captured_generation.clone();
+        let command_slot = command.clone();
+        Arc::new(move || {
+            if injected.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let generation = cluster
+                .test_object_generation_reservation_for(&bucket, &key, &session_id)
+                .expect("stream create must reserve a generation before the race hook");
+            captured_generation.store(generation.get(), Ordering::SeqCst);
+            let contender = pending_release_command(&cluster, &map, pg_id, &bucket, &key, "6f");
+            *command_slot.lock().unwrap() = Some(contender.clone());
+            insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &contender);
+        })
+    };
+    let _command_id_hook =
+        matches!(race, StreamCreatePostSnapshotRecoveryRace::CommandId).then(|| {
+            cluster.test_install_before_stream_put_create_command_id_hook(inject_action.clone())
+        });
+    let _pending_install_hook =
+        matches!(race, StreamCreatePostSnapshotRecoveryRace::PendingInstall).then(|| {
+            cluster
+                .test_install_before_stream_put_create_pending_install_hook(inject_action.clone())
+        });
+
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = fail_once.clone();
+    let _apply_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if matches!(
+                candidate.payload(),
+                MetadataCommandPayload::ReleaseObjectGeneration(_)
+            ) && fail_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                let id = candidate.id();
+                return Err(StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                });
+            }
+            Ok(())
+        }));
+
+    thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let create_cluster = &cluster;
+        let create_bucket = &bucket;
+        let create_key = &key;
+        let create_session_id = &session_id;
+        scope.spawn(move || {
+            result_tx
+                .send(create_cluster.create_put_object_stream_session_record(
+                    create_bucket,
+                    create_key,
+                    create_session_id,
+                    crate::ObjectEncryption::None,
+                ))
+                .unwrap();
+        });
+
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        let contender = loop {
+            let contender = command.lock().unwrap().clone();
+            if let Some(contender) = contender {
+                if cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &contender) {
+                    break contender;
+                }
+            }
+            assert!(
+                Instant::now() < handoff_deadline,
+                "post-snapshot stream create contender did not relinquish recovery"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let first_generation = captured_generation.load(Ordering::SeqCst);
+        assert_ne!(first_generation, 0);
+        assert_eq!(
+            cluster
+                .test_object_generation_reservation_for(&bucket, &key, &session_id)
+                .unwrap()
+                .get(),
+            first_generation,
+            "stream create must retain its reservation while non-owningly waiting"
+        );
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &contender, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream create did not resume after post-snapshot recovery")
+            .expect("stream create must retry after post-snapshot recovery");
+    });
+
+    assert!(injected.load(Ordering::SeqCst));
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    let first_generation = captured_generation.load(Ordering::SeqCst);
+    let final_generation = cluster
+        .test_object_generation_reservation_for(&bucket, &key, &session_id)
+        .unwrap();
+    assert_eq!(final_generation.get(), first_generation);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let applied_log_index = primary_pg
+        .metadata_command_replica_state()
+        .unwrap()
+        .applied_log_index;
+    let released_before_retry = primary_pg
+        .retained_metadata_command_log_entries(
+            primary.node_id().as_u32(),
+            ClusterEpoch::INITIAL,
+            MetadataCommandLogIndex::new(1).unwrap(),
+            MetadataCommandLogIndex::new(applied_log_index).unwrap(),
+        )
+        .unwrap()
+        .into_iter()
+        .any(|entry| {
+            matches!(
+                entry.kind,
+                crate::metadata_command::MetadataCommandLogRangeEntryKind::Applied(command)
+                    if matches!(
+                        command.payload(),
+                        MetadataCommandPayload::ReleaseObjectGeneration(release)
+                            if release.matches_request(&bucket, &key, &session_id)
+                    )
+            )
+        });
+    assert!(
+        released_before_retry,
+        "stream create must release the failed attempt's generation before retrying"
+    );
+    drop(primary_pg);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+    }
+}
+
+#[test]
+fn stream_put_create_command_id_race_waits_for_authorized_recovery() {
+    assert_stream_create_post_snapshot_race_waits_for_authorized_recovery(
+        StreamCreatePostSnapshotRecoveryRace::CommandId,
+    );
+}
+
+#[test]
+fn stream_put_create_install_race_waits_for_authorized_recovery() {
+    assert_stream_create_post_snapshot_race_waits_for_authorized_recovery(
+        StreamCreatePostSnapshotRecoveryRace::PendingInstall,
+    );
+}
+
+#[test]
+fn stream_append_waits_for_unrelated_abort_recovery_before_preparation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -3993,9 +4467,11 @@ fn stream_append_maps_unrelated_abort_convergence_to_contention_before_preparati
     let hook_command = command.clone();
     let hook_calls = Arc::new(AtomicUsize::new(0));
     let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = Arc::clone(&fail_once);
     let _hook =
         cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
-            if candidate == &hook_command {
+            if candidate == &hook_command && fail_once_for_hook.swap(false, Ordering::SeqCst) {
                 hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
                 let id = candidate.id();
                 return Err(StoreError::MetadataCommandOutcomeUnconfirmed {
@@ -4008,42 +4484,65 @@ fn stream_append_maps_unrelated_abort_convergence_to_contention_before_preparati
         }));
     let prepared = Arc::new(AtomicBool::new(false));
     let prepared_for_callback = Arc::clone(&prepared);
-    let payload = b"append must not start";
+    let payload = b"append waits for recovery";
 
-    let error = cluster
-        .test_append_stream_segment_with_after_prepare(
-            &bucket,
-            &waiter_key,
-            crate::StreamSegmentAppendInput {
-                session_id: &waiter_session_id,
-                segment_index: 0,
-                payload_crc64: checksum::crc64::checksum(payload),
-                storage_bytes: payload,
-            },
-            move || {
-                prepared_for_callback.store(true, Ordering::SeqCst);
-            },
-        )
-        .expect_err("an unrelated abort awaiting recovery must block append as contention");
+    thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let append_cluster = &cluster;
+        let append_bucket = &bucket;
+        let append_key = &waiter_key;
+        let append_session_id = &waiter_session_id;
+        scope.spawn(move || {
+            result_tx
+                .send(
+                    append_cluster.test_append_stream_segment_with_after_prepare(
+                        append_bucket,
+                        append_key,
+                        crate::StreamSegmentAppendInput {
+                            session_id: append_session_id,
+                            segment_index: 0,
+                            payload_crc64: checksum::crc64::checksum(payload),
+                            storage_bytes: payload,
+                        },
+                        move || {
+                            prepared_for_callback.store(true, Ordering::SeqCst);
+                        },
+                    ),
+                )
+                .unwrap();
+        });
 
-    assert!(
-        matches!(
-            &error,
-            crate::ObjectPgActionError::MetadataCommandRecoveryTransferred
-        ),
-        "unexpected stream append drain error: {error:?}"
-    );
-    assert_eq!(
-        crate::StreamUploadFailure::from_object_pg_action(error).kind(),
-        crate::StreamUploadFailureKind::MetadataCommandContention
-    );
-    assert!(!prepared.load(Ordering::SeqCst));
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "stream append did not relinquish the unrelated abort to authorized recovery"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!prepared.load(Ordering::SeqCst));
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream append did not resume after authorized abort recovery")
+            .expect("stream append must succeed after unrelated recovery");
+    });
+
+    assert!(prepared.load(Ordering::SeqCst));
     assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        pending_metadata_command_for_test(&map, pg_id, &bucket),
-        Some(command.clone())
-    );
-    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
 }
 
 #[test]

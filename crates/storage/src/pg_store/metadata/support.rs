@@ -71,6 +71,12 @@ impl PgStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_pending_slot_inspection(&self) {
+        self.fail_next_pending_slot_inspection
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_next_metadata_command_abandon_before_commit(&self) {
         self.fail_next_metadata_command_abandon_with_fatal_error
             .store(false, Ordering::Relaxed);

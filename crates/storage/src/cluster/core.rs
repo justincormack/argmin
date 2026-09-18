@@ -118,6 +118,10 @@ mod metadata_command_drain_authority {
         ) -> Result<(), StoreError> {
             self.work_budget.sleep_after_contention(context)
         }
+
+        pub(super) fn work_budget(&mut self) -> &mut RequestWorkBudget {
+            self.work_budget
+        }
     }
 
     /// One invocation's compiler-visible authority to drain a pending

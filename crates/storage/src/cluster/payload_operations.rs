@@ -1575,6 +1575,45 @@ impl StorageCluster {
             .map(|_| ())
     }
 
+    fn drain_pending_object_metadata_command_outcome_or_wait_with_work_budget(
+        &self,
+        publisher: impl crate::metadata_command::MetadataCommandPublisher,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        loop {
+            match self.drain_pending_object_metadata_command_with_work_budget(
+                publisher,
+                pg_id,
+                command,
+                work_budget,
+            ) {
+                Ok(outcome) => return Ok(outcome),
+                Err(
+                    ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+                    | ObjectPgActionError::MetadataCommandRecoveryTransferred,
+                ) => match self.wait_for_metadata_command_recovery_resolution_with_work_budget(
+                    pg_id,
+                    command,
+                    work_budget,
+                )? {
+                    MetadataCommandRecoveryWaiterOutcome::Applied => continue,
+                    MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+                    | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
+                        return Ok(PendingMetadataCommandOutcome::Abandoned);
+                    }
+                    MetadataCommandRecoveryWaiterOutcome::StillPending => {
+                        unreachable!(
+                            "non-owning recovery wait must return only after the slot advances"
+                        )
+                    }
+                },
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn drain_pending_object_metadata_command_outcome(
         &self,
         publisher: impl crate::metadata_command::MetadataCommandPublisher,
@@ -3847,6 +3886,144 @@ impl StorageCluster {
             }
         }
         Ok(CollectedPendingObjectMetadataCommands::Drained(applied))
+    }
+
+    fn drain_pending_object_metadata_commands_for_publisher_collect_waiting_for_recovery(
+        &self,
+        publisher: impl crate::metadata_command::MetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<CollectedPendingObjectMetadataCommands, ObjectPgActionError> {
+        let mut applied = Vec::new();
+        while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            let outcome = self
+                .drain_pending_object_metadata_command_outcome_or_wait_with_work_budget(
+                    publisher,
+                    pg_id,
+                    &command,
+                    work_budget,
+                )?;
+            if Self::metadata_command_recovery_applied_collectable_object_command(&command, outcome)
+            {
+                applied.push(command);
+            }
+            if outcome.retains_pending_slot() {
+                return Ok(CollectedPendingObjectMetadataCommands::PendingRecovery(
+                    applied,
+                ));
+            }
+        }
+        Ok(CollectedPendingObjectMetadataCommands::Drained(applied))
+    }
+
+    fn drain_one_pending_object_metadata_command_waiting_for_recovery(
+        &self,
+        publisher: impl crate::metadata_command::MetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
+            return Ok(());
+        };
+        let _ = self.drain_pending_object_metadata_command_outcome_or_wait_with_work_budget(
+            publisher,
+            pg_id,
+            &command,
+            work_budget,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_snapshot_sensitive_stream_create_command_or_wait_for_recovery(
+        &self,
+        publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut RequestWorkBudget,
+        evaluated_attempt: &mut SnapshotSensitiveEvaluatedAttempt<'_>,
+    ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
+        match self.install_snapshot_sensitive_metadata_command_or_drain_with_work_budget(
+            publisher,
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+            work_budget,
+            evaluated_attempt,
+        ) {
+            Err(
+                ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+                | ObjectPgActionError::MetadataCommandRecoveryTransferred,
+            ) => {
+                let Some(contender) =
+                    self.pending_metadata_command_for_bucket(pg_id, bucket)?
+                else {
+                    evaluated_attempt.require_snapshot_reinspection();
+                    return Ok(SnapshotSensitiveInstallOutcome::ReinspectSnapshot);
+                };
+                let contender_is_candidate = contender == *command;
+                match self.wait_for_metadata_command_recovery_resolution_with_work_budget(
+                    pg_id,
+                    &contender,
+                    work_budget,
+                )? {
+                    MetadataCommandRecoveryWaiterOutcome::Applied if contender_is_candidate => {
+                        Ok(SnapshotSensitiveInstallOutcome::Installed)
+                    }
+                    MetadataCommandRecoveryWaiterOutcome::Applied
+                    | MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+                    | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
+                        evaluated_attempt.require_snapshot_reinspection();
+                        Ok(SnapshotSensitiveInstallOutcome::ReinspectSnapshot)
+                    }
+                    MetadataCommandRecoveryWaiterOutcome::StillPending => {
+                        unreachable!(
+                            "non-owning recovery wait must return only after the slot advances"
+                        )
+                    }
+                }
+            }
+            result => result,
+        }
+    }
+
+    fn apply_new_stream_create_command_or_wait_for_recovery(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<ExactPendingObjectMetadataCommandOutcome, ObjectPgActionError> {
+        match self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, command) {
+            Ok(()) => Ok(ExactPendingObjectMetadataCommandOutcome::Applied),
+            Err(
+                ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+                | ObjectPgActionError::MetadataCommandRecoveryTransferred,
+            ) => match self.wait_for_metadata_command_recovery_resolution_with_work_budget(
+                pg_id,
+                command,
+                work_budget,
+            )? {
+                MetadataCommandRecoveryWaiterOutcome::Applied => {
+                    Ok(ExactPendingObjectMetadataCommandOutcome::Applied)
+                }
+                MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+                | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
+                    Ok(ExactPendingObjectMetadataCommandOutcome::Reinspect)
+                }
+                MetadataCommandRecoveryWaiterOutcome::StillPending => {
+                    unreachable!(
+                        "non-owning recovery wait must return only after the slot advances"
+                    )
+                }
+            },
+            Err(error) => Err(error),
+        }
     }
 
     fn drain_pending_object_metadata_commands_for_exact_bucket_with_work_budget(
@@ -6380,9 +6557,17 @@ impl StorageCluster {
                         pg_id, bucket, &proof,
                     ) {
                         Ok(true) => Ok(()),
-                        Ok(false) => self
-                            .release_durable_bucket_write_reservation(reservation)
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error),
+                        Ok(false) => {
+                            let generation_cleanup = self
+                                .release_object_generation_reservation(bucket, key, session_id);
+                            let bucket_cleanup = self
+                                .release_durable_bucket_write_reservation(reservation)
+                                .map_err(bucket_snapshot_error_to_object_pg_action_error);
+                            match (generation_cleanup, bucket_cleanup) {
+                                (Ok(()), Ok(())) => Ok(()),
+                                (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+                            }
+                        }
                         Err(error) => Err(error),
                     }
                 }
@@ -6427,8 +6612,11 @@ impl StorageCluster {
                 .check("put object stream create retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
             let applied_commands = if snapshot_retry_phase.pending_drain_allowed() {
-                self.drain_pending_object_metadata_commands_for_publisher_collect(
-                    publisher, pg_id, bucket,
+                self.drain_pending_object_metadata_commands_for_publisher_collect_waiting_for_recovery(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    work_budget,
                 )?
             } else {
                 CollectedPendingObjectMetadataCommands::empty_drained()
@@ -6461,6 +6649,10 @@ impl StorageCluster {
                 let _ = self.release_object_generation_reservation(bucket, key, session_id);
                 return Err(ObjectPgActionError::Store(error));
             }
+            #[cfg(test)]
+            request_ops::maybe_run_before_stream_put_create_command_id_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+            );
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
                     request: &request,
@@ -6484,8 +6676,17 @@ impl StorageCluster {
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
-                    self.drain_one_pending_object_metadata_command(publisher, pg_id, bucket)?;
-                    self.release_object_generation_reservation(bucket, key, session_id)?;
+                    let drain_result = self
+                        .drain_one_pending_object_metadata_command_waiting_for_recovery(
+                            publisher,
+                            pg_id,
+                            bucket,
+                            work_budget,
+                        );
+                    let cleanup_result =
+                        self.release_object_generation_reservation(bucket, key, session_id);
+                    drain_result?;
+                    cleanup_result?;
                     work_budget
                         .sleep_after_contention(
                             "put object stream create log conflict retry budget exhausted",
@@ -6502,18 +6703,42 @@ impl StorageCluster {
                 let _ = self.release_object_generation_reservation(bucket, key, session_id);
                 return Err(ObjectPgActionError::Store(error));
             }
+            #[cfg(any(test, feature = "test-hooks"))]
+            request_ops::maybe_run_before_stream_put_create_pending_install_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+            );
             self.maybe_run_before_metadata_command_pending_install_hook();
-            match self.install_snapshot_sensitive_metadata_command_or_drain(
+            let install = self
+                .install_snapshot_sensitive_stream_create_command_or_wait_for_recovery(
                 publisher,
                 pg_id,
                 bucket,
                 &command,
                 Some(route.effect_fence),
+                work_budget,
                 &mut evaluated_attempt,
-            )? {
-                SnapshotSensitiveInstallOutcome::Installed => {}
-                SnapshotSensitiveInstallOutcome::ReinspectSnapshot
-                | SnapshotSensitiveInstallOutcome::ContenderDrained => {
+            );
+            match install {
+                Err(error) => {
+                    if matches!(
+                        self.pending_metadata_command_uses_bucket_write_reservation(
+                            pg_id,
+                            bucket,
+                            &bucket_write_reservation,
+                        ),
+                        Ok(false)
+                    ) {
+                        self.release_object_generation_reservation_best_effort(
+                            bucket, key, session_id,
+                        );
+                    }
+                    return Err(error);
+                }
+                Ok(SnapshotSensitiveInstallOutcome::Installed) => {}
+                Ok(
+                    SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | SnapshotSensitiveInstallOutcome::ContenderDrained,
+                ) => {
                     self.release_object_generation_reservation(bucket, key, session_id)?;
                     work_budget
                         .sleep_after_contention(
@@ -6523,18 +6748,40 @@ impl StorageCluster {
                     continue;
                 }
             }
-            if let Err(error) =
-                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
-            {
-                if self
-                    .pending_metadata_command_for_bucket(pg_id, bucket)?
-                    .is_none()
-                {
-                    let _ = self.release_object_generation_reservation(bucket, key, session_id);
+            match self.apply_new_stream_create_command_or_wait_for_recovery(
+                pg_id,
+                bucket,
+                &command,
+                work_budget,
+            ) {
+                Ok(ExactPendingObjectMetadataCommandOutcome::Applied) => {
+                    return Ok(BucketWriteReservationDisposition::TransferredToCommand);
                 }
-                return Err(error);
+                Ok(ExactPendingObjectMetadataCommandOutcome::Reinspect) => {
+                    self.release_object_generation_reservation(bucket, key, session_id)?;
+                    work_budget
+                        .sleep_after_contention(
+                            "put object stream create recovery retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
+                Err(error) => {
+                    if matches!(
+                        self.pending_metadata_command_uses_bucket_write_reservation(
+                            pg_id,
+                            bucket,
+                            &bucket_write_reservation,
+                        ),
+                        Ok(false)
+                    ) {
+                        self.release_object_generation_reservation_best_effort(
+                            bucket, key, session_id,
+                        );
+                    }
+                    return Err(error);
+                }
             }
-            return Ok(BucketWriteReservationDisposition::TransferredToCommand);
         }
     }
 
@@ -6732,6 +6979,14 @@ impl StorageCluster {
                     Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery) => {
                         recovery_authority.sleep_after_contention(
                             "stream append preparation pending recovery retry budget exhausted",
+                        )?;
+                        continue;
+                    }
+                    Err(ObjectPgActionError::MetadataCommandRecoveryTransferred) => {
+                        self.wait_for_transferred_metadata_command_with_work_budget(
+                            pg_id,
+                            &command,
+                            recovery_authority.work_budget(),
                         )?;
                         continue;
                     }
@@ -7068,6 +7323,17 @@ impl StorageCluster {
                         }
                         continue;
                     }
+                    Err(ObjectPgActionError::MetadataCommandRecoveryTransferred) => {
+                        if let Err(error) = self.wait_for_transferred_metadata_command_with_work_budget(
+                            pg_id,
+                            &command,
+                            &mut work_budget,
+                        ) {
+                            cleanup_stream_append_payload!();
+                            return Err(error);
+                        }
+                        continue;
+                    }
                     Err(error) => {
                         cleanup_stream_append_payload!();
                         return Err(error);
@@ -7228,6 +7494,20 @@ impl StorageCluster {
                         ) {
                             cleanup_stream_append_payload!();
                             return Err(ObjectPgActionError::Store(error));
+                        }
+                        continue;
+                    }
+                    if matches!(
+                        error,
+                        ObjectPgActionError::MetadataCommandRecoveryTransferred
+                    ) {
+                        if let Err(error) = self.wait_for_transferred_metadata_command_with_work_budget(
+                            pg_id,
+                            &command,
+                            &mut work_budget,
+                        ) {
+                            cleanup_stream_append_payload!();
+                            return Err(error);
                         }
                         continue;
                     }

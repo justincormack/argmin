@@ -16,6 +16,31 @@ fn inconclusive_multipart_apply_failure_requires_uncertainty(
 }
 
 impl super::StorageCluster {
+    fn release_upload_part_stream_create_proof_unless_pending_owner(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError> {
+        match self.pending_metadata_command_uses_bucket_write_reservation(pg_id, bucket, proof) {
+            Ok(true) => Ok(()),
+            Ok(false) => self
+                .release_bucket_write_reservation_proof(proof)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_release_upload_part_stream_create_proof_unless_pending_owner(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError> {
+        self.release_upload_part_stream_create_proof_unless_pending_owner(pg_id, bucket, proof)
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_put_object_stream_session<T, E>(
         &self,
@@ -123,11 +148,23 @@ impl super::StorageCluster {
         } = route;
         let pg_id = object_pg_id.pg_id();
         let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
+        let mut work_budget = super::RequestWorkBudget::new(
+            super::PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET,
+            None,
+        )
+        .for_operation("create_put_object_stream_session")
+        .for_pg(pg_id);
         loop {
             require_valid_route()?;
+            work_budget
+                .check("PutObject stream create retry budget exhausted")
+                .map_err(BucketSnapshotLoadError::Store)?;
             let applied_commands = if snapshot_retry_phase.pending_drain_allowed() {
-                self.drain_pending_object_metadata_commands_for_publisher_collect(
-                    publisher, pg_id, bucket,
+                self.drain_pending_object_metadata_commands_for_publisher_collect_waiting_for_recovery(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    &mut work_budget,
                 )
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
             } else {
@@ -256,18 +293,26 @@ impl super::StorageCluster {
                     Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                         ..
                     })) => {
-                        let cleanup = self
-                            .drain_one_pending_object_metadata_command(publisher, pg_id, bucket)
-                            .and_then(|_| {
-                                self.release_object_generation_reservation(
-                                    bucket,
-                                    key,
-                                    &create.session_id,
-                                )
-                            });
-                        if let Err(cleanup_error) = cleanup {
+                        let drain_result = self
+                            .drain_one_pending_object_metadata_command_waiting_for_recovery(
+                                publisher,
+                                pg_id,
+                                bucket,
+                                &mut work_budget,
+                            );
+                        let cleanup_result = self.release_object_generation_reservation(
+                            bucket,
+                            key,
+                            &create.session_id,
+                        );
+                        if let Err(cleanup_error) = cleanup_result {
                             return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                                 cleanup_error,
+                            ));
+                        }
+                        if let Err(drain_error) = drain_result {
+                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                drain_error,
                             ));
                         }
                         return Ok(Ok(Attempt::Retry));
@@ -293,21 +338,39 @@ impl super::StorageCluster {
                     return Err(error.into());
                 }
                 self.maybe_run_before_metadata_command_pending_install_hook();
-                let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
-                    publisher,
-                    pg_id,
-                    bucket,
-                    &command,
-                    Some(effect_fence),
-                    &mut evaluated_attempt,
-                ) {
+                let install = match self
+                    .install_snapshot_sensitive_stream_create_command_or_wait_for_recovery(
+                        publisher,
+                        pg_id,
+                        bucket,
+                        &command,
+                        Some(effect_fence),
+                        &mut work_budget,
+                        &mut evaluated_attempt,
+                    )
+                {
                     Ok(install) => install,
                     Err(error) => {
-                        let _ = self.release_object_generation_reservation(
-                            bucket,
-                            key,
-                            &create.session_id,
-                        );
+                        match self.pending_metadata_command_uses_bucket_write_reservation(
+                            pg_id, bucket, &proof,
+                        ) {
+                            Ok(true) => {
+                                disposition = super::BucketWriteReservationDisposition::TransferredToCommand;
+                            }
+                            Ok(false) => {
+                                let _ = self.release_object_generation_reservation(
+                                    bucket,
+                                    key,
+                                    &create.session_id,
+                                );
+                            }
+                            Err(lookup_error) => {
+                                disposition = super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure;
+                                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                    lookup_error,
+                                ));
+                            }
+                        }
                         return Err(super::object_pg_action_error_to_bucket_snapshot_error(
                             error,
                         ));
@@ -329,33 +392,50 @@ impl super::StorageCluster {
                         return Ok(Ok(Attempt::Retry));
                     }
                 }
-                if let Err(error) =
-                    self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
-                {
-                    match self.pending_metadata_command_uses_bucket_write_reservation(
-                        pg_id, bucket, &proof,
-                    ) {
-                        Ok(true) => {
-                            disposition =
-                                super::BucketWriteReservationDisposition::TransferredToCommand;
-                        }
-                        Ok(false) => {
-                            let _ = self.release_object_generation_reservation(
-                                bucket,
-                                key,
-                                &create.session_id,
-                            );
-                        }
-                        Err(lookup_error) => {
-                            disposition = super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure;
+                match self.apply_new_stream_create_command_or_wait_for_recovery(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                ) {
+                    Ok(super::ExactPendingObjectMetadataCommandOutcome::Applied) => {}
+                    Ok(super::ExactPendingObjectMetadataCommandOutcome::Reinspect) => {
+                        if let Err(cleanup_error) = self.release_object_generation_reservation(
+                            bucket,
+                            key,
+                            &create.session_id,
+                        ) {
                             return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                lookup_error,
+                                cleanup_error,
                             ));
                         }
+                        return Ok(Ok(Attempt::Retry));
                     }
-                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                        error,
-                    ));
+                    Err(error) => {
+                        match self.pending_metadata_command_uses_bucket_write_reservation(
+                            pg_id, bucket, &proof,
+                        ) {
+                            Ok(true) => {
+                                disposition = super::BucketWriteReservationDisposition::TransferredToCommand;
+                            }
+                            Ok(false) => {
+                                let _ = self.release_object_generation_reservation(
+                                    bucket,
+                                    key,
+                                    &create.session_id,
+                                );
+                            }
+                            Err(lookup_error) => {
+                                disposition = super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure;
+                                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                    lookup_error,
+                                ));
+                            }
+                        }
+                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                            error,
+                        ));
+                    }
                 }
 
                 disposition = super::BucketWriteReservationDisposition::TransferredToCommand;
@@ -373,7 +453,14 @@ impl super::StorageCluster {
             let attempt = Self::finish_bucket_write_snapshot_operation(result, release_result)?;
             match attempt {
                 Ok(Attempt::Complete(value)) => return Ok(Ok(value)),
-                Ok(Attempt::Retry) => continue,
+                Ok(Attempt::Retry) => {
+                    work_budget
+                        .sleep_after_contention(
+                            "PutObject stream create contention retry budget exhausted",
+                        )
+                        .map_err(BucketSnapshotLoadError::Store)?;
+                    continue;
+                }
                 Err(error) => return Ok(Err(error)),
             }
         }
@@ -1538,8 +1625,17 @@ impl super::StorageCluster {
             key,
         )?;
         let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
+        let mut work_budget = super::RequestWorkBudget::new(
+            super::PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET,
+            None,
+        )
+        .for_operation("create_upload_part_stream_session")
+        .for_pg(pg_id);
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
+            work_budget
+                .check("UploadPart stream create retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
                 bucket,
                 UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
@@ -1570,9 +1666,14 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             let applied_commands = if snapshot_retry_phase.pending_drain_allowed() {
-                match self.drain_pending_object_metadata_commands_for_publisher_collect(
-                    publisher, pg_id, bucket,
-                ) {
+                match self
+                    .drain_pending_object_metadata_commands_for_publisher_collect_waiting_for_recovery(
+                        publisher,
+                        pg_id,
+                        bucket,
+                        &mut work_budget,
+                    )
+                {
                     Ok(applied_commands) => applied_commands,
                     Err(error) => {
                         release_caller_bucket_write_proof!()?;
@@ -1655,13 +1756,23 @@ impl super::StorageCluster {
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..
                 })) => {
-                    if let Err(error) =
-                        self.drain_one_pending_object_metadata_command(publisher, pg_id, bucket)
+                    if let Err(error) = self
+                        .drain_one_pending_object_metadata_command_waiting_for_recovery(
+                            publisher,
+                            pg_id,
+                            bucket,
+                            &mut work_budget,
+                        )
                     {
                         release_caller_bucket_write_proof!()?;
                         return Err(error);
                     }
                     release_caller_bucket_write_proof!()?;
+                    work_budget
+                        .sleep_after_contention(
+                            "UploadPart stream create log conflict retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
                 Err(error) => {
@@ -1673,29 +1784,57 @@ impl super::StorageCluster {
                 release_caller_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
-            match self.install_snapshot_sensitive_metadata_command_or_drain(
-                publisher,
-                pg_id,
-                bucket,
-                &command,
-                Some(effect_fence),
-                &mut evaluated_attempt,
-            ) {
+            match self
+                .install_snapshot_sensitive_stream_create_command_or_wait_for_recovery(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    &command,
+                    Some(effect_fence),
+                    &mut work_budget,
+                    &mut evaluated_attempt,
+                )
+            {
                 Ok(super::SnapshotSensitiveInstallOutcome::Installed) => {}
                 Ok(
                     super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
                     | super::SnapshotSensitiveInstallOutcome::ContenderDrained,
                 ) => {
                     release_caller_bucket_write_proof!()?;
+                    work_budget
+                        .sleep_after_contention(
+                            "UploadPart stream create pending install retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
                 Err(error) => {
-                    release_caller_bucket_write_proof!()?;
+                    self.release_upload_part_stream_create_proof_unless_pending_owner(
+                        pg_id,
+                        bucket,
+                        &bucket_write_reservation,
+                    )?;
                     return Err(error);
                 }
             }
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-            return Ok(session_id.clone());
+            match self.apply_new_stream_create_command_or_wait_for_recovery(
+                pg_id,
+                bucket,
+                &command,
+                &mut work_budget,
+            )? {
+                super::ExactPendingObjectMetadataCommandOutcome::Applied => {
+                    return Ok(session_id.clone());
+                }
+                super::ExactPendingObjectMetadataCommandOutcome::Reinspect => {
+                    release_caller_bucket_write_proof!()?;
+                    work_budget
+                        .sleep_after_contention(
+                            "UploadPart stream create recovery retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                }
+            }
         }
     }
 

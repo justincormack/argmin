@@ -1989,7 +1989,7 @@ fn maybe_run_before_abort_multipart_pending_install_hook(_scope_id: usize) {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-fn maybe_run_before_stream_put_create_pending_install_hook(_scope_id: usize) {
+pub(super) fn maybe_run_before_stream_put_create_pending_install_hook(_scope_id: usize) {
     let hook = BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -2002,7 +2002,7 @@ fn maybe_run_before_stream_put_create_pending_install_hook(_scope_id: usize) {
 }
 
 #[cfg(test)]
-fn maybe_run_before_stream_put_create_command_id_hook(_scope_id: usize) {
+pub(super) fn maybe_run_before_stream_put_create_command_id_hook(_scope_id: usize) {
     let hook = BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
