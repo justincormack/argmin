@@ -144,3 +144,5 @@ account-level S3 Block Public Access settings, the separate HTTP-only
 `s3-http-tests` crate, the local-only `s3-local-tests` crate, and local
 deep-tracing instructions are documented in
 [`guides/testing.md`](guides/testing.md).
+
+For contributing changes, see [CONTRIBUTING.md](CONTRIBUTING.md).
