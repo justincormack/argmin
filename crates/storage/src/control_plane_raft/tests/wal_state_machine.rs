@@ -138,9 +138,34 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
         ),
         (
             714,
+            "f25368e2e0d9d98ed23a71ef1afa74b4773c22ee0288c8f93e7726955a45e0c3".to_owned()
+        )
+    );
+}
+
+#[test]
+fn historical_command_v31_wal_v2_file_remains_rejected_evidence() {
+    const BYTES: &[u8] =
+        include_bytes!("../../control_plane/testdata/raft_wal_v2_command_v31.bin");
+    assert_eq!(
+        (BYTES.len(), raft_test_hex(&checksum::sha256::digest(BYTES))),
+        (
+            714,
             "a3dac3cff01f9104cabc3f6076477f4fc300ff67d62aa6c6bc747a347e05f2ea".to_owned()
         )
     );
+    let tmp = test_util::tempdir();
+    let wal_path = tmp.path().join("raft.wal");
+    fs::write(&wal_path, BYTES).unwrap();
+    let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+    let error = wal.read_records_from(0).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported control-plane command version 31"),
+        "unexpected historical WAL rejection: {error:?}"
+    );
+    assert_eq!(fs::read(&wal_path).unwrap(), BYTES);
 }
 
 #[test]
@@ -313,7 +338,7 @@ fn control_plane_raft_wal_v2_rejects_noncurrent_nested_command_versions() {
         .filter_map(|(offset, candidate)| (candidate == current.as_slice()).then_some(offset))
         .collect::<Vec<_>>();
     assert_eq!(offsets.len(), 1);
-    for version in [16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32] {
+    for version in [16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33] {
         let previous =
             crate::control_plane_command::encode_control_plane_command_with_version_for_test(
                 &command, version,
@@ -770,6 +795,30 @@ fn historical_state_v37_restart_compaction_artifact_remains_rejected_evidence() 
 
 #[test]
 fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
+    const HISTORICAL_STATE_V43_CHECKPOINT: &[u8] = include_bytes!(
+        "../../control_plane/testdata/raft_restart_v5_checkpoint_state_v43.bin"
+    );
+    assert_eq!(
+        (
+            HISTORICAL_STATE_V43_CHECKPOINT.len(),
+            raft_test_hex(&checksum::sha256::digest(HISTORICAL_STATE_V43_CHECKPOINT))
+        ),
+        (
+            236,
+            "8ccaea1b423cdeb0876b048301d15e985af7f6aaf5ff9d55cfd106161cd9e37b".to_owned()
+        )
+    );
+    let historical_error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(
+        HISTORICAL_STATE_V43_CHECKPOINT,
+    )
+    .unwrap_err();
+    assert!(
+        historical_error
+            .to_string()
+            .contains("unsupported control-plane state version 43"),
+        "unexpected historical checkpoint rejection: {historical_error:?}"
+    );
+
     const HISTORICAL_STATE_V42_CHECKPOINT: &[u8] = include_bytes!(
         "../../control_plane/testdata/raft_restart_v5_checkpoint_state_v42.bin"
     );
@@ -848,7 +897,7 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         (
             75,
             236,
-            "8ccaea1b423cdeb0876b048301d15e985af7f6aaf5ff9d55cfd106161cd9e37b".to_owned(),
+            "38f43556cab372746c64f40df4b0aeeda45e38ca75dfdc79629eefe78a49318e".to_owned(),
             112,
             "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62".to_owned()
         )

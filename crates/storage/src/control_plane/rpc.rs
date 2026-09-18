@@ -2501,41 +2501,6 @@ impl UnixControlPlaneClient {
         }
     }
 
-    pub(crate) fn install_unavailable_pg_transition_runtime_map_checked(
-        &self,
-        binding: &UnavailablePgTransitionMutationBinding,
-        transfer: PgMetadataTransferProof,
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let mut payload = Vec::new();
-        write_unavailable_pg_transition_mutation_binding(&mut payload, binding)?;
-        write_rpc_pg_metadata_transfer_proof(&mut payload, transfer);
-        write_u64(&mut payload, expected_destination_epoch.get());
-        let kind = ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap;
-        let payload =
-            self.send_mutating_request_with_read_timeout(kind, &payload, CONTROL_PLANE_RPC_IO_TIMEOUT)?;
-        decode_admin_mutation_success(kind, || {
-            let mut reader = PayloadReader::new(&payload);
-            let runtime_map = read_runtime_map_snapshot(&mut reader)?;
-            reader.finish()?;
-            if !metadata_transfer_install_applied(
-                &runtime_map,
-                binding.pg_id(),
-                binding.destination_acting_set(),
-                transfer,
-                expected_destination_epoch,
-            ) {
-                return Err(ControlPlaneError::RpcUnconfirmed {
-                    message: format!(
-                        "unavailable transition metadata-transfer install for PG {} returned without the expected exact route/proof",
-                        binding.pg_id().get()
-                    ),
-                });
-            }
-            Ok(runtime_map)
-        })
-    }
-
     pub fn transfer_raft_leadership_to(&self, node_id: u64) -> Result<(), ControlPlaneError> {
         let mut payload = Vec::new();
         write_u64(&mut payload, node_id);
@@ -3510,46 +3475,6 @@ impl AuthenticatedUnixControlPlaneClient {
                 ),
             Err(error) => Err(error),
         }
-    }
-
-    pub(crate) fn install_unavailable_pg_transition_runtime_map_checked(
-        &self,
-        binding: &UnavailablePgTransitionMutationBinding,
-        transfer: PgMetadataTransferProof,
-        expected_destination_epoch: ClusterEpoch,
-        authority_now_ms: u64,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let mut payload = Vec::new();
-        write_unavailable_pg_transition_mutation_binding(&mut payload, binding)?;
-        write_rpc_pg_metadata_transfer_proof(&mut payload, transfer);
-        write_u64(&mut payload, expected_destination_epoch.get());
-        let kind = ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap;
-        let payload = self.send_admin_request_with_read_timeout(
-            kind,
-            authority_now_ms,
-            payload,
-            CONTROL_PLANE_RPC_IO_TIMEOUT,
-        )?;
-        decode_authenticated_admin_mutation_success(kind, || {
-            let mut reader = PayloadReader::new(&payload);
-            let runtime_map = read_runtime_map_snapshot(&mut reader)?;
-            reader.finish()?;
-            if !metadata_transfer_install_applied(
-                &runtime_map,
-                binding.pg_id(),
-                binding.destination_acting_set(),
-                transfer,
-                expected_destination_epoch,
-            ) {
-                return Err(ControlPlaneError::RpcUnconfirmed {
-                    message: format!(
-                        "unavailable transition metadata-transfer install for PG {} returned without the expected exact route/proof",
-                        binding.pg_id().get()
-                    ),
-                });
-            }
-            Ok(runtime_map)
-        })
     }
 
     pub(crate) fn set_pg_acting_set_with_metadata_transfer_checked(
@@ -6265,33 +6190,6 @@ where
                 Err(error) => Err(error),
             }
         }
-        ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap => {
-            let mut reader = PayloadReader::new(&payload);
-            let binding = read_unavailable_pg_transition_mutation_binding(&mut reader)?;
-            let transfer = read_rpc_pg_metadata_transfer_proof(&mut reader)?;
-            let expected_destination_epoch =
-                read_cluster_epoch(&mut reader, "metadata transfer destination epoch")?;
-            reader.finish()?;
-            match control_plane
-                .install_unavailable_pg_transition_metadata_transfer(
-                    binding.clone(),
-                    transfer,
-                    expected_destination_epoch,
-                )
-                .and_then(|snapshot| {
-                    snapshot.reconstructed_runtime_map_for_pg_with_fallback_validity(
-                        binding.pg_id(),
-                        non_serving_runtime_map_validity(authority_now_ms),
-                    )
-                }) {
-                Ok(snapshot) => {
-                    let mut response = Vec::new();
-                    write_runtime_map_snapshot(&mut response, &snapshot)?;
-                    Ok(response)
-                }
-                Err(error) => Err(error),
-            }
-        }
         ControlPlaneRpcKind::TransferRaftLeadership => {
             let mut reader = PayloadReader::new(&payload);
             let node_id = reader.read_u64()?;
@@ -6546,7 +6444,6 @@ enum ControlPlaneRpcKind {
     RuntimeMapDiagnostics = 16,
     ServingPgRuntimeMapSnapshot = 17,
     FenceUnavailablePgTransitionRuntimeMap = 18,
-    InstallUnavailablePgTransitionRuntimeMap = 19,
     ApplyMetadataTransferStagingEvidencePage = 20,
 }
 
@@ -6630,7 +6527,7 @@ fn control_plane_rpc_frame_format_error(
 
 impl ControlPlaneRpcKind {
     #[cfg(test)]
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 18] = [
         Self::RuntimeMapSnapshot,
         Self::RefreshNodeHeartbeat,
         Self::SetPgActingSet,
@@ -6648,7 +6545,6 @@ impl ControlPlaneRpcKind {
         Self::RuntimeMapDiagnostics,
         Self::ServingPgRuntimeMapSnapshot,
         Self::FenceUnavailablePgTransitionRuntimeMap,
-        Self::InstallUnavailablePgTransitionRuntimeMap,
         Self::ApplyMetadataTransferStagingEvidencePage,
     ];
 
@@ -6675,7 +6571,6 @@ impl ControlPlaneRpcKind {
             16 => Ok(Self::RuntimeMapDiagnostics),
             17 => Ok(Self::ServingPgRuntimeMapSnapshot),
             18 => Ok(Self::FenceUnavailablePgTransitionRuntimeMap),
-            19 => Ok(Self::InstallUnavailablePgTransitionRuntimeMap),
             20 => Ok(Self::ApplyMetadataTransferStagingEvidencePage),
             _ => Err(ControlPlaneError::rpc_protocol(format!(
                 "unknown control-plane RPC kind {value}"
@@ -6702,7 +6597,6 @@ impl ControlPlaneRpcKind {
             | Self::SetPgActingSetWithMetadataTransferRuntimeMap
             | Self::FencePgForMetadataTransferRuntimeMap
             | Self::FenceUnavailablePgTransitionRuntimeMap
-            | Self::InstallUnavailablePgTransitionRuntimeMap
             | Self::TransferRaftLeadership
             | Self::TriggerRaftSnapshotAndPurge
             | Self::TriggerRaftElection
@@ -6727,9 +6621,6 @@ impl ControlPlaneRpcKind {
             }
             Self::FenceUnavailablePgTransitionRuntimeMap => {
                 Some("control-plane unavailable-PG transition fence")
-            }
-            Self::InstallUnavailablePgTransitionRuntimeMap => {
-                Some("control-plane unavailable-PG transition metadata-transfer install")
             }
             Self::TransferRaftLeadership => Some("control-plane Raft leadership transfer"),
             Self::TriggerRaftSnapshotAndPurge => Some("control-plane Raft snapshot/purge trigger"),
@@ -6767,9 +6658,6 @@ impl ControlPlaneRpcKind {
             }
             Self::FenceUnavailablePgTransitionRuntimeMap => {
                 MetricKind::FencePgForMetadataTransferRuntimeMap
-            }
-            Self::InstallUnavailablePgTransitionRuntimeMap => {
-                MetricKind::SetPgActingSetWithMetadataTransferRuntimeMap
             }
             Self::TransferRaftLeadership => MetricKind::TransferRaftLeadership,
             Self::PgRuntimeMapSnapshot => MetricKind::PgRuntimeMapSnapshot,
@@ -8802,25 +8690,6 @@ fn write_pg_acting_set_with_metadata_transfer_request(
     write_pg_metadata_proof(out, transfer.metadata_proof());
     write_u64(out, expected_destination_epoch.get());
     Ok(())
-}
-
-fn write_rpc_pg_metadata_transfer_proof(
-    out: &mut Vec<u8>,
-    transfer: PgMetadataTransferProof,
-) {
-    write_u64(out, transfer.source_epoch().get());
-    write_pg_metadata_proof(out, transfer.source_metadata_proof());
-    write_pg_metadata_proof(out, transfer.metadata_proof());
-}
-
-fn read_rpc_pg_metadata_transfer_proof(
-    reader: &mut PayloadReader<'_>,
-) -> Result<PgMetadataTransferProof, ControlPlaneError> {
-    Ok(PgMetadataTransferProof::new_with_imported_metadata_proof(
-        read_cluster_epoch(reader, "metadata transfer source epoch")?,
-        read_pg_metadata_proof(reader)?,
-        read_pg_metadata_proof(reader)?,
-    ))
 }
 
 fn read_pg_acting_set_with_metadata_transfer_request(

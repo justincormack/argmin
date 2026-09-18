@@ -3031,6 +3031,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 begun.extend(included.into_iter().map(|(pg_id, _)| pg_id));
             }
         }
+        let cleanup_fallbacks = scan.cleanup_fallbacks;
         let mut work = scan
             .candidates
             .into_iter()
@@ -3054,7 +3055,11 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             ));
         }
         work.sort_by_key(UnavailablePgReconciliationWork::pg_id);
-        Ok(UnavailablePgReconciliationPollBatch { work, rejected })
+        Ok(UnavailablePgReconciliationPollBatch {
+            work,
+            cleanup_fallbacks,
+            rejected,
+        })
     }
 
     pub fn complete_unavailable_pg_reconciliation(
@@ -3111,6 +3116,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             completed: prepared.included,
             rejected: prepared.rejected,
             rederive,
+            snapshot: self.snapshot.clone(),
         })
     }
 
@@ -3141,7 +3147,6 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             acting_set,
             transfer,
             expected_destination_epoch,
-            unavailable_transition: None,
         })?;
         Ok(self.snapshot.clone())
     }
@@ -3201,24 +3206,6 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             self.snapshot.clone(),
             source_primary_lease_deadline_ms,
         ))
-    }
-
-    pub fn install_unavailable_pg_transition_metadata_transfer(
-        &mut self,
-        binding: UnavailablePgTransitionMutationBinding,
-        transfer: PgMetadataTransferProof,
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.apply_and_commit_command(
-            ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
-                pg_id: binding.pg_id(),
-                acting_set: binding.destination_acting_set().to_vec(),
-                transfer,
-                expected_destination_epoch,
-                unavailable_transition: Some(binding),
-            },
-        )?;
-        Ok(self.snapshot.clone())
     }
 
     pub fn set_pg_state(
@@ -4113,17 +4100,4 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         )
     }
 
-    fn install_unavailable_pg_transition_metadata_transfer(
-        &mut self,
-        binding: UnavailablePgTransitionMutationBinding,
-        transfer: PgMetadataTransferProof,
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::install_unavailable_pg_transition_metadata_transfer(
-            self,
-            binding,
-            transfer,
-            expected_destination_epoch,
-        )
-    }
 }

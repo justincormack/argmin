@@ -143,6 +143,7 @@ fn forge_staging_authorization_at_epoch_with_length(
                     transition.destination_acting_set.clone(),
                 ),
                 staging_generation: transition.transition_epoch.get(),
+                artifact_target_epoch: next_epoch(receipt_epoch).unwrap(),
                 artifact_digest: [u8::try_from(pg_id.get()).unwrap(); 32],
                 artifact_length: artifact_length(pg_id),
                 artifact_format_version:
@@ -174,6 +175,7 @@ fn forge_staging_authorization_at_epoch_with_length(
         };
         transition.staging_authorization = Some(UnavailablePgStagingIntentAuthorization {
             staging_generation: request.staging_generation,
+            artifact_target_epoch: request.artifact_target_epoch,
             artifact_digest: request.artifact_digest,
             artifact_length: request.artifact_length,
             artifact_format_version: request.artifact_format_version,
@@ -739,6 +741,7 @@ fn finalized_staging_floor_authority_fixture_with_isolated_checkpoints(
     let cleanup = FinalizeMetadataTransferStagingGenerationRequest {
         unavailable_transition: bindings[0].clone(),
         staging_generation: first_authorization.staging_generation,
+        disposition: MetadataTransferStagingCleanupDisposition::Completed,
         tombstones,
     };
     ControlPlaneAdmin::finalize_metadata_transfer_staging_generation(
@@ -890,6 +893,7 @@ fn adjacent_collapsed_staging_checkpoint_authority_fixture() -> (
             FinalizeMetadataTransferStagingGenerationRequest {
                 unavailable_transition: binding.clone(),
                 staging_generation: authorization.staging_generation,
+                disposition: MetadataTransferStagingCleanupDisposition::Completed,
                 tombstones,
             },
         )
@@ -1375,6 +1379,7 @@ fn checkpoint_anchor_direct_boundary_fixture() -> (
         FinalizeMetadataTransferStagingGenerationRequest {
             unavailable_transition: first_binding,
             staging_generation,
+            disposition: MetadataTransferStagingCleanupDisposition::Completed,
             tombstones,
         },
     )
@@ -2040,6 +2045,7 @@ fn authorize_and_publish_unavailable_transition(
     let authorization = UnavailablePgStagingIntentAuthorizationRequest {
         unavailable_transition: binding.clone(),
         staging_generation: binding.transition_epoch().get(),
+        artifact_target_epoch: next_epoch(authority.snapshot().cluster_epoch()).unwrap(),
         artifact_digest: [artifact_byte; 32],
         artifact_length: 4_096 + u64::from(artifact_byte),
         artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
@@ -2047,6 +2053,15 @@ fn authorize_and_publish_unavailable_transition(
     authority
         .authorize_unavailable_pg_staging_intents_batch(std::slice::from_ref(&authorization))
         .unwrap();
+    publish_authorized_unavailable_transition(authority, binding, proof, &authorization)
+}
+
+fn publish_authorized_unavailable_transition(
+    authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
+    binding: &UnavailablePgTransitionMutationBinding,
+    proof: PgMetadataProof,
+    authorization: &UnavailablePgStagingIntentAuthorizationRequest,
+) -> UnavailablePgTransitionInstallRequest {
     let destination_epoch = next_epoch(authority.snapshot().cluster_epoch()).unwrap();
     let transfer = PgMetadataTransferProof::new(binding.source_epoch(), proof);
     let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
@@ -2069,12 +2084,14 @@ fn authorize_and_publish_unavailable_transition(
             node_id,
             node.node_incarnation(),
         );
-        let page = crate::pg_store::metadata_transfer_staging_publication_evidence_page_for_test(
-            actor,
-            &intent,
-            transfer,
-            previous.as_ref(),
-        );
+        let page =
+            crate::pg_store::metadata_transfer_staging_publication_evidence_page_at_epoch_for_test(
+                actor,
+                &intent,
+                destination_epoch,
+                transfer,
+                previous.as_ref(),
+            );
         ControlPlaneAdmin::apply_metadata_transfer_staging_evidence_page(
             authority,
             page.operation_payload().to_vec(),
@@ -2113,6 +2130,52 @@ fn authorize_and_publish_unavailable_transition(
         expected_destination_epoch: destination_epoch,
         publications,
     }
+}
+
+#[test]
+fn staging_authorization_retains_prepared_target_across_unrelated_epoch_and_restart() {
+    let proof = PgMetadataProof::current(23, 0x2323, 0x3434);
+    let (_tmp, store, mut authority, authorizations) =
+        begun_two_pg_staging_authorization_authority_fixture_with_proof(proof);
+    let prepared = authorizations[0].clone();
+    let unrelated_binding = authorizations[1].unavailable_transition.clone();
+    let unrelated_install =
+        authorize_and_publish_unavailable_transition(&mut authority, &unrelated_binding, proof, 9);
+    install_and_complete_unavailable_transition(&mut authority, &unrelated_install);
+    assert!(authority.snapshot().cluster_epoch() >= prepared.artifact_target_epoch);
+
+    authority
+        .authorize_unavailable_pg_staging_intents_batch(std::slice::from_ref(&prepared))
+        .unwrap();
+    let authorization_epoch = authority
+        .snapshot()
+        .unavailable_pg_placement_transition(prepared.unavailable_transition.pg_id())
+        .unwrap()
+        .staging_authorization
+        .as_ref()
+        .unwrap()
+        .batch_receipt
+        .source_epoch;
+    assert!(authorization_epoch >= prepared.artifact_target_epoch);
+
+    drop(authority);
+    let restarted = SingleAuthorityControlPlane::open(store).unwrap();
+    let transition = restarted
+        .snapshot()
+        .unavailable_pg_placement_transition(prepared.unavailable_transition.pg_id())
+        .unwrap();
+    let work = UnavailablePgReconciliationWork::from_transition(
+        transition,
+        UnavailablePgReconciliationStage::MetadataTransfer,
+    );
+    let (durable, source_epoch, target_epoch) = restarted
+        .snapshot()
+        .committed_unavailable_pg_staging_request_binding(&work)
+        .unwrap();
+    assert_eq!(durable, prepared);
+    assert_eq!(target_epoch, prepared.artifact_target_epoch);
+    assert_eq!(next_epoch(source_epoch).unwrap(), target_epoch);
+    assert_ne!(next_epoch(authorization_epoch).unwrap(), target_epoch);
 }
 
 fn install_and_complete_unavailable_transition(
@@ -2233,6 +2296,7 @@ fn append_staging_tombstones(
         FinalizeMetadataTransferStagingGenerationRequest {
             unavailable_transition: binding.clone(),
             staging_generation: authorization.staging_generation,
+            disposition: MetadataTransferStagingCleanupDisposition::Completed,
             tombstones,
         },
         page_generations,
@@ -3147,7 +3211,7 @@ fn production_staging_maintenance_wraps_fixed_segment_sweep_to_deferred_earlier_
 }
 
 #[test]
-fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neutral() {
+fn finalized_staging_floor_retains_raw_tip_until_later_checkpoint_and_is_epoch_neutral() {
     let (_tmp, store, mut authority, installs) = completed_staged_two_pg_authority_fixture();
     let original_epoch = authority.snapshot().cluster_epoch();
     let first_binding = installs[0].unavailable_transition.clone();
@@ -3250,6 +3314,7 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
     let cleanup = FinalizeMetadataTransferStagingGenerationRequest {
         unavailable_transition: first_binding.clone(),
         staging_generation: first_authorization.staging_generation,
+        disposition: MetadataTransferStagingCleanupDisposition::Completed,
         tombstones,
     };
     let mut partial = cleanup.clone();
@@ -3262,36 +3327,6 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
         .unwrap_err()
         .to_string()
         .contains("does not match its authorization obligations"));
-    let uncheckpointed_error = authority
-        .snapshot()
-        .apply_control_plane_command(
-            ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration {
-                cleanup: cleanup.clone(),
-            },
-        )
-        .unwrap_err();
-    assert!(
-        uncheckpointed_error
-            .to_string()
-            .contains("is not checkpoint-covered"),
-        "unexpected uncheckpointed cleanup error: {uncheckpointed_error}"
-    );
-
-    for node_id in first_transition.destination_acting_set.iter().copied() {
-        let incarnation = authority
-            .snapshot()
-            .node(node_id)
-            .unwrap()
-            .node_incarnation();
-        ControlPlaneAdmin::checkpoint_metadata_transfer_staging_evidence_pages(
-            &mut authority,
-            node_id,
-            incarnation,
-            1,
-            3,
-        )
-        .unwrap();
-    }
     let finalized = ControlPlaneAdmin::finalize_metadata_transfer_staging_generation(
         &mut authority,
         cleanup.clone(),
@@ -3306,7 +3341,7 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
             .staging_generation,
         first_authorization.staging_generation
     );
-    assert!(!finalized
+    assert!(finalized
         .metadata_transfer_staging_evidence
         .keys()
         .any(|key| {
@@ -3325,6 +3360,30 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
         parse_snapshot(&format_snapshot(&finalized)).unwrap(),
         finalized
     );
+    let retained_key = finalized
+        .metadata_transfer_staging_evidence
+        .keys()
+        .find(|key| {
+            key.pg_id == first_binding.pg_id()
+                && key.staging_generation == first_authorization.staging_generation
+        })
+        .cloned()
+        .unwrap();
+    let mut missing_detail = finalized.clone();
+    missing_detail
+        .metadata_transfer_staging_evidence
+        .remove(&retained_key);
+    assert!(parse_snapshot(&format_snapshot(&missing_detail))
+        .unwrap_err()
+        .to_string()
+        .contains("neither detail nor checkpoint binding"));
+    let mut corrupted_detail = finalized.clone();
+    corrupted_detail
+        .metadata_transfer_staging_evidence
+        .get_mut(&retained_key)
+        .unwrap()
+        .push(0);
+    assert!(parse_snapshot(&format_snapshot(&corrupted_detail)).is_err());
 
     let replay = ControlPlaneAdmin::finalize_metadata_transfer_staging_generation(
         &mut authority,
@@ -3332,6 +3391,51 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
     )
     .unwrap();
     assert_eq!(replay, finalized);
+
+    for node_id in first_transition.destination_acting_set.iter().copied() {
+        let incarnation = authority
+            .snapshot()
+            .node(node_id)
+            .unwrap()
+            .node_incarnation();
+        ControlPlaneAdmin::checkpoint_metadata_transfer_staging_evidence_pages(
+            &mut authority,
+            node_id,
+            incarnation,
+            1,
+            3,
+        )
+        .unwrap();
+    }
+    let checkpointed = authority.snapshot().clone();
+    assert!(!checkpointed
+        .metadata_transfer_staging_evidence
+        .keys()
+        .any(|key| {
+            key.pg_id == first_binding.pg_id()
+                && key.staging_generation == first_authorization.staging_generation
+        }));
+    let floor = &checkpointed.metadata_transfer_staging_finalized_floors[&(
+        first_binding.pg_id(),
+        first_authorization.staging_generation,
+    )];
+    assert_eq!(
+        floor.checkpoint_bindings.len(),
+        floor.publications.len() + floor.tombstones.len()
+    );
+    checkpointed.validate_current_state_invariants().unwrap();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(&checkpointed)).unwrap(),
+        checkpointed
+    );
+    assert_eq!(
+        ControlPlaneAdmin::finalize_metadata_transfer_staging_generation(
+            &mut authority,
+            cleanup.clone(),
+        )
+        .unwrap(),
+        checkpointed
+    );
 
     let stale_actor = &cleanup.tombstones[0];
     let stale_page_tip = authority
@@ -3372,10 +3476,10 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
         .unwrap_err()
         .to_string()
         .contains("at or below finalized floor"));
-    assert_eq!(authority.snapshot(), &finalized);
+    assert_eq!(authority.snapshot(), &checkpointed);
 
     let first_actor = &cleanup.tombstones[0];
-    let checkpoint = finalized
+    let checkpoint = checkpointed
         .metadata_transfer_staging_evidence_checkpoint_segments
         .get(&(first_actor.node_id, first_actor.node_incarnation, 1))
         .unwrap();
@@ -3389,18 +3493,18 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
         restarted
             .snapshot()
             .metadata_transfer_staging_finalized_floors,
-        finalized.metadata_transfer_staging_finalized_floors
+        checkpointed.metadata_transfer_staging_finalized_floors
     );
     assert_eq!(
         restarted.snapshot().metadata_transfer_staging_evidence,
-        finalized.metadata_transfer_staging_evidence
+        checkpointed.metadata_transfer_staging_evidence
     );
     restarted
         .snapshot()
         .validate_current_state_invariants()
         .unwrap();
 
-    let mut forged = finalized.clone();
+    let mut forged = checkpointed.clone();
     forged
         .metadata_transfer_staging_finalized_floors
         .get_mut(&(
@@ -3414,7 +3518,7 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
         .to_string()
         .contains("invalid identity or digest"));
 
-    let mut forged_checkpoint_binding = finalized.clone();
+    let mut forged_checkpoint_binding = checkpointed.clone();
     let floor = forged_checkpoint_binding
         .metadata_transfer_staging_finalized_floors
         .get_mut(&(
@@ -3426,6 +3530,7 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
     floor.tombstone_set_digest = metadata_transfer_staging_cleanup_digest(
         &floor.transition,
         floor.staging_generation,
+        floor.disposition,
         floor.artifact_digest,
         floor.artifact_length,
         floor.artifact_format_version,
@@ -3440,7 +3545,7 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
         "unexpected forged checkpoint error: {forged_checkpoint_error}"
     );
 
-    let mut coordinated_forgery = finalized.clone();
+    let mut coordinated_forgery = checkpointed.clone();
     let forged_tombstone = coordinated_forgery
         .metadata_transfer_staging_finalized_floors
         .get_mut(&(
@@ -3471,6 +3576,7 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
     floor.tombstone_set_digest = metadata_transfer_staging_cleanup_digest(
         &floor.transition,
         floor.staging_generation,
+        floor.disposition,
         floor.artifact_digest,
         floor.artifact_length,
         floor.artifact_format_version,
@@ -3489,7 +3595,7 @@ fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neu
         "unexpected coordinated checkpoint forgery error: {coordinated_error}"
     );
 
-    let mut membership_forgery = finalized.clone();
+    let mut membership_forgery = checkpointed.clone();
     let entry = membership_forgery
         .metadata_transfer_staging_evidence_checkpoint_segments
         .values_mut()
@@ -4069,6 +4175,7 @@ fn begun_staging_authorization_authority_fixture_with_proof(
                     transition.destination_acting_set.clone(),
                 ),
                 staging_generation: transition.transition_epoch.get(),
+                artifact_target_epoch: next_epoch(authority.snapshot().cluster_epoch()).unwrap(),
                 artifact_digest: [0x80 + u8::try_from(index).unwrap(); 32],
                 artifact_length: 8_192 + u64::try_from(index).unwrap(),
                 artifact_format_version:
@@ -4146,6 +4253,7 @@ pub(crate) fn authenticated_staging_authorization_fixture(
     authorizations[1] = UnavailablePgStagingIntentAuthorizationRequest {
         unavailable_transition: cross_member_binding.clone(),
         staging_generation: cross_member_binding.transition_epoch().get(),
+        artifact_target_epoch: initial_destination_epoch,
         artifact_digest: checksum::sha256::digest(&cross_member_artifact),
         artifact_length: u64::try_from(cross_member_artifact.len()).unwrap(),
         artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
@@ -4437,6 +4545,46 @@ fn unavailable_pg_destination_install_batch_is_receipt_bound_atomic_and_replayab
         command
     );
 
+    let singleton = source
+        .install_unavailable_pg_placement_transitions_batch_command(
+            std::slice::from_ref(&requests[0]),
+            destination_epoch,
+        )
+        .unwrap();
+    let singleton_len =
+        crate::control_plane_raft::control_plane_command_replication_encoded_len(&singleton)
+            .unwrap();
+    let full_len =
+        crate::control_plane_raft::control_plane_command_replication_encoded_len(&command).unwrap();
+    assert!(singleton_len < full_len);
+    let split_limit = singleton_len + (full_len - singleton_len) / 2;
+    let split = source
+        .prepare_unavailable_pg_placement_install_batch_with_replication_limit(
+            &requests,
+            destination_epoch,
+            split_limit,
+        )
+        .unwrap();
+    assert_eq!(split.included, vec![requests[0].clone()]);
+    assert!(split.rejected.is_empty());
+    assert!(
+        crate::control_plane_raft::control_plane_command_replication_encoded_len(
+            split.command.as_ref().unwrap()
+        )
+        .unwrap()
+            <= split_limit
+    );
+    let below_singleton = source
+        .prepare_unavailable_pg_placement_install_batch_with_replication_limit(
+            std::slice::from_ref(&requests[0]),
+            destination_epoch,
+            singleton_len - 1,
+        )
+        .unwrap();
+    assert!(below_singleton.command.is_none());
+    assert!(below_singleton.included.is_empty());
+    assert_eq!(below_singleton.rejected.len(), 1);
+
     let mut invalid = requests.clone();
     invalid[1].publications[0].evidence_digest[0] ^= 0x80;
     let error = source
@@ -4624,6 +4772,7 @@ fn nonempty_staged_artifact_requires_epoch_rebound_proof_after_unrelated_advance
     let authorization_request = UnavailablePgStagingIntentAuthorizationRequest {
         unavailable_transition: binding.clone(),
         staging_generation: binding.transition_epoch().get(),
+        artifact_target_epoch: initial_destination_epoch,
         artifact_digest,
         artifact_length,
         artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
@@ -4656,6 +4805,7 @@ fn nonempty_staged_artifact_requires_epoch_rebound_proof_after_unrelated_advance
         .unwrap()
         .staging_authorization = Some(UnavailablePgStagingIntentAuthorization {
         staging_generation: authorization_request.staging_generation,
+        artifact_target_epoch: authorization_request.artifact_target_epoch,
         artifact_digest,
         artifact_length,
         artifact_format_version: authorization_request.artifact_format_version,
@@ -4881,6 +5031,7 @@ fn nonempty_staged_artifact_requires_epoch_rebound_proof_after_unrelated_advance
     let filler_authorization = UnavailablePgStagingIntentAuthorizationRequest {
         unavailable_transition: filler_binding.clone(),
         staging_generation: filler_binding.transition_epoch().get(),
+        artifact_target_epoch: next_epoch(authority.snapshot().cluster_epoch()).unwrap(),
         artifact_digest: [0xe1; 32],
         artifact_length: 4_097,
         artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
@@ -4936,6 +5087,7 @@ fn nonempty_staged_artifact_requires_epoch_rebound_proof_after_unrelated_advance
     let cleanup = FinalizeMetadataTransferStagingGenerationRequest {
         unavailable_transition: binding,
         staging_generation: intent.staging_generation(),
+        disposition: MetadataTransferStagingCleanupDisposition::Completed,
         tombstones,
     };
     ControlPlaneAdmin::finalize_metadata_transfer_staging_generation(
@@ -5022,6 +5174,7 @@ fn finalized_evidence_index_accepts_every_actor_at_the_epoch_proof_limit() {
     let floor = MetadataTransferStagingFinalizedFloor {
         transition: transition.clone(),
         staging_generation,
+        disposition: MetadataTransferStagingCleanupDisposition::Completed,
         artifact_digest: [0x45; 32],
         artifact_length: 4_096,
         artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
@@ -5120,6 +5273,105 @@ fn unavailable_pg_reconciliation_scan_is_cursor_and_page_bounded() {
         second.next_cursor,
         UnavailablePgReconciliationCursor::start()
     );
+}
+
+#[test]
+fn active_successor_reconciliation_outranks_retained_terminal_cleanup() {
+    let (_tmp, _store, mut authority, installs) = completed_staged_two_pg_authority_fixture();
+    let pg_id = installs[0].unavailable_transition.pg_id();
+    let before = authority.snapshot().scan_unavailable_pg_reconciliation(
+        UnavailablePgReconciliationCursor::start(),
+        authority.snapshot().max_committed_timestamp_ms().unwrap(),
+    );
+    let Some(UnavailablePgReconciliationCandidate::Resume(cleanup)) = before.candidate else {
+        panic!("completed staged transition did not expose terminal cleanup");
+    };
+    assert_eq!(cleanup.pg_id(), pg_id);
+    assert_eq!(
+        cleanup.stage(),
+        UnavailablePgReconciliationStage::StagingCleanup
+    );
+
+    let successor = begin_successor_unavailable_transition(
+        &mut authority,
+        pg_id,
+        NodeId::new(4),
+        installs[0].transfer.metadata_proof(),
+    );
+    let after = authority.snapshot().scan_unavailable_pg_reconciliation(
+        UnavailablePgReconciliationCursor::start(),
+        authority.snapshot().max_committed_timestamp_ms().unwrap(),
+    );
+    let Some(UnavailablePgReconciliationCandidate::Resume(active)) = after.candidate else {
+        panic!("active successor was hidden by retained terminal cleanup");
+    };
+    assert_eq!(active.pg_id(), pg_id);
+    assert_eq!(active.transition_epoch(), successor.transition_epoch());
+    assert_eq!(
+        active.stage(),
+        UnavailablePgReconciliationStage::MetadataTransfer
+    );
+
+    let batch = authority
+        .snapshot()
+        .scan_unavailable_pg_reconciliation_batch(
+            UnavailablePgReconciliationCursor::start(),
+            authority.snapshot().max_committed_timestamp_ms().unwrap(),
+        );
+    assert!(batch.candidates.iter().any(|candidate| matches!(
+        candidate,
+        UnavailablePgReconciliationCandidate::Resume(work)
+            if work.pg_id() == pg_id
+                && work.transition_epoch() == successor.transition_epoch()
+    )));
+    let fallback = batch
+        .cleanup_fallbacks
+        .iter()
+        .find(|work| work.pg_id() == pg_id)
+        .expect("active successor has no retained cleanup fallback");
+    assert_eq!(fallback.transition_epoch(), cleanup.transition_epoch());
+    assert_eq!(
+        fallback.stage(),
+        UnavailablePgReconciliationStage::StagingCleanup
+    );
+}
+
+#[test]
+fn superseded_cleanup_rejects_a_durable_destination_install_even_without_completion() {
+    let (_tmp, _store, mut authority, installs) = completed_staged_two_pg_authority_fixture();
+    let install = &installs[0];
+    let pg_id = install.unavailable_transition.pg_id();
+    let transition_epoch = install.unavailable_transition.transition_epoch();
+    let successor = begin_successor_unavailable_transition(
+        &mut authority,
+        pg_id,
+        NodeId::new(4),
+        install.transfer.metadata_proof(),
+    );
+    let transition = authority
+        .snapshot
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, transition_epoch))
+        .unwrap();
+    transition.completion = None;
+    transition.completion_batch_receipt = None;
+
+    let error = match authority
+        .snapshot()
+        .validate_unavailable_pg_staging_cleanup(
+            &install.unavailable_transition,
+            MetadataTransferStagingCleanupDisposition::Superseded {
+                successor_transition_epoch: successor.transition_epoch(),
+            },
+            None,
+            transition_epoch.get(),
+        ) {
+        Ok(_) => panic!("superseded cleanup accepted a durable destination install"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("not a superseded pre-install transition"));
 }
 
 #[test]
@@ -5389,6 +5641,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
                     transition.destination_acting_set.clone(),
                 ),
                 staging_generation: transition.transition_epoch.get(),
+                artifact_target_epoch: next_epoch(recorded.cluster_epoch()).unwrap(),
                 artifact_digest: [u8::try_from(index + 1).unwrap(); 32],
                 artifact_length: 4_096 + u64::try_from(index).unwrap(),
                 artifact_format_version:
@@ -6408,7 +6661,9 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     .unwrap();
     assert!(authorized.changed());
 
-    for pg_id in pg_ids {
+    let destination_epoch = next_epoch(authority.snapshot().cluster_epoch()).unwrap();
+    let mut installs = Vec::new();
+    for (pg_id, authorization) in pg_ids.into_iter().zip(&staging_requests) {
         let transition = authority
             .snapshot()
             .unavailable_pg_placement_transition(pg_id)
@@ -6417,17 +6672,70 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
             transition,
             UnavailablePgReconciliationStage::MetadataTransfer,
         );
-        let transfer =
-            PgMetadataTransferProof::new(authority.snapshot().cluster_epoch(), active_proof);
-        let destination_epoch = next_epoch(authority.snapshot().cluster_epoch()).unwrap();
-        authority
-            .install_unavailable_pg_transition_metadata_transfer(
-                work.mutation_binding().clone(),
-                transfer,
+        let transfer = PgMetadataTransferProof::new(work.source_epoch(), active_proof);
+        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            work.mutation_binding(),
+            authorization.artifact_digest,
+            authorization.artifact_length,
+            authorization.artifact_format_version,
+        )
+        .unwrap();
+        let mut publications = Vec::new();
+        for node_id in work.destination_acting_set().iter().copied() {
+            let node = authority.snapshot().node(node_id).unwrap();
+            let previous = latest_staging_evidence_apply_receipt(
+                authority.snapshot(),
+                node_id,
+                node.node_incarnation(),
+            );
+            let page = crate::pg_store::metadata_transfer_staging_publication_evidence_page_at_epoch_for_test(
+                crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+                    node_id,
+                    node.node_incarnation(),
+                    node.endpoint().to_owned(),
+                )
+                .unwrap(),
+                &intent,
                 destination_epoch,
+                transfer,
+                previous.as_ref(),
+            );
+            ControlPlaneAdmin::apply_metadata_transfer_staging_evidence_page(
+                &mut authority,
+                page.operation_payload().to_vec(),
+                page.page_digest(),
             )
             .unwrap();
+            let node = authority.snapshot().node(node_id).unwrap();
+            let key = MetadataTransferStagingEvidenceKey {
+                pg_id,
+                staging_generation: authorization.staging_generation,
+                actor_node_id: node_id,
+                actor_node_incarnation: node.node_incarnation(),
+                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                target_epoch: Some(destination_epoch),
+            };
+            publications.push(UnavailablePgStagingPublicationBinding {
+                node_id,
+                node_incarnation: node.node_incarnation(),
+                endpoint: node.endpoint().to_owned(),
+                evidence_digest: checksum::sha256::digest(
+                    &authority.snapshot().metadata_transfer_staging_evidence[&key],
+                ),
+            });
+        }
+        publications.sort_by_key(|publication| publication.node_id);
+        installs.push(UnavailablePgTransitionInstallRequest {
+            unavailable_transition: work.mutation_binding().clone(),
+            transfer,
+            expected_destination_epoch: destination_epoch,
+            publications,
+        });
     }
+    installs.sort_by_key(|install| install.unavailable_transition.pg_id());
+    authority
+        .install_unavailable_pg_placement_transitions_batch(&installs, destination_epoch)
+        .unwrap();
     let installed_authorized = authority.snapshot().clone();
     installed_authorized
         .validate_current_state_invariants()
@@ -6466,7 +6774,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     assert!(
         post_install_error
             .to_string()
-            .contains("invalid staging authorization"),
+            .contains("staging evidence does not match its authorization"),
         "unexpected post-install staging authorization error: {post_install_error}"
     );
     let post_install_replay = authority
@@ -6528,26 +6836,33 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     );
     assert_eq!(prepared_with_stale_member.rejected.len(), 1);
 
-    let mut large_completion_source = authority.snapshot().clone();
-    for node_id in [2, 3, 4] {
-        large_completion_source
-            .nodes
-            .get_mut(&NodeId::new(node_id))
-            .unwrap()
-            .endpoint = "x".repeat(25_000);
-    }
-    let oversized_completion = large_completion_source
+    let full_completion = authority
+        .snapshot()
         .complete_unavailable_pg_placement_transition_batch_command(&completion_work, ready_at_ms)
         .unwrap();
-    assert!(
-        crate::control_plane_raft::control_plane_command_replication_encoded_len(
-            &oversized_completion
+    let singleton_completion = authority
+        .snapshot()
+        .complete_unavailable_pg_placement_transition_batch_command(
+            std::slice::from_ref(&completion_work[0]),
+            ready_at_ms,
         )
-        .unwrap()
-            > crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
-    );
-    let split_completion = large_completion_source
-        .prepare_unavailable_pg_placement_completion_batch(&completion_work, ready_at_ms)
+        .unwrap();
+    let full_len =
+        crate::control_plane_raft::control_plane_command_replication_encoded_len(&full_completion)
+            .unwrap();
+    let singleton_len = crate::control_plane_raft::control_plane_command_replication_encoded_len(
+        &singleton_completion,
+    )
+    .unwrap();
+    assert!(singleton_len < full_len);
+    let split_limit = singleton_len + (full_len - singleton_len) / 2;
+    let split_completion = authority
+        .snapshot()
+        .prepare_unavailable_pg_placement_completion_batch_with_replication_limit(
+            &completion_work,
+            ready_at_ms,
+            split_limit,
+        )
         .unwrap();
     assert_eq!(split_completion.included.len(), 1);
     assert!(split_completion.rejected.is_empty());
@@ -6556,7 +6871,7 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
             split_completion.command.as_ref().unwrap()
         )
         .unwrap()
-            <= crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+            <= split_limit
     );
     let completion_command = authority
         .snapshot()
@@ -7426,23 +7741,28 @@ fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
     drop(authority);
     let mut authority = restarted;
 
-    let transfer = PgMetadataTransferProof::new(authority.snapshot().cluster_epoch(), active_proof);
     let before_generic_install = authority.snapshot().clone();
     assert!(authority
         .set_pg_acting_set_with_metadata_transfer(
             pg_id,
             vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
-            transfer,
+            PgMetadataTransferProof::new(
+                dispatched_work.mutation_binding().source_epoch(),
+                active_proof,
+            ),
         )
         .is_err());
     assert_eq!(authority.snapshot(), &before_generic_install);
-    let expected_destination_epoch =
-        ClusterEpoch::new(authority.snapshot().cluster_epoch().get() + 1).unwrap();
+    let install = authorize_and_publish_unavailable_transition(
+        &mut authority,
+        dispatched_work.mutation_binding(),
+        active_proof,
+        0x71,
+    );
     authority
-        .install_unavailable_pg_transition_metadata_transfer(
-            dispatched_work.mutation_binding().clone(),
-            transfer,
-            expected_destination_epoch,
+        .install_unavailable_pg_placement_transitions_batch(
+            std::slice::from_ref(&install),
+            install.expected_destination_epoch,
         )
         .unwrap();
     let destination_epoch = authority.snapshot().cluster_epoch();
@@ -7716,10 +8036,13 @@ fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
         .is_err());
     assert_eq!(authority.snapshot(), &active_after_completion);
     assert!(authority
-        .install_unavailable_pg_transition_metadata_transfer(
-            dispatched_work.mutation_binding().clone(),
-            PgMetadataTransferProof::new(authority.snapshot().cluster_epoch(), active_proof,),
-            ClusterEpoch::new(authority.snapshot().cluster_epoch().get() + 1).unwrap(),
+        .set_pg_acting_set_with_metadata_transfer(
+            pg_id,
+            dispatched_work.destination_acting_set().to_vec(),
+            PgMetadataTransferProof::new(
+                dispatched_work.mutation_binding().source_epoch(),
+                active_proof,
+            ),
         )
         .is_err());
     assert_eq!(authority.snapshot(), &active_after_completion);
@@ -7912,7 +8235,7 @@ fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
         .validate_current_state_invariants()
         .unwrap_err();
     assert!(
-        coordinated_proof_error.contains("completion source route does not match its destination"),
+        coordinated_proof_error.contains("invalid destination install evidence"),
         "unexpected coordinated proof error: {coordinated_proof_error}"
     );
     let coordinated_proof_parse_error =
@@ -7953,10 +8276,13 @@ fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
         .unwrap()
         .destination_acting_set
         .swap(0, 1);
-    assert!(forged_substitution
+    let forged_substitution_error = forged_substitution
         .validate_current_state_invariants()
-        .unwrap_err()
-        .contains("destination-route evidence"));
+        .unwrap_err();
+    assert!(
+        forged_substitution_error.contains("staging evidence does not match its authorization"),
+        "unexpected forged-substitution error: {forged_substitution_error}"
+    );
 
     let mut forged_history = authority.snapshot().clone();
     let historical_route = forged_history
@@ -8119,17 +8445,25 @@ fn unavailable_pg_transition_successor_consumes_retained_lineage_tip() {
         .snapshot()
         .unavailable_pg_placement_transition(pg_id)
         .unwrap();
+    let first_binding = UnavailablePgTransitionMutationBinding::new(
+        first_transition.pg_id,
+        first_transition.transition_epoch,
+        first_transition.source_epoch,
+        first_transition.source_acting_set.clone(),
+        first_transition.destination_acting_set.clone(),
+    );
+    let first_artifact_target_epoch = next_epoch(authority.snapshot().cluster_epoch()).unwrap();
+    let first_artifact =
+        crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
+            &first_binding,
+            first_artifact_target_epoch,
+        );
     let first_staging_request = UnavailablePgStagingIntentAuthorizationRequest {
-        unavailable_transition: UnavailablePgTransitionMutationBinding::new(
-            first_transition.pg_id,
-            first_transition.transition_epoch,
-            first_transition.source_epoch,
-            first_transition.source_acting_set.clone(),
-            first_transition.destination_acting_set.clone(),
-        ),
+        unavailable_transition: first_binding,
         staging_generation: first_transition.transition_epoch.get(),
-        artifact_digest: [0x71; 32],
-        artifact_length: 4_096,
+        artifact_target_epoch: first_artifact_target_epoch,
+        artifact_digest: checksum::sha256::digest(&first_artifact),
+        artifact_length: u64::try_from(first_artifact.len()).unwrap(),
         artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
     };
     ControlPlaneLinearizedCommandSink::submit_control_plane_command(
@@ -8199,6 +8533,7 @@ fn unavailable_pg_transition_successor_consumes_retained_lineage_tip() {
         .unwrap();
     assert_eq!(retained_uninstalled.destination_epoch(), None);
     assert!(retained_uninstalled.staging_authorization.is_some());
+    let retained_destination_acting_set = retained_uninstalled.destination_acting_set.clone();
     superseded
         .snapshot()
         .validate_current_state_invariants()
@@ -8215,39 +8550,110 @@ fn unavailable_pg_transition_successor_consumes_retained_lineage_tip() {
         .unwrap();
     assert!(!superseded_replay.changed());
     assert_eq!(superseded_replay.snapshot(), superseded.snapshot());
-    let mut superseded_tombstones = retained_uninstalled
-        .destination_acting_set
-        .iter()
-        .copied()
-        .map(|node_id| {
-            let node = superseded.snapshot().node(node_id).unwrap();
-            MetadataTransferStagingTombstoneBinding {
-                node_id,
-                node_incarnation: node.node_incarnation(),
-                endpoint: node.endpoint().to_owned(),
-                evidence_digest: [0x72; 32],
-            }
-        })
-        .collect::<Vec<_>>();
-    superseded_tombstones.sort_by_key(|tombstone| tombstone.node_id);
-    let incomplete_cleanup_error = superseded
-        .snapshot()
-        .apply_control_plane_command(
-            ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration {
-                cleanup: FinalizeMetadataTransferStagingGenerationRequest {
-                    unavailable_transition: first_staging_request.unavailable_transition.clone(),
-                    staging_generation: first_staging_request.staging_generation,
-                    tombstones: superseded_tombstones,
-                },
-            },
+    let first_intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+        &first_staging_request.unavailable_transition,
+        first_staging_request.artifact_digest,
+        first_staging_request.artifact_length,
+        first_staging_request.artifact_format_version,
+    )
+    .unwrap();
+    let mut destination_stores = Vec::new();
+    let mut superseded_tombstones = Vec::new();
+    for (index, node_id) in retained_destination_acting_set.iter().copied().enumerate() {
+        let node = superseded.snapshot().node(node_id).unwrap();
+        let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+            node_id,
+            node.node_incarnation(),
+            node.endpoint().to_owned(),
         )
+        .unwrap();
+        let authorization = superseded
+            .snapshot()
+            .committed_unavailable_pg_staging_authorization(&first_staging_request, node_id)
+            .unwrap();
+        let temp = test_util::tempdir();
+        let store = crate::pg_store::MetadataTransferStagingStore::open(
+            temp.path(),
+            actor,
+            crate::pg_store::MetadataTransferStagingLimits::new(8, 1 << 20, 8 << 20).unwrap(),
+        )
+        .unwrap();
+        if index == 0 {
+            store
+                .create_intent_authorized(&authorization, &first_intent)
+                .unwrap();
+            store
+                .publish_artifact_authorized(&authorization, &first_intent, &first_artifact)
+                .unwrap();
+        }
+        let tombstone = store
+            .tombstone_authorized(&authorization, &first_intent)
+            .unwrap();
+        let evidence = crate::pg_store::decode_staging_evidence(tombstone.as_bytes()).unwrap();
+        let page = store.next_evidence_page().unwrap().unwrap();
+        let apply_receipt = superseded
+            .apply_metadata_transfer_staging_evidence_page(
+                page.operation_payload().to_vec(),
+                page.page_digest(),
+            )
+            .unwrap();
+        store
+            .record_evidence_apply_receipt(
+                &page,
+                &crate::pg_store::decode_staging_evidence_apply_receipt(&apply_receipt).unwrap(),
+            )
+            .unwrap();
+        superseded_tombstones.push(MetadataTransferStagingTombstoneBinding {
+            node_id,
+            node_incarnation: evidence.actor().node_incarnation(),
+            endpoint: evidence.actor().endpoint().to_owned(),
+            evidence_digest: checksum::sha256::digest(tombstone.as_bytes()),
+        });
+        destination_stores.push((temp, store, authorization));
+    }
+    superseded_tombstones.sort_by_key(|tombstone| tombstone.node_id);
+    let cancellation = FinalizeMetadataTransferStagingGenerationRequest {
+        unavailable_transition: first_staging_request.unavailable_transition.clone(),
+        staging_generation: first_staging_request.staging_generation,
+        disposition: MetadataTransferStagingCleanupDisposition::Superseded {
+            successor_transition_epoch: superseding_transition_epoch,
+        },
+        tombstones: superseded_tombstones,
+    };
+    let cancelled = superseded
+        .finalize_metadata_transfer_staging_generation(cancellation.clone())
+        .unwrap();
+    assert_eq!(
+        cancelled.metadata_transfer_staging_finalized_floors
+            [&(pg_id, first_staging_request.staging_generation)]
+            .disposition,
+        cancellation.disposition
+    );
+    assert_eq!(
+        superseded
+            .finalize_metadata_transfer_staging_generation(cancellation)
+            .unwrap(),
+        cancelled
+    );
+    let mut installed_cancellation_forgery = cancelled.clone();
+    installed_cancellation_forgery
+        .retained_unavailable_pg_placement_transitions
+        .get_mut(&(pg_id, first_transition_epoch))
+        .unwrap()
+        .destination_epoch = Some(superseding_transition_epoch);
+    let error = installed_cancellation_forgery
+        .validate_current_state_invariants()
         .unwrap_err();
     assert!(
-        incomplete_cleanup_error
-            .to_string()
-            .contains("requires its exact completed transition"),
-        "unexpected incomplete cleanup error: {incomplete_cleanup_error}"
+        error.contains("not an exact pre-install successor"),
+        "unexpected installed cancellation invariant error: {error}"
     );
+    for (_, store, authorization) in &destination_stores {
+        assert!(matches!(
+            store.create_intent_authorized(authorization, &first_intent),
+            Err(crate::pg_store::MetadataTransferStagingError::GenerationRetired)
+        ));
+    }
     let mut superseded_forgery = superseded.snapshot().clone();
     forge_staging_authorization_at_epoch(
         &mut superseded_forgery,
@@ -8304,30 +8710,36 @@ fn unavailable_pg_transition_successor_consumes_retained_lineage_tip() {
         })
         .collect::<Vec<_>>();
     superseding_tombstones.sort_by_key(|tombstone| tombstone.node_id);
-    let skipped_authorization_error = superseded
+    let missing_tombstone_error = superseded
         .snapshot()
         .apply_control_plane_command(
             ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration {
                 cleanup: FinalizeMetadataTransferStagingGenerationRequest {
                     unavailable_transition: superseding_binding,
                     staging_generation: superseding_authorization.staging_generation,
+                    disposition: MetadataTransferStagingCleanupDisposition::Completed,
                     tombstones: superseding_tombstones,
                 },
             },
         )
         .unwrap_err();
     assert!(
-        skipped_authorization_error
+        missing_tombstone_error
             .to_string()
-            .contains("cannot skip an authorized generation"),
-        "unexpected skipped-authorization error: {skipped_authorization_error}"
+            .contains("lacks a tombstone for node"),
+        "unexpected missing-tombstone error: {missing_tombstone_error}"
     );
 
+    let first_install = publish_authorized_unavailable_transition(
+        &mut authority,
+        first_work.mutation_binding(),
+        proof,
+        &first_staging_request,
+    );
     authority
-        .install_unavailable_pg_transition_metadata_transfer(
-            first_work.mutation_binding().clone(),
-            PgMetadataTransferProof::new(authority.snapshot().cluster_epoch(), proof),
-            ClusterEpoch::new(authority.snapshot().cluster_epoch().get() + 1).unwrap(),
+        .install_unavailable_pg_placement_transitions_batch(
+            std::slice::from_ref(&first_install),
+            first_install.expected_destination_epoch,
         )
         .unwrap();
     let post_transfer_time = authority.snapshot().max_committed_timestamp_ms().unwrap() + 1;

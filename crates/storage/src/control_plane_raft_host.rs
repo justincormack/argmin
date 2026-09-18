@@ -539,6 +539,7 @@ impl ControlPlaneRaftAuthorityHost {
             rejected.extend(prepared.rejected);
         }
         let current = self.current_snapshot()?;
+        let cleanup_fallbacks = scan.cleanup_fallbacks;
         let mut work = scan
             .candidates
             .into_iter()
@@ -561,7 +562,11 @@ impl ControlPlaneRaftAuthorityHost {
             ));
         }
         work.sort_by_key(UnavailablePgReconciliationWork::pg_id);
-        Ok(UnavailablePgReconciliationPollBatch { work, rejected })
+        Ok(UnavailablePgReconciliationPollBatch {
+            work,
+            cleanup_fallbacks,
+            rejected,
+        })
     }
 
     pub fn authorize_unavailable_pg_staging_intents_batch(
@@ -843,6 +848,7 @@ impl ControlPlaneRaftAuthorityHost {
             completed: prepared.included,
             rejected: prepared.rejected,
             rederive,
+            snapshot: self.current_snapshot()?,
         })
     }
 
@@ -1029,6 +1035,12 @@ impl ControlPlaneRaftAuthorityHost {
     fn current_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
         self.block_on(self.authority.current_control_plane_snapshot())
+    }
+
+    pub(crate) fn unavailable_pg_reconciliation_snapshot(
+        &self,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.current_snapshot()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1638,23 +1650,6 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
             acting_set,
             transfer,
             expected_destination_epoch,
-            unavailable_transition: None,
-        })?;
-        self.current_snapshot()
-    }
-
-    fn install_unavailable_pg_transition_metadata_transfer(
-        &mut self,
-        binding: crate::control_plane::UnavailablePgTransitionMutationBinding,
-        transfer: PgMetadataTransferProof,
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.submit_raft_command(ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
-            pg_id: binding.pg_id(),
-            acting_set: binding.destination_acting_set().to_vec(),
-            transfer,
-            expected_destination_epoch,
-            unavailable_transition: Some(binding),
         })?;
         self.current_snapshot()
     }
@@ -1817,6 +1812,94 @@ mod tests {
              committed={committed_timestamp_ms} previous={previous_timestamp_ms}"
         );
         committed_timestamp_ms
+    }
+
+    fn stage_and_install_unavailable_transition_for_test(
+        host: &mut ControlPlaneRaftAuthorityHost,
+        work: &UnavailablePgReconciliationWork,
+        artifact_byte: u8,
+        receipts: &mut std::collections::BTreeMap<
+            NodeId,
+            crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt,
+        >,
+    ) {
+        let artifact_target_epoch = ClusterEpoch::new(
+            host.current_snapshot_for_test()
+                .unwrap()
+                .cluster_epoch()
+                .get()
+                + 1,
+        )
+        .unwrap();
+        let authorization = UnavailablePgStagingIntentAuthorizationRequest {
+            unavailable_transition: work.mutation_binding().clone(),
+            staging_generation: work.transition_epoch().get(),
+            artifact_target_epoch,
+            artifact_digest: [artifact_byte; 32],
+            artifact_length: 4_096 + u64::from(artifact_byte),
+            artifact_format_version:
+                crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+        };
+        host.authorize_unavailable_pg_staging_intents_batch(std::slice::from_ref(&authorization))
+            .unwrap();
+        let snapshot = host.current_snapshot_for_test().unwrap();
+        let destination_epoch = ClusterEpoch::new(snapshot.cluster_epoch().get() + 1).unwrap();
+        let transfer = PgMetadataTransferProof::new(
+            work.source_epoch(),
+            crate::control_plane::PgMetadataProof::empty(),
+        );
+        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+            work.mutation_binding(),
+            authorization.artifact_digest,
+            authorization.artifact_length,
+            authorization.artifact_format_version,
+        )
+        .unwrap();
+        let mut publications = Vec::new();
+        for node_id in work.destination_acting_set().iter().copied() {
+            let node = snapshot.node(node_id).unwrap();
+            let page =
+                crate::pg_store::metadata_transfer_staging_publication_evidence_page_for_test(
+                    crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+                        node_id,
+                        node.node_incarnation(),
+                        node.endpoint().to_owned(),
+                    )
+                    .unwrap(),
+                    &intent,
+                    transfer,
+                    receipts.get(&node_id),
+                );
+            let evidence_digest = checksum::sha256::digest(page.entries()[0].evidence());
+            host.apply_metadata_transfer_staging_evidence_page(
+                page.operation_payload().to_vec(),
+                page.page_digest(),
+            )
+            .unwrap();
+            receipts.insert(
+                node_id,
+                crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&page),
+            );
+            publications.push(
+                crate::control_plane_command::UnavailablePgStagingPublicationBinding {
+                    node_id,
+                    node_incarnation: node.node_incarnation(),
+                    endpoint: node.endpoint().to_owned(),
+                    evidence_digest,
+                },
+            );
+        }
+        publications.sort_by_key(|publication| publication.node_id);
+        host.install_unavailable_pg_placement_transitions_batch(
+            &[UnavailablePgTransitionInstallRequest {
+                unavailable_transition: work.mutation_binding().clone(),
+                transfer,
+                expected_destination_epoch: destination_epoch,
+                publications,
+            }],
+            destination_epoch,
+        )
+        .unwrap();
     }
 
     fn run_reconciliation_across_durable_heartbeat_races<T: Send>(
@@ -2276,17 +2359,13 @@ mod tests {
                 ),
         ));
 
-        let transfer = PgMetadataTransferProof::new(
-            snapshot.cluster_epoch(),
-            crate::control_plane::PgMetadataProof::empty(),
+        let mut staging_receipts = std::collections::BTreeMap::new();
+        stage_and_install_unavailable_transition_for_test(
+            &mut host,
+            &work,
+            0x61,
+            &mut staging_receipts,
         );
-        let destination_epoch = ClusterEpoch::new(snapshot.cluster_epoch().get() + 1).unwrap();
-        host.install_unavailable_pg_transition_metadata_transfer(
-            work.mutation_binding().clone(),
-            transfer,
-            destination_epoch,
-        )
-        .unwrap();
         for &node_id in work.destination_acting_set() {
             heartbeat(
                 &mut host,
@@ -2388,15 +2467,12 @@ mod tests {
                     crate::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 10,
                 ),
         ));
-        host.install_unavailable_pg_transition_metadata_transfer(
-            direct_work.mutation_binding().clone(),
-            PgMetadataTransferProof::new(
-                direct_begin_snapshot.cluster_epoch(),
-                crate::control_plane::PgMetadataProof::empty(),
-            ),
-            ClusterEpoch::new(direct_begin_snapshot.cluster_epoch().get() + 1).unwrap(),
-        )
-        .unwrap();
+        stage_and_install_unavailable_transition_for_test(
+            &mut host,
+            &direct_work,
+            0x62,
+            &mut staging_receipts,
+        );
         for &node_id in direct_work.destination_acting_set() {
             heartbeat(
                 &mut host,

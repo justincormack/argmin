@@ -529,6 +529,7 @@ pub(super) mod pg_store_facade {
     #[cfg(test)]
     pub(crate) use super::pg_store::{
         canonical_nonempty_staged_metadata_transfer_artifact_for_test,
+        committed_staging_authorization_for_intent_at_epoch_for_test,
         committed_staging_authorization_for_intent_for_test,
         metadata_transfer_staging_checkpoint_page_digest,
         metadata_transfer_staging_closure_evidence_page_for_test,

@@ -527,10 +527,55 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
         ),
         (
             2196,
-            "d67aa11d97e31b59beb66ccdfd92ab21c518627cc6c3b090ae2e76562f64b0a7"
+            "6846e7ba9548151d70998673832f25a02be45e2b548541e8cd10a4d105a65eff"
                 .to_string()
         )
     );
+}
+
+#[test]
+fn historical_state_v43_command_v31_restart_v5_aggregate_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!(
+        "../../control_plane/testdata/raft_restart_v5_state_v43_command_v31.aggregate"
+    );
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            raft_test_hex(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            2_196,
+            "d67aa11d97e31b59beb66ccdfd92ab21c518627cc6c3b090ae2e76562f64b0a7".to_owned()
+        )
+    );
+
+    let mut offset = 0;
+    let mut artifact_count = 0;
+    let mut command_rejections = 0;
+    let mut state_rejections = 0;
+    while offset < AGGREGATE.len() {
+        let artifact_len = u32::from_be_bytes(
+            AGGREGATE[offset..offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset += std::mem::size_of::<u32>();
+        let artifact = &AGGREGATE[offset..offset + artifact_len];
+        offset += artifact_len;
+        let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
+        let rendered = error.to_string();
+        if rendered.contains("unsupported control-plane command version 31") {
+            command_rejections += 1;
+        } else if rendered.contains("unsupported control-plane state version 43") {
+            state_rejections += 1;
+        } else {
+            panic!("unexpected historical restart artifact rejection: {error:?}");
+        }
+        artifact_count += 1;
+    }
+    assert_eq!(artifact_count, 4);
+    assert!(command_rejections > 0);
+    assert!(state_rejections > 0);
 }
 
 #[test]
@@ -827,7 +872,7 @@ fn control_plane_raft_restart_v5_rejects_noncurrent_nested_versions() {
     };
     let encoded = artifact.encode_durable_artifact().unwrap();
 
-    for version in [16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32] {
+    for version in [16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33] {
         let previous =
             crate::control_plane_command::encode_control_plane_command_with_version_for_test(
                 &command, version,
@@ -856,7 +901,7 @@ fn control_plane_raft_restart_v5_rejects_noncurrent_nested_versions() {
             );
         }
     }
-    for version in [29, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44] {
+    for version in [29, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45] {
         let previous =
             crate::control_plane_command::reseal_control_plane_snapshot_state_version_for_test(
                 &current_snapshot,

@@ -777,7 +777,7 @@ mod tests {
             current_aggregate.extend_from_slice(current_frame);
         }
         const CURRENT_AGGREGATE: &[u8] = include_bytes!(
-            "../control_plane/testdata/storage_rpc_v27_command_v31_staging.aggregate"
+            "../control_plane/testdata/storage_rpc_v27_command_v32_staging.aggregate"
         );
         assert_eq!(
             (
@@ -786,12 +786,58 @@ mod tests {
                 current_aggregate.as_slice(),
             ),
             (
-                2_255,
-                "9ca433857dc2bb49bbbefae52b878c24c8e36f92db4f8a3d464ac9cf5bffd723"
+                2_295,
+                "0f2a0f262335f78cfb63ba8c7621b29b271550fed32995428121e7ffd28dc5b2"
                     .to_owned(),
                 CURRENT_AGGREGATE,
             )
         );
+        const HISTORICAL_COMMAND_V31_AGGREGATE: &[u8] = include_bytes!(
+            "../control_plane/testdata/storage_rpc_v27_command_v31_staging.aggregate"
+        );
+        assert_eq!(
+            (
+                HISTORICAL_COMMAND_V31_AGGREGATE.len(),
+                hex_bytes(&checksum::sha256::digest(
+                    HISTORICAL_COMMAND_V31_AGGREGATE
+                ))
+            ),
+            (
+                2_255,
+                "9ca433857dc2bb49bbbefae52b878c24c8e36f92db4f8a3d464ac9cf5bffd723"
+                    .to_owned()
+            )
+        );
+        let mut historical_remaining = HISTORICAL_COMMAND_V31_AGGREGATE;
+        while !historical_remaining.is_empty() {
+            let frame_len = usize::try_from(u32::from_be_bytes(
+                historical_remaining[..4].try_into().unwrap(),
+            ))
+            .unwrap();
+            let frame = decode_storage_rpc_frame(&historical_remaining[4..4 + frame_len]).unwrap();
+            historical_remaining = &historical_remaining[4 + frame_len..];
+            let error = match frame.kind {
+                StorageRpcMessageKind::MetadataTransferStagingIntentCreate =>
+                    decode_metadata_transfer_staging_intent_create_request(&frame.payload)
+                        .unwrap_err(),
+                StorageRpcMessageKind::MetadataTransferStagingArtifactPublish =>
+                    decode_metadata_transfer_staging_artifact_publish_request(&frame.payload)
+                        .unwrap_err(),
+                StorageRpcMessageKind::MetadataTransferStagingProofPublish =>
+                    decode_metadata_transfer_staging_proof_publish_request(&frame.payload)
+                        .unwrap_err(),
+                StorageRpcMessageKind::MetadataTransferStagingTombstone =>
+                    decode_metadata_transfer_staging_tombstone_request(&frame.payload).unwrap_err(),
+                StorageRpcMessageKind::MetadataTransferStagingArtifactRead =>
+                    decode_metadata_transfer_staging_artifact_read_request(&frame.payload)
+                        .unwrap_err(),
+                kind => panic!("unexpected historical staging operation {kind:?}"),
+            };
+            assert_eq!(
+                error.to_string(),
+                "invalid metadata-transfer staging request: committed authorization is invalid"
+            );
+        }
         let historical_create = decode_storage_rpc_frame(&decode_hex(
             HISTORICAL_V27_COMMAND_V30_STAGING_INTENT_CREATE_FRAME_HEX,
         ))

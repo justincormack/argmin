@@ -1424,6 +1424,7 @@ impl MetadataTransferStagingStore {
         &self,
         intent: &MetadataTransferStagingIntent,
         artifact: &[u8],
+        authorized_target_epoch: Option<ClusterEpoch>,
     ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
         self.validate_intent_limits(intent)?;
         if u64::try_from(artifact.len()).ok() != Some(intent.artifact_length)
@@ -1432,6 +1433,14 @@ impl MetadataTransferStagingStore {
             return Err(MetadataTransferStagingError::ArtifactMismatch);
         }
         let validated_artifact = validate_staged_artifact_for_publication(artifact, intent)?;
+        if authorized_target_epoch
+            .is_some_and(|target_epoch| target_epoch != validated_artifact.destination_epoch)
+        {
+            return Err(MetadataTransferStagingError::ArtifactSemanticMismatch(
+                "staged artifact destination epoch does not match committed authorization"
+                    .to_owned(),
+            ));
+        }
         let mut state = self.lock_state()?;
         let transaction = state
             .connection
@@ -1527,8 +1536,9 @@ impl MetadataTransferStagingStore {
         intent: &MetadataTransferStagingIntent,
         artifact: &[u8],
     ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
-        validate_committed_staging_authorization(&self.identity, authorization, intent)?;
-        self.publish_artifact_inner(intent, artifact)
+        let committed =
+            validate_committed_staging_authorization(&self.identity, authorization, intent)?;
+        self.publish_artifact_inner(intent, artifact, Some(committed.artifact_target_epoch))
     }
 
     #[cfg(test)]
@@ -1537,7 +1547,7 @@ impl MetadataTransferStagingStore {
         intent: &MetadataTransferStagingIntent,
         artifact: &[u8],
     ) -> Result<MetadataTransferStagingReceipt, MetadataTransferStagingError> {
-        self.publish_artifact_inner(intent, artifact)
+        self.publish_artifact_inner(intent, artifact, None)
     }
 
     fn publish_proof_for_epoch_inner(
@@ -3139,11 +3149,14 @@ fn require_exact_intent(
     Ok(())
 }
 
-fn validate_committed_staging_authorization(
+fn validate_committed_staging_authorization<'a>(
     actor: &MetadataTransferStagingNodeIdentity,
-    authorization: &CommittedUnavailablePgStagingAuthorization,
+    authorization: &'a CommittedUnavailablePgStagingAuthorization,
     intent: &MetadataTransferStagingIntent,
-) -> Result<(), MetadataTransferStagingError> {
+) -> Result<
+    &'a crate::control_plane_command::UnavailablePgStagingIntentAuthorizationRequest,
+    MetadataTransferStagingError,
+> {
     if authorization.destination_node_id() != actor.node_id()
         || authorization.pg_id() != intent.pg_id
     {
@@ -3174,7 +3187,7 @@ fn validate_committed_staging_authorization(
             "committed authorization does not match the exact staging intent".to_owned(),
         ));
     }
-    Ok(())
+    Ok(committed)
 }
 
 fn validate_staging_intent_shape(
@@ -5818,13 +5831,23 @@ mod tests {
         label: &[u8],
         binding: &UnavailablePgTransitionMutationBinding,
     ) -> &'static [u8] {
+        canonical_artifact_for_binding_at_epoch(
+            label,
+            binding,
+            ClusterEpoch::new(binding.transition_epoch().get().checked_add(1).unwrap()).unwrap(),
+        )
+    }
+
+    fn canonical_artifact_for_binding_at_epoch(
+        label: &[u8],
+        binding: &UnavailablePgTransitionMutationBinding,
+        destination_epoch: ClusterEpoch,
+    ) -> &'static [u8] {
         let source_route_epoch = binding.source_epoch().get();
         let source_epoch = ClusterEpoch::new(
             source_route_epoch - checksum::crc64::checksum(label) % source_route_epoch,
         )
         .unwrap();
-        let destination_epoch =
-            ClusterEpoch::new(binding.transition_epoch().get().checked_add(1).unwrap()).unwrap();
         let artifact = PgMetadataTransferArtifact {
             pg_id: binding.pg_id(),
             source_node_id: binding.source_acting_set()[0],
@@ -6657,6 +6680,36 @@ mod tests {
             NodeId::new(4),
         )
         .is_err());
+    }
+
+    #[test]
+    fn committed_authorization_rejects_artifact_bytes_for_a_different_target_epoch() {
+        let tmp = test_util::tempdir();
+        let store = open(tmp.path());
+        let binding = binding();
+        let authorized_target = ClusterEpoch::new(binding.transition_epoch().get() + 1).unwrap();
+        let encoded_target = ClusterEpoch::new(authorized_target.get() + 1).unwrap();
+        let artifact = canonical_artifact_for_binding_at_epoch(
+            b"wrong authorized target",
+            &binding,
+            encoded_target,
+        );
+        let intent = intent_for_binding(artifact, &binding);
+        let authorization =
+            crate::pg_store::committed_staging_authorization_for_intent_at_epoch_for_test(
+                &intent,
+                authorized_target,
+            );
+        store
+            .create_intent_authorized(&authorization, &intent)
+            .unwrap();
+
+        assert!(matches!(
+            store.publish_artifact_authorized(&authorization, &intent, artifact),
+            Err(MetadataTransferStagingError::ArtifactSemanticMismatch(message))
+                if message.contains("destination epoch does not match committed authorization")
+        ));
+        assert!(!store.artifact_path(&intent).exists());
     }
 
     #[test]

@@ -29,7 +29,8 @@ use crate::control_plane_command::{
     decode_control_plane_command, encode_control_plane_command, AppliedControlPlaneCommand,
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneCommandStateMachine,
     ControlPlaneLogId, ExpiredNodeHeartbeatLease, FinalizeMetadataTransferStagingGenerationRequest,
-    MetadataTransferStagingTombstoneBinding, PromotedNodeHeartbeatLease, ReadyPgPeeringCompletion,
+    MetadataTransferStagingCleanupDisposition, MetadataTransferStagingTombstoneBinding,
+    PromotedNodeHeartbeatLease, ReadyPgPeeringCompletion,
     UnavailablePgStagingIntentAuthorizationRequest, UnavailablePgStagingPublicationBinding,
     UnavailablePgTransitionBeginRequest, UnavailablePgTransitionCompletionRequest,
     UnavailablePgTransitionInstallRequest,
@@ -128,7 +129,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 22;
+const CONTROL_PLANE_RPC_VERSION: u16 = 23;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -140,11 +141,11 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 43;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 44;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 const METADATA_TRANSFER_STAGING_CLEANUP_DIGEST_DOMAIN: &[u8] =
-    b"argmin-metadata-transfer-staging-cleanup-v1";
+    b"argmin-metadata-transfer-staging-cleanup-v2";
 const METADATA_TRANSFER_STAGING_CHECKPOINT_SEGMENT_DIGEST_DOMAIN: &[u8] =
     b"argmin-metadata-transfer-staging-checkpoint-segment-v1";
 const METADATA_TRANSFER_STAGING_CHECKPOINT_SOURCE_SEGMENTS_DIGEST_DOMAIN: &[u8] =
@@ -1060,6 +1061,7 @@ fn metadata_transfer_staging_actor_closure_certificate_digest(
 struct MetadataTransferStagingFinalizedFloor {
     transition: UnavailablePgTransitionMutationBinding,
     staging_generation: u64,
+    disposition: MetadataTransferStagingCleanupDisposition,
     artifact_digest: [u8; 32],
     artifact_length: u64,
     artifact_format_version: u16,
@@ -1507,6 +1509,7 @@ pub struct UnavailablePgPlacementTransition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnavailablePgStagingIntentAuthorization {
     staging_generation: u64,
+    artifact_target_epoch: ClusterEpoch,
     artifact_digest: [u8; 32],
     artifact_length: u64,
     artifact_format_version: u16,
@@ -1784,6 +1787,7 @@ fn unavailable_pg_staging_authorization_batch_identity(
     for request in requests {
         digest_unavailable_pg_transition_binding(&mut hasher, &request.unavailable_transition);
         digest_u64(&mut hasher, request.staging_generation);
+        digest_u64(&mut hasher, request.artifact_target_epoch.get());
         digest_bytes(&mut hasher, &request.artifact_digest);
         digest_u64(&mut hasher, request.artifact_length);
         digest_u16(&mut hasher, request.artifact_format_version);
@@ -1861,6 +1865,7 @@ fn unavailable_pg_staging_authorization_request_from_durable(
             transition.destination_acting_set.clone(),
         ),
         staging_generation: authorization.staging_generation,
+        artifact_target_epoch: authorization.artifact_target_epoch,
         artifact_digest: authorization.artifact_digest,
         artifact_length: authorization.artifact_length,
         artifact_format_version: authorization.artifact_format_version,
@@ -1971,6 +1976,7 @@ fn digest_unavailable_pg_transition_binding(
 fn metadata_transfer_staging_cleanup_digest(
     transition: &UnavailablePgTransitionMutationBinding,
     staging_generation: u64,
+    disposition: MetadataTransferStagingCleanupDisposition,
     artifact_digest: [u8; 32],
     artifact_length: u64,
     artifact_format_version: u16,
@@ -1980,6 +1986,15 @@ fn metadata_transfer_staging_cleanup_digest(
     digest_bytes(&mut hasher, METADATA_TRANSFER_STAGING_CLEANUP_DIGEST_DOMAIN);
     digest_unavailable_pg_transition_binding(&mut hasher, transition);
     digest_u64(&mut hasher, staging_generation);
+    match disposition {
+        MetadataTransferStagingCleanupDisposition::Completed => digest_u8(&mut hasher, 0),
+        MetadataTransferStagingCleanupDisposition::Superseded {
+            successor_transition_epoch,
+        } => {
+            digest_u8(&mut hasher, 1);
+            digest_u64(&mut hasher, successor_transition_epoch.get());
+        }
+    }
     digest_bytes(&mut hasher, &artifact_digest);
     digest_u64(&mut hasher, artifact_length);
     digest_u16(&mut hasher, artifact_format_version);
@@ -2149,10 +2164,11 @@ pub struct UnavailablePgTransitionMutationBinding {
     destination_acting_set: Vec<NodeId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UnavailablePgReconciliationStage {
     MetadataTransfer,
     PayloadReadiness,
+    StagingCleanup,
 }
 
 impl UnavailablePgReconciliationWork {
@@ -2292,6 +2308,7 @@ pub(crate) struct UnavailablePgReconciliationScan {
 
 pub(crate) struct UnavailablePgReconciliationBatchScan {
     pub(crate) candidates: Vec<UnavailablePgReconciliationCandidate>,
+    pub(crate) cleanup_fallbacks: Vec<UnavailablePgReconciliationWork>,
     pub(crate) next_cursor: UnavailablePgReconciliationCursor,
 }
 
@@ -2307,8 +2324,15 @@ pub(crate) struct PreparedUnavailablePgCompletionBatch {
     pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
 }
 
+pub(crate) struct PreparedUnavailablePgInstallBatch {
+    pub(crate) command: Option<ControlPlaneCommand>,
+    pub(crate) included: Vec<UnavailablePgTransitionInstallRequest>,
+    pub(crate) rejected: Vec<(UnavailablePgTransitionInstallRequest, ControlPlaneError)>,
+}
+
 pub(crate) struct UnavailablePgReconciliationPollBatch {
     pub(crate) work: Vec<UnavailablePgReconciliationWork>,
+    pub(crate) cleanup_fallbacks: Vec<UnavailablePgReconciliationWork>,
     pub(crate) rejected: Vec<(PgId, ControlPlaneError)>,
 }
 
@@ -2316,6 +2340,7 @@ pub(crate) struct UnavailablePgReconciliationCompletionBatch {
     pub(crate) completed: Vec<UnavailablePgReconciliationWork>,
     pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
     pub(crate) rederive: Vec<UnavailablePgReconciliationWork>,
+    pub(crate) snapshot: ClusterControlSnapshot,
 }
 
 impl UnavailablePgPlacementTransition {
@@ -2376,6 +2401,33 @@ impl UnavailablePgPlacementTransition {
 }
 
 impl ClusterControlSnapshot {
+    pub(crate) fn next_cluster_epoch(&self) -> Result<ClusterEpoch, ControlPlaneError> {
+        next_epoch(self.cluster_epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn metadata_transfer_staging_is_finalized(
+        &self,
+        work: &UnavailablePgReconciliationWork,
+    ) -> bool {
+        self.metadata_transfer_staging_finalized_floors
+            .contains_key(&(work.pg_id(), work.transition_epoch().get()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn latest_retained_unavailable_pg_transition(
+        &self,
+        pg_id: PgId,
+    ) -> Option<&UnavailablePgPlacementTransition> {
+        self.retained_unavailable_pg_placement_transitions
+            .range((
+                std::ops::Bound::Included((pg_id, ClusterEpoch::INITIAL)),
+                std::ops::Bound::Included((pg_id, self.cluster_epoch)),
+            ))
+            .next_back()
+            .map(|(_, transition)| transition)
+    }
+
     pub(crate) fn empty() -> Self {
         Self {
             authority_incarnation: AuthorityIncarnation::INITIAL,
@@ -2433,6 +2485,33 @@ impl ClusterControlSnapshot {
             grant_not_after_ms,
         ));
         snapshot
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_rebind_singleton_staging_artifact_target_epoch(
+        &mut self,
+        pg_id: PgId,
+        artifact_target_epoch: ClusterEpoch,
+    ) {
+        let transition = self
+            .unavailable_pg_placement_transitions
+            .get_mut(&pg_id)
+            .expect("test staging transition is active");
+        let authorization = transition
+            .staging_authorization
+            .as_mut()
+            .expect("test staging transition is authorized");
+        assert_eq!(authorization.batch_receipt.identity.member_pg_ids, [pg_id]);
+        authorization.artifact_target_epoch = artifact_target_epoch;
+        let request = unavailable_pg_staging_authorization_request_from_durable(transition)
+            .expect("test staging authorization remains durable");
+        transition
+            .staging_authorization
+            .as_mut()
+            .unwrap()
+            .batch_receipt
+            .identity
+            .members_digest = unavailable_pg_staging_authorization_members_digest(&[request]);
     }
 
     #[must_use]
@@ -2593,22 +2672,35 @@ impl ClusterControlSnapshot {
             });
         let mut records = self.pgs.range((start, std::ops::Bound::Unbounded));
         let mut candidates = Vec::new();
+        let mut cleanup_fallbacks = Vec::new();
         let mut last_examined = None;
         for _ in 0..UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE {
             let Some((&pg_id, pg)) = records.next() else {
                 return UnavailablePgReconciliationBatchScan {
                     candidates,
+                    cleanup_fallbacks,
                     next_cursor: UnavailablePgReconciliationCursor::start(),
                 };
             };
             last_examined = Some(pg_id);
             if let Some(candidate) = self.unavailable_pg_reconciliation_candidate(pg_id, pg, now_ms)
             {
+                let primary_is_cleanup = matches!(
+                    &candidate,
+                    UnavailablePgReconciliationCandidate::Resume(work)
+                        if work.stage() == UnavailablePgReconciliationStage::StagingCleanup
+                );
                 candidates.push(candidate);
+                if !primary_is_cleanup {
+                    if let Some(cleanup) = self.unavailable_pg_reconciliation_cleanup_work(pg_id) {
+                        cleanup_fallbacks.push(cleanup);
+                    }
+                }
             }
         }
         UnavailablePgReconciliationBatchScan {
             candidates,
+            cleanup_fallbacks,
             next_cursor: UnavailablePgReconciliationCursor {
                 after_pg_id: last_examined,
             },
@@ -2647,16 +2739,54 @@ impl ClusterControlSnapshot {
                 unavailable_node_id,
             });
         }
-        active_transition.map(|transition| {
+        if let Some(transition) = active_transition {
             let stage = if transition.destination_epoch.is_some() {
                 UnavailablePgReconciliationStage::PayloadReadiness
             } else {
                 UnavailablePgReconciliationStage::MetadataTransfer
             };
-            UnavailablePgReconciliationCandidate::Resume(
+            return Some(UnavailablePgReconciliationCandidate::Resume(
                 UnavailablePgReconciliationWork::from_transition(transition, stage),
-            )
-        })
+            ));
+        }
+        self.unavailable_pg_reconciliation_cleanup_work(pg_id)
+            .map(UnavailablePgReconciliationCandidate::Resume)
+    }
+
+    fn unavailable_pg_reconciliation_cleanup_work(
+        &self,
+        pg_id: PgId,
+    ) -> Option<UnavailablePgReconciliationWork> {
+        self.retained_unavailable_pg_placement_transitions
+            .range((
+                std::ops::Bound::Included((pg_id, ClusterEpoch::INITIAL)),
+                std::ops::Bound::Included((pg_id, self.cluster_epoch)),
+            ))
+            .find(|((retained_pg_id, transition_epoch), transition)| {
+                *retained_pg_id == pg_id
+                    && transition.staging_authorization.is_some()
+                    && (transition.completion.is_some()
+                        || (transition.destination_epoch.is_none()
+                            && transition.destination_install.is_none()
+                            && self
+                                .retained_unavailable_pg_placement_transitions
+                                .values()
+                                .chain(self.unavailable_pg_placement_transitions.values())
+                                .any(|candidate| {
+                                    candidate.pg_id == pg_id
+                                        && candidate.predecessor_transition_epoch
+                                            == Some(transition.transition_epoch)
+                                })))
+                    && !self
+                        .metadata_transfer_staging_finalized_floors
+                        .contains_key(&(pg_id, transition_epoch.get()))
+            })
+            .map(|(_, transition)| {
+                UnavailablePgReconciliationWork::from_transition(
+                    transition,
+                    UnavailablePgReconciliationStage::StagingCleanup,
+                )
+            })
     }
 
     fn unavailable_replacement_grace_elapsed_for_pg(
@@ -3233,8 +3363,10 @@ impl ClusterControlSnapshot {
             .into_iter()
             .map(|request| {
                 let pg_id = request.unavailable_transition.pg_id();
+                let transition_epoch = request.unavailable_transition.transition_epoch();
                 if request.staging_generation
                     != request.unavailable_transition.transition_epoch().get()
+                    || request.artifact_target_epoch <= transition_epoch
                     || request.artifact_length == 0
                     || request.artifact_length
                         > crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES
@@ -3248,7 +3380,6 @@ impl ClusterControlSnapshot {
                         ),
                     });
                 }
-                let transition_epoch = request.unavailable_transition.transition_epoch();
                 let active_transition = self
                     .unavailable_pg_placement_transitions
                     .get(&pg_id)
@@ -3273,6 +3404,7 @@ impl ClusterControlSnapshot {
                 }
                 if let Some(existing) = &transition.staging_authorization {
                     if existing.staging_generation == request.staging_generation
+                        && existing.artifact_target_epoch == request.artifact_target_epoch
                         && existing.artifact_digest == request.artifact_digest
                         && existing.artifact_length == request.artifact_length
                         && existing.artifact_format_version == request.artifact_format_version
@@ -3302,6 +3434,7 @@ impl ClusterControlSnapshot {
                 }
                 let authorization = UnavailablePgStagingIntentAuthorization {
                     staging_generation: request.staging_generation,
+                    artifact_target_epoch: request.artifact_target_epoch,
                     artifact_digest: request.artifact_digest,
                     artifact_length: request.artifact_length,
                     artifact_format_version: request.artifact_format_version,
@@ -3458,15 +3591,63 @@ impl ClusterControlSnapshot {
         &self,
         work: &UnavailablePgReconciliationWork,
     ) -> Result<UnavailablePgStagingIntentAuthorizationRequest, ControlPlaneError> {
+        self.committed_unavailable_pg_staging_request_binding(work)
+            .map(|(request, _, _)| request)
+    }
+
+    pub(crate) fn committed_unavailable_pg_staging_request_binding(
+        &self,
+        work: &UnavailablePgReconciliationWork,
+    ) -> Result<
+        (
+            UnavailablePgStagingIntentAuthorizationRequest,
+            ClusterEpoch,
+            ClusterEpoch,
+        ),
+        ControlPlaneError,
+    > {
         let transition = self.exact_unavailable_pg_transition_for_reconciliation(work)?;
-        unavailable_pg_staging_authorization_request_from_durable(transition).ok_or_else(|| {
+        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
             ControlPlaneError::CommandDecode {
                 message: format!(
                     "PG {} staged transfer recovery has no durable staging authorization",
                     work.pg_id().get()
                 ),
             }
-        })
+        })?;
+        let request = unavailable_pg_staging_authorization_request_from_durable(transition)
+            .expect("staging authorization request exists with its durable authorization");
+        let target_epoch = authorization.artifact_target_epoch;
+        let source_epoch =
+            ClusterEpoch::new(target_epoch.get().checked_sub(1).ok_or_else(|| {
+                ControlPlaneError::invariant_failure(
+                    "staging artifact target epoch has no source runtime epoch",
+                )
+            })?)
+            .ok_or_else(|| {
+                ControlPlaneError::invariant_failure(
+                    "staging artifact target epoch has no source runtime epoch",
+                )
+            })?;
+        Ok((request, source_epoch, target_epoch))
+    }
+
+    pub(crate) fn committed_unavailable_pg_staged_transfer_if_present(
+        &self,
+        work: &UnavailablePgReconciliationWork,
+    ) -> Result<
+        Option<(
+            UnavailablePgStagingIntentAuthorizationRequest,
+            UnavailablePgTransitionInstallRequest,
+        )>,
+        ControlPlaneError,
+    > {
+        let transition = self.exact_unavailable_pg_transition_for_reconciliation(work)?;
+        let authorization = self.committed_unavailable_pg_staging_request(work)?;
+        Ok(
+            unavailable_pg_destination_install_request_from_durable(transition)
+                .map(|install| (authorization, install)),
+        )
     }
 
     #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged ownership.
@@ -3480,33 +3661,92 @@ impl ClusterControlSnapshot {
         ),
         ControlPlaneError,
     > {
-        let transition = self.exact_unavailable_pg_transition_for_reconciliation(work)?;
-        let authorization = self.committed_unavailable_pg_staging_request(work)?;
-        let install = unavailable_pg_destination_install_request_from_durable(transition)
+        self.committed_unavailable_pg_staged_transfer_if_present(work)?
             .ok_or_else(|| ControlPlaneError::CommandDecode {
                 message: format!(
                     "PG {} staged transfer recovery has no durable destination install",
                     work.pg_id().get()
                 ),
-            })?;
-        Ok((authorization, install))
+            })
     }
 
-    pub(crate) fn validate_completed_unavailable_pg_staging_cleanup(
+    pub(crate) fn committed_unavailable_pg_staging_cleanup(
         &self,
-        install: &UnavailablePgTransitionInstallRequest,
+        work: &UnavailablePgReconciliationWork,
+    ) -> Result<
+        (
+            UnavailablePgStagingIntentAuthorizationRequest,
+            MetadataTransferStagingCleanupDisposition,
+            Option<UnavailablePgTransitionInstallRequest>,
+        ),
+        ControlPlaneError,
+    > {
+        let transition = self.exact_unavailable_pg_transition_for_reconciliation(work)?;
+        let authorization = self.committed_unavailable_pg_staging_request(work)?;
+        if transition.completion.is_some() && transition.completion_batch_receipt.is_some() {
+            let install = unavailable_pg_destination_install_request_from_durable(transition)
+                .ok_or_else(|| {
+                    ControlPlaneError::invariant_failure(
+                        "completed staging cleanup transition has no destination install",
+                    )
+                })?;
+            return Ok((
+                authorization,
+                MetadataTransferStagingCleanupDisposition::Completed,
+                Some(install),
+            ));
+        }
+        if transition.destination_epoch.is_some() || transition.destination_install.is_some() {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} staging cancellation is not a superseded pre-install transition",
+                    work.pg_id().get()
+                ),
+            });
+        }
+        let mut successors = self
+            .retained_unavailable_pg_placement_transitions
+            .values()
+            .chain(self.unavailable_pg_placement_transitions.values())
+            .filter(|candidate| {
+                candidate.pg_id == transition.pg_id
+                    && candidate.predecessor_transition_epoch == Some(transition.transition_epoch)
+            });
+        let successor = successors
+            .next()
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} staging cancellation has no exact successor transition",
+                    work.pg_id().get()
+                ),
+            })?;
+        if successors.next().is_some() {
+            return Err(ControlPlaneError::invariant_failure(
+                "staging cancellation transition has multiple direct successors",
+            ));
+        }
+        Ok((
+            authorization,
+            MetadataTransferStagingCleanupDisposition::Superseded {
+                successor_transition_epoch: successor.transition_epoch,
+            },
+            None,
+        ))
+    }
+
+    pub(crate) fn validate_unavailable_pg_staging_cleanup(
+        &self,
+        binding: &UnavailablePgTransitionMutationBinding,
+        disposition: MetadataTransferStagingCleanupDisposition,
+        install: Option<&UnavailablePgTransitionInstallRequest>,
         staging_generation: u64,
     ) -> Result<CompletedUnavailablePgStagingCleanupAuthorization, ControlPlaneError> {
-        let pg_id = install.unavailable_transition.pg_id();
-        let transition_epoch = install.unavailable_transition.transition_epoch();
+        let pg_id = binding.pg_id();
+        let transition_epoch = binding.transition_epoch();
         let transition = self
             .retained_unavailable_pg_placement_transitions
             .get(&(pg_id, transition_epoch))
-            .filter(|transition| {
-                install
-                    .unavailable_transition
-                    .matches_transition(transition)
-            })
+            .filter(|transition| binding.matches_transition(transition))
             .ok_or_else(|| ControlPlaneError::CommandDecode {
                 message: format!(
                     "PG {} staging cleanup requires its exact retained transition",
@@ -3521,30 +3761,86 @@ impl ClusterControlSnapshot {
                 ),
             }
         })?;
-        let destination_install = transition.destination_install.as_ref().ok_or_else(|| {
-            ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} staging cleanup has no durable destination install",
-                    pg_id.get()
-                ),
-            }
-        })?;
-        if transition.destination_epoch != Some(install.expected_destination_epoch)
-            || authorization.staging_generation != staging_generation
-            || destination_install.transfer != install.transfer
-            || destination_install.publications != install.publications
-            || transition.completion.is_none()
-            || transition.completion_batch_receipt.is_none()
-        {
+        if authorization.staging_generation != staging_generation {
             return Err(ControlPlaneError::CommandDecode {
                 message: format!(
-                    "PG {} staging cleanup does not match its completed destination installation",
+                    "PG {} staging cleanup generation is not authorized",
                     pg_id.get()
                 ),
             });
         }
-        let mut destination_actors = install
-            .unavailable_transition
+        match disposition {
+            MetadataTransferStagingCleanupDisposition::Completed => {
+                let install = install.ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} completed staging cleanup has no install",
+                        pg_id.get()
+                    ),
+                })?;
+                let destination_install =
+                    transition.destination_install.as_ref().ok_or_else(|| {
+                        ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} staging cleanup has no durable destination install",
+                                pg_id.get()
+                            ),
+                        }
+                    })?;
+                if transition.destination_epoch != Some(install.expected_destination_epoch)
+                    || install.unavailable_transition != *binding
+                    || destination_install.transfer != install.transfer
+                    || destination_install.publications != install.publications
+                    || transition.completion.is_none()
+                    || transition.completion_batch_receipt.is_none()
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging cleanup does not match its completed destination installation",
+                            pg_id.get()
+                        ),
+                    });
+                }
+            }
+            MetadataTransferStagingCleanupDisposition::Superseded {
+                successor_transition_epoch,
+            } => {
+                if install.is_some()
+                    || transition.destination_epoch.is_some()
+                    || transition.destination_install.is_some()
+                    || transition.completion.is_some()
+                    || transition.completion_batch_receipt.is_some()
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging cancellation is not a superseded pre-install transition",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                let successor_matches = self
+                    .retained_unavailable_pg_placement_transitions
+                    .get(&(pg_id, successor_transition_epoch))
+                    .or_else(|| {
+                        self.unavailable_pg_placement_transitions
+                            .get(&pg_id)
+                            .filter(|candidate| {
+                                candidate.transition_epoch == successor_transition_epoch
+                            })
+                    })
+                    .is_some_and(|successor| {
+                        successor.predecessor_transition_epoch == Some(transition_epoch)
+                    });
+                if !successor_matches {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} staging cancellation does not match its direct successor",
+                            pg_id.get()
+                        ),
+                    });
+                }
+            }
+        }
+        let mut destination_actors = binding
             .destination_acting_set()
             .iter()
             .copied()
@@ -3958,7 +4254,108 @@ impl ClusterControlSnapshot {
         Ok(Some(next_snapshot))
     }
 
+    pub(crate) fn prepare_unavailable_pg_placement_install_batch(
+        &self,
+        transitions: &[UnavailablePgTransitionInstallRequest],
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<PreparedUnavailablePgInstallBatch, ControlPlaneError> {
+        self.prepare_unavailable_pg_placement_install_batch_with_replication_limit(
+            transitions,
+            expected_destination_epoch,
+            crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES,
+        )
+    }
+
+    fn prepare_unavailable_pg_placement_install_batch_with_replication_limit(
+        &self,
+        transitions: &[UnavailablePgTransitionInstallRequest],
+        expected_destination_epoch: ClusterEpoch,
+        max_encoded_entry_bytes: usize,
+    ) -> Result<PreparedUnavailablePgInstallBatch, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "destination installation preparation",
+            transitions
+                .iter()
+                .map(|request| request.unavailable_transition.pg_id()),
+        )?;
+        let mut included = Vec::new();
+        let mut rejected = Vec::new();
+        for candidate in transitions {
+            let singleton = match self
+                .install_unavailable_pg_placement_transitions_batch_command_unbounded(
+                    std::slice::from_ref(candidate),
+                    expected_destination_epoch,
+                ) {
+                Ok(command) => command,
+                Err(error) => {
+                    rejected.push((candidate.clone(), error));
+                    continue;
+                }
+            };
+            let singleton_len =
+                crate::control_plane_raft::control_plane_command_replication_encoded_len(
+                    &singleton,
+                )?;
+            if singleton_len > max_encoded_entry_bytes {
+                rejected.push((
+                    candidate.clone(),
+                    ControlPlaneError::invariant_failure(format!(
+                        "single PG {} unavailable transition installation encodes to {singleton_len} OpenRaft entry bytes, exceeding the replication-safe limit {max_encoded_entry_bytes}",
+                        candidate.unavailable_transition.pg_id().get()
+                    )),
+                ));
+                continue;
+            }
+
+            let mut tentative = included.clone();
+            tentative.push(candidate.clone());
+            let command = self
+                .install_unavailable_pg_placement_transitions_batch_command_unbounded(
+                    &tentative,
+                    expected_destination_epoch,
+                )?;
+            let encoded_len =
+                crate::control_plane_raft::control_plane_command_replication_encoded_len(&command)?;
+            if encoded_len > max_encoded_entry_bytes {
+                break;
+            }
+            included = tentative;
+        }
+
+        let command = if included.is_empty() {
+            None
+        } else {
+            Some(
+                self.install_unavailable_pg_placement_transitions_batch_command_unbounded(
+                    &included,
+                    expected_destination_epoch,
+                )?,
+            )
+        };
+        Ok(PreparedUnavailablePgInstallBatch {
+            command,
+            included,
+            rejected,
+        })
+    }
+
     pub fn install_unavailable_pg_placement_transitions_batch_command(
+        &self,
+        transitions: &[UnavailablePgTransitionInstallRequest],
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        let command = self.install_unavailable_pg_placement_transitions_batch_command_unbounded(
+            transitions,
+            expected_destination_epoch,
+        )?;
+        self.validate_replication_safe_unavailable_pg_batch_command(
+            "destination installation",
+            &command,
+        )?;
+        Ok(command)
+    }
+
+    fn install_unavailable_pg_placement_transitions_batch_command_unbounded(
         &self,
         transitions: &[UnavailablePgTransitionInstallRequest],
         expected_destination_epoch: ClusterEpoch,
@@ -3973,10 +4370,7 @@ impl ClusterControlSnapshot {
             transitions: transitions.to_vec(),
             expected_destination_epoch,
         };
-        self.validate_replication_safe_unavailable_pg_batch_command(
-            "destination installation",
-            &command,
-        )?;
+        self.apply_control_plane_command(command.clone())?;
         Ok(command)
     }
 
@@ -4518,6 +4912,40 @@ impl ClusterControlSnapshot {
         Ok(())
     }
 
+    fn validate_metadata_transfer_staging_finalized_evidence_retention(
+        &self,
+        key: &MetadataTransferStagingEvidenceKey,
+        evidence_digest: [u8; 32],
+        expected_endpoint: &str,
+        binding: Option<&MetadataTransferStagingFinalizedCheckpointBinding>,
+    ) -> Result<(), String> {
+        if let Some(binding) = binding {
+            return self.validate_metadata_transfer_staging_finalized_checkpoint_binding(
+                key,
+                evidence_digest,
+                expected_endpoint,
+                binding,
+            );
+        }
+        let bytes = self
+            .metadata_transfer_staging_evidence
+            .get(key)
+            .ok_or_else(|| {
+                "metadata-transfer staging finalized evidence has neither detail nor checkpoint binding"
+                    .to_owned()
+            })?;
+        let evidence =
+            crate::pg_store::decode_staging_evidence(bytes).map_err(|error| error.to_string())?;
+        if checksum::sha256::digest(bytes) != evidence_digest
+            || evidence.actor().endpoint() != expected_endpoint
+        {
+            return Err(
+                "metadata-transfer staging finalized detailed evidence is not exact".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     fn validate_metadata_transfer_staging_evidence_invariants(&self) -> Result<(), String> {
         let mut page_members = BTreeMap::new();
         let mut finalized_page_members = BTreeSet::new();
@@ -4621,12 +5049,6 @@ impl ClusterControlSnapshot {
                 )
                 .is_some_and(|floor| evidence_key.staging_generation <= floor);
                 if finalized_replay {
-                    if !actor_has_closure_candidate {
-                        return Err(
-                            "metadata-transfer staging page retains evidence at or below its finalized floor without actor rollover"
-                                .to_owned(),
-                        );
-                    }
                     let floor = self
                         .metadata_transfer_staging_finalized_floors
                         .get(&(evidence_key.pg_id, evidence_key.staging_generation))
@@ -4634,14 +5056,39 @@ impl ClusterControlSnapshot {
                             "metadata-transfer staging page replay has no exact finalized certificate"
                                 .to_owned()
                         })?;
+                    if !actor_has_closure_candidate
+                        && floor.checkpoint_bindings.contains_key(&evidence_key)
+                    {
+                        return Err(
+                            "metadata-transfer staging page retains checkpointed evidence at or below its finalized floor without actor rollover"
+                                .to_owned(),
+                        );
+                    }
                     let expected = metadata_transfer_staging_finalized_semantic_evidence_bytes(
                         floor,
                         evidence.actor(),
                         evidence.kind(),
                         evidence.target_epoch(),
                     )?;
-                    if expected != entry.evidence() || !finalized_page_members.insert(evidence_key)
+                    if expected != entry.evidence() {
+                        return Err(
+                            "metadata-transfer staging page does not exactly replay finalized evidence"
+                                .to_owned(),
+                        );
+                    }
+                    if self.metadata_transfer_staging_evidence.get(&evidence_key)
+                        == Some(&entry.evidence().to_vec())
                     {
+                        if page_members
+                            .insert(evidence_key, entry.evidence().to_vec())
+                            .is_some()
+                        {
+                            return Err(
+                                "metadata-transfer staging finalized evidence appears in more than one retained page"
+                                    .to_owned(),
+                            );
+                        }
+                    } else if !finalized_page_members.insert(evidence_key) {
                         return Err(
                             "metadata-transfer staging page does not exactly replay unique finalized evidence"
                                 .to_owned(),
@@ -5025,7 +5472,8 @@ impl ClusterControlSnapshot {
             if *pg_id != floor.transition.pg_id()
                 || *staging_generation != floor.staging_generation
                 || floor.staging_generation != floor.transition.transition_epoch().get()
-                || floor.publications.is_empty()
+                || (floor.disposition == MetadataTransferStagingCleanupDisposition::Completed
+                    && floor.publications.is_empty())
                 || floor.publications.windows(2).any(|pair| {
                     (pair[0].target_epoch, pair[0].node_id)
                         >= (pair[1].target_epoch, pair[1].node_id)
@@ -5039,6 +5487,7 @@ impl ClusterControlSnapshot {
                     != metadata_transfer_staging_cleanup_digest(
                         &floor.transition,
                         floor.staging_generation,
+                        floor.disposition,
                         floor.artifact_digest,
                         floor.artifact_length,
                         floor.artifact_format_version,
@@ -5058,14 +5507,47 @@ impl ClusterControlSnapshot {
                     "metadata-transfer staging finalized floor has no exact retained transition"
                         .to_owned()
                 })?;
-            if transition.destination_epoch.is_none()
-                || transition.completion.is_none()
-                || transition.completion_batch_receipt.is_none()
-            {
-                return Err(
-                    "metadata-transfer staging finalized floor transition is not completed"
-                        .to_owned(),
-                );
+            match floor.disposition {
+                MetadataTransferStagingCleanupDisposition::Completed => {
+                    if transition.destination_epoch.is_none()
+                        || transition.completion.is_none()
+                        || transition.completion_batch_receipt.is_none()
+                    {
+                        return Err(
+                            "metadata-transfer staging finalized floor transition is not completed"
+                                .to_owned(),
+                        );
+                    }
+                }
+                MetadataTransferStagingCleanupDisposition::Superseded {
+                    successor_transition_epoch,
+                } => {
+                    let successor_matches = self
+                        .retained_unavailable_pg_placement_transitions
+                        .get(&(*pg_id, successor_transition_epoch))
+                        .or_else(|| {
+                            self.unavailable_pg_placement_transitions.get(pg_id).filter(
+                                |candidate| {
+                                    candidate.transition_epoch == successor_transition_epoch
+                                },
+                            )
+                        })
+                        .is_some_and(|successor| {
+                            successor.predecessor_transition_epoch
+                                == Some(transition.transition_epoch)
+                        });
+                    if transition.destination_epoch.is_some()
+                        || transition.destination_install.is_some()
+                        || transition.completion.is_some()
+                        || transition.completion_batch_receipt.is_some()
+                        || !successor_matches
+                    {
+                        return Err(
+                            "metadata-transfer staging finalized floor cancellation is not an exact pre-install successor"
+                                .to_owned(),
+                        );
+                    }
+                }
             }
             let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
                 "metadata-transfer staging finalized floor has no retained authorization".to_owned()
@@ -5091,9 +5573,15 @@ impl ClusterControlSnapshot {
                         .to_owned(),
                 );
             }
-            let install = transition.destination_install.as_ref().ok_or_else(|| {
-                "metadata-transfer staging finalized floor has no destination install".to_owned()
-            })?;
+            let install = transition.destination_install.as_ref();
+            if floor.disposition == MetadataTransferStagingCleanupDisposition::Completed
+                && install.is_none()
+            {
+                return Err(
+                    "metadata-transfer staging finalized floor has no destination install"
+                        .to_owned(),
+                );
+            }
             let mut expected_checkpoint_keys = BTreeSet::new();
             let mut publication_transfers = BTreeMap::new();
             for publication in &floor.publications {
@@ -5134,15 +5622,11 @@ impl ClusterControlSnapshot {
                     target_epoch: Some(publication.target_epoch),
                 };
                 expected_checkpoint_keys.insert(key.clone());
-                let binding = floor.checkpoint_bindings.get(&key).ok_or_else(|| {
-                    "metadata-transfer staging finalized publication has no checkpoint binding"
-                        .to_owned()
-                })?;
-                self.validate_metadata_transfer_staging_finalized_checkpoint_binding(
+                self.validate_metadata_transfer_staging_finalized_evidence_retention(
                     &key,
                     publication.evidence_digest,
                     &publication.endpoint,
-                    binding,
+                    floor.checkpoint_bindings.get(&key),
                 )?;
             }
             if publication_transfers.len() > crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT {
@@ -5151,28 +5635,30 @@ impl ClusterControlSnapshot {
                     crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
                 ));
             }
-            let final_publications = floor
-                .publications
-                .iter()
-                .filter(|publication| {
-                    publication.target_epoch == install.batch_receipt.target_epoch
-                })
-                .collect::<Vec<_>>();
-            if final_publications.len() != install.publications.len()
-                || install.publications.iter().any(|installed| {
-                    !final_publications.iter().any(|publication| {
-                        publication.node_id == installed.node_id
-                            && publication.node_incarnation == installed.node_incarnation
-                            && publication.endpoint == installed.endpoint
-                            && publication.evidence_digest == installed.evidence_digest
-                            && publication.transfer == install.transfer
+            if let Some(install) = install {
+                let final_publications = floor
+                    .publications
+                    .iter()
+                    .filter(|publication| {
+                        publication.target_epoch == install.batch_receipt.target_epoch
                     })
-                })
-            {
-                return Err(
-                    "metadata-transfer staging finalized publication does not match its destination install"
-                        .to_owned(),
-                );
+                    .collect::<Vec<_>>();
+                if final_publications.len() != install.publications.len()
+                    || install.publications.iter().any(|installed| {
+                        !final_publications.iter().any(|publication| {
+                            publication.node_id == installed.node_id
+                                && publication.node_incarnation == installed.node_incarnation
+                                && publication.endpoint == installed.endpoint
+                                && publication.evidence_digest == installed.evidence_digest
+                                && publication.transfer == install.transfer
+                        })
+                    })
+                {
+                    return Err(
+                        "metadata-transfer staging finalized publication does not match its destination install"
+                            .to_owned(),
+                    );
+                }
             }
             for tombstone in &floor.tombstones {
                 let node = self.nodes.get(&tombstone.node_id).ok_or_else(|| {
@@ -5197,23 +5683,19 @@ impl ClusterControlSnapshot {
                     target_epoch: None,
                 };
                 expected_checkpoint_keys.insert(key.clone());
-                let binding = floor.checkpoint_bindings.get(&key).ok_or_else(|| {
-                    "metadata-transfer staging finalized floor tombstone has no checkpoint binding"
-                        .to_owned()
-                })?;
-                self.validate_metadata_transfer_staging_finalized_checkpoint_binding(
+                self.validate_metadata_transfer_staging_finalized_evidence_retention(
                     &key,
                     tombstone.evidence_digest,
                     &tombstone.endpoint,
-                    binding,
+                    floor.checkpoint_bindings.get(&key),
                 )?;
             }
-            if !expected_checkpoint_keys
-                .iter()
-                .all(|key| floor.checkpoint_bindings.contains_key(key))
-            {
+            if !expected_checkpoint_keys.iter().all(|key| {
+                floor.checkpoint_bindings.contains_key(key)
+                    || self.metadata_transfer_staging_evidence.contains_key(key)
+            }) {
                 return Err(
-                    "metadata-transfer staging finalized floor lacks an original evidence checkpoint binding"
+                    "metadata-transfer staging finalized floor lacks retained evidence authority"
                         .to_owned(),
                 );
             }
@@ -6514,16 +6996,18 @@ impl ClusterControlSnapshot {
         let segment_digest = metadata_transfer_staging_checkpoint_segment_digest(&segment);
         let mut finalized_replay_bindings = Vec::new();
         for (key, evidence_digest) in &segment.commitments {
-            if self.metadata_transfer_staging_evidence.contains_key(key) {
-                continue;
-            }
-            let floor = self
+            let Some(floor) = self
                 .metadata_transfer_staging_finalized_floors
                 .get(&(key.pg_id, key.staging_generation))
-                .ok_or_else(|| ControlPlaneError::SnapshotInvariantViolation {
+            else {
+                if self.metadata_transfer_staging_evidence.contains_key(key) {
+                    continue;
+                }
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
                     context: "retained metadata-transfer staging evidence page",
                     message: "page member lacks detailed or exact finalized evidence".to_owned(),
-                })?;
+                });
+            };
             let expected = metadata_transfer_staging_finalized_semantic_evidence_bytes(
                 floor,
                 &segment.actor,
@@ -6592,6 +7076,9 @@ impl ClusterControlSnapshot {
             .metadata_transfer_staging_evidence_checkpoint_segments
             .insert(segment_key, segment);
         for (floor_key, evidence_key, binding) in finalized_replay_bindings {
+            next_snapshot
+                .metadata_transfer_staging_evidence
+                .remove(&evidence_key);
             let floor = next_snapshot
                 .metadata_transfer_staging_finalized_floors
                 .get_mut(&floor_key)
@@ -7427,16 +7914,45 @@ impl ClusterControlSnapshot {
                     pg_id.get()
                 ),
             })?;
-        if transition.destination_epoch.is_none()
-            || transition.completion.is_none()
-            || transition.completion_batch_receipt.is_none()
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging cleanup requires its exact completed transition",
-                    pg_id.get()
-                ),
-            });
+        match cleanup.disposition {
+            MetadataTransferStagingCleanupDisposition::Completed => {
+                if transition.destination_epoch.is_none()
+                    || transition.completion.is_none()
+                    || transition.completion_batch_receipt.is_none()
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} metadata-transfer staging cleanup requires its exact completed transition",
+                            pg_id.get()
+                        ),
+                    });
+                }
+            }
+            MetadataTransferStagingCleanupDisposition::Superseded {
+                successor_transition_epoch,
+            } => {
+                let successor_matches = self
+                    .retained_unavailable_pg_placement_transitions
+                    .get(&(pg_id, successor_transition_epoch))
+                    .or_else(|| {
+                        self.unavailable_pg_placement_transitions
+                            .get(&pg_id)
+                            .filter(|candidate| {
+                                candidate.transition_epoch == successor_transition_epoch
+                            })
+                    })
+                    .is_some_and(|successor| {
+                        successor.predecessor_transition_epoch == Some(transition.transition_epoch)
+                    });
+                if transition.completion.is_some() || !successor_matches {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} metadata-transfer staging cancellation requires its exact successor transition",
+                            pg_id.get()
+                        ),
+                    });
+                }
+            }
         }
         let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
             ControlPlaneError::CommandDecode {
@@ -7472,6 +7988,7 @@ impl ClusterControlSnapshot {
         let tombstone_set_digest = metadata_transfer_staging_cleanup_digest(
             &transition_binding,
             staging_generation,
+            cleanup.disposition,
             authorization.artifact_digest,
             authorization.artifact_length,
             authorization.artifact_format_version,
@@ -7484,6 +8001,7 @@ impl ClusterControlSnapshot {
         {
             if existing.transition == transition_binding
                 && existing.staging_generation == staging_generation
+                && existing.disposition == cleanup.disposition
                 && existing.artifact_digest == authorization.artifact_digest
                 && existing.artifact_length == authorization.artifact_length
                 && existing.artifact_format_version == authorization.artifact_format_version
@@ -7603,12 +8121,7 @@ impl ClusterControlSnapshot {
                 .iter()
                 .find(|(_, segment)| segment.commitments.contains_key(key))
             else {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} metadata-transfer staging cleanup evidence is not checkpoint-covered",
-                        pg_id.get()
-                    ),
-                });
+                continue;
             };
             let evidence_digest = checksum::sha256::digest(
                 self.metadata_transfer_staging_evidence
@@ -7737,9 +8250,11 @@ impl ClusterControlSnapshot {
             })
             .collect::<Result<Vec<_>, ControlPlaneError>>()?;
         publications.sort_by_key(|publication| (publication.target_epoch, publication.node_id));
+        let checkpointed_keys = checkpoint_bindings.keys().cloned().collect::<Vec<_>>();
         let certificate = MetadataTransferStagingFinalizedFloor {
             transition: transition_binding,
             staging_generation,
+            disposition: cleanup.disposition,
             artifact_digest: authorization.artifact_digest,
             artifact_length: authorization.artifact_length,
             artifact_format_version: authorization.artifact_format_version,
@@ -7750,7 +8265,7 @@ impl ClusterControlSnapshot {
         };
 
         let mut next_snapshot = self.clone();
-        for key in covered_keys {
+        for key in checkpointed_keys {
             next_snapshot
                 .metadata_transfer_staging_evidence
                 .remove(&key);
@@ -7906,6 +8421,19 @@ impl ClusterControlSnapshot {
         work: &[UnavailablePgReconciliationWork],
         ready_at_ms: u64,
     ) -> Result<PreparedUnavailablePgCompletionBatch, ControlPlaneError> {
+        self.prepare_unavailable_pg_placement_completion_batch_with_replication_limit(
+            work,
+            ready_at_ms,
+            crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES,
+        )
+    }
+
+    fn prepare_unavailable_pg_placement_completion_batch_with_replication_limit(
+        &self,
+        work: &[UnavailablePgReconciliationWork],
+        ready_at_ms: u64,
+        max_encoded_entry_bytes: usize,
+    ) -> Result<PreparedUnavailablePgCompletionBatch, ControlPlaneError> {
         validate_canonical_unavailable_pg_batch(
             "completion preparation",
             work.iter().map(UnavailablePgReconciliationWork::pg_id),
@@ -7935,14 +8463,14 @@ impl ClusterControlSnapshot {
             )?;
             let encoded_len =
                 crate::control_plane_raft::control_plane_command_replication_encoded_len(&command)?;
-            if encoded_len > crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
+            if encoded_len > max_encoded_entry_bytes {
                 if included.is_empty() {
                     rejected.push((
                         candidate.clone(),
                         ControlPlaneError::invariant_failure(format!(
                             "single PG {} unavailable transition completion encodes to {encoded_len} OpenRaft entry bytes, exceeding the replication-safe limit {}",
                             candidate.pg_id().get(),
-                            crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+                            max_encoded_entry_bytes
                         )),
                     ));
                     continue;
@@ -11177,24 +11705,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 acting_set,
                 transfer,
                 expected_destination_epoch,
-                unavailable_transition,
             } => {
-                validate_unavailable_transition_mutation_binding(
-                    self,
-                    pg_id,
-                    unavailable_transition.as_ref(),
-                )?;
-                if unavailable_transition
-                    .as_ref()
-                    .is_some_and(|binding| acting_set != binding.destination_acting_set)
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} metadata transfer does not match its unavailable placement destination",
-                            pg_id.get()
-                        ),
-                    });
-                }
+                validate_unavailable_transition_mutation_binding(self, pg_id, None)?;
                 validate_acting_set(self, pg_id, &acting_set)?;
                 validate_acting_set_preserves_pending_recovery(self, pg_id, &acting_set)?;
                 let record = self
@@ -11283,11 +11795,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     transfer,
                 })?;
                 let source_route_epoch = self.cluster_epoch;
-                let source_node_id = if let Some(transition) =
-                    self.unavailable_pg_placement_transitions.get(&pg_id)
-                {
-                    transition.source_node_id
-                } else {
+                let source_node_id =
                     match state {
                         PgState::Active => record.active_primary.ok_or(
                             ControlPlaneError::PgHasNoServingPrimary {
@@ -11305,8 +11813,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                                 pg_id: pg_id.get(),
                             });
                         }
-                    }
-                };
+                    };
 
                 let mut next_snapshot = self.clone();
                 let record = next_snapshot
@@ -11333,14 +11840,6 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 record.metadata_transfer_fence_source_lease_deadline_ms = None;
                 record.metadata_transfer_fence_source_imported = false;
                 record.metadata_transfer_fence_epoch = None;
-                let destination_route = HistoricalPgRouteRecord::from(&*record);
-                if let Some(transition) = next_snapshot
-                    .unavailable_pg_placement_transitions
-                    .get_mut(&pg_id)
-                {
-                    transition.destination_epoch = Some(expected_destination_epoch);
-                    transition.destination_route = Some(destination_route);
-                }
                 next_snapshot.bump_epoch()?;
                 Ok(applied_control_plane_command(
                     self,
@@ -12522,6 +13021,7 @@ fn validate_unavailable_pg_transition_invariant(
                 .copied()
         });
         if authorization.staging_generation != transition.transition_epoch.get()
+            || authorization.artifact_target_epoch <= transition.transition_epoch
             || authorization.artifact_length == 0
             || authorization.artifact_length
                 > crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES
@@ -16374,19 +16874,6 @@ pub trait ControlPlaneAdmin {
         expected_destination_epoch: ClusterEpoch,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
 
-    fn install_unavailable_pg_transition_metadata_transfer(
-        &mut self,
-        binding: UnavailablePgTransitionMutationBinding,
-        transfer: PgMetadataTransferProof,
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let _ = (binding, transfer, expected_destination_epoch);
-        Err(ControlPlaneError::rpc_remote(
-            "unavailable PG transition metadata transfer is not supported by this authority"
-                .to_owned(),
-        ))
-    }
-
     fn transfer_raft_leadership_to(&mut self, node_id: u64) -> Result<(), ControlPlaneError> {
         let _ = node_id;
         Err(ControlPlaneError::rpc_remote(
@@ -16835,6 +17322,12 @@ fn format_metadata_transfer_staging_finalized_floor(
         format_node_list(floor.transition.source_acting_set()),
         format_node_list(floor.transition.destination_acting_set()),
         floor.staging_generation.to_string(),
+        match floor.disposition {
+            MetadataTransferStagingCleanupDisposition::Completed => "completed".to_owned(),
+            MetadataTransferStagingCleanupDisposition::Superseded {
+                successor_transition_epoch,
+            } => format!("superseded:{}", successor_transition_epoch.get()),
+        },
         hex_encode(&floor.artifact_digest),
         floor.artifact_length.to_string(),
         floor.artifact_format_version.to_string(),
@@ -16854,15 +17347,31 @@ fn parse_metadata_transfer_staging_finalized_floor(
     value: &str,
 ) -> Result<MetadataTransferStagingFinalizedFloor, ControlPlaneError> {
     let fields = value.split(',').collect::<Vec<_>>();
-    if fields.len() != 16 {
+    if fields.len() != 17 {
         return Err(parse_error(
             line,
-            "metadata-transfer staging finalized floor must have sixteen fields",
+            "metadata-transfer staging finalized floor must have seventeen fields",
         ));
     }
+    let disposition = if fields[6] == "completed" {
+        MetadataTransferStagingCleanupDisposition::Completed
+    } else if let Some(epoch) = fields[6].strip_prefix("superseded:") {
+        MetadataTransferStagingCleanupDisposition::Superseded {
+            successor_transition_epoch: parse_required_cluster_epoch(
+                line,
+                epoch,
+                "staging finalized-floor successor transition epoch",
+            )?,
+        }
+    } else {
+        return Err(parse_error(
+            line,
+            "metadata-transfer staging finalized floor disposition is invalid",
+        ));
+    };
     let publication_count = usize::try_from(parse_u64(
         line,
-        fields[9],
+        fields[10],
         "staging finalized-floor publication count",
     )?)
     .map_err(|_| {
@@ -16871,10 +17380,10 @@ fn parse_metadata_transfer_staging_finalized_floor(
             "staging finalized-floor publication count does not fit usize",
         )
     })?;
-    let publications = if fields[10].is_empty() {
+    let publications = if fields[11].is_empty() {
         Vec::new()
     } else {
-        fields[10]
+        fields[11]
             .split(';')
             .map(|encoded| {
                 let parts = encoded.split('/').collect::<Vec<_>>();
@@ -16955,7 +17464,7 @@ fn parse_metadata_transfer_staging_finalized_floor(
     }
     let tombstone_count = usize::try_from(parse_u64(
         line,
-        fields[12],
+        fields[13],
         "staging finalized-floor tombstone count",
     )?)
     .map_err(|_| {
@@ -16964,10 +17473,10 @@ fn parse_metadata_transfer_staging_finalized_floor(
             "staging finalized-floor tombstone count does not fit usize",
         )
     })?;
-    let tombstones = if fields[13].is_empty() {
+    let tombstones = if fields[14].is_empty() {
         Vec::new()
     } else {
-        fields[13]
+        fields[14]
             .split(';')
             .map(|encoded| {
                 let parts = encoded.split('/').collect::<Vec<_>>();
@@ -17012,7 +17521,7 @@ fn parse_metadata_transfer_staging_finalized_floor(
     }
     let checkpoint_binding_count = usize::try_from(parse_u64(
         line,
-        fields[14],
+        fields[15],
         "staging finalized-floor checkpoint-binding count",
     )?)
     .map_err(|_| {
@@ -17022,8 +17531,8 @@ fn parse_metadata_transfer_staging_finalized_floor(
         )
     })?;
     let mut checkpoint_bindings = BTreeMap::new();
-    if !fields[15].is_empty() {
-        for encoded in fields[15].split(';') {
+    if !fields[16].is_empty() {
+        for encoded in fields[16].split(';') {
             let parts = encoded.split('/').collect::<Vec<_>>();
             if parts.len() != 15 {
                 return Err(parse_error(
@@ -17155,20 +17664,21 @@ fn parse_metadata_transfer_staging_finalized_floor(
             parse_node_list(line, fields[4])?,
         ),
         staging_generation: parse_u64(line, fields[5], "staging finalized-floor generation")?,
-        artifact_digest: hex_decode(line, fields[6])?.try_into().map_err(|_| {
+        disposition,
+        artifact_digest: hex_decode(line, fields[7])?.try_into().map_err(|_| {
             parse_error(
                 line,
                 "staging finalized-floor artifact digest must contain 32 bytes",
             )
         })?,
-        artifact_length: parse_u64(line, fields[7], "staging finalized-floor artifact length")?,
+        artifact_length: parse_u64(line, fields[8], "staging finalized-floor artifact length")?,
         artifact_format_version: parse_u16(
             line,
-            fields[8],
+            fields[9],
             "staging finalized-floor artifact format version",
         )?,
         publications,
-        tombstone_set_digest: hex_decode(line, fields[11])?.try_into().map_err(|_| {
+        tombstone_set_digest: hex_decode(line, fields[12])?.try_into().map_err(|_| {
             parse_error(
                 line,
                 "staging finalized-floor tombstone-set digest must contain 32 bytes",
@@ -17761,8 +18271,9 @@ fn format_unavailable_pg_staging_authorization(
     authorization: &UnavailablePgStagingIntentAuthorization,
 ) -> String {
     format!(
-        "{},{},{},{},{}",
+        "{},{},{},{},{},{}",
         authorization.staging_generation,
+        authorization.artifact_target_epoch.get(),
         hex_encode(&authorization.artifact_digest),
         authorization.artifact_length,
         authorization.artifact_format_version,
@@ -19757,21 +20268,26 @@ fn parse_unavailable_pg_staging_authorization(
     let encoded = String::from_utf8(hex_decode(line, value)?)
         .map_err(|_| parse_error(line, "staging authorization is not UTF-8"))?;
     let fields = encoded.split(',').collect::<Vec<_>>();
-    if fields.len() != 5 {
+    if fields.len() != 6 {
         return Err(parse_error(
             line,
-            "staging authorization must have five fields",
+            "staging authorization must have six fields",
         ));
     }
-    let artifact_digest = hex_decode(line, fields[1])?
+    let artifact_digest = hex_decode(line, fields[2])?
         .try_into()
         .map_err(|_| parse_error(line, "staging artifact digest must contain 32 bytes"))?;
     Ok(Some(UnavailablePgStagingIntentAuthorization {
         staging_generation: parse_u64(line, fields[0], "staging generation")?,
+        artifact_target_epoch: parse_required_cluster_epoch(
+            line,
+            fields[1],
+            "staging artifact target epoch",
+        )?,
         artifact_digest,
-        artifact_length: parse_u64(line, fields[2], "staging artifact length")?,
-        artifact_format_version: parse_u16(line, fields[3], "staging artifact format version")?,
-        batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[4])?,
+        artifact_length: parse_u64(line, fields[3], "staging artifact length")?,
+        artifact_format_version: parse_u16(line, fields[4], "staging artifact format version")?,
+        batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[5])?,
     }))
 }
 

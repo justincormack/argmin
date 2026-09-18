@@ -1083,6 +1083,13 @@ trusting the command builder. Receipt evidence is consumed by install but
 retained through terminal import and cleanup evidence so replay and failover
 remain independently verifiable.
 
+The committed authorization also binds the target epoch encoded in the initial
+artifact bytes. Destination publication decodes the canonical artifact before
+mutation and rejects a target different from `artifact_target_epoch`; restart
+recovery repeats that comparison after exact digest/length retrieval. Later
+lightweight proof rebasing remains an explicit, separately evidenced operation
+and cannot change which initial artifact the authorization admitted.
+
 The staging authorization creates one cleanup obligation for every destination
 in its exact authorized destination set, independent of which staging responses
 or receipts the control plane observed. Pre-install cancellation and
@@ -1155,9 +1162,19 @@ canonical sorted finalized-floor request only after the complete obligation
 set succeeds. Destination incarnation or endpoint rollover therefore cannot
 pin retries to the pre-install route. A partial failure leaves earlier durable
 tombstones replayable and later destinations untouched, so retry converges
-without narrowing the obligation set. Production-worker handoff,
-finalized-floor advancement, pre-install
-cancellation, and fenced-incarnation retirement substitutes remain gated.
+without narrowing the obligation set. Production-worker handoff and
+finalized-floor advancement are active. Pre-install cancellation is also
+active once a direct successor transition durably consumes the authorized
+transition tip, but only while both durable `destination_epoch` and
+`destination_install` remain absent. An installed predecessor requires its
+separate post-install recovery path and cannot be destructively treated as a
+pre-install cancellation. The exact successor epoch is the cancellation certificate,
+every actor in the original authorized destination set must publish a
+tombstone even when it reports no local intent, and the cumulative finalized
+floor records the superseded disposition before old evidence can be pruned.
+Delayed creation or publication under the cancelled generation is rejected by
+the destination tombstone. Fenced-incarnation retirement substitutes remain
+gated.
 
 Storage RPC v27 adds committed-authorization-bound exact-artifact retrieval.
 The request carries the same complete authority presentation and exact intent
@@ -1201,26 +1218,42 @@ reconstructs from destination storage, imports, activates, and completes the
 existing all-destination cleanup path. The production worker remains on the
 singular wrapper until the atomic state-machine handoff consumes this owner.
 
-The pre-install owner is now restart-safe after the first destination has
-fsync-complete artifact bytes. Authorization binding consumes the original
-prepared export and retains only the exact work, intent, complete destination
-capabilities, decoded artifact, canonical staged bytes, and initial target
-proof. On restart, storage reconstructs that owner from the durable complete
-authorization batch and any destination copy matching its exact digest and
-length. A missing or unpublished copy on another destination is not authority
-to alter the artifact: staging replay sends the recovered canonical bytes to
-the complete destination set, and every destination must accept the exact
-intent before install. Recovery classifies absent and not-yet-published copies
-separately from read failures. Transient uncertainty from a possible holder is
-retained when every other destination reports absence, while any observed
-authentication, protocol, integrity, or invariant failure dominates even when
-a later destination supplies valid bytes. Artifact publication resolves current
-authority-certified destination identities rather than retaining the
-preparation-time route. Composed coverage commits authorization, fsyncs only
-the first destination, loses both the in-memory owner and historical source,
-then reconstructs and completes staging, epoch-proof rebase, install, import,
-activation, and cleanup. If no destination has published the artifact, source
-re-export or separately authorized cancellation remains required.
+The pre-install owner is restart-safe from the authorization commit boundary,
+including before the first destination has fsync-complete artifact bytes. The
+durable authorization retains the exact source epoch, initial target epoch,
+artifact digest, and length. Recovery first accepts any exact destination copy;
+when every destination is absent it re-exports from the still-fenced retained
+source route, re-encodes for the authorization's original target epoch, and
+requires the resulting request to match the committed digest and length before
+publishing any bytes. If a possible destination holder has a transient read
+failure, a failed or mismatched source re-export cannot override that
+uncertainty. A missing or unpublished copy is not authority to alter the
+artifact: staging replay sends recovered canonical bytes to the complete
+destination set, and every destination must accept the exact intent before
+install. Observed authentication, protocol, or destination-artifact integrity
+failure remains fatal. Artifact publication resolves current authority-
+certified destination identities rather than retaining the preparation-time
+route. Retryable publication drops volatile ownership, records per-PG deferral,
+and lets the global scan continue. Install-preparation rejection and retryable
+terminal finalization follow the same rule: volatile owners are released,
+retry state is keyed by exact PG, transition epoch, and durable reconciliation
+phase, and durable scan rediscovery proceeds without blocking unrelated or
+successor PGs. A leader returning with stale transfer quarantine must therefore
+accept a cleanup phase durably completed by another leader. Durable
+authorization reconstructs the next
+attempt. Composed coverage includes both zero-copy process loss with exact
+source re-export and first-copy-only recovery after the historical source is
+lost.
+
+Destination-install uncertainty follows the same durable-owner rule. Before a
+staged owner is rebased, the worker checks the current snapshot for its exact
+durable install. A committed install is reconstructed and imported at its
+original epoch; an absent install may be rebased and retried. Retryable or
+ambiguous install errors drop volatile ownership and defer only that PG, so a
+lost response cannot turn a committed prefix into a conflicting rebase and one
+failed PG cannot monopolize reconciliation. Definitive authorization rejection
+also discards the stale prepared batch and rederives from current durable state;
+only observed fatal integrity or durability failures quarantine the transition.
 
 Command v29 and state v41 implement the first bounded segment-retirement
 step. `CollapseMetadataTransferStagingEvidenceCheckpointSegment` performs an
@@ -1407,21 +1440,45 @@ transition, transfer-worker, and prepared-artifact capacity can retain. A
 failed member must not discard already prepared work for unrelated members or
 monopolize the scanner.
 
-The existing singular production transfer wrapper now runs through a bounded
-four-worker pool rather than one transfer thread. One bounded scan page owns an
-exact per-PG in-flight map and pending queue; successful transfers accumulate
-for one canonical activation batch, while retryable and fatal failures defer or
-quarantine only their exact transition. A worker panic remains process-fatal,
-so loss of one lane cannot silently reduce capacity or strand its accepted
-work; standalone and Raft service loops observe worker health before any
-authority-time operation that may defer reconciliation. Composed production
-coverage prepares two real transfers at one destination epoch, forces one to
-install first, and requires the other to rebase and import before both join one
-canonical activation batch. This concurrency slice deliberately does not
-activate the staged ownership path: the later atomic worker handoff must
-replace these transfer results with durable
-prepare/authorization/stage/install/import/cleanup states without introducing
-a second production owner.
+Deferral and quarantine identity is the exact
+`(PG, transition epoch, durable reconciliation phase)`, not the PG or
+transition alone. Batch discovery carries retained predecessor cleanup as an
+ordered fallback beside active successor work. The successor remains primary
+while it is runnable; if it is deferred, quarantined, or definitively rejected,
+the worker may run the predecessor cleanup without clearing the successor's
+retry state. A durable phase advance likewise supersedes stale process-local
+quarantine from an earlier phase. This prevents either side of the same-PG
+lineage from masking the other or deadlocking bounded staging capacity.
+
+The production reconciliation worker now owns the complete staged lifecycle:
+prepare, plural authorization, destination staging and evidence publication,
+plural receipt-bound install, import, plural activation, destination
+tombstoning, and finalized-floor advancement. One bounded scan page owns an
+exact per-PG in-flight map and stage queue, while four transfer workers may
+prepare and stage independently before successful members accumulate into
+canonical install and activation batches. Retryable and fatal failures defer or
+quarantine only their exact transition. Restart discovery resumes authorized,
+installed, and cleanup-owned transitions from durable control-plane and
+staging-store state rather than reconstructing a second owner. A worker panic
+remains process-fatal, so loss of one lane cannot silently reduce capacity or
+strand accepted work; standalone and Raft service loops observe worker health
+before authority-time operations that may defer reconciliation. Composed
+production coverage prepares two real transfers at one destination epoch,
+forces one to install first, and requires the other to rebase and import before
+both join one canonical activation batch.
+
+Authorization response uncertainty retains the complete prepared owner and
+replays the exact authorization batch; it never discards the sole artifact
+bytes. After authorization, a retryable staging failure retains the authorized
+owner until at least one exact destination artifact is durable. Active or new
+outage work for a PG outranks terminal cleanup from retained predecessor
+transitions while runnable, so an offline old cleanup actor cannot hide a
+recoverable successor. A deferred or blocked successor yields to its retained
+cleanup fallback, so the successor cannot in turn pin predecessor capacity.
+Destination installation uses the production OpenRaft encoder to
+select the largest fitting canonical prefix, rejects a legal singleton that
+cannot fit, and leaves the unsubmitted suffix owned for epoch rebasing after
+the prefix commits.
 
 Begin, install, and activation batches must all use Raft's gated command
 derivation primitive. Command construction reads the effective
@@ -1445,12 +1502,13 @@ aggregates and exact nested-container rejection evidence. The evidence-apply
 prerequisite advances command v22 to v23 and state v34 to v35, retaining
 immutable v22/v34 evidence. The plural destination-install slice advances
 command v23 to v24 and state v35 to v36, retaining immutable v23/v35
-evidence. It makes receipt-bound plural installation mandatory for the new
-command while temporarily retaining the singular unavailable-transition
-operation used by the production worker. That singular path is retired
-atomically when the worker begins consuming staging authorization and
-evidence; it is not removed in an intermediate commit that would disable
-outage recovery. The transition-scoped artifact staging operations advance
+evidence. That v24 slice made receipt-bound plural installation mandatory for
+the new command while temporarily retaining the singular unavailable-
+transition operation used by the production worker. The later staged-worker
+handoff retires that path atomically when the worker begins consuming staging
+authorization and evidence; it is not removed in an intermediate commit that
+would disable outage recovery. The transition-scoped artifact staging
+operations advance
 storage RPC again from v23 to v24 for semantic artifact format v2 and the
 epoch-bound proof-publication operation. Fixed v22/v23/v24 frame evidence,
 authenticated Unix/TLS coverage, and explicit
@@ -1530,6 +1588,24 @@ seconds, while transport tests cover a delayed signed chunk, rejection before
 allocation above the response envelope cap, and one absolute multi-chunk
 operation deadline.
 
+The staged worker handoff is now complete. Command v32 removes the optional
+unavailable-transition binding from ordinary metadata-transfer tag 7, leaving
+plural receipt-bound tag 20 as the only command that can install an unavailable
+transition. The same uncommitted command-v32 grammar now binds each staging
+authorization to its exact prepared artifact target epoch and records terminal
+cleanup as either completed or superseded by one exact direct successor.
+Control-plane RPC v23 removes the corresponding singular runtime-
+map install operation and its authenticated operation catalogue entry. State
+v44 persists those target epochs and cleanup dispositions and permits finalized
+cleanup to retain the exact raw page-tip detail when no
+successor yet makes that tip checkpointable; a later checkpoint atomically
+replaces the detail with exact page-membership bindings. Immutable command-v31,
+RPC-v22, and state-v43 aggregates remain rejection evidence, including nested
+journal, Raft WAL, peer, restart, snapshot, and storage-RPC containers. The
+current coordinated version vector is staging-store/evidence/page/apply-receipt
+v4, staged-artifact v3, storage RPC v27, control-plane RPC v23, command v32,
+state v44, and authentication envelope v2.
+
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Staging-store format v4 owns the
 versioned root manifest, initialization-complete marker, outer establishment
@@ -1579,14 +1655,27 @@ Required deterministic and generated coverage includes:
   maximum acting sets and endpoint lengths;
 - identical count and encoded-byte splitting, decoder rejection, and legal
   single-entry fit coverage for staging-intent authorization batches;
-- coordinated destination-install/staging-version rejection of every singular unavailable-transition command path and
-  singleton operation through each plural worker/admin entry point;
+- coordinated destination-install/staging-version rejection of every singular
+  unavailable-transition command path, including removed RPC kind 19 and
+  ordinary metadata-transfer tag 7, plus singleton operation through each
+  plural worker/admin entry point;
 - multiple PGs sharing transition and destination epochs;
 - heartbeat renewal between batch preparation and gated derivation;
 - proof preparation and stale-epoch recomputation without artifact work under
   the heartbeat gate;
 - partial transfer failure, bounded retry, and preservation of successful
   prepared work;
+- authorization response loss and process loss before the first destination
+  write, proving exact digest-checked source re-export from durable authority;
+- retryable first-destination publication failure, proving the failed PG leaves
+  foreground scheduling while unrelated recovery continues;
+- committed destination-install response loss, proving exact installed-state
+  recovery precedes rebasing, plus definitive regrouped-authorization rejection
+  followed by current-state rederivation;
+- retained predecessor cleanup concurrent with a newer outage for the same PG,
+  proving active recovery is selected without abandoning terminal cleanup;
+- destination-install splitting at the exact production OpenRaft byte ceiling,
+  including legal-singleton fit and suffix rebasing after prefix commit;
 - durable artifact retrieval and exact-byte import after leader/process loss,
   with source and destination loss at every staging boundary;
 - independently verified committed staging receipts, forged receipt fields,
@@ -1650,7 +1739,9 @@ Required deterministic and generated coverage includes:
   floor advancement with replay through the compact cleanup certificate;
 - pre-install cancellation where one authorized destination reports no intent
   and another committed staging but lost its response, proving both durably
-  tombstone before the finalized floor advances;
+  tombstone before the finalized floor advances; the same disposition rejects
+  once either durable destination-install field exists, even if completion is
+  absent;
 - permanent destination loss using an exact fenced-incarnation retirement
   certificate after credential and endpoint retirement, plus rejection while
   that actor is merely offline, expired, or capable of returning;
@@ -1659,7 +1750,14 @@ Required deterministic and generated coverage includes:
   retirement-certificate, floor, pruning, and compact-certificate mutations do
   not change the global cluster-map epoch or couple PG outcomes;
 - competing staging-intent authorization and destination creation with
-  mismatched artifact digest, length, or format version;
+  mismatched artifact digest, length, format version, or encoded target epoch,
+  including restart retrieval from an otherwise checksum-valid surviving copy;
+- an active successor deferred and quarantined in turn while its retained
+  predecessor cleanup remains selectable and the successor's exact retry state
+  remains intact;
+- leadership returning with stale transfer quarantine after another leader
+  durably completes the same transition, proving terminal cleanup remains
+  selectable for that exact PG and transition;
 - cleanup before install, delayed stage and publish after cleanup, generation
   reuse, tombstone restart, and finalized-generation-floor rejection;
 - staging-store publication crashes before and after file fsync, rename,

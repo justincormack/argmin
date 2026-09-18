@@ -436,7 +436,7 @@ fn control_plane_rpc_v21_staging_evidence_frames_remain_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v22_staging_evidence_frames_are_exact() {
+fn control_plane_rpc_v23_staging_evidence_frames_are_exact() {
     let genesis = control_plane_rpc_catalogue_staging_page();
     let genesis_receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&genesis);
     let successor = metadata_transfer_staging_evidence_page_for_test(
@@ -477,21 +477,21 @@ fn control_plane_rpc_v22_staging_evidence_frames_are_exact() {
         [
             (
                 469,
-                "9b38041c63c362c5fd5b0143bb77e446d03cac450736db2651d493c62b4d08c7".to_owned(),
+                "2bb0c492d844f0052ef449bada1f6fcd1d77964a53e28326cce99b1dbe53bf58".to_owned(),
                 214,
-                "dd3b3a617b47db2c236a0d818b8cf453eff749e9a37210220e7da6ac78b9de8f".to_owned(),
+                "28354d0822fd054b3d9e7f27697f2ac78d2817c180e799f5c8c5e3af74c09ecf".to_owned(),
             ),
             (
                 409,
-                "cf214cf8cd90496ccbabd942426e71ecc5d96b7de1f8df6dd18f6b870257f244".to_owned(),
+                "eb627fff873460c97929c1c2a33375a74a2dcdd200a267844baabccb473d9e67".to_owned(),
                 214,
-                "4e14262d62cca4cc2a390f58e22bb407baca3377e10db446bf126ad211643100".to_owned(),
+                "f198765c5d17e6425b40acd10bde28f2fcd4e2b1875db77074a5a46062209e88".to_owned(),
             ),
             (
                 734,
-                "0973b0e570fcf5607a331ce961104f02b3aed8752300e677e1dce413adff9d57".to_owned(),
+                "bc52ca5ee8802e2bd3154c1a30b21ab03f006266dc80dd532852ccd8bee78dfe".to_owned(),
                 214,
-                "68a6dafdc3031792d395964fab5b8d1313f2f2c55175391efbe4bc6dfa891156".to_owned(),
+                "086c8b09cfcfccc0a04a54e455907914477f4ecb79f6ed543923ba83f730e1bd".to_owned(),
             ),
         ]
     );
@@ -540,17 +540,6 @@ fn control_plane_rpc_catalogue_request(
                 &mut payload,
                 &control_plane_rpc_catalogue_transition_binding(),
             )?;
-        }
-        ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap => {
-            write_unavailable_pg_transition_mutation_binding(
-                &mut payload,
-                &control_plane_rpc_catalogue_transition_binding(),
-            )?;
-            write_rpc_pg_metadata_transfer_proof(
-                &mut payload,
-                control_plane_rpc_catalogue_transfer(),
-            );
-            write_u64(&mut payload, 16);
         }
         ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage => {
             write_staging_evidence_publication_request(
@@ -611,17 +600,6 @@ fn validate_control_plane_rpc_catalogue_request(
                 read_unavailable_pg_transition_mutation_binding(&mut reader)?,
                 control_plane_rpc_catalogue_transition_binding()
             );
-        }
-        ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap => {
-            assert_eq!(
-                read_unavailable_pg_transition_mutation_binding(&mut reader)?,
-                control_plane_rpc_catalogue_transition_binding()
-            );
-            assert_eq!(
-                read_rpc_pg_metadata_transfer_proof(&mut reader)?,
-                control_plane_rpc_catalogue_transfer()
-            );
-            assert_eq!(reader.read_u64()?, 16);
         }
         ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage => {
             let (operation_payload, page_digest) =
@@ -846,7 +824,6 @@ fn control_plane_rpc_catalogue_success(
     match kind {
         ControlPlaneRpcKind::RuntimeMapSnapshot
         | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
-        | ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap
         | ControlPlaneRpcKind::PgRuntimeMapSnapshot
         | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot => {
             write_runtime_map_snapshot(&mut payload, &control_plane_rpc_catalogue_snapshot())?;
@@ -922,7 +899,6 @@ fn validate_control_plane_rpc_catalogue_success(
     match kind {
         ControlPlaneRpcKind::RuntimeMapSnapshot
         | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
-        | ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap
         | ControlPlaneRpcKind::PgRuntimeMapSnapshot
         | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot => {
             assert_eq!(
@@ -1715,7 +1691,7 @@ fn control_plane_rpc_v21_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v22_operation_catalogue_is_exact() {
+fn control_plane_rpc_v23_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -1928,10 +1904,39 @@ fn control_plane_rpc_v22_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
+            14_825,
+            "1ec11d2014208fbdd8aef3880b46b47477bab3271ad21e214c6b701cd6eb7d82".to_owned()
+        )
+    );
+}
+
+#[test]
+fn control_plane_rpc_v22_operation_catalogue_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v22_operation.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
             15_194,
             "e14fdaa8c1ac38e2af2d68f7e6219169cca55561af3306201a2dca0659b1216a".to_owned()
         )
     );
+
+    let mut remaining = AGGREGATE;
+    while !remaining.is_empty() {
+        let (_section, tail) = remaining.split_first().unwrap();
+        let (length, tail) = tail.split_at(std::mem::size_of::<u32>());
+        let length = usize::try_from(u32::from_be_bytes(length.try_into().unwrap())).unwrap();
+        let (frame, tail) = tail.split_at(length);
+        assert!(matches!(
+            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+            Err(ControlPlaneError::RpcProtocol { diagnostic })
+                if diagnostic.as_str() == "unsupported control-plane RPC version 22"
+        ));
+        remaining = tail;
+    }
 }
 
 #[test]
@@ -2113,8 +2118,8 @@ fn authenticated_control_plane_rpc_v20_auth_v2_payload_binding_remains_rejected_
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v22_auth_v2_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 22);
+fn authenticated_control_plane_rpc_v23_auth_v2_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 23);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -2191,15 +2196,15 @@ fn authenticated_control_plane_rpc_v22_auth_v2_payload_bindings_are_exact() {
         ),
         (
             182,
-            "de3f513bde163b51fb9842dae142ef5a14488ee03d0f4b9b5a0860404e44df02".to_owned(),
+            "c535fc7c2d7e050a6cc7fb5f77ce3be011fe7ff4d6178d611108746efb94e45e".to_owned(),
             190,
-            "28aff8719a51dcc0e7d135f075bf9bf6b25ab75f80b026d65bb3e326913221bb".to_owned(),
+            "bc77a904f7a8a8a7a80fe14f290ed95ddb82c30e847c5901277a09da19ef96e0".to_owned(),
         )
     );
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v22_closure_page_frames_are_exact() {
+fn authenticated_control_plane_rpc_v23_closure_page_frames_are_exact() {
     let kind = ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage;
     let page = control_plane_rpc_catalogue_staging_closure_page();
     assert!(page.actor_closure_candidate().is_some());
@@ -2246,9 +2251,9 @@ fn authenticated_control_plane_rpc_v22_closure_page_frames_are_exact() {
         ),
         (
             867,
-            "1ae5f2c34784fd377e230f14b983de06cd096711f973e5b7a5cf0798c74c8d8c".to_owned(),
+            "cc686c006d5b77ad5931d0f5811372503fb86eaf07222dcc6622c39018c930b6".to_owned(),
             348,
-            "0c9bf876851ba06e57be6b125a62576007b73f52a1579297997e8f76d14e1a8c".to_owned(),
+            "f2531ff0070216e32017deb45cf6b55a81e88c3dd7c19bd29799fddb2712d3ee".to_owned(),
         )
     );
 }
@@ -7943,25 +7948,23 @@ fn assert_authenticated_stale_unavailable_transition_mutations_are_rejected<S>(
     let verifier = admin_auth_verifier("auth-cluster", "admin-1");
     let server = std::thread::spawn(move || {
         let mut authority = authority;
-        for expected_kind in [
-            ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap,
-            ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap,
-        ] {
-            let mut stream = accept();
-            let request = read_control_plane_unix_request(&mut stream).unwrap();
-            assert_eq!(request.kind, expected_kind);
-            let response = build_control_plane_unix_response_with_auth_and_response_clock(
-                &mut authority,
-                request,
-                2_003,
-                Some(&verifier),
-                || Ok(2_003),
-            )
-            .unwrap();
-            write_control_plane_unix_response(&mut stream, response).unwrap();
-            stream.flush().unwrap();
-            assert_eq!(authority.snapshot(), &before);
-        }
+        let mut stream = accept();
+        let request = read_control_plane_unix_request(&mut stream).unwrap();
+        assert_eq!(
+            request.kind,
+            ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap
+        );
+        let response = build_control_plane_unix_response_with_auth_and_response_clock(
+            &mut authority,
+            request,
+            2_003,
+            Some(&verifier),
+            || Ok(2_003),
+        )
+        .unwrap();
+        write_control_plane_unix_response(&mut stream, response).unwrap();
+        stream.flush().unwrap();
+        assert_eq!(authority.snapshot(), &before);
     });
 
     let client = AuthenticatedUnixControlPlaneClient::new(
@@ -7979,22 +7982,11 @@ fn assert_authenticated_stale_unavailable_transition_mutations_are_rejected<S>(
     let fence_error = client
         .fence_unavailable_pg_transition_runtime_map_with_source_lease_checked(&binding, 2_003)
         .unwrap_err();
-    let install_error = client
-        .install_unavailable_pg_transition_runtime_map_checked(
-            &binding,
-            PgMetadataTransferProof::new(ClusterEpoch::new(11).unwrap(), PgMetadataProof::empty()),
-            ClusterEpoch::new(13).unwrap(),
-            2_003,
-        )
-        .unwrap_err();
-
     server.join().unwrap();
-    for error in [fence_error, install_error] {
-        assert!(
-            matches!(error, ControlPlaneError::RpcRemote { .. }),
-            "unexpected stale transition error: {error:?}"
-        );
-    }
+    assert!(
+        matches!(fence_error, ControlPlaneError::RpcRemote { .. }),
+        "unexpected stale transition error: {fence_error:?}"
+    );
 }
 
 #[test]
@@ -11085,7 +11077,6 @@ fn control_plane_rpc_kinds_have_explicit_auth_operations() {
         ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap,
         ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
         ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap,
-        ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap,
         ControlPlaneRpcKind::TransferRaftLeadership,
         ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
         ControlPlaneRpcKind::TriggerRaftElection,

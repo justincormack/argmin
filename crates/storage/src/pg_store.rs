@@ -165,6 +165,17 @@ pub(crate) use metadata_transfer_staging::{
 pub(crate) fn committed_staging_authorization_for_intent_for_test(
     intent: &MetadataTransferStagingIntent,
 ) -> crate::control_plane_command::CommittedUnavailablePgStagingAuthorization {
+    committed_staging_authorization_for_intent_at_epoch_for_test(
+        intent,
+        ClusterEpoch::new(intent.transition_epoch().get() + 1).unwrap(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn committed_staging_authorization_for_intent_at_epoch_for_test(
+    intent: &MetadataTransferStagingIntent,
+    artifact_target_epoch: ClusterEpoch,
+) -> crate::control_plane_command::CommittedUnavailablePgStagingAuthorization {
     use crate::control_plane::UnavailablePgTransitionMutationBinding;
     use crate::control_plane_command::UnavailablePgStagingIntentAuthorizationRequest;
 
@@ -177,6 +188,7 @@ pub(crate) fn committed_staging_authorization_for_intent_for_test(
             intent.destination_acting_set().to_vec(),
         ),
         staging_generation: intent.staging_generation(),
+        artifact_target_epoch,
         artifact_digest: intent.artifact_digest(),
         artifact_length: intent.artifact_length(),
         artifact_format_version: intent.artifact_format_version(),

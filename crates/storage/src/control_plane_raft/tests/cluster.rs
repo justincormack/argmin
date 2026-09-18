@@ -289,6 +289,7 @@ fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox(
             crate::control_plane_command::UnavailablePgStagingIntentAuthorizationRequest {
                 unavailable_transition: binding.clone(),
                 staging_generation: intent.staging_generation(),
+                artifact_target_epoch: ClusterEpoch::new(13).unwrap(),
                 artifact_digest: intent.artifact_digest(),
                 artifact_length: intent.artifact_length(),
                 artifact_format_version: intent.artifact_format_version(),
@@ -5609,8 +5610,12 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                             transition.source_epoch(),
                             transition.source_acting_set().to_vec(),
                             transition.destination_acting_set().to_vec(),
-                        ),
+                    ),
                     staging_generation: transition.transition_epoch().get(),
+                    artifact_target_epoch: ClusterEpoch::new(
+                        begun_snapshot.cluster_epoch().get() + 1,
+                    )
+                    .unwrap(),
                     artifact_digest: [0x80 + u8::try_from(index).unwrap(); 32],
                     artifact_length: 8_192 + u64::try_from(index).unwrap(),
                     artifact_format_version:
@@ -5983,6 +5988,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 crate::control_plane_command::FinalizeMetadataTransferStagingGenerationRequest {
                     unavailable_transition: authorization.unavailable_transition.clone(),
                     staging_generation: authorization.staging_generation,
+                    disposition: crate::control_plane_command::MetadataTransferStagingCleanupDisposition::Completed,
                     tombstones,
                 }
             })
@@ -6394,8 +6400,12 @@ fn authenticated_staging_evidence_preflight_suppresses_invalid_pages_and_exact_r
                         transition.source_epoch(),
                         transition.source_acting_set().to_vec(),
                         transition.destination_acting_set().to_vec(),
-                    ),
+                ),
                 staging_generation: transition.transition_epoch().get(),
+                artifact_target_epoch: ClusterEpoch::new(
+                    begun_snapshot.cluster_epoch().get() + 1,
+                )
+                .unwrap(),
                 artifact_digest: [0x80; 32],
                 artifact_length: 8_192,
                 artifact_format_version:

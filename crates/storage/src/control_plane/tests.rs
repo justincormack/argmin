@@ -326,7 +326,22 @@ fn control_plane_rpc_v21_frame_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v22_frame_encoding_is_exact() {
+fn control_plane_rpc_v22_frame_remains_rejected_evidence() {
+    const FRAME: &[u8] = &[
+        97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97, 110,
+        101, 45, 114, 112, 99, 0, 22, 0, 12, 0, 0, 0, 3, 113, 41, 227, 208, 88, 150, 105, 102, 1,
+        2, 3,
+    ];
+    let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(FRAME)).unwrap_err();
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str() == "unsupported control-plane RPC version 22"
+    ));
+}
+
+#[test]
+fn control_plane_rpc_v23_frame_encoding_is_exact() {
     let frame =
         encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
             .unwrap();
@@ -335,10 +350,38 @@ fn control_plane_rpc_v22_frame_encoding_is_exact() {
         frame,
         [
             97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
-            110, 101, 45, 114, 112, 99, 0, 22, 0, 12, 0, 0, 0, 3, 113, 41, 227, 208, 88, 150, 105,
-            102, 1, 2, 3,
+            110, 101, 45, 114, 112, 99, 0, 23, 0, 12, 0, 0, 0, 3, 35, 90, 173, 115, 191, 176, 149,
+            50, 1, 2, 3,
         ]
     );
+}
+
+#[test]
+fn control_plane_rpc_v23_rejects_retired_singular_install_kind() {
+    const RETIRED_INSTALL_KIND: u16 = 19;
+    let payload = [0x01, 0x02, 0x03];
+    let payload_len = u32::try_from(payload.len()).unwrap();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(CONTROL_PLANE_RPC_MAGIC);
+    write_u16(&mut frame, CONTROL_PLANE_RPC_VERSION);
+    write_u16(&mut frame, RETIRED_INSTALL_KIND);
+    write_u32(&mut frame, payload_len);
+    write_u64(
+        &mut frame,
+        control_plane_rpc_frame_checksum(
+            CONTROL_PLANE_RPC_VERSION,
+            RETIRED_INSTALL_KIND,
+            payload_len,
+            &payload,
+        ),
+    );
+    frame.extend_from_slice(&payload);
+
+    assert!(matches!(
+        read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+        Err(ControlPlaneError::RpcProtocol { diagnostic })
+            if diagnostic.as_str() == "unknown control-plane RPC kind 19"
+    ));
 }
 
 #[test]
@@ -1646,7 +1689,7 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         Err(ControlPlaneStateVersionError::Missing)
     );
     for version in [
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 44,
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45,
     ] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
@@ -1654,8 +1697,8 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(43)),
-        Ok(43)
+        require_current_control_plane_state_version(Some(44)),
+        Ok(44)
     );
 
     assert!(matches!(
@@ -1996,11 +2039,41 @@ fn canonical_control_plane_state_v42_text_remains_rejected_evidence() {
 }
 
 #[test]
-fn canonical_control_plane_state_v43_text_is_exact() {
+fn canonical_control_plane_state_v43_representative_aggregate_remains_rejected_evidence() {
+    const AGGREGATE: &[u8] = include_bytes!("testdata/state_v43_representative.aggregate");
+    assert_eq!(
+        (
+            AGGREGATE.len(),
+            hex_encode(&checksum::sha256::digest(AGGREGATE))
+        ),
+        (
+            130_078,
+            "9434b2ae07e55307b850ec4c2a98998d33e9994a375552170c3dc6de611bf325".to_owned()
+        )
+    );
+    let mut remaining = AGGREGATE;
+    let mut count = 0;
+    while !remaining.is_empty() {
+        let (length, tail) = remaining.split_at(8);
+        let length = usize::try_from(u64::from_be_bytes(length.try_into().unwrap())).unwrap();
+        let (snapshot, tail) = tail.split_at(length);
+        assert!(matches!(
+            parse_snapshot(std::str::from_utf8(snapshot).unwrap()),
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 43"
+        ));
+        remaining = tail;
+        count += 1;
+    }
+    assert!(count > 1, "v43 aggregate must contain a corpus");
+}
+
+#[test]
+fn canonical_control_plane_state_v44_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=43\n",
+            "version=44\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -2166,7 +2239,7 @@ fn canonical_control_plane_state_v36_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v43_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v44_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -2314,56 +2387,92 @@ fn canonical_control_plane_state_v43_representative_aggregate_is_stable() {
         .unwrap()
         .expect("new unavailable transition remains recoverable");
     snapshots.push(unavailable_authority.snapshot().clone());
-    let staged_snapshot = unavailable_authority
-        .snapshot()
-        .apply_control_plane_command(ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
-            authorizations: vec![UnavailablePgStagingIntentAuthorizationRequest {
-                unavailable_transition: work.mutation_binding().clone(),
-                staging_generation: work.transition_epoch().get(),
-                artifact_digest: [0x7a; 32],
-                artifact_length: 8_192,
-                artifact_format_version:
-                    crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-            }],
-        })
-        .unwrap()
-        .into_snapshot();
-    snapshots.push(staged_snapshot.clone());
-    let staging_actor_id = work.destination_acting_set()[0];
-    let staging_actor_record = staged_snapshot.node(staging_actor_id).unwrap();
-    let staging_page = crate::pg_store::metadata_transfer_staging_evidence_page_for_test(
-        crate::pg_store::MetadataTransferStagingNodeIdentity::new(
-            staging_actor_id,
-            staging_actor_record.node_incarnation(),
-            staging_actor_record.endpoint().to_owned(),
+    let authorization = UnavailablePgStagingIntentAuthorizationRequest {
+        unavailable_transition: work.mutation_binding().clone(),
+        staging_generation: work.transition_epoch().get(),
+        artifact_target_epoch: ClusterEpoch::new(
+            unavailable_authority.snapshot().cluster_epoch().get() + 1,
         )
         .unwrap(),
-        work.mutation_binding(),
-        [0x7a; 32],
-        8_192,
-        crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-        crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-        None,
-    );
-    snapshots.push(
-        staged_snapshot
-            .apply_control_plane_command(
-                ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
-                    operation_payload: staging_page.operation_payload().to_vec(),
-                    page_digest: staging_page.page_digest(),
-                },
-            )
-            .unwrap()
-            .into_snapshot(),
-    );
+        artifact_digest: [0x7a; 32],
+        artifact_length: 8_192,
+        artifact_format_version: crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    };
     unavailable_authority
-        .install_unavailable_pg_transition_metadata_transfer(
-            work.mutation_binding().clone(),
-            PgMetadataTransferProof::new(
-                unavailable_authority.snapshot().cluster_epoch(),
-                unavailable_transition_proof,
+        .authorize_unavailable_pg_staging_intents_batch(std::slice::from_ref(&authorization))
+        .unwrap();
+    snapshots.push(unavailable_authority.snapshot().clone());
+    let destination_epoch =
+        ClusterEpoch::new(unavailable_authority.snapshot().cluster_epoch().get() + 1).unwrap();
+    let transfer = PgMetadataTransferProof::new(
+        work.mutation_binding().source_epoch(),
+        unavailable_transition_proof,
+    );
+    let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
+        work.mutation_binding(),
+        authorization.artifact_digest,
+        authorization.artifact_length,
+        authorization.artifact_format_version,
+    )
+    .unwrap();
+    let mut publications = Vec::new();
+    for staging_actor_id in work.destination_acting_set().iter().copied() {
+        let staging_actor_record = unavailable_authority
+            .snapshot()
+            .node(staging_actor_id)
+            .unwrap();
+        let staging_page =
+            crate::pg_store::metadata_transfer_staging_publication_evidence_page_for_test(
+                crate::pg_store::MetadataTransferStagingNodeIdentity::new(
+                    staging_actor_id,
+                    staging_actor_record.node_incarnation(),
+                    staging_actor_record.endpoint().to_owned(),
+                )
+                .unwrap(),
+                &intent,
+                transfer,
+                None,
+            );
+        unavailable_authority
+            .apply_metadata_transfer_staging_evidence_page(
+                staging_page.operation_payload().to_vec(),
+                staging_page.page_digest(),
+            )
+            .unwrap();
+        let staging_actor_record = unavailable_authority
+            .snapshot()
+            .node(staging_actor_id)
+            .unwrap();
+        let evidence_key = MetadataTransferStagingEvidenceKey {
+            pg_id: work.pg_id(),
+            staging_generation: authorization.staging_generation,
+            actor_node_id: staging_actor_id,
+            actor_node_incarnation: staging_actor_record.node_incarnation(),
+            kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+            target_epoch: Some(destination_epoch),
+        };
+        publications.push(UnavailablePgStagingPublicationBinding {
+            node_id: staging_actor_id,
+            node_incarnation: staging_actor_record.node_incarnation(),
+            endpoint: staging_actor_record.endpoint().to_owned(),
+            evidence_digest: checksum::sha256::digest(
+                &unavailable_authority
+                    .snapshot()
+                    .metadata_transfer_staging_evidence[&evidence_key],
             ),
-            ClusterEpoch::new(unavailable_authority.snapshot().cluster_epoch().get() + 1).unwrap(),
+        });
+    }
+    publications.sort_by_key(|publication| publication.node_id);
+    snapshots.push(unavailable_authority.snapshot().clone());
+    unavailable_authority
+        .install_unavailable_pg_placement_transitions_batch(
+            &[UnavailablePgTransitionInstallRequest {
+                unavailable_transition: work.mutation_binding().clone(),
+                transfer,
+                expected_destination_epoch: destination_epoch,
+                publications,
+            }],
+            destination_epoch,
         )
         .unwrap();
     let payload_ready_at_ms = unavailable_authority
@@ -2849,7 +2958,7 @@ fn canonical_control_plane_state_v43_representative_aggregate_is_stable() {
         aggregate_text.push_str(&formatted);
     }
     for required_record in [
-        "version=43\n",
+        "version=44\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -2933,8 +3042,8 @@ fn canonical_control_plane_state_v43_representative_aggregate_is_stable() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            130_078,
-            "9434b2ae07e55307b850ec4c2a98998d33e9994a375552170c3dc6de611bf325".to_owned()
+            136_450,
+            "751ad15d70cde06ea90038535f6d15ca0b05e5bca01ce79f1083b9bd097cae60".to_owned()
         )
     );
 }
