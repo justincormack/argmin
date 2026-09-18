@@ -3422,17 +3422,10 @@ impl ClusterControlSnapshot {
         ))
     }
 
-    #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged ownership.
-    pub(crate) fn committed_unavailable_pg_staged_transfer(
+    fn exact_unavailable_pg_transition_for_reconciliation(
         &self,
         work: &UnavailablePgReconciliationWork,
-    ) -> Result<
-        (
-            UnavailablePgStagingIntentAuthorizationRequest,
-            UnavailablePgTransitionInstallRequest,
-        ),
-        ControlPlaneError,
-    > {
+    ) -> Result<&UnavailablePgPlacementTransition, ControlPlaneError> {
         let pg_id = work.pg_id();
         let transition_epoch = work.transition_epoch();
         let transition = self
@@ -3457,18 +3450,43 @@ impl ClusterControlSnapshot {
                 ),
             });
         }
-        let authorization = unavailable_pg_staging_authorization_request_from_durable(transition)
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-            message: format!(
-                "PG {} staged transfer recovery has no durable staging authorization",
-                pg_id.get()
-            ),
-        })?;
+        Ok(transition)
+    }
+
+    #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged ownership.
+    pub(crate) fn committed_unavailable_pg_staging_request(
+        &self,
+        work: &UnavailablePgReconciliationWork,
+    ) -> Result<UnavailablePgStagingIntentAuthorizationRequest, ControlPlaneError> {
+        let transition = self.exact_unavailable_pg_transition_for_reconciliation(work)?;
+        unavailable_pg_staging_authorization_request_from_durable(transition).ok_or_else(|| {
+            ControlPlaneError::CommandDecode {
+                message: format!(
+                    "PG {} staged transfer recovery has no durable staging authorization",
+                    work.pg_id().get()
+                ),
+            }
+        })
+    }
+
+    #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged ownership.
+    pub(crate) fn committed_unavailable_pg_staged_transfer(
+        &self,
+        work: &UnavailablePgReconciliationWork,
+    ) -> Result<
+        (
+            UnavailablePgStagingIntentAuthorizationRequest,
+            UnavailablePgTransitionInstallRequest,
+        ),
+        ControlPlaneError,
+    > {
+        let transition = self.exact_unavailable_pg_transition_for_reconciliation(work)?;
+        let authorization = self.committed_unavailable_pg_staging_request(work)?;
         let install = unavailable_pg_destination_install_request_from_durable(transition)
             .ok_or_else(|| ControlPlaneError::CommandDecode {
                 message: format!(
                     "PG {} staged transfer recovery has no durable destination install",
-                    pg_id.get()
+                    work.pg_id().get()
                 ),
             })?;
         Ok((authorization, install))

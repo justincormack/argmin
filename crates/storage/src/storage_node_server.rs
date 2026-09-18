@@ -9552,6 +9552,11 @@ fn staging_error_response(error: MetadataTransferStagingError) -> StorageRpcErro
             code: StorageRpcErrorCode::ShardIntegrity,
             message: "metadata-transfer staging artifact failed integrity validation".to_owned(),
         },
+        MetadataTransferStagingError::ArtifactAbsent
+        | MetadataTransferStagingError::ArtifactNotPublished => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::NotFound,
+            message: "metadata-transfer staging artifact is not published".to_owned(),
+        },
         MetadataTransferStagingError::ArtifactTooLarge { .. }
         | MetadataTransferStagingError::ArtifactSemanticMismatch(_) => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::PayloadDecode,

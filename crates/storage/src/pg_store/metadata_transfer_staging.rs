@@ -92,6 +92,10 @@ pub(crate) enum MetadataTransferStagingError {
     ArtifactMismatch,
     #[error("metadata-transfer staging artifact semantic validation failed: {0}")]
     ArtifactSemanticMismatch(String),
+    #[error("metadata-transfer staging artifact is absent")]
+    ArtifactAbsent,
+    #[error("metadata-transfer staging artifact has not been durably published")]
+    ArtifactNotPublished,
     #[error("metadata-transfer staging artifact length {length} exceeds protocol limit {limit}")]
     ArtifactTooLarge { length: u64, limit: u64 },
     #[error("metadata-transfer staging generation has been tombstoned or finalized")]
@@ -1753,11 +1757,7 @@ impl MetadataTransferStagingStore {
         let state = self.lock_state()?;
         let existing =
             load_staging_row(&state.connection, intent.pg_id, intent.staging_generation)?
-                .ok_or_else(|| {
-                    MetadataTransferStagingError::IntentConflict(
-                        "artifact read has no durable staging row".to_owned(),
-                    )
-                })?;
+                .ok_or(MetadataTransferStagingError::ArtifactAbsent)?;
         require_exact_intent(&existing.intent, intent)?;
         if !matches!(
             existing.state,
@@ -1766,9 +1766,7 @@ impl MetadataTransferStagingStore {
             return Err(if existing.state == StagingState::Tombstoned {
                 MetadataTransferStagingError::GenerationRetired
             } else {
-                MetadataTransferStagingError::IntentConflict(
-                    "artifact has not been durably published".to_owned(),
-                )
+                MetadataTransferStagingError::ArtifactNotPublished
             });
         }
         Ok(state)
@@ -6669,9 +6667,27 @@ mod tests {
         let intent = intent(artifact);
         let authorization =
             crate::pg_store::committed_staging_authorization_for_intent_for_test(&intent);
+        assert!(matches!(
+            store.read_artifact_chunk_authorized(
+                &authorization,
+                &intent,
+                0,
+                METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES,
+            ),
+            Err(MetadataTransferStagingError::ArtifactAbsent)
+        ));
         store
             .create_intent_authorized(&authorization, &intent)
             .unwrap();
+        assert!(matches!(
+            store.read_artifact_chunk_authorized(
+                &authorization,
+                &intent,
+                0,
+                METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES,
+            ),
+            Err(MetadataTransferStagingError::ArtifactNotPublished)
+        ));
         store
             .publish_artifact_authorized(&authorization, &intent, artifact)
             .unwrap();
@@ -6977,7 +6993,7 @@ mod tests {
         ));
         assert!(matches!(
             store.read_artifact(&intent),
-            Err(MetadataTransferStagingError::IntentConflict(_))
+            Err(MetadataTransferStagingError::ArtifactNotPublished)
         ));
         assert_eq!(store.unacknowledged_evidence_count(), 0);
     }

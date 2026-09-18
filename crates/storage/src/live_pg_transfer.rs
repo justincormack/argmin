@@ -299,6 +299,12 @@ enum LivePgMetadataTransferStorageTransport {
         export_route_refresh_failures: std::sync::atomic::AtomicU64,
         import_route_refresh_failures: std::sync::atomic::AtomicU64,
         import_pending_command_failures: std::sync::atomic::AtomicU64,
+        staging_artifact_read_failures: std::sync::Mutex<
+            std::collections::BTreeMap<
+                NodeId,
+                std::collections::VecDeque<LivePgMetadataTransferFailureDisposition>,
+            >,
+        >,
     },
 }
 
@@ -344,8 +350,13 @@ pub(crate) struct PreparedUnavailablePgMetadataTransfer {
 /// batch is known to be committed by the control plane.
 #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged installation.
 pub(crate) struct AuthorizedUnavailablePgMetadataTransfer {
-    prepared: PreparedUnavailablePgMetadataTransfer,
+    work: UnavailablePgReconciliationWork,
+    intent: MetadataTransferStagingIntent,
     authorizations: Vec<CommittedUnavailablePgStagingAuthorization>,
+    artifact: PgMetadataTransferArtifact,
+    staged_artifact: Vec<u8>,
+    target_epoch: ClusterEpoch,
+    transfer: PgMetadataTransferProof,
 }
 
 /// Linear ownership of a fully published unavailable-PG artifact and the
@@ -418,15 +429,41 @@ impl PreparedUnavailablePgMetadataTransfer {
                     })?,
             );
         }
+        let PreparedUnavailablePgMetadataTransfer {
+            work,
+            prepared,
+            intent,
+            staged_artifact,
+        } = self;
+        let PreparedLivePgMetadataTransfer {
+            artifact,
+            install_member,
+            ..
+        } = *prepared;
         Ok(AuthorizedUnavailablePgMetadataTransfer {
-            prepared: self,
+            work,
+            intent,
             authorizations,
+            artifact,
+            staged_artifact,
+            target_epoch: install_member.expected_destination_epoch,
+            transfer: install_member.transfer,
         })
     }
 }
 
 #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged installation.
 impl AuthorizedUnavailablePgMetadataTransfer {
+    pub(crate) fn authorization_request(&self) -> UnavailablePgStagingIntentAuthorizationRequest {
+        UnavailablePgStagingIntentAuthorizationRequest {
+            unavailable_transition: self.work.mutation_binding().clone(),
+            staging_generation: self.intent.staging_generation(),
+            artifact_digest: self.intent.artifact_digest(),
+            artifact_length: self.intent.artifact_length(),
+            artifact_format_version: self.intent.artifact_format_version(),
+        }
+    }
+
     pub(crate) fn bind_publications(
         self,
         published: PublishedUnavailablePgMetadataTransfer,
@@ -436,17 +473,19 @@ impl AuthorizedUnavailablePgMetadataTransfer {
                 "staging publications do not match their prepared authorization".to_owned(),
             ));
         }
-        let PreparedUnavailablePgMetadataTransfer {
+        let AuthorizedUnavailablePgMetadataTransfer {
             work,
-            prepared,
             intent,
+            authorizations,
+            artifact,
             staged_artifact: _,
-        } = self.prepared;
-        let PreparedLivePgMetadataTransfer { artifact, .. } = *prepared;
+            target_epoch: _,
+            transfer: _,
+        } = self;
         Ok(StagedUnavailablePgMetadataTransfer {
             work,
             intent,
-            authorizations: self.authorizations,
+            authorizations,
             artifact,
             target_epoch: published.target_epoch,
             transfer: published.transfer,
@@ -712,6 +751,47 @@ fn staging_rpc_failure(error: crate::StoreError) -> LivePgMetadataTransferFailur
     }
 }
 
+enum StagingArtifactReadOutcome {
+    Published(Vec<u8>),
+    Absent,
+    Retryable(LivePgMetadataTransferFailure),
+    Fatal(LivePgMetadataTransferFailure),
+}
+
+fn staging_artifact_failure_outcome(
+    failure: LivePgMetadataTransferFailure,
+) -> StagingArtifactReadOutcome {
+    if failure.disposition == LivePgMetadataTransferFailureDisposition::Retryable {
+        StagingArtifactReadOutcome::Retryable(failure)
+    } else {
+        StagingArtifactReadOutcome::Fatal(failure)
+    }
+}
+
+fn staging_artifact_rpc_read_outcome(
+    result: Result<Vec<u8>, crate::StoreError>,
+) -> StagingArtifactReadOutcome {
+    match result {
+        Ok(bytes) => StagingArtifactReadOutcome::Published(bytes),
+        Err(crate::StoreError::NotFound) => StagingArtifactReadOutcome::Absent,
+        Err(error) => staging_artifact_failure_outcome(staging_rpc_failure(error)),
+    }
+}
+
+#[cfg(test)]
+fn staging_artifact_local_read_outcome(
+    result: Result<Vec<u8>, crate::pg_store::MetadataTransferStagingError>,
+) -> StagingArtifactReadOutcome {
+    match result {
+        Ok(bytes) => StagingArtifactReadOutcome::Published(bytes),
+        Err(
+            crate::pg_store::MetadataTransferStagingError::ArtifactAbsent
+            | crate::pg_store::MetadataTransferStagingError::ArtifactNotPublished,
+        ) => StagingArtifactReadOutcome::Absent,
+        Err(error) => staging_artifact_failure_outcome(staging_local_failure(error)),
+    }
+}
+
 #[cfg(test)]
 fn staging_local_failure(
     error: crate::pg_store::MetadataTransferStagingError,
@@ -938,6 +1018,9 @@ impl LivePgMetadataTransferAdmin {
                 export_route_refresh_failures: std::sync::atomic::AtomicU64::new(0),
                 import_route_refresh_failures: std::sync::atomic::AtomicU64::new(0),
                 import_pending_command_failures: std::sync::atomic::AtomicU64::new(0),
+                staging_artifact_read_failures: std::sync::Mutex::new(
+                    std::collections::BTreeMap::new(),
+                ),
             },
             failpoint: None,
             _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
@@ -973,6 +1056,28 @@ impl LivePgMetadataTransferAdmin {
             panic!("pending-command failure injection requires in-process storage");
         };
         import_pending_command_failures.store(failures, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_staging_artifact_read_failure(
+        self,
+        node_id: NodeId,
+        disposition: LivePgMetadataTransferFailureDisposition,
+    ) -> Self {
+        let LivePgMetadataTransferStorageTransport::InProcess {
+            staging_artifact_read_failures,
+            ..
+        } = &self.transport
+        else {
+            panic!("staging artifact read failure injection requires in-process storage");
+        };
+        staging_artifact_read_failures
+            .lock()
+            .unwrap()
+            .entry(node_id)
+            .or_default()
+            .push_back(disposition);
         self
     }
 
@@ -1107,9 +1212,8 @@ impl LivePgMetadataTransferAdmin {
     ) -> Result<PublishedUnavailablePgMetadataTransfer, LivePgMetadataTransferError> {
         let result =
             (|| -> Result<PublishedUnavailablePgMetadataTransfer, LivePgMetadataTransferFailure> {
-                let prepared = &authorized.prepared;
-                let target_epoch = prepared.prepared.install_member.expected_destination_epoch;
-                let transfer = prepared.prepared.install_member.transfer;
+                let target_epoch = authorized.target_epoch;
+                let transfer = authorized.transfer;
                 let publications = self.publish_staging_artifact_to_destinations(
                     authorized,
                     StagingPublication::Artifact,
@@ -1121,6 +1225,28 @@ impl LivePgMetadataTransferAdmin {
                     publications,
                 })
             })();
+        result.map_err(|error| {
+            LivePgMetadataTransferError::at_stage(LivePgMetadataTransferStage::Export, error)
+        })
+    }
+
+    #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged ownership.
+    pub(crate) fn resume_authorized_unavailable_pg_reconciliation(
+        &self,
+        work: UnavailablePgReconciliationWork,
+        snapshot: &crate::control_plane::ClusterControlSnapshot,
+    ) -> Result<AuthorizedUnavailablePgMetadataTransfer, LivePgMetadataTransferError> {
+        let result = (|| -> Result<_, LivePgMetadataTransferFailure> {
+            let authorization_request = snapshot
+                .committed_unavailable_pg_staging_request(&work)
+                .map_err(|error| {
+                    control_plane_transfer_failure(
+                        "failed to recover committed staging authorization",
+                        error,
+                    )
+                })?;
+            self.recover_authorized_staging_artifact(work, snapshot, authorization_request)
+        })();
         result.map_err(|error| {
             LivePgMetadataTransferError::at_stage(LivePgMetadataTransferStage::Export, error)
         })
@@ -1141,145 +1267,36 @@ impl LivePgMetadataTransferAdmin {
                         error,
                     )
                 })?;
-            let intent = MetadataTransferStagingIntent::for_unavailable_transition(
-                work.mutation_binding(),
-                authorization_request.artifact_digest,
-                authorization_request.artifact_length,
-                authorization_request.artifact_format_version,
-            )
-            .map_err(|error| {
-                LivePgMetadataTransferFailure::fatal(format!(
-                    "failed to reconstruct PG {} staging intent: {error}",
-                    work.pg_id().get()
-                ))
-            })?;
-            if intent.staging_generation() != authorization_request.staging_generation {
-                return Err(LivePgMetadataTransferFailure::fatal(format!(
-                    "PG {} committed staging generation does not match its transition",
-                    work.pg_id().get()
-                )));
-            }
-            let mut authorizations = Vec::with_capacity(work.destination_acting_set().len());
-            for node_id in work.destination_acting_set().iter().copied() {
-                authorizations.push(
-                    snapshot
-                        .committed_unavailable_pg_staging_authorization(
-                            &authorization_request,
-                            node_id,
-                        )
-                        .map_err(|error| {
-                            control_plane_transfer_failure(
-                                "failed to recover destination staging authorization",
-                                error,
-                            )
-                        })?,
-                );
-            }
-
-            let mut last_retryable = None;
-            let mut staged_artifact = None;
-            for authorization in &authorizations {
-                let node_id = authorization.destination_node_id();
-                let node = snapshot.node(node_id).ok_or_else(|| {
-                    LivePgMetadataTransferFailure::fatal(format!(
-                        "PG {} staged transfer destination {} is absent from authority state",
-                        work.pg_id().get(),
-                        node_id.as_u32()
-                    ))
-                })?;
-                #[cfg(test)]
-                let read_result =
-                    if let LivePgMetadataTransferStorageTransport::InProcess { data_dir, .. } =
-                        &self.transport
-                    {
-                        let identity = MetadataTransferStagingNodeIdentity::new(
-                            node_id,
-                            node.node_incarnation(),
-                            node.endpoint().to_owned(),
-                        )
-                        .map_err(staging_local_failure)?;
-                        let limits = MetadataTransferStagingLimits::new(
-                            256,
-                            METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-                            4 * 1024 * 1024 * 1024,
-                        )
-                        .map_err(staging_local_failure)?;
-                        MetadataTransferStagingStore::open(
-                            &data_dir.join(format!("staging-node-{}", node_id.as_u32())),
-                            identity,
-                            limits,
-                        )
-                        .and_then(|store| store.read_artifact(&intent))
-                        .map_err(staging_local_failure)
-                    } else {
-                        self.staging_rpc_client(snapshot.cluster_epoch(), node_id, node.endpoint())?
-                            .read_metadata_transfer_staging_artifact(authorization, &intent)
-                            .map_err(staging_rpc_failure)
-                    };
-                #[cfg(not(test))]
-                let read_result = self
-                    .staging_rpc_client(snapshot.cluster_epoch(), node_id, node.endpoint())?
-                    .read_metadata_transfer_staging_artifact(authorization, &intent)
-                    .map_err(staging_rpc_failure);
-                match read_result {
-                    Ok(bytes) => {
-                        staged_artifact = Some(bytes);
-                        break;
-                    }
-                    Err(error)
-                        if error.disposition
-                            == LivePgMetadataTransferFailureDisposition::Retryable =>
-                    {
-                        last_retryable = Some(error);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            let staged_artifact = staged_artifact.ok_or_else(|| {
-                last_retryable.unwrap_or_else(|| {
-                    LivePgMetadataTransferFailure::fatal(format!(
-                        "PG {} committed staged transfer has no destination artifact",
-                        work.pg_id().get()
-                    ))
-                })
-            })?;
-            let (artifact, _encoded_target_epoch, _encoded_transfer) =
-                decode_staged_metadata_transfer_artifact(&staged_artifact, &intent).map_err(
-                    |error| {
-                        LivePgMetadataTransferFailure::fatal(format!(
-                            "PG {} committed staged artifact is invalid: {error}",
-                            work.pg_id().get()
-                        ))
-                    },
-                )?;
+            let authorized =
+                self.recover_authorized_staging_artifact(work, snapshot, authorization_request)?;
             let imported_proof = StorageCluster::metadata_transfer_imported_proof_at_epoch(
-                &artifact,
+                &authorized.artifact,
                 install.expected_destination_epoch,
             )
             .map_err(|error| {
                 LivePgMetadataTransferFailure::fatal(format!(
                     "PG {} staged artifact cannot derive its durable install proof: {error}",
-                    work.pg_id().get()
+                    authorized.work.pg_id().get()
                 ))
             })?;
             let recovered_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
-                artifact.cluster_epoch(),
-                artifact.source_metadata_proof(),
+                authorized.artifact.cluster_epoch(),
+                authorized.artifact.source_metadata_proof(),
                 imported_proof,
             );
             if recovered_transfer != install.transfer
-                || install.unavailable_transition != *work.mutation_binding()
+                || install.unavailable_transition != *authorized.work.mutation_binding()
             {
                 return Err(LivePgMetadataTransferFailure::fatal(format!(
                     "PG {} staged artifact does not match its durable destination install",
-                    work.pg_id().get()
+                    authorized.work.pg_id().get()
                 )));
             }
             Ok(StagedUnavailablePgMetadataTransfer {
-                work,
-                intent,
-                authorizations,
-                artifact,
+                work: authorized.work,
+                intent: authorized.intent,
+                authorizations: authorized.authorizations,
+                artifact: authorized.artifact,
                 target_epoch: install.expected_destination_epoch,
                 transfer: install.transfer,
                 publications: install.publications,
@@ -1287,6 +1304,163 @@ impl LivePgMetadataTransferAdmin {
         })();
         result.map_err(|error| {
             LivePgMetadataTransferError::at_stage(LivePgMetadataTransferStage::Import, error)
+        })
+    }
+
+    fn recover_authorized_staging_artifact(
+        &self,
+        work: UnavailablePgReconciliationWork,
+        snapshot: &crate::control_plane::ClusterControlSnapshot,
+        authorization_request: UnavailablePgStagingIntentAuthorizationRequest,
+    ) -> Result<AuthorizedUnavailablePgMetadataTransfer, LivePgMetadataTransferFailure> {
+        let intent = MetadataTransferStagingIntent::for_unavailable_transition(
+            work.mutation_binding(),
+            authorization_request.artifact_digest,
+            authorization_request.artifact_length,
+            authorization_request.artifact_format_version,
+        )
+        .map_err(|error| {
+            LivePgMetadataTransferFailure::fatal(format!(
+                "failed to reconstruct PG {} staging intent: {error}",
+                work.pg_id().get()
+            ))
+        })?;
+        if intent.staging_generation() != authorization_request.staging_generation {
+            return Err(LivePgMetadataTransferFailure::fatal(format!(
+                "PG {} committed staging generation does not match its transition",
+                work.pg_id().get()
+            )));
+        }
+        let mut authorizations = Vec::with_capacity(work.destination_acting_set().len());
+        for node_id in work.destination_acting_set().iter().copied() {
+            authorizations.push(
+                snapshot
+                    .committed_unavailable_pg_staging_authorization(&authorization_request, node_id)
+                    .map_err(|error| {
+                        control_plane_transfer_failure(
+                            "failed to recover destination staging authorization",
+                            error,
+                        )
+                    })?,
+            );
+        }
+
+        let mut first_fatal = None;
+        let mut last_retryable = None;
+        let mut staged_artifact = None;
+        // Authorization may have reached only a subset of destinations. Any
+        // exact digest-bound copy can recover the bytes; staging replay still
+        // requires every destination to accept those bytes before install.
+        for authorization in &authorizations {
+            let node_id = authorization.destination_node_id();
+            let node = snapshot.node(node_id).ok_or_else(|| {
+                LivePgMetadataTransferFailure::fatal(format!(
+                    "PG {} staged transfer destination {} is absent from authority state",
+                    work.pg_id().get(),
+                    node_id.as_u32()
+                ))
+            })?;
+            #[cfg(test)]
+            let read_outcome = if let LivePgMetadataTransferStorageTransport::InProcess {
+                data_dir,
+                staging_artifact_read_failures,
+                ..
+            } = &self.transport
+            {
+                let injected = staging_artifact_read_failures
+                    .lock()
+                    .expect("staging artifact read failure injection poisoned")
+                    .get_mut(&node_id)
+                    .and_then(std::collections::VecDeque::pop_front);
+                if let Some(disposition) = injected {
+                    staging_artifact_failure_outcome(LivePgMetadataTransferFailure {
+                        disposition,
+                        diagnostic: format!(
+                            "injected staging artifact read failure on node {}",
+                            node_id.as_u32()
+                        ),
+                    })
+                } else {
+                    let identity = MetadataTransferStagingNodeIdentity::new(
+                        node_id,
+                        node.node_incarnation(),
+                        node.endpoint().to_owned(),
+                    )
+                    .map_err(staging_local_failure)?;
+                    let limits = MetadataTransferStagingLimits::new(
+                        256,
+                        METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
+                        4 * 1024 * 1024 * 1024,
+                    )
+                    .map_err(staging_local_failure)?;
+                    let read_result = MetadataTransferStagingStore::open(
+                        &data_dir.join(format!("staging-node-{}", node_id.as_u32())),
+                        identity,
+                        limits,
+                    )
+                    .and_then(|store| store.read_artifact(&intent));
+                    staging_artifact_local_read_outcome(read_result)
+                }
+            } else {
+                match self.staging_rpc_client(snapshot.cluster_epoch(), node_id, node.endpoint()) {
+                    Ok(client) => staging_artifact_rpc_read_outcome(
+                        client.read_metadata_transfer_staging_artifact(authorization, &intent),
+                    ),
+                    Err(error) => staging_artifact_failure_outcome(error),
+                }
+            };
+            #[cfg(not(test))]
+            let read_outcome =
+                match self.staging_rpc_client(snapshot.cluster_epoch(), node_id, node.endpoint()) {
+                    Ok(client) => staging_artifact_rpc_read_outcome(
+                        client.read_metadata_transfer_staging_artifact(authorization, &intent),
+                    ),
+                    Err(error) => staging_artifact_failure_outcome(error),
+                };
+            match read_outcome {
+                StagingArtifactReadOutcome::Published(bytes) => {
+                    staged_artifact.get_or_insert(bytes);
+                }
+                StagingArtifactReadOutcome::Absent => {}
+                StagingArtifactReadOutcome::Retryable(error) => {
+                    last_retryable = Some(error);
+                }
+                StagingArtifactReadOutcome::Fatal(error) => {
+                    first_fatal.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_fatal {
+            return Err(error);
+        }
+        let staged_artifact = match staged_artifact {
+            Some(staged_artifact) => staged_artifact,
+            None => {
+                return Err(last_retryable.unwrap_or_else(|| {
+                    LivePgMetadataTransferFailure::retryable(format!(
+                        "PG {} committed staging authorization has no published destination artifact",
+                        work.pg_id().get()
+                    ))
+                }));
+            }
+        };
+        let (artifact, target_epoch, transfer) =
+            decode_staged_metadata_transfer_artifact(&staged_artifact, &intent).map_err(
+                |error| {
+                    LivePgMetadataTransferFailure::fatal(format!(
+                        "PG {} committed staged artifact is invalid: {error}",
+                        work.pg_id().get()
+                    ))
+                },
+            )?;
+        Ok(AuthorizedUnavailablePgMetadataTransfer {
+            work,
+            intent,
+            authorizations,
+            artifact,
+            staged_artifact,
+            target_epoch,
+            transfer,
         })
     }
 
@@ -1788,15 +1962,11 @@ impl LivePgMetadataTransferAdmin {
         authorized: &AuthorizedUnavailablePgMetadataTransfer,
         publication: StagingPublication,
     ) -> Result<Vec<UnavailablePgStagingPublicationBinding>, LivePgMetadataTransferFailure> {
-        let prepared = &authorized.prepared;
         let (expected_target_epoch, expected_transfer) = match publication {
-            StagingPublication::Artifact => (
-                prepared.prepared.install_member.expected_destination_epoch,
-                prepared.prepared.install_member.transfer,
-            ),
+            StagingPublication::Artifact => (authorized.target_epoch, authorized.transfer),
             StagingPublication::Proof(target_epoch) => {
                 let imported_proof = StorageCluster::metadata_transfer_imported_proof_at_epoch(
-                    &prepared.prepared.artifact,
+                    &authorized.artifact,
                     target_epoch,
                 )
                 .map_err(|error| {
@@ -1805,25 +1975,38 @@ impl LivePgMetadataTransferAdmin {
                 (
                     target_epoch,
                     PgMetadataTransferProof::new_with_imported_metadata_proof(
-                        prepared.prepared.artifact.cluster_epoch(),
-                        prepared.prepared.artifact.source_metadata_proof(),
+                        authorized.artifact.cluster_epoch(),
+                        authorized.artifact.source_metadata_proof(),
                         imported_proof,
                     ),
                 )
             }
         };
-        let mut publications = Vec::with_capacity(prepared.work.destination_acting_set().len());
-        for node_id in prepared.work.destination_acting_set().iter().copied() {
-            let receipt =
-                self.publish_staging_artifact_to_destination(authorized, node_id, publication)?;
+        let runtime = self
+            .control_plane
+            .pg_runtime_map_snapshot(authorized.work.pg_id(), crate::clock::current_time_millis())
+            .map_err(|error| {
+                control_plane_transfer_failure(
+                    "failed to obtain current staging destination identities",
+                    error,
+                )
+            })?;
+        let mut publications = Vec::with_capacity(authorized.work.destination_acting_set().len());
+        for node_id in authorized.work.destination_acting_set().iter().copied() {
+            let receipt = self.publish_staging_artifact_to_destination(
+                authorized,
+                &runtime,
+                node_id,
+                publication,
+            )?;
             let evidence = decode_staging_evidence(receipt.as_bytes()).map_err(|error| {
                 LivePgMetadataTransferFailure::fatal(format!(
                     "destination {} returned invalid PG {} staging evidence: {error}",
                     node_id.as_u32(),
-                    prepared.work.pg_id().get()
+                    authorized.work.pg_id().get()
                 ))
             })?;
-            if evidence.intent() != &prepared.intent
+            if evidence.intent() != &authorized.intent
                 || evidence.actor().node_id() != node_id
                 || evidence.target_epoch() != Some(expected_target_epoch)
                 || evidence.transfer() != Some(expected_transfer)
@@ -1848,10 +2031,10 @@ impl LivePgMetadataTransferAdmin {
     fn publish_staging_artifact_to_destination(
         &self,
         authorized: &AuthorizedUnavailablePgMetadataTransfer,
+        runtime: &ClusterRuntimeMapSnapshot,
         node_id: NodeId,
         publication: StagingPublication,
     ) -> Result<MetadataTransferStagingReceipt, LivePgMetadataTransferFailure> {
-        let prepared = &authorized.prepared;
         let authorization = authorized
             .authorizations
             .iter()
@@ -1859,19 +2042,18 @@ impl LivePgMetadataTransferAdmin {
             .ok_or_else(|| {
                 LivePgMetadataTransferFailure::fatal(format!(
                     "PG {} has no committed staging authorization for destination {}",
-                    prepared.work.pg_id().get(),
+                    authorized.work.pg_id().get(),
                     node_id.as_u32()
                 ))
             })?;
-        let runtime = &prepared.prepared.staging_runtime;
         let node = runtime
             .nodes()
             .iter()
             .find(|candidate| candidate.node_id() == node_id)
             .ok_or_else(|| {
                 LivePgMetadataTransferFailure::fatal(format!(
-                    "PG {} staging destination {} is absent from the authorized source runtime map",
-                    prepared.work.pg_id().get(),
+                    "PG {} staging destination {} is absent from the current authority map",
+                    authorized.work.pg_id().get(),
                     node_id.as_u32()
                 ))
             })?;
@@ -1897,20 +2079,20 @@ impl LivePgMetadataTransferAdmin {
             )
             .map_err(staging_local_failure)?;
             store
-                .create_intent_authorized(authorization, &prepared.intent)
+                .create_intent_authorized(authorization, &authorized.intent)
                 .map_err(staging_local_failure)?;
             return match publication {
                 StagingPublication::Artifact => store
                     .publish_artifact_authorized(
                         authorization,
-                        &prepared.intent,
-                        &prepared.staged_artifact,
+                        &authorized.intent,
+                        &authorized.staged_artifact,
                     )
                     .map_err(staging_local_failure),
                 StagingPublication::Proof(target_epoch) => store
                     .publish_proof_for_epoch_authorized(
                         authorization,
-                        &prepared.intent,
+                        &authorized.intent,
                         target_epoch,
                     )
                     .map_err(staging_local_failure),
@@ -1919,20 +2101,20 @@ impl LivePgMetadataTransferAdmin {
 
         let client = self.staging_rpc_client(runtime.cluster_epoch(), node_id, node.endpoint())?;
         client
-            .create_metadata_transfer_staging_intent(authorization, &prepared.intent)
+            .create_metadata_transfer_staging_intent(authorization, &authorized.intent)
             .map_err(staging_rpc_failure)?;
         match publication {
             StagingPublication::Artifact => client
                 .publish_metadata_transfer_staging_artifact(
                     authorization,
-                    &prepared.intent,
-                    &prepared.staged_artifact,
+                    &authorized.intent,
+                    &authorized.staged_artifact,
                 )
                 .map_err(staging_rpc_failure),
             StagingPublication::Proof(target_epoch) => client
                 .publish_metadata_transfer_staging_proof(
                     authorization,
-                    &prepared.intent,
+                    &authorized.intent,
                     target_epoch,
                 )
                 .map_err(staging_rpc_failure),
@@ -2302,7 +2484,6 @@ impl LivePgMetadataTransferAdmin {
         Ok(LivePgMetadataTransferPreparation::Prepared(Box::new(
             PreparedLivePgMetadataTransfer {
                 source_node_id,
-                staging_runtime: fenced_source_runtime,
                 source_route,
                 artifact,
                 install_member,
@@ -2316,7 +2497,6 @@ impl LivePgMetadataTransferAdmin {
     ) -> Result<LivePgMetadataTransferInstallation, LivePgMetadataTransferFailure> {
         let PreparedLivePgMetadataTransfer {
             source_node_id,
-            staging_runtime: _,
             source_route,
             artifact,
             install_member,
@@ -2968,8 +3148,6 @@ enum LivePgMetadataTransferPreparation {
 
 struct PreparedLivePgMetadataTransfer {
     source_node_id: NodeId,
-    #[allow(dead_code)] // Retained by the prepared staging ownership state.
-    staging_runtime: ClusterRuntimeMapSnapshot,
     source_route: PgRouteSnapshot,
     artifact: PgMetadataTransferArtifact,
     install_member: PreparedLivePgMetadataTransferInstallMember,
@@ -4539,7 +4717,7 @@ mod tests {
         let server = spawn_live_transfer_control_plane(
             &socket_path,
             Arc::clone(&authority),
-            (1..=6).map(|offset| begin_at_ms + offset).collect(),
+            (1..=8).map(|offset| begin_at_ms + offset).collect(),
         );
         let _time = crate::clock::test_time_override_guard(begin_at_ms + 10);
         let admin = LivePgMetadataTransferAdmin::with_in_process_storage_nodes(
@@ -4597,6 +4775,51 @@ mod tests {
             partial_error._diagnostic
         );
         std::fs::remove_file(&blocked_destination).unwrap();
+        drop(authorized);
+        std::fs::rename(&source_data_root, tmp.path().join("retired-source-cluster")).unwrap();
+        let restarted_admin = LivePgMetadataTransferAdmin::with_in_process_storage_nodes(
+            bound_plain_control_plane(&socket_path),
+            EcShape { k: 2, m: 1 },
+            tmp.path().join("storage"),
+        );
+        let transient_reader = LivePgMetadataTransferAdmin::with_in_process_storage_nodes(
+            bound_plain_control_plane(&socket_path),
+            EcShape { k: 2, m: 1 },
+            tmp.path().join("storage"),
+        )
+        .with_staging_artifact_read_failure(
+            NodeId::new(4),
+            LivePgMetadataTransferFailureDisposition::Retryable,
+        );
+        let transient_error = match transient_reader
+            .resume_authorized_unavailable_pg_reconciliation(work.clone(), &authorized_snapshot)
+        {
+            Ok(_) => panic!("absent peers discarded the sole artifact holder's timeout"),
+            Err(error) => error,
+        };
+        assert!(!transient_error.is_fatal());
+        assert!(
+            transient_error.retained_diagnostic_contains("injected staging artifact read failure")
+        );
+        let recovered_authorized = restarted_admin
+            .resume_authorized_unavailable_pg_reconciliation(work.clone(), &authorized_snapshot)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to recover partially staged authorization: {}",
+                    error._diagnostic
+                )
+            });
+        assert_eq!(recovered_authorized.authorization_request(), authorization);
+        assert_eq!(
+            recovered_authorized.target_epoch,
+            initially_prepared_destination_epoch
+        );
+        assert_eq!(
+            recovered_authorized.transfer.metadata_proof(),
+            initially_prepared_proof
+        );
+        let admin = restarted_admin;
+        let authorized = recovered_authorized;
         let published = admin
             .stage_prepared_unavailable_pg_reconciliation(&authorized)
             .unwrap_or_else(|error| {
@@ -4605,6 +4828,23 @@ mod tests {
                     error._diagnostic
                 )
             });
+        let fatal_reader = LivePgMetadataTransferAdmin::with_in_process_storage_nodes(
+            bound_plain_control_plane(&socket_path),
+            EcShape { k: 2, m: 1 },
+            tmp.path().join("storage"),
+        )
+        .with_staging_artifact_read_failure(
+            NodeId::new(4),
+            LivePgMetadataTransferFailureDisposition::Fatal,
+        );
+        let fatal_error = match fatal_reader
+            .resume_authorized_unavailable_pg_reconciliation(work.clone(), &authorized_snapshot)
+        {
+            Ok(_) => panic!("a later valid artifact discarded earlier fatal read evidence"),
+            Err(error) => error,
+        };
+        assert!(fatal_error.is_fatal());
+        assert!(fatal_error.retained_diagnostic_contains("injected staging artifact read failure"));
         let mut staged = authorized.bind_publications(published).unwrap();
         assert_eq!(staged.target_epoch(), initially_prepared_destination_epoch);
         assert_eq!(staged.install_request().publications.len(), 3);
@@ -4673,7 +4913,6 @@ mod tests {
             )
             .unwrap();
         let installed_snapshot = authority.lock().unwrap().snapshot().clone();
-        std::fs::rename(&source_data_root, tmp.path().join("retired-source-cluster")).unwrap();
         let restarted_admin = LivePgMetadataTransferAdmin::with_in_process_storage_nodes(
             bound_plain_control_plane(&socket_path),
             EcShape { k: 2, m: 1 },

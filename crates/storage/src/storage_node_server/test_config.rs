@@ -6447,12 +6447,20 @@
             .create_metadata_transfer_staging_intent(&malformed_authorization, &intent)
             .is_err());
 
+        assert!(matches!(
+            client.read_metadata_transfer_staging_artifact(&authorization, &intent),
+            Err(crate::StoreError::NotFound)
+        ));
         client
             .create_metadata_transfer_staging_intent(&authorization, &intent)
             .unwrap();
         client
             .create_metadata_transfer_staging_intent(&authorization, &intent)
             .unwrap();
+        assert!(matches!(
+            client.read_metadata_transfer_staging_artifact(&authorization, &intent),
+            Err(crate::StoreError::NotFound)
+        ));
         let first = client
             .publish_metadata_transfer_staging_artifact(&authorization, &intent, &artifact)
             .unwrap();

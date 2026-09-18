@@ -1201,6 +1201,27 @@ reconstructs from destination storage, imports, activates, and completes the
 existing all-destination cleanup path. The production worker remains on the
 singular wrapper until the atomic state-machine handoff consumes this owner.
 
+The pre-install owner is now restart-safe after the first destination has
+fsync-complete artifact bytes. Authorization binding consumes the original
+prepared export and retains only the exact work, intent, complete destination
+capabilities, decoded artifact, canonical staged bytes, and initial target
+proof. On restart, storage reconstructs that owner from the durable complete
+authorization batch and any destination copy matching its exact digest and
+length. A missing or unpublished copy on another destination is not authority
+to alter the artifact: staging replay sends the recovered canonical bytes to
+the complete destination set, and every destination must accept the exact
+intent before install. Recovery classifies absent and not-yet-published copies
+separately from read failures. Transient uncertainty from a possible holder is
+retained when every other destination reports absence, while any observed
+authentication, protocol, integrity, or invariant failure dominates even when
+a later destination supplies valid bytes. Artifact publication resolves current
+authority-certified destination identities rather than retaining the
+preparation-time route. Composed coverage commits authorization, fsyncs only
+the first destination, loses both the in-memory owner and historical source,
+then reconstructs and completes staging, epoch-proof rebase, install, import,
+activation, and cleanup. If no destination has published the artifact, source
+re-export or separately authorized cancellation remains required.
+
 Command v29 and state v41 implement the first bounded segment-retirement
 step. `CollapseMetadataTransferStagingEvidenceCheckpointSegment` performs an
 exact CAS over the actor incarnation, generation range, and canonical source
