@@ -2619,6 +2619,534 @@ fn staging_evidence_checkpoint_compacts_history_without_consuming_the_tip() {
 }
 
 #[test]
+fn production_staging_maintenance_checkpoints_history_but_retains_open_tips() {
+    let (_tmp, _store, mut authority, installs) =
+        staged_two_pg_install_authority_fixture_with_proof(PgMetadataProof::current(
+            23, 0x2323, 0x3434,
+        ));
+    let actor_node_id = installs[0].publications[0].node_id;
+    let actor_node_incarnation = installs[0].publications[0].node_incarnation;
+    let original_epoch = authority.snapshot().cluster_epoch();
+    let mut cursor = MetadataTransferStagingMaintenanceCursor::start();
+
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert_eq!(authority.snapshot().cluster_epoch(), original_epoch);
+    assert!(!authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(actor_node_id, actor_node_incarnation, 1)));
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(actor_node_id, actor_node_incarnation, 2)));
+
+    for _ in 0..32 {
+        authority
+            .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+            .unwrap();
+    }
+    for (node_id, incarnation, generation) in authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .keys()
+    {
+        let actor_tip = authority
+            .snapshot()
+            .metadata_transfer_staging_evidence_pages
+            .range((*node_id, *incarnation, 0)..=(*node_id, *incarnation, u64::MAX))
+            .next_back()
+            .unwrap()
+            .0
+             .2;
+        assert_eq!(
+            *generation, actor_tip,
+            "maintenance consumed an open actor tip"
+        );
+    }
+}
+
+#[test]
+fn production_staging_maintenance_retires_closure_before_checkpointing_genesis() {
+    let snapshot = staging_actor_closure_snapshot_fixture();
+    let closure_key = *snapshot
+        .metadata_transfer_staging_actor_closures
+        .keys()
+        .next()
+        .unwrap();
+    let destination_actor = snapshot.metadata_transfer_staging_actor_closures[&closure_key]
+        .destination_actor
+        .clone();
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    store.checkpoint(None, &snapshot).unwrap();
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+    let original_epoch = authority.snapshot().cluster_epoch();
+    let mut cursor = MetadataTransferStagingMaintenanceCursor::start();
+
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_retired_actor_closures
+        .contains_key(&closure_key));
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(
+            destination_actor.node_id(),
+            destination_actor.node_incarnation(),
+            1,
+        )));
+
+    for _ in 0..32 {
+        authority
+            .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+            .unwrap();
+    }
+    assert!(!authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&(
+            destination_actor.node_id(),
+            destination_actor.node_incarnation(),
+            1,
+        )));
+    assert_eq!(authority.snapshot().cluster_epoch(), original_epoch);
+    authority
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+}
+
+#[test]
+fn production_staging_maintenance_collapses_and_coalesces_finalized_history() {
+    let (_tmp, _store, mut authority, _, _) =
+        finalized_staging_floor_authority_fixture_with_isolated_checkpoints(true);
+    let original_epoch = authority.snapshot().cluster_epoch();
+    let mut cursor = MetadataTransferStagingMaintenanceCursor::start();
+    for _ in 0..96 {
+        authority
+            .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+            .unwrap();
+    }
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_anchors
+        .values()
+        .any(|anchor| anchor.source_segment_count == 1));
+    assert_eq!(authority.snapshot().cluster_epoch(), original_epoch);
+    authority
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+
+    let (_tmp, _store, mut authority) = adjacent_collapsed_staging_checkpoint_authority_fixture();
+    let original_epoch = authority.snapshot().cluster_epoch();
+    let initial_anchor_count = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_anchors
+        .len();
+    let mut cursor = MetadataTransferStagingMaintenanceCursor::start();
+    for _ in 0..96 {
+        authority
+            .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+            .unwrap();
+    }
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_anchors
+        .values()
+        .any(|anchor| anchor.source_segment_count >= 2));
+    assert!(
+        authority
+            .snapshot()
+            .metadata_transfer_staging_evidence_checkpoint_anchors
+            .len()
+            < initial_anchor_count
+    );
+    assert_eq!(authority.snapshot().cluster_epoch(), original_epoch);
+    authority
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+}
+
+#[test]
+fn production_staging_maintenance_finishes_anchor_sweep_when_coalescing_consumes_ceiling() {
+    let (_tmp, _store, mut authority) = adjacent_collapsed_staging_checkpoint_authority_fixture();
+    let first_key = *authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_anchors
+        .keys()
+        .next()
+        .unwrap();
+    let second_key = (first_key.0, first_key.1, 2);
+    let third_key = (first_key.0, first_key.1, 3);
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_anchors
+        .contains_key(&second_key));
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_anchors
+        .contains_key(&third_key));
+
+    let mut cursor = MetadataTransferStagingMaintenanceCursor::start();
+    cursor.next_phase = MetadataTransferStagingMaintenancePhase::AnchorCoalescing;
+    cursor.anchor_high_water = Some(second_key);
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert_eq!(cursor.anchor_high_water, None);
+    assert_eq!(
+        authority
+            .snapshot()
+            .metadata_transfer_staging_evidence_checkpoint_anchors[&first_key]
+            .last_generation,
+        2
+    );
+
+    // Generation 3 was outside the first sweep's captured ceiling. A fresh sweep must include
+    // it and merge it with the replacement anchor at generation 1.
+    cursor.next_phase = MetadataTransferStagingMaintenancePhase::AnchorCoalescing;
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert_eq!(
+        authority
+            .snapshot()
+            .metadata_transfer_staging_evidence_checkpoint_anchors[&first_key]
+            .last_generation,
+        3
+    );
+    assert!(!authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_anchors
+        .contains_key(&third_key));
+    authority
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+}
+
+fn append_next_epoch_staging_publication(
+    authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
+    actor: &crate::pg_store::MetadataTransferStagingNodeIdentity,
+) {
+    let latest = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence
+        .values()
+        .filter_map(|bytes| crate::pg_store::decode_staging_evidence(bytes).ok())
+        .filter(|evidence| {
+            evidence.actor() == actor
+                && evidence.kind()
+                    == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication
+        })
+        .max_by_key(|evidence| evidence.target_epoch())
+        .expect("maintenance fixture actor must retain publication evidence");
+    let target_epoch = next_epoch(
+        latest
+            .target_epoch()
+            .expect("publication evidence must bind a target epoch"),
+    )
+    .unwrap();
+    let previous = latest_staging_evidence_apply_receipt(
+        authority.snapshot(),
+        actor.node_id(),
+        actor.node_incarnation(),
+    )
+    .expect("maintenance fixture actor must retain its page-chain tip");
+    let page =
+        crate::pg_store::metadata_transfer_staging_publication_evidence_page_at_epoch_for_test(
+            actor.clone(),
+            latest.intent(),
+            target_epoch,
+            latest
+                .transfer()
+                .expect("publication evidence must retain its transfer proof"),
+            Some(&previous),
+        );
+    ControlPlaneAdmin::apply_metadata_transfer_staging_evidence_page(
+        authority,
+        page.operation_payload().to_vec(),
+        page.page_digest(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn production_staging_maintenance_does_not_skip_scanned_records_or_starve_later_phases() {
+    let (_tmp, _store, mut authority, actor) = checkpoint_anchor_direct_boundary_fixture();
+    let actor_key = (actor.node_id(), actor.node_incarnation());
+    assert!(
+        authority
+            .snapshot()
+            .metadata_transfer_staging_evidence_checkpoint_anchors
+            .range((actor_key.0, actor_key.1, 0)..=(actor_key.0, actor_key.1, u64::MAX))
+            .count()
+            > METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE
+    );
+    let mut cursor = MetadataTransferStagingMaintenanceCursor::start();
+
+    // First coalesce the beginning of a catalogue larger than one scan page. Keep appending
+    // higher evidence generations between polls so the catalogue never needs to wrap before
+    // the next low record and the lower-priority phases receive service.
+    for _ in 0..8 {
+        assert!(authority
+            .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+            .unwrap());
+        if cursor.next_phase == MetadataTransferStagingMaintenancePhase::ClosureRetirement {
+            break;
+        }
+    }
+    assert_eq!(
+        cursor.next_phase,
+        MetadataTransferStagingMaintenancePhase::ClosureRetirement
+    );
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_anchors
+        .contains_key(&(actor_key.0, actor_key.1, 3)));
+
+    append_next_epoch_staging_publication(&mut authority, &actor);
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert_eq!(
+        cursor.next_phase,
+        MetadataTransferStagingMaintenancePhase::SegmentCollapse
+    );
+
+    append_next_epoch_staging_publication(&mut authority, &actor);
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert_eq!(
+        cursor.next_phase,
+        MetadataTransferStagingMaintenancePhase::AnchorCoalescing
+    );
+
+    append_next_epoch_staging_publication(&mut authority, &actor);
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert_eq!(
+        cursor.next_phase,
+        MetadataTransferStagingMaintenancePhase::ClosureRetirement
+    );
+    assert!(
+        !authority
+            .snapshot()
+            .metadata_transfer_staging_evidence_checkpoint_anchors
+            .contains_key(&(actor_key.0, actor_key.1, 3)),
+        "the next low anchor must not be skipped while higher generations are appended"
+    );
+    authority
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+}
+
+#[test]
+fn production_staging_maintenance_wraps_fixed_page_sweep_before_growing_later_actor() {
+    let (_tmp, _store, mut authority, _boundary_actor) =
+        checkpoint_anchor_direct_boundary_fixture();
+    let mut actors = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence
+        .values()
+        .filter_map(|bytes| crate::pg_store::decode_staging_evidence(bytes).ok())
+        .map(|evidence| evidence.actor().clone())
+        .collect::<Vec<_>>();
+    actors.sort_by_key(|actor| (actor.node_id(), actor.node_incarnation()));
+    actors.dedup();
+    let earlier_actor = actors
+        .first()
+        .expect("maintenance fixture must retain a first destination actor");
+    let later_actor = actors
+        .last()
+        .expect("maintenance fixture must retain a last destination actor");
+    assert_ne!(earlier_actor, later_actor);
+    let earlier_tip = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .range(
+            (earlier_actor.node_id(), earlier_actor.node_incarnation(), 0)
+                ..=(
+                    earlier_actor.node_id(),
+                    earlier_actor.node_incarnation(),
+                    u64::MAX,
+                ),
+        )
+        .next_back()
+        .map(|(key, _)| *key)
+        .unwrap();
+    let later_tip = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .range(
+            (later_actor.node_id(), later_actor.node_incarnation(), 0)
+                ..=(
+                    later_actor.node_id(),
+                    later_actor.node_incarnation(),
+                    u64::MAX,
+                ),
+        )
+        .next_back()
+        .map(|(key, _)| *key)
+        .unwrap();
+
+    append_next_epoch_staging_publication(&mut authority, later_actor);
+    let mut cursor = MetadataTransferStagingMaintenanceCursor::start();
+    cursor.next_phase = MetadataTransferStagingMaintenancePhase::PageCheckpoint;
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&earlier_tip));
+    assert!(!authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&later_tip));
+
+    // A becomes eligible after the sweep passed it. Keep extending B beyond the sweep's fixed
+    // high-water mark; B may finish the old sweep, but the next poll must wrap and select A.
+    append_next_epoch_staging_publication(&mut authority, earlier_actor);
+    append_next_epoch_staging_publication(&mut authority, later_actor);
+    cursor.next_phase = MetadataTransferStagingMaintenancePhase::PageCheckpoint;
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .contains_key(&earlier_tip));
+
+    append_next_epoch_staging_publication(&mut authority, later_actor);
+    cursor.next_phase = MetadataTransferStagingMaintenancePhase::PageCheckpoint;
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert!(
+        !authority
+            .snapshot()
+            .metadata_transfer_staging_evidence_pages
+            .contains_key(&earlier_tip),
+        "a newly eligible earlier actor must be revisited before the later actor tail drains"
+    );
+    authority
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+}
+
+#[test]
+fn production_staging_maintenance_wraps_fixed_segment_sweep_to_deferred_earlier_actor() {
+    let (_tmp, _store, mut authority, boundary_actor) = checkpoint_anchor_direct_boundary_fixture();
+    let mut segment_actors = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .keys()
+        .map(|(node_id, incarnation, _)| (*node_id, *incarnation))
+        .collect::<Vec<_>>();
+    segment_actors.sort_unstable();
+    segment_actors.dedup();
+    let [earlier_actor, later_actor] = segment_actors.as_slice() else {
+        panic!("maintenance fixture must retain two non-boundary segment actors");
+    };
+    assert_ne!(
+        *earlier_actor,
+        (boundary_actor.node_id(), boundary_actor.node_incarnation())
+    );
+
+    let (earlier_first, earlier_last) = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .iter()
+        .find(|((node_id, incarnation, _), _)| (*node_id, *incarnation) == *earlier_actor)
+        .map(|((_, _, first), segment)| (*first, segment.last_generation))
+        .unwrap();
+    ControlPlaneAdmin::collapse_metadata_transfer_staging_evidence_checkpoint_segment(
+        &mut authority,
+        earlier_actor.0,
+        earlier_actor.1,
+        earlier_first,
+        earlier_last,
+    )
+    .unwrap();
+
+    let earlier_identity = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence
+        .values()
+        .filter_map(|bytes| crate::pg_store::decode_staging_evidence(bytes).ok())
+        .map(|evidence| evidence.actor().clone())
+        .find(|actor| (actor.node_id(), actor.node_incarnation()) == *earlier_actor)
+        .unwrap();
+    let earlier_open_tip = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_pages
+        .range((earlier_actor.0, earlier_actor.1, 0)..=(earlier_actor.0, earlier_actor.1, u64::MAX))
+        .next_back()
+        .map(|(key, _)| *key)
+        .unwrap();
+    append_next_epoch_staging_publication(&mut authority, &earlier_identity);
+    ControlPlaneAdmin::checkpoint_metadata_transfer_staging_evidence_pages(
+        &mut authority,
+        earlier_open_tip.0,
+        earlier_open_tip.1,
+        earlier_open_tip.2,
+        earlier_open_tip.2,
+    )
+    .unwrap();
+    let deferred_segment_key = earlier_open_tip;
+    let later_segment_key = authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .keys()
+        .find(|(node_id, incarnation, _)| (*node_id, *incarnation) == *later_actor)
+        .copied()
+        .unwrap();
+
+    let mut cursor = MetadataTransferStagingMaintenanceCursor::start();
+    cursor.next_phase = MetadataTransferStagingMaintenancePhase::SegmentCollapse;
+    assert!(authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap());
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .contains_key(&deferred_segment_key));
+    assert!(!authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .contains_key(&later_segment_key));
+    assert_eq!(cursor.after_segment, Some(later_segment_key));
+    assert_eq!(cursor.segment_high_water, Some(later_segment_key));
+
+    cursor.next_phase = MetadataTransferStagingMaintenancePhase::SegmentCollapse;
+    authority
+        .maintain_metadata_transfer_staging_evidence_once(&mut cursor)
+        .unwrap();
+    assert_eq!(cursor.after_segment, Some(deferred_segment_key));
+    assert_eq!(cursor.segment_high_water, Some(deferred_segment_key));
+    assert!(authority
+        .snapshot()
+        .metadata_transfer_staging_evidence_checkpoint_segments
+        .contains_key(&deferred_segment_key));
+    authority
+        .snapshot()
+        .validate_current_state_invariants()
+        .unwrap();
+}
+
+#[test]
 fn finalized_staging_floor_requires_all_checkpointed_tombstones_and_is_epoch_neutral() {
     let (_tmp, store, mut authority, installs) = completed_staged_two_pg_authority_fixture();
     let original_epoch = authority.snapshot().cluster_epoch();

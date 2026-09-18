@@ -1157,8 +1157,7 @@ pin retries to the pre-install route. A partial failure leaves earlier durable
 tombstones replayable and later destinations untouched, so retry converges
 without narrowing the obligation set. Production-worker handoff,
 finalized-floor advancement, pre-install
-cancellation, fenced-incarnation retirement substitutes, and
-closure-certificate retirement remain gated.
+cancellation, and fenced-incarnation retirement substitutes remain gated.
 
 Storage RPC v27 adds committed-authorization-bound exact-artifact retrieval.
 The request carries the same complete authority presentation and exact intent
@@ -1250,9 +1249,33 @@ observable. Checkpoint bindings for such replay rows retain the exact rebound
 actor endpoint and closure candidate so later segment and anchor reconstruction
 remains canonical. The immutable command v30/state v42 aggregates and their
 snapshot, standalone-journal, Raft-peer, restart, WAL, and storage-RPC
-containers remain exact rejection evidence. Production manager selection and
-retirement scheduling remain gated; this slice exposes only the exact
-state-machine and admin primitive needed by that worker.
+containers remain exact rejection evidence. A bounded production maintenance
+cursor now schedules these existing epoch-neutral primitives through both
+standalone and Raft authorities. Each reconciliation poll examines at most 16
+records in each independent closure, page, segment, and anchor catalogue and
+submits at most one low-priority command. Cursor progress is committed only
+through the selected or actually examined record and only after durable command
+success. Each catalogue sweep captures a fixed high-water key and wraps after
+reaching it, independently of records appended later by the same or another
+actor; mutable page, segment, and anchor boundaries are therefore reconsidered
+when a successor or finalized floor can make them eligible. The starting phase
+rotates after every selection, so sustained page publication cannot starve
+segment collapse or anchor coalescing. Coalescing that consumes the captured
+anchor high-water key completes that sweep before the replacement anchor is
+revisited, so a removed ceiling cannot exclude later successors. It retires an exact closure before checkpointing
+a closure-bearing genesis, never consumes an open actor tip, collapses only
+fully finalized segments, and coalesces only adjacent validated anchors. Typed
+leadership, transport, and authority-clock gaps use an independent retry
+backoff and do not suppress PG transfer or activation polling; integrity,
+durability, protocol, and fatal Raft outcomes propagate to the service loop and
+fail stop. Standalone production-path regressions cover open-tip retention,
+rollover ordering, bounded same-actor and cross-actor sweeps with continuously
+appended higher generations, deferred-segment reconsideration, phase fairness,
+collapse, coalescing, epoch neutrality, and fatal-versus-retryable maintenance
+classification; the three-voter staged-transfer
+composition drives checkpointing through the same Raft maintenance entry
+point. This closes retention and closure-retirement scheduling before the
+worker begins creating staged production evidence.
 
 This cleanup CAS is intentionally one per PG, not a fifth multi-PG batch
 command. Epoch-neutral cleanup does not need batching to amortize cluster-map

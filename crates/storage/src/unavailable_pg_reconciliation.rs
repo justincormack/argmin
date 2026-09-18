@@ -9,10 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::control_plane::{
-    ControlPlaneError, FileControlPlaneStore, SingleAuthorityControlPlane,
-    UnavailablePgReconciliationCompletionBatch, UnavailablePgReconciliationCursor,
-    UnavailablePgReconciliationPollBatch, UnavailablePgReconciliationStage,
-    UnavailablePgReconciliationWork,
+    ControlPlaneError, FileControlPlaneStore, MetadataTransferStagingMaintenanceCursor,
+    SingleAuthorityControlPlane, UnavailablePgReconciliationCompletionBatch,
+    UnavailablePgReconciliationCursor, UnavailablePgReconciliationPollBatch,
+    UnavailablePgReconciliationStage, UnavailablePgReconciliationWork,
 };
 use crate::{ClusterEpoch, ControlPlaneRaftAuthorityHost, LivePgMetadataTransferAdmin, PgId};
 
@@ -58,6 +58,11 @@ trait ReconciliationAuthority {
         work: &[UnavailablePgReconciliationWork],
         now_ms: u64,
     ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError>;
+
+    fn maintain_staging_evidence(
+        &mut self,
+        cursor: &mut MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<bool, ControlPlaneError>;
 }
 
 impl ReconciliationAuthority for ControlPlaneRaftAuthorityHost {
@@ -75,6 +80,13 @@ impl ReconciliationAuthority for ControlPlaneRaftAuthorityHost {
         now_ms: u64,
     ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
         self.complete_unavailable_pg_reconciliation_batch(work, now_ms)
+    }
+
+    fn maintain_staging_evidence(
+        &mut self,
+        cursor: &mut MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<bool, ControlPlaneError> {
+        self.maintain_metadata_transfer_staging_evidence_once(cursor)
     }
 }
 
@@ -94,20 +106,30 @@ impl ReconciliationAuthority for SingleAuthorityControlPlane<FileControlPlaneSto
     ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
         self.complete_unavailable_pg_reconciliation_batch(work, now_ms)
     }
+
+    fn maintain_staging_evidence(
+        &mut self,
+        cursor: &mut MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<bool, ControlPlaneError> {
+        self.maintain_metadata_transfer_staging_evidence_once(cursor)
+    }
 }
 
 pub struct UnavailablePgReconciliationWorker {
     work_tx: SyncSender<UnavailablePgReconciliationWork>,
     completion_rx: Receiver<TransferWorkerEvent>,
     cursor: UnavailablePgReconciliationCursor,
+    staging_maintenance_cursor: MetadataTransferStagingMaintenanceCursor,
     in_flight: BTreeMap<PgId, UnavailablePgReconciliationWork>,
     pending_transfers: VecDeque<UnavailablePgReconciliationWork>,
     ready_for_activation: Vec<UnavailablePgReconciliationWork>,
     authority_retry_not_before: Instant,
+    maintenance_retry_not_before: Instant,
     deferred: BTreeMap<PgId, (ClusterEpoch, Instant)>,
     blocked: BTreeMap<PgId, ClusterEpoch>,
     retry_backoff: Duration,
     last_diagnostic: Option<String>,
+    last_maintenance_diagnostic: Option<String>,
 }
 
 impl UnavailablePgReconciliationWorker {
@@ -177,14 +199,17 @@ impl UnavailablePgReconciliationWorker {
             work_tx,
             completion_rx,
             cursor: UnavailablePgReconciliationCursor::start(),
+            staging_maintenance_cursor: MetadataTransferStagingMaintenanceCursor::start(),
             in_flight: BTreeMap::new(),
             pending_transfers: VecDeque::new(),
             ready_for_activation: Vec::new(),
             authority_retry_not_before: Instant::now(),
+            maintenance_retry_not_before: Instant::now(),
             deferred: BTreeMap::new(),
             blocked: BTreeMap::new(),
             retry_backoff,
             last_diagnostic: None,
+            last_maintenance_diagnostic: None,
         }
     }
 
@@ -192,12 +217,16 @@ impl UnavailablePgReconciliationWorker {
         &mut self,
         authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
         now_ms: u64,
-    ) {
-        self.poll(authority, now_ms);
+    ) -> Result<(), ControlPlaneError> {
+        self.poll(authority, now_ms)
     }
 
-    pub fn poll_raft(&mut self, authority: &mut ControlPlaneRaftAuthorityHost, now_ms: u64) {
-        self.poll(authority, now_ms);
+    pub fn poll_raft(
+        &mut self,
+        authority: &mut ControlPlaneRaftAuthorityHost,
+        now_ms: u64,
+    ) -> Result<(), ControlPlaneError> {
+        self.poll(authority, now_ms)
     }
 
     /// Observe transfer completion and fail-stop worker loss independently of authority role.
@@ -386,7 +415,16 @@ impl UnavailablePgReconciliationWorker {
         }
     }
 
-    fn poll(&mut self, authority: &mut impl ReconciliationAuthority, now_ms: u64) {
+    fn poll(
+        &mut self,
+        authority: &mut impl ReconciliationAuthority,
+        now_ms: u64,
+    ) -> Result<(), ControlPlaneError> {
+        self.poll_reconciliation(authority, now_ms);
+        self.poll_staging_maintenance(authority)
+    }
+
+    fn poll_reconciliation(&mut self, authority: &mut impl ReconciliationAuthority, now_ms: u64) {
         self.observe_transfer_workers();
         if Instant::now() < self.authority_retry_not_before {
             return;
@@ -438,6 +476,37 @@ impl UnavailablePgReconciliationWorker {
             }
         }
     }
+
+    fn poll_staging_maintenance(
+        &mut self,
+        authority: &mut impl ReconciliationAuthority,
+    ) -> Result<(), ControlPlaneError> {
+        if Instant::now() < self.maintenance_retry_not_before {
+            return Ok(());
+        }
+        match authority.maintain_staging_evidence(&mut self.staging_maintenance_cursor) {
+            Ok(_) => {
+                self.last_maintenance_diagnostic = None;
+                Ok(())
+            }
+            Err(error) if staging_maintenance_error_is_retryable(&error) => {
+                let diagnostic = error.to_string();
+                if self.last_maintenance_diagnostic.as_deref() != Some(&diagnostic) {
+                    eprintln!("metadata-transfer staging maintenance deferred: {diagnostic}");
+                    self.last_maintenance_diagnostic = Some(diagnostic);
+                }
+                self.maintenance_retry_not_before = Instant::now() + self.retry_backoff;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn staging_maintenance_error_is_retryable(error: &ControlPlaneError) -> bool {
+    error.is_retryable_runtime_map_observation_error()
+        || matches!(error, ControlPlaneError::RpcUnconfirmed { .. })
+        || error.is_retryable_openraft_leadership_error()
 }
 
 fn reconciliation_completion_error_is_fatal(error: &ControlPlaneError) -> bool {
@@ -483,6 +552,8 @@ mod tests {
         candidates: VecDeque<UnavailablePgReconciliationWork>,
         poll_batch_size: usize,
         poll_count: usize,
+        maintenance_count: usize,
+        maintenance_results: VecDeque<Result<bool, ControlPlaneError>>,
         published: Vec<UnavailablePgReconciliationWork>,
         published_batches: Vec<Vec<UnavailablePgReconciliationWork>>,
         publish_results:
@@ -542,6 +613,14 @@ mod tests {
                 })
             })
         }
+
+        fn maintain_staging_evidence(
+            &mut self,
+            _cursor: &mut MetadataTransferStagingMaintenanceCursor,
+        ) -> Result<bool, ControlPlaneError> {
+            self.maintenance_count += 1;
+            self.maintenance_results.pop_front().unwrap_or(Ok(false))
+        }
     }
 
     fn work(
@@ -592,22 +671,23 @@ mod tests {
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100);
+        worker.poll(&mut authority, 100).unwrap();
         assert_eq!(
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             expected
         );
         for _ in 0..100 {
-            worker.poll(&mut authority, 101);
+            worker.poll(&mut authority, 101).unwrap();
         }
         assert_eq!(authority.poll_count, 1);
+        assert_eq!(authority.maintenance_count, 101);
         assert!(authority.published.is_empty());
 
         let (lock, ready) = &*transfer_gate;
         *lock.lock().unwrap() = true;
         ready.notify_all();
         for _ in 0..1_000 {
-            worker.poll(&mut authority, 102);
+            worker.poll(&mut authority, 102).unwrap();
             if !authority.published.is_empty() {
                 break;
             }
@@ -633,7 +713,7 @@ mod tests {
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100);
+        worker.poll(&mut authority, 100).unwrap();
         assert_eq!(
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             expected
@@ -694,7 +774,7 @@ mod tests {
         };
 
         for now_ms in 100..104 {
-            worker.poll(&mut authority, now_ms);
+            worker.poll(&mut authority, now_ms).unwrap();
         }
 
         assert_eq!(authority.published, vec![stale, successor]);
@@ -722,7 +802,7 @@ mod tests {
         };
 
         for now_ms in 100..104 {
-            worker.poll(&mut authority, now_ms);
+            worker.poll(&mut authority, now_ms).unwrap();
         }
 
         assert_eq!(authority.published, vec![deferred.clone(), successor]);
@@ -754,7 +834,7 @@ mod tests {
         };
 
         for now_ms in 100..105 {
-            worker.poll(&mut authority, now_ms);
+            worker.poll(&mut authority, now_ms).unwrap();
         }
 
         assert_eq!(authority.published, vec![blocked.clone(), successor]);
@@ -795,7 +875,7 @@ mod tests {
         };
 
         for now_ms in 100..10_100 {
-            worker.poll(&mut authority, now_ms);
+            worker.poll(&mut authority, now_ms).unwrap();
             if authority.poll_count == 5 && worker.in_flight.is_empty() {
                 break;
             }
@@ -839,7 +919,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while authority.published_batches.is_empty() {
-            worker.poll(&mut authority, 100);
+            worker.poll(&mut authority, 100).unwrap();
             assert!(
                 Instant::now() < deadline,
                 "successful transfer peer did not reach batch activation"
@@ -885,7 +965,7 @@ mod tests {
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100);
+        worker.poll(&mut authority, 100).unwrap();
 
         assert_eq!(authority.poll_count, 1);
         assert_eq!(authority.published_batches, vec![vec![first, second]]);
@@ -914,7 +994,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while authority.published_batches.is_empty() {
-            worker.poll(&mut authority, 100);
+            worker.poll(&mut authority, 100).unwrap();
             assert!(
                 Instant::now() < deadline,
                 "transferred page did not reach batch activation"
@@ -964,7 +1044,7 @@ mod tests {
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100);
+        worker.poll(&mut authority, 100).unwrap();
         let mut started = Vec::new();
         for _ in 0..TRANSFER_WORKER_COUNT {
             started.push(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
@@ -985,7 +1065,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while authority.published_batches.is_empty() {
-            worker.poll(&mut authority, 101);
+            worker.poll(&mut authority, 101).unwrap();
             assert!(
                 Instant::now() < deadline,
                 "bounded transfer page did not reach batch activation"
@@ -1019,7 +1099,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while authority.published_batches.is_empty() {
-            worker.poll(&mut authority, 100);
+            worker.poll(&mut authority, 100).unwrap();
             assert!(
                 Instant::now() < deadline,
                 "mixed-stage page did not reach batch activation"
@@ -1053,7 +1133,7 @@ mod tests {
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100);
+        worker.poll(&mut authority, 100).unwrap();
 
         assert_eq!(
             authority.published_batches,
@@ -1093,7 +1173,7 @@ mod tests {
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100);
+        worker.poll(&mut authority, 100).unwrap();
 
         assert_eq!(
             authority.published_batches,
@@ -1103,5 +1183,60 @@ mod tests {
             worker.deferred.get(&stale.pg_id()).map(|entry| entry.0),
             Some(stale.transition_epoch())
         );
+    }
+
+    #[test]
+    fn retryable_staging_maintenance_failure_uses_bounded_backoff() {
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            |_| Ok(()),
+            Duration::from_secs(60),
+        );
+        let mut authority = FakeAuthority {
+            maintenance_results: VecDeque::from([Err(ControlPlaneError::AuthorityNotServing)]),
+            ..FakeAuthority::default()
+        };
+
+        worker.poll(&mut authority, 100).unwrap();
+        assert_eq!(authority.maintenance_count, 1);
+        assert!(worker.last_maintenance_diagnostic.is_some());
+
+        worker.poll(&mut authority, 101).unwrap();
+        assert_eq!(authority.maintenance_count, 1);
+        assert!(worker.last_maintenance_diagnostic.is_some());
+    }
+
+    #[test]
+    fn fatal_staging_maintenance_failure_propagates_without_becoming_retryable() {
+        let mut worker =
+            UnavailablePgReconciliationWorker::spawn_with_transfer(|_| Ok(()), Duration::ZERO);
+        let mut authority = FakeAuthority {
+            maintenance_results: VecDeque::from([Err(
+                ControlPlaneError::SnapshotInvariantViolation {
+                    context: "injected staging maintenance",
+                    message: "corrupt checkpoint catalogue".to_owned(),
+                },
+            )]),
+            ..FakeAuthority::default()
+        };
+        let retry_not_before = worker.maintenance_retry_not_before;
+
+        let error = worker.poll(&mut authority, 100).unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::SnapshotInvariantViolation { .. }
+        ));
+        assert_eq!(authority.maintenance_count, 1);
+        assert!(worker.last_maintenance_diagnostic.is_none());
+        assert_eq!(worker.maintenance_retry_not_before, retry_not_before);
+
+        for fatal in [
+            ControlPlaneError::durability_failure("injected staging durability failure"),
+            ControlPlaneError::OpenRaftOperation {
+                kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::Fatal,
+                message: "injected staging Raft failure".to_owned(),
+            },
+        ] {
+            assert!(!staging_maintenance_error_is_retryable(&fatal));
+        }
     }
 }

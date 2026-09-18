@@ -109,6 +109,7 @@ const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 pub const DEFAULT_UNAVAILABLE_PLACEMENT_GRACE_MS: u64 = 30_000;
 pub const UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE: usize = 16;
+pub(crate) const METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE: usize = 16;
 pub const MAX_UNAVAILABLE_PG_TRANSITION_BATCH: usize = 16;
 pub(crate) const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES: usize = 64;
 const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS: usize = 64;
@@ -2062,6 +2063,63 @@ fn validate_metadata_transfer_staging_checkpoint_coalescing_source_count(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UnavailablePgReconciliationCursor {
     after_pg_id: Option<PgId>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum MetadataTransferStagingMaintenancePhase {
+    #[default]
+    ClosureRetirement,
+    PageCheckpoint,
+    SegmentCollapse,
+    AnchorCoalescing,
+}
+
+impl MetadataTransferStagingMaintenancePhase {
+    fn next(self) -> Self {
+        match self {
+            Self::ClosureRetirement => Self::PageCheckpoint,
+            Self::PageCheckpoint => Self::SegmentCollapse,
+            Self::SegmentCollapse => Self::AnchorCoalescing,
+            Self::AnchorCoalescing => Self::ClosureRetirement,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MetadataTransferStagingMaintenanceCursor {
+    next_phase: MetadataTransferStagingMaintenancePhase,
+    after_closure: Option<(NodeId, u64)>,
+    closure_high_water: Option<(NodeId, u64)>,
+    after_page: Option<(NodeId, u64, u64)>,
+    page_high_water: Option<(NodeId, u64, u64)>,
+    after_segment: Option<(NodeId, u64, u64)>,
+    segment_high_water: Option<(NodeId, u64, u64)>,
+    after_anchor: Option<(NodeId, u64, u64)>,
+    anchor_high_water: Option<(NodeId, u64, u64)>,
+}
+
+impl MetadataTransferStagingMaintenanceCursor {
+    pub(crate) fn start() -> Self {
+        Self::default()
+    }
+}
+
+fn metadata_transfer_staging_maintenance_sweep_high_water<K: Copy + Ord>(
+    after: &mut Option<K>,
+    high_water: &mut Option<K>,
+    current_last: Option<K>,
+) -> Option<K> {
+    if after
+        .zip(*high_water)
+        .is_some_and(|(after, high_water)| after >= high_water)
+    {
+        *after = None;
+        *high_water = None;
+    }
+    if high_water.is_none() {
+        *high_water = current_last;
+    }
+    *high_water
 }
 
 impl UnavailablePgReconciliationCursor {
@@ -6501,6 +6559,305 @@ impl ClusterControlSnapshot {
         };
         self.apply_control_plane_command(command.clone())?;
         Ok(command)
+    }
+
+    pub(crate) fn next_metadata_transfer_staging_maintenance_command(
+        &self,
+        cursor: &mut MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
+        let first_phase = cursor.next_phase;
+        let mut phase = first_phase;
+        loop {
+            let command = match phase {
+                MetadataTransferStagingMaintenancePhase::ClosureRetirement => {
+                    self.next_staging_closure_retirement_command(cursor)?
+                }
+                MetadataTransferStagingMaintenancePhase::PageCheckpoint => {
+                    self.next_staging_checkpoint_command(cursor)?
+                }
+                MetadataTransferStagingMaintenancePhase::SegmentCollapse => {
+                    self.next_staging_segment_collapse_command(cursor)?
+                }
+                MetadataTransferStagingMaintenancePhase::AnchorCoalescing => {
+                    self.next_staging_anchor_coalescing_command(cursor)?
+                }
+            };
+            if command.is_some() {
+                cursor.next_phase = phase.next();
+                return Ok(command);
+            }
+            phase = phase.next();
+            if phase == first_phase {
+                cursor.next_phase = first_phase.next();
+                return Ok(None);
+            }
+        }
+    }
+
+    fn next_staging_closure_retirement_command(
+        &self,
+        cursor: &mut MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
+        let Some(high_water) = metadata_transfer_staging_maintenance_sweep_high_water(
+            &mut cursor.after_closure,
+            &mut cursor.closure_high_water,
+            self.metadata_transfer_staging_actor_closures
+                .keys()
+                .next_back()
+                .copied(),
+        ) else {
+            return Ok(None);
+        };
+        let start = cursor
+            .after_closure
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let candidates = self
+            .metadata_transfer_staging_actor_closures
+            .range((start, std::ops::Bound::Included(high_water)))
+            .take(METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE)
+            .map(|(key, closure)| (*key, closure.clone()))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            cursor.after_closure = None;
+            cursor.closure_high_water = None;
+            return Ok(None);
+        }
+        for ((node_id, incarnation), closure) in candidates {
+            let key = (node_id, incarnation);
+            match self
+                .metadata_transfer_staging_retired_actor_closures
+                .get(&key)
+            {
+                Some(retired) if retired == &closure => {
+                    cursor.after_closure = Some(key);
+                }
+                Some(_) => {
+                    return Err(ControlPlaneError::SnapshotInvariantViolation {
+                        context: "metadata-transfer staging maintenance closure retirement",
+                        message: "active and retired actor-closure certificates conflict"
+                            .to_owned(),
+                    });
+                }
+                None => {
+                    let command = self
+                        .retire_metadata_transfer_staging_actor_closure_command(
+                            node_id,
+                            incarnation,
+                        )
+                        .map(Some)?;
+                    cursor.after_closure = Some(key);
+                    return Ok(command);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_staging_checkpoint_command(
+        &self,
+        cursor: &mut MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
+        let Some(high_water) = metadata_transfer_staging_maintenance_sweep_high_water(
+            &mut cursor.after_page,
+            &mut cursor.page_high_water,
+            self.metadata_transfer_staging_evidence_pages
+                .keys()
+                .next_back()
+                .copied(),
+        ) else {
+            return Ok(None);
+        };
+        let start = cursor
+            .after_page
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let mut candidates = cursor
+            .after_page
+            .filter(|key| {
+                self.metadata_transfer_staging_evidence_pages
+                    .contains_key(key)
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        candidates.extend(
+            self.metadata_transfer_staging_evidence_pages
+                .range((start, std::ops::Bound::Included(high_water)))
+                .take(METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE - candidates.len())
+                .map(|(key, _)| *key),
+        );
+        if candidates.is_empty() {
+            cursor.after_page = None;
+            cursor.page_high_water = None;
+            return Ok(None);
+        }
+        for (node_id, incarnation, generation) in candidates {
+            let key = (node_id, incarnation, generation);
+            let has_later_page = generation.checked_add(1).is_some_and(|next_generation| {
+                self.metadata_transfer_staging_evidence_pages
+                    .range(
+                        (node_id, incarnation, next_generation)..=(node_id, incarnation, u64::MAX),
+                    )
+                    .next()
+                    .is_some()
+            });
+            let closes_tip = self
+                .metadata_transfer_staging_actor_closures
+                .get(&(node_id, incarnation))
+                .is_some_and(|closure| closure.source_tip_generation == generation);
+            if !has_later_page && !closes_tip {
+                cursor.after_page = Some(key);
+                continue;
+            }
+            match self.checkpoint_metadata_transfer_staging_evidence_pages_command(
+                node_id,
+                incarnation,
+                generation,
+                generation,
+            ) {
+                Ok(command) => {
+                    cursor.after_page = Some(key);
+                    return Ok(Some(command));
+                }
+                Err(ControlPlaneError::CommandDecode { .. }) => {
+                    cursor.after_page = Some(key);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_staging_segment_collapse_command(
+        &self,
+        cursor: &mut MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
+        let Some(high_water) = metadata_transfer_staging_maintenance_sweep_high_water(
+            &mut cursor.after_segment,
+            &mut cursor.segment_high_water,
+            self.metadata_transfer_staging_evidence_checkpoint_segments
+                .keys()
+                .next_back()
+                .copied(),
+        ) else {
+            return Ok(None);
+        };
+        let start = cursor
+            .after_segment
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let mut candidates = cursor
+            .after_segment
+            .and_then(|key| {
+                self.metadata_transfer_staging_evidence_checkpoint_segments
+                    .get(&key)
+                    .map(|segment| (key, segment.last_generation))
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        candidates.extend(
+            self.metadata_transfer_staging_evidence_checkpoint_segments
+                .range((start, std::ops::Bound::Included(high_water)))
+                .take(METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE - candidates.len())
+                .map(|(key, segment)| (*key, segment.last_generation)),
+        );
+        if candidates.is_empty() {
+            cursor.after_segment = None;
+            cursor.segment_high_water = None;
+            return Ok(None);
+        }
+        for ((node_id, incarnation, first_generation), last_generation) in candidates {
+            let key = (node_id, incarnation, first_generation);
+            match self.collapse_metadata_transfer_staging_evidence_checkpoint_segment_command(
+                node_id,
+                incarnation,
+                first_generation,
+                last_generation,
+            ) {
+                Ok(command) => {
+                    cursor.after_segment = Some(key);
+                    return Ok(Some(command));
+                }
+                Err(ControlPlaneError::CommandDecode { .. }) => {
+                    cursor.after_segment = Some(key);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_staging_anchor_coalescing_command(
+        &self,
+        cursor: &mut MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
+        let Some(high_water) = metadata_transfer_staging_maintenance_sweep_high_water(
+            &mut cursor.after_anchor,
+            &mut cursor.anchor_high_water,
+            self.metadata_transfer_staging_evidence_checkpoint_anchors
+                .keys()
+                .next_back()
+                .copied(),
+        ) else {
+            return Ok(None);
+        };
+        let start = cursor
+            .after_anchor
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let mut candidates = cursor
+            .after_anchor
+            .and_then(|key| {
+                self.metadata_transfer_staging_evidence_checkpoint_anchors
+                    .get(&key)
+                    .map(|anchor| (key, anchor.last_generation))
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        candidates.extend(
+            self.metadata_transfer_staging_evidence_checkpoint_anchors
+                .range((start, std::ops::Bound::Included(high_water)))
+                .take(METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE + 1 - candidates.len())
+                .map(|(key, anchor)| (*key, anchor.last_generation)),
+        );
+        if candidates.is_empty() {
+            cursor.after_anchor = None;
+            cursor.anchor_high_water = None;
+            return Ok(None);
+        }
+        for pair in candidates.windows(2) {
+            let ((left_node, left_incarnation, first_generation), left_last) = pair[0];
+            let ((right_node, right_incarnation, right_first), right_last) = pair[1];
+            let left_key = (left_node, left_incarnation, first_generation);
+            let right_key = (right_node, right_incarnation, right_first);
+            if left_node != right_node
+                || left_incarnation != right_incarnation
+                || left_last.checked_add(1) != Some(right_first)
+            {
+                cursor.after_anchor = Some(left_key);
+                continue;
+            }
+            match self.coalesce_metadata_transfer_staging_evidence_checkpoint_anchors_command(
+                left_node,
+                left_incarnation,
+                first_generation,
+                right_last,
+            ) {
+                Ok(command) => {
+                    // Coalescing replaces the left anchor in place. Revisit it so it can be
+                    // combined with its new successor on a later phase rotation.
+                    cursor.after_anchor = None;
+                    if right_key == high_water {
+                        cursor.anchor_high_water = None;
+                    }
+                    return Ok(Some(command));
+                }
+                Err(ControlPlaneError::CommandDecode { .. }) => {
+                    cursor.after_anchor = Some(left_key);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if candidates.len() <= METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE {
+            cursor.after_anchor = candidates.last().map(|(key, _)| *key);
+        }
+        Ok(None)
     }
 
     fn retire_metadata_transfer_staging_actor_closure(

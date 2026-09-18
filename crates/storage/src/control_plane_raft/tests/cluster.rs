@@ -5711,20 +5711,23 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
             .current_snapshot_for_test()
             .unwrap()
             .cluster_epoch();
-        let mut checkpointed = None;
-        for actor in &evidence_actors {
-            checkpointed = Some(
-                <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::checkpoint_metadata_transfer_staging_evidence_pages(
-                    &mut leader,
-                    actor.node_id(),
-                    actor.node_incarnation(),
-                    1,
-                    1,
-                )
-                .unwrap(),
-            );
+        let mut maintenance_cursor =
+            crate::control_plane::MetadataTransferStagingMaintenanceCursor::start();
+        for _ in 0..64 {
+            leader
+                .maintain_metadata_transfer_staging_evidence_once(&mut maintenance_cursor)
+                .unwrap();
+            if crate::control_plane::format_snapshot(
+                &leader.current_snapshot_for_test().unwrap(),
+            )
+                .matches("metadata_transfer_staging_evidence_checkpoint=")
+                .count()
+                == evidence_actors.len()
+            {
+                break;
+            }
         }
-        let checkpointed = checkpointed.unwrap();
+        let checkpointed = leader.current_snapshot_for_test().unwrap();
         assert_eq!(checkpointed.cluster_epoch(), checkpoint_epoch);
         assert_eq!(
             crate::control_plane::format_snapshot(&checkpointed)

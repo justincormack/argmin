@@ -709,6 +709,34 @@ impl ControlPlaneRaftAuthorityHost {
         self.current_snapshot()
     }
 
+    pub(crate) fn maintain_metadata_transfer_staging_evidence_once(
+        &mut self,
+        cursor: &mut crate::control_plane::MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut next_cursor = *cursor;
+        let Some(command) = self
+            .current_snapshot()?
+            .next_metadata_transfer_staging_maintenance_command(&mut next_cursor)?
+        else {
+            *cursor = next_cursor;
+            return Ok(false);
+        };
+        let response = self.submit_low_priority_raft_command(command)?;
+        if !matches!(
+            response,
+            ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages
+                | ControlPlaneCommandResponse::CollapseMetadataTransferStagingEvidenceCheckpointSegment
+                | ControlPlaneCommandResponse::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors
+                | ControlPlaneCommandResponse::RetireMetadataTransferStagingActorClosure
+        ) {
+            return Err(ControlPlaneError::invariant_failure(
+                "staging evidence maintenance returned the wrong response",
+            ));
+        }
+        *cursor = next_cursor;
+        Ok(true)
+    }
+
     pub fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,

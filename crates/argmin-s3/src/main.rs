@@ -1802,14 +1802,19 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 .lock()
                 .expect("control-plane authority mutex poisoned");
             if let Some(reconciler) = unavailable_pg_reconciler.as_mut() {
-                reconciler.poll_single_authority(&mut authority, now_ms);
+                reconciler.poll_single_authority(&mut authority, now_ms)?;
             }
             Ok::<(), ControlPlaneError>(())
         })();
         if let Err(error) = reconciliation {
-            eprintln!(
-                "unavailable PG reconciliation deferred because authority time is unavailable: {error}"
-            );
+            if error.is_retryable_authority_clock_wait_error() {
+                eprintln!(
+                    "unavailable PG reconciliation deferred because authority time is unavailable: {error}"
+                );
+            } else {
+                eprintln!("unavailable PG staging maintenance failed fatally: {error}");
+                std::process::exit(1);
+            }
         }
         thread::sleep(config.control_plane_lease_scan_interval);
     }
@@ -2288,7 +2293,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         if let Some(reconciler) = unavailable_pg_reconciler.as_mut() {
             reconciler.observe_transfer_workers();
             if local_raft_authority_serving {
-                reconciler.poll_raft(authority_service.host_mut(), expiry_now_ms);
+                reconciler
+                    .poll_raft(authority_service.host_mut(), expiry_now_ms)
+                    .unwrap_or_else(|error| {
+                        eprintln!("unavailable PG staging maintenance failed fatally: {error}");
+                        std::process::exit(1);
+                    });
             }
         }
         thread::sleep(config.control_plane_lease_scan_interval);

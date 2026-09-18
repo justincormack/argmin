@@ -2904,6 +2904,23 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    pub(crate) fn maintain_metadata_transfer_staging_evidence_once(
+        &mut self,
+        cursor: &mut crate::control_plane::MetadataTransferStagingMaintenanceCursor,
+    ) -> Result<bool, ControlPlaneError> {
+        let mut next_cursor = *cursor;
+        let Some(command) = self
+            .snapshot
+            .next_metadata_transfer_staging_maintenance_command(&mut next_cursor)?
+        else {
+            *cursor = next_cursor;
+            return Ok(false);
+        };
+        let changed = self.apply_and_commit_command(command)?.changed();
+        *cursor = next_cursor;
+        Ok(changed)
+    }
+
     pub fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,

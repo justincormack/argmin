@@ -3926,7 +3926,9 @@ mod tests {
         let mut worker = UnavailablePgReconciliationWorker::spawn(admin);
         {
             let mut authority = authority.lock().unwrap();
-            worker.poll_single_authority(&mut authority, begin_at_ms);
+            worker
+                .poll_single_authority(&mut authority, begin_at_ms)
+                .unwrap();
         }
         let mut receive_prepared = || {
             prepared_rx
@@ -4027,7 +4029,9 @@ mod tests {
         loop {
             {
                 let mut authority = authority.lock().unwrap();
-                worker.poll_single_authority(&mut authority, readiness_at_ms + 10);
+                worker
+                    .poll_single_authority(&mut authority, readiness_at_ms + 10)
+                    .unwrap();
                 if pg_ids.iter().all(|pg_id| {
                     authority
                         .snapshot()
