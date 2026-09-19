@@ -4,6 +4,7 @@
 use super::*;
 use crate::node_client::{ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute};
 use crate::{BucketSnapshotLoadError, ObjectPgActionError, StorageClusterRouteHandle};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[test]
 fn embedded_peering_metadata_read_rechecks_certified_proof_under_pg_lock() {
@@ -188,11 +189,15 @@ fn embedded_peering_metadata_read_authorization_rejects_equal_proof_from_another
 struct PayloadLeaseUnavailableClient {
     inner: Arc<dyn ObjectPayloadLeaseNodeClient>,
     failure: PayloadLeaseUnavailableFailure,
+    attempts: Option<Arc<AtomicUsize>>,
+    recovered: Option<Arc<AtomicBool>>,
 }
 
 struct PayloadLeaseUnavailableRoute<'a> {
     inner: Box<dyn ObjectPayloadLeaseRoute + 'a>,
     failure: PayloadLeaseUnavailableFailure,
+    attempts: Option<Arc<AtomicUsize>>,
+    recovered: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Copy)]
@@ -217,6 +222,8 @@ impl ObjectPayloadLeaseNodeClient for PayloadLeaseUnavailableClient {
                 generation_id,
             )?,
             failure: self.failure,
+            attempts: self.attempts.clone(),
+            recovered: self.recovered.clone(),
         }))
     }
 }
@@ -224,8 +231,18 @@ impl ObjectPayloadLeaseNodeClient for PayloadLeaseUnavailableClient {
 impl ObjectPayloadLeaseRoute for PayloadLeaseUnavailableRoute<'_> {
     fn acquire_object_payload_lease(
         &self,
-        _kind: ObjectPayloadLeaseKind,
+        kind: ObjectPayloadLeaseKind,
     ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
+        if let Some(attempts) = &self.attempts {
+            attempts.fetch_add(1, Ordering::Relaxed);
+        }
+        if self
+            .recovered
+            .as_ref()
+            .is_some_and(|recovered| recovered.load(Ordering::Relaxed))
+        {
+            return self.inner.acquire_object_payload_lease(kind);
+        }
         match self.failure {
             PayloadLeaseUnavailableFailure::Transport => Err(StoreError::StorageRpc {
                 node_id: 0,
@@ -482,7 +499,12 @@ fn retained_read_with_unavailable_lease_nodes_and_failure(
         let inner = Arc::clone(map.node(*node_id).unwrap().object_payload_lease_client());
         map.replace_object_payload_lease_client_for_tests(
             *node_id,
-            Arc::new(PayloadLeaseUnavailableClient { inner, failure }),
+            Arc::new(PayloadLeaseUnavailableClient {
+                inner,
+                failure,
+                attempts: None,
+                recovered: None,
+            }),
         );
     }
     let map = Arc::new(map);
@@ -634,6 +656,236 @@ fn retained_read_preserves_resource_exhaustion_when_no_lease_node_is_available()
         crate::ObjectReadFailureKind::ResourceExhausted
     );
     assert_eq!(error.diagnostic_cause_label(), "store_resource_exhausted");
+}
+
+#[test]
+fn retained_reads_do_not_reconnect_to_a_recently_unreachable_lease_node() {
+    let tmp = test_util::tempdir();
+    let node_ids = trace_node_ids();
+    let unavailable_node = node_ids[0];
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let recovered = Arc::new(AtomicBool::new(false));
+    let mut map = LocalClusterMap::open(
+        tmp.path(),
+        &node_ids,
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let inner = Arc::clone(
+        map.node(unavailable_node)
+            .unwrap()
+            .object_payload_lease_client(),
+    );
+    map.replace_object_payload_lease_client_for_tests(
+        unavailable_node,
+        Arc::new(PayloadLeaseUnavailableClient {
+            inner,
+            failure: PayloadLeaseUnavailableFailure::Transport,
+            attempts: Some(Arc::clone(&attempts)),
+            recovered: Some(Arc::clone(&recovered)),
+        }),
+    );
+    let map = Arc::new(map);
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("broad-lease-unavailable-cache");
+    let key = crate::tests::object_key("read");
+    let payload = b"readable from the two surviving EC shards";
+    write_committed_direct_segment_for(&cluster, &bucket, &key, payload);
+    let read = || {
+        let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+        let admission = handle.admit_current_route().unwrap();
+        let route = admission
+            .active_object_read_route(
+                &bucket,
+                &key,
+                None,
+                crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            )
+            .unwrap();
+        let outcome = route
+            .load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(()))
+            .unwrap()
+            .unwrap();
+        let segment = outcome.snapshot().object_segments[0].clone();
+        let (_, _, leased_snapshot) = outcome.into_parts();
+        let retained = route
+            .retain_object_payload_read(leased_snapshot)
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        retained
+            .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
+            .unwrap();
+        bytes
+    };
+
+    let before = attempts.load(Ordering::Relaxed);
+    assert_eq!(read(), payload);
+    assert_eq!(attempts.load(Ordering::Relaxed), before + 1);
+    assert_eq!(read(), payload);
+    assert_eq!(attempts.load(Ordering::Relaxed), before + 1);
+
+    recovered.store(true, Ordering::Relaxed);
+    std::thread::sleep(OBJECT_PAYLOAD_LEASE_UNAVAILABLE_RETRY + Duration::from_millis(20));
+    assert_eq!(read(), payload);
+    assert_eq!(attempts.load(Ordering::Relaxed), before + 2);
+    assert_eq!(read(), payload);
+    assert_eq!(attempts.load(Ordering::Relaxed), before + 3);
+}
+
+#[test]
+fn unavailable_lease_node_allows_only_one_probe_after_cooldown() {
+    let tmp = test_util::tempdir();
+    let node_id = NodeId::new(1);
+    let map = LocalClusterMap::open(
+        tmp.path(),
+        &trace_node_ids(),
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let node = map.node(node_id).unwrap();
+    let health = &map.runtime_state;
+    let now = Instant::now();
+    let ordinary = health.begin_object_payload_lease_node_attempt(node, now);
+    assert!(matches!(ordinary, ObjectPayloadLeaseNodeAttempt::Ordinary));
+    health.finish_object_payload_lease_node_attempt(node, ordinary, true, now);
+    assert!(matches!(
+        health.begin_object_payload_lease_node_attempt(node, now),
+        ObjectPayloadLeaseNodeAttempt::Skip
+    ));
+
+    let after_cooldown = now + OBJECT_PAYLOAD_LEASE_UNAVAILABLE_RETRY;
+    let probe = health.begin_object_payload_lease_node_attempt(node, after_cooldown);
+    assert!(matches!(probe, ObjectPayloadLeaseNodeAttempt::Probe(_)));
+    assert!(matches!(
+        health.begin_object_payload_lease_node_attempt(node, after_cooldown),
+        ObjectPayloadLeaseNodeAttempt::Skip
+    ));
+    health.finish_object_payload_lease_node_attempt(node, probe, false, after_cooldown);
+    assert!(matches!(
+        health.begin_object_payload_lease_node_attempt(node, after_cooldown),
+        ObjectPayloadLeaseNodeAttempt::Ordinary
+    ));
+}
+
+#[test]
+fn broad_lease_refresh_during_old_identity_probe_does_not_suppress_replacement() {
+    use crate::control_plane::{
+        ControlPlaneHeartbeatRuntimeMapSource, FileControlPlaneStore, NodeHeartbeat,
+        SingleAuthorityControlPlane,
+    };
+
+    let tmp = test_util::tempdir();
+    let node_id = NodeId::new(2);
+    let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+        tmp.path().join("control-plane.state"),
+    ))
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            vec![
+                (NodeId::new(1), "/tmp/lease-refresh-node-1.sock".to_owned()),
+                (node_id, "/tmp/lease-refresh-node-2.sock".to_owned()),
+            ],
+            vec![PgId::new(0)],
+        )
+        .unwrap();
+    let now_ms = crate::clock::current_time_millis();
+    let initial_runtime_map = authority.snapshot().runtime_map(now_ms).unwrap();
+    let original = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+        NodeId::new(1),
+        &initial_runtime_map,
+        EcShape { k: 1, m: 0 },
+    )
+    .unwrap();
+    let old_node = original.node(node_id).unwrap();
+    let old_incarnation = old_node.route_authority_node_incarnation.unwrap();
+    let now = Instant::now();
+    let ordinary = original
+        .runtime_state
+        .begin_object_payload_lease_node_attempt(old_node, now);
+    original
+        .runtime_state
+        .finish_object_payload_lease_node_attempt(old_node, ordinary, true, now);
+    let after_cooldown = now + OBJECT_PAYLOAD_LEASE_UNAVAILABLE_RETRY;
+    let old_probe = original
+        .runtime_state
+        .begin_object_payload_lease_node_attempt(old_node, after_cooldown);
+    assert!(matches!(old_probe, ObjectPayloadLeaseNodeAttempt::Probe(_)));
+
+    authority
+        .refresh_node_heartbeat(
+            NodeHeartbeat::test_fixture(
+                node_id,
+                old_incarnation + 1,
+                old_node
+                    .route_authority_advertised_endpoint
+                    .clone()
+                    .unwrap(),
+                authority.snapshot().cluster_epoch(),
+                5_000,
+                Default::default(),
+                Vec::new(),
+            ),
+            now_ms + 1,
+        )
+        .unwrap();
+    let refreshed_runtime_map = authority.snapshot().runtime_map(now_ms + 1).unwrap();
+    let refreshed = LocalClusterMap::open_runtime_map_with_existing_local_nodes(
+        &original,
+        &refreshed_runtime_map,
+    )
+    .unwrap();
+    let new_node = refreshed.node(node_id).unwrap();
+    assert!(Arc::ptr_eq(
+        &original.runtime_state,
+        &refreshed.runtime_state
+    ));
+    assert_eq!(
+        new_node.route_authority_node_incarnation,
+        Some(old_incarnation + 1)
+    );
+    assert!(matches!(
+        refreshed
+            .runtime_state
+            .begin_object_payload_lease_node_attempt(new_node, after_cooldown),
+        ObjectPayloadLeaseNodeAttempt::Ordinary
+    ));
+
+    original
+        .runtime_state
+        .finish_object_payload_lease_node_attempt(old_node, old_probe, true, after_cooldown);
+    assert!(matches!(
+        refreshed
+            .runtime_state
+            .begin_object_payload_lease_node_attempt(new_node, after_cooldown),
+        ObjectPayloadLeaseNodeAttempt::Ordinary
+    ));
+
+    let current_attempt = refreshed
+        .runtime_state
+        .begin_object_payload_lease_node_attempt(new_node, after_cooldown);
+    refreshed
+        .runtime_state
+        .finish_object_payload_lease_node_attempt(new_node, current_attempt, true, after_cooldown);
+    let mut changed_endpoint =
+        refreshed.test_clone_with_route_map_validity(RouteMapValidity::Forever);
+    changed_endpoint
+        .nodes
+        .get_mut(&node_id)
+        .unwrap()
+        .route_authority_advertised_endpoint = Some("/tmp/replaced-lease-endpoint.sock".to_owned());
+    assert!(matches!(
+        changed_endpoint
+            .runtime_state
+            .begin_object_payload_lease_node_attempt(
+                changed_endpoint.node(node_id).unwrap(),
+                after_cooldown,
+            ),
+        ObjectPayloadLeaseNodeAttempt::Ordinary
+    ));
 }
 
 #[test]

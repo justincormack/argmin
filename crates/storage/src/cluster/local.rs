@@ -68,6 +68,8 @@ const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT: usize = 4096;
+const OBJECT_PAYLOAD_LEASE_UNAVAILABLE_RETRY: Duration = Duration::from_secs(1);
+const OBJECT_PAYLOAD_LEASE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
 type OpenMetadataCommandAfterApplyTestHook = Arc<
@@ -135,6 +137,10 @@ fn object_payload_lease_node_is_unavailable(error: &StoreError) -> bool {
     if matches!(error, StoreError::StorageRpcResourceExhausted { .. }) {
         return true;
     }
+    object_payload_lease_node_is_transport_unavailable(error)
+}
+
+fn object_payload_lease_node_is_transport_unavailable(error: &StoreError) -> bool {
     if error.storage_node_failure_class()
         == Some(crate::error::StorageNodeFailureClass::TransportInterrupted)
     {
@@ -654,6 +660,7 @@ pub struct LocalNodeStore {
     data_dir: PathBuf,
     route_execution_endpoint: LocalRouteExecutionEndpoint,
     route_authority_advertised_endpoint: Option<String>,
+    route_authority_node_incarnation: Option<u64>,
     runtime: LocalNodeRuntime,
     object_payload_lease_client: Arc<dyn ObjectPayloadLeaseNodeClient>,
     retained_object_payload_reclaim_client: Arc<dyn RetainedObjectPayloadReclaimNodeClient>,
@@ -721,6 +728,7 @@ impl LocalNodeStore {
             data_dir,
             route_execution_endpoint,
             route_authority_advertised_endpoint: None,
+            route_authority_node_incarnation: None,
             runtime,
             object_payload_lease_client: clients.object_payload_lease,
             retained_object_payload_reclaim_client: clients.retained_object_payload_reclaim,
@@ -1398,12 +1406,54 @@ impl From<&PgRouteSnapshot> for LocalPgRoute {
 pub(crate) struct LocalClusterRuntimeState {
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     active_object_payload_reclaims: Mutex<HashSet<LocalReclaimRoot>>,
+    object_payload_lease_node_health: Mutex<ObjectPayloadLeaseNodeHealth>,
     placed_segment_shard_repair_queue: (Mutex<LocalPlacedSegmentShardRepairQueueState>, Condvar),
     metadata_command_pg_locks: Mutex<HashMap<PgId, Arc<MetadataCommandPgLock>>>,
     metadata_command_recovery_flights:
         Arc<Mutex<HashMap<MetadataCommandRecoveryKey, Arc<MetadataCommandRecoveryFlight>>>>,
     #[cfg(test)]
     metadata_command_recovery_wait_hook: Mutex<Option<MetadataCommandRecoveryWaitTestHook>>,
+}
+
+#[derive(Debug, Default)]
+struct ObjectPayloadLeaseNodeHealth {
+    nodes: HashMap<NodeId, ObjectPayloadLeaseNodeHealthEntry>,
+    next_probe_id: u64,
+}
+
+#[derive(Debug)]
+struct ObjectPayloadLeaseNodeHealthEntry {
+    incarnation: Option<u64>,
+    endpoint: Option<String>,
+    status: ObjectPayloadLeaseNodeStatus,
+}
+
+impl ObjectPayloadLeaseNodeHealthEntry {
+    fn new(node: &LocalNodeStore, status: ObjectPayloadLeaseNodeStatus) -> Self {
+        Self {
+            incarnation: node.route_authority_node_incarnation,
+            endpoint: node.route_authority_advertised_endpoint.clone(),
+            status,
+        }
+    }
+
+    fn matches_node(&self, node: &LocalNodeStore) -> bool {
+        self.incarnation == node.route_authority_node_incarnation
+            && self.endpoint.as_deref() == node.route_authority_advertised_endpoint.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ObjectPayloadLeaseNodeStatus {
+    UnavailableUntil(Instant),
+    Probing { id: u64, until: Instant },
+}
+
+#[derive(Clone, Copy)]
+enum ObjectPayloadLeaseNodeAttempt {
+    Ordinary,
+    Probe(u64),
+    Skip,
 }
 
 /// FIFO serialization for metadata-command mutation and inspection on one PG.
@@ -1990,6 +2040,103 @@ struct LocalPlacedSegmentShardRepairQueueState {
 }
 
 impl LocalClusterRuntimeState {
+    fn begin_object_payload_lease_node_attempt(
+        &self,
+        node: &LocalNodeStore,
+        now: Instant,
+    ) -> ObjectPayloadLeaseNodeAttempt {
+        let mut health = self
+            .object_payload_lease_node_health
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if health
+            .nodes
+            .get(&node.node_id)
+            .is_some_and(|entry| !entry.matches_node(node))
+        {
+            health.nodes.remove(&node.node_id);
+        }
+        match health.nodes.get(&node.node_id).map(|entry| entry.status) {
+            None => ObjectPayloadLeaseNodeAttempt::Ordinary,
+            Some(ObjectPayloadLeaseNodeStatus::UnavailableUntil(until)) if now < until => {
+                ObjectPayloadLeaseNodeAttempt::Skip
+            }
+            Some(ObjectPayloadLeaseNodeStatus::Probing { until, .. }) if now < until => {
+                ObjectPayloadLeaseNodeAttempt::Skip
+            }
+            Some(_) => {
+                health.next_probe_id = health
+                    .next_probe_id
+                    .checked_add(1)
+                    .expect("object payload lease probe identity exhausted");
+                let id = health.next_probe_id;
+                health.nodes.insert(
+                    node.node_id,
+                    ObjectPayloadLeaseNodeHealthEntry::new(
+                        node,
+                        ObjectPayloadLeaseNodeStatus::Probing {
+                            id,
+                            until: now + OBJECT_PAYLOAD_LEASE_PROBE_TIMEOUT,
+                        },
+                    ),
+                );
+                ObjectPayloadLeaseNodeAttempt::Probe(id)
+            }
+        }
+    }
+
+    fn finish_object_payload_lease_node_attempt(
+        &self,
+        node: &LocalNodeStore,
+        attempt: ObjectPayloadLeaseNodeAttempt,
+        unavailable: bool,
+        now: Instant,
+    ) {
+        let mut health = self
+            .object_payload_lease_node_health
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if health
+            .nodes
+            .get(&node.node_id)
+            .is_some_and(|entry| !entry.matches_node(node))
+        {
+            return;
+        }
+        match attempt {
+            ObjectPayloadLeaseNodeAttempt::Skip => unreachable!("skipped lease node was probed"),
+            ObjectPayloadLeaseNodeAttempt::Ordinary => {
+                if matches!(
+                    health.nodes.get(&node.node_id).map(|entry| entry.status),
+                    Some(ObjectPayloadLeaseNodeStatus::Probing { .. })
+                ) {
+                    return;
+                }
+            }
+            ObjectPayloadLeaseNodeAttempt::Probe(id) => {
+                if !matches!(
+                    health.nodes.get(&node.node_id).map(|entry| entry.status),
+                    Some(ObjectPayloadLeaseNodeStatus::Probing { id: current, .. }) if current == id
+                ) {
+                    return;
+                }
+            }
+        }
+        if unavailable {
+            health.nodes.insert(
+                node.node_id,
+                ObjectPayloadLeaseNodeHealthEntry::new(
+                    node,
+                    ObjectPayloadLeaseNodeStatus::UnavailableUntil(
+                        now + OBJECT_PAYLOAD_LEASE_UNAVAILABLE_RETRY,
+                    ),
+                ),
+            );
+        } else {
+            health.nodes.remove(&node.node_id);
+        }
+    }
+
     fn new() -> Self {
         Self {
             reclaim_queue: (
@@ -2005,6 +2152,7 @@ impl LocalClusterRuntimeState {
                 Condvar::new(),
             ),
             active_object_payload_reclaims: Mutex::new(HashSet::new()),
+            object_payload_lease_node_health: Mutex::new(ObjectPayloadLeaseNodeHealth::default()),
             placed_segment_shard_repair_queue: (
                 Mutex::new(LocalPlacedSegmentShardRepairQueueState {
                     work_queue: VecDeque::new(),
@@ -3363,10 +3511,12 @@ impl LocalClusterMap {
 
     fn bind_runtime_map_advertised_endpoints(&mut self, runtime_map: &ClusterRuntimeMapSnapshot) {
         for route in runtime_map.nodes() {
-            self.nodes
+            let node = self
+                .nodes
                 .get_mut(&route.node_id())
-                .expect("runtime-map node set was used to construct the local route map")
-                .route_authority_advertised_endpoint = Some(route.endpoint().to_owned());
+                .expect("runtime-map node set was used to construct the local route map");
+            node.route_authority_advertised_endpoint = Some(route.endpoint().to_owned());
+            node.route_authority_node_incarnation = Some(route.node_incarnation());
         }
     }
 
@@ -5084,6 +5234,23 @@ impl LocalClusterMap {
         let mut acquired_node_ids = BTreeSet::new();
         let mut unavailable_error = None;
         for (node_id, node) in &self.nodes {
+            let attempt = if retain_available {
+                self.runtime_state
+                    .begin_object_payload_lease_node_attempt(node, Instant::now())
+            } else {
+                ObjectPayloadLeaseNodeAttempt::Ordinary
+            };
+            if matches!(attempt, ObjectPayloadLeaseNodeAttempt::Skip) {
+                unavailable_error.get_or_insert_with(|| StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "broad object payload lease acquire",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "recent object payload lease transport failure",
+                    ),
+                });
+                continue;
+            }
             let result = node
                 .object_payload_lease_client()
                 .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)
@@ -5092,6 +5259,17 @@ impl LocalClusterMap {
                         crate::node_client::ObjectPayloadLeaseKind::BroadSnapshot,
                     )
                 });
+            if retain_available {
+                self.runtime_state.finish_object_payload_lease_node_attempt(
+                    node,
+                    attempt,
+                    result
+                        .as_ref()
+                        .err()
+                        .is_some_and(object_payload_lease_node_is_transport_unavailable),
+                    Instant::now(),
+                );
+            }
             match result {
                 Ok(Some(lease)) => {
                     acquired.push(lease);
