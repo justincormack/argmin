@@ -9654,6 +9654,23 @@ impl ClusterControlSnapshot {
 
         let mut next_snapshot = applied.into_snapshot();
         next_snapshot.max_committed_timestamp_ms = self.max_committed_timestamp_ms;
+        let previous_observations = &self
+            .nodes
+            .get(&node_id)
+            .expect("volatile heartbeat has an existing node")
+            .pg_observations;
+        for (pg_id, observation) in &mut next_snapshot
+            .nodes
+            .get_mut(&node_id)
+            .expect("volatile heartbeat retains its node")
+            .pg_observations
+        {
+            // Begin authorization must name an observation also present in durable state.
+            observation.observed_at_ms = previous_observations
+                .get(pg_id)
+                .expect("volatile heartbeat retains PG observation subjects")
+                .observed_at_ms;
+        }
         validate_control_plane_snapshot(
             "attempted to publish invalid volatile heartbeat state",
             &next_snapshot,

@@ -7699,6 +7699,97 @@ fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
         .snapshot()
         .begin_unavailable_pg_placement_transition_command(pg_id, NodeId::new(1), begin_at_ms)
         .unwrap();
+    let mut durable = authority.snapshot().clone();
+    let renewal_at_ms = durable.max_committed_timestamp_ms().unwrap() + 1;
+    let horizon_authority = LeaseHorizonAuthorityBinding::new(3, Some(9));
+    durable.lease_grant_horizon = Some(CommittedLeaseGrantHorizon::from_parts(
+        horizon_authority,
+        renewal_at_ms + 20_000,
+    ));
+    let previous_observation = *durable
+        .node(NodeId::new(2))
+        .unwrap()
+        .pg_observation(pg_id)
+        .unwrap();
+    let mut renewed_heartbeat =
+        heartbeat_from_snapshot(&durable, 2, durable.cluster_epoch(), renewal_at_ms);
+    renewed_heartbeat.requested_lease_duration_ms = 10_000;
+    renewed_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id,
+        state: previous_observation.state(),
+        metadata_proof: previous_observation.metadata_proof(),
+        pending_metadata_command: previous_observation.pending_metadata_command(),
+    }];
+    let renewal = ControlPlaneCommand::RecordNodeHeartbeat {
+        heartbeat: renewed_heartbeat,
+        heartbeat_at_ms: renewal_at_ms,
+        lease_deadline_ms: renewal_at_ms + 10_000,
+        lease_horizon_authority: Some(horizon_authority),
+    };
+    let uncanonicalized = durable
+        .apply_control_plane_command(renewal.clone())
+        .unwrap()
+        .into_snapshot();
+    assert!(
+        uncanonicalized
+            .node(NodeId::new(2))
+            .unwrap()
+            .pg_observation(pg_id)
+            .unwrap()
+            .observed_at_ms()
+            > previous_observation.observed_at_ms()
+    );
+    let volatile = durable
+        .apply_covered_volatile_heartbeat(renewal)
+        .unwrap()
+        .expect("unchanged PG heartbeat renews only the volatile lease");
+    assert_eq!(
+        volatile
+            .node(NodeId::new(2))
+            .unwrap()
+            .pg_observation(pg_id)
+            .unwrap()
+            .observed_at_ms(),
+        previous_observation.observed_at_ms(),
+    );
+    assert!(
+        volatile.node(NodeId::new(2)).unwrap().lease_deadline_ms()
+            > durable.node(NodeId::new(2)).unwrap().lease_deadline_ms()
+    );
+    let promotion = volatile
+        .promote_volatile_heartbeat_leases_command(&durable)
+        .unwrap()
+        .expect("renewed lease needs durable promotion");
+    let promoted = durable
+        .apply_control_plane_command(promotion)
+        .unwrap()
+        .into_snapshot();
+    let volatile_begin_at_ms = begin_at_ms.max(renewal_at_ms + 1);
+    let uncanonicalized_begin = uncanonicalized
+        .begin_unavailable_pg_placement_transition_command(
+            pg_id,
+            NodeId::new(1),
+            volatile_begin_at_ms,
+        )
+        .unwrap();
+    assert!(promoted
+        .apply_control_plane_command(uncanonicalized_begin)
+        .unwrap_err()
+        .to_string()
+        .contains("begin authorization changed"));
+    let live_begin = volatile
+        .begin_unavailable_pg_placement_transition_command(
+            pg_id,
+            NodeId::new(1),
+            volatile_begin_at_ms,
+        )
+        .unwrap();
+    promoted
+        .apply_control_plane_command(live_begin.clone())
+        .expect("live begin authorization must apply after lease promotion");
+    volatile
+        .apply_control_plane_command(live_begin)
+        .expect("same begin authorization must apply to the live overlay");
     let mut wrong_topology = stale_proposal.clone();
     let ControlPlaneCommand::BeginUnavailablePgPlacementTransitions { transitions, .. } =
         &mut wrong_topology
