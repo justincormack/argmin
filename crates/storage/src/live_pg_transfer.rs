@@ -6155,7 +6155,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_transfer_endpoints_are_scoped_to_runtime_map_actors() {
+    fn configured_transfer_endpoints_include_routable_spares_not_unknown_nodes() {
         let tmp = test_util::tempdir();
         let (authority, now_ms, pg_id, _, _) = prepared_live_transfer_authority(tmp.path(), false);
         let runtime_map = authority
@@ -6163,12 +6163,17 @@ mod tests {
             .unwrap()
             .serving_pg_runtime_map_snapshot(pg_id, now_ms.saturating_add(11))
             .unwrap();
-        assert_eq!(runtime_map.nodes().len(), 1);
-        let routed_node = runtime_map.nodes().first().unwrap();
-        let routed_endpoint = (
-            routed_node.node_id().as_u32(),
-            StorageRpcClientEndpoint::unix(routed_node.endpoint()),
-        );
+        assert_eq!(runtime_map.nodes().len(), 2);
+        let endpoint_for = |node_id| {
+            let node = runtime_map
+                .nodes()
+                .iter()
+                .find(|node| node.node_id() == NodeId::new(node_id))
+                .unwrap();
+            (node_id, StorageRpcClientEndpoint::unix(node.endpoint()))
+        };
+        let routed_endpoint = endpoint_for(7);
+        let destination_endpoint = endpoint_for(8);
         let spare_endpoint = (
             99,
             StorageRpcClientEndpoint::unix(tmp.path().join("spare.sock")),
@@ -6179,7 +6184,11 @@ mod tests {
             control_plane,
             EcShape { k: 1, m: 0 },
             LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
-            [routed_endpoint, spare_endpoint.clone()],
+            [
+                routed_endpoint,
+                destination_endpoint.clone(),
+                spare_endpoint.clone(),
+            ],
             frontend_storage_rpc_capability(),
         );
         admin
@@ -6190,7 +6199,7 @@ mod tests {
             bound_plain_control_plane(&tmp.path().join("unused-control-2.sock")),
             EcShape { k: 1, m: 0 },
             LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
-            [spare_endpoint],
+            [destination_endpoint, spare_endpoint],
             frontend_storage_rpc_capability(),
         );
         let error = match missing_actor_admin.build_cluster(&runtime_map) {

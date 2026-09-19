@@ -579,6 +579,24 @@ mod runtime_map_refresh_invalidation_tests {
         ));
     }
 
+    #[test]
+    fn local_recovery_map_cannot_fabricate_new_node() {
+        let current = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            NodeId::new(1),
+            &one_node_runtime_map(),
+            EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        assert!(matches!(
+            LocalClusterMap::open_runtime_map_with_existing_local_nodes(
+                &current,
+                &two_node_runtime_map()
+            ),
+            Err(ClusterBuildError::HistoricalRecoveryNodeSetMismatch { current, candidate })
+                if current == vec![1] && candidate == vec![1, 2]
+        ));
+    }
+
     fn active_test_cluster(validity: RouteMapValidity) -> Arc<StorageCluster> {
         let route = PgRouteSnapshot::reconstructed(
             ClusterEpoch::INITIAL,
@@ -910,6 +928,181 @@ mod runtime_map_refresh_invalidation_tests {
             .unwrap()
             .values()
             .all(crate::storage_rpc_transport::StorageRpcClientEndpoint::is_tls_tcp));
+    }
+
+    #[test]
+    fn scoped_pending_recovery_map_matches_full_inventory_with_unassigned_spare() {
+        let tmp = test_util::tempdir();
+        let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+            crate::control_plane::FileControlPlaneStore::new(
+                tmp.path().join("control-plane.state"),
+            ),
+        )
+        .unwrap();
+        let nodes = (1..=4)
+            .map(|id| (NodeId::new(id), format!("/tmp/recovery-node-{id}.sock")))
+            .collect::<Vec<_>>();
+        let pg_id = PgId::new(31);
+        let pg_acting_sets = vec![(pg_id, vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)])];
+        let topology = crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+            7,
+            [0x53; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+            vec![1],
+            &nodes,
+            &pg_acting_sets,
+            crate::control_plane::test_certified_storage_placement_policy(
+                (1..=4).map(NodeId::new),
+                3,
+                2_000,
+            ),
+        )
+        .unwrap();
+        crate::control_plane::ControlPlaneLinearizedCommandSink::submit_control_plane_command(
+            &mut authority,
+            crate::control_plane_command::ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes: nodes.clone(),
+                pg_acting_sets,
+                topology,
+            },
+        )
+        .unwrap();
+        let current_map = authority.snapshot().runtime_map(1_000).unwrap();
+        assert_eq!(current_map.nodes().len(), nodes.len());
+        assert!(!current_map.pg_routes()[0]
+            .acting_set()
+            .contains(&NodeId::new(4)));
+        let endpoints = nodes.iter().map(|(node_id, endpoint)| {
+            (
+                *node_id,
+                crate::storage_rpc_transport::StorageRpcClientEndpoint::unix(endpoint),
+            )
+        });
+        let current = StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_auth(
+            NodeId::new(4),
+            &current_map,
+            EcShape { k: 2, m: 1 },
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            endpoints,
+            frontend_storage_rpc_auth(),
+        )
+        .unwrap();
+        let current_with_routed_primary =
+            StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_auth(
+                NodeId::new(1),
+                &current_map,
+                EcShape { k: 2, m: 1 },
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                nodes.iter().map(|(node_id, endpoint)| {
+                    (
+                        *node_id,
+                        crate::storage_rpc_transport::StorageRpcClientEndpoint::unix(endpoint),
+                    )
+                }),
+                frontend_storage_rpc_auth(),
+            )
+            .unwrap();
+
+        authority.set_pg_state(pg_id, PgState::Peering).unwrap();
+        let scoped = crate::control_plane::ControlPlaneRuntimeMapSource::pg_runtime_map_snapshot(
+            &authority, pg_id, 1_001,
+        )
+        .unwrap();
+        assert_eq!(scoped.pg_routes().len(), 1);
+        assert_eq!(scoped.pg_routes()[0].pg_id(), pg_id);
+        assert_eq!(scoped.pg_routes()[0].state(), PgState::Peering);
+        assert!(scoped
+            .historical_pg_routes()
+            .iter()
+            .all(|route| !route.acting_set().contains(&NodeId::new(4))));
+        assert_eq!(scoped.nodes().len(), nodes.len());
+        assert_eq!(scoped.nodes(), current_map.nodes());
+
+        LocalClusterMap::open_runtime_map_with_existing_local_nodes(&current.local_map, &scoped)
+            .unwrap();
+
+        let recovery = current
+            .historical_recovery_cluster_with_storage_rpc_clients(
+                &scoped,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            )
+            .unwrap();
+        assert_eq!(recovery.metadata_node_id(), NodeId::new(4));
+        assert_eq!(recovery.operation_epoch(), scoped.cluster_epoch());
+
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2), NodeId::new(4)])
+            .unwrap();
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)])
+            .unwrap();
+        authority
+            .set_node_membership(NodeId::new(4), crate::control_plane::NodeMembershipState::Removed)
+            .unwrap();
+        assert!(authority
+            .snapshot()
+            .runtime_map(1_002)
+            .unwrap()
+            .nodes()
+            .iter()
+            .any(|node| node.node_id() == NodeId::new(4)));
+
+        for step in 0..260 {
+            let state = if step % 2 == 0 {
+                PgState::Degraded
+            } else {
+                PgState::Peering
+            };
+            authority.set_pg_state(pg_id, state).unwrap();
+        }
+        assert!(authority.snapshot().cluster_map_history().iter().all(|history| {
+            history
+                .pgs()
+                .iter()
+                .all(|pg| !pg.acting_set().contains(&NodeId::new(4)))
+        }));
+        let current_map = authority.snapshot().runtime_map(2_000).unwrap();
+        let scoped = crate::control_plane::ControlPlaneRuntimeMapSource::pg_runtime_map_snapshot(
+            &authority, pg_id, 2_001,
+        )
+        .unwrap();
+        assert_eq!(current_map.nodes().len(), 3);
+        assert_eq!(scoped.nodes(), current_map.nodes());
+
+        assert_eq!(current.metadata_node_id(), NodeId::new(4));
+        assert!(current.rpc_endpoints.as_ref().unwrap().contains_key(&NodeId::new(4)));
+        let refreshed = current
+            .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+                &FixedRuntimeMapSource(current_map.clone()),
+                2_000,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            )
+            .unwrap();
+        assert_eq!(refreshed.metadata_node_id(), NodeId::new(1));
+        assert_eq!(refreshed.local_map.node_count(), 3);
+        assert!(!refreshed.local_map.node_ids().any(|node_id| node_id == NodeId::new(4)));
+        assert!(refreshed.rpc_endpoints.as_ref().unwrap().contains_key(&NodeId::new(4)));
+        LocalClusterMap::open_runtime_map_with_existing_local_nodes(&refreshed.local_map, &scoped)
+            .unwrap();
+        refreshed
+            .historical_recovery_cluster_with_storage_rpc_clients(
+                &scoped,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            )
+            .unwrap();
+
+        let refreshed_with_routed_primary = current_with_routed_primary
+            .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+                &FixedRuntimeMapSource(current_map),
+                2_000,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            )
+            .unwrap();
+        assert_eq!(refreshed_with_routed_primary.metadata_node_id(), NodeId::new(1));
+        assert_eq!(refreshed_with_routed_primary.local_map.node_count(), 3);
+        assert!(!refreshed_with_routed_primary
+            .local_map
+            .node_ids()
+            .any(|node_id| node_id == NodeId::new(4)));
     }
 
     #[test]

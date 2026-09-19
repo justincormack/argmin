@@ -992,6 +992,9 @@ id = "control-$number"
 host_id = "host-$number"
 kind = "control-plane"
 admin_instance_id = "control-$number-admin"
+trace_enabled = true
+trace_filter = "storage_live_pg_transfer"
+trace_file = "$remote_run/logs/control-$number.trace"
 
 [[processes]]
 id = "storage-$number"

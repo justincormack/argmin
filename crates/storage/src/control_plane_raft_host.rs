@@ -1281,6 +1281,21 @@ impl ControlPlaneRuntimeMapSource for ControlPlaneRaftAuthorityHost {
         Ok(diagnostics)
     }
 
+    fn pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
+        let snapshot = self.block_on(
+            self.authority
+                .linearized_pg_runtime_map_snapshot(pg_id, authority_now_ms),
+        )?;
+        self.checkpoint_successful_linearized_read()?;
+        Ok(snapshot)
+    }
+
     fn serving_pg_runtime_map_snapshot(
         &self,
         pg_id: PgId,
@@ -2119,6 +2134,16 @@ mod tests {
             topology,
         })
         .unwrap();
+
+        let scoped_before_activation = ControlPlaneRuntimeMapSource::pg_runtime_map_snapshot(
+            &host,
+            pg_id,
+            crate::clock::current_time_millis(),
+        )
+        .unwrap();
+        assert_eq!(scoped_before_activation.pg_routes().len(), 1);
+        assert_eq!(scoped_before_activation.pg_routes()[0].pg_id(), pg_id);
+        assert_eq!(scoped_before_activation.nodes().len(), nodes.len());
 
         let heartbeat = |host: &mut ControlPlaneRaftAuthorityHost,
                          node_id: u32,

@@ -3315,20 +3315,47 @@ impl LocalClusterMap {
         current: &Self,
         runtime_map: &ClusterRuntimeMapSnapshot,
     ) -> Result<Self, ClusterBuildError> {
+        let candidate_node_ids = runtime_map
+            .nodes()
+            .iter()
+            .map(NodeRouteSnapshot::node_id)
+            .collect::<Vec<_>>();
+        let metadata_primary_node_id =
+            if candidate_node_ids.contains(&current.metadata_primary_node_id) {
+                current.metadata_primary_node_id
+            } else {
+                *candidate_node_ids
+                    .first()
+                    .ok_or(ClusterBuildError::EmptyCluster)?
+            };
         let mut local_map = Self::open_frontend_topology_only_with_runtime_map(
-            current.metadata_primary_node_id,
+            metadata_primary_node_id,
             runtime_map,
             current.default_ec_shape,
         )?;
         let current_node_ids = current.nodes.keys().copied().collect::<Vec<_>>();
-        let candidate_node_ids = local_map.nodes.keys().copied().collect::<Vec<_>>();
-        if current_node_ids != candidate_node_ids {
+        if candidate_node_ids
+            .iter()
+            .any(|node_id| !current.nodes.contains_key(node_id))
+        {
             return Err(ClusterBuildError::HistoricalRecoveryNodeSetMismatch {
                 current: current_node_ids.into_iter().map(NodeId::as_u32).collect(),
                 candidate: candidate_node_ids.into_iter().map(NodeId::as_u32).collect(),
             });
         }
-        local_map.nodes.clone_from(&current.nodes);
+        local_map.nodes = candidate_node_ids
+            .into_iter()
+            .map(|node_id| {
+                (
+                    node_id,
+                    current
+                        .nodes
+                        .get(&node_id)
+                        .expect("candidate node was verified in current local map")
+                        .clone(),
+                )
+            })
+            .collect();
         local_map.bind_runtime_map_advertised_endpoints(runtime_map);
         local_map.inherit_process_local_state_from(current);
         Ok(local_map)

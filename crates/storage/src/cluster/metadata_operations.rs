@@ -3926,32 +3926,68 @@ impl StorageCluster {
         runtime_map: &ClusterRuntimeMapSnapshot,
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Result<Arc<Self>, ClusterBuildError> {
-        if let Some(endpoints) = &self.rpc_endpoints {
+        let metadata_primary_node_id = self.metadata_primary_node_id_for_runtime_map(runtime_map)?;
+        if let Some(endpoints) = self.storage_rpc_endpoints_for_runtime_map(runtime_map) {
             let rpc_auth = self
                 .rpc_auth
                 .clone()
                 .ok_or(ClusterBuildError::ResolvedStorageRpcEndpointsRequireAuthentication)?;
             return Self::from_runtime_map_with_storage_rpc_endpoints_auth_and_process_state(
-                self.metadata_node_id(),
+                metadata_primary_node_id,
                 runtime_map,
                 self.default_payload_ec_shape(),
                 admission_settings,
-                endpoints
-                    .iter()
-                    .map(|(&node_id, endpoint)| (node_id, endpoint.clone())),
+                endpoints,
                 rpc_auth,
                 Some(self),
             );
         }
 
         Self::from_runtime_map_with_unix_storage_node_client_admission_settings_auth_and_process_state(
-            self.metadata_node_id(),
+            metadata_primary_node_id,
             runtime_map,
             self.default_payload_ec_shape(),
             admission_settings,
             self.rpc_auth.clone(),
             Some(self),
         )
+    }
+
+    fn metadata_primary_node_id_for_runtime_map(
+        &self,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<NodeId, ClusterBuildError> {
+        if runtime_map
+            .nodes()
+            .iter()
+            .any(|node| node.node_id() == self.metadata_node_id())
+        {
+            Ok(self.metadata_node_id())
+        } else {
+            runtime_map
+                .nodes()
+                .first()
+                .map(|node| node.node_id())
+                .ok_or(ClusterBuildError::EmptyCluster)
+        }
+    }
+
+    fn storage_rpc_endpoints_for_runtime_map(
+        &self,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Option<BTreeMap<NodeId, crate::storage_rpc_transport::StorageRpcClientEndpoint>> {
+        self.rpc_endpoints.as_ref().map(|endpoints| {
+            runtime_map
+                .nodes()
+                .iter()
+                .filter_map(|node| {
+                    endpoints
+                        .get(&node.node_id())
+                        .cloned()
+                        .map(|endpoint| (node.node_id(), endpoint))
+                })
+                .collect()
+        })
     }
 
     pub fn from_runtime_map_with_unix_storage_node_client_admission_settings_and_frontend_auth(
@@ -4074,13 +4110,15 @@ impl StorageCluster {
     ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
         self.require_dynamic_route_authority()?;
         let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
+        let metadata_primary_node_id = self.metadata_primary_node_id_for_runtime_map(&runtime_map)?;
+        let rpc_endpoints = self.storage_rpc_endpoints_for_runtime_map(&runtime_map);
         let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
-            self.metadata_node_id(),
+            metadata_primary_node_id,
             &runtime_map,
             self.default_payload_ec_shape(),
         )?;
         local_map.inherit_process_local_state_from(&self.local_map);
-        let storage_node_configs = match &self.rpc_endpoints {
+        let storage_node_configs = match &rpc_endpoints {
             Some(endpoints) => endpoints
                 .iter()
                 .map(|(&node_id, endpoint)| {

@@ -1327,6 +1327,14 @@ fn control_plane_openraft_read_index_runtime_map_uses_applied_tip() {
             .await
             .is_err());
 
+        let reconstructed = authority
+            .linearized_pg_runtime_map_snapshot(PgId::new(1), 44_103)
+            .await
+            .unwrap();
+        assert_eq!(reconstructed.pg_routes().len(), 1);
+        assert_eq!(reconstructed.pg_routes()[0].pg_id(), PgId::new(1));
+        assert_eq!(reconstructed.pg_routes()[0].state(), PgState::Active);
+
         let scoped = authority
             .linearized_serving_pg_runtime_map_snapshot(PgId::new(0), 44_103)
             .await

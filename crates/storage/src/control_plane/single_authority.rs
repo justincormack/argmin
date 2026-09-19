@@ -3917,11 +3917,7 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         self.store.ensure_healthy()?;
-        self.snapshot
-            .reconstructed_runtime_map_for_pg_with_fallback_validity(
-                pg_id,
-                non_serving_runtime_map_validity(authority_now_ms),
-            )
+        self.snapshot.reconstructed_runtime_map_for_pg(pg_id, authority_now_ms)
     }
 
     fn serving_pg_runtime_map_snapshot(

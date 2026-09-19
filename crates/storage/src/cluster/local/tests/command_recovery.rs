@@ -423,6 +423,158 @@ fn route_independent_listing_recovers_later_real_authority_task_after_earlier_fa
 }
 
 #[test]
+fn scoped_local_pending_recovery_ignores_unrelated_retired_route_actor() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+    ];
+    let pg_id = PgId::new(31);
+    let other_pg_id = PgId::new(32);
+    let mut local_map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[31, 32], EcShape { k: 2, m: 1 }).unwrap();
+    set_route_primary(&mut local_map, pg_id.get(), NodeId::new(0));
+    let bucket = bucket_for_pg(
+        local_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        pg_id.get(),
+        "unrelated-retired-route-",
+    );
+    let local_map = Arc::new(local_map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&local_map)).unwrap();
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(cluster);
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    let nodes = node_ids
+        .into_iter()
+        .map(|node_id| {
+            (
+                node_id,
+                format!("/tmp/unrelated-route-node-{}.sock", node_id.as_u32()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let pg_acting_sets = vec![
+        (pg_id, vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)]),
+        (
+            other_pg_id,
+            vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+        ),
+    ];
+    let topology = crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+        7,
+        [0x71; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+        vec![1],
+        &nodes,
+        &pg_acting_sets,
+        crate::control_plane::test_certified_storage_placement_policy(node_ids, 3, 2_000),
+    )
+    .unwrap();
+    crate::control_plane::ControlPlaneLinearizedCommandSink::submit_control_plane_command(
+        &mut authority,
+        crate::control_plane_command::ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes,
+            pg_acting_sets,
+            topology,
+        },
+    )
+    .unwrap();
+    for (node_id, now_ms) in node_ids[..3].iter().copied().zip([990, 991, 992]) {
+        heartbeat_authority_with_pending(&mut authority, &local_map, node_id, pg_id, None, now_ms);
+    }
+    for (node_id, now_ms) in node_ids[..3].iter().copied().zip([1_000, 1_001, 1_002]) {
+        heartbeat_authority_with_pending(&mut authority, &local_map, node_id, pg_id, None, now_ms);
+    }
+    let primary_incarnation = authority
+        .snapshot()
+        .node(NodeId::new(0))
+        .unwrap()
+        .node_incarnation();
+    authority
+        .complete_pg_peering(pg_id, NodeId::new(0), primary_incarnation, 1_003)
+        .unwrap();
+    let pending_epoch = authority.snapshot().cluster_epoch();
+    let command = create_bucket_metadata_command_at_epoch(pending_epoch, pg_id, 1, bucket.clone());
+    let pending = PendingMetadataCommandObservation::new(
+        pending_epoch,
+        std::num::NonZeroU64::MIN,
+        command.checksum_crc64(),
+    );
+    insert_pending_metadata_command_for_test(&local_map, pg_id, &bucket, &command);
+
+    authority.set_pg_state(pg_id, PgState::Peering).unwrap();
+    authority
+        .set_pg_acting_set(
+            other_pg_id,
+            vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+        )
+        .unwrap();
+    authority
+        .set_node_membership(
+            NodeId::new(3),
+            crate::control_plane::NodeMembershipState::Removed,
+        )
+        .unwrap();
+    for (node_id, now_ms) in node_ids[..3].iter().copied().zip([1_010, 1_011, 1_012]) {
+        heartbeat_authority_with_pending(
+            &mut authority,
+            &local_map,
+            node_id,
+            pg_id,
+            (node_id == NodeId::new(0)).then_some(pending),
+            now_ms,
+        );
+    }
+    let full = authority.runtime_map_snapshot(1_020).unwrap();
+    let scoped = authority.pg_runtime_map_snapshot(pg_id, 1_020).unwrap();
+    assert!(full
+        .nodes()
+        .iter()
+        .any(|node| node.node_id() == NodeId::new(3)));
+    assert!(!scoped
+        .nodes()
+        .iter()
+        .any(|node| node.node_id() == NodeId::new(3)));
+    assert!(full.historical_pg_routes().iter().any(|route| {
+        route.pg_id() == other_pg_id && route.acting_set().contains(&NodeId::new(3))
+    }));
+    assert!(scoped
+        .historical_pg_routes()
+        .iter()
+        .all(|route| route.pg_id() == pg_id && !route.acting_set().contains(&NodeId::new(3))));
+
+    let recovered = handle
+        .recover_reported_pending_metadata_command(
+            &authority,
+            1_020,
+            None,
+            pg_id,
+            NodeId::new(0),
+            pending,
+        )
+        .unwrap();
+    assert_eq!(recovered, 1);
+    let primary_pg = local_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    assert!(primary_pg
+        .pending_metadata_command_envelope(NodeId::new(0).as_u32(), pending_epoch)
+        .unwrap()
+        .is_none());
+    crate::PgMetadataStore::head_bucket(&*primary_pg, &bucket).unwrap();
+}
+
+#[test]
 fn refresh_recovery_applies_direct_put_from_historical_active_route() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

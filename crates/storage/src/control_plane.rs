@@ -9111,6 +9111,17 @@ impl ClusterControlSnapshot {
         )
     }
 
+    pub(crate) fn reconstructed_runtime_map_for_pg(
+        &self,
+        pg_id: PgId,
+        now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.reconstructed_runtime_map_for_pg_with_fallback_validity(
+            pg_id,
+            non_serving_runtime_map_validity(now_ms),
+        )
+    }
+
     fn reconstructed_runtime_map_for_pg_with_fallback_validity(
         &self,
         pg_id: PgId,
@@ -9252,6 +9263,14 @@ impl ClusterControlSnapshot {
             routed_node_ids.extend(route.acting_set().iter().copied());
         }
         routed_node_ids.extend(extra_node_ids);
+        routed_node_ids.extend(
+            self.nodes
+                .values()
+                .filter(|node| {
+                    node.membership == NodeMembershipState::Active && !node.endpoint.is_empty()
+                })
+                .map(|node| node.node_id),
+        );
         let mut nodes = Vec::with_capacity(routed_node_ids.len());
         for node_id in routed_node_ids {
             let node = self

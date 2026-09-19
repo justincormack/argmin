@@ -1448,7 +1448,7 @@ impl UnavailablePgReconciliationWorker {
 }
 
 fn staging_maintenance_error_is_retryable(error: &ControlPlaneError) -> bool {
-    error.is_retryable_runtime_map_observation_error()
+    error.is_retryable_staging_evidence_publication_error()
         || matches!(error, ControlPlaneError::RpcUnconfirmed { .. })
         || error.is_retryable_openraft_leadership_error()
 }
@@ -2314,22 +2314,30 @@ mod tests {
 
     #[test]
     fn retryable_staging_maintenance_failure_uses_bounded_backoff() {
-        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| Ok(()),
-            Duration::from_secs(60),
-        );
-        let mut authority = FakeAuthority {
-            maintenance_results: VecDeque::from([Err(ControlPlaneError::AuthorityNotServing)]),
-            ..FakeAuthority::default()
-        };
+        for error in [
+            ControlPlaneError::AuthorityNotServing,
+            ControlPlaneError::StagingEvidencePublicationDeferred,
+            ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed {
+                message: "injected response loss".to_owned(),
+            },
+        ] {
+            let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+                |_| Ok(()),
+                Duration::from_secs(60),
+            );
+            let mut authority = FakeAuthority {
+                maintenance_results: VecDeque::from([Err(error)]),
+                ..FakeAuthority::default()
+            };
 
-        worker.poll(&mut authority, 100).unwrap();
-        assert_eq!(authority.maintenance_count, 1);
-        assert!(worker.last_maintenance_diagnostic.is_some());
+            worker.poll(&mut authority, 100).unwrap();
+            assert_eq!(authority.maintenance_count, 1);
+            assert!(worker.last_maintenance_diagnostic.is_some());
 
-        worker.poll(&mut authority, 101).unwrap();
-        assert_eq!(authority.maintenance_count, 1);
-        assert!(worker.last_maintenance_diagnostic.is_some());
+            worker.poll(&mut authority, 101).unwrap();
+            assert_eq!(authority.maintenance_count, 1);
+            assert!(worker.last_maintenance_diagnostic.is_some());
+        }
     }
 
     #[test]

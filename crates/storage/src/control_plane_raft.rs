@@ -5531,6 +5531,22 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
+    pub async fn linearized_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        issued_at_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let selected = self.linearized_control_plane_snapshot_selection().await?;
+        Self::derive_linearized_snapshot(
+            selected,
+            "reconstructed scoped runtime-map",
+            move |snapshot, _read_index| {
+                snapshot.reconstructed_runtime_map_for_pg(pg_id, issued_at_ms)
+            },
+        )
+        .await
+    }
+
     pub async fn linearized_serving_pg_runtime_map_snapshot(
         &self,
         pg_id: PgId,
