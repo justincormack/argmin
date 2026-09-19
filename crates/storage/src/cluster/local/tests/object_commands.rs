@@ -3831,12 +3831,15 @@ fn assert_insert_delete_marker_witness_survives_expired_authority(
             assert_bucket_write_reservations_released(&map, &bucket);
         }
         WitnessedCommandExpiredAuthority::Route => {
-            assert!(matches!(
-                result,
-                Err(crate::ObjectPgActionError::Store(
-                    StoreError::MetadataCommandIrrevocableConvergencePending { .. }
-                ))
-            ));
+            assert!(
+                matches!(
+                    &result,
+                    Err(crate::ObjectPgActionError::Store(
+                        StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+                    ))
+                ),
+                "unexpected expired-route result: {result:?}"
+            );
             let primary_pg = map
                 .node(NodeId::new(1))
                 .unwrap()
@@ -4765,6 +4768,160 @@ fn suspended_delete_marker_retries_transient_recovery_waiter_observation() {
         Ok(crate::StoredObject::DeleteMarker(_))
     ));
     drop(primary_pg);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn suspended_delete_marker_retries_install_time_recovery_handoff() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, contender_key, object_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let (bucket, key, object_pg, _) = bucket_key_with_distinct_object_and_data_pg(topology);
+        let contender_key =
+            key_for_object_pg(topology, &bucket, object_pg, "marker-install-contender-");
+        (bucket, key, contender_key, object_pg)
+    };
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Suspended);
+
+    let pg_id = PgId::new(object_pg);
+    let contender = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            contender_key,
+            crate::SessionId::try_from("76".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+
+    let install_once = Arc::new(AtomicBool::new(true));
+    let install_once_for_hook = Arc::clone(&install_once);
+    let install_map = Arc::clone(&map);
+    let install_bucket = bucket.clone();
+    let install_contender = contender.clone();
+    let _install_hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            if !install_once_for_hook.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let primary = install_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                primary.node_id().as_u32(),
+                &install_contender,
+                Some(&install_bucket),
+            )
+            .expect("test contender must win the marker install-time pending-slot race");
+            let MetadataCommandRecoveryAdmission::Leader(owner) = install_map
+                .runtime_state()
+                .join_metadata_command_recovery(pg_id, &install_contender)
+            else {
+                panic!("test must acquire the marker install-time contender recovery flight");
+            };
+            owner.mark_irreversible_handoff(
+                crate::cluster::MetadataCommandRecoveryResolution::IrrevocableConvergencePending,
+            );
+            owner.relinquish_for_authorized_recovery();
+        }));
+
+    let (recovery_wait_tx, recovery_wait_rx) = std::sync::mpsc::sync_channel(1);
+    let contender_id = contender.id();
+    let signalled = Arc::new(AtomicBool::new(false));
+    let signalled_for_hook = Arc::clone(&signalled);
+    let _wait_hook = cluster
+        .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+            move |observed| {
+                if observed.id() == contender_id && !signalled_for_hook.swap(true, Ordering::SeqCst)
+                {
+                    recovery_wait_tx.send(()).unwrap();
+                }
+            },
+        ));
+
+    thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let request_cluster = Arc::clone(&cluster);
+        let request_bucket = bucket.clone();
+        let request_key = key.clone();
+        scope.spawn(move || {
+            result_tx
+                .send(request_cluster.insert_current_delete_marker_if(
+                    &request_bucket,
+                    &request_key,
+                    crate::BucketVersioningState::Suspended,
+                    crate::OwnerIdentity::from_principal("owner"),
+                    |stored| {
+                        assert!(stored.is_none());
+                        Ok::<(), ()>(())
+                    },
+                ))
+                .unwrap();
+        });
+
+        recovery_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("marker request did not wait for install-time authorized recovery");
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket).as_ref(),
+            Some(&contender)
+        );
+        assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &contender));
+
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &contender, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        let outcome = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("marker request did not resume after authorized recovery")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.version_id, crate::VersionId::Null);
+    });
+
+    assert!(!install_once.load(Ordering::SeqCst));
+    assert!(signalled.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Ok(crate::StoredObject::DeleteMarker(marker))
+                if marker.version_id == crate::VersionId::Null
+        ));
+    }
     assert_clean_metadata_command_stream(&map, &[object_pg]);
     assert_bucket_write_reservations_released(&map, &bucket);
 }
@@ -7011,16 +7168,19 @@ fn suspended_delete_marker_reissue_conflict_classifies_replacement_identity_afte
 
     assert!(helper_ran.load(Ordering::SeqCst));
     assert!(!expire_once.load(Ordering::SeqCst));
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(
-            StoreError::MetadataCommandIrrevocableConvergencePending {
-                pg_id: error_pg_id,
-                log_index,
-                ..
-            }
-        ) if error_pg_id == object_pg && log_index == replacement_log_index
-    ));
+    assert!(
+        matches!(
+            &error,
+            crate::ObjectPgActionError::Store(
+                StoreError::MetadataCommandIrrevocableConvergencePending {
+                    pg_id: error_pg_id,
+                    log_index,
+                    ..
+                }
+            ) if *error_pg_id == object_pg && *log_index == replacement_log_index
+        ),
+        "unexpected replacement classification: {error:?}"
+    );
     let pending = pending_metadata_command_for_test(&map, pg_id, &bucket)
         .expect("published replacement must remain recoverable");
     assert_eq!(pending.id().log_index().get(), replacement_log_index);

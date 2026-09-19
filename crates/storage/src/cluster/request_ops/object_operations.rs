@@ -2437,21 +2437,6 @@ impl super::StorageCluster {
         }
     }
 
-    fn retry_insert_delete_marker_after_command_observation_error(
-        &self,
-        error: ObjectPgActionError,
-        work_budget: &mut super::RequestWorkBudget,
-    ) -> Result<(), ObjectPgActionError> {
-        if !object_pg_action_error_is_retryable_command_observation(&error) {
-            return Err(error);
-        }
-        work_budget
-            .sleep_after_contention(
-                "insert delete marker contender observation retry budget exhausted",
-            )
-            .map_err(ObjectPgActionError::Store)
-    }
-
     pub(super) fn insert_current_delete_marker_if_with_route_validation<T, E>(
         &self,
         route: super::ObjectMetadataMutationEffectRoute<'_>,
@@ -2486,7 +2471,7 @@ impl super::StorageCluster {
         #[cfg(test)]
         let mut abandoned_hook_command = None;
 
-        loop {
+        'request: loop {
             #[cfg(test)]
             if let Some(command) = abandoned_hook_command.take() {
                 maybe_run_object_metadata_command_abandoned_hook(
@@ -2511,35 +2496,43 @@ impl super::StorageCluster {
                             Err(error) => return Ok(Err(error)),
                         };
                         require_valid_route().map_err(ObjectPgActionError::Store)?;
-                        if self
-                            .apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
-                                pg_id,
-                                super::ExactPendingObjectMetadataCommand::for_checked_request(
-                                    &command,
-                                ),
-                                &mut work_budget,
-                            )?
-                            == super::ExactPendingObjectMetadataCommandOutcome::Reinspect
-                        {
-                            continue;
+                        loop {
+                            match self
+                                .apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
+                                    pg_id,
+                                    super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                        &command,
+                                    ),
+                                    &mut work_budget,
+                                )
+                            {
+                                Ok(super::ExactPendingObjectMetadataCommandOutcome::Applied) => {
+                                    return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
+                                        value,
+                                        version_id: marker.version_id,
+                                    }));
+                                }
+                                Ok(
+                                    super::ExactPendingObjectMetadataCommandOutcome::Reinspect,
+                                ) => break,
+                                Err(error) => self
+                                    .wait_for_insert_delete_marker_recovery_handoff(
+                                        pg_id,
+                                        &command,
+                                        error,
+                                        &mut work_budget,
+                                    )?,
+                            }
                         }
-                        return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
-                            value,
-                            version_id: marker.version_id,
-                        }));
+                        continue;
                     }
                 }
-                if let Err(error) = self.drain_pending_object_metadata_command_with_work_budget(
+                self.drain_snapshot_sensitive_pending_object_metadata_command(
                     publisher,
                     pg_id,
                     &command,
                     &mut work_budget,
-                ) {
-                    self.retry_insert_delete_marker_after_command_observation_error(
-                        error,
-                        &mut work_budget,
-                    )?;
-                }
+                )?;
                 continue;
             }
 
@@ -2674,12 +2667,12 @@ impl super::StorageCluster {
                     )?;
                     if let Err(error) = self
                         .drain_one_pending_object_metadata_command_with_work_budget(
-                        publisher,
-                        pg_id,
+                            publisher,
+                            pg_id,
                         bucket,
                         &mut work_budget,
                     ) {
-                        self.retry_insert_delete_marker_after_command_observation_error(
+                        self.retry_snapshot_sensitive_metadata_command_install_after_error(
                             error,
                             &mut work_budget,
                         )?;
@@ -2690,7 +2683,7 @@ impl super::StorageCluster {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
-                    self.retry_insert_delete_marker_after_command_observation_error(
+                    self.retry_snapshot_sensitive_metadata_command_install_after_error(
                         error,
                         &mut work_budget,
                     )?;
@@ -2704,9 +2697,8 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             let mut install_may_have_applied = false;
-            let install = loop {
-                match self
-                    .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
+            let install = match self
+                .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
                     publisher,
                     pg_id,
                     bucket,
@@ -2715,40 +2707,29 @@ impl super::StorageCluster {
                     &mut work_budget,
                     &mut install_may_have_applied,
                     &mut evaluated_attempt,
-                ) {
-                    Ok(install) => break install,
-                    Err(error)
-                        if object_pg_action_error_is_retryable_command_observation(&error) =>
-                    {
-                        if let Err(retry_error) = self
-                            .retry_insert_delete_marker_after_command_observation_error(
-                            error,
-                            &mut work_budget,
-                        ) {
-                            if install_may_have_applied {
-                                return Err(ObjectPgActionError::Store(
-                                    StoreError::MetadataCommandOutcomeUnconfirmed {
-                                        pg_id: command.id().pg_id().get(),
-                                        cluster_epoch: command.id().cluster_epoch(),
-                                        log_index: command.id().log_index().get(),
-                                    },
-                                ));
-                            }
-                            self.release_bucket_write_proof_for_object_metadata_command(
-                                &bucket_write_reservation,
-                            )?;
-                            return Err(retry_error);
-                        }
-                    }
-                    Err(error) => {
-                        if install_may_have_applied {
-                            return Err(error);
-                        }
+                )
+            {
+                Ok(install) => install,
+                Err(error) => {
+                    let pending_owns_reservation = if install_may_have_applied {
+                        self.pending_metadata_command_uses_bucket_write_reservation(
+                            pg_id,
+                            bucket,
+                            &bucket_write_reservation,
+                        )?
+                    } else {
+                        false
+                    };
+                    if !pending_owns_reservation {
                         self.release_bucket_write_proof_for_object_metadata_command(
                             &bucket_write_reservation,
                         )?;
-                        return Err(error);
                     }
+                    self.retry_snapshot_sensitive_metadata_command_install_after_error(
+                        error,
+                        &mut work_budget,
+                    )?;
+                    continue 'request;
                 }
             };
             match install {
@@ -2761,28 +2742,66 @@ impl super::StorageCluster {
                     continue;
                 }
             }
-            match self.apply_new_object_metadata_command_for_bucket_or_reinspect(
-                pg_id,
-                bucket,
-                &command,
-                &mut work_budget,
-            )? {
-                NewObjectMetadataCommandApplyOutcome::Applied
-                | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
-                | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending => {}
-                NewObjectMetadataCommandApplyOutcome::Reinspect(_) => {
-                    #[cfg(test)]
-                    {
-                        abandoned_hook_command = Some(command.clone());
+            loop {
+                match self.apply_new_object_metadata_command_for_bucket_or_reinspect(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                ) {
+                    Ok(
+                        NewObjectMetadataCommandApplyOutcome::Applied
+                        | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+                        | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending,
+                    ) => break,
+                    Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(_)) => {
+                        #[cfg(test)]
+                        {
+                            abandoned_hook_command = Some(command.clone());
+                        }
+                        continue 'request;
                     }
-                    continue;
+                    Ok(NewObjectMetadataCommandApplyOutcome::Abandoned(error)) => {
+                        return Err(error)
+                    }
+                    Err(error) => self
+                        .wait_for_insert_delete_marker_recovery_handoff(
+                            pg_id,
+                            &command,
+                            error,
+                            &mut work_budget,
+                        )?,
                 }
-                NewObjectMetadataCommandApplyOutcome::Abandoned(error) => return Err(error),
             }
             return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
                 value,
                 version_id: marker_vid,
             }));
+        }
+    }
+
+    fn wait_for_insert_delete_marker_recovery_handoff(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        error: ObjectPgActionError,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        match error {
+            ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
+            | ObjectPgActionError::MetadataCommandRecoveryTransferred => {
+                #[cfg(test)]
+                maybe_run_pending_object_metadata_command_recovery_transferred_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    command,
+                );
+                self.wait_for_transferred_metadata_command_with_work_budget(
+                    pg_id,
+                    command,
+                    work_budget,
+                )
+            }
+            error => Err(error),
         }
     }
 
