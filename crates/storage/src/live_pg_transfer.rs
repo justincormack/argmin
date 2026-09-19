@@ -573,6 +573,7 @@ pub struct LivePgMetadataTransferError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LivePgMetadataTransferFailureDisposition {
     Retryable,
+    AuthorizationNotObserved,
     Fatal,
 }
 
@@ -698,6 +699,10 @@ impl LivePgMetadataTransferError {
         self.disposition == LivePgMetadataTransferFailureDisposition::Fatal
     }
 
+    pub(crate) fn is_staging_authorization_not_observed(&self) -> bool {
+        self.disposition == LivePgMetadataTransferFailureDisposition::AuthorizationNotObserved
+    }
+
     #[cfg(test)]
     fn retained_diagnostic_contains(&self, expected: &str) -> bool {
         self._diagnostic.contains(expected)
@@ -779,12 +784,19 @@ fn metadata_transfer_failure(
 }
 
 fn staging_rpc_failure(error: crate::StoreError) -> LivePgMetadataTransferFailure {
+    let authorization_not_observed = error.storage_node_failure_class()
+        == Some(crate::error::StorageNodeFailureClass::StagingAuthorizationNotObserved);
     let retryable = !matches!(
         error.operation_failure_class(),
         crate::StoreOperationFailureClass::Other
     );
     let diagnostic = format!("metadata-transfer staging RPC failed: {error}");
-    if retryable {
+    if authorization_not_observed {
+        LivePgMetadataTransferFailure {
+            disposition: LivePgMetadataTransferFailureDisposition::AuthorizationNotObserved,
+            diagnostic,
+        }
+    } else if retryable {
         LivePgMetadataTransferFailure::retryable(diagnostic)
     } else {
         LivePgMetadataTransferFailure::fatal(diagnostic)
@@ -801,7 +813,7 @@ enum StagingArtifactReadOutcome {
 fn staging_artifact_failure_outcome(
     failure: LivePgMetadataTransferFailure,
 ) -> StagingArtifactReadOutcome {
-    if failure.disposition == LivePgMetadataTransferFailureDisposition::Retryable {
+    if failure.disposition != LivePgMetadataTransferFailureDisposition::Fatal {
         StagingArtifactReadOutcome::Retryable(failure)
     } else {
         StagingArtifactReadOutcome::Fatal(failure)
@@ -916,6 +928,8 @@ pub struct LivePgMetadataTransferAdmin {
     #[cfg(test)]
     after_transfer_prepare_hook: Option<Arc<dyn Fn(PgId, ClusterEpoch) + Send + Sync>>,
     #[cfg(test)]
+    before_staging_artifact_publish_hook: Option<Arc<dyn Fn(PgId) + Send + Sync>>,
+    #[cfg(test)]
     after_transfer_import_hook: Option<Arc<dyn Fn(PgId, ClusterEpoch) + Send + Sync>>,
     #[cfg(test)]
     clock_override_ms: Option<u64>,
@@ -942,6 +956,8 @@ impl LivePgMetadataTransferAdmin {
             after_transfer_install_hook: None,
             #[cfg(test)]
             after_transfer_prepare_hook: None,
+            #[cfg(test)]
+            before_staging_artifact_publish_hook: None,
             #[cfg(test)]
             after_transfer_import_hook: None,
             #[cfg(test)]
@@ -975,6 +991,8 @@ impl LivePgMetadataTransferAdmin {
             #[cfg(test)]
             after_transfer_prepare_hook: None,
             #[cfg(test)]
+            before_staging_artifact_publish_hook: None,
+            #[cfg(test)]
             after_transfer_import_hook: None,
             #[cfg(test)]
             clock_override_ms: None,
@@ -1003,6 +1021,8 @@ impl LivePgMetadataTransferAdmin {
             after_transfer_install_hook: None,
             #[cfg(test)]
             after_transfer_prepare_hook: None,
+            #[cfg(test)]
+            before_staging_artifact_publish_hook: None,
             #[cfg(test)]
             after_transfer_import_hook: None,
             #[cfg(test)]
@@ -1035,6 +1055,8 @@ impl LivePgMetadataTransferAdmin {
             after_transfer_install_hook: None,
             #[cfg(test)]
             after_transfer_prepare_hook: None,
+            #[cfg(test)]
+            before_staging_artifact_publish_hook: None,
             #[cfg(test)]
             after_transfer_import_hook: None,
             #[cfg(test)]
@@ -1069,6 +1091,7 @@ impl LivePgMetadataTransferAdmin {
             _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             after_transfer_install_hook: None,
             after_transfer_prepare_hook: None,
+            before_staging_artifact_publish_hook: None,
             after_transfer_import_hook: None,
             clock_override_ms: None,
         }
@@ -1168,6 +1191,15 @@ impl LivePgMetadataTransferAdmin {
         hook: impl Fn(PgId, ClusterEpoch) + Send + Sync + 'static,
     ) -> Self {
         self.after_transfer_import_hook = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_before_staging_artifact_publish_hook(
+        mut self,
+        hook: impl Fn(PgId) + Send + Sync + 'static,
+    ) -> Self {
+        self.before_staging_artifact_publish_hook = Some(Arc::new(hook));
         self
     }
 
@@ -1295,6 +1327,10 @@ impl LivePgMetadataTransferAdmin {
         let _time_override = self
             .clock_override_ms
             .map(crate::clock::test_time_override_guard);
+        #[cfg(test)]
+        if let Some(hook) = &self.before_staging_artifact_publish_hook {
+            hook(authorized.work.pg_id());
+        }
         let result =
             (|| -> Result<PublishedUnavailablePgMetadataTransfer, LivePgMetadataTransferFailure> {
                 let target_epoch = authorized.target_epoch;
@@ -3588,7 +3624,7 @@ fn wait_for_source_lease_to_expire(lease_deadline_ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::TcpStream;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
@@ -4415,6 +4451,10 @@ mod tests {
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum ConcurrentReconciliationFailure {
         None,
+        PublicationLag,
+        PublicationWaitExpiry,
+        MixedPublicationLagAndPreparationRejection,
+        AuthorizationObservationLag,
         AuthorizationResponseLossAndFirstStageFailure,
         DefinitiveAuthorizationRejection,
         InstallPreparationRejection,
@@ -4422,12 +4462,29 @@ mod tests {
         FinalizationDeferred,
     }
 
+    #[test]
+    fn staging_rpc_preserves_authorization_observation_lag() {
+        let failure = staging_rpc_failure(crate::StoreError::StorageRpc {
+            node_id: 1,
+            operation: "metadata transfer staging intent create",
+            failure: crate::storage_rpc::StorageRpcErrorCode::StagingAuthorizationNotObserved,
+            detail: crate::error::StorageNodeFailureDetail::new("authorization not observed"),
+        });
+        assert_eq!(
+            failure.disposition,
+            LivePgMetadataTransferFailureDisposition::AuthorizationNotObserved
+        );
+    }
+
     fn concurrent_reconciliation_transfers_rebase_and_activate(
         failure: ConcurrentReconciliationFailure,
+        pg_count: usize,
     ) {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
-        let pg_ids = [PgId::new(19), PgId::new(20)];
+        let pg_ids = (19..19 + u32::try_from(pg_count).unwrap())
+            .map(PgId::new)
+            .collect::<Vec<_>>();
         let source_acting_set = vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)];
         let destination_acting_set = vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)];
         let nodes = (1..=4)
@@ -4442,8 +4499,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let pgs = pg_ids
+            .iter()
+            .copied()
             .map(|pg_id| (pg_id, source_acting_set.clone()))
-            .to_vec();
+            .collect::<Vec<_>>();
         let topology =
             crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
                 7,
@@ -4473,10 +4532,16 @@ mod tests {
         store.checkpoint(None, &snapshot).unwrap();
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
         let storage_root = tmp.path().join("storage");
-        let commands = [
-            composed_transfer_source_command(pg_ids[0], source_epoch, "concurrent-transfer-a"),
-            composed_transfer_source_command(pg_ids[1], source_epoch, "concurrent-transfer-b"),
-        ];
+        let commands = pg_ids
+            .iter()
+            .map(|pg_id| {
+                composed_transfer_source_command(
+                    *pg_id,
+                    source_epoch,
+                    &format!("concurrent-transfer-{}", pg_id.get()),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut proofs = std::collections::BTreeMap::new();
         for generation in 0..8 {
             for node_id in 1..=3 {
@@ -4484,12 +4549,12 @@ mod tests {
                     &storage_root
                         .join(format!("cluster-{generation}"))
                         .join(format!("node-{node_id}")),
-                    &pg_ids.map(PgId::get),
+                    &pg_ids.iter().map(|pg_id| pg_id.get()).collect::<Vec<_>>(),
                     EcShape { k: 2, m: 1 },
                     source_epoch,
                 )
                 .unwrap();
-                for (pg_id, command) in pg_ids.into_iter().zip(&commands) {
+                for (pg_id, command) in pg_ids.iter().copied().zip(&commands) {
                     let state = node
                         .get_pg(pg_id.get())
                         .unwrap()
@@ -4507,9 +4572,10 @@ mod tests {
         }
 
         let now_ms = crate::clock::current_time_millis();
-        let observations = |states: [PgState; 2]| {
+        let observations = |states: Vec<PgState>| {
             pg_ids
-                .into_iter()
+                .iter()
+                .copied()
                 .zip(states)
                 .map(|(pg_id, state)| NodePgHeartbeatObservation {
                     pg_id,
@@ -4526,7 +4592,7 @@ mod tests {
                 nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
                 10_000,
                 if node_id <= 3 {
-                    observations([PgState::Peering, PgState::Peering])
+                    observations(vec![PgState::Peering; pg_count])
                 } else {
                     Vec::new()
                 },
@@ -4539,34 +4605,37 @@ mod tests {
                 NodeId::new(node_id),
                 nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
                 10_000,
-                observations([PgState::Peering, PgState::Peering]),
+                observations(vec![PgState::Peering; pg_count]),
                 now_ms + 5 + u64::from(node_id),
             );
         }
-        authority
-            .complete_pg_peering(pg_ids[0], NodeId::new(1), 1, now_ms + 10)
-            .unwrap();
-        for node_id in 1..=3 {
-            submit_heartbeat_until_serving(
-                &mut authority,
-                NodeId::new(node_id),
-                nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
-                10_000,
-                observations([PgState::Active, PgState::Peering]),
-                now_ms + 11 + u64::from(node_id),
-            );
+        let mut states = vec![PgState::Peering; pg_count];
+        for (index, pg_id) in pg_ids.iter().copied().enumerate() {
+            let peering_at_ms = now_ms + 10 + u64::try_from(index).unwrap() * 10;
+            authority
+                .complete_pg_peering(pg_id, NodeId::new(1), 1, peering_at_ms)
+                .unwrap();
+            states[index] = PgState::Active;
+            for node_id in 1..=3 {
+                submit_heartbeat_until_serving(
+                    &mut authority,
+                    NodeId::new(node_id),
+                    nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
+                    10_000,
+                    observations(states.clone()),
+                    peering_at_ms + 1 + u64::from(node_id),
+                );
+            }
         }
-        authority
-            .complete_pg_peering(pg_ids[1], NodeId::new(1), 1, now_ms + 20)
-            .unwrap();
+        let active_at_ms = now_ms + 20 + u64::try_from(pg_count - 1).unwrap() * 10;
         for node_id in 1..=3 {
             submit_heartbeat_until_serving(
                 &mut authority,
                 NodeId::new(node_id),
                 nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
                 if node_id == 1 { 50 } else { 10_000 },
-                observations([PgState::Active, PgState::Active]),
-                now_ms + 30 + u64::from(node_id),
+                observations(states.clone()),
+                active_at_ms + u64::from(node_id),
             );
         }
         let failed_deadline_ms = authority
@@ -4584,7 +4653,7 @@ mod tests {
                 NodeId::new(node_id),
                 nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
                 500,
-                observations([PgState::Peering, PgState::Peering]),
+                observations(vec![PgState::Peering; pg_count]),
                 failed_deadline_ms + u64::from(node_id),
             );
         }
@@ -4602,7 +4671,7 @@ mod tests {
                 NodeId::new(node_id),
                 nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
                 500,
-                observations([PgState::Peering, PgState::Peering]),
+                observations(vec![PgState::Peering; pg_count]),
                 failed_deadline_ms + 10 + u64::from(node_id),
             );
         }
@@ -4612,8 +4681,16 @@ mod tests {
             .unwrap()
             .observed_at_ms()
             + 50;
-        for pg_id in pg_ids {
-            let route = authority.snapshot().pg_route(pg_id, begin_at_ms).unwrap();
+        if matches!(
+            failure,
+            ConcurrentReconciliationFailure::PublicationLag
+                | ConcurrentReconciliationFailure::PublicationWaitExpiry
+                | ConcurrentReconciliationFailure::MixedPublicationLagAndPreparationRejection
+        ) {
+            publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+        }
+        for pg_id in &pg_ids {
+            let route = authority.snapshot().pg_route(*pg_id, begin_at_ms).unwrap();
             assert!(
                 route.metadata_read_route().is_some(),
                 "PG {} fixture has no proof-qualified transfer source",
@@ -4629,12 +4706,15 @@ mod tests {
             Arc::clone(&stop),
         );
         let _time = crate::clock::test_time_override_guard(begin_at_ms + 1_000);
-        let (prepared_tx, prepared_rx) = mpsc::sync_channel(2);
-        let (release_tx, release_rx) = mpsc::sync_channel(2);
+        let (prepared_tx, prepared_rx) = mpsc::sync_channel(pg_count);
+        let (release_tx, release_rx) = mpsc::sync_channel(pg_count);
         let release_rx = Arc::new(Mutex::new(release_rx));
         let prepare_release = Arc::clone(&release_rx);
-        let (imported_tx, imported_rx) = mpsc::sync_channel(8);
+        let (imported_tx, imported_rx) = mpsc::sync_channel(pg_count * 4);
         let (stage_failure_tx, stage_failure_rx) = mpsc::sync_channel(1);
+        let (stage_blocked_tx, stage_blocked_rx) = mpsc::sync_channel(pg_count);
+        let (stage_release_tx, stage_release_rx) = mpsc::sync_channel(pg_count);
+        let stage_release_rx = Arc::new(Mutex::new(stage_release_rx));
         let mut admin = live_transfer_admin(tmp.path(), &socket_path)
             .with_clock_override(begin_at_ms + 1_000)
             .with_after_transfer_prepare_hook(move |pg_id, destination_epoch| {
@@ -4650,17 +4730,50 @@ mod tests {
                     .try_send((pg_id, destination_epoch))
                     .expect("staged import retried beyond the bounded regression budget");
             });
-        if failure == ConcurrentReconciliationFailure::AuthorizationResponseLossAndFirstStageFailure
-        {
+        if matches!(
+            failure,
+            ConcurrentReconciliationFailure::PublicationWaitExpiry
+                | ConcurrentReconciliationFailure::MixedPublicationLagAndPreparationRejection
+        ) {
+            let first_blocked_pg = pg_ids[2];
+            let blocked_once = Arc::new(Mutex::new(BTreeSet::new()));
+            admin = admin.with_before_staging_artifact_publish_hook(move |pg_id| {
+                let should_block =
+                    pg_id >= first_blocked_pg && blocked_once.lock().unwrap().insert(pg_id);
+                if should_block {
+                    stage_blocked_tx.send(pg_id).unwrap();
+                    stage_release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("blocked staging publication was not released");
+                }
+            });
+        }
+        if matches!(
+            failure,
+            ConcurrentReconciliationFailure::AuthorizationObservationLag
+                | ConcurrentReconciliationFailure::AuthorizationResponseLossAndFirstStageFailure
+        ) {
             admin = admin.with_staging_artifact_publish_failure_notification(
                 NodeId::new(2),
-                LivePgMetadataTransferFailureDisposition::Retryable,
+                if failure == ConcurrentReconciliationFailure::AuthorizationObservationLag {
+                    LivePgMetadataTransferFailureDisposition::AuthorizationNotObserved
+                } else {
+                    LivePgMetadataTransferFailureDisposition::Retryable
+                },
                 stage_failure_tx,
             );
         }
         let mut worker = UnavailablePgReconciliationWorker::spawn(admin);
         match failure {
             ConcurrentReconciliationFailure::None => {}
+            ConcurrentReconciliationFailure::PublicationLag => {}
+            ConcurrentReconciliationFailure::PublicationWaitExpiry => {}
+            ConcurrentReconciliationFailure::MixedPublicationLagAndPreparationRejection => {
+                worker.reject_next_install_preparation_for_test();
+            }
+            ConcurrentReconciliationFailure::AuthorizationObservationLag => {}
             ConcurrentReconciliationFailure::AuthorizationResponseLossAndFirstStageFailure => {
                 worker.fail_next_authorization_response_for_test();
             }
@@ -4683,7 +4796,8 @@ mod tests {
         }
         let preparation_deadline = Instant::now() + Duration::from_secs(5);
         let mut prepared = Vec::new();
-        while prepared.len() < 2 {
+        let mut released_one = false;
+        while prepared.len() < pg_count {
             {
                 let mut authority = authority.lock().unwrap();
                 worker
@@ -4692,6 +4806,10 @@ mod tests {
             }
             while let Ok(value) = prepared_rx.try_recv() {
                 prepared.push(value);
+            }
+            if pg_count > 4 && prepared.len() >= 4 && !released_one {
+                release_tx.send(()).unwrap();
+                released_one = true;
             }
             assert!(
                 Instant::now() < preparation_deadline,
@@ -4705,9 +4823,137 @@ mod tests {
             prepared.iter().map(|(pg_id, _)| *pg_id).collect::<Vec<_>>(),
             pg_ids
         );
-        assert_eq!(prepared[0].1, prepared[1].1);
-        release_tx.send(()).unwrap();
-        release_tx.send(()).unwrap();
+        assert!(prepared.iter().all(|(_, epoch)| *epoch == prepared[0].1));
+        for _ in usize::from(released_one)..pg_count {
+            release_tx.send(()).unwrap();
+        }
+
+        if failure == ConcurrentReconciliationFailure::PublicationLag {
+            let wait_deadline = Instant::now() + Duration::from_secs(5);
+            while worker.staged_install_depth_for_test() < pg_count {
+                {
+                    let mut authority = authority.lock().unwrap();
+                    worker
+                        .poll_single_authority(&mut authority, begin_at_ms + 1)
+                        .unwrap();
+                }
+                assert!(
+                    Instant::now() < wait_deadline,
+                    "staged owners were lost before publication evidence arrived: {:?}",
+                    worker.retained_test_state()
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            let epoch_before_publication = authority.lock().unwrap().snapshot().cluster_epoch();
+            for _ in 0..3 {
+                let mut authority = authority.lock().unwrap();
+                worker
+                    .poll_single_authority(&mut authority, begin_at_ms + 1)
+                    .unwrap();
+                assert_eq!(
+                    authority.snapshot().cluster_epoch(),
+                    epoch_before_publication
+                );
+                assert_eq!(worker.staged_install_depth_for_test(), pg_count);
+            }
+        }
+
+        if matches!(
+            failure,
+            ConcurrentReconciliationFailure::PublicationWaitExpiry
+                | ConcurrentReconciliationFailure::MixedPublicationLagAndPreparationRejection
+        ) {
+            let wait_deadline = Instant::now() + Duration::from_secs(5);
+            let mut blocked = 0;
+            while blocked < 2 || worker.staged_install_depth_for_test() < 2 {
+                {
+                    let mut authority = authority.lock().unwrap();
+                    worker
+                        .poll_single_authority(&mut authority, begin_at_ms + 1)
+                        .unwrap();
+                }
+                while stage_blocked_rx.try_recv().is_ok() {
+                    blocked += 1;
+                }
+                assert!(
+                    Instant::now() < wait_deadline,
+                    "the mixed-result fixture did not stage two ready and two blocked PGs"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            {
+                let mut authority = authority.lock().unwrap();
+                publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+            }
+            for _ in 0..pg_count - 2 {
+                stage_release_tx.send(()).unwrap();
+            }
+            let epoch_before_install = authority.lock().unwrap().snapshot().cluster_epoch();
+            let classified = |worker: &UnavailablePgReconciliationWorker| {
+                if failure == ConcurrentReconciliationFailure::PublicationWaitExpiry {
+                    worker.staged_install_depth_for_test() == pg_count
+                        && worker.install_evidence_wait_is_pending_for_test()
+                } else {
+                    worker.pg_is_deferred_for_test(pg_ids[0])
+                }
+            };
+            while !classified(&worker) {
+                {
+                    let mut authority = authority.lock().unwrap();
+                    worker
+                        .poll_single_authority(&mut authority, begin_at_ms + 1)
+                        .unwrap();
+                    assert_eq!(authority.snapshot().cluster_epoch(), epoch_before_install);
+                }
+                assert!(
+                    Instant::now() < wait_deadline,
+                    "mixed rejection did not reach pre-install classification: {:?}",
+                    worker.retained_test_state()
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            if failure == ConcurrentReconciliationFailure::PublicationWaitExpiry {
+                worker.expire_install_evidence_wait_for_test();
+                {
+                    let mut authority = authority.lock().unwrap();
+                    worker
+                        .poll_single_authority(&mut authority, begin_at_ms + 1)
+                        .unwrap();
+                    assert_eq!(
+                        authority.snapshot().cluster_epoch(),
+                        ClusterEpoch::new(epoch_before_install.get() + 1).unwrap(),
+                        "ready members must install after the evidence wait expires"
+                    );
+                    for pg_id in &pg_ids[..2] {
+                        assert!(authority
+                            .snapshot()
+                            .unavailable_pg_placement_transition(*pg_id)
+                            .unwrap()
+                            .destination_epoch()
+                            .is_some());
+                    }
+                    for pg_id in &pg_ids[2..] {
+                        assert!(authority
+                            .snapshot()
+                            .unavailable_pg_placement_transition(*pg_id)
+                            .unwrap()
+                            .destination_epoch()
+                            .is_none());
+                    }
+                }
+                for pg_id in &pg_ids[2..] {
+                    assert!(worker.pg_is_deferred_for_test(*pg_id));
+                    assert!(!worker.foreground_owns_pg_for_test(*pg_id));
+                }
+            } else {
+                assert_eq!(worker.staged_install_depth_for_test(), pg_count - 1);
+                assert!(worker.foreground_owns_pg_for_test(pg_ids[1]));
+            }
+            {
+                let mut authority = authority.lock().unwrap();
+                publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+            }
+        }
 
         if failure == ConcurrentReconciliationFailure::AuthorizationResponseLossAndFirstStageFailure
         {
@@ -4813,11 +5059,11 @@ mod tests {
             }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10 + u64::try_from(pg_count).unwrap());
         let mut imported = BTreeMap::new();
         let mut import_callback_count = 0_usize;
         let mut observed_definitive_authorization_rejection = false;
-        while imported.len() < 2 {
+        while imported.len() < pg_count {
             {
                 let mut authority = authority.lock().unwrap();
                 poll_composed_reconciliation_after_publishing_staging(
@@ -4830,7 +5076,7 @@ mod tests {
             while let Ok(value) = imported_rx.try_recv() {
                 import_callback_count += 1;
                 assert!(
-                    import_callback_count <= 8,
+                    import_callback_count <= pg_count * 4,
                     "staged imports retried beyond the bounded regression budget"
                 );
                 imported.insert(value.0, value.1);
@@ -4850,15 +5096,25 @@ mod tests {
         if matches!(
             failure,
             ConcurrentReconciliationFailure::None
+                | ConcurrentReconciliationFailure::PublicationLag
+                | ConcurrentReconciliationFailure::AuthorizationObservationLag
                 | ConcurrentReconciliationFailure::InstallResponseLoss
         ) {
-            assert_eq!(
-                imported[&pg_ids[0]], imported[&pg_ids[1]],
+            assert!(
+                imported
+                    .values()
+                    .all(|epoch| *epoch == imported[&pg_ids[0]]),
                 "plural destination installation must assign one shared epoch"
             );
         }
         if failure == ConcurrentReconciliationFailure::DefinitiveAuthorizationRejection {
             assert!(observed_definitive_authorization_rejection);
+        }
+        if failure == ConcurrentReconciliationFailure::MixedPublicationLagAndPreparationRejection {
+            let shared_epoch = imported[&pg_ids[1]];
+            assert!(pg_ids[2..]
+                .iter()
+                .all(|pg_id| imported[pg_id] == shared_epoch));
         }
         if failure == ConcurrentReconciliationFailure::InstallResponseLoss {
             assert!(
@@ -4870,15 +5126,18 @@ mod tests {
         let readiness_at_ms = begin_at_ms + 1_100;
         let imported_proofs = {
             let authority = authority.lock().unwrap();
-            pg_ids.map(|pg_id| {
-                authority
-                    .snapshot()
-                    .pg(pg_id)
-                    .unwrap()
-                    .peering_metadata_transfer()
-                    .unwrap()
-                    .metadata_proof()
-            })
+            pg_ids
+                .iter()
+                .map(|pg_id| {
+                    authority
+                        .snapshot()
+                        .pg(*pg_id)
+                        .unwrap()
+                        .peering_metadata_transfer()
+                        .unwrap()
+                        .metadata_proof()
+                })
+                .collect::<Vec<_>>()
         };
         {
             let mut authority = authority.lock().unwrap();
@@ -4889,8 +5148,9 @@ mod tests {
                     nodes[usize::try_from(node_id - 1).unwrap()].1.clone(),
                     10_000,
                     pg_ids
-                        .into_iter()
-                        .zip(imported_proofs)
+                        .iter()
+                        .copied()
+                        .zip(imported_proofs.iter().copied())
                         .map(|(pg_id, metadata_proof)| NodePgHeartbeatObservation {
                             pg_id,
                             state: PgState::Peering,
@@ -4905,7 +5165,7 @@ mod tests {
         {
             let authority = authority.lock().unwrap();
             let current_epoch = authority.snapshot().cluster_epoch();
-            for (pg_id, imported_proof) in pg_ids.into_iter().zip(imported_proofs) {
+            for (pg_id, imported_proof) in pg_ids.iter().copied().zip(&imported_proofs) {
                 for node_id in &destination_acting_set {
                     let node = authority.snapshot().node(*node_id).unwrap();
                     assert!(node.lease_deadline_ms().unwrap() > readiness_at_ms + 10);
@@ -4927,7 +5187,7 @@ mod tests {
                     });
                     assert_eq!(observation.observed_epoch(), current_epoch);
                     assert_eq!(observation.state(), PgState::Peering);
-                    assert_eq!(observation.metadata_proof(), imported_proof);
+                    assert_eq!(observation.metadata_proof(), *imported_proof);
                 }
             }
         }
@@ -4940,12 +5200,15 @@ mod tests {
                 if !matches!(
                     failure,
                     ConcurrentReconciliationFailure::None
+                        | ConcurrentReconciliationFailure::PublicationLag
+                        | ConcurrentReconciliationFailure::AuthorizationObservationLag
                         | ConcurrentReconciliationFailure::InstallResponseLoss
                 ) {
                     readiness_round += 1;
                     let observations = pg_ids
-                        .into_iter()
-                        .zip(imported_proofs)
+                        .iter()
+                        .copied()
+                        .zip(imported_proofs.iter().copied())
                         .map(|(pg_id, metadata_proof)| NodePgHeartbeatObservation {
                             pg_id,
                             state: authority.snapshot().pg(pg_id).unwrap().state(),
@@ -4990,6 +5253,8 @@ mod tests {
         if matches!(
             failure,
             ConcurrentReconciliationFailure::None
+                | ConcurrentReconciliationFailure::PublicationLag
+                | ConcurrentReconciliationFailure::AuthorizationObservationLag
                 | ConcurrentReconciliationFailure::InstallResponseLoss
         ) {
             assert_eq!(
@@ -5000,8 +5265,8 @@ mod tests {
         } else {
             assert!(authority_guard.snapshot().cluster_epoch() > epoch_before_activation);
         }
-        for pg_id in pg_ids {
-            let pg = authority_guard.snapshot().pg(pg_id).unwrap();
+        for pg_id in &pg_ids {
+            let pg = authority_guard.snapshot().pg(*pg_id).unwrap();
             assert_eq!(pg.state(), PgState::Active);
             assert_eq!(pg.acting_set(), destination_acting_set);
         }
@@ -5104,6 +5369,12 @@ mod tests {
         if failure == ConcurrentReconciliationFailure::FinalizationDeferred {
             assert!(observed_finalization_fairness);
         }
+        if failure == ConcurrentReconciliationFailure::AuthorizationObservationLag {
+            assert!(
+                stage_failure_rx.try_recv().is_ok(),
+                "the destination did not exercise authorization observation lag"
+            );
+        }
 
         stop.store(true, Ordering::Release);
         drop(UnixStream::connect(&socket_path).unwrap());
@@ -5114,6 +5385,47 @@ mod tests {
     fn concurrent_reconciliation_transfers_rebase_and_activate_as_one_batch() {
         concurrent_reconciliation_transfers_rebase_and_activate(
             ConcurrentReconciliationFailure::None,
+            2,
+        );
+    }
+
+    #[test]
+    fn reconciliation_accumulates_more_pgs_than_transfer_workers_into_one_install() {
+        concurrent_reconciliation_transfers_rebase_and_activate(
+            ConcurrentReconciliationFailure::None,
+            5,
+        );
+    }
+
+    #[test]
+    fn staging_authorization_lag_keeps_five_pgs_in_one_install() {
+        concurrent_reconciliation_transfers_rebase_and_activate(
+            ConcurrentReconciliationFailure::AuthorizationObservationLag,
+            5,
+        );
+    }
+
+    #[test]
+    fn staging_publication_lag_keeps_five_pgs_in_one_install() {
+        concurrent_reconciliation_transfers_rebase_and_activate(
+            ConcurrentReconciliationFailure::PublicationLag,
+            5,
+        );
+    }
+
+    #[test]
+    fn expired_staging_publication_wait_installs_ready_members_and_defers_missing_members() {
+        concurrent_reconciliation_transfers_rebase_and_activate(
+            ConcurrentReconciliationFailure::PublicationWaitExpiry,
+            5,
+        );
+    }
+
+    #[test]
+    fn mixed_install_rejection_does_not_split_publication_pending_batch() {
+        concurrent_reconciliation_transfers_rebase_and_activate(
+            ConcurrentReconciliationFailure::MixedPublicationLagAndPreparationRejection,
+            5,
         );
     }
 
@@ -5121,6 +5433,7 @@ mod tests {
     fn reconciliation_recovers_artifact_across_authorization_loss_and_first_stage_failure() {
         concurrent_reconciliation_transfers_rebase_and_activate(
             ConcurrentReconciliationFailure::AuthorizationResponseLossAndFirstStageFailure,
+            2,
         );
     }
 
@@ -5128,6 +5441,7 @@ mod tests {
     fn reconciliation_rederives_after_definitive_authorization_rejection() {
         concurrent_reconciliation_transfers_rebase_and_activate(
             ConcurrentReconciliationFailure::DefinitiveAuthorizationRejection,
+            2,
         );
     }
 
@@ -5135,6 +5449,7 @@ mod tests {
     fn reconciliation_recovers_committed_install_after_response_loss() {
         concurrent_reconciliation_transfers_rebase_and_activate(
             ConcurrentReconciliationFailure::InstallResponseLoss,
+            2,
         );
     }
 
@@ -5142,6 +5457,7 @@ mod tests {
     fn install_preparation_rejection_defers_one_pg_without_blocking_its_peer() {
         concurrent_reconciliation_transfers_rebase_and_activate(
             ConcurrentReconciliationFailure::InstallPreparationRejection,
+            2,
         );
     }
 
@@ -5149,6 +5465,7 @@ mod tests {
     fn retryable_finalization_defers_one_pg_without_blocking_its_peer() {
         concurrent_reconciliation_transfers_rebase_and_activate(
             ConcurrentReconciliationFailure::FinalizationDeferred,
+            2,
         );
     }
 

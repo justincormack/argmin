@@ -4293,6 +4293,35 @@ impl ClusterControlSnapshot {
         )
     }
 
+    pub(crate) fn unavailable_pg_install_awaits_publication(
+        &self,
+        request: &UnavailablePgTransitionInstallRequest,
+    ) -> bool {
+        let pg_id = request.unavailable_transition.pg_id();
+        let transition_epoch = request.unavailable_transition.transition_epoch();
+        let Some(transition) = self
+            .unavailable_pg_placement_transitions
+            .get(&pg_id)
+            .filter(|transition| transition.transition_epoch == transition_epoch)
+        else {
+            return false;
+        };
+        let Some(authorization) = transition.staging_authorization.as_ref() else {
+            return false;
+        };
+        request.publications.iter().any(|publication| {
+            let key = MetadataTransferStagingEvidenceKey {
+                pg_id,
+                staging_generation: authorization.staging_generation,
+                actor_node_id: publication.node_id,
+                actor_node_incarnation: publication.node_incarnation,
+                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
+                target_epoch: Some(request.expected_destination_epoch),
+            };
+            !self.metadata_transfer_staging_evidence.contains_key(&key)
+        })
+    }
+
     fn prepare_unavailable_pg_placement_install_batch_with_replication_limit(
         &self,
         transitions: &[UnavailablePgTransitionInstallRequest],

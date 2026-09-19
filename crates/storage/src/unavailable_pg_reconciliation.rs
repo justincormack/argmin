@@ -28,6 +28,9 @@ use crate::{ClusterEpoch, ControlPlaneRaftAuthorityHost, LivePgMetadataTransferA
 
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const TRANSFER_WORKER_COUNT: usize = 4;
+const STAGING_AUTHORIZATION_OBSERVATION_WAIT: Duration = Duration::from_secs(2);
+const STAGING_AUTHORIZATION_OBSERVATION_RETRY: Duration = Duration::from_millis(250);
+const STAGING_EVIDENCE_INSTALL_WAIT: Duration = Duration::from_secs(5);
 
 struct TransferCompletion {
     work: UnavailablePgReconciliationWork,
@@ -118,9 +121,23 @@ impl TransferExecutor {
                 .map(TransferOutcome::Authorized)
                 .map_err(reconciliation_transfer_failure),
             (Self::Staged(admin), TransferJob::Stage(authorized)) => {
-                let published = admin
-                    .stage_prepared_unavailable_pg_reconciliation(&authorized)
-                    .map_err(reconciliation_transfer_error)?;
+                let observation_deadline = Instant::now() + STAGING_AUTHORIZATION_OBSERVATION_WAIT;
+                let published = loop {
+                    match admin.stage_prepared_unavailable_pg_reconciliation(&authorized) {
+                        Ok(published) => break published,
+                        Err(error) if error.is_staging_authorization_not_observed() => {
+                            let remaining =
+                                observation_deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                return Err(reconciliation_transfer_error(error));
+                            }
+                            // The committed authorization is epoch-neutral, but the
+                            // destination may not have refreshed its runtime map yet.
+                            thread::sleep(remaining.min(STAGING_AUTHORIZATION_OBSERVATION_RETRY));
+                        }
+                        Err(error) => return Err(reconciliation_transfer_error(error)),
+                    }
+                };
                 authorized
                     .bind_publications(published)
                     .map(TransferOutcome::ReadyInstall)
@@ -394,6 +411,7 @@ pub struct UnavailablePgReconciliationWorker {
     pending_transfers: VecDeque<TransferJob>,
     prepared_for_authorization: Vec<PreparedUnavailablePgMetadataTransfer>,
     staged_for_install: Vec<StagedUnavailablePgMetadataTransfer>,
+    install_evidence_wait_started_at: Option<Instant>,
     ready_for_activation: Vec<ActivationOwner>,
     tombstoned_for_finalization: Vec<TombstonedUnavailablePgMetadataTransfer>,
     authority_retry_not_before: Instant,
@@ -515,6 +533,7 @@ impl UnavailablePgReconciliationWorker {
             pending_transfers: VecDeque::new(),
             prepared_for_authorization: Vec::new(),
             staged_for_install: Vec::new(),
+            install_evidence_wait_started_at: None,
             ready_for_activation: Vec::new(),
             tombstoned_for_finalization: Vec::new(),
             authority_retry_not_before: Instant::now(),
@@ -599,6 +618,26 @@ impl UnavailablePgReconciliationWorker {
             self.blocked.len(),
             self.last_diagnostic.as_deref(),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn staged_install_depth_for_test(&self) -> usize {
+        self.staged_for_install.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_install_evidence_wait_for_test(&mut self) {
+        assert!(
+            self.install_evidence_wait_started_at.is_some(),
+            "test must enter the evidence wait before expiring it"
+        );
+        self.install_evidence_wait_started_at =
+            Some(Instant::now() - STAGING_EVIDENCE_INSTALL_WAIT);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_evidence_wait_is_pending_for_test(&self) -> bool {
+        self.install_evidence_wait_started_at.is_some()
     }
 
     #[cfg(test)]
@@ -1052,12 +1091,14 @@ impl UnavailablePgReconciliationWorker {
     fn install_staged_batch(&mut self, authority: &mut impl ReconciliationAuthority) {
         let mut staged = std::mem::take(&mut self.staged_for_install);
         if staged.is_empty() {
+            self.install_evidence_wait_started_at = None;
             return;
         }
         staged.sort_by_key(|owner| owner.work().pg_id());
         let snapshot = match authority.reconciliation_snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                self.install_evidence_wait_started_at = None;
                 self.record_authority_batch_error(
                     staged.into_iter().map(|owner| owner.work().clone()),
                     error,
@@ -1069,6 +1110,7 @@ impl UnavailablePgReconciliationWorker {
         let target_epoch = match snapshot.next_cluster_epoch() {
             Ok(target_epoch) => target_epoch,
             Err(error) => {
+                self.install_evidence_wait_started_at = None;
                 self.record_authority_batch_error(
                     staged.into_iter().map(|owner| owner.work().clone()),
                     error,
@@ -1096,6 +1138,7 @@ impl UnavailablePgReconciliationWorker {
             }
         }
         if ready.is_empty() {
+            self.install_evidence_wait_started_at = None;
             return;
         }
         let requests = ready
@@ -1107,6 +1150,7 @@ impl UnavailablePgReconciliationWorker {
         {
             Ok(prepared) => prepared,
             Err(error) => {
+                self.install_evidence_wait_started_at = None;
                 self.record_authority_batch_error(
                     ready.into_iter().map(|owner| owner.work().clone()),
                     error,
@@ -1141,12 +1185,17 @@ impl UnavailablePgReconciliationWorker {
             .into_iter()
             .map(|owner| (owner.work().pg_id(), owner))
             .collect::<BTreeMap<_, _>>();
+        let mut awaiting_publication = Vec::new();
         for (request, error) in prepared.rejected {
             let pg_id = request.unavailable_transition.pg_id();
             let owner = owners
                 .remove(&pg_id)
                 .expect("install preparation rejected an unknown staged owner");
-            if reconciliation_completion_error_is_fatal(&error) {
+            if !reconciliation_completion_error_is_fatal(&error)
+                && snapshot.unavailable_pg_install_awaits_publication(&request)
+            {
+                awaiting_publication.push(owner);
+            } else if reconciliation_completion_error_is_fatal(&error) {
                 self.record_completion_error(owner.work(), error);
             } else {
                 self.record_diagnostic(error.to_string());
@@ -1167,6 +1216,20 @@ impl UnavailablePgReconciliationWorker {
             })
             .collect::<Vec<_>>();
         self.staged_for_install.extend(owners.into_values());
+        if !awaiting_publication.is_empty() {
+            let started_at = self
+                .install_evidence_wait_started_at
+                .get_or_insert_with(Instant::now);
+            if started_at.elapsed() < STAGING_EVIDENCE_INSTALL_WAIT {
+                self.staged_for_install.extend(included);
+                self.staged_for_install.extend(awaiting_publication);
+                return;
+            }
+            for owner in awaiting_publication {
+                self.defer(owner.work());
+            }
+        }
+        self.install_evidence_wait_started_at = None;
         if prepared.command.is_none() {
             return;
         }
@@ -1305,20 +1368,25 @@ impl UnavailablePgReconciliationWorker {
         if Instant::now() < self.authority_retry_not_before {
             return;
         }
-        if self.in_flight.is_empty() && !self.tombstoned_for_finalization.is_empty() {
+        // Drain the whole selected page before advancing an epoch-bound stage.
+        // Otherwise the four transfer workers turn one page into four-member
+        // install batches and every later member must rebase its proof again.
+        self.dispatch_pending_transfers();
+        if !self.in_flight.is_empty() || !self.pending_transfers.is_empty() {
+            return;
+        }
+        if !self.tombstoned_for_finalization.is_empty() {
             self.finalize_tombstoned(authority);
             return;
         }
-        if self.in_flight.is_empty() && !self.prepared_for_authorization.is_empty() {
+        if !self.prepared_for_authorization.is_empty() {
             self.authorize_prepared_batch(authority);
-        }
-        if self.in_flight.is_empty() && !self.staged_for_install.is_empty() {
-            self.install_staged_batch(authority);
-        }
-        if self.prepared_for_authorization.is_empty() && self.staged_for_install.is_empty() {
             self.dispatch_pending_transfers();
+            return;
         }
-        if !self.in_flight.is_empty() || !self.pending_transfers.is_empty() {
+        if !self.staged_for_install.is_empty() {
+            self.install_staged_batch(authority);
+            self.dispatch_pending_transfers();
             return;
         }
         if !self.ready_for_activation.is_empty() {
