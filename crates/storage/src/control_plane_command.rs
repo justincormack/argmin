@@ -24,7 +24,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 32;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 33;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -32,7 +32,7 @@ const CONTROL_PLANE_SNAPSHOT_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_COMMAND_BOOTSTRAP_NODE_MIN_LEN: usize = 8;
 const CONTROL_PLANE_COMMAND_ACTING_SET_NODE_MIN_LEN: usize = 4;
 const CONTROL_PLANE_COMMAND_PG_MIN_LEN: usize = 4;
-const CONTROL_PLANE_COMMAND_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 30;
+const CONTROL_PLANE_COMMAND_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 38;
 const CONTROL_PLANE_COMMAND_HISTORY_ROUTE_REFERENCE_MIN_LEN: usize = 13;
 const CONTROL_PLANE_COMMAND_READY_PG_MIN_LEN: usize = 48;
 const CONTROL_PLANE_COMMAND_EXPIRED_NODE_LEASE_MIN_LEN: usize = 12;
@@ -2946,6 +2946,7 @@ fn write_node_heartbeat(
         write_u32(out, observation.pg_id.get());
         write_pg_state(out, observation.state);
         write_pg_metadata_proof(out, observation.metadata_proof);
+        write_u64(out, observation.metadata_log_epoch.get());
         write_pending_metadata_command_observation(out, observation.pending_metadata_command);
     }
     Ok(())
@@ -2970,6 +2971,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
             pg_id: PgId::new(reader.read_u32()?),
             state: read_pg_state(reader)?,
             metadata_proof: read_pg_metadata_proof(reader)?,
+            metadata_log_epoch: read_cluster_epoch(reader, "PG metadata log epoch")?,
             pending_metadata_command: read_pending_metadata_command_observation(reader)?,
         });
     }
@@ -3985,6 +3987,7 @@ mod tests {
                         pg_id: PgId::new(3),
                         state: PgState::Peering,
                         metadata_proof: proof,
+                        metadata_log_epoch: ClusterEpoch::new(13).unwrap(),
                         pending_metadata_command: Some(PendingMetadataCommandObservation::new(
                             ClusterEpoch::new(13).unwrap(),
                             NonZeroU64::new(7).unwrap(),
@@ -4813,7 +4816,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_command_v32_aggregate_encoding_is_stable() {
+    fn control_plane_command_v33_aggregate_encoding_is_stable() {
         let mut aggregate = Vec::new();
         for command in sample_commands().into_iter().chain(degenerate_commands()) {
             let encoded = encode_control_plane_command(&command).unwrap();
@@ -4831,10 +4834,10 @@ mod tests {
         assert_eq!(
             (aggregate.len(), digest),
             (
-                4_144,
+                4_152,
                 [
-                    54, 15, 60, 191, 60, 2, 67, 95, 150, 147, 159, 153, 140, 123, 125, 195, 37,
-                    251, 116, 17, 53, 231, 66, 69, 57, 171, 172, 200, 162, 85, 183, 155,
+                    69, 36, 34, 50, 97, 63, 57, 107, 89, 127, 122, 127, 26, 219, 62, 143, 64, 161,
+                    134, 11, 118, 183, 222, 6, 103, 149, 252, 235, 6, 161, 75, 238,
                 ],
             )
         );
@@ -5117,7 +5120,7 @@ mod tests {
         );
 
         for version in [
-            15_u16, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33,
+            15_u16, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34,
         ] {
             let mut unsupported = Vec::from(CONTROL_PLANE_COMMAND_MAGIC.as_slice());
             unsupported.extend_from_slice(&version.to_be_bytes());
@@ -5359,7 +5362,7 @@ mod tests {
         assert_decode_error_contains(&bad_magic, "invalid control-plane command magic");
 
         for version in [
-            14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33,
+            14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34,
         ] {
             let encoded = encode_control_plane_command_with_version_for_test(
                 &ControlPlaneCommand::ExpireHeartbeatLeases {
@@ -5700,6 +5703,7 @@ mod tests {
             write_u32(body, 7);
             write_pg_state(body, PgState::Peering);
             write_pg_metadata_proof(body, PgMetadataProof::current(1, 2, 3));
+            write_u64(body, ClusterEpoch::INITIAL.get());
             write_u8(body, 2);
         });
         assert_decode_error_contains(
@@ -5901,7 +5905,8 @@ mod tests {
         const PREVIOUS_V41: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=41\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x53\xa5\xb9\xe7\x13\x6b\x0c\x47";
         const PREVIOUS_V42: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=42\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x16\xf8\xf8\x5f\x9d\x46\xcd\x8b";
         const PREVIOUS_V43: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=43\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xc6\x7b\x25\x06\xd0\xd0\xfc\x16";
-        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=44\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x9c\x42\x7b\x2e\x81\x1d\x4e\x13";
+        const PREVIOUS_V44: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=44\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x9c\x42\x7b\x2e\x81\x1d\x4e\x13";
+        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=45\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x4c\xc1\xa6\x77\xcc\x8b\x7f\x8e";
         let encoded = encode_control_plane_snapshot(&ClusterControlSnapshot::empty()).unwrap();
 
         assert_eq!(encoded, EXPECTED);
@@ -5918,6 +5923,11 @@ mod tests {
             decode_control_plane_snapshot(PREVIOUS_V43),
             Err(ControlPlaneError::Parse { message, .. })
                 if message == "unsupported control-plane state version 43"
+        ));
+        assert!(matches!(
+            decode_control_plane_snapshot(PREVIOUS_V44),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "unsupported control-plane state version 44"
         ));
         assert!(matches!(
             decode_control_plane_snapshot(PREVIOUS_V28),
@@ -6070,10 +6080,10 @@ mod tests {
     fn replicated_snapshot_install_rejects_noncurrent_state_versions_before_mutation() {
         let current_contents = format_snapshot(&sample_snapshot());
         for version in [
-            28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45,
+            28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46,
         ] {
             let unsupported_contents =
-                current_contents.replacen("version=44\n", &format!("version={version}\n"), 1);
+                current_contents.replacen("version=45\n", &format!("version={version}\n"), 1);
             let payload =
                 snapshot_frame_with_version(CONTROL_PLANE_SNAPSHOT_VERSION, &unsupported_contents);
             let mut installed = replay_sample_state_machine();

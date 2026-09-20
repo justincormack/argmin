@@ -598,6 +598,7 @@ fn record_node_heartbeat_command_records_current_epoch_pg_observation() {
         pg_id: PgId::new(7),
         state: PgState::Peering,
         metadata_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let before = authority.snapshot().clone();
@@ -650,6 +651,7 @@ fn record_node_heartbeat_command_stale_epoch_clears_pg_observations() {
         pg_id: PgId::new(8),
         state: PgState::Active,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let before = authority.snapshot().clone();

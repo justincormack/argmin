@@ -1752,6 +1752,7 @@ impl SharedStorageNode {
                 applied_log_hash: metadata_state.applied_log_hash,
                 state_digest: metadata_state.state_digest,
             },
+            metadata_log_epoch: metadata_state.cluster_epoch,
             pending_metadata_command,
         })
     }

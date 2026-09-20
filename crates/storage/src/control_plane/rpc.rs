@@ -8487,6 +8487,7 @@ fn write_node_heartbeat(
         write_u32(out, observation.pg_id.get());
         write_pg_state(out, observation.state);
         write_pg_metadata_proof(out, observation.metadata_proof);
+        write_u64(out, observation.metadata_log_epoch.get());
         write_pending_metadata_command_observation(out, observation.pending_metadata_command);
     }
     Ok(())
@@ -8513,6 +8514,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
             pg_id: PgId::new(reader.read_u32()?),
             state: read_pg_state(reader)?,
             metadata_proof: read_pg_metadata_proof(reader)?,
+            metadata_log_epoch: read_cluster_epoch(reader, "PG metadata log epoch")?,
             pending_metadata_command: read_pending_metadata_command_observation(reader)?,
         });
     }

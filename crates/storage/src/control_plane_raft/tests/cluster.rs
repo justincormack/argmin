@@ -128,6 +128,7 @@ fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox(
                                         pg_id,
                                         state,
                                         metadata_proof: PgMetadataProof::empty(),
+                                        metadata_log_epoch: ClusterEpoch::INITIAL,
                                         pending_metadata_command: None,
                                     }]
                                 })
@@ -1250,6 +1251,7 @@ fn control_plane_openraft_read_index_runtime_map_uses_applied_tip() {
                         pg_id: PgId::new(1),
                         state: PgState::Peering,
                         metadata_proof: PgMetadataProof::empty(),
+                        metadata_log_epoch: ClusterEpoch::INITIAL,
                         pending_metadata_command: None,
                     }],
                 },
@@ -1288,6 +1290,7 @@ fn control_plane_openraft_read_index_runtime_map_uses_applied_tip() {
                         pg_id: PgId::new(1),
                         state: PgState::Peering,
                         metadata_proof: PgMetadataProof::empty(),
+                        metadata_log_epoch: ClusterEpoch::INITIAL,
                         pending_metadata_command: None,
                     }],
                 },
@@ -3316,6 +3319,7 @@ fn control_plane_openraft_runtime_map_reads_route_followers_and_capture_rebased_
                             pg_id: PgId::new(0),
                             state: PgState::Peering,
                             metadata_proof: PgMetadataProof::empty(),
+                            metadata_log_epoch: ClusterEpoch::INITIAL,
                             pending_metadata_command: None,
                         }],
                     },
@@ -3372,6 +3376,7 @@ fn control_plane_openraft_runtime_map_reads_route_followers_and_capture_rebased_
                         pg_id: PgId::new(0),
                         state: PgState::Active,
                         metadata_proof: PgMetadataProof::empty(),
+                        metadata_log_epoch: ClusterEpoch::INITIAL,
                         pending_metadata_command: None,
                     }],
                 },
@@ -3402,6 +3407,7 @@ fn control_plane_openraft_runtime_map_reads_route_followers_and_capture_rebased_
                         pg_id: PgId::new(0),
                         state: PgState::Active,
                         metadata_proof: PgMetadataProof::empty(),
+                        metadata_log_epoch: ClusterEpoch::INITIAL,
                         pending_metadata_command: None,
                     }],
                 },
@@ -5497,6 +5503,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                                             pg_id,
                                             state,
                                             metadata_proof: PgMetadataProof::empty(),
+                                            metadata_log_epoch: ClusterEpoch::INITIAL,
                                             pending_metadata_command: None,
                                         }
                                     })
@@ -6304,6 +6311,7 @@ fn authenticated_staging_evidence_preflight_suppresses_invalid_pages_and_exact_r
                                         pg_id,
                                         state,
                                         metadata_proof: PgMetadataProof::empty(),
+                                        metadata_log_epoch: ClusterEpoch::INITIAL,
                                         pending_metadata_command: None,
                                     }]
                                 })

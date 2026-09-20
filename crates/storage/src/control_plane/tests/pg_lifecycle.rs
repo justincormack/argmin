@@ -713,6 +713,7 @@ fn pg_operation_authorization_validation_fences_stale_tokens() {
         pg_id: PgId::new(17),
         state: PgState::Active,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let refreshed = authority.heartbeat(shorter_lease, 3_061).unwrap();
@@ -795,6 +796,7 @@ fn heartbeat_records_current_epoch_pg_observations() {
         pg_id: PgId::new(15),
         state: PgState::Peering,
         metadata_proof: PgMetadataProof::current(9, 10, 11),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(heartbeat, 2_000).unwrap();
@@ -857,6 +859,7 @@ fn complete_pg_peering_requires_matching_metadata_proofs() {
             pg_id: PgId::new(19),
             state: PgState::Peering,
             metadata_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }];
         authority
@@ -885,6 +888,7 @@ fn complete_pg_peering_requires_matching_metadata_proofs() {
         pg_id: PgId::new(19),
         state: PgState::Peering,
         metadata_proof: matching_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(heartbeat, 2_060).unwrap();
@@ -1269,6 +1273,7 @@ fn complete_pg_peering_rejects_pending_metadata_command_observation() {
         pg_id: PgId::new(29),
         state: PgState::Peering,
         metadata_proof: proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: Some(test_pending_metadata_command(active_epoch)),
     }];
     authority.heartbeat(heartbeat, 2_030).unwrap();
@@ -1293,6 +1298,7 @@ fn complete_pg_peering_rejects_pending_metadata_command_observation() {
         pg_id: PgId::new(29),
         state: PgState::Peering,
         metadata_proof: proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(heartbeat, 2_060).unwrap();
@@ -1326,6 +1332,7 @@ fn active_heartbeat_accepts_metadata_progress_after_peering() {
         pg_id: PgId::new(19),
         state: PgState::Peering,
         metadata_proof: accepted_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -1348,6 +1355,7 @@ fn active_heartbeat_accepts_metadata_progress_after_peering() {
         pg_id: PgId::new(19),
         state: PgState::Active,
         metadata_proof: accepted_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(equal_active, 2_020).unwrap();
@@ -1371,6 +1379,7 @@ fn active_heartbeat_accepts_metadata_progress_after_peering() {
         pg_id: PgId::new(19),
         state: PgState::Active,
         metadata_proof: progressed_proof,
+        metadata_log_epoch: active_epoch,
         pending_metadata_command: None,
     }];
     let lease = authority.heartbeat(progressed_active, 2_030).unwrap();
@@ -1426,12 +1435,14 @@ fn complete_ready_pg_peerings_stamps_active_proofs_with_peering_epoch() {
             pg_id: PgId::new(21),
             state: PgState::Peering,
             metadata_proof: proof_21,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
         NodePgHeartbeatObservation {
             pg_id: PgId::new(22),
             state: PgState::Peering,
             metadata_proof: proof_22,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
     ];
@@ -1455,6 +1466,7 @@ fn complete_ready_pg_peerings_stamps_active_proofs_with_peering_epoch() {
         pg_id: PgId::new(21),
         state: PgState::Active,
         metadata_proof: progressed_proof,
+        metadata_log_epoch: active_epoch,
         pending_metadata_command: None,
     }];
     authority.heartbeat(active_heartbeat, 2_020).unwrap();
@@ -1483,6 +1495,7 @@ fn complete_ready_pg_peerings_command_rejects_unobserved_metadata_proof() {
         pg_id: PgId::new(23),
         state: PgState::Peering,
         metadata_proof: observed_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -1531,6 +1544,7 @@ fn complete_ready_pg_peerings_command_rejects_wrong_metadata_proof_epoch() {
         pg_id: PgId::new(24),
         state: PgState::Peering,
         metadata_proof: observed_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -1577,6 +1591,7 @@ fn complete_ready_pg_peerings_command_replays_with_committed_ready_time() {
         pg_id: PgId::new(25),
         state: PgState::Peering,
         metadata_proof: observed_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -1611,6 +1626,7 @@ fn complete_ready_pg_peerings_command_replays_with_committed_ready_time() {
         pg_id: PgId::new(25),
         state: PgState::Active,
         metadata_proof: progressed_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(active_heartbeat, 2_010).unwrap();
@@ -1649,6 +1665,7 @@ fn complete_ready_pg_peerings_command_rejects_stale_node_incarnation() {
         pg_id: PgId::new(51),
         state: PgState::Peering,
         metadata_proof: observed_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -1729,6 +1746,7 @@ fn complete_ready_pg_peerings_command_rejects_non_deterministic_primary() {
             pg_id: PgId::new(26),
             state: PgState::Peering,
             metadata_proof: observed_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -1859,6 +1877,7 @@ fn active_primary_pending_command_is_recoverable_without_epoch_bump() {
         pg_id: PgId::new(32),
         state: PgState::Active,
         metadata_proof: active_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: Some(pending),
     }];
     let before_invalid = authority.snapshot().clone();
@@ -1908,6 +1927,7 @@ fn active_primary_pending_command_is_recoverable_without_epoch_bump() {
         pg_id: PgId::new(32),
         state: PgState::Active,
         metadata_proof: active_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let clean = authority.refresh_node_heartbeat(clean, 2_021).unwrap();
@@ -1938,7 +1958,13 @@ fn active_primary_pending_retains_proof_floor_and_serving_lease() {
 
     let affected_pg = PgId::new(34);
     let unaffected_pg = PgId::new(35);
-    let affected_floor = PgMetadataProof::current(90, 0xabc, 0xdef);
+    let metadata_store = PgStore::open(&tmp.path().join("affected-pg"), affected_pg.get()).unwrap();
+    let bucket = bucket_name("pending-cleanup-proof");
+    let create = logged_create_bucket_command(affected_pg, 1, &bucket);
+    metadata_store
+        .apply_metadata_command_and_record(1, &create)
+        .unwrap();
+    let affected_floor = pg_metadata_proof_from_store(&metadata_store);
     let unaffected_proof = PgMetadataProof::current(12, 0x123, 0x456);
 
     authority
@@ -1972,12 +1998,14 @@ fn active_primary_pending_retains_proof_floor_and_serving_lease() {
             pg_id: affected_pg,
             state: PgState::Active,
             metadata_proof: affected_floor,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
         NodePgHeartbeatObservation {
             pg_id: unaffected_pg,
             state: PgState::Peering,
             metadata_proof: unaffected_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
     ];
@@ -1999,12 +2027,14 @@ fn active_primary_pending_retains_proof_floor_and_serving_lease() {
             pg_id: affected_pg,
             state: PgState::Active,
             metadata_proof: affected_floor,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
         NodePgHeartbeatObservation {
             pg_id: unaffected_pg,
             state: PgState::Active,
             metadata_proof: unaffected_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
     ];
@@ -2016,8 +2046,27 @@ fn active_primary_pending_retains_proof_floor_and_serving_lease() {
         .lease_deadline_ms()
         .unwrap();
 
-    let pending_proof = affected_floor;
-    let pending = test_pending_metadata_command(active_epoch);
+    let pending_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            active_epoch,
+            affected_pg,
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        create.payload().clone(),
+    );
+    metadata_store
+        .try_insert_pending_metadata_command_slot(1, &pending_command, Some(&bucket))
+        .unwrap();
+    let pending_proof = PgMetadataProof::current(
+        affected_floor.applied_log_index,
+        affected_floor.applied_log_hash.value().wrapping_add(1),
+        affected_floor.state_digest,
+    );
+    let pending = PendingMetadataCommandObservation::new(
+        active_epoch,
+        NonZeroU64::MIN,
+        pending_command.checksum_crc64(),
+    );
     let mut pending_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_030);
     pending_heartbeat.requested_lease_duration_ms = 1_000;
     pending_heartbeat.pg_observations = vec![
@@ -2025,12 +2074,14 @@ fn active_primary_pending_retains_proof_floor_and_serving_lease() {
             pg_id: affected_pg,
             state: PgState::Active,
             metadata_proof: pending_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: Some(pending),
         },
         NodePgHeartbeatObservation {
             pg_id: unaffected_pg,
             state: PgState::Active,
             metadata_proof: unaffected_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
     ];
@@ -2058,6 +2109,16 @@ fn active_primary_pending_retains_proof_floor_and_serving_lease() {
     assert_eq!(
         authority
             .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(affected_pg)
+            .unwrap()
+            .metadata_proof(),
+        pending_proof
+    );
+    assert_eq!(
+        authority
+            .snapshot()
             .pending_metadata_command_recoveries()
             .tasks(),
         &[PendingMetadataCommandRecoveryTask::new(
@@ -2073,12 +2134,14 @@ fn active_primary_pending_retains_proof_floor_and_serving_lease() {
             pg_id: affected_pg,
             state: PgState::Active,
             metadata_proof: pending_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: Some(pending),
         },
         NodePgHeartbeatObservation {
             pg_id: unaffected_pg,
             state: PgState::Active,
             metadata_proof: unaffected_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
     ];
@@ -2098,6 +2161,322 @@ fn active_primary_pending_retains_proof_floor_and_serving_lease() {
         .snapshot()
         .active_pg_route(unaffected_pg, previous_lease_deadline + 1)
         .is_ok());
+    assert_eq!(
+        FileControlPlaneStore::new(tmp.path().join("control-plane.state"))
+            .load()
+            .unwrap()
+            .unwrap(),
+        *authority.snapshot()
+    );
+
+    // An abandoned command in a later log epoch changes the log hash but
+    // need not change materialized metadata. Once cleanup removes its slot,
+    // the next clean heartbeat must renew the lease against the older floor.
+    authority
+        .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+        .unwrap();
+    let cleanup_epoch = authority.snapshot().cluster_epoch();
+    let mut divergent = heartbeat_from_record(&authority, 1, cleanup_epoch, 2_045);
+    divergent.pg_observations = vec![
+        NodePgHeartbeatObservation {
+            pg_id: affected_pg,
+            state: PgState::Active,
+            metadata_proof: pending_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
+            pending_metadata_command: None,
+        },
+        NodePgHeartbeatObservation {
+            pg_id: unaffected_pg,
+            state: PgState::Active,
+            metadata_proof: unaffected_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
+            pending_metadata_command: None,
+        },
+    ];
+    let before_divergence = authority.snapshot().clone();
+    assert!(matches!(
+        authority.refresh_node_heartbeat(divergent, 2_045),
+        Err(ControlPlaneError::PgActiveMetadataProofMismatch { pg_id: 34, .. })
+    ));
+    assert_eq!(*authority.snapshot(), before_divergence);
+    let changed_digest_conflict = PgMetadataProof::current(
+        affected_floor.applied_log_index,
+        affected_floor.applied_log_hash.value().wrapping_add(1),
+        affected_floor.state_digest.value().wrapping_add(1),
+    );
+    let mut changed_digest = heartbeat_from_record(&authority, 1, cleanup_epoch, 2_046);
+    changed_digest.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id: affected_pg,
+        state: PgState::Active,
+        metadata_proof: changed_digest_conflict,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
+        pending_metadata_command: None,
+    }];
+    assert!(matches!(
+        authority.refresh_node_heartbeat(changed_digest, 2_046),
+        Err(ControlPlaneError::PgActiveMetadataProofMismatch { pg_id: 34, .. })
+    ));
+    assert_eq!(*authority.snapshot(), before_divergence);
+    metadata_store
+        .record_metadata_command_abandoned(1, &pending_command)
+        .unwrap();
+    assert!(metadata_store
+        .remove_pending_metadata_command_slot(1, &pending_command)
+        .unwrap());
+    let terminal_proof = pg_metadata_proof_from_store(&metadata_store);
+    let terminal_log_epoch = metadata_store
+        .metadata_command_replica_state()
+        .unwrap()
+        .cluster_epoch;
+    assert_eq!(terminal_proof.state_digest, affected_floor.state_digest);
+    assert_ne!(
+        terminal_proof.applied_log_hash,
+        affected_floor.applied_log_hash
+    );
+    assert!(terminal_proof.applied_log_index <= affected_floor.applied_log_index);
+    assert!(
+        !metadata_proof_satisfies_active_primary_observation_floor_at_log_epoch(
+            affected_floor,
+            terminal_proof,
+            metadata_proof_progress_provenance(false, Some(active_epoch)),
+            cleanup_epoch,
+            Some(ClusterEpoch::INITIAL),
+            ClusterEpoch::INITIAL,
+        )
+    );
+    let mut clean = heartbeat_from_record(&authority, 1, cleanup_epoch, 2_050);
+    clean.requested_lease_duration_ms = 1_000;
+    clean.pg_observations = vec![
+        NodePgHeartbeatObservation {
+            pg_id: affected_pg,
+            state: PgState::Active,
+            metadata_proof: terminal_proof,
+            metadata_log_epoch: terminal_log_epoch,
+            pending_metadata_command: None,
+        },
+        NodePgHeartbeatObservation {
+            pg_id: unaffected_pg,
+            state: PgState::Active,
+            metadata_proof: unaffected_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
+            pending_metadata_command: None,
+        },
+    ];
+    let renewed = authority.refresh_node_heartbeat(clean, 2_050).unwrap();
+    assert!(renewed.lease().serving());
+    assert!(authority
+        .snapshot()
+        .active_pg_route(affected_pg, 2_050)
+        .is_ok());
+    assert!(authority
+        .snapshot()
+        .pending_metadata_command_recoveries()
+        .tasks()
+        .is_empty());
+    assert_eq!(
+        authority
+            .snapshot()
+            .pg(affected_pg)
+            .unwrap()
+            .active_metadata_proof(),
+        Some(terminal_proof),
+    );
+    let before_delayed = authority.snapshot().clone();
+    let delayed_higher_index = PgMetadataProof::current(
+        terminal_proof.applied_log_index + 1,
+        terminal_proof.applied_log_hash.value().wrapping_add(1),
+        terminal_proof.state_digest,
+    );
+    let mut delayed = heartbeat_from_record(&authority, 1, cleanup_epoch, 2_051);
+    delayed.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id: affected_pg,
+        state: PgState::Active,
+        metadata_proof: delayed_higher_index,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
+        pending_metadata_command: None,
+    }];
+    assert!(matches!(
+        authority.refresh_node_heartbeat(delayed, 2_051),
+        Err(ControlPlaneError::PgActiveMetadataProofMismatch { pg_id: 34, .. })
+    ));
+    assert_eq!(*authority.snapshot(), before_delayed);
+    assert_eq!(
+        FileControlPlaneStore::new(tmp.path().join("control-plane.state"))
+            .load()
+            .unwrap()
+            .unwrap(),
+        *authority.snapshot(),
+    );
+}
+
+#[test]
+fn imported_active_floor_accepts_hash_only_progress_only_after_pg_log_epoch_advances() {
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+    authority
+        .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+        .unwrap();
+    assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+    let pg_id = PgId::new(37);
+    let metadata_store = PgStore::open(&tmp.path().join("imported-pg"), pg_id.get()).unwrap();
+    let mut first_create = None;
+    for log_index in 1..=3 {
+        let bucket = bucket_name(&format!("imported-floor-{log_index}"));
+        let create = logged_create_bucket_command(pg_id, log_index, &bucket);
+        metadata_store
+            .apply_metadata_command_and_record(1, &create)
+            .unwrap();
+        if log_index == 1 {
+            first_create = Some((bucket, create));
+        }
+    }
+    let (bucket, create) = first_create.unwrap();
+    let imported_floor = pg_metadata_proof_from_store(&metadata_store);
+    authority
+        .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut authority,
+        1,
+        pg_id.get(),
+        PgState::Peering,
+        imported_floor,
+        false,
+        2_000,
+    );
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            2_001,
+        )
+        .unwrap();
+    authority
+        .snapshot
+        .pgs
+        .get_mut(&pg_id)
+        .unwrap()
+        .active_metadata_transfer_imported = true;
+    persist_manually_modified_test_snapshot(&mut authority);
+
+    authority
+        .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+        .unwrap();
+    let current_epoch = authority.snapshot().cluster_epoch();
+    let divergent_proof = PgMetadataProof::current(
+        1,
+        imported_floor.applied_log_hash.value().wrapping_add(1),
+        imported_floor.state_digest,
+    );
+    let mut unchanged_log_epoch = heartbeat_from_record(&authority, 1, current_epoch, 2_010);
+    unchanged_log_epoch.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id,
+        state: PgState::Active,
+        metadata_proof: divergent_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
+        pending_metadata_command: None,
+    }];
+    let before = authority.snapshot().clone();
+    assert!(matches!(
+        authority.refresh_node_heartbeat(unchanged_log_epoch, 2_010),
+        Err(ControlPlaneError::PgActiveMetadataProofMismatch { pg_id: 37, .. })
+    ));
+    assert_eq!(*authority.snapshot(), before);
+
+    let lower_index_conflict = PgMetadataProof::current(
+        1,
+        imported_floor.applied_log_hash.value().wrapping_add(2),
+        imported_floor.state_digest.value().wrapping_add(1),
+    );
+    let mut lower_index = heartbeat_from_record(&authority, 1, current_epoch, 2_010);
+    lower_index.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id,
+        state: PgState::Active,
+        metadata_proof: lower_index_conflict,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
+        pending_metadata_command: None,
+    }];
+    assert!(matches!(
+        authority.refresh_node_heartbeat(lower_index, 2_010),
+        Err(ControlPlaneError::PgActiveMetadataProofMismatch { pg_id: 37, .. })
+    ));
+    assert_eq!(*authority.snapshot(), before);
+
+    let same_index_conflict = PgMetadataProof::current(
+        imported_floor.applied_log_index,
+        imported_floor.applied_log_hash.value().wrapping_add(1),
+        imported_floor.state_digest.value().wrapping_add(1),
+    );
+    let mut conflicting = heartbeat_from_record(&authority, 1, current_epoch, 2_010);
+    conflicting.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id,
+        state: PgState::Active,
+        metadata_proof: same_index_conflict,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
+        pending_metadata_command: None,
+    }];
+    assert!(matches!(
+        authority.refresh_node_heartbeat(conflicting, 2_010),
+        Err(ControlPlaneError::PgActiveMetadataProofMismatch { pg_id: 37, .. })
+    ));
+    assert_eq!(*authority.snapshot(), before);
+
+    let abandoned = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            current_epoch,
+            pg_id,
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        create.payload().clone(),
+    );
+    metadata_store
+        .try_insert_pending_metadata_command_slot(1, &abandoned, Some(&bucket))
+        .unwrap();
+    metadata_store
+        .record_metadata_command_abandoned(1, &abandoned)
+        .unwrap();
+    assert!(metadata_store
+        .remove_pending_metadata_command_slot(1, &abandoned)
+        .unwrap());
+    let terminal_proof = pg_metadata_proof_from_store(&metadata_store);
+    let terminal_log_epoch = metadata_store
+        .metadata_command_replica_state()
+        .unwrap()
+        .cluster_epoch;
+    assert_eq!(terminal_proof.state_digest, imported_floor.state_digest);
+    assert!(terminal_proof.applied_log_index < imported_floor.applied_log_index);
+    assert_ne!(
+        terminal_proof.applied_log_hash,
+        imported_floor.applied_log_hash
+    );
+    assert!(terminal_log_epoch > ClusterEpoch::INITIAL);
+
+    let mut advanced_log_epoch = heartbeat_from_record(&authority, 1, current_epoch, 2_011);
+    advanced_log_epoch.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id,
+        state: PgState::Active,
+        metadata_proof: terminal_proof,
+        metadata_log_epoch: terminal_log_epoch,
+        pending_metadata_command: None,
+    }];
+    assert!(authority
+        .refresh_node_heartbeat(advanced_log_epoch, 2_011)
+        .unwrap()
+        .lease()
+        .serving());
+    let pg = authority.snapshot().pg(pg_id).unwrap();
+    assert_eq!(pg.active_metadata_proof(), Some(terminal_proof));
+    assert!(!pg.active_metadata_transfer_imported());
+    assert_eq!(
+        FileControlPlaneStore::new(tmp.path().join("control-plane.state"))
+            .load()
+            .unwrap()
+            .unwrap(),
+        *authority.snapshot(),
+    );
 }
 
 #[test]
@@ -2118,6 +2497,7 @@ fn peering_heartbeat_rejects_pending_command_without_historical_active_primary()
         pg_id: PgId::new(33),
         state: PgState::Peering,
         metadata_proof: heartbeat_model_proof(3),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: Some(test_pending_metadata_command(peering_epoch)),
     }];
     let before = authority.snapshot().clone();
@@ -2162,6 +2542,7 @@ fn stale_heartbeat_does_not_mutate_pg_observations() {
         pg_id: PgId::new(16),
         state: PgState::Active,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let response = authority.heartbeat(stale, 2_000).unwrap();
@@ -2238,6 +2619,7 @@ fn stale_historical_primary_heartbeat_reports_pending_after_acting_set_change() 
         pg_id,
         state: PgState::Peering,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: Some(pending),
     }];
     let retransmitted = stale.clone();
@@ -2291,6 +2673,14 @@ fn stale_historical_primary_heartbeat_reports_pending_after_acting_set_change() 
         )],
         "idempotent retransmission must retain historical recovery evidence"
     );
+    assert_eq!(
+        FileControlPlaneStore::new(tmp.path().join("control-plane.state"))
+            .load()
+            .unwrap()
+            .unwrap(),
+        *authority.snapshot(),
+        "historical-primary evidence must survive persisted-state parsing",
+    );
 }
 
 #[test]
@@ -2315,12 +2705,14 @@ fn heartbeat_rejects_invalid_pg_observations() {
             pg_id: PgId::new(17),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
         NodePgHeartbeatObservation {
             pg_id: PgId::new(17),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         },
     ];
@@ -2338,6 +2730,7 @@ fn heartbeat_rejects_invalid_pg_observations() {
         pg_id: PgId::new(99),
         state: PgState::Peering,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     assert!(matches!(
@@ -2351,6 +2744,7 @@ fn heartbeat_rejects_invalid_pg_observations() {
         pg_id: PgId::new(17),
         state: PgState::Peering,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     assert!(matches!(
@@ -2380,6 +2774,7 @@ fn epoch_change_drops_reconstructible_pg_observations_from_history() {
         pg_id: PgId::new(18),
         state: PgState::Peering,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(heartbeat, 2_000).unwrap();
@@ -2429,6 +2824,7 @@ fn restart_epoch_bump_drops_reconstructible_pg_observations_from_history() {
         pg_id: PgId::new(18),
         state: PgState::Peering,
         metadata_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(heartbeat, 2_000).unwrap();
@@ -2490,6 +2886,7 @@ fn authority_restart_moves_active_pg_back_to_peering_before_service() {
         pg_id: PgId::new(26),
         state: PgState::Peering,
         metadata_proof: active_metadata_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -2507,6 +2904,7 @@ fn authority_restart_moves_active_pg_back_to_peering_before_service() {
         pg_id: PgId::new(26),
         state: PgState::Active,
         metadata_proof: active_metadata_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let active = authority.heartbeat(active_heartbeat, 2_002).unwrap();
@@ -2552,6 +2950,7 @@ fn authority_restart_moves_active_pg_back_to_peering_before_service() {
         pg_id: PgId::new(26),
         state: PgState::Active,
         metadata_proof: active_metadata_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let refresh = restarted
@@ -2583,6 +2982,7 @@ fn authority_restart_moves_active_pg_back_to_peering_before_service() {
         pg_id: PgId::new(26),
         state: PgState::Peering,
         metadata_proof: active_metadata_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let refresh = restarted
@@ -2687,6 +3087,7 @@ fn future_observed_epoch_heartbeat_rejected_without_mutation() {
         pg_id: PgId::new(1),
         state: PgState::Active,
         metadata_proof: proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     assert!(authority
@@ -2708,6 +3109,7 @@ fn future_observed_epoch_heartbeat_rejected_without_mutation() {
         pg_id: PgId::new(1),
         state: PgState::Active,
         metadata_proof: proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
 
@@ -2780,6 +3182,7 @@ proptest! {
             pg_id: heartbeat_model_pg_id(),
             state: PgState::Active,
             metadata_proof: initial_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }];
         authority.heartbeat(active_primary_heartbeat, 2_003).unwrap();
@@ -2970,6 +3373,7 @@ proptest! {
             pg_id: heartbeat_model_pg_id(),
             state: PgState::Active,
             metadata_proof: initial_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }];
         authority.heartbeat(active_primary_heartbeat, 2_003).unwrap();

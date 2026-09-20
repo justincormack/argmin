@@ -777,7 +777,7 @@ mod tests {
             current_aggregate.extend_from_slice(current_frame);
         }
         const CURRENT_AGGREGATE: &[u8] = include_bytes!(
-            "../control_plane/testdata/storage_rpc_v27_command_v32_staging.aggregate"
+            "../control_plane/testdata/storage_rpc_v27_command_v33_staging.aggregate"
         );
         assert_eq!(
             (
@@ -787,29 +787,33 @@ mod tests {
             ),
             (
                 2_295,
-                "0f2a0f262335f78cfb63ba8c7621b29b271550fed32995428121e7ffd28dc5b2"
+                "6a0cc823b035dfbc4cc4acc6fe0a16516faf6c25ad6dc3d27462a18c11ebe8dd"
                     .to_owned(),
                 CURRENT_AGGREGATE,
             )
         );
-        const HISTORICAL_COMMAND_V31_AGGREGATE: &[u8] = include_bytes!(
-            "../control_plane/testdata/storage_rpc_v27_command_v31_staging.aggregate"
-        );
-        assert_eq!(
+        for (historical_aggregate, expected_digest) in [
             (
-                HISTORICAL_COMMAND_V31_AGGREGATE.len(),
-                hex_bytes(&checksum::sha256::digest(
-                    HISTORICAL_COMMAND_V31_AGGREGATE
-                ))
+                include_bytes!(
+                    "../control_plane/testdata/storage_rpc_v27_command_v32_staging.aggregate"
+                )
+                .as_slice(),
+                "0f2a0f262335f78cfb63ba8c7621b29b271550fed32995428121e7ffd28dc5b2",
             ),
             (
-                2_255,
-                "9ca433857dc2bb49bbbefae52b878c24c8e36f92db4f8a3d464ac9cf5bffd723"
-                    .to_owned()
-            )
-        );
-        let mut historical_remaining = HISTORICAL_COMMAND_V31_AGGREGATE;
-        while !historical_remaining.is_empty() {
+                include_bytes!(
+                    "../control_plane/testdata/storage_rpc_v27_command_v31_staging.aggregate"
+                )
+                .as_slice(),
+                "9ca433857dc2bb49bbbefae52b878c24c8e36f92db4f8a3d464ac9cf5bffd723",
+            ),
+        ] {
+            assert_eq!(
+                hex_bytes(&checksum::sha256::digest(historical_aggregate)),
+                expected_digest,
+            );
+            let mut historical_remaining = historical_aggregate;
+            while !historical_remaining.is_empty() {
             let frame_len = usize::try_from(u32::from_be_bytes(
                 historical_remaining[..4].try_into().unwrap(),
             ))
@@ -833,10 +837,11 @@ mod tests {
                         .unwrap_err(),
                 kind => panic!("unexpected historical staging operation {kind:?}"),
             };
-            assert_eq!(
-                error.to_string(),
-                "invalid metadata-transfer staging request: committed authorization is invalid"
-            );
+                assert_eq!(
+                    error.to_string(),
+                    "invalid metadata-transfer staging request: committed authorization is invalid"
+                );
+            }
         }
         let historical_create = decode_storage_rpc_frame(&decode_hex(
             HISTORICAL_V27_COMMAND_V30_STAGING_INTENT_CREATE_FRAME_HEX,

@@ -1768,6 +1768,7 @@ fn heartbeat_authority_with_pending<S: crate::control_plane::ControlPlaneStore>(
                         state.applied_log_hash,
                         state.state_digest,
                     ),
+                    metadata_log_epoch: state.cluster_epoch,
                     pending_metadata_command,
                 }],
             },
@@ -9688,6 +9689,7 @@ fn heartbeat_authority_with_local_pg_proof<S: crate::control_plane::ControlPlane
                 state.applied_log_hash,
                 state.state_digest,
             ),
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }],
     };

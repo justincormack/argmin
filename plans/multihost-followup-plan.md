@@ -1603,8 +1603,8 @@ replaces the detail with exact page-membership bindings. Immutable command-v31,
 RPC-v22, and state-v43 aggregates remain rejection evidence, including nested
 journal, Raft WAL, peer, restart, snapshot, and storage-RPC containers. The
 current coordinated version vector is staging-store/evidence/page/apply-receipt
-v4, staged-artifact v3, storage RPC v27, control-plane RPC v24, command v32,
-state v44, and authentication envelope v2.
+v4, staged-artifact v3, storage RPC v27, control-plane RPC v25, command v33,
+state v45, and authentication envelope v2.
 
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Staging-store format v4 owns the

@@ -2172,6 +2172,7 @@ mod tests {
                                         state,
                                         metadata_proof:
                                             crate::control_plane::PgMetadataProof::empty(),
+                                        metadata_log_epoch: ClusterEpoch::INITIAL,
                                         pending_metadata_command: None,
                                     }
                                 })

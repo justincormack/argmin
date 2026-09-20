@@ -236,6 +236,7 @@ fn heartbeat_with_pg_proofs_and_lease_duration(
             pg_id,
             state,
             metadata_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         })
         .collect();
@@ -7718,6 +7719,7 @@ fn unavailable_pg_transition_is_exact_durable_and_uses_the_committed_spare() {
         pg_id,
         state: previous_observation.state(),
         metadata_proof: previous_observation.metadata_proof(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: previous_observation.pending_metadata_command(),
     }];
     let renewal = ControlPlaneCommand::RecordNodeHeartbeat {
@@ -9890,6 +9892,7 @@ fn storage_node_refresh_after_epoch_transition_cannot_keep_stale_active_route() 
         pg_id: PgId::new(19),
         state: PgState::Active,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let refresh = authority
@@ -10427,6 +10430,7 @@ fn acting_set_change_fences_old_primary_token_until_new_peering_completes() {
         pg_id: PgId::new(20),
         state: PgState::Peering,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(stale_node_two_peering, 2_013).unwrap();
@@ -10448,6 +10452,7 @@ fn acting_set_change_fences_old_primary_token_until_new_peering_completes() {
         pg_id: PgId::new(20),
         state: PgState::Peering,
         metadata_proof: active_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(ready_but_fenced, 2_015).unwrap();
@@ -10461,6 +10466,7 @@ fn acting_set_change_fences_old_primary_token_until_new_peering_completes() {
         pg_id: PgId::new(20),
         state: PgState::Peering,
         metadata_proof: active_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(fence_bridge, 2_103).unwrap();
@@ -10469,6 +10475,7 @@ fn acting_set_change_fences_old_primary_token_until_new_peering_completes() {
         pg_id: PgId::new(20),
         state: PgState::Peering,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(stale_node_two_peering, 3_103).unwrap();
@@ -10493,6 +10500,7 @@ fn acting_set_change_fences_old_primary_token_until_new_peering_completes() {
         pg_id: PgId::new(20),
         state: PgState::Peering,
         metadata_proof: active_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(node_two_peering, 3_104).unwrap();
@@ -10510,6 +10518,7 @@ fn acting_set_change_fences_old_primary_token_until_new_peering_completes() {
         pg_id: PgId::new(20),
         state: PgState::Active,
         metadata_proof: active_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let new_active = authority.heartbeat(new_active_heartbeat, 3_105).unwrap();
@@ -10764,13 +10773,13 @@ fn active_metadata_overlap_migration_does_not_relax_non_primary_imported_proof()
     assert_eq!(pg.state(), PgState::Active);
     assert_eq!(pg.acting_set(), &[NodeId::new(1), NodeId::new(2)]);
 
-    heartbeat_with_pg_proof(
+    let pg_log_epoch = authority.snapshot().cluster_epoch();
+    heartbeat_with_pg_proof_at_log_epoch(
         &mut authority,
         1,
         45,
-        PgState::Active,
         epoch_local_progress,
-        false,
+        pg_log_epoch,
         2_022,
     );
     {
@@ -10830,13 +10839,13 @@ fn active_metadata_overlap_migration_does_not_relax_non_primary_imported_proof()
     authority
         .set_pg_acting_set(PgId::new(48), vec![NodeId::new(1)])
         .unwrap();
-    heartbeat_with_pg_proof(
+    let pg_log_epoch = authority.snapshot().cluster_epoch();
+    heartbeat_with_pg_proof_at_log_epoch(
         &mut authority,
         1,
         46,
-        PgState::Active,
         primary_destination_progress,
-        false,
+        pg_log_epoch,
         3_021,
     );
     {
@@ -10910,6 +10919,7 @@ fn imported_active_primary_restart_preserves_epoch_local_peering_floor() {
         pg_id: PgId::new(49),
         state: PgState::Peering,
         metadata_proof: epoch_local_proof,
+        metadata_log_epoch: active_epoch,
         pending_metadata_command: None,
     }];
     authority.heartbeat(restarting_primary, 2_002).unwrap();
@@ -10923,6 +10933,7 @@ fn imported_active_primary_restart_preserves_epoch_local_peering_floor() {
         pg_id: PgId::new(49),
         state: PgState::Peering,
         metadata_proof: epoch_local_proof,
+        metadata_log_epoch: active_epoch,
         pending_metadata_command: None,
     }];
     authority.heartbeat(current_peering, 2_003).unwrap();
@@ -11034,6 +11045,7 @@ fn imported_active_restart_without_initial_observation_accepts_later_epoch_local
         pg_id: PgId::new(50),
         state: PgState::Peering,
         metadata_proof: epoch_local_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(current_peering, 2_003).unwrap();
@@ -11946,6 +11958,7 @@ fn fencing_pending_recovery_peering_preserves_imported_source_provenance() {
         pg_id,
         state: PgState::Active,
         metadata_proof: local_progress,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: Some(pending),
     }];
     authority.heartbeat(pending_heartbeat, 3_220).unwrap();
@@ -11963,6 +11976,7 @@ fn fencing_pending_recovery_peering_preserves_imported_source_provenance() {
         pg_id,
         state: PgState::Peering,
         metadata_proof: local_progress,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(cleared_heartbeat, 3_221).unwrap();

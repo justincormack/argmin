@@ -356,7 +356,7 @@ fn control_plane_rpc_v23_frame_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v24_frame_encoding_is_exact() {
+fn control_plane_rpc_v25_frame_encoding_is_exact() {
     let frame =
         encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
             .unwrap();
@@ -365,8 +365,8 @@ fn control_plane_rpc_v24_frame_encoding_is_exact() {
         frame,
         [
             97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
-            110, 101, 45, 114, 112, 99, 0, 24, 0, 12, 0, 0, 0, 3, 82, 243, 91, 242, 218, 207, 55,
-            131, 1, 2, 3,
+            110, 101, 45, 114, 112, 99, 0, 25, 0, 12, 0, 0, 0, 3, 0, 128, 21, 81, 61, 233, 203,
+            215, 1, 2, 3,
         ]
     );
 }
@@ -1561,6 +1561,7 @@ fn volatile_lease_promotion_makes_acting_set_fence_durable() {
                 observed_epoch: durable.cluster_epoch,
                 observed_at_ms: 100,
                 metadata_proof: proof,
+                metadata_log_epoch: ClusterEpoch::INITIAL,
                 pending_metadata_command: None,
             },
         );
@@ -1571,6 +1572,7 @@ fn volatile_lease_promotion_makes_acting_set_fence_durable() {
             active_primary: Some(NodeId::new(1)),
             active_metadata_proof: Some(proof),
             active_metadata_proof_epoch: Some(durable.cluster_epoch),
+            active_metadata_log_epoch: Some(ClusterEpoch::INITIAL),
             ..PgControlRecord::new(pg_id, vec![NodeId::new(1)])
         },
     );
@@ -1704,7 +1706,7 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         Err(ControlPlaneStateVersionError::Missing)
     );
     for version in [
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45,
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46,
     ] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
@@ -1712,8 +1714,8 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(44)),
-        Ok(44)
+        require_current_control_plane_state_version(Some(45)),
+        Ok(45)
     );
 
     assert!(matches!(
@@ -2084,11 +2086,11 @@ fn canonical_control_plane_state_v43_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v44_text_is_exact() {
+fn canonical_control_plane_state_v45_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=44\n",
+            "version=45\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -2254,7 +2256,7 @@ fn canonical_control_plane_state_v36_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v44_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v45_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -2699,6 +2701,7 @@ fn canonical_control_plane_state_v44_representative_aggregate_is_stable() {
         pg_id,
         state: PgState::Peering,
         metadata_proof: proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: Some(test_pending_metadata_command(active_epoch)),
     }];
     authority.heartbeat(pending_heartbeat, 4_030).unwrap();
@@ -2748,6 +2751,7 @@ fn canonical_control_plane_state_v44_representative_aggregate_is_stable() {
         pg_id: active_pending_pg_id,
         state: PgState::Active,
         metadata_proof: active_pending_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: Some(test_pending_metadata_command(active_pending_epoch)),
     }];
     active_pending_authority
@@ -2973,7 +2977,7 @@ fn canonical_control_plane_state_v44_representative_aggregate_is_stable() {
         aggregate_text.push_str(&formatted);
     }
     for required_record in [
-        "version=44\n",
+        "version=45\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -3057,8 +3061,8 @@ fn canonical_control_plane_state_v44_representative_aggregate_is_stable() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            136_450,
-            "751ad15d70cde06ea90038535f6d15ca0b05e5bca01ce79f1083b9bd097cae60".to_owned()
+            136_514,
+            "bd8728e6221f0b3b8d2f285719bae8d83b7a9dc255a7a08254ae1b7a52a9c9e0".to_owned()
         )
     );
 }
@@ -3626,6 +3630,7 @@ fn heartbeat_with_pg_observation<S: ControlPlaneStore>(
         pg_id: PgId::new(pg_id),
         state,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(heartbeat, now_ms).unwrap()
@@ -3675,11 +3680,40 @@ fn heartbeat_with_pg_proof_and_lease_duration<S: ControlPlaneStore>(
         pg_id: PgId::new(pg_id),
         state,
         metadata_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: has_pending_metadata_command.then_some(
             test_pending_metadata_command(authority.snapshot().cluster_epoch()),
         ),
     }];
     heartbeat.requested_lease_duration_ms = requested_lease_duration_ms;
+    authority.heartbeat(heartbeat, now_ms).unwrap()
+}
+
+fn heartbeat_with_pg_proof_at_log_epoch<S: ControlPlaneStore>(
+    authority: &mut SingleAuthorityControlPlane<S>,
+    node_id: u32,
+    pg_id: u32,
+    metadata_proof: PgMetadataProof,
+    metadata_log_epoch: ClusterEpoch,
+    now_ms: u64,
+) -> HeartbeatLease {
+    let now_ms = authority
+        .snapshot()
+        .max_committed_timestamp_ms()
+        .map_or(now_ms, |timestamp_ms| timestamp_ms.max(now_ms));
+    let mut heartbeat = heartbeat_from_record(
+        authority,
+        node_id,
+        authority.snapshot().cluster_epoch(),
+        now_ms,
+    );
+    heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id: PgId::new(pg_id),
+        state: PgState::Active,
+        metadata_proof,
+        metadata_log_epoch,
+        pending_metadata_command: None,
+    }];
     authority.heartbeat(heartbeat, now_ms).unwrap()
 }
 
@@ -4241,6 +4275,7 @@ fn pending_recovery_listing_preserves_valid_task_after_other_pg_validation_failu
                 observed_epoch: current_epoch,
                 observed_at_ms: 10,
                 metadata_proof: PgMetadataProof::empty(),
+                metadata_log_epoch: ClusterEpoch::INITIAL,
                 pending_metadata_command: Some(valid_pending),
             },
         );
@@ -4257,6 +4292,7 @@ fn pending_recovery_listing_preserves_valid_task_after_other_pg_validation_failu
                 observed_epoch: current_epoch,
                 observed_at_ms: 10,
                 metadata_proof: PgMetadataProof::empty(),
+                metadata_log_epoch: ClusterEpoch::INITIAL,
                 pending_metadata_command: Some(invalid_pending),
             },
         );
@@ -4306,6 +4342,7 @@ fn heartbeat_model_observation(
                 pg_id,
                 state: PgState::Peering,
                 metadata_proof: heartbeat_model_proof(observation_kind),
+                metadata_log_epoch: ClusterEpoch::INITIAL,
                 pending_metadata_command: None,
             }],
         };
@@ -4316,12 +4353,14 @@ fn heartbeat_model_observation(
             pg_id,
             state: PgState::Peering,
             metadata_proof: heartbeat_model_proof(1),
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }],
         2 => vec![NodePgHeartbeatObservation {
             pg_id,
             state: PgState::Peering,
             metadata_proof: heartbeat_model_proof(2),
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: Some(test_pending_metadata_command(snapshot.cluster_epoch())),
         }],
         3 => vec![NodePgHeartbeatObservation {
@@ -4330,12 +4369,14 @@ fn heartbeat_model_observation(
             metadata_proof: pg
                 .active_metadata_proof()
                 .unwrap_or_else(|| heartbeat_model_proof(3)),
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }],
         4 => vec![NodePgHeartbeatObservation {
             pg_id,
             state: PgState::Active,
             metadata_proof: heartbeat_model_proof(observation_kind),
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }],
         _ => vec![NodePgHeartbeatObservation {
@@ -4344,6 +4385,7 @@ fn heartbeat_model_observation(
             metadata_proof: pg
                 .active_metadata_proof()
                 .unwrap_or_else(|| heartbeat_model_proof(5)),
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: Some(test_pending_metadata_command(snapshot.cluster_epoch())),
         }],
     }
@@ -4682,6 +4724,7 @@ impl CrossPgActingSetClientAuthority {
             pg_id: Self::TARGET_PG_ID,
             state,
             metadata_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: (pending && node_id == NodeId::new(1))
                 .then_some(test_pending_metadata_command(self.active_epoch)),
         }];
@@ -5075,6 +5118,7 @@ impl PendingCommandLifecycleCase {
                         .pg(heartbeat_model_pg_id())
                         .and_then(PgControlRecord::active_metadata_proof)
                         .unwrap_or(self.proof),
+                    metadata_log_epoch: ClusterEpoch::INITIAL,
                     pending_metadata_command: (self.model.slot == PendingCommandSlotState::Pending)
                         .then_some(self.pending),
                 }];
@@ -6283,6 +6327,7 @@ fn endpoint_change_fences_active_pg_until_repeering_completes() {
         pg_id: PgId::new(39),
         state: PgState::Active,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let changed = authority.heartbeat(moved, 204).unwrap();
@@ -6720,6 +6765,7 @@ fn control_plane_command_replay_matches_single_authority_snapshot() {
                     pg_id: PgId::new(7),
                     state: PgState::Peering,
                     metadata_proof: PgMetadataProof::empty(),
+                    metadata_log_epoch: ClusterEpoch::INITIAL,
                     pending_metadata_command: None,
                 }],
             },

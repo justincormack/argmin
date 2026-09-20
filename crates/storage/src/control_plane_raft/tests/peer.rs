@@ -63,7 +63,7 @@ fn control_plane_raft_peer_rpc_rejects_noncurrent_nested_command_versions() {
 
     let mut unsupported_frames = Vec::new();
     for version in [
-        14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33,
+        14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 34,
     ] {
         let unsupported_command =
             crate::control_plane_command::encode_control_plane_command_with_version_for_test(
@@ -871,7 +871,7 @@ fn control_plane_raft_peer_server_rejects_noncurrent_nested_snapshot_versions_be
 fn control_plane_raft_peer_server_rejects_noncurrent_nested_state_versions_before_publication() {
     let current = current_peer_snapshot_payload();
     for version in [
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45,
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46,
     ] {
         let unsupported =
             crate::control_plane_command::reseal_control_plane_snapshot_state_version_for_test(
@@ -1722,7 +1722,7 @@ fn control_plane_raft_peer_rpc_v3_catalogue_is_exact() {
         ),
         (
             2_402,
-            "a723298407de46498d43495a914190ca485f963175d234869763bce7dedc241b".to_owned()
+            "c688c197d20b8ec370c93947fd1ad06fc8d79472f4ffa771b76c62d2a141ec89".to_owned()
         )
     );
 }

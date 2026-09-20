@@ -300,6 +300,7 @@ fn control_plane_rpc_catalogue_heartbeat() -> NodeHeartbeat {
                     u64::try_from(index).unwrap() + 20,
                     u64::try_from(index).unwrap() + 30,
                 ),
+                metadata_log_epoch: ClusterEpoch::INITIAL,
                 pending_metadata_command: (index % 2 == 0).then(|| {
                     PendingMetadataCommandObservation::new(
                         ClusterEpoch::new(u64::try_from(index).unwrap() + 11).unwrap(),
@@ -436,7 +437,7 @@ fn control_plane_rpc_v21_staging_evidence_frames_remain_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v24_staging_evidence_frames_are_exact() {
+fn control_plane_rpc_v25_staging_evidence_frames_are_exact() {
     let genesis = control_plane_rpc_catalogue_staging_page();
     let genesis_receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&genesis);
     let successor = metadata_transfer_staging_evidence_page_for_test(
@@ -477,21 +478,21 @@ fn control_plane_rpc_v24_staging_evidence_frames_are_exact() {
         [
             (
                 469,
-                "36ad969e73c93a50b2a9ca2006b556dcb2ccfdcbc13c36bccfb0ab07f19e2bb1".to_owned(),
+                "dd618b05e61a089dea48e062d85923f89371b7fe9c93344c91c32f6c53062a47".to_owned(),
                 214,
-                "d777906246e22aa6f92e7509b2dd090df0012d8fe9c38a78455530a7995c1b30".to_owned(),
+                "71b28439c66c34d437eb2e26164081924305a9de58f3c9dd3868fb3e049a41e0".to_owned(),
             ),
             (
                 409,
-                "71f0a608aa3dab0eb6a1c9af7f6a3b1054b34adb840be414c6a286ce7745ce59".to_owned(),
+                "82f31c85cdd084b8d71f6cdf60c70751eb03db74a43ece4027fc424732dc3254".to_owned(),
                 214,
-                "696b4f981389f69ed03f0f31fd54bc48796757f116d06cfb0cd04fd66426e7bd".to_owned(),
+                "4fa694ef0d5abd054d9bc7b2e793a6dc5b2670333da130d274f00bfdac5845f7".to_owned(),
             ),
             (
                 734,
-                "2fa12ec46524420b18555f1560513fbe458a11065d4ef38ac73d8d4682ee1f3c".to_owned(),
+                "41985efbb10395aaaf17e782b11c4c5ca41104fc15d24ec0e7c5b0dc5981a785".to_owned(),
                 214,
-                "f22126c82a53b0617d20a28bfcc8addcf9f4b0d267709cc155132387e4b8b0ba".to_owned(),
+                "f922e11fb9aa45fb2d5f513f64a5743e34f338beba9663ebfb9618b3e00c1be7".to_owned(),
             ),
         ]
     );
@@ -1810,7 +1811,7 @@ fn control_plane_rpc_v21_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v24_operation_catalogue_is_exact() {
+fn control_plane_rpc_v25_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -2023,8 +2024,8 @@ fn control_plane_rpc_v24_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            16_649,
-            "fac73edace527731178665aa8104f12e30513033845b74239f91b040e000563a".to_owned()
+            16_689,
+            "c54060df276b4018c79d7da65005fc2b3f4ce08b93d859ec88b88369ef809816".to_owned()
         )
     );
 }
@@ -2295,8 +2296,8 @@ fn authenticated_control_plane_rpc_v23_auth_v2_payload_binding_remains_rejected_
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v24_auth_v2_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 24);
+fn authenticated_control_plane_rpc_v25_auth_v2_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 25);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -2373,15 +2374,15 @@ fn authenticated_control_plane_rpc_v24_auth_v2_payload_bindings_are_exact() {
         ),
         (
             182,
-            "3ef29ce0a8f47bd11e224473d08c742adb279df03bd93c1b2534dcaa9d041c91".to_owned(),
+            "e5e3784da42baa34200dd8216ee8121300ad772e7cc5ae65a1f33ccd649c410c".to_owned(),
             190,
-            "3d06ef68ccde74b6e547a77636e8a2d067ca3c8161786d6b587dc03ae186e052".to_owned(),
+            "a47102ffe567167ef965f14144c80485ec10bce6f0b32f06e29836a0d632d23a".to_owned(),
         )
     );
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v24_closure_page_frames_are_exact() {
+fn authenticated_control_plane_rpc_v25_closure_page_frames_are_exact() {
     let kind = ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage;
     let page = control_plane_rpc_catalogue_staging_closure_page();
     assert!(page.actor_closure_candidate().is_some());
@@ -2428,9 +2429,9 @@ fn authenticated_control_plane_rpc_v24_closure_page_frames_are_exact() {
         ),
         (
             867,
-            "a8b670f5a66c0cc56dc65d8685eb99de795f934e6ad3c3ef3200cc31a60e0c3b".to_owned(),
+            "0b9b0e631b19dadea6740665b82eea7d382aaca259d1fcef972d3dc1f5c7b519".to_owned(),
             348,
-            "7e1aeb63c3b96b56e143701b284ec687b80e1e3353e6929bbfc7c17f8c5f9d80".to_owned(),
+            "e43723132ed4c4c400951e86ac91112d7bc1b77549c41481e04d6f50256be863".to_owned(),
         )
     );
 }
@@ -6055,6 +6056,7 @@ fn pg_acting_set_command_rejects_removing_pending_reporter_before_mutation() {
         pg_id,
         state: PgState::Active,
         metadata_proof: active_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: Some(pending),
     }];
     authority
@@ -8653,6 +8655,7 @@ fn authenticated_heartbeat_response_carries_current_active_recovery_authorizatio
         pg_id,
         state: PgState::Active,
         metadata_proof: proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: Some(pending),
     }];
 
@@ -9749,6 +9752,7 @@ fn unix_control_plane_heartbeat_retry_observes_completed_peering_after_lost_resp
         pg_id: PgId::new(22),
         state: PgState::Peering,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
@@ -12261,6 +12265,7 @@ fn control_plane_rpc_rejects_malformed_heartbeat_pending_command_presence() {
     write_u32(&mut payload, 7);
     write_pg_state(&mut payload, PgState::Peering);
     write_pg_metadata_proof(&mut payload, PgMetadataProof::current(10, 11, 12));
+    write_u64(&mut payload, ClusterEpoch::INITIAL.get());
     write_u8(&mut payload, 2);
 
     let mut reader = PayloadReader::new(&payload);

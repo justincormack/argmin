@@ -2057,12 +2057,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(7),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(7), PgState::Peering, proof)],
                 },
                 20_100,
             )
@@ -2100,12 +2095,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(7),
-                        state: PgState::Active,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(7), PgState::Active, proof)],
                 },
                 20_200,
             )
@@ -2135,12 +2125,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(7),
-                        state: PgState::Active,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(7), PgState::Active, proof)],
                 },
                 20_300,
             )
@@ -2255,12 +2240,7 @@ mod tests {
             snapshot
                 .pgs()
                 .filter(|pg| pg.active_primary() == Some(NodeId::new(node_id)))
-                .map(|pg| NodePgHeartbeatObservation {
-                    pg_id: pg.pg_id(),
-                    state: PgState::Active,
-                    metadata_proof,
-                    pending_metadata_command: None,
-                })
+                .map(|pg| NodePgHeartbeatObservation::for_test(pg.pg_id(), PgState::Active, metadata_proof))
                 .collect()
         }
 
@@ -2471,12 +2451,7 @@ mod tests {
                     let pg_observations = snapshot
                         .pgs()
                         .filter(|pg| pg.acting_set().contains(&NodeId::new(node_id)))
-                        .map(|pg| NodePgHeartbeatObservation {
-                            pg_id: pg.pg_id(),
-                            state: PgState::Peering,
-                            metadata_proof: node_proof,
-                            pending_metadata_command: None,
-                        })
+                        .map(|pg| NodePgHeartbeatObservation::for_test(pg.pg_id(), PgState::Peering, node_proof))
                         .collect();
                     harness
                         .control_plane
@@ -3259,12 +3234,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(7),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(7), PgState::Peering, proof)],
                 },
                 20_020,
             )
@@ -3290,12 +3260,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(7),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(7), PgState::Peering, proof)],
                 },
                 20_030,
             )
@@ -4217,12 +4182,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(7),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(7), PgState::Peering, proof)],
                 },
                 20_100,
             )
@@ -4247,12 +4207,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(7),
-                        state: PgState::Active,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(7), PgState::Active, proof)],
                 },
                 20_200,
             )
@@ -4269,12 +4224,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(7),
-                        state: PgState::Active,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(7), PgState::Active, proof)],
                 },
                 20_300,
             )
@@ -4331,12 +4281,7 @@ mod tests {
                     observed_epoch: restored.cluster_epoch(),
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(7),
-                        state: PgState::Active,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(7), PgState::Active, proof)],
                 },
                 20_400,
             )
@@ -4596,12 +4541,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Peering, proof)],
                 },
                 50_100,
             )
@@ -4621,12 +4561,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Active,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Active, proof)],
                 },
                 50_200,
             )
@@ -4651,12 +4586,7 @@ mod tests {
                     observed_epoch: active_cluster_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Active,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Active, proof)],
                 },
                 50_400,
             )
@@ -4738,12 +4668,7 @@ mod tests {
                     observed_epoch: expired_snapshot.cluster_epoch(),
                     requested_lease_duration_ms: 3_000,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Peering, proof)],
                 },
                 51_101,
             )
@@ -4759,12 +4684,7 @@ mod tests {
                     observed_epoch: successor_epoch,
                     requested_lease_duration_ms: 3_000,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Peering, proof)],
                 },
                 52_099,
             )
@@ -4784,12 +4704,7 @@ mod tests {
                     observed_epoch: fenced.runtime_map().cluster_epoch(),
                     requested_lease_duration_ms: 3_000,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Peering, proof)],
                 },
                 52_100,
             )
@@ -4989,12 +4904,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Peering, proof)],
                 },
                 50_100,
             )
@@ -5014,12 +4924,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Active,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Active, proof)],
                 },
                 50_200,
             )
@@ -5137,12 +5042,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Peering, proof)],
                 },
                 50_100,
             )
@@ -5162,12 +5062,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(17),
-                        state: PgState::Active,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(17), PgState::Active, proof)],
                 },
                 50_200,
             )
@@ -5253,12 +5148,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(9),
-                        state: PgState::Peering,
-                        metadata_proof: proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(9), PgState::Peering, proof)],
                 },
                 0,
             )
@@ -5762,12 +5652,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(13),
-                        state: PgState::Peering,
-                        metadata_proof: active_proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(13), PgState::Peering, active_proof)],
                 },
                 40_100,
             )
@@ -5787,12 +5672,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(13),
-                        state: PgState::Active,
-                        metadata_proof: active_proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(13), PgState::Active, active_proof)],
                 },
                 40_200,
             )
@@ -5817,12 +5697,7 @@ mod tests {
                     observed_epoch: live_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(13),
-                        state: PgState::Active,
-                        metadata_proof: active_proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(13), PgState::Active, active_proof)],
                 },
                 40_400,
             )
@@ -6011,12 +5886,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(13),
-                        state: PgState::Peering,
-                        metadata_proof: active_proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(13), PgState::Peering, active_proof)],
                 },
                 40_100,
             )
@@ -6043,12 +5913,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(13),
-                        state: PgState::Active,
-                        metadata_proof: active_proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(13), PgState::Active, active_proof)],
                 },
                 40_200,
             )
@@ -6194,12 +6059,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(14),
-                        state: PgState::Peering,
-                        metadata_proof: active_proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(14), PgState::Peering, active_proof)],
                 },
                 41_100,
             )
@@ -6219,12 +6079,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(14),
-                        state: PgState::Active,
-                        metadata_proof: active_proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(14), PgState::Active, active_proof)],
                 },
                 41_150,
             )
@@ -6562,12 +6417,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: history_references.clone(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(3),
-                        state: PgState::Peering,
-                        metadata_proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(3), PgState::Peering, metadata_proof)],
                 },
                 1_001,
             )
@@ -6583,12 +6433,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: history_references,
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(3),
-                        state: PgState::Active,
-                        metadata_proof,
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(3), PgState::Active, metadata_proof)],
                 },
                 1_002,
             )
@@ -7311,12 +7156,7 @@ mod tests {
             .unwrap();
         let heartbeat_started_at_ms = storage::clock::current_time_millis();
         let pg_observations = if serving_pg_routes {
-            vec![NodePgHeartbeatObservation {
-                pg_id: PgId::new(0),
-                state: PgState::Peering,
-                metadata_proof: PgMetadataProof::empty(),
-                pending_metadata_command: None,
-            }]
+            vec![NodePgHeartbeatObservation::for_test(PgId::new(0), PgState::Peering, PgMetadataProof::empty())]
         } else {
             Vec::new()
         };
@@ -7363,12 +7203,7 @@ mod tests {
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: TEST_LEASE_DURATION_MS,
                         cluster_map_history_route_references: Default::default(),
-                        pg_observations: vec![NodePgHeartbeatObservation {
-                            pg_id: PgId::new(0),
-                            state: PgState::Active,
-                            metadata_proof: PgMetadataProof::empty(),
-                            pending_metadata_command: None,
-                        }],
+                        pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(0), PgState::Active, PgMetadataProof::empty())],
                     },
                     heartbeat_started_at_ms.saturating_add(5),
                 )
@@ -7414,12 +7249,7 @@ mod tests {
                         observed_epoch,
                         requested_lease_duration_ms: 1_000,
                         cluster_map_history_route_references: Default::default(),
-                        pg_observations: vec![NodePgHeartbeatObservation {
-                            pg_id: PgId::new(0),
-                            state: PgState::Peering,
-                            metadata_proof: PgMetadataProof::empty(),
-                            pending_metadata_command: None,
-                        }],
+                        pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(0), PgState::Peering, PgMetadataProof::empty())],
                     },
                     now_ms,
                 )
@@ -7446,12 +7276,7 @@ mod tests {
                         observed_epoch,
                         requested_lease_duration_ms: 1_000,
                         cluster_map_history_route_references: Default::default(),
-                        pg_observations: vec![NodePgHeartbeatObservation {
-                            pg_id: PgId::new(1),
-                            state: PgState::Peering,
-                            metadata_proof: PgMetadataProof::empty(),
-                            pending_metadata_command: None,
-                        }],
+                        pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(1), PgState::Peering, PgMetadataProof::empty())],
                     },
                     now_ms,
                 )
@@ -7476,12 +7301,7 @@ mod tests {
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(0),
-                        state: PgState::Active,
-                        metadata_proof: PgMetadataProof::empty(),
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(0), PgState::Active, PgMetadataProof::empty())],
                 },
                 1_007,
             )
@@ -7615,12 +7435,7 @@ mod tests {
             .set_pg_acting_set(PgId::new(0), vec![node_id])
             .unwrap();
 
-        let peering_observation = NodePgHeartbeatObservation {
-            pg_id: PgId::new(0),
-            state: PgState::Peering,
-            metadata_proof: PgMetadataProof::empty(),
-            pending_metadata_command: None,
-        };
+        let peering_observation = NodePgHeartbeatObservation::for_test(PgId::new(0), PgState::Peering, PgMetadataProof::empty());
         for now_ms in 1_000..1_004 {
             let observed_epoch = authority.snapshot().cluster_epoch();
             let lease = authority
@@ -7655,12 +7470,7 @@ mod tests {
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(0),
-                        state: PgState::Active,
-                        metadata_proof: PgMetadataProof::empty(),
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(0), PgState::Active, PgMetadataProof::empty())],
                 },
                 1_003,
             )
@@ -7914,12 +7724,7 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(0),
-                        state: PgState::Peering,
-                        metadata_proof: PgMetadataProof::empty(),
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(0), PgState::Peering, PgMetadataProof::empty())],
                 },
                 61_100,
             )
@@ -7939,12 +7744,7 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    pg_observations: vec![NodePgHeartbeatObservation {
-                        pg_id: PgId::new(0),
-                        state: PgState::Active,
-                        metadata_proof: PgMetadataProof::empty(),
-                        pending_metadata_command: None,
-                    }],
+                    pg_observations: vec![NodePgHeartbeatObservation::for_test(PgId::new(0), PgState::Active, PgMetadataProof::empty())],
                 },
                 61_200,
             )

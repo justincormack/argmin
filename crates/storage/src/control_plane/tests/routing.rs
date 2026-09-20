@@ -139,6 +139,7 @@ fn heartbeat_refresh_completes_ready_peering_for_storage_node_before_frontend_ex
         pg_id: PgId::new(22),
         state: PgState::Peering,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let refresh = authority
@@ -174,6 +175,7 @@ fn heartbeat_refresh_completes_ready_peering_for_storage_node_before_frontend_ex
         pg_id: PgId::new(22),
         state: PgState::Active,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let refresh = authority
@@ -216,6 +218,7 @@ fn storage_node_refresh_hands_active_route_to_primary_after_non_primary_complete
             pg_id: PgId::new(77),
             state: PgState::Peering,
             metadata_proof: proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }];
         if node_id == 1 {
@@ -266,6 +269,7 @@ fn storage_node_refresh_hands_active_route_to_primary_after_non_primary_complete
         pg_id: PgId::new(77),
         state: PgState::Active,
         metadata_proof: proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let active_refresh = authority
@@ -314,6 +318,7 @@ fn storage_node_refresh_recovers_when_another_active_primary_lease_expires() {
             pg_id: PgId::new(pg_id),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }];
         authority.heartbeat(heartbeat, now_ms).unwrap();
@@ -324,6 +329,7 @@ fn storage_node_refresh_recovers_when_another_active_primary_lease_expires() {
         pg_id: PgId::new(81),
         state: PgState::Active,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let node_2_refresh = authority
@@ -344,6 +350,7 @@ fn storage_node_refresh_recovers_when_another_active_primary_lease_expires() {
         pg_id: PgId::new(80),
         state: PgState::Active,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let node_1_refresh = authority
@@ -387,6 +394,7 @@ fn storage_node_refresh_does_not_block_non_actor_on_pending_active_handoff() {
         pg.active_primary = Some(NodeId::new(2));
         pg.active_metadata_proof = Some(PgMetadataProof::empty());
         pg.active_metadata_proof_epoch = Some(authority.snapshot().cluster_epoch());
+        pg.active_metadata_log_epoch = Some(ClusterEpoch::INITIAL);
     }
     next_snapshot.bump_epoch().unwrap();
     authority.commit_snapshot(next_snapshot).unwrap();
@@ -402,6 +410,7 @@ fn storage_node_refresh_does_not_block_non_actor_on_pending_active_handoff() {
         pg_id: PgId::new(70),
         state: PgState::Active,
         metadata_proof: PgMetadataProof::empty(),
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     let refresh = authority
@@ -581,6 +590,7 @@ fn active_primary_service_requires_current_observation_metadata_proof() {
         pg_id: PgId::new(22),
         state: PgState::Peering,
         metadata_proof: accepted_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -599,6 +609,7 @@ fn active_primary_service_requires_current_observation_metadata_proof() {
         pg_id: PgId::new(22),
         state: PgState::Active,
         metadata_proof: accepted_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(active_heartbeat, 2_020).unwrap();
@@ -628,6 +639,7 @@ fn active_primary_service_requires_current_observation_metadata_proof() {
         pg_id: PgId::new(22),
         state: PgState::Active,
         metadata_proof: progressed_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(progressed_heartbeat, 2_031).unwrap();
@@ -728,6 +740,7 @@ fn active_primary_heartbeat_does_not_promote_digest_only_cleanup_progress() {
         pg_id: PgId::new(22),
         state: PgState::Peering,
         metadata_proof: accepted_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -746,6 +759,7 @@ fn active_primary_heartbeat_does_not_promote_digest_only_cleanup_progress() {
         pg_id: PgId::new(22),
         state: PgState::Active,
         metadata_proof: accepted_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(active_heartbeat, 2_020).unwrap();
@@ -766,6 +780,7 @@ fn active_primary_heartbeat_does_not_promote_digest_only_cleanup_progress() {
         pg_id: PgId::new(22),
         state: PgState::Active,
         metadata_proof: cleanup_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     assert!(matches!(
@@ -815,6 +830,7 @@ fn non_primary_active_observation_cannot_satisfy_primary_active_proof() {
             pg_id: PgId::new(23),
             state: PgState::Peering,
             metadata_proof: accepted_proof,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
             pending_metadata_command: None,
         }];
         authority
@@ -837,6 +853,7 @@ fn non_primary_active_observation_cannot_satisfy_primary_active_proof() {
         pg_id: PgId::new(23),
         state: PgState::Active,
         metadata_proof: progressed_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(non_primary_active, 2_020).unwrap();
@@ -911,6 +928,7 @@ fn non_primary_active_observation_may_lag_active_primary_metadata_proof() {
                 } else {
                     stale_proof
                 },
+                metadata_log_epoch: ClusterEpoch::INITIAL,
                 pending_metadata_command: None,
             },
         );
@@ -923,6 +941,7 @@ fn non_primary_active_observation_may_lag_active_primary_metadata_proof() {
         pg_id: PgId::new(24),
         state: PgState::Active,
         metadata_proof: stale_proof,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
         pending_metadata_command: None,
     }];
     authority.heartbeat(stale_replica_heartbeat, 2_020).unwrap();
@@ -1310,6 +1329,7 @@ fn serving_pg_runtime_map_ignores_unrelated_unserved_pg() {
                     pg_id: PgId::new(26),
                     state: PgState::Peering,
                     metadata_proof: PgMetadataProof::empty(),
+                    metadata_log_epoch: ClusterEpoch::INITIAL,
                     pending_metadata_command: None,
                 }],
             },
