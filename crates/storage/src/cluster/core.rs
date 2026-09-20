@@ -2216,6 +2216,11 @@ fn control_plane_refresh_error_diagnostic_kind(error: &ControlPlaneError) -> &'s
 
 #[derive(Debug, thiserror::Error)]
 enum PendingMetadataCommandRefreshRecoveryError {
+    #[error("recover pending metadata command for PG {pg_id}: {source}")]
+    Task {
+        pg_id: u32,
+        source: Box<Self>,
+    },
     #[error("load PG-scoped runtime map: {0}")]
     ControlPlane(#[from] ControlPlaneError),
     #[error("build historical recovery cluster: {0}")]
@@ -2275,6 +2280,7 @@ enum PendingMetadataCommandRefreshRecoveryError {
 impl PendingMetadataCommandRefreshRecoveryError {
     fn diagnostic_kind(&self) -> &'static str {
         match self {
+            Self::Task { source, .. } => source.diagnostic_kind(),
             Self::ControlPlane(error) => control_plane_refresh_error_diagnostic_kind(error),
             Self::Build(_) => "pending_recovery_build",
             Self::Store(_) => "pending_recovery_store",
@@ -2285,6 +2291,40 @@ impl PendingMetadataCommandRefreshRecoveryError {
             Self::HistoricalRouteNotActive { .. } => "pending_recovery_route_not_active",
             Self::IdentityChanged { .. } => "pending_recovery_identity_changed",
         }
+    }
+
+    fn diagnostic_cause_label(&self) -> &'static str {
+        match self {
+            Self::Task { source, .. } => source.diagnostic_cause_label(),
+            Self::ControlPlane(error) => control_plane_refresh_error_diagnostic_kind(error),
+            Self::Store(error) => error.diagnostic_cause_label(),
+            Self::Recover(error) => error.diagnostic_cause_label(),
+            _ => self.diagnostic_kind(),
+        }
+    }
+
+    fn diagnostic_pg_id(&self) -> Option<u32> {
+        match self {
+            Self::Task { pg_id, .. }
+            | Self::DiscoveryFailure { pg_id, .. }
+            | Self::AuthorizationChanged { pg_id, .. }
+            | Self::ReportingNodeNotHistoricalPrimary { pg_id, .. }
+            | Self::HistoricalRouteNotActive { pg_id, .. }
+            | Self::IdentityChanged { pg_id, .. } => Some(*pg_id),
+            _ => None,
+        }
+    }
+
+    fn diagnostic_detail(&self) -> String {
+        let pg_context = self
+            .diagnostic_pg_id()
+            .map(|pg_id| format!("pg_id={pg_id} "))
+            .unwrap_or_default();
+        format!(
+            "{pg_context}kind={} cause={}",
+            self.diagnostic_kind(),
+            self.diagnostic_cause_label()
+        )
     }
 }
 

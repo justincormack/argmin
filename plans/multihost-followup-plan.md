@@ -1853,6 +1853,22 @@ or removing nodes dynamically and is not capacity rebalancing. It must:
 - resume exactly after authority failover, process restart, response loss, or
   repeated unavailable/healthy observations without duplicating migration.
 
+Published pending commands need an explicit outage path before this phase is
+complete. If the historical primary and a surviving replica apply a command but
+the third actor fails before terminal cleanup, the primary retains its slot.
+The Active proof floor remains at the pre-command proof. After the outage fences
+the PG to Peering, the primary is excluded as a transfer source because of its
+slot and the clean survivor is excluded because its post-command proof differs
+from that floor. Historical recovery still requires the failed actor, so neither
+recovery nor replacement can make progress. The September 2026 four-node GET
+outage reproduced this with 21 retained slots and 21 non-serving PGs. Preserve
+both integrity checks until an authenticated protocol proves the exact
+pre-command-to-published-command log lineage and either transfers the pending
+slot and its cleanup dependencies to the replacement route or certifies safe
+terminal cleanup under failed-actor fencing. The protocol must reject divergent
+replica chains and survive leader failover, restart, and delayed failed-actor
+return. A faster batch cadence cannot resolve this dependency cycle.
+
 Deterministic replacement coverage must include multiple differently weighted
 eligible spares and a changing availability subset. It must prove that retries,
 authority failover, and subset changes preserve the ranking derived from the

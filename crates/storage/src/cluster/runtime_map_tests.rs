@@ -5,6 +5,38 @@
 mod runtime_map_refresh_invalidation_tests {
     use super::*;
 
+    #[test]
+    fn pending_recovery_task_diagnostic_keeps_pg_and_bounded_cause() {
+        let error = PendingMetadataCommandRefreshRecoveryError::Task {
+            pg_id: 7,
+            source: Box::new(PendingMetadataCommandRefreshRecoveryError::Recover(
+                ObjectPgActionError::MetadataCommandRecoveryTransferred,
+            )),
+        };
+        assert_eq!(error.diagnostic_pg_id(), Some(7));
+        assert_eq!(error.diagnostic_kind(), "pending_recovery_command");
+        assert_eq!(
+            error.diagnostic_cause_label(),
+            "metadata_command_recovery_transferred"
+        );
+        assert_eq!(
+            error.diagnostic_detail(),
+            "pg_id=7 kind=pending_recovery_command cause=metadata_command_recovery_transferred"
+        );
+    }
+
+    #[test]
+    fn pending_recovery_global_error_diagnostic_has_no_pg_id() {
+        let error = PendingMetadataCommandRefreshRecoveryError::ControlPlane(
+            ControlPlaneError::AuthorityClockSourceUnavailable,
+        );
+        assert_eq!(error.diagnostic_pg_id(), None);
+        assert_eq!(
+            error.diagnostic_detail(),
+            "kind=control_plane_clock cause=control_plane_clock"
+        );
+    }
+
     #[derive(Clone)]
     struct FixedRuntimeMapSource(ClusterRuntimeMapSnapshot);
 

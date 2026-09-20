@@ -810,15 +810,16 @@ impl StorageClusterRouteHandle {
                             (Ok(targeted), None) => Ok(targeted),
                         };
                         if let Err(error) = &recovery_result {
+                            let detail = error.diagnostic_detail();
                             let _ = observability::emit_flight_event(
                                 "storage",
                                 "pending_metadata_command_recovery_error",
-                                format!("kind={}", error.diagnostic_kind()),
+                                detail.clone(),
                             );
                             let _ = observability::event(
                                 "storage",
                                 "pending_metadata_command_recovery_error",
-                                Some(format_args!("kind={}", error.diagnostic_kind())),
+                                Some(format_args!("{detail}")),
                             );
                         }
 
@@ -1011,7 +1012,12 @@ impl StorageClusterRouteHandle {
                 recovery.pending(),
             ) {
                 Ok(count) => recovered += count,
-                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(PendingMetadataCommandRefreshRecoveryError::Task {
+                        pg_id: task.pg_id().get(),
+                        source: Box::new(error),
+                    });
+                }
                 Err(_) => {}
             }
         }
