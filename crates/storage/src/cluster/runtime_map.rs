@@ -73,6 +73,272 @@ impl Drop for StorageClusterRuntimeMapRefreshLoop {
 }
 
 const PENDING_METADATA_COMMAND_FALLBACK_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const PENDING_METADATA_COMMAND_RECOVERY_MAX_IN_FLIGHT: usize = 4;
+const PENDING_METADATA_COMMAND_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct PendingMetadataCommandRecoveryRetrySchedule {
+    attempted: BTreeMap<
+        PgId,
+        (
+            PendingMetadataCommandObservation,
+            Instant,
+        ),
+    >,
+}
+
+impl PendingMetadataCommandRecoveryRetrySchedule {
+    fn ready(
+        &mut self,
+        listing: crate::control_plane::PendingMetadataCommandRecoveryListing,
+        now: Instant,
+    ) -> crate::control_plane::PendingMetadataCommandRecoveryListing {
+        let (mut tasks, failures) = listing.into_parts();
+        tasks.sort_by_key(|task| task.pg_id());
+        let listed = tasks.iter().map(|task| task.pg_id()).collect::<BTreeSet<_>>();
+        self.attempted.retain(|pg_id, _| listed.contains(pg_id));
+        let ready = tasks
+            .into_iter()
+            .filter(|task| {
+                !self.attempted.get(&task.pg_id()).is_some_and(
+                    |(previous, not_before)| {
+                        *previous == task.recovery().pending() && now < *not_before
+                    },
+                )
+            })
+            .collect();
+        crate::control_plane::PendingMetadataCommandRecoveryListing::new(ready, failures)
+    }
+
+    fn record_completed(
+        &mut self,
+        pg_id: PgId,
+        pending: PendingMetadataCommandObservation,
+        now: Instant,
+    ) {
+        self.attempted.insert(
+            pg_id,
+            (pending, now + PENDING_METADATA_COMMAND_RECOVERY_RETRY_INTERVAL),
+        );
+    }
+}
+
+fn with_bounded_pending_recovery_workers<T, O, E, R>(
+    task: impl Fn(T) -> Result<O, E> + Sync,
+    on_worker_panic: impl Fn() + Sync,
+    run: impl FnOnce(
+        &std::sync::mpsc::Sender<T>,
+        &std::sync::mpsc::Receiver<(T, Instant, Result<O, E>)>,
+    ) -> R,
+) -> R
+where
+    T: Copy + Send,
+    O: Send,
+    E: Send,
+{
+    let (task_sender, task_receiver) = std::sync::mpsc::channel::<T>();
+    let task_receiver = Mutex::new(task_receiver);
+    let (completion_sender, completion_receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..PENDING_METADATA_COMMAND_RECOVERY_MAX_IN_FLIGHT {
+            let task = &task;
+            let on_worker_panic = &on_worker_panic;
+            let task_receiver = &task_receiver;
+            let completion_sender = completion_sender.clone();
+            scope.spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                    let received = task_receiver
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv();
+                    let Ok(item) = received else {
+                        break;
+                    };
+                    let result = task(item);
+                    if completion_sender
+                        .send((item, Instant::now(), result))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }));
+                if result.is_err() {
+                    on_worker_panic();
+                }
+            });
+        }
+        drop(completion_sender);
+        let result = run(&task_sender, &completion_receiver);
+        drop(task_sender);
+        result
+    })
+}
+
+#[derive(Clone, Copy)]
+enum PendingMetadataCommandRecoveryWork {
+    Target(crate::control_plane::PendingMetadataCommandRecoveryTask),
+    Fallback(u64),
+}
+
+struct PendingMetadataCommandRecoveryOutcome {
+    recovered: usize,
+    skipped_claimed_pgs: usize,
+}
+
+impl PendingMetadataCommandRecoveryOutcome {
+    fn complete(&self) -> bool {
+        self.skipped_claimed_pgs == 0
+    }
+}
+
+fn pending_metadata_command_recovery_attempt_complete<E>(
+    result: &Result<PendingMetadataCommandRecoveryOutcome, E>,
+) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(PendingMetadataCommandRecoveryOutcome::complete)
+}
+
+#[derive(Clone, Default)]
+struct PendingMetadataCommandRecoveryPgClaims(Arc<Mutex<BTreeSet<PgId>>>);
+
+impl PendingMetadataCommandRecoveryPgClaims {
+    fn claim(&self, pg_id: PgId) -> Option<PendingMetadataCommandRecoveryPgClaim> {
+        let mut claimed = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        claimed.insert(pg_id).then(|| PendingMetadataCommandRecoveryPgClaim {
+            claims: self.clone(),
+            pg_id,
+        })
+    }
+}
+
+struct PendingMetadataCommandRecoveryPgClaim {
+    claims: PendingMetadataCommandRecoveryPgClaims,
+    pg_id: PgId,
+}
+
+impl Drop for PendingMetadataCommandRecoveryPgClaim {
+    fn drop(&mut self) {
+        let mut claimed = self
+            .claims
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        claimed.remove(&self.pg_id);
+    }
+}
+
+#[derive(Default)]
+struct PendingMetadataCommandRecoveryDispatch {
+    active: BTreeMap<
+        PgId,
+        (
+            PendingMetadataCommandObservation,
+            PendingMetadataCommandRecoveryPgClaim,
+        ),
+    >,
+    claims: PendingMetadataCommandRecoveryPgClaims,
+    last_target_pg: Option<PgId>,
+    fallback_active: bool,
+    targeted_retry: PendingMetadataCommandRecoveryRetrySchedule,
+    fallback_retry: PendingMetadataCommandFallbackSchedule,
+}
+
+impl PendingMetadataCommandRecoveryDispatch {
+    fn submit_targets(
+        &mut self,
+        listing: crate::control_plane::PendingMetadataCommandRecoveryListing,
+        now: Instant,
+        sender: &std::sync::mpsc::Sender<PendingMetadataCommandRecoveryWork>,
+    ) -> Vec<crate::control_plane::PendingMetadataCommandRecoveryDiscoveryFailure> {
+        let listing = self.targeted_retry.ready(listing, now);
+        let (tasks, failures) = listing.into_parts();
+        let start = self.last_target_pg.map_or(0, |last| {
+            tasks.partition_point(|task| task.pg_id() <= last)
+        });
+        for task in tasks[start..].iter().chain(&tasks[..start]).copied() {
+            if self.active.len() + usize::from(self.fallback_active)
+                >= PENDING_METADATA_COMMAND_RECOVERY_MAX_IN_FLIGHT
+            {
+                break;
+            }
+            if self.active.contains_key(&task.pg_id()) {
+                continue;
+            }
+            let Some(claim) = self.claims.claim(task.pg_id()) else {
+                continue;
+            };
+            sender
+                .send(PendingMetadataCommandRecoveryWork::Target(task))
+                .expect("pending-command recovery workers must remain alive");
+            self.active
+                .insert(task.pg_id(), (task.recovery().pending(), claim));
+            self.last_target_pg = Some(task.pg_id());
+        }
+        failures
+    }
+
+    fn submit_fallback(
+        &mut self,
+        generation: u64,
+        now: Instant,
+        sender: &std::sync::mpsc::Sender<PendingMetadataCommandRecoveryWork>,
+    ) {
+        if !self.fallback_active
+            && self.active.len() < PENDING_METADATA_COMMAND_RECOVERY_MAX_IN_FLIGHT
+            && self.fallback_retry.should_attempt(generation, now)
+        {
+            sender
+                .send(PendingMetadataCommandRecoveryWork::Fallback(generation))
+                .expect("pending-command recovery workers must remain alive");
+            self.fallback_active = true;
+        }
+    }
+
+    fn complete(
+        &mut self,
+        work: PendingMetadataCommandRecoveryWork,
+        now: Instant,
+        succeeded: bool,
+    ) -> bool {
+        match work {
+            PendingMetadataCommandRecoveryWork::Target(task) => {
+                self.active.remove(&task.pg_id());
+                self.targeted_retry.record_completed(
+                    task.pg_id(),
+                    task.recovery().pending(),
+                    now,
+                );
+                false
+            }
+            PendingMetadataCommandRecoveryWork::Fallback(generation) => {
+                self.fallback_active = false;
+                self.fallback_retry.record_attempt(generation, now, succeeded);
+                true
+            }
+        }
+    }
+
+    fn has_active_work(&self) -> bool {
+        !self.active.is_empty() || self.fallback_active
+    }
+}
+
+fn emit_pending_metadata_command_recovery_error(
+    error: &PendingMetadataCommandRefreshRecoveryError,
+) {
+    let detail = error.diagnostic_detail();
+    let _ = observability::emit_flight_event(
+        "storage",
+        "pending_metadata_command_recovery_error",
+        detail.clone(),
+    );
+    let _ = observability::event(
+        "storage",
+        "pending_metadata_command_recovery_error",
+        Some(format_args!("{detail}")),
+    );
+}
 
 #[derive(Default)]
 struct PendingMetadataCommandFallbackSchedule {
@@ -756,77 +1022,110 @@ impl StorageClusterRouteHandle {
             let recovery_handle = thread::Builder::new()
                 .name("argmin-storage-cluster-pending-command-recovery".to_string())
                 .spawn(move || {
-                    let mut fallback_schedule =
-                        PendingMetadataCommandFallbackSchedule::default();
-                    loop {
-                        let discovery_now_ms = worker_authority_now_ms();
-                        let request_generation =
-                            recovery_request_generation.load(Ordering::Acquire);
-                        let fallback_requested =
-                            fallback_schedule.should_attempt(request_generation, Instant::now());
-                        let targeted_recovery_result = match worker_control_plane
-                            .pending_metadata_command_recoveries(discovery_now_ms)
-                        {
-                            Ok(listing)
-                                if !listing.tasks().is_empty()
-                                    || !listing.failures().is_empty() =>
-                            {
+                    let mut dispatch = PendingMetadataCommandRecoveryDispatch::default();
+                    let claims = dispatch.claims.clone();
+                    with_bounded_pending_recovery_workers(
+                        |work| match work {
+                            PendingMetadataCommandRecoveryWork::Target(task) => {
+                                let recovery = task.recovery();
                                 recovery_route_handle
-                                    .recover_authorized_pending_metadata_commands(
+                                    .recover_reported_pending_metadata_command(
                                         worker_control_plane.as_ref(),
-                                        worker_authority_now_ms.as_ref(),
+                                        worker_authority_now_ms(),
                                         admission_settings,
-                                        listing,
+                                        task.pg_id(),
+                                        recovery.reporting_node_id(),
+                                        recovery.pending(),
                                     )
+                                    .map(|recovered| PendingMetadataCommandRecoveryOutcome {
+                                        recovered,
+                                        skipped_claimed_pgs: 0,
+                                    })
+                                    .map_err(|error| {
+                                        PendingMetadataCommandRefreshRecoveryError::Task {
+                                            pg_id: task.pg_id().get(),
+                                            source: Box::new(error),
+                                        }
+                                    })
                             }
-                            Ok(_) => Ok(0),
-                            Err(error) => Err(
-                                PendingMetadataCommandRefreshRecoveryError::ControlPlane(error),
-                            ),
-                        };
-                        let fallback_recovery_result = fallback_requested.then(|| {
-                            let result = recovery_route_handle
-                                .current()
-                                .drain_pending_metadata_commands_for_current_map()
-                                .map_err(PendingMetadataCommandRefreshRecoveryError::Recover);
-                            fallback_schedule.record_attempt(
-                                request_generation,
-                                Instant::now(),
-                                result.is_ok(),
-                            );
-                            let mut status = recovery_status
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            status.fallback_recovery_attempts += 1;
-                            status.fallback_recovery_failures += u64::from(result.is_err());
-                            result
-                        });
-                        let recovery_result = match (
-                            targeted_recovery_result,
-                            fallback_recovery_result,
-                        ) {
-                            (Err(error), _) | (Ok(_), Some(Err(error))) => Err(error),
-                            (Ok(targeted), Some(Ok(fallback))) => Ok(targeted + fallback),
-                            (Ok(targeted), None) => Ok(targeted),
-                        };
-                        if let Err(error) = &recovery_result {
-                            let detail = error.diagnostic_detail();
-                            let _ = observability::emit_flight_event(
-                                "storage",
-                                "pending_metadata_command_recovery_error",
-                                detail.clone(),
-                            );
-                            let _ = observability::event(
-                                "storage",
-                                "pending_metadata_command_recovery_error",
-                                Some(format_args!("{detail}")),
-                            );
-                        }
+                            PendingMetadataCommandRecoveryWork::Fallback(_) => {
+                                recovery_route_handle
+                                    .current()
+                                    .drain_pending_metadata_commands_for_current_map_with_claims(
+                                        &claims,
+                                    )
+                                    .map_err(PendingMetadataCommandRefreshRecoveryError::Recover)
+                            }
+                        },
+                        || {
+                            eprintln!("pending metadata-command recovery worker panicked; aborting");
+                            std::process::abort();
+                        },
+                        |sender, completions| loop {
+                            loop {
+                                match completions.try_recv() {
+                                    Ok((work, completed_at, result)) => {
+                                        let complete =
+                                            pending_metadata_command_recovery_attempt_complete(&result);
+                                        if dispatch.complete(work, completed_at, complete) {
+                                            let mut status = recovery_status
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                            status.fallback_recovery_attempts += 1;
+                                            status.fallback_recovery_failures +=
+                                                u64::from(!complete);
+                                        }
+                                        if let Ok(outcome) = &result {
+                                            if outcome.skipped_claimed_pgs != 0 {
+                                                let _ = observability::event(
+                                                    "storage",
+                                                    "pending_metadata_command_fallback_incomplete",
+                                                    Some(format_args!(
+                                                        "skipped_claimed_pgs={} recovered={}",
+                                                        outcome.skipped_claimed_pgs,
+                                                        outcome.recovered,
+                                                    )),
+                                                );
+                                            }
+                                        }
+                                        if let Err(error) = result {
+                                            emit_pending_metadata_command_recovery_error(&error);
+                                        }
+                                    }
+                                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                        assert!(!dispatch.has_active_work(),
+                                            "pending-command recovery workers exited with work active");
+                                        break;
+                                    }
+                                }
+                            }
 
-                        if wait_for_runtime_map_worker(&worker_stop, refresh_interval) {
-                            break;
-                        }
-                    }
+                            let generation = recovery_request_generation.load(Ordering::Acquire);
+                            dispatch.submit_fallback(generation, Instant::now(), sender);
+                            match worker_control_plane
+                                .pending_metadata_command_recoveries(worker_authority_now_ms())
+                            {
+                                Ok(listing) => {
+                                    for failure in dispatch.submit_targets(listing, Instant::now(), sender) {
+                                        emit_pending_metadata_command_recovery_error(
+                                            &PendingMetadataCommandRefreshRecoveryError::DiscoveryFailure {
+                                                pg_id: failure.pg_id().get(),
+                                                kind: failure.kind(),
+                                                detail: failure.detail().to_owned(),
+                                            },
+                                        );
+                                    }
+                                }
+                                Err(error) => emit_pending_metadata_command_recovery_error(
+                                    &PendingMetadataCommandRefreshRecoveryError::ControlPlane(error),
+                                ),
+                            }
+                            if wait_for_runtime_map_worker(&worker_stop, refresh_interval) {
+                                break;
+                            }
+                        },
+                    );
                 });
             match recovery_handle {
                 Ok(handle) => handles.push(handle),
@@ -988,53 +1287,6 @@ impl StorageClusterRouteHandle {
         Ok(usize::from(outcome.is_terminal()))
     }
 
-    fn recover_authorized_pending_metadata_commands<F>(
-        &self,
-        control_plane: &impl ControlPlaneRuntimeMapSource,
-        authority_now_ms: &F,
-        admission_settings: Option<LocalUnixStorageNodeClientAdmissionSettings>,
-        listing: crate::control_plane::PendingMetadataCommandRecoveryListing,
-    ) -> Result<usize, PendingMetadataCommandRefreshRecoveryError>
-    where
-        F: Fn() -> u64,
-    {
-        let mut recovered = 0;
-        let mut first_error = None;
-        let (recoveries, discovery_failures) = listing.into_parts();
-        for task in recoveries {
-            let recovery = task.recovery();
-            match self.recover_reported_pending_metadata_command(
-                control_plane,
-                authority_now_ms(),
-                admission_settings,
-                task.pg_id(),
-                recovery.reporting_node_id(),
-                recovery.pending(),
-            ) {
-                Ok(count) => recovered += count,
-                Err(error) if first_error.is_none() => {
-                    first_error = Some(PendingMetadataCommandRefreshRecoveryError::Task {
-                        pg_id: task.pg_id().get(),
-                        source: Box::new(error),
-                    });
-                }
-                Err(_) => {}
-            }
-        }
-        if first_error.is_none() {
-            first_error = discovery_failures.into_iter().next().map(|failure| {
-                PendingMetadataCommandRefreshRecoveryError::DiscoveryFailure {
-                    pg_id: failure.pg_id().get(),
-                    kind: failure.kind(),
-                    detail: failure.detail().to_owned(),
-                }
-            });
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(recovered)
-    }
 }
 
 impl StorageClusterRuntimeMapHandle {

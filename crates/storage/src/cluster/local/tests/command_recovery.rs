@@ -1,8 +1,14 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::num::NonZeroU64;
+
 use super::*;
-use crate::cluster::{PendingMetadataCommandRefreshRecoveryError, RequestWorkBudget};
+use crate::cluster::{
+    pending_metadata_command_recovery_attempt_complete, PendingMetadataCommandRecoveryDispatch,
+    PendingMetadataCommandRefreshRecoveryError, RequestWorkBudget,
+    PENDING_METADATA_COMMAND_FALLBACK_RETRY_INTERVAL,
+};
 use crate::control_plane::{
     ControlPlaneError, ControlPlaneRuntimeMapSource, PendingMetadataCommandObservation,
     PendingMetadataCommandRecovery, PendingMetadataCommandRecoveryDiscoveryFailure,
@@ -177,6 +183,102 @@ fn static_recovery_scan_continues_after_an_earlier_pg_fails() {
         .metadata_command_replica_state()
         .unwrap();
     assert_eq!(state.applied_log_index, 1);
+}
+
+#[test]
+fn incomplete_fallback_scan_retries_skipped_pg_after_target_releases_claim() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &[NodeId::new(0)],
+            &[1, 2],
+            EcShape { k: 1, m: 0 },
+        )
+        .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_pg = PgId::new(1);
+    let second_pg = PgId::new(2);
+    let first_bucket = bucket_for_pg(topology, first_pg.get(), "claimed-recovery-first-");
+    let second_bucket = bucket_for_pg(topology, second_pg.get(), "claimed-recovery-second-");
+    let first_command = create_bucket_metadata_command(first_pg, 1, first_bucket.clone());
+    let second_command = create_bucket_metadata_command(second_pg, 1, second_bucket.clone());
+    insert_pending_metadata_command_for_test(&map, first_pg, &first_bucket, &first_command);
+    insert_pending_metadata_command_for_test(&map, second_pg, &second_bucket, &second_command);
+
+    let mut dispatch = PendingMetadataCommandRecoveryDispatch::default();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    dispatch.submit_targets(
+        PendingMetadataCommandRecoveryListing::new(
+            vec![PendingMetadataCommandRecoveryTask::new(
+                first_pg,
+                PendingMetadataCommandRecovery::new(
+                    NodeId::new(0),
+                    PendingMetadataCommandObservation::new(
+                        first_command.id().cluster_epoch(),
+                        NonZeroU64::new(first_command.id().log_index().get()).unwrap(),
+                        first_command.checksum_crc64(),
+                    ),
+                ),
+            )],
+            Vec::new(),
+        ),
+        started,
+        &sender,
+    );
+    let target_work = receiver.try_recv().expect("target PG was not claimed");
+    dispatch.submit_fallback(1, started, &sender);
+    let first_fallback = receiver.try_recv().expect("fallback was not dispatched");
+    let first_pass =
+        cluster.test_drain_pending_metadata_commands_for_static_map_with_claims(&dispatch.claims);
+    assert_eq!(first_pass.as_ref().unwrap().recovered, 1);
+    assert_eq!(first_pass.as_ref().unwrap().skipped_claimed_pgs, 1);
+    let completed = Instant::now();
+    dispatch.complete(
+        first_fallback,
+        completed,
+        pending_metadata_command_recovery_attempt_complete(&first_pass),
+    );
+    assert!(pending_metadata_command_for_test(&map, first_pg, &first_bucket).is_some());
+    assert!(pending_metadata_command_for_test(&map, second_pg, &second_bucket).is_none());
+
+    dispatch.complete(target_work, completed, false);
+    dispatch.submit_fallback(
+        1,
+        completed + PENDING_METADATA_COMMAND_FALLBACK_RETRY_INTERVAL - Duration::from_millis(1),
+        &sender,
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "incomplete scan retried before cooldown"
+    );
+    dispatch.submit_fallback(
+        1,
+        completed + PENDING_METADATA_COMMAND_FALLBACK_RETRY_INTERVAL,
+        &sender,
+    );
+    let second_fallback = receiver
+        .try_recv()
+        .expect("incomplete scan was not retried");
+    let second_pass =
+        cluster.test_drain_pending_metadata_commands_for_static_map_with_claims(&dispatch.claims);
+    assert_eq!(second_pass.as_ref().unwrap().recovered, 1);
+    assert!(pending_metadata_command_recovery_attempt_complete(
+        &second_pass
+    ));
+    dispatch.complete(
+        second_fallback,
+        completed,
+        pending_metadata_command_recovery_attempt_complete(&second_pass),
+    );
+    assert!(pending_metadata_command_for_test(&map, first_pg, &first_bucket).is_none());
 }
 
 impl<S: crate::control_plane::ControlPlaneStore> ControlPlaneRuntimeMapSource

@@ -5141,10 +5141,38 @@ impl StorageCluster {
             .pending_metadata_command_envelope_until(deadline)
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_pending_metadata_commands_for_current_map(
         &self,
     ) -> Result<usize, ObjectPgActionError> {
-        self.drain_pending_metadata_commands_for_current_map_inner(false)
+        self.drain_pending_metadata_commands_for_current_map_with(false, |_| Ok(Some(())))
+    }
+
+    fn drain_pending_metadata_commands_for_current_map_with_claims(
+        &self,
+        claims: &PendingMetadataCommandRecoveryPgClaims,
+    ) -> Result<PendingMetadataCommandRecoveryOutcome, ObjectPgActionError> {
+        self.drain_pending_metadata_commands_for_current_map_with_claims_inner(false, claims)
+    }
+
+    fn drain_pending_metadata_commands_for_current_map_with_claims_inner(
+        &self,
+        authorize_static_recovery: bool,
+        claims: &PendingMetadataCommandRecoveryPgClaims,
+    ) -> Result<PendingMetadataCommandRecoveryOutcome, ObjectPgActionError> {
+        let mut skipped_claimed_pgs = 0;
+        let recovered = self.drain_pending_metadata_commands_for_current_map_with(
+            authorize_static_recovery,
+            |pg_id| {
+                let claim = claims.claim(pg_id);
+                skipped_claimed_pgs += usize::from(claim.is_none());
+                Ok(claim)
+            },
+        )?;
+        Ok(PendingMetadataCommandRecoveryOutcome {
+            recovered,
+            skipped_claimed_pgs,
+        })
     }
 
     pub(crate) fn drain_pending_metadata_commands_for_static_map(
@@ -5157,30 +5185,22 @@ impl StorageCluster {
                 },
             ));
         }
-        self.drain_pending_metadata_commands_for_current_map_inner(true)
+        self.drain_pending_metadata_commands_for_current_map_with(true, |_| Ok(Some(())))
     }
 
-    fn drain_pending_metadata_commands_for_current_map_inner(
+    fn drain_pending_metadata_commands_for_current_map_with<G>(
         &self,
         authorize_static_recovery: bool,
-    ) -> Result<usize, ObjectPgActionError> {
-        self.drain_pending_metadata_commands_for_current_map_with(
-            authorize_static_recovery,
-            |_| Ok(()),
-        )
-    }
-
-    fn drain_pending_metadata_commands_for_current_map_with(
-        &self,
-        authorize_static_recovery: bool,
-        mut before_attempt: impl FnMut(PgId) -> Result<(), ObjectPgActionError>,
+        mut before_attempt: impl FnMut(PgId) -> Result<Option<G>, ObjectPgActionError>,
     ) -> Result<usize, ObjectPgActionError> {
         let mut drained = 0usize;
         let mut first_error = None;
         for raw_pg_id in self.local_map.pg_ids() {
             let pg_id = PgId::new(*raw_pg_id);
             let attempt = (|| {
-                before_attempt(pg_id)?;
+                let Some(_claim) = before_attempt(pg_id)? else {
+                    return Ok(0usize);
+                };
                 let primary = self
                     .local_map
                     .metadata_pg_primary_node_for_metadata_command_recovery(
@@ -5220,7 +5240,7 @@ impl StorageCluster {
     #[cfg(test)]
     pub(crate) fn test_drain_pending_metadata_commands_for_static_map_with_attempt_hook(
         &self,
-        before_attempt: impl FnMut(PgId) -> Result<(), ObjectPgActionError>,
+        mut before_attempt: impl FnMut(PgId) -> Result<(), ObjectPgActionError>,
     ) -> Result<usize, ObjectPgActionError> {
         if !self.has_static_route_authority() {
             return Err(ObjectPgActionError::Store(
@@ -5229,7 +5249,18 @@ impl StorageCluster {
                 },
             ));
         }
-        self.drain_pending_metadata_commands_for_current_map_with(true, before_attempt)
+        self.drain_pending_metadata_commands_for_current_map_with(true, |pg_id| {
+            before_attempt(pg_id).map(|()| Some(()))
+        })
+    }
+
+    #[cfg(test)]
+    fn test_drain_pending_metadata_commands_for_static_map_with_claims(
+        &self,
+        claims: &PendingMetadataCommandRecoveryPgClaims,
+    ) -> Result<PendingMetadataCommandRecoveryOutcome, ObjectPgActionError> {
+        assert!(self.has_static_route_authority());
+        self.drain_pending_metadata_commands_for_current_map_with_claims_inner(true, claims)
     }
 
     pub(crate) fn has_static_route_authority(&self) -> bool {

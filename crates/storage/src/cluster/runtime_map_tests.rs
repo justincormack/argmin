@@ -6,6 +6,265 @@ mod runtime_map_refresh_invalidation_tests {
     use super::*;
 
     #[test]
+    fn pending_recovery_cooldown_is_per_pg_and_exact_command() {
+        use crate::control_plane::{
+            PendingMetadataCommandRecovery, PendingMetadataCommandRecoveryListing,
+            PendingMetadataCommandRecoveryTask,
+        };
+
+        let task = |pg_id, checksum| {
+            PendingMetadataCommandRecoveryTask::new(
+                PgId::new(pg_id),
+                PendingMetadataCommandRecovery::new(
+                    NodeId::new(1),
+                    PendingMetadataCommandObservation::new(
+                        ClusterEpoch::INITIAL,
+                        NonZeroU64::new(1).unwrap(),
+                        checksum,
+                    ),
+                ),
+            )
+        };
+        let listing = |tasks| PendingMetadataCommandRecoveryListing::new(tasks, Vec::new());
+        let mut schedule = PendingMetadataCommandRecoveryRetrySchedule::default();
+        let now = Instant::now();
+        let initial = schedule.ready(listing(vec![task(0, 11), task(1, 22)]), now);
+        assert_eq!(initial.tasks().len(), 2);
+        let completed = now + Duration::from_secs(10);
+        schedule.record_completed(PgId::new(0), task(0, 11).recovery().pending(), completed);
+        schedule.record_completed(PgId::new(1), task(1, 22).recovery().pending(), completed);
+        let soon = completed + Duration::from_millis(500);
+        let changed = schedule.ready(listing(vec![task(0, 11), task(1, 23)]), soon);
+        assert_eq!(
+            changed.tasks().iter().map(|task| task.pg_id()).collect::<Vec<_>>(),
+            vec![PgId::new(1)]
+        );
+        schedule.record_completed(PgId::new(1), task(1, 23).recovery().pending(), soon);
+        let later = completed + Duration::from_millis(1_001);
+        let ready = schedule.ready(listing(vec![task(0, 11), task(1, 23)]), later);
+        assert_eq!(
+            ready.tasks().iter().map(|task| task.pg_id()).collect::<Vec<_>>(),
+            vec![PgId::new(0)]
+        );
+        schedule.ready(listing(Vec::new()), later);
+        assert_eq!(
+            schedule
+                .ready(listing(vec![task(1, 23)]), later)
+                .tasks()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn blocked_pending_recovery_allows_peer_retry_and_new_discovery() {
+        use crate::control_plane::{
+            PendingMetadataCommandRecovery, PendingMetadataCommandRecoveryListing,
+            PendingMetadataCommandRecoveryTask,
+        };
+
+        let task = |pg_id| {
+            PendingMetadataCommandRecoveryTask::new(
+                PgId::new(pg_id),
+                PendingMetadataCommandRecovery::new(
+                    NodeId::new(1),
+                    PendingMetadataCommandObservation::new(
+                        ClusterEpoch::INITIAL,
+                        NonZeroU64::new(1).unwrap(),
+                        pg_id as u64 + 1,
+                    ),
+                ),
+            )
+        };
+        let listing = |tasks| PendingMetadataCommandRecoveryListing::new(tasks, Vec::new());
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+        let peer_attempts = std::sync::atomic::AtomicUsize::new(0);
+        let worker_gate = Arc::clone(&gate);
+        let outcomes = with_bounded_pending_recovery_workers(
+            |work| match work {
+                PendingMetadataCommandRecoveryWork::Target(item) => match item.pg_id().get() {
+                    0 => {
+                        first_started_tx.send(()).unwrap();
+                        let (lock, wake) = &*worker_gate;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = wake.wait(released).unwrap();
+                        }
+                        Err("first PG is blocked")
+                    }
+                    1 => {
+                        if peer_attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            Err("peer needs retry")
+                        } else {
+                            Ok(1)
+                        }
+                    }
+                    _ => Ok(1),
+                },
+                PendingMetadataCommandRecoveryWork::Fallback(_) => unreachable!(),
+            },
+            || {},
+            |sender, completions| {
+                let mut dispatch = PendingMetadataCommandRecoveryDispatch::default();
+                dispatch.submit_targets(listing(vec![task(0), task(1)]), Instant::now(), sender);
+                let first_started = first_started_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                let first_peer = completions.recv_timeout(Duration::from_secs(2));
+                let mut first_peer_failed = false;
+                let mut peer_retried = false;
+                let mut new_pg_finished = false;
+                if let Ok((work, finished, result)) = first_peer {
+                    first_peer_failed = matches!(work, PendingMetadataCommandRecoveryWork::Target(item)
+                        if item.pg_id() == PgId::new(1)) && result.is_err();
+                    dispatch.complete(work, finished, result.is_ok());
+                    dispatch.submit_targets(
+                        listing(vec![task(0), task(1)]),
+                        finished + Duration::from_millis(500),
+                        sender,
+                    );
+                    dispatch.submit_targets(
+                        listing(vec![task(0), task(1), task(2)]),
+                        finished + PENDING_METADATA_COMMAND_RECOVERY_RETRY_INTERVAL
+                            + Duration::from_millis(1),
+                        sender,
+                    );
+                    for _ in 0..2 {
+                        if let Ok((work, completed, result)) =
+                            completions.recv_timeout(Duration::from_secs(2))
+                        {
+                            if let PendingMetadataCommandRecoveryWork::Target(item) = work {
+                                if item.pg_id() == PgId::new(1) {
+                                    peer_retried = result.is_ok();
+                                } else if item.pg_id() == PgId::new(2) {
+                                    new_pg_finished = result.is_ok();
+                                }
+                            }
+                            dispatch.complete(work, completed, result.is_ok());
+                        }
+                    }
+                }
+                let (lock, wake) = &*gate;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+                (first_started, first_peer_failed, peer_retried, new_pg_finished)
+            },
+        );
+        assert!(outcomes.0, "first PG never entered recovery");
+        assert!(outcomes.1, "peer did not fail before its retry");
+        assert!(outcomes.2, "peer retry waited for blocked PG");
+        assert!(outcomes.3, "new PG discovery waited for blocked PG");
+        assert_eq!(peer_attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn pending_recovery_rotates_past_reeligible_low_pg_ids() {
+        use crate::control_plane::{
+            PendingMetadataCommandRecovery, PendingMetadataCommandRecoveryListing,
+            PendingMetadataCommandRecoveryTask,
+        };
+
+        let listing = || {
+            PendingMetadataCommandRecoveryListing::new(
+                (0..8)
+                    .map(|pg_id| {
+                        PendingMetadataCommandRecoveryTask::new(
+                            PgId::new(pg_id),
+                            PendingMetadataCommandRecovery::new(
+                                NodeId::new(1),
+                                PendingMetadataCommandObservation::new(
+                                    ClusterEpoch::INITIAL,
+                                    NonZeroU64::new(1).unwrap(),
+                                    pg_id as u64 + 1,
+                                ),
+                            ),
+                        )
+                    })
+                    .collect(),
+                Vec::new(),
+            )
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut dispatch = PendingMetadataCommandRecoveryDispatch::default();
+        let now = Instant::now();
+        dispatch.submit_targets(listing(), now, &sender);
+        let first = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(first.len(), PENDING_METADATA_COMMAND_RECOVERY_MAX_IN_FLIGHT);
+        for work in first {
+            dispatch.complete(work, now, false);
+        }
+        dispatch.submit_targets(listing(), now + Duration::from_secs(2), &sender);
+        let second = receiver
+            .try_iter()
+            .map(|work| match work {
+                PendingMetadataCommandRecoveryWork::Target(task) => task.pg_id().get(),
+                PendingMetadataCommandRecoveryWork::Fallback(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(second, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn due_fallback_takes_next_slot_before_reeligible_targets() {
+        use crate::control_plane::{
+            PendingMetadataCommandRecovery, PendingMetadataCommandRecoveryListing,
+            PendingMetadataCommandRecoveryTask,
+        };
+
+        let listing = || {
+            PendingMetadataCommandRecoveryListing::new(
+                (0..8)
+                    .map(|pg_id| {
+                        PendingMetadataCommandRecoveryTask::new(
+                            PgId::new(pg_id),
+                            PendingMetadataCommandRecovery::new(
+                                NodeId::new(1),
+                                PendingMetadataCommandObservation::new(
+                                    ClusterEpoch::INITIAL,
+                                    NonZeroU64::new(1).unwrap(),
+                                    pg_id as u64 + 1,
+                                ),
+                            ),
+                        )
+                    })
+                    .collect(),
+                Vec::new(),
+            )
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut dispatch = PendingMetadataCommandRecoveryDispatch::default();
+        let now = Instant::now();
+        dispatch.submit_targets(listing(), now, &sender);
+        let first = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(first.len(), PENDING_METADATA_COMMAND_RECOVERY_MAX_IN_FLIGHT);
+        dispatch.submit_fallback(1, now, &sender);
+        assert!(receiver.try_recv().is_err());
+        dispatch.complete(first[0], now, false);
+        dispatch.submit_fallback(1, now, &sender);
+        dispatch.submit_targets(listing(), now, &sender);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            PendingMetadataCommandRecoveryWork::Fallback(1)
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn pending_recovery_worker_panic_is_reported_before_coordinator_exits() {
+        let (panic_sender, panic_receiver) = std::sync::mpsc::channel();
+        let reported = with_bounded_pending_recovery_workers(
+            |_task: u8| -> Result<usize, ()> { panic!("injected recovery panic") },
+            || {
+                panic_sender.send(()).unwrap();
+            },
+            |sender, _| {
+                sender.send(1).unwrap();
+                panic_receiver.recv_timeout(Duration::from_secs(2)).is_ok()
+            },
+        );
+        assert!(reported, "worker failure was not supervised promptly");
+    }
+
+    #[test]
     fn pending_recovery_task_diagnostic_keeps_pg_and_bounded_cause() {
         let error = PendingMetadataCommandRefreshRecoveryError::Task {
             pg_id: 7,

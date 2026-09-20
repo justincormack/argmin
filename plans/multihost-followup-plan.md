@@ -1869,6 +1869,61 @@ terminal cleanup under failed-actor fencing. The protocol must reject divergent
 replica chains and survive leader failover, restart, and delayed failed-actor
 return. A faster batch cadence cannot resolve this dependency cycle.
 
+The September 20 mixed-workload outage also exposed a stale-floor variant:
+PG 12 retained a certified Peering floor at log index 10, two surviving actors
+agreed at index 14, and the primary held an unmarked pending slot at index 15.
+The current source selector rejects the primary for its slot and the clean
+replica for differing from the floor. Recovery of index 15 then waits for the
+powered-off actor before it can abandon or converge the slot. Resolving only
+index 15 would still leave the 10-to-14 floor gap. Implement the outage path as
+one exact, durable proof-lineage handoff:
+
+- Fence the old route and failed incarnation through a committed authority
+  transition before any partial-actor cleanup can remove the pending slot.
+  Retain the exact old route, unavailable observation, command identity, and
+  cleanup ownership through response loss, restart, and later actor return.
+- Obtain authenticated, bounded evidence from the available actors for every
+  command and checkpoint link after the certified floor. Validate the chain
+  from that floor, exact terminal dispositions, primary publication-start
+  marker, and actor agreement. A checksum-valid but divergent or missing link
+  must fail closed; equal tips alone do not certify the intervening chain.
+- An unmarked primary slot may be abandoned only by a fenced compare-and-set
+  under the primary PG command section, after proving no exact actor row
+  contradicts the marker-before-dispatch invariant. A marked or ambiguously
+  applied slot must retain and converge its exact command and dependency
+  ownership on the replacement route; it cannot be reclassified as abandoned
+  merely because an old actor is unreachable.
+- Persist the verified source proof and terminal disposition as a replicated
+  receipt that snapshot validation can reconstruct. Bind any source-floor
+  advance and batch begin to that receipt, not to a mutable current heartbeat.
+  Keep the replacement Peering until its imported proof and new-write shard
+  readiness are complete. The off-route actor's terminalization/catch-up is a
+  durable deferred obligation, and its old incarnation cannot serve or accept
+  delayed mutations after the fence.
+- Test unmarked, marked-before-witness, witness-only, primary-published, and
+  trailing-replica cases; divergent chains; response loss; leader and storage
+  restart; and the failed actor returning before and after activation. Include
+  the floor-10/tip-14/pending-15 composition, not only a one-command fixture.
+  The transition should still use the plural batch epoch boundary, with
+  epoch-neutral evidence and cleanup publication.
+
+Pending-command recovery scheduling is a separate latency bound. A failed PG
+must not make other PGs wait through its ten-second command budget; use a small
+fixed, persistent worker queue across discovery cycles, preserve per-PG single
+flight, and rate limit repeated failures so outage recovery does not amplify
+storage RPC load. Each task's retry floor starts at its own completion, not at
+dispatch or completion of a batch. Fallback scans share the bound and cannot
+block targeted discovery. A blocked PG must not delay another PG's retry or
+newly discovered work. Rotate the target scan after the last dispatched PG so
+continually reeligible low IDs cannot starve the tail, and admit due fallback
+work before refilling target slots. Worker panic must fail-stop directly rather
+than silently reducing pool capacity. Targeted and fallback workers share an
+exact per-PG claim held through each attempt; fallback skips a claimed PG
+before opening its recovery flight so it can reach other undiscovered work. A
+scan that skipped any claim is incomplete and must retain a bounded fallback
+retry even when its other PGs drained successfully; targeted discovery may
+omit the skipped PG by then.
+
 Deterministic replacement coverage must include multiple differently weighted
 eligible spares and a changing availability subset. It must prove that retries,
 authority failover, and subset changes preserve the ranking derived from the
