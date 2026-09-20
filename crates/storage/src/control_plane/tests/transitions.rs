@@ -8680,6 +8680,130 @@ fn published_pending_command_blocks_unavailable_pg_transfer_source() {
 }
 
 #[test]
+fn peering_floor_gap_with_pending_slot_does_not_certify_a_transfer_source() {
+    let (_tmp, _store, mut authority, pg_id) = certified_spare_authority();
+    for node_id in 1..=4 {
+        heartbeat_spare_node(&mut authority, node_id, 1_000 + u64::from(node_id));
+    }
+    let floor = PgMetadataProof::current(10, 0x1010, 0x2020);
+    let survivor_tip = PgMetadataProof::current(14, 0x1414, 0x2424);
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Peering,
+            floor,
+            false,
+            (2_000 + u64::from(node_id), 10_000),
+        );
+    }
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            2_004,
+        )
+        .unwrap();
+    let pending_epoch = authority.snapshot().cluster_epoch();
+    let pending =
+        PendingMetadataCommandObservation::new(pending_epoch, NonZeroU64::new(15).unwrap(), 0x1515);
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            node_id,
+            pg_id.get(),
+            PgState::Active,
+            floor,
+            false,
+            (
+                3_000 + u64::from(node_id),
+                if node_id == 3 { 100 } else { 10_000 },
+            ),
+        );
+    }
+    let mut primary = heartbeat_from_record(&authority, 1, pending_epoch, 3_101);
+    primary.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id,
+        state: PgState::Active,
+        metadata_proof: survivor_tip,
+        metadata_log_epoch: ClusterEpoch::INITIAL,
+        pending_metadata_command: Some(pending),
+    }];
+    primary.requested_lease_duration_ms = 10_000;
+    authority.heartbeat(primary, 3_101).unwrap();
+    heartbeat_with_pg_proof_and_lease_duration(
+        &mut authority,
+        2,
+        pg_id.get(),
+        PgState::Active,
+        survivor_tip,
+        false,
+        (3_102, 10_000),
+    );
+    let failed_deadline = authority
+        .snapshot()
+        .node(NodeId::new(3))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    authority.expire_heartbeat_leases(failed_deadline).unwrap();
+    for node_id in [1, 2, 4] {
+        heartbeat_spare_node(
+            &mut authority,
+            node_id,
+            failed_deadline + u64::from(node_id),
+        );
+    }
+    let peering_at_ms = authority.snapshot().max_committed_timestamp_ms().unwrap() + 1;
+    for node_id in 1..=2 {
+        let now_ms = peering_at_ms + u64::from(node_id);
+        let mut request = heartbeat_from_record(
+            &authority,
+            node_id,
+            authority.snapshot().cluster_epoch(),
+            now_ms,
+        );
+        request.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id,
+            state: PgState::Peering,
+            metadata_proof: survivor_tip,
+            metadata_log_epoch: ClusterEpoch::INITIAL,
+            pending_metadata_command: (node_id == 1).then_some(pending),
+        }];
+        request.requested_lease_duration_ms = 10_000;
+        authority.heartbeat(request, now_ms).unwrap();
+    }
+    assert_eq!(
+        authority
+            .snapshot()
+            .pg(pg_id)
+            .unwrap()
+            .peering_metadata_proof_floor(),
+        Some(floor)
+    );
+    assert!(authority
+        .snapshot()
+        .pending_metadata_command_recoveries()
+        .tasks()
+        .iter()
+        .any(|task| task.pg_id() == pg_id));
+    let snapshot = authority.snapshot().clone();
+    let begin_at_ms = snapshot
+        .unavailable_node_observation(NodeId::new(3))
+        .unwrap()
+        .observed_at_ms()
+        + 50;
+    assert!(snapshot
+        .begin_unavailable_pg_placement_transition_command(pg_id, NodeId::new(3), begin_at_ms)
+        .unwrap_err()
+        .to_string()
+        .contains("no proof-qualified serving metadata-transfer source"));
+    assert_eq!(authority.snapshot(), &snapshot);
+}
+
+#[test]
 fn unavailable_pg_transition_successor_consumes_retained_lineage_tip() {
     let (_tmp, _store, mut authority, pg_id) = certified_spare_authority_with_policy(
         5,

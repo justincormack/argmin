@@ -1878,32 +1878,124 @@ powered-off actor before it can abandon or converge the slot. Resolving only
 index 15 would still leave the 10-to-14 floor gap. Implement the outage path as
 one exact, durable proof-lineage handoff:
 
-- Fence the old route and failed incarnation through a committed authority
-  transition before any partial-actor cleanup can remove the pending slot.
-  Retain the exact old route, unavailable observation, command identity, and
-  cleanup ownership through response loss, restart, and later actor return.
+- Fence the old route and failed incarnation through a committed, epoch-neutral
+  outage-resolution intent before any partial-actor cleanup can remove the
+  pending slot. The intent CASes the exact old route, unavailable observation,
+  topology, command identity, and a finalized command-artifact manifest; its
+  observed publication state is provisional until the fence is effective.
+  Publish the exact command bytes as bounded, epoch-neutral Raft pages before
+  committing the intent. Each page and the manifest bind length, format,
+  generation, and digest; the state machine requires a complete, contiguous,
+  size-capped page set and snapshot-retains it until all cleanup/import
+  obligations are discharged. Orphaned pre-intent pages require bounded,
+  generation-fenced cleanup; completed manifests retain a compact replay
+  commitment after byte pruning. Never put an unbounded envelope in one intent
+  command or rely on the old primary as the only post-crash byte source.
+  The intent also fixes an authority-clock cutoff covering every previously
+  granted old-route lease and the maximum admitted in-flight RPC deadline,
+  derived from the committed lease-grant horizon and configured operation
+  bound rather than a caller-supplied timestamp. A new leader resumes the same
+  wait. Live actors may acknowledge an installed fence earlier; otherwise no
+  partial mutation starts until the durable cutoff passes. Held sessions must
+  revalidate the fence before each mutation and cannot outlive it. After the
+  wait, reacquire the old primary section and re-inspect exact marker/rows:
+  activity admitted before the cutoff may have changed the disposition.
+  An offline actor cannot acknowledge: on startup or reconnection
+  it must obtain and apply the authoritative per-PG fence floor *before*
+  opening storage RPC admission, including for delayed authenticated requests.
+  If authority is unavailable, it remains non-serving. A network-partitioned
+  old process is bounded by its existing lease and session-operation deadline.
+- Committing the intent is the irreversible boundary. A returning actor,
+  renewed lease, or changed topology may invalidate the originally proposed
+  plural begin, but must not cancel the intent or reopen the old route. After
+  either terminal or pending-transfer proof is committed, an epoch-neutral
+  successor-intent revision CASes the exact prior intent and current
+  topology/availability, preserves the original command decision and selected
+  proof, and selects an eligible destination.
+  A returned actor is eligible only after fenced rejoin and exact catch-up; a
+  different spare may be selected instead. If no safe destination exists,
+  retain the fenced Peering PG and retry/reconfigure rather than undo cleanup.
+  The plural begin consumes the latest intent revision and revalidates current
+  destination leases; subsequent revisions cannot alter a committed begin.
 - Obtain authenticated, bounded evidence from the available actors for every
   command and checkpoint link after the certified floor. Validate the chain
   from that floor, exact terminal dispositions, primary publication-start
   marker, and actor agreement. A checksum-valid but divergent or missing link
   must fail closed; equal tips alone do not certify the intervening chain.
+- Keep an observed higher-proof actor as a *non-serving evidence candidate*.
+  Do not give it the existing metadata read/export route, or advance the
+  Peering floor from matching heartbeat tips. Obtain its retained suffix under
+  an exact, transition-bound inspection capability; every page must link back
+  to the certified floor, including its pre-state digest. A later checkpoint
+  is not a substitute for missing links unless its own provenance proves that
+  exact floor-to-checkpoint interval. Cap evidence pages and retain their
+  canonical bytes or independently verifiable commitments through Raft replay
+  and snapshot validation. Only the final certificate may authorize export
+  from the clean candidate at its verified tip.
 - An unmarked primary slot may be abandoned only by a fenced compare-and-set
-  under the primary PG command section, after proving no exact actor row
-  contradicts the marker-before-dispatch invariant. A marked or ambiguously
-  applied slot must retain and converge its exact command and dependency
-  ownership on the replacement route; it cannot be reclassified as abandoned
-  merely because an old actor is unreachable.
-- Persist the verified source proof and terminal disposition as a replicated
-  receipt that snapshot validation can reconstruct. Bind any source-floor
-  advance and batch begin to that receipt, not to a mutable current heartbeat.
-  Keep the replacement Peering until its imported proof and new-write shard
-  readiness are complete. The off-route actor's terminalization/catch-up is a
-  durable deferred obligation, and its old incarnation cannot serve or accept
-  delayed mutations after the fence.
+  under the primary PG command section. Normal fanout durably marks the slot
+  before dispatch to the lowest-ID non-primary witness, then applies the
+  primary, then the remaining replicas. For PG 12 the surviving node 3 is
+  that witness: its absence of *any* index-15 row, together with the held
+  primary section and an unmarked exact slot, can exclude publication to the
+  offline trailing node 4. Check the complete replacement lineage and hash
+  chain, not only the latest command identity. The authority fence must
+  prevent any previously issued old-route capability from applying afterward;
+  otherwise absence observed before the fence is not stable. A marked,
+  witnessed, or ambiguously applied slot must instead retain and converge its
+  exact command and dependency ownership on the replacement route; it cannot
+  be reclassified as abandoned merely because an old actor is unreachable.
+- Terminalization changes the log proof: normal pending-slot removal requires
+  an exact terminal row. For the unmarked case, write the abandonment tombstone
+  on each surviving old-route actor under the fence. A crash between actors
+  must resume the same tombstone from the durable intent, while the primary
+  slot remains in place. Commit a replicated terminal receipt containing the
+  validated floor-to-tip evidence, exact disposition, command identity, and
+  cleanup dependencies *before* removing the primary slot. After a lost
+  receipt response, exact replay recovers the same receipt; after slot removal,
+  the receipt owns idempotent dependency release and the offline actor's
+  deferred obligation until both finish. For a marked or witnessed command,
+  converge its exact published command to a terminal receipt where possible;
+  never substitute an abandonment. If the command must remain pending, commit
+  a distinct replicated pending-transfer proof instead. It binds the exact
+  command-artifact manifest, predecessor/replacement lineage, old-route actor
+  observations and publication marker, chosen source proof, and exclusive
+  ownership of the slot and every cleanup dependency. It is not a terminal
+  receipt and cannot authorize release or slot removal. Transfer/install must
+  reproduce those bytes and dependencies on the destination route, fencing the
+  old owner; activation remains prohibited until exact convergence produces a
+  terminal receipt and discharges the pending-transfer proof. Without a clean
+  source matching the chosen proof, remain fenced and continue convergence;
+  do not authorize speculative export. Do not commit begin against a
+  pre-terminal proof and then export a different proof.
+- Persist the verified *post-terminal* source proof and disposition in the
+  terminal receipt, or the still-pending command and source proof in the
+  mutually exclusive pending-transfer proof. Snapshot validation reconstructs
+  either proof from the complete paged artifact, actor evidence, and dependency
+  ownership. Atomically CAS the latest fenced intent revision, old route,
+  original floor, candidate identity and resulting tip, exactly one of those
+  proofs, and current topology/destination leases into the plural begin;
+  a response-loss replay must reproduce the same decision. Bind source-floor
+  advance and export authorization to the selected proof, not to a mutable
+  current heartbeat. The terminalization/inspection phase is epoch-neutral, so
+  PGs still share the plural begin epoch. Keep the replacement Peering until its
+  imported proof and new-write shard readiness are complete. The off-route
+  actor's terminalization/catch-up is a durable deferred obligation, and its
+  old incarnation cannot serve or accept delayed mutations after the fence.
 - Test unmarked, marked-before-witness, witness-only, primary-published, and
   trailing-replica cases; divergent chains; response loss; leader and storage
   restart; and the failed actor returning before and after activation. Include
   the floor-10/tip-14/pending-15 composition, not only a one-command fixture.
+  Test return or topology change after the intent and first tombstone but
+  before begin, including no eligible spare and a successor-intent revision;
+  restart after terminal rows but before receipt, after receipt but before slot
+  removal, and after slot removal but before dependency release. Test an
+  offline actor's first RPC before authority refresh and a delayed signed
+  request after fenced rejoin; neither may mutate the old route. Test a marked
+  command transferred while pending, including failover before import and
+  activation rejection until terminal convergence. Test a maximum-size command
+  spanning pages, a missing/corrupt page, and failover during the durable
+  lease-wait cutoff with an old session completing just before it.
   The transition should still use the plural batch epoch boundary, with
   epoch-neutral evidence and cleanup publication.
 

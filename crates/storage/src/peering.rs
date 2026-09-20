@@ -6,9 +6,10 @@ use crate::control_plane::CanonicalStateDigest;
 use crate::control_plane::{MetadataCommandLogHash, PgMetadataProof};
 use crate::error::{BucketSnapshotLoadError, PgMetadataTransferError, StoreError};
 use crate::metadata_command::{
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogHashRangeEntry,
-    MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
-    MetadataCommandReplicaState, MetadataTransferCommand,
+    abandoned_command_log_bytes, metadata_command_log_hash, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex,
+    MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind, MetadataCommandReplicaState,
+    MetadataTransferCommand,
 };
 use crate::pg_store::MetadataCommandCheckpoint;
 use crate::types::{ClusterEpoch, PgId, PgState};
@@ -224,8 +225,201 @@ pub(crate) enum PgPeeringReconstructionError {
         expected_previous_log_hash: u64,
         actual_previous_log_hash: u64,
     },
+    #[error("PG peering node {node_id:?} retained command-log entry {log_index} for PG {pg_id} is invalid: {reason}")]
+    InvalidRetainedCommandLogEntry {
+        node_id: NodeId,
+        pg_id: PgId,
+        log_index: u64,
+        reason: &'static str,
+    },
+    #[error("PG peering node {node_id:?} retained command-log entry {log_index} has log hash {actual_log_hash:#018X}, expected {expected_log_hash:#018X}")]
+    RetainedCommandLogHashMismatch {
+        node_id: NodeId,
+        log_index: u64,
+        expected_log_hash: u64,
+        actual_log_hash: u64,
+    },
+    #[error("PG peering node {node_id:?} retained command-log chain ends at {actual:?}, expected {expected:?}")]
+    RetainedCommandLogTipMismatch {
+        node_id: NodeId,
+        expected: PgMetadataProof,
+        actual: PgMetadataProof,
+    },
     #[error("PG peering node {node_id:?} retained command-log entry {log_index} is abandoned and cannot be replayed from retained payloads")]
     UnreplayableAbandonedCommandLogEntry { node_id: NodeId, log_index: u64 },
+}
+
+pub(crate) struct PgMetadataRetainedChainVerifier {
+    node_id: NodeId,
+    pg_id: PgId,
+    log_epoch: ClusterEpoch,
+    proof: PgMetadataProof,
+}
+
+impl PgMetadataRetainedChainVerifier {
+    pub(crate) fn new(
+        node_id: NodeId,
+        pg_id: PgId,
+        log_epoch: ClusterEpoch,
+        certified_floor: PgMetadataProof,
+    ) -> Self {
+        Self {
+            node_id,
+            pg_id,
+            log_epoch,
+            proof: certified_floor,
+        }
+    }
+
+    pub(crate) fn append_page(
+        &mut self,
+        entries: &[MetadataCommandLogRangeEntry],
+    ) -> Result<(), PgPeeringReconstructionError> {
+        let mut proof = self.proof;
+        for entry in entries {
+            let expected_index = proof.applied_log_index().checked_add(1).ok_or(
+                PgPeeringReconstructionError::InvalidRetainedCommandLogEntry {
+                    node_id: self.node_id,
+                    pg_id: self.pg_id,
+                    log_index: entry.log_index,
+                    reason: "log index overflow",
+                },
+            )?;
+            if entry.log_index != expected_index {
+                return Err(
+                    PgPeeringReconstructionError::MissingRetainedCommandLogEntry {
+                        node_id: self.node_id,
+                        log_index: expected_index,
+                    },
+                );
+            }
+            let log_index = MetadataCommandLogIndex::new(entry.log_index)
+                .expect("successor of a metadata proof index is nonzero");
+            let command_id = MetadataCommandId::new(self.log_epoch, self.pg_id, log_index);
+            let invalid = |reason| PgPeeringReconstructionError::InvalidRetainedCommandLogEntry {
+                node_id: self.node_id,
+                pg_id: self.pg_id,
+                log_index: entry.log_index,
+                reason,
+            };
+            if entry.previous_log_hash != proof.applied_log_hash() {
+                return Err(PgPeeringReconstructionError::RetainedCommandLogFork {
+                    node_id: self.node_id,
+                    log_index: entry.log_index,
+                    expected_previous_log_hash: proof.applied_log_hash().value(),
+                    actual_previous_log_hash: entry.previous_log_hash.value(),
+                });
+            }
+            let pre_state_digest = entry.pre_state_digest.ok_or(
+                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                    node_id: self.node_id,
+                    pg_id: self.pg_id,
+                    log_index: entry.log_index,
+                },
+            )?;
+            let post_state_digest = entry.post_state_digest.ok_or(
+                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                    node_id: self.node_id,
+                    pg_id: self.pg_id,
+                    log_index: entry.log_index,
+                },
+            )?;
+            if pre_state_digest != proof.state_digest() {
+                return Err(
+                    PgPeeringReconstructionError::RetainedCommandStateDigestFork {
+                        node_id: self.node_id,
+                        pg_id: self.pg_id,
+                        log_index: entry.log_index,
+                        expected_pre_state_digest: proof.state_digest().value(),
+                        actual_pre_state_digest: pre_state_digest.value(),
+                        post_state_digest: post_state_digest.value(),
+                    },
+                );
+            }
+            let checksum = match &entry.kind {
+                MetadataCommandLogRangeEntryKind::Applied(command) => {
+                    if command.id() != command_id {
+                        return Err(invalid("command identity does not match log row"));
+                    }
+                    let checksum = checksum::crc64::checksum(&command.command_bytes());
+                    if checksum != command.checksum_crc64() {
+                        return Err(invalid("command checksum does not match canonical bytes"));
+                    }
+                    checksum
+                }
+                MetadataCommandLogRangeEntryKind::Abandoned {
+                    original_command_checksum,
+                } => {
+                    if post_state_digest != pre_state_digest {
+                        return Err(invalid("abandonment changed the metadata digest"));
+                    }
+                    checksum::crc64::checksum(&abandoned_command_log_bytes(
+                        command_id,
+                        *original_command_checksum,
+                    ))
+                }
+            };
+            let expected_log_hash = metadata_command_log_hash(
+                self.log_epoch,
+                self.pg_id,
+                log_index,
+                entry.previous_log_hash.value(),
+                checksum,
+            );
+            if entry.log_hash != expected_log_hash {
+                return Err(
+                    PgPeeringReconstructionError::RetainedCommandLogHashMismatch {
+                        node_id: self.node_id,
+                        log_index: entry.log_index,
+                        expected_log_hash: expected_log_hash.value(),
+                        actual_log_hash: entry.log_hash.value(),
+                    },
+                );
+            }
+            proof =
+                PgMetadataProof::from_carriers(entry.log_index, entry.log_hash, post_state_digest);
+        }
+        self.proof = proof;
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        self,
+        expected_tip: PgMetadataProof,
+    ) -> Result<(), PgPeeringReconstructionError> {
+        if self.proof.applied_log_index() == expected_tip.applied_log_index() {
+            if self.proof.applied_log_hash() != expected_tip.applied_log_hash() {
+                return Err(PgPeeringReconstructionError::RetainedCommandLogFork {
+                    node_id: self.node_id,
+                    log_index: expected_tip.applied_log_index(),
+                    expected_previous_log_hash: self.proof.applied_log_hash().value(),
+                    actual_previous_log_hash: expected_tip.applied_log_hash().value(),
+                });
+            }
+            if self.proof.state_digest() != expected_tip.state_digest() {
+                return Err(
+                    PgPeeringReconstructionError::RetainedCommandStateDigestFork {
+                        node_id: self.node_id,
+                        pg_id: self.pg_id,
+                        log_index: expected_tip.applied_log_index(),
+                        expected_pre_state_digest: expected_tip.state_digest().value(),
+                        actual_pre_state_digest: self.proof.state_digest().value(),
+                        post_state_digest: self.proof.state_digest().value(),
+                    },
+                );
+            }
+        }
+        if self.proof != expected_tip {
+            return Err(
+                PgPeeringReconstructionError::RetainedCommandLogTipMismatch {
+                    node_id: self.node_id,
+                    expected: expected_tip,
+                    actual: self.proof,
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -499,8 +693,6 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
             },
         );
     };
-    let mut expected_previous_log_hash = first_retained.previous_log_hash;
-    let mut expected_pre_state_digest = Some(base_state_digest);
     let base_proof = PgMetadataProof::from_carriers(
         first_retained_log_index - 1,
         first_retained.previous_log_hash,
@@ -512,92 +704,23 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
     } else {
         PgMetadataTransferBaseKind::RetainedLogPrefix
     };
-    for log_index in first_retained_log_index..=state.applied_log_index {
-        let retained = retained_log_entries
-            .iter()
-            .find(|entry| entry.log_index == log_index)
-            .ok_or(
-                PgPeeringReconstructionError::MissingRetainedCommandLogEntry {
-                    node_id: source_node_id,
-                    log_index,
-                },
-            )?;
-        if retained.previous_log_hash != expected_previous_log_hash {
-            return Err(PgPeeringReconstructionError::RetainedCommandLogFork {
-                node_id: source_node_id,
-                log_index,
-                expected_previous_log_hash: expected_previous_log_hash.value(),
-                actual_previous_log_hash: retained.previous_log_hash.value(),
-            });
-        }
-        if matches!(
-            &retained.kind,
+    if let Some(abandoned) = retained_log_entries.iter().find(|entry| {
+        matches!(
+            &entry.kind,
             MetadataCommandLogRangeEntryKind::Abandoned { .. }
-        ) {
-            return Err(
-                PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry {
-                    node_id: source_node_id,
-                    log_index,
-                },
-            );
-        }
-        let Some(pre_state_digest) = retained.pre_state_digest else {
-            return Err(
-                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
-                    node_id: source_node_id,
-                    pg_id,
-                    log_index,
-                },
-            );
-        };
-        let Some(post_state_digest) = retained.post_state_digest else {
-            return Err(
-                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
-                    node_id: source_node_id,
-                    pg_id,
-                    log_index,
-                },
-            );
-        };
-        let expected = expected_pre_state_digest
-            .expect("metadata transfer retained suffix should have a base state digest");
-        if pre_state_digest != expected {
-            return Err(
-                PgPeeringReconstructionError::RetainedCommandStateDigestFork {
-                    node_id: source_node_id,
-                    pg_id,
-                    log_index,
-                    expected_pre_state_digest: expected.value(),
-                    actual_pre_state_digest: pre_state_digest.value(),
-                    post_state_digest: post_state_digest.value(),
-                },
-            );
-        }
-        expected_pre_state_digest = Some(post_state_digest);
-        expected_previous_log_hash = retained.log_hash;
+        )
+    }) {
+        return Err(
+            PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry {
+                node_id: source_node_id,
+                log_index: abandoned.log_index,
+            },
+        );
     }
-    if expected_previous_log_hash != state.applied_log_hash {
-        return Err(PgPeeringReconstructionError::RetainedCommandLogFork {
-            node_id: source_node_id,
-            log_index: state.applied_log_index,
-            expected_previous_log_hash: expected_previous_log_hash.value(),
-            actual_previous_log_hash: state.applied_log_hash.value(),
-        });
-    }
-    if let Some(final_state_digest) = expected_pre_state_digest {
-        if final_state_digest != state.state_digest {
-            return Err(
-                PgPeeringReconstructionError::RetainedCommandStateDigestFork {
-                    node_id: source_node_id,
-                    pg_id,
-                    log_index: state.applied_log_index,
-                    expected_pre_state_digest: state.state_digest.value(),
-                    actual_pre_state_digest: final_state_digest.value(),
-                    post_state_digest: final_state_digest.value(),
-                },
-            );
-        }
-    }
+    let mut verifier =
+        PgMetadataRetainedChainVerifier::new(source_node_id, pg_id, cluster_epoch, base_proof);
+    verifier.append_page(&retained_log_entries)?;
+    verifier.finish(proof_from_replica_state(state))?;
 
     Ok(PgMetadataTransferArtifact {
         pg_id,
@@ -892,7 +1015,10 @@ mod tests {
                 MetadataCommandLogIndex::new(log_index).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config_for_test(&config, 1, log_index).unwrap(),
+                CreateBucketCommand::from_config_with_fixed_upload_id_key_for_test(
+                    &config, 1, log_index,
+                )
+                .unwrap(),
             ),
         )
     }
@@ -956,7 +1082,14 @@ mod tests {
 
         for offset in 0..len {
             let log_index = first_log_index + offset as u64;
-            let log_hash = derived_transfer_value(seed, log_index, 0x4841_5348);
+            let log_hash = metadata_command_log_hash(
+                ClusterEpoch::INITIAL,
+                PgId::new(7),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+                previous_log_hash,
+                command(log_index).checksum_crc64(),
+            )
+            .value();
             let post_state_digest = derived_transfer_value(seed, log_index, 0x0053_5441_5445);
             retained_entries.push(retained_transfer_entry(
                 log_index,
@@ -978,6 +1111,188 @@ mod tests {
             ),
             retained_entries,
         )
+    }
+
+    fn outage_chain_with_abandonment() -> (
+        PgMetadataProof,
+        Vec<MetadataCommandLogRangeEntry>,
+        PgMetadataProof,
+        PgMetadataProof,
+    ) {
+        let log_epoch = ClusterEpoch::new(16).unwrap();
+        let pg_id = PgId::new(12);
+        let floor = PgMetadataProof::from_carriers(
+            10,
+            MetadataCommandLogHash::for_test(3439484954540676867),
+            CanonicalStateDigest::for_test(13956199312537336264),
+        );
+        let mut proof = floor;
+        let mut rows = Vec::new();
+        for index in 11..=14 {
+            let id = MetadataCommandId::new(
+                log_epoch,
+                pg_id,
+                MetadataCommandLogIndex::new(index).unwrap(),
+            );
+            let command = MetadataCommandEnvelope::new(id, command(index).payload().clone());
+            let post_digest = CanonicalStateDigest::for_test(proof.state_digest().value() + index);
+            let log_hash = metadata_command_log_hash(
+                log_epoch,
+                pg_id,
+                id.log_index(),
+                proof.applied_log_hash().value(),
+                command.checksum_crc64(),
+            );
+            rows.push(MetadataCommandLogRangeEntry {
+                log_index: index,
+                previous_log_hash: proof.applied_log_hash(),
+                log_hash,
+                pre_state_digest: Some(proof.state_digest()),
+                post_state_digest: Some(post_digest),
+                kind: MetadataCommandLogRangeEntryKind::Applied(Box::new(command)),
+            });
+            proof = PgMetadataProof::from_carriers(index, log_hash, post_digest);
+        }
+        let pre_terminal = proof;
+        let terminal_id =
+            MetadataCommandId::new(log_epoch, pg_id, MetadataCommandLogIndex::new(15).unwrap());
+        let original_checksum = 7650087655367533823;
+        let tombstone_checksum =
+            checksum::crc64::checksum(&abandoned_command_log_bytes(terminal_id, original_checksum));
+        let terminal_hash = metadata_command_log_hash(
+            log_epoch,
+            pg_id,
+            terminal_id.log_index(),
+            proof.applied_log_hash().value(),
+            tombstone_checksum,
+        );
+        rows.push(MetadataCommandLogRangeEntry {
+            log_index: 15,
+            previous_log_hash: proof.applied_log_hash(),
+            log_hash: terminal_hash,
+            pre_state_digest: Some(proof.state_digest()),
+            post_state_digest: Some(proof.state_digest()),
+            kind: MetadataCommandLogRangeEntryKind::Abandoned {
+                original_command_checksum: original_checksum,
+            },
+        });
+        (
+            floor,
+            rows,
+            pre_terminal,
+            PgMetadataProof::from_carriers(15, terminal_hash, proof.state_digest()),
+        )
+    }
+
+    #[test]
+    fn outage_chain_verifies_floor_gap_and_terminal_tombstone_across_pages() {
+        let (floor, rows, pre_terminal, terminal) = outage_chain_with_abandonment();
+        for node_id in [NodeId::new(1), NodeId::new(3)] {
+            let mut verifier = PgMetadataRetainedChainVerifier::new(
+                node_id,
+                PgId::new(12),
+                ClusterEpoch::new(16).unwrap(),
+                floor,
+            );
+            verifier.append_page(&rows[..2]).unwrap();
+            verifier.append_page(&rows[2..4]).unwrap();
+            verifier.append_page(&rows[4..]).unwrap();
+            verifier.finish(terminal).unwrap();
+        }
+        let mut verifier = PgMetadataRetainedChainVerifier::new(
+            NodeId::new(3),
+            PgId::new(12),
+            ClusterEpoch::new(16).unwrap(),
+            floor,
+        );
+        verifier.append_page(&rows[..4]).unwrap();
+        verifier.finish(pre_terminal).unwrap();
+    }
+
+    #[test]
+    fn outage_chain_rejects_missing_forked_and_misbound_evidence() {
+        let (floor, rows, _, terminal) = outage_chain_with_abandonment();
+        let verify = |entries: &[MetadataCommandLogRangeEntry]| {
+            let mut verifier = PgMetadataRetainedChainVerifier::new(
+                NodeId::new(3),
+                PgId::new(12),
+                ClusterEpoch::new(16).unwrap(),
+                floor,
+            );
+            verifier.append_page(entries)?;
+            verifier.finish(terminal)
+        };
+        assert!(matches!(
+            verify(&rows[1..]),
+            Err(PgPeeringReconstructionError::MissingRetainedCommandLogEntry { log_index: 11, .. })
+        ));
+        let mut forked = rows.clone();
+        forked[2].previous_log_hash = floor.applied_log_hash();
+        assert!(matches!(
+            verify(&forked),
+            Err(PgPeeringReconstructionError::RetainedCommandLogFork { log_index: 13, .. })
+        ));
+        let mut wrong_hash = rows.clone();
+        wrong_hash[0].log_hash = floor.applied_log_hash();
+        assert!(matches!(
+            verify(&wrong_hash),
+            Err(PgPeeringReconstructionError::RetainedCommandLogHashMismatch { log_index: 11, .. })
+        ));
+        let mut wrong_epoch = rows.clone();
+        let MetadataCommandLogRangeEntryKind::Applied(command) = &rows[0].kind else {
+            unreachable!()
+        };
+        wrong_epoch[0].kind =
+            MetadataCommandLogRangeEntryKind::Applied(Box::new(MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    ClusterEpoch::new(17).unwrap(),
+                    PgId::new(12),
+                    MetadataCommandLogIndex::new(11).unwrap(),
+                ),
+                command.payload().clone(),
+            )));
+        assert!(matches!(
+            verify(&wrong_epoch),
+            Err(PgPeeringReconstructionError::InvalidRetainedCommandLogEntry { log_index: 11, .. })
+        ));
+        let mut changed_tombstone = rows.clone();
+        changed_tombstone[4].post_state_digest = Some(CanonicalStateDigest::for_test(1));
+        assert!(matches!(
+            verify(&changed_tombstone),
+            Err(PgPeeringReconstructionError::InvalidRetainedCommandLogEntry { log_index: 15, .. })
+        ));
+        let mut wrong_tombstone_checksum = rows.clone();
+        wrong_tombstone_checksum[4].kind = MetadataCommandLogRangeEntryKind::Abandoned {
+            original_command_checksum: 1,
+        };
+        assert!(matches!(
+            verify(&wrong_tombstone_checksum),
+            Err(PgPeeringReconstructionError::RetainedCommandLogHashMismatch { log_index: 15, .. })
+        ));
+        assert!(matches!(
+            verify(&rows[..4]),
+            Err(PgPeeringReconstructionError::RetainedCommandLogTipMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rejected_evidence_page_does_not_advance_the_verified_floor() {
+        let (floor, rows, _, terminal) = outage_chain_with_abandonment();
+        let mut verifier = PgMetadataRetainedChainVerifier::new(
+            NodeId::new(3),
+            PgId::new(12),
+            ClusterEpoch::new(16).unwrap(),
+            floor,
+        );
+        let mut corrupt_page = rows[..2].to_vec();
+        corrupt_page[1].log_hash = floor.applied_log_hash();
+        assert!(matches!(
+            verifier.append_page(&corrupt_page),
+            Err(PgPeeringReconstructionError::RetainedCommandLogHashMismatch { log_index: 12, .. })
+        ));
+        verifier.append_page(&rows[..2]).unwrap();
+        verifier.append_page(&rows[2..]).unwrap();
+        verifier.finish(terminal).unwrap();
     }
 
     #[derive(Clone, Copy, Debug)]

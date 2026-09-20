@@ -2452,7 +2452,7 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         first_log_index: MetadataCommandLogIndex,
         last_log_index: MetadataCommandLogIndex,
     ) -> Result<Vec<MetadataCommandLogHashRangeEntry>, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
+        if cluster_epoch > self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: pg_id.get(),
                 operation_epoch: cluster_epoch,
@@ -2488,7 +2488,7 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         first_log_index: MetadataCommandLogIndex,
         last_log_index: MetadataCommandLogIndex,
     ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
+        if cluster_epoch > self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: pg_id.get(),
                 operation_epoch: cluster_epoch,
@@ -2915,6 +2915,10 @@ impl ShardReadHandleLease for UnixStorageNodeReadHandleLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_rpc::{
+        StorageRpcMetadataCommandLogEntryRangeResponse,
+        StorageRpcMetadataCommandLogHashRangeResponse,
+    };
     use crate::storage_rpc_transport::accepted_unix_stream;
     use std::os::unix::net::UnixStream;
 
@@ -2922,6 +2926,87 @@ mod tests {
         Arc::new(UnixStorageNodeRpcAdmission::new(1))
             .try_acquire_for_test()
             .unwrap()
+    }
+
+    #[test]
+    fn peering_session_reads_retained_entries_from_an_older_log_epoch() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pg_id = PgId::new(3);
+        let log_epoch = ClusterEpoch::new(4).unwrap();
+        let route_epoch = ClusterEpoch::new(7).unwrap();
+        let server = std::thread::spawn(move || {
+            for kind in [
+                StorageRpcMessageKind::MetadataCommandRetainedLogHashes,
+                StorageRpcMessageKind::MetadataCommandRetainedLogEntries,
+            ] {
+                let request =
+                    crate::storage_rpc::read_storage_rpc_frame_from(&mut server_stream).unwrap();
+                assert_eq!(request.kind, kind);
+                let range = crate::storage_rpc::decode_metadata_command_log_hash_range_request(
+                    &request.payload,
+                )
+                .unwrap();
+                assert_eq!(range.cluster_epoch, log_epoch);
+                assert_eq!(range.pg_id, pg_id);
+                let payload = match kind {
+                    StorageRpcMessageKind::MetadataCommandRetainedLogHashes => {
+                        crate::storage_rpc::encode_metadata_command_log_hash_range_response(
+                            &StorageRpcMetadataCommandLogHashRangeResponse { entries: vec![] },
+                        )
+                        .unwrap()
+                    }
+                    StorageRpcMessageKind::MetadataCommandRetainedLogEntries => {
+                        crate::storage_rpc::encode_metadata_command_log_entry_range_response(
+                            &StorageRpcMetadataCommandLogEntryRangeResponse { entries: vec![] },
+                        )
+                        .unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                crate::storage_rpc::write_storage_rpc_frame_to(
+                    &mut server_stream,
+                    &StorageRpcFrame {
+                        request_id: request.request_id,
+                        kind,
+                        payload: crate::storage_rpc::encode_storage_rpc_success_response(&payload),
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let io_timeout = Duration::from_secs(1);
+        let session = UnixStorageNodeMetadataCommandSession {
+            node_id: NodeId::new(7),
+            cluster_epoch: route_epoch,
+            rpc_auth: None,
+            _rpc_permit: test_rpc_admission_permit(),
+            inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
+                stream: accepted_unix_stream(client_stream, Instant::now() + io_timeout).unwrap(),
+                next_request_id: 1,
+                io_timeout,
+                pg_id,
+                released: false,
+            }),
+        };
+        let first = MetadataCommandLogIndex::new(1).unwrap();
+        assert!(session
+            .retained_metadata_command_log_hashes(pg_id, log_epoch, first, first)
+            .unwrap()
+            .is_empty());
+        assert!(session
+            .retained_metadata_command_log_entries(pg_id, log_epoch, first, first)
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            session.retained_metadata_command_log_entries(
+                pg_id,
+                ClusterEpoch::new(8).unwrap(),
+                first,
+                first,
+            ),
+            Err(StoreError::StalePayloadOperation { .. })
+        ));
+        server.join().unwrap();
     }
 
     #[test]
