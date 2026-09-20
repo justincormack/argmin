@@ -3,16 +3,25 @@
 
 # argmin
 
-S3-compatible object storage written in Rust.
+S3-compatible multihost object storage written in Rust.
 
 Current status: not yet suited for production use, fine for local use cases like CI. There is
-still work to do to get this production ready, see [plans](plans/) for details. Currently
-upgrades are not supported, this will be supported from the first tagged version, which
-should happen shortly.
+still work to do to get this production ready.
+
+Single (currently 34MB) binary with minimal dependencies.
 
 AI notice: this code was written with AI, with detailed care, attention and supervision.
 
 Development has focused on correctness, security and data safety over raw performance. 
+
+What is needed to be production ready
+- Implement version upgrades and backwards compatibility for format changes.
+- Production observability.
+- Further failure case testing.
+- Operational tooling.
+- Operational recipes eg for Kubernetes.
+
+Currently working on distributed failure testing to improve robustness and correctness.
 
 ## Prerequisites
 
