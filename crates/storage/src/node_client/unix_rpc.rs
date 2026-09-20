@@ -2339,9 +2339,29 @@ impl UnixStorageNodeClient {
         pg_id: PgId,
         deadline: Instant,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.metadata_command_replica_state_at_route_epoch_until(
+            pg_id,
+            self.cluster_epoch,
+            deadline,
+        )
+    }
+
+    fn metadata_command_replica_state_at_route_epoch_until(
+        &self,
+        pg_id: PgId,
+        inspection_route_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        if inspection_route_epoch > self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: inspection_route_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
         let request = StorageRpcMetadataCommandStateRequest {
             node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
+            cluster_epoch: inspection_route_epoch,
             pg_id,
         };
         let payload = encode_metadata_command_state_request(&request);
@@ -2534,8 +2554,40 @@ impl UnixStorageNodeClient {
             StorageRpcMessageKind::MetadataCommandRetainedLogEntries,
             payload,
         )?;
+        self.decode_retained_metadata_command_log_entries(&response)
+    }
+
+    fn retained_metadata_command_log_entries_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+        deadline: Instant,
+    ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError> {
+        let payload = encode_metadata_command_log_hash_range_request(
+            &StorageRpcMetadataCommandLogHashRangeRequest {
+                node_id: self.node_id,
+                cluster_epoch,
+                pg_id,
+                first_log_index,
+                last_log_index,
+            },
+        );
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandRetainedLogEntries,
+            payload,
+            deadline,
+        )?;
+        self.decode_retained_metadata_command_log_entries(&response)
+    }
+
+    fn decode_retained_metadata_command_log_entries(
+        &self,
+        response: &[u8],
+    ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError> {
         decode_metadata_command_log_entry_range_response(
-            &response,
+            response,
             &MetadataCommandDecodeAuthority::new(),
         )
         .map(|response| response.entries)
@@ -2562,6 +2614,16 @@ impl UnixStorageNodeClient {
         cluster_epoch: ClusterEpoch,
     ) -> Result<PendingMetadataCommandInspection, StoreError> {
         self.pending_metadata_command_response_at_epoch(pg_id, cluster_epoch)
+            .map(Self::inspection_from_pending_response)
+    }
+
+    fn pending_metadata_command_inspection_at_epoch_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<PendingMetadataCommandInspection, StoreError> {
+        self.pending_metadata_command_response_at_epoch_until(pg_id, cluster_epoch, deadline)
             .map(Self::inspection_from_pending_response)
     }
 
@@ -4282,6 +4344,15 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         self.pending_metadata_command_inspection_at_epoch(pg_id, cluster_epoch)
     }
 
+    fn pending_metadata_command_inspection_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<PendingMetadataCommandInspection, StoreError> {
+        self.pending_metadata_command_inspection_at_epoch_until(pg_id, cluster_epoch, deadline)
+    }
+
     fn pending_metadata_command_envelope_until(
         &self,
         pg_id: PgId,
@@ -4305,6 +4376,20 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         deadline: Instant,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         UnixStorageNodeClient::metadata_command_replica_state_until(self, pg_id, deadline)
+    }
+
+    fn metadata_command_replica_state_at_route_epoch_until(
+        &self,
+        pg_id: PgId,
+        inspection_route_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        UnixStorageNodeClient::metadata_command_replica_state_at_route_epoch_until(
+            self,
+            pg_id,
+            inspection_route_epoch,
+            deadline,
+        )
     }
 
     fn metadata_command_checkpoint(
@@ -4419,6 +4504,24 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
             cluster_epoch,
             first_log_index,
             last_log_index,
+        )
+    }
+
+    fn retained_metadata_command_log_entries_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+        deadline: Instant,
+    ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError> {
+        UnixStorageNodeClient::retained_metadata_command_log_entries_until(
+            self,
+            pg_id,
+            cluster_epoch,
+            first_log_index,
+            last_log_index,
+            deadline,
         )
     }
 

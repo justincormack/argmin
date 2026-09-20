@@ -1593,6 +1593,13 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
     ) -> Result<PendingMetadataCommandInspection, StoreError>;
 
+    fn pending_metadata_command_inspection_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<PendingMetadataCommandInspection, StoreError>;
+
     fn pending_metadata_command_envelope_until(
         &self,
         pg_id: PgId,
@@ -1613,6 +1620,13 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         require_metadata_command_operation_deadline(deadline)?;
         self.metadata_command_replica_state(pg_id)
     }
+
+    fn metadata_command_replica_state_at_route_epoch_until(
+        &self,
+        pg_id: PgId,
+        inspection_route_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
 
     fn metadata_command_checkpoint(
         &self,
@@ -1698,6 +1712,15 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
         first_log_index: MetadataCommandLogIndex,
         last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError>;
+
+    fn retained_metadata_command_log_entries_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+        deadline: Instant,
     ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError>;
 
     fn has_matching_applied_metadata_command_log_entry(

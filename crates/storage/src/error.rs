@@ -1891,6 +1891,14 @@ pub(crate) enum PgMetadataTransferError {
     Reconstruction { message: String },
     #[error("PG peering node {node_id:?} still has a pending metadata command")]
     PendingMetadataCommand { node_id: crate::NodeId },
+    #[error(
+        "PG peering node {node_id:?} lacks predecessor evidence for terminal pending command {log_index} on PG {pg_id}"
+    )]
+    TerminalPendingDispositionUnconfirmed {
+        node_id: crate::NodeId,
+        pg_id: crate::types::PgId,
+        log_index: u64,
+    },
     #[error("PG metadata transfer route changed during reconstruction: {message}")]
     RouteRefreshRequired { message: String },
 }
@@ -1900,6 +1908,18 @@ impl PgMetadataTransferError {
         let error = match error {
             crate::peering::PgPeeringReconstructionError::PendingMetadataCommand { node_id } => {
                 return Self::PendingMetadataCommand { node_id };
+            }
+            crate::peering::PgPeeringReconstructionError::TerminalPendingDispositionUnconfirmed {
+                node_id,
+                pg_id,
+                log_index,
+                ..
+            } => {
+                return Self::TerminalPendingDispositionUnconfirmed {
+                    node_id,
+                    pg_id,
+                    log_index,
+                };
             }
             error => error,
         };
@@ -1928,7 +1948,8 @@ impl PgMetadataTransferError {
             Self::Apply(BucketSnapshotLoadError::Metadata(_)) | Self::Reconstruction { .. } => {
                 false
             }
-            Self::PendingMetadataCommand { .. } => false,
+            Self::PendingMetadataCommand { .. }
+            | Self::TerminalPendingDispositionUnconfirmed { .. } => false,
             Self::RouteRefreshRequired { .. } => true,
         }
     }
@@ -1937,7 +1958,11 @@ impl PgMetadataTransferError {
     /// normal metadata-command recovery path before import retries.
     #[must_use]
     pub(crate) fn is_transient_import_blocker(&self) -> bool {
-        matches!(self, Self::PendingMetadataCommand { .. })
+        matches!(
+            self,
+            Self::PendingMetadataCommand { .. }
+                | Self::TerminalPendingDispositionUnconfirmed { .. }
+        )
     }
 }
 
@@ -5684,6 +5709,21 @@ mod tests {
         ));
         assert!(!pending_reconstruction.requires_route_refresh_retry());
         assert!(pending_reconstruction.is_transient_import_blocker());
+
+        let insufficient_evidence = PgMetadataTransferError::reconstruction(
+            crate::peering::PgPeeringReconstructionError::TerminalPendingDispositionUnconfirmed {
+                node_id: crate::NodeId::new(1),
+                pg_id: crate::types::PgId::new(2),
+                log_index: 3,
+                floor_index: 3,
+            },
+        );
+        assert!(matches!(
+            insufficient_evidence,
+            PgMetadataTransferError::TerminalPendingDispositionUnconfirmed { .. }
+        ));
+        assert!(!insufficient_evidence.requires_route_refresh_retry());
+        assert!(insufficient_evidence.is_transient_import_blocker());
 
         let permanent_reconstruction = PgMetadataTransferError::reconstruction(
             crate::peering::PgPeeringReconstructionError::PrimaryMissing {

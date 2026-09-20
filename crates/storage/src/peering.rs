@@ -9,11 +9,16 @@ use crate::metadata_command::{
     abandoned_command_log_bytes, metadata_command_log_hash, MetadataCommandEnvelope,
     MetadataCommandId, MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex,
     MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind, MetadataCommandReplicaState,
-    MetadataTransferCommand,
+    MetadataTransferCommand, PendingMetadataCommandInspection,
+};
+use crate::node_client::{
+    require_metadata_command_operation_deadline, MetadataCommandInspectionNodeClient,
 };
 use crate::pg_store::MetadataCommandCheckpoint;
+use crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES;
 use crate::types::{ClusterEpoch, PgId, PgState};
 use placement::NodeId;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PgPeeringReplicaReconstructionInput {
@@ -232,6 +237,15 @@ pub(crate) enum PgPeeringReconstructionError {
         log_index: u64,
         reason: &'static str,
     },
+    #[error(
+        "PG peering node {node_id:?} cannot confirm terminal pending command {log_index} for PG {pg_id}: certified floor {floor_index} has no predecessor evidence"
+    )]
+    TerminalPendingDispositionUnconfirmed {
+        node_id: NodeId,
+        pg_id: PgId,
+        log_index: u64,
+        floor_index: u64,
+    },
     #[error("PG peering node {node_id:?} retained command-log entry {log_index} has log hash {actual_log_hash:#018X}, expected {expected_log_hash:#018X}")]
     RetainedCommandLogHashMismatch {
         node_id: NodeId,
@@ -245,6 +259,10 @@ pub(crate) enum PgPeeringReconstructionError {
         expected: PgMetadataProof,
         actual: PgMetadataProof,
     },
+    #[error(
+        "PG peering node {node_id:?} pending command changed during retained-lineage inspection"
+    )]
+    PendingCommandChangedDuringInspection { node_id: NodeId },
     #[error("PG peering node {node_id:?} retained command-log entry {log_index} is abandoned and cannot be replayed from retained payloads")]
     UnreplayableAbandonedCommandLogEntry { node_id: NodeId, log_index: u64 },
 }
@@ -420,6 +438,227 @@ impl PgMetadataRetainedChainVerifier {
         }
         Ok(())
     }
+}
+
+/// Read-only preflight evidence. It cannot authorize cleanup without the
+/// committed outage fence and an exact post-fence reinspection.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct PgOutageRetainedLineageScope {
+    pub(crate) node_id: NodeId,
+    pub(crate) pg_id: PgId,
+    pub(crate) inspection_route_epoch: ClusterEpoch,
+    pub(crate) log_epoch: ClusterEpoch,
+    pub(crate) certified_floor: PgMetadataProof,
+    pub(crate) expected_tip: PgMetadataProof,
+    pub(crate) deadline: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct PgOutageRetainedLineagePreflight {
+    pub(crate) node_id: NodeId,
+    pub(crate) pg_id: PgId,
+    pub(crate) inspection_route_epoch: ClusterEpoch,
+    pub(crate) log_epoch: ClusterEpoch,
+    pub(crate) certified_floor: PgMetadataProof,
+    pub(crate) verified_tip: PgMetadataProof,
+    pub(crate) pending: PendingMetadataCommandInspection,
+}
+
+fn terminal_pending_matches_row(
+    command: &MetadataCommandEnvelope,
+    row: &MetadataCommandLogRangeEntry,
+) -> bool {
+    if row.log_index != command.id().log_index().get() {
+        return false;
+    }
+    match &row.kind {
+        MetadataCommandLogRangeEntryKind::Applied(applied) => applied.as_ref() == command,
+        MetadataCommandLogRangeEntryKind::Abandoned {
+            original_command_checksum,
+        } => *original_command_checksum == command.checksum_crc64(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalPendingEvidence {
+    Verified,
+    InsufficientPredecessor,
+    Mismatch,
+}
+
+fn terminal_pending_evidence(
+    pending_index: u64,
+    certified_floor: PgMetadataProof,
+    matched_retained_row: Option<bool>,
+) -> TerminalPendingEvidence {
+    if pending_index <= certified_floor.applied_log_index() {
+        TerminalPendingEvidence::InsufficientPredecessor
+    } else if matched_retained_row == Some(true) {
+        TerminalPendingEvidence::Verified
+    } else {
+        TerminalPendingEvidence::Mismatch
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn inspect_pg_outage_retained_lineage(
+    client: &dyn MetadataCommandInspectionNodeClient,
+    scope: PgOutageRetainedLineageScope,
+) -> Result<PgOutageRetainedLineagePreflight, PgPeeringReconstructionFailure> {
+    let PgOutageRetainedLineageScope {
+        node_id,
+        pg_id,
+        inspection_route_epoch,
+        log_epoch,
+        certified_floor,
+        expected_tip,
+        deadline,
+    } = scope;
+    let state_before = client.metadata_command_replica_state_at_route_epoch_until(
+        pg_id,
+        inspection_route_epoch,
+        deadline,
+    )?;
+    if state_before.cluster_epoch != log_epoch {
+        return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
+            node_id,
+            replica_epoch: state_before.cluster_epoch,
+            cluster_epoch: log_epoch,
+        }
+        .into());
+    }
+    let pending_before =
+        client.pending_metadata_command_inspection_until(pg_id, log_epoch, deadline)?;
+    let mut verifier =
+        PgMetadataRetainedChainVerifier::new(node_id, pg_id, log_epoch, certified_floor);
+    let terminal_pending_index = match &pending_before {
+        PendingMetadataCommandInspection::Present { command, .. }
+            if command.id().log_index().get() <= expected_tip.applied_log_index() =>
+        {
+            Some(command.id().log_index().get())
+        }
+        _ => None,
+    };
+    let mut terminal_pending_matches = None;
+    let mut through = certified_floor.applied_log_index();
+    while through < expected_tip.applied_log_index() {
+        let first = through + 1;
+        let last = first
+            .saturating_add(STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES - 1)
+            .min(expected_tip.applied_log_index());
+        let entries = client.retained_metadata_command_log_entries_until(
+            pg_id,
+            log_epoch,
+            MetadataCommandLogIndex::new(first).expect("successor log index is nonzero"),
+            MetadataCommandLogIndex::new(last).expect("retained log tip is nonzero"),
+            deadline,
+        )?;
+        verifier.append_page(&entries)?;
+        if let Some(index) = terminal_pending_index {
+            if let Some(row) = entries.iter().find(|row| row.log_index == index) {
+                let PendingMetadataCommandInspection::Present { command, .. } = &pending_before
+                else {
+                    unreachable!("terminal index requires a pending command")
+                };
+                terminal_pending_matches = Some(terminal_pending_matches_row(command, row));
+            }
+        }
+        through = last;
+    }
+    verifier.finish(expected_tip)?;
+    let state_after = client.metadata_command_replica_state_at_route_epoch_until(
+        pg_id,
+        inspection_route_epoch,
+        deadline,
+    )?;
+    if state_after != state_before {
+        return Err(
+            PgPeeringReconstructionError::RetainedCommandLogTipMismatch {
+                node_id,
+                expected: PgMetadataProof::from_carriers(
+                    state_before.applied_log_index,
+                    state_before.applied_log_hash,
+                    state_before.state_digest,
+                ),
+                actual: PgMetadataProof::from_carriers(
+                    state_after.applied_log_index,
+                    state_after.applied_log_hash,
+                    state_after.state_digest,
+                ),
+            }
+            .into(),
+        );
+    }
+    let observed_tip = PgMetadataProof::from_carriers(
+        state_after.applied_log_index,
+        state_after.applied_log_hash,
+        state_after.state_digest,
+    );
+    if observed_tip != expected_tip {
+        return Err(
+            PgPeeringReconstructionError::RetainedCommandLogTipMismatch {
+                node_id,
+                expected: expected_tip,
+                actual: observed_tip,
+            }
+            .into(),
+        );
+    }
+    let pending_after =
+        client.pending_metadata_command_inspection_until(pg_id, log_epoch, deadline)?;
+    if pending_after != pending_before {
+        return Err(
+            PgPeeringReconstructionError::PendingCommandChangedDuringInspection { node_id }.into(),
+        );
+    }
+    if let PendingMetadataCommandInspection::Present { command, .. } = &pending_after {
+        let log_index = command.id().log_index().get();
+        let invalid = || PgPeeringReconstructionError::InvalidRetainedCommandLogEntry {
+            node_id,
+            pg_id,
+            log_index,
+            reason:
+                "pending command does not follow the verified tip or match a verified terminal row",
+        };
+        if command.id().cluster_epoch() != log_epoch || command.id().pg_id() != pg_id {
+            return Err(invalid().into());
+        }
+        if terminal_pending_index.is_some() {
+            match terminal_pending_evidence(log_index, certified_floor, terminal_pending_matches) {
+                TerminalPendingEvidence::Verified => {}
+                TerminalPendingEvidence::InsufficientPredecessor => {
+                    return Err(
+                        PgPeeringReconstructionError::TerminalPendingDispositionUnconfirmed {
+                            node_id,
+                            pg_id,
+                            log_index,
+                            floor_index: certified_floor.applied_log_index(),
+                        }
+                        .into(),
+                    );
+                }
+                TerminalPendingEvidence::Mismatch => return Err(invalid().into()),
+            }
+        } else if expected_tip
+            .applied_log_index()
+            .checked_add(1)
+            .is_none_or(|next| log_index != next)
+        {
+            return Err(invalid().into());
+        }
+    }
+    require_metadata_command_operation_deadline(deadline)?;
+    Ok(PgOutageRetainedLineagePreflight {
+        node_id,
+        pg_id,
+        inspection_route_epoch,
+        log_epoch,
+        certified_floor,
+        verified_tip: expected_tip,
+        pending: pending_after,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1036,6 +1275,87 @@ mod tests {
             pre_state_digest: None,
             post_state_digest: None,
             kind,
+        }
+    }
+
+    #[test]
+    fn terminal_pending_requires_exact_row_disposition() {
+        let pending = command(1);
+        let other = MetadataCommandEnvelope::new(pending.id(), command(2).payload().clone());
+        let applied = retained_entry(
+            1,
+            0,
+            0,
+            MetadataCommandLogRangeEntryKind::Applied(Box::new(other)),
+        );
+        assert!(!terminal_pending_matches_row(&pending, &applied));
+        assert_eq!(
+            terminal_pending_evidence(
+                1,
+                PgMetadataProof::from_carriers(
+                    0,
+                    MetadataCommandLogHash::for_test(0),
+                    CanonicalStateDigest::for_test(0),
+                ),
+                Some(false)
+            ),
+            TerminalPendingEvidence::Mismatch
+        );
+        let abandoned = retained_entry(
+            1,
+            0,
+            0,
+            MetadataCommandLogRangeEntryKind::Abandoned {
+                original_command_checksum: pending.checksum_crc64() ^ 1,
+            },
+        );
+        assert!(!terminal_pending_matches_row(&pending, &abandoned));
+    }
+
+    #[test]
+    fn coordinated_at_floor_row_cannot_certify_its_own_predecessor() {
+        let pending = command(1);
+        for abandoned in [false, true] {
+            let previous_hash = MetadataCommandLogHash::for_test(0x1234_5678);
+            let pre_digest = CanonicalStateDigest::for_test(0x4321);
+            let post_digest = if abandoned {
+                pre_digest
+            } else {
+                CanonicalStateDigest::for_test(0x8765)
+            };
+            let checksum = if abandoned {
+                pending.abandoned_log_checksum_crc64()
+            } else {
+                pending.checksum_crc64()
+            };
+            let log_hash = metadata_command_log_hash(
+                pending.id().cluster_epoch(),
+                pending.id().pg_id(),
+                pending.id().log_index(),
+                previous_hash.value(),
+                checksum,
+            );
+            let row = MetadataCommandLogRangeEntry {
+                log_index: 1,
+                previous_log_hash: previous_hash,
+                log_hash,
+                pre_state_digest: Some(pre_digest),
+                post_state_digest: Some(post_digest),
+                kind: if abandoned {
+                    MetadataCommandLogRangeEntryKind::Abandoned {
+                        original_command_checksum: pending.checksum_crc64(),
+                    }
+                } else {
+                    MetadataCommandLogRangeEntryKind::Applied(Box::new(pending.clone()))
+                },
+            };
+            let floor = PgMetadataProof::from_carriers(1, log_hash, post_digest);
+            assert!(terminal_pending_matches_row(&pending, &row));
+            assert_eq!(row.log_hash, floor.applied_log_hash());
+            assert_eq!(
+                terminal_pending_evidence(1, floor, Some(true)),
+                TerminalPendingEvidence::InsufficientPredecessor
+            );
         }
     }
 

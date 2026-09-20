@@ -2845,6 +2845,255 @@
     }
 
     #[test]
+    fn outage_lineage_preflight_reads_exact_tip_and_detects_marker_change() {
+        for mark_during_read in [false, true] {
+            let tmp = test_util::tempdir();
+            let mut config = test_config(&tmp);
+            let log_epoch = config.cluster_epoch;
+            let initialized = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            drop(initialized);
+            config.cluster_epoch = ClusterEpoch::new(log_epoch.get() + 3).unwrap();
+            config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+            config.pg_routes[0].state = PgState::Peering;
+            config.pg_routes[0].primary_node_id = NodeId::new(8);
+            config.pg_routes[0].acting_set = vec![NodeId::new(8)];
+            let historical_route_epoch = ClusterEpoch::new(log_epoch.get() + 1).unwrap();
+            config.historical_pg_routes.push(StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: historical_route_epoch,
+                state: PgState::Peering,
+                primary_node_id: config.node_id,
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![config.node_id],
+            });
+            private_socket_dir(config.socket_path.parent().unwrap());
+            let server = StorageNodeServer::bind(config.clone()).unwrap();
+            let applied = test_metadata_command(0, 1);
+            let pending = test_metadata_command_for_subject(
+                0,
+                2,
+                applied.bucket_name().clone(),
+                crate::tests::object_key("outage-preflight-pending"),
+            );
+            let (floor, tip) = {
+                let pg = server._node.get_pg(0).unwrap();
+                let floor_state = pg.metadata_command_replica_state().unwrap();
+                pg.apply_metadata_command_and_record(config.node_id.as_u32(), &applied)
+                    .unwrap();
+                pg.try_insert_pending_metadata_command_slot(
+                    config.node_id.as_u32(),
+                    &pending,
+                    Some(pending.bucket_name()),
+                )
+                .unwrap();
+                let tip_state = pg.metadata_command_replica_state().unwrap();
+                let proof = |state: crate::metadata_command::MetadataCommandReplicaState| {
+                    crate::control_plane::PgMetadataProof::from_carriers(
+                        state.applied_log_index,
+                        state.applied_log_hash,
+                        state.state_digest,
+                    )
+                };
+                (proof(floor_state), proof(tip_state))
+            };
+            if mark_during_read {
+                let db_path = config.data_dir.join("pg-0000/metadata.db");
+                server
+                    ._node
+                    .get_pg(0)
+                    .unwrap()
+                    .test_after_pending_slot_row_read(move || {
+                        rusqlite::Connection::open(db_path)
+                            .unwrap()
+                            .execute(
+                                "UPDATE metadata_command_pending_slot SET publication_started = 1 WHERE singleton = 0",
+                                [],
+                            )
+                            .unwrap();
+                    });
+            }
+            let socket_path = config.socket_path.clone();
+            let server_thread = thread::spawn(move || {
+                for _ in 0..if mark_during_read { 5 } else { 8 } {
+                    server.accept_one().unwrap();
+                }
+            });
+            let client = UnixStorageNodeClient::new(
+                config.node_id,
+                config.cluster_epoch,
+                socket_path,
+            );
+            let scope = crate::peering::PgOutageRetainedLineageScope {
+                node_id: config.node_id,
+                pg_id: PgId::new(0),
+                inspection_route_epoch: historical_route_epoch,
+                log_epoch,
+                certified_floor: floor,
+                expected_tip: tip,
+                deadline: Instant::now() + Duration::from_secs(5),
+            };
+            let result = crate::peering::inspect_pg_outage_retained_lineage(&client, scope);
+            if mark_during_read {
+                assert!(matches!(
+                    result,
+                    Err(crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+                        crate::peering::PgPeeringReconstructionError::PendingCommandChangedDuringInspection { .. }
+                    ))
+                ));
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    crate::peering::PgOutageRetainedLineagePreflight {
+                        node_id: config.node_id,
+                        pg_id: PgId::new(0),
+                        inspection_route_epoch: historical_route_epoch,
+                        log_epoch,
+                        certified_floor: floor,
+                        verified_tip: tip,
+                        pending: crate::metadata_command::PendingMetadataCommandInspection::Present {
+                            command: Box::new(pending),
+                            publication_started: false,
+                        },
+                    }
+                );
+                let wrong_floor = crate::control_plane::PgMetadataProof::from_carriers(
+                    floor.applied_log_index(),
+                    crate::control_plane::MetadataCommandLogHash::for_test(
+                        floor.applied_log_hash().value() ^ 1,
+                    ),
+                    floor.state_digest(),
+                );
+                assert!(matches!(
+                    crate::peering::inspect_pg_outage_retained_lineage(
+                        &client,
+                        crate::peering::PgOutageRetainedLineageScope {
+                            certified_floor: wrong_floor,
+                            deadline: Instant::now() + Duration::from_secs(5),
+                            ..scope
+                        },
+                    ),
+                    Err(crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+                        crate::peering::PgPeeringReconstructionError::RetainedCommandLogFork { .. }
+                    ))
+                ));
+            }
+            server_thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn outage_lineage_preflight_requires_predecessor_for_terminal_pending_rows() {
+        for abandoned in [false, true] {
+            for floor_at_tip in [false, true] {
+                let tmp = test_util::tempdir();
+                let mut config = test_config(&tmp);
+                let log_epoch = config.cluster_epoch;
+                let initialized = SharedStorageNode::open_with_default_ec_shape(
+                    &config.data_dir,
+                    &config.pg_ids,
+                    config.default_ec_shape,
+                )
+                .unwrap();
+                drop(initialized);
+                config.cluster_epoch = ClusterEpoch::new(log_epoch.get() + 3).unwrap();
+                config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+                config.pg_routes[0].state = PgState::Peering;
+                config.pg_routes[0].primary_node_id = NodeId::new(8);
+                config.pg_routes[0].acting_set = vec![NodeId::new(8)];
+                let historical_route_epoch = ClusterEpoch::new(log_epoch.get() + 1).unwrap();
+                config.historical_pg_routes.push(StorageNodePgRoute {
+                    pg_id: 0,
+                    cluster_epoch: historical_route_epoch,
+                    state: PgState::Peering,
+                    primary_node_id: config.node_id,
+                    metadata_transfer_destination_epoch: None,
+                    metadata_read_route: None,
+                    acting_set: vec![config.node_id],
+                });
+                private_socket_dir(config.socket_path.parent().unwrap());
+                let server = StorageNodeServer::bind(config.clone()).unwrap();
+                let command = test_metadata_command(0, 1);
+                let (initial, tip) = {
+                    let pg = server._node.get_pg(0).unwrap();
+                    let proof = |state: crate::metadata_command::MetadataCommandReplicaState| {
+                        crate::control_plane::PgMetadataProof::from_carriers(
+                            state.applied_log_index,
+                            state.applied_log_hash,
+                            state.state_digest,
+                        )
+                    };
+                    let initial = proof(pg.metadata_command_replica_state().unwrap());
+                    pg.try_insert_pending_metadata_command_slot(
+                        config.node_id.as_u32(),
+                        &command,
+                        Some(command.bucket_name()),
+                    )
+                    .unwrap();
+                    if abandoned {
+                        pg.record_metadata_command_abandoned(config.node_id.as_u32(), &command)
+                            .unwrap();
+                    } else {
+                        pg.apply_metadata_command_and_record(config.node_id.as_u32(), &command)
+                            .unwrap();
+                    }
+                    (initial, proof(pg.metadata_command_replica_state().unwrap()))
+                };
+                let socket_path = config.socket_path.clone();
+                let server_thread = thread::spawn(move || {
+                    for _ in 0..if floor_at_tip { 4 } else { 5 } {
+                        server.accept_one().unwrap();
+                    }
+                });
+                let client = UnixStorageNodeClient::new(
+                    config.node_id,
+                    config.cluster_epoch,
+                    socket_path,
+                );
+                let floor = if floor_at_tip { tip } else { initial };
+                let result = crate::peering::inspect_pg_outage_retained_lineage(
+                    &client,
+                    crate::peering::PgOutageRetainedLineageScope {
+                        node_id: config.node_id,
+                        pg_id: PgId::new(0),
+                        inspection_route_epoch: historical_route_epoch,
+                        log_epoch,
+                        certified_floor: floor,
+                        expected_tip: tip,
+                        deadline: Instant::now() + Duration::from_secs(5),
+                    },
+                );
+                if floor_at_tip {
+                    assert!(matches!(
+                        result,
+                        Err(crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+                            crate::peering::PgPeeringReconstructionError::TerminalPendingDispositionUnconfirmed {
+                                log_index: 1,
+                                floor_index: 1,
+                                ..
+                            }
+                        ))
+                    ));
+                } else {
+                    assert_eq!(
+                        result.unwrap().pending,
+                        crate::metadata_command::PendingMetadataCommandInspection::Present {
+                            command: Box::new(command),
+                            publication_started: false,
+                        }
+                    );
+                }
+                server_thread.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn storage_node_server_rejects_peering_replay_apply_while_active() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);

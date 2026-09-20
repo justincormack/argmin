@@ -6138,6 +6138,19 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
         pg.pending_metadata_command_inspection(self.node_id.as_u32(), cluster_epoch)
     }
 
+    fn pending_metadata_command_inspection_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<PendingMetadataCommandInspection, StoreError> {
+        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
+        let inspection =
+            pg.pending_metadata_command_inspection(self.node_id.as_u32(), cluster_epoch)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(inspection)
+    }
+
     fn pending_metadata_command_envelope_until(
         &self,
         pg_id: PgId,
@@ -6167,6 +6180,15 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
         let state = pg.metadata_command_replica_state()?;
         require_metadata_command_operation_deadline(deadline)?;
         Ok(state)
+    }
+
+    fn metadata_command_replica_state_at_route_epoch_until(
+        &self,
+        pg_id: PgId,
+        _inspection_route_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.metadata_command_replica_state_until(pg_id, deadline)
     }
 
     fn metadata_command_checkpoint(
@@ -6270,6 +6292,25 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
             first_log_index,
             last_log_index,
         )
+    }
+
+    fn retained_metadata_command_log_entries_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+        deadline: Instant,
+    ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError> {
+        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
+        let entries = pg.retained_metadata_command_log_entries(
+            self.node_id.as_u32(),
+            cluster_epoch,
+            first_log_index,
+            last_log_index,
+        )?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(entries)
     }
 
     fn has_matching_applied_metadata_command_log_entry(

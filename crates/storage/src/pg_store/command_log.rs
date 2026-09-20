@@ -6702,7 +6702,7 @@ impl PgStore {
             self.execute_cached(
                 "UPDATE metadata_command_log \
                  SET post_state_digest = ?1 \
-                 WHERE cluster_epoch = ?2 AND pg_id = ?3 AND log_index = ?4 AND abandoned = 0",
+                 WHERE cluster_epoch = ?2 AND pg_id = ?3 AND log_index = ?4",
                 params![
                     state_digest.value() as i64,
                     cluster_epoch.get() as i64,

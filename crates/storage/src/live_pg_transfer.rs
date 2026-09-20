@@ -773,6 +773,9 @@ fn metadata_transfer_failure(
             )
             | crate::error::PgMetadataTransferError::Reconstruction { .. } => false,
             crate::error::PgMetadataTransferError::PendingMetadataCommand { .. }
+            | crate::error::PgMetadataTransferError::TerminalPendingDispositionUnconfirmed {
+                ..
+            }
             | crate::error::PgMetadataTransferError::RouteRefreshRequired { .. } => true,
         };
     let diagnostic = format!("{context}: {error}");
