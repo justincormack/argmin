@@ -8,7 +8,7 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_cleanup_response,
     StorageRpcMetadataCommandPendingSlotCleanupResponse,
 };
-use crate::{PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind};
+use crate::{PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind, PgState};
 use std::sync::mpsc;
 
 fn append_stream_segment_command_for_rpc_test(
@@ -1211,6 +1211,125 @@ fn unix_storage_node_client_applies_metadata_command_idempotently() {
         .metadata_command_replica_state()
         .unwrap();
     assert_eq!(state.applied_log_index, 1);
+}
+
+#[test]
+fn unix_pending_inspection_preserves_the_atomic_publication_marker() {
+    for expected_started in [None, Some(false), Some(true)] {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let storage_node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        if let Some(started) = expected_started {
+            let pg = storage_node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                config.node_id.as_u32(),
+                &command,
+                Some(command.bucket_name()),
+            )
+            .unwrap();
+            if started {
+                pg.mark_pending_metadata_command_publication_started(
+                    config.node_id.as_u32(),
+                    &command,
+                )
+                .unwrap();
+            }
+        }
+        drop(storage_node);
+
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let server_thread = thread::spawn(move || server.accept_one().unwrap());
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let observed = MetadataCommandInspectionNodeClient::pending_metadata_command_inspection(
+            &client,
+            PgId::new(0),
+            config.cluster_epoch,
+        )
+        .unwrap();
+        assert_eq!(
+            observed,
+            match expected_started {
+                None => PendingMetadataCommandInspection::Absent,
+                Some(publication_started) => PendingMetadataCommandInspection::Present {
+                    command: Box::new(command),
+                    publication_started,
+                },
+            }
+        );
+        server_thread.join().unwrap();
+    }
+}
+
+#[test]
+fn unix_pending_inspection_reads_a_historical_peering_slot() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    let log_epoch = config.cluster_epoch;
+    let current_epoch = ClusterEpoch::new(log_epoch.get() + 3).unwrap();
+    config.cluster_epoch = current_epoch;
+    config.pg_routes[0].cluster_epoch = current_epoch;
+    config.pg_routes[0].state = PgState::Peering;
+    config.pg_routes[0].primary_node_id = NodeId::new(8);
+    config.pg_routes[0].acting_set = vec![NodeId::new(8)];
+    config.historical_pg_routes.push(StorageNodePgRoute {
+        pg_id: 0,
+        cluster_epoch: ClusterEpoch::new(log_epoch.get() + 1).unwrap(),
+        state: PgState::Peering,
+        primary_node_id: config.node_id,
+        metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
+        acting_set: vec![config.node_id],
+    });
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let command = test_metadata_command(0, 1);
+    let storage_node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    storage_node
+        .get_pg(0)
+        .unwrap()
+        .try_insert_pending_metadata_command_slot(
+            config.node_id.as_u32(),
+            &command,
+            Some(command.bucket_name()),
+        )
+        .unwrap();
+    drop(storage_node);
+
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    assert_eq!(
+        MetadataCommandInspectionNodeClient::pending_metadata_command_inspection(
+            &client,
+            PgId::new(0),
+            log_epoch,
+        )
+        .unwrap(),
+        PendingMetadataCommandInspection::Present {
+            command: Box::new(command),
+            publication_started: false,
+        }
+    );
+    server_thread.join().unwrap();
 }
 
 #[test]

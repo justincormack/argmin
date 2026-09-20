@@ -598,6 +598,15 @@ pub(crate) struct MetadataCommandReplicaState {
     pub(crate) state_digest: CanonicalStateDigest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingMetadataCommandInspection {
+    Absent,
+    Present {
+        command: Box<MetadataCommandEnvelope>,
+        publication_started: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataCommandLogHashRangeEntry {
     pub(crate) log_index: u64,

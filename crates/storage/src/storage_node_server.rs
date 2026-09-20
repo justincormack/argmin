@@ -7936,18 +7936,21 @@ impl StorageNodeConnectionHandler {
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
-            let slot = pg.pending_metadata_command_slot(
+            pg.pending_metadata_command_inspection(
                 self.config.node_id.as_u32(),
                 request.cluster_epoch,
-            )?;
-            let publication_started = slot.as_ref().is_some_and(|slot| slot.publication_started);
-            let command = pg.pending_metadata_command_envelope(
-                self.config.node_id.as_u32(),
-                request.cluster_epoch,
-            )?;
-            Ok((command, publication_started))
+            )
         }) {
-            Ok((command, publication_started)) => {
+            Ok(inspection) => {
+                let (command, publication_started) = match inspection {
+                    crate::metadata_command::PendingMetadataCommandInspection::Absent => {
+                        (None, false)
+                    }
+                    crate::metadata_command::PendingMetadataCommandInspection::Present {
+                        command,
+                        publication_started,
+                    } => (Some(*command), publication_started),
+                };
                 let payload = encode_metadata_command_pending_envelope_response(
                     &StorageRpcMetadataCommandPendingEnvelopeResponse {
                         command,

@@ -6129,6 +6129,15 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
         MetadataCommandNodeClient::pending_metadata_command_envelope(self, pg_id, cluster_epoch)
     }
 
+    fn pending_metadata_command_inspection(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PendingMetadataCommandInspection, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.pending_metadata_command_inspection(self.node_id.as_u32(), cluster_epoch)
+    }
+
     fn pending_metadata_command_envelope_until(
         &self,
         pg_id: PgId,

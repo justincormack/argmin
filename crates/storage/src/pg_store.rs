@@ -817,6 +817,8 @@ pub struct PgStore {
     #[cfg(test)]
     fail_next_pending_slot_inspection: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    after_pending_slot_row_read: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
     before_object_payload_reclaim_claim_effect_check:
         std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
     #[cfg(test)]
@@ -1047,6 +1049,8 @@ pub(crate) fn inspect_pg_shard_inventory(
         ),
         #[cfg(test)]
         fail_next_pending_slot_inspection: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        after_pending_slot_row_read: std::sync::Mutex::new(None),
         #[cfg(test)]
         before_object_payload_reclaim_claim_effect_check: std::sync::Mutex::new(None),
         #[cfg(test)]
@@ -1322,6 +1326,8 @@ impl PgStore {
             ),
             #[cfg(test)]
             fail_next_pending_slot_inspection: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            after_pending_slot_row_read: std::sync::Mutex::new(None),
             #[cfg(test)]
             before_object_payload_reclaim_claim_effect_check: std::sync::Mutex::new(None),
             #[cfg(test)]

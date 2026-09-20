@@ -2552,6 +2552,32 @@ impl UnixStorageNodeClient {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        self.pending_metadata_command_response_at_epoch(pg_id, cluster_epoch)
+            .map(|response| response.command)
+    }
+
+    fn pending_metadata_command_inspection_at_epoch(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PendingMetadataCommandInspection, StoreError> {
+        self.pending_metadata_command_response_at_epoch(pg_id, cluster_epoch)
+            .map(Self::inspection_from_pending_response)
+    }
+
+    fn pending_metadata_command_response_at_epoch(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<crate::storage_rpc::StorageRpcMetadataCommandPendingEnvelopeResponse, StoreError>
+    {
+        if cluster_epoch > self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
         let request = StorageRpcMetadataCommandStateRequest {
             node_id: self.node_id,
             cluster_epoch,
@@ -2562,8 +2588,46 @@ impl UnixStorageNodeClient {
             StorageRpcMessageKind::MetadataCommandPendingEnvelope,
             payload,
         )?;
+        self.decode_pending_metadata_command_response(pg_id, cluster_epoch, &response)
+    }
+
+    fn pending_metadata_command_response_at_epoch_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<crate::storage_rpc::StorageRpcMetadataCommandPendingEnvelopeResponse, StoreError>
+    {
+        if cluster_epoch > self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        let payload =
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: self.node_id,
+                cluster_epoch,
+                pg_id,
+            });
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            payload,
+            deadline,
+        )?;
+        self.decode_pending_metadata_command_response(pg_id, cluster_epoch, &response)
+    }
+
+    fn decode_pending_metadata_command_response(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        response: &[u8],
+    ) -> Result<crate::storage_rpc::StorageRpcMetadataCommandPendingEnvelopeResponse, StoreError>
+    {
         let response = decode_metadata_command_pending_envelope_response(
-            &response,
+            response,
             &MetadataCommandDecodeAuthority::new(),
         )
         .map_err(|error| {
@@ -2580,7 +2644,19 @@ impl UnixStorageNodeClient {
                 ));
             }
         }
-        Ok(response.command)
+        Ok(response)
+    }
+
+    fn inspection_from_pending_response(
+        response: crate::storage_rpc::StorageRpcMetadataCommandPendingEnvelopeResponse,
+    ) -> PendingMetadataCommandInspection {
+        match response.command {
+            Some(command) => PendingMetadataCommandInspection::Present {
+                command: Box::new(command),
+                publication_started: response.publication_started,
+            },
+            None => PendingMetadataCommandInspection::Absent,
+        }
     }
 
     pub(crate) fn next_metadata_command_id_at_least(
@@ -4195,7 +4271,15 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
-        MetadataCommandNodeClient::pending_metadata_command_envelope(self, pg_id, cluster_epoch)
+        self.pending_metadata_command_envelope_at_epoch(pg_id, cluster_epoch)
+    }
+
+    fn pending_metadata_command_inspection(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PendingMetadataCommandInspection, StoreError> {
+        self.pending_metadata_command_inspection_at_epoch(pg_id, cluster_epoch)
     }
 
     fn pending_metadata_command_envelope_until(
@@ -4204,38 +4288,8 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         cluster_epoch: ClusterEpoch,
         deadline: Instant,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
-                operation_epoch: cluster_epoch,
-                current_epoch: self.cluster_epoch,
-            });
-        }
-        let payload = self.encode_metadata_command_state_request(pg_id);
-        let response = self.rpc_request_until(
-            StorageRpcMessageKind::MetadataCommandPendingEnvelope,
-            payload,
-            deadline,
-        )?;
-        let response = decode_metadata_command_pending_envelope_response(
-            &response,
-            &MetadataCommandDecodeAuthority::new(),
-        )
-        .map_err(|error| {
-            self.rpc_payload_error(
-                "decode metadata command pending envelope response",
-                error.to_string(),
-            )
-        })?;
-        if let Some(command) = response.command.as_ref() {
-            if command.id().cluster_epoch() != cluster_epoch || command.id().pg_id() != pg_id {
-                return Err(self.rpc_payload_error(
-                    "decode metadata command pending envelope response",
-                    "metadata command pending envelope route mismatch".to_string(),
-                ));
-            }
-        }
-        Ok(response.command)
+        self.pending_metadata_command_response_at_epoch_until(pg_id, cluster_epoch, deadline)
+            .map(|response| response.command)
     }
 
     fn metadata_command_replica_state(

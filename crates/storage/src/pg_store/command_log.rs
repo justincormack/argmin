@@ -5,7 +5,7 @@ use super::*;
 use crate::control_plane::{
     CanonicalStateDigest, MetadataCommandLogHash, METADATA_CANONICAL_STATE_ENCODING_VERSION,
 };
-use crate::metadata_command::MetadataTransferCommand;
+use crate::metadata_command::{MetadataTransferCommand, PendingMetadataCommandInspection};
 use crate::storage_rpc::{
     decode_metadata_command_checkpoint_payload, encode_metadata_command_checkpoint_payload,
 };
@@ -2974,6 +2974,11 @@ impl PgStore {
         Ok(Some(slot))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_after_pending_slot_row_read(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_pending_slot_row_read.lock().unwrap() = Some(Box::new(hook));
+    }
+
     pub(crate) fn pending_metadata_command_slot_any_epoch(
         &self,
         node_id: u32,
@@ -3008,6 +3013,10 @@ impl PgStore {
                 ))
             },
         )?;
+        #[cfg(test)]
+        if let Some(hook) = self.after_pending_slot_row_read.lock().unwrap().take() {
+            hook();
+        }
         let Some((
             raw_cluster_epoch,
             raw_pg_id,
@@ -3440,6 +3449,22 @@ impl PgStore {
         };
         self.decode_pending_metadata_command_slot(node_id, slot)
             .map(Some)
+    }
+
+    pub(crate) fn pending_metadata_command_inspection(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PendingMetadataCommandInspection, StoreError> {
+        let Some(slot) = self.pending_metadata_command_slot(node_id, cluster_epoch)? else {
+            return Ok(PendingMetadataCommandInspection::Absent);
+        };
+        let publication_started = slot.publication_started;
+        let command = self.decode_pending_metadata_command_slot(node_id, slot)?;
+        Ok(PendingMetadataCommandInspection::Present {
+            command: Box::new(command),
+            publication_started,
+        })
     }
 
     pub(crate) fn pending_metadata_command_envelope_any_epoch(

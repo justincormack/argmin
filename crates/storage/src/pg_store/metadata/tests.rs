@@ -5,6 +5,7 @@ use super::*;
 use crate::control_plane::{CanonicalStateDigest, MetadataCommandLogHash};
 use crate::metadata_command::{
     MetadataCommandId, MetadataCommandLogIndex, MetadataTransferCommand,
+    PendingMetadataCommandInspection,
 };
 use crate::node_runtime::traits::PgMetadataStore;
 use crate::PgTopology;
@@ -6084,9 +6085,24 @@ fn pending_metadata_command_slot_is_pg_scoped_and_persistent() {
 
     {
         let store = PgStore::open(tmp.path(), 1).unwrap();
+        assert_eq!(
+            store
+                .pending_metadata_command_inspection(0, ClusterEpoch::INITIAL)
+                .unwrap(),
+            PendingMetadataCommandInspection::Absent
+        );
         store
             .try_insert_pending_metadata_command_slot(0, &first_command, Some(&first_bucket))
             .unwrap();
+        assert_eq!(
+            store
+                .pending_metadata_command_inspection(0, ClusterEpoch::INITIAL)
+                .unwrap(),
+            PendingMetadataCommandInspection::Present {
+                command: Box::new(first_command.clone()),
+                publication_started: false,
+            }
+        );
         assert!(!store
             .pending_metadata_command_publication_started(0, &first_command)
             .unwrap());
@@ -6115,6 +6131,15 @@ fn pending_metadata_command_slot_is_pg_scoped_and_persistent() {
     }
 
     let store = PgStore::open(tmp.path(), 1).unwrap();
+    assert_eq!(
+        store
+            .pending_metadata_command_inspection(0, ClusterEpoch::INITIAL)
+            .unwrap(),
+        PendingMetadataCommandInspection::Present {
+            command: Box::new(first_command.clone()),
+            publication_started: true,
+        }
+    );
     let slot = store
         .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
         .unwrap()

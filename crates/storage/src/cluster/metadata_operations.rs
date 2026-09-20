@@ -2258,9 +2258,10 @@ impl StorageCluster {
             }
             .into());
         }
-        let has_pending_metadata_command = metadata_client
-            .pending_metadata_command_envelope(pg_id, state.cluster_epoch)?
-            .is_some();
+        let has_pending_metadata_command = matches!(
+            metadata_client.pending_metadata_command_inspection(pg_id, state.cluster_epoch)?,
+            PendingMetadataCommandInspection::Present { .. }
+        );
 
         let mut retained_log_entries = Vec::new();
         let mut batch_start = 1;

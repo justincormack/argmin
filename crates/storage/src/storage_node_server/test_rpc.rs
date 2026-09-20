@@ -2763,6 +2763,88 @@
     }
 
     #[test]
+    fn pending_envelope_rpc_keeps_command_and_marker_from_one_sqlite_row() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let original = test_metadata_command(0, 1);
+        let replacement = test_metadata_command(0, 2);
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                config.node_id.as_u32(),
+                &original,
+                Some(original.bucket_name()),
+            )
+            .unwrap();
+        }
+        let writer = crate::PgStore::open(&config.data_dir.join("pg-0000"), 0).unwrap();
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            let original_for_write = original.clone();
+            let replacement_for_write = replacement.clone();
+            let node_id = config.node_id.as_u32();
+            pg.test_after_pending_slot_row_read(move || {
+                assert!(writer
+                    .replace_pending_metadata_command_slot_for_reissue(
+                        node_id,
+                        &original_for_write,
+                        &replacement_for_write,
+                        Some(original_for_write.bucket_name()),
+                    )
+                    .unwrap());
+                writer
+                    .record_metadata_command_abandoned(node_id, &original_for_write)
+                    .unwrap();
+                writer
+                    .mark_pending_metadata_command_publication_started(
+                        node_id,
+                        &replacement_for_write,
+                    )
+                    .unwrap();
+            });
+        }
+
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: config.node_id,
+                cluster_epoch: config.cluster_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        drop(client);
+        join.join().unwrap();
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let observed = decode_metadata_command_pending_envelope_response(
+            &payload,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
+        assert_eq!(observed.command, Some(original));
+        assert!(!observed.publication_started);
+
+        let reader = crate::PgStore::open(&config.data_dir.join("pg-0000"), 0).unwrap();
+        assert_eq!(
+            reader
+                .pending_metadata_command_inspection(config.node_id.as_u32(), config.cluster_epoch)
+                .unwrap(),
+            crate::metadata_command::PendingMetadataCommandInspection::Present {
+                command: Box::new(replacement),
+                publication_started: true,
+            }
+        );
+    }
+
+    #[test]
     fn storage_node_server_rejects_peering_replay_apply_while_active() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);

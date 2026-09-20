@@ -1587,6 +1587,12 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError>;
 
+    fn pending_metadata_command_inspection(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PendingMetadataCommandInspection, StoreError>;
+
     fn pending_metadata_command_envelope_until(
         &self,
         pg_id: PgId,
