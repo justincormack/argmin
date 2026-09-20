@@ -607,7 +607,7 @@ pub struct StorageNodeControlPlaneRefreshLoop {
 struct StorageNodeHeartbeatSubmissionState<S> {
     control_plane: S,
     latest_submitted: Option<NodeHeartbeat>,
-    last_submission_started_at: Option<Instant>,
+    last_accepted_submission_started_at: Option<Instant>,
 }
 
 pub const STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_USABLE_LEASE_MS: u64 = 1_000;
@@ -1155,18 +1155,19 @@ impl StorageNodeServer {
             // after the authority accepts this report, no concurrent renewal
             // may submit the older report and regress its PG observations.
             submission.latest_submitted = Some(heartbeat.clone());
-            submission.last_submission_started_at = Some(Instant::now());
+            let submitted_at = Instant::now();
             let authority_now_ms = {
                 let authority_now_ms = authority_now_ms
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 authority_now_ms()
             };
-            submission
+            let refresh = submission
                 .control_plane
                 .refresh_node_heartbeat(heartbeat, authority_now_ms)
-                .map_err(StorageNodeServerError::from)?
-                .into_parts()
+                .map_err(StorageNodeServerError::from)?;
+            submission.last_accepted_submission_started_at = Some(submitted_at);
+            refresh.into_parts()
         };
         // Every local topology operation may wait behind route publication.
         // Keep it outside heartbeat submission so the renewal worker can
@@ -1200,24 +1201,27 @@ impl StorageNodeServer {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if submission
-                .last_submission_started_at
+                .last_accepted_submission_started_at
                 .is_some_and(|started| started.elapsed() < minimum_interval)
             {
                 return None;
             }
             let heartbeat = submission.latest_submitted.clone()?;
-            submission.last_submission_started_at = Some(Instant::now());
+            let submitted_at = Instant::now();
             let authority_now_ms = {
                 let authority_now_ms = authority_now_ms
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 authority_now_ms()
             };
-            submission
+            let refresh = submission
                 .control_plane
                 .refresh_node_heartbeat(heartbeat, authority_now_ms)
-                .map(|refresh| refresh.into_parts().0)
-                .map_err(StorageNodeServerError::from)
+                .map_err(StorageNodeServerError::from);
+            if refresh.is_ok() {
+                submission.last_accepted_submission_started_at = Some(submitted_at);
+            }
+            refresh.map(|refresh| refresh.into_parts().0)
         };
         // The complete-scan worker is the sole runtime-map publisher. A
         // cached report carries no new PG evidence and renews only the
@@ -1262,7 +1266,7 @@ impl StorageNodeServer {
         let submission = Arc::new(Mutex::new(StorageNodeHeartbeatSubmissionState {
             control_plane,
             latest_submitted: None,
-            last_submission_started_at: None,
+            last_accepted_submission_started_at: None,
         }));
         let authority_now_ms = Arc::new(Mutex::new(authority_now_ms));
 

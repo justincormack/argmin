@@ -3785,6 +3785,129 @@
         }));
     }
 
+    struct RejectFirstHeartbeatAuthority<S> {
+        authority: SingleAuthorityControlPlane<S>,
+        reject_first: bool,
+        delay_next_success: Option<Duration>,
+    }
+
+    impl<S: crate::control_plane::ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
+        for RejectFirstHeartbeatAuthority<S>
+    {
+        fn refresh_node_heartbeat(
+            &mut self,
+            heartbeat: NodeHeartbeat,
+            authority_now_ms: u64,
+        ) -> Result<crate::control_plane::ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+            if std::mem::take(&mut self.reject_first) {
+                return Err(ControlPlaneError::AuthorityClockSourceUnavailable);
+            }
+            if let Some(delay) = self.delay_next_success.take() {
+                thread::sleep(delay);
+            }
+            self.authority
+                .refresh_node_heartbeat(heartbeat, authority_now_ms)
+        }
+    }
+
+    #[test]
+    fn failed_scan_submission_cannot_suppress_authority_lease_renewal() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+        let heartbeat = |epoch| {
+            NodeHeartbeat::test_fixture(
+                node_id,
+                12,
+                socket_path.to_str().unwrap().to_owned(),
+                epoch,
+                5_000,
+                Default::default(),
+                Vec::new(),
+            )
+        };
+        let first = authority
+            .heartbeat(heartbeat(authority.snapshot().cluster_epoch()), 1_000)
+            .unwrap();
+        let initial = authority
+            .heartbeat(heartbeat(first.cluster_epoch()), 1_001)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(0), vec![node_id])
+            .unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        let server = StorageNodeServer::bind(config).unwrap();
+        let report = heartbeat(authority.snapshot().cluster_epoch());
+        let submission = Mutex::new(StorageNodeHeartbeatSubmissionState {
+            control_plane: RejectFirstHeartbeatAuthority {
+                authority,
+                reject_first: true,
+                delay_next_success: None,
+            },
+            latest_submitted: None,
+            last_accepted_submission_started_at: None,
+        });
+        let now = Mutex::new(|| 2_000);
+
+        assert!(server
+            .submit_serialized_control_plane_heartbeat(&submission, &now, report)
+            .is_err());
+        assert!(submission
+            .lock()
+            .unwrap()
+            .last_accepted_submission_started_at
+            .is_none());
+        submission.lock().unwrap().control_plane.delay_next_success =
+            Some(Duration::from_millis(150));
+        let renewed = StorageNodeServer::renew_latest_serialized_control_plane_heartbeat(
+            &submission,
+            &now,
+            Duration::from_millis(100),
+        )
+        .expect("a rejected scan must not suppress renewal")
+        .unwrap();
+        assert!(renewed.lease_deadline_ms() > initial.lease_deadline_ms());
+        StorageNodeServer::renew_latest_serialized_control_plane_heartbeat(
+            &submission,
+            &now,
+            Duration::from_millis(100),
+        )
+        .expect("a slow successful renewal must not start a new throttle window")
+        .unwrap();
+
+        submission.lock().unwrap().control_plane.delay_next_success =
+            Some(Duration::from_millis(150));
+        server
+            .submit_serialized_control_plane_heartbeat(
+                &submission,
+                &now,
+                heartbeat(runtime_map.cluster_epoch()),
+            )
+            .unwrap();
+        StorageNodeServer::renew_latest_serialized_control_plane_heartbeat(
+            &submission,
+            &now,
+            Duration::from_millis(100),
+        )
+        .expect("a slow successful scan must not start a new throttle window")
+        .unwrap();
+    }
+
     struct RecordingHeartbeatAuthority<S> {
         authority: SingleAuthorityControlPlane<S>,
         accepted_reports: Arc<Mutex<Vec<(std::num::NonZeroU64, HeartbeatLease)>>>,
