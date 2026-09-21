@@ -18,6 +18,11 @@ use rustls::pki_types::ServerName;
 use rustls::sign::CertifiedKey;
 use thiserror::Error;
 
+mod outage_artifact;
+pub use outage_artifact::OutageCommandArtifactPage;
+use outage_artifact::OutageCommandArtifactRecord;
+pub(crate) use outage_artifact::OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES;
+
 use crate::control_plane_auth::{
     control_plane_auth_payload_has_magic, ControlPlaneAuthDecision, ControlPlaneAuthEnvelope,
     ControlPlaneAuthEnvelopeDecodeError, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
@@ -130,7 +135,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 25;
+const CONTROL_PLANE_RPC_VERSION: u16 = 26;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -142,7 +147,9 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 45;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 46;
+const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS: usize = 64;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
     b"argmin-unavailable-pg-transition-batch-receipt-v1";
 const METADATA_TRANSFER_STAGING_CLEANUP_DIGEST_DOMAIN: &[u8] =
@@ -922,6 +929,8 @@ pub struct ClusterControlSnapshot {
     unavailable_pg_placement_transitions: BTreeMap<PgId, UnavailablePgPlacementTransition>,
     retained_unavailable_pg_placement_transitions:
         BTreeMap<(PgId, ClusterEpoch), UnavailablePgPlacementTransition>,
+    outage_command_artifacts:
+        BTreeMap<(PgId, ClusterEpoch, ClusterEpoch, u64), Arc<OutageCommandArtifactRecord>>,
     metadata_transfer_staging_evidence_pages:
         BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidencePageRecord>,
     metadata_transfer_staging_evidence_checkpoint_segments:
@@ -2468,6 +2477,7 @@ impl ClusterControlSnapshot {
             unavailable_pg_placement_transitions: BTreeMap::new(),
             retained_unavailable_pg_placement_transitions: BTreeMap::new(),
             metadata_transfer_staging_evidence_pages: BTreeMap::new(),
+            outage_command_artifacts: BTreeMap::new(),
             metadata_transfer_staging_evidence_checkpoint_segments: BTreeMap::new(),
             metadata_transfer_staging_evidence_checkpoint_anchors: BTreeMap::new(),
             metadata_transfer_staging_actor_closures: BTreeMap::new(),
@@ -5901,6 +5911,46 @@ impl ClusterControlSnapshot {
             );
         }
         Ok(())
+    }
+
+    fn apply_outage_command_artifact_page(
+        &self,
+        page: OutageCommandArtifactPage,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        page.validate()
+            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+        if page.source_epoch > self.cluster_epoch || !self.pgs.contains_key(&page.pg_id) {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "outage artifact references a future route or unknown PG".into(),
+            });
+        }
+        let key = page.key();
+        let mut next = self.clone();
+        let changed = if let Some(existing) = next.outage_command_artifacts.get(&key) {
+            let mut record = (**existing).clone();
+            let changed = record
+                .append(&page)
+                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+            if changed {
+                next.outage_command_artifacts.insert(key, Arc::new(record));
+            }
+            changed
+        } else {
+            let record = OutageCommandArtifactRecord::from_first_page(&page)
+                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+            next.outage_command_artifacts.insert(key, Arc::new(record));
+            true
+        };
+        if changed {
+            next.validate_current_state_invariants()
+                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+        }
+        Ok(applied_control_plane_command(
+            self,
+            next,
+            ControlPlaneCommandResponse::PublishOutageCommandArtifactPage,
+            changed,
+        ))
     }
 
     pub(crate) fn classify_metadata_transfer_staging_evidence_page(
@@ -10040,6 +10090,25 @@ impl ClusterControlSnapshot {
             }
         }
         self.validate_lease_grant_horizon_invariant()?;
+        if self.outage_command_artifacts.len() > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS {
+            return Err("too many retained outage command artifacts".into());
+        }
+        let mut retained_artifact_bytes = 0usize;
+        for (key, record) in &self.outage_command_artifacts {
+            if *key != record.key() || record.source_epoch > self.cluster_epoch {
+                return Err("outage command artifact key or source epoch is invalid".into());
+            }
+            if !self.pgs.contains_key(&record.pg_id) {
+                return Err("outage command artifact references unknown PG".into());
+            }
+            // Records are immutable after validated publication or snapshot decoding.
+            retained_artifact_bytes = retained_artifact_bytes
+                .checked_add(record.total_retained_bytes())
+                .ok_or("outage command artifact retained-byte count overflows")?;
+        }
+        if retained_artifact_bytes > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES {
+            return Err("retained outage command artifacts exceed the byte budget".into());
+        }
         self.validate_metadata_transfer_staging_evidence_invariants()?;
         for (node_id, observation) in &self.unavailable_node_observations {
             if *node_id != observation.node_id {
@@ -11596,6 +11665,9 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 operation_payload,
                 page_digest,
             } => self.apply_metadata_transfer_staging_evidence_page(operation_payload, page_digest),
+            ControlPlaneCommand::PublishOutageCommandArtifactPage { page } => {
+                self.apply_outage_command_artifact_page(page)
+            }
             ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
                 actor_node_id,
                 actor_node_incarnation,
@@ -17365,6 +17437,21 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             format_unavailable_pg_placement_transition(transition)
         ));
     }
+    for record in snapshot.outage_command_artifacts.values() {
+        for (page_index, bytes) in record.pages.iter().enumerate() {
+            out.push_str(&format!(
+                "outage_command_artifact_page={},{},{},{},{},{},{},{}\n",
+                record.pg_id.get(),
+                record.source_epoch.get(),
+                record.command_id.cluster_epoch().get(),
+                record.command_id.log_index().get(),
+                record.total_length,
+                hex_encode(&record.digest),
+                page_index,
+                hex_encode(bytes)
+            ));
+        }
+    }
     for transition in snapshot
         .retained_unavailable_pg_placement_transitions
         .values()
@@ -19037,6 +19124,8 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut unavailable_node_observations = BTreeMap::new();
     let mut unavailable_pg_placement_transitions = BTreeMap::new();
     let mut retained_unavailable_pg_placement_transitions = BTreeMap::new();
+    let mut outage_command_artifacts = BTreeMap::new();
+    let mut outage_command_artifact_bytes = 0usize;
     let mut metadata_transfer_staging_evidence_pages = BTreeMap::new();
     let mut metadata_transfer_staging_evidence_checkpoint_segments = BTreeMap::new();
     let mut metadata_transfer_staging_evidence_checkpoint_anchors = BTreeMap::new();
@@ -19241,6 +19330,97 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                     line_number,
                     "duplicate retained unavailable PG placement transition",
                 ));
+            }
+        } else if let Some(value) = line.strip_prefix("outage_command_artifact_page=") {
+            let fields: Vec<_> = value.split(',').collect();
+            if fields.len() != 8 {
+                return Err(parse_error(
+                    line_number,
+                    "outage artifact page must have eight fields",
+                ));
+            }
+            if fields[7].len() > OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES * 2 {
+                return Err(parse_error(
+                    line_number,
+                    "outage artifact page exceeds the byte bound",
+                ));
+            }
+            if fields[5].len() != 64 {
+                return Err(parse_error(
+                    line_number,
+                    "outage artifact digest must contain 32 bytes",
+                ));
+            }
+            outage_command_artifact_bytes = outage_command_artifact_bytes
+                .checked_add(fields[7].len() / 2)
+                .ok_or_else(|| parse_error(line_number, "outage artifact byte count overflows"))?;
+            if outage_command_artifact_bytes > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES {
+                return Err(parse_error(
+                    line_number,
+                    "retained outage artifacts exceed the byte budget",
+                ));
+            }
+            let pg_id = PgId::new(parse_u32(line_number, fields[0], "outage artifact PG")?);
+            let source_epoch = ClusterEpoch::new(parse_u64(
+                line_number,
+                fields[1],
+                "outage artifact source epoch",
+            )?)
+            .ok_or_else(|| parse_error(line_number, "outage artifact source epoch is zero"))?;
+            let command_epoch = ClusterEpoch::new(parse_u64(
+                line_number,
+                fields[2],
+                "outage artifact command epoch",
+            )?)
+            .ok_or_else(|| parse_error(line_number, "outage artifact command epoch is zero"))?;
+            let log_index = crate::metadata_command::MetadataCommandLogIndex::new(parse_u64(
+                line_number,
+                fields[3],
+                "outage artifact command index",
+            )?)
+            .ok_or_else(|| parse_error(line_number, "outage artifact command index is zero"))?;
+            let digest = hex_decode(line_number, fields[5])?
+                .try_into()
+                .map_err(|_| {
+                    parse_error(line_number, "outage artifact digest must contain 32 bytes")
+                })?;
+            let page = OutageCommandArtifactPage {
+                pg_id,
+                source_epoch,
+                command_id: crate::metadata_command::MetadataCommandId::new(
+                    command_epoch,
+                    pg_id,
+                    log_index,
+                ),
+                total_length: parse_u32(line_number, fields[4], "outage artifact length")?,
+                digest,
+                page_index: parse_u16(line_number, fields[6], "outage artifact page index")?,
+                bytes: hex_decode(line_number, fields[7])?,
+            };
+            page.validate()
+                .map_err(|message| parse_error(line_number, &message))?;
+            let key = page.key();
+            if let Some(existing) = outage_command_artifacts.get_mut(&key) {
+                let record: &mut OutageCommandArtifactRecord = Arc::make_mut(existing);
+                if page.page_index as usize != record.pages.len() {
+                    return Err(parse_error(
+                        line_number,
+                        "outage artifact pages are not canonical and contiguous",
+                    ));
+                }
+                record
+                    .append(&page)
+                    .map_err(|message| parse_error(line_number, &message))?;
+            } else {
+                if outage_command_artifacts.len() >= MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS {
+                    return Err(parse_error(
+                        line_number,
+                        "too many retained outage artifacts",
+                    ));
+                }
+                let record = OutageCommandArtifactRecord::from_first_page(&page)
+                    .map_err(|message| parse_error(line_number, &message))?;
+                outage_command_artifacts.insert(key, Arc::new(record));
             }
         } else if let Some(value) = line.strip_prefix("metadata_transfer_staging_evidence_page=") {
             let fields: Vec<_> = value.split(',').collect();
@@ -19462,6 +19642,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         unavailable_node_observations,
         unavailable_pg_placement_transitions,
         retained_unavailable_pg_placement_transitions,
+        outage_command_artifacts,
         metadata_transfer_staging_evidence_pages,
         metadata_transfer_staging_evidence_checkpoint_segments,
         metadata_transfer_staging_evidence_checkpoint_anchors,

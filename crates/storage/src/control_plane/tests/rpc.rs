@@ -73,6 +73,31 @@ fn control_plane_rpc_catalogue_snapshot() -> ClusterRuntimeMapSnapshot {
     runtime_map_test_snapshot_with_active_route()
 }
 
+fn control_plane_rpc_catalogue_authorized_snapshot() -> ClusterRuntimeMapSnapshot {
+    let mut snapshot = control_plane_rpc_catalogue_snapshot();
+    let committed_epoch = ClusterEpoch::new(16).unwrap();
+    snapshot.cluster_epoch = committed_epoch;
+    snapshot.pg_routes[0].cluster_epoch = committed_epoch;
+    let authorizations = vec![UnavailablePgStagingIntentAuthorizationRequest {
+        unavailable_transition: control_plane_rpc_catalogue_transition_binding(),
+        staging_generation: 15,
+        artifact_target_epoch: ClusterEpoch::new(17).unwrap(),
+        artifact_digest: [0x5a; 32],
+        artifact_length: 12_345,
+        artifact_format_version: METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
+    }];
+    let digest = unavailable_pg_staging_authorization_members_digest(&authorizations);
+    snapshot.staging_authorizations = vec![
+        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
+            authorizations,
+            committed_epoch,
+            digest,
+        )
+        .unwrap(),
+    ];
+    snapshot
+}
+
 fn control_plane_rpc_catalogue_freshness_kind(
     proof: &RuntimeMapFreshnessProof,
 ) -> ControlPlaneRpcRuntimeMapFreshnessProofKind {
@@ -437,7 +462,7 @@ fn control_plane_rpc_v21_staging_evidence_frames_remain_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v25_staging_evidence_frames_are_exact() {
+fn control_plane_rpc_v26_staging_evidence_frames_are_exact() {
     let genesis = control_plane_rpc_catalogue_staging_page();
     let genesis_receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&genesis);
     let successor = metadata_transfer_staging_evidence_page_for_test(
@@ -478,21 +503,21 @@ fn control_plane_rpc_v25_staging_evidence_frames_are_exact() {
         [
             (
                 469,
-                "dd618b05e61a089dea48e062d85923f89371b7fe9c93344c91c32f6c53062a47".to_owned(),
+                "9e2d9f0d6b04c74547cd905bab11b1812cb99ef484a6364920888f3e37175a91".to_owned(),
                 214,
-                "71b28439c66c34d437eb2e26164081924305a9de58f3c9dd3868fb3e049a41e0".to_owned(),
+                "aa23e1039afcdada74e382205551fe75ca8950a4b7bb0c1e42b7072cb569c78a".to_owned(),
             ),
             (
                 409,
-                "82f31c85cdd084b8d71f6cdf60c70751eb03db74a43ece4027fc424732dc3254".to_owned(),
+                "7c1dddf77a55517f7bb1d2f3e99eecf328fa62708b856ebc0c20e37e2ff48928".to_owned(),
                 214,
-                "4fa694ef0d5abd054d9bc7b2e793a6dc5b2670333da130d274f00bfdac5845f7".to_owned(),
+                "2ce4f17c1329d106a8bc0c823f5edb37a09cb2f7563a0554fb7c7b9f82e36be0".to_owned(),
             ),
             (
                 734,
-                "41985efbb10395aaaf17e782b11c4c5ca41104fc15d24ec0e7c5b0dc5981a785".to_owned(),
+                "f37c7553cabdd93262e14959574beae9acb9288d9594f69edd1782494f44053c".to_owned(),
                 214,
-                "f922e11fb9aa45fb2d5f513f64a5743e34f338beba9663ebfb9618b3e00c1be7".to_owned(),
+                "ecdfd977174c3d04765459c4a41524d7baa085dd6af955299aff5f07950819df".to_owned(),
             ),
         ]
     );
@@ -1811,7 +1836,7 @@ fn control_plane_rpc_v21_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v25_operation_catalogue_is_exact() {
+fn control_plane_rpc_v26_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -1823,8 +1848,12 @@ fn control_plane_rpc_v25_operation_catalogue_is_exact() {
         control_plane_rpc_catalogue_recovery_snapshot(),
         control_plane_rpc_catalogue_current_recovery_snapshot(),
         control_plane_rpc_catalogue_empty_snapshot(),
+        control_plane_rpc_catalogue_authorized_snapshot(),
     ];
     assert_control_plane_rpc_catalogue_runtime_map_branches(&runtime_map_snapshots);
+    assert!(runtime_map_snapshots
+        .iter()
+        .any(|snapshot| !snapshot.staging_authorizations.is_empty()));
     assert_eq!(
         runtime_map_snapshots
             .iter()
@@ -2024,10 +2053,59 @@ fn control_plane_rpc_v25_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            16_689,
-            "c54060df276b4018c79d7da65005fc2b3f4ce08b93d859ec88b88369ef809816".to_owned()
+            17_072,
+            "74bceaefed41f9b4b5ce27a281c033c8cf907fc24d5ed2555d2daa8a665fe87c".to_owned()
         )
     );
+}
+
+#[test]
+fn control_plane_rpc_v25_nonempty_authorization_remains_rejected_evidence() {
+    let snapshot = control_plane_rpc_catalogue_authorized_snapshot();
+    let mut payload = Vec::new();
+    write_runtime_map_snapshot(&mut payload, &snapshot).unwrap();
+    let mut reader = PayloadReader::new(&payload);
+    assert_eq!(read_runtime_map_snapshot(&mut reader).unwrap(), snapshot);
+    reader.finish().unwrap();
+
+    let authorization = &snapshot.staging_authorizations[0];
+    let current_command = authorization.encode_command().unwrap();
+    let historical_command =
+        crate::control_plane_command::encode_control_plane_command_with_version_for_test(
+            &ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
+                authorizations: authorization.authorizations().to_vec(),
+            },
+            33,
+        )
+        .unwrap();
+    assert_eq!(current_command.len(), historical_command.len());
+    let offsets = payload
+        .windows(current_command.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == current_command).then_some(offset))
+        .collect::<Vec<_>>();
+    assert_eq!(offsets.len(), 1);
+    let offset = offsets[0];
+    payload[offset..offset + historical_command.len()].copy_from_slice(&historical_command);
+    let response = encode_control_plane_rpc_response(Ok(payload)).unwrap();
+    let frame = encode_control_plane_rpc_frame_with_version(
+        ControlPlaneRpcKind::RuntimeMapSnapshot,
+        &response,
+        25,
+    )
+    .unwrap();
+    assert_eq!(
+        (frame.len(), hex_encode(&checksum::sha256::digest(&frame))),
+        (
+            378,
+            "c7d1c13f347523358f877ece9e77c18d98691facf2fc89dc72cd3eba94ce3915".to_owned(),
+        ),
+    );
+    assert!(matches!(
+        read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+        Err(ControlPlaneError::RpcProtocol { diagnostic })
+            if diagnostic.as_str() == "unsupported control-plane RPC version 25"
+    ));
 }
 
 #[test]
@@ -2296,8 +2374,8 @@ fn authenticated_control_plane_rpc_v23_auth_v2_payload_binding_remains_rejected_
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v25_auth_v2_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 25);
+fn authenticated_control_plane_rpc_v26_auth_v2_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 26);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -2352,6 +2430,42 @@ fn authenticated_control_plane_rpc_v25_auth_v2_payload_bindings_are_exact() {
     assert!(
         read_control_plane_rpc_frame(&mut std::io::Cursor::new(historical_response_frame)).is_err()
     );
+    let previous_request_frame = encode_control_plane_rpc_frame_with_version(
+        kind,
+        &signed_frontend_runtime_map_request(
+            kind,
+            client.credential(),
+            Vec::new(),
+            Some(1_000),
+            Some(6_000),
+        )
+        .payload,
+        25,
+    )
+    .unwrap();
+    let previous_response_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &response, 25).unwrap();
+    assert_eq!(
+        (
+            previous_request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&previous_request_frame)),
+            previous_response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&previous_response_frame)),
+        ),
+        (
+            182,
+            "e5e3784da42baa34200dd8216ee8121300ad772e7cc5ae65a1f33ccd649c410c".to_owned(),
+            190,
+            "a47102ffe567167ef965f14144c80485ec10bce6f0b32f06e29836a0d632d23a".to_owned(),
+        )
+    );
+    for frame in [previous_request_frame, previous_response_frame] {
+        assert!(matches!(
+            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+            Err(ControlPlaneError::RpcProtocol { diagnostic })
+                if diagnostic.as_str() == "unsupported control-plane RPC version 25"
+        ));
+    }
     let request_frame = encode_control_plane_rpc_frame(
         kind,
         &signed_frontend_runtime_map_request(
@@ -2374,15 +2488,15 @@ fn authenticated_control_plane_rpc_v25_auth_v2_payload_bindings_are_exact() {
         ),
         (
             182,
-            "e5e3784da42baa34200dd8216ee8121300ad772e7cc5ae65a1f33ccd649c410c".to_owned(),
+            "ff002336534e2d043876019c7041e9d36ec1686a177b582233f86a9362e21712".to_owned(),
             190,
-            "a47102ffe567167ef965f14144c80485ec10bce6f0b32f06e29836a0d632d23a".to_owned(),
+            "a3d3037ea3267ae91f3ca0a8028015b60cb91de88e9e704230c70899fdfe1c1c".to_owned(),
         )
     );
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v25_closure_page_frames_are_exact() {
+fn authenticated_control_plane_rpc_v26_closure_page_frames_are_exact() {
     let kind = ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage;
     let page = control_plane_rpc_catalogue_staging_closure_page();
     assert!(page.actor_closure_candidate().is_some());
@@ -2429,9 +2543,9 @@ fn authenticated_control_plane_rpc_v25_closure_page_frames_are_exact() {
         ),
         (
             867,
-            "0b9b0e631b19dadea6740665b82eea7d382aaca259d1fcef972d3dc1f5c7b519".to_owned(),
+            "eaf424a257aa330e22ba3da9802caefb18fbd78a415bdb1d9cd83b3e47547e05".to_owned(),
             348,
-            "e43723132ed4c4c400951e86ac91112d7bc1b77549c41481e04d6f50256be863".to_owned(),
+            "a78f1da79a0a8df193f1dc307ac171106ef653c16f4bc40db9b723acced7ed83".to_owned(),
         )
     );
 }

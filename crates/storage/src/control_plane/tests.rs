@@ -356,7 +356,30 @@ fn control_plane_rpc_v23_frame_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v25_frame_encoding_is_exact() {
+fn control_plane_rpc_v25_frame_remains_rejected_evidence() {
+    let frame = encode_control_plane_rpc_frame_with_version(
+        ControlPlaneRpcKind::RuntimeMapStatus,
+        &[0x01, 0x02, 0x03],
+        25,
+    )
+    .unwrap();
+    assert_eq!(
+        frame,
+        [
+            97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
+            110, 101, 45, 114, 112, 99, 0, 25, 0, 12, 0, 0, 0, 3, 0, 128, 21, 81, 61, 233, 203,
+            215, 1, 2, 3,
+        ]
+    );
+    assert!(matches!(
+        read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+        Err(ControlPlaneError::RpcProtocol { diagnostic })
+            if diagnostic.as_str() == "unsupported control-plane RPC version 25"
+    ));
+}
+
+#[test]
+fn control_plane_rpc_v26_frame_encoding_is_exact() {
     let frame =
         encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
             .unwrap();
@@ -365,8 +388,8 @@ fn control_plane_rpc_v25_frame_encoding_is_exact() {
         frame,
         [
             97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
-            110, 101, 45, 114, 112, 99, 0, 25, 0, 12, 0, 0, 0, 3, 0, 128, 21, 81, 61, 233, 203,
-            215, 1, 2, 3,
+            110, 101, 45, 114, 112, 99, 0, 26, 0, 12, 0, 0, 0, 3, 246, 21, 198, 181, 20, 130, 207,
+            43, 1, 2, 3,
         ]
     );
 }
@@ -1706,7 +1729,7 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         Err(ControlPlaneStateVersionError::Missing)
     );
     for version in [
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46,
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 47,
     ] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
@@ -1714,8 +1737,8 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(45)),
-        Ok(45)
+        require_current_control_plane_state_version(Some(46)),
+        Ok(46)
     );
 
     assert!(matches!(
@@ -2086,11 +2109,11 @@ fn canonical_control_plane_state_v43_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v45_text_is_exact() {
+fn canonical_control_plane_state_v46_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=45\n",
+            "version=46\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -2256,7 +2279,7 @@ fn canonical_control_plane_state_v36_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v45_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v46_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -2286,6 +2309,73 @@ fn canonical_control_plane_state_v45_representative_aggregate_is_stable() {
         .unwrap()
         .into_snapshot();
     snapshots.push(certified.clone());
+
+    let small_artifact_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(7),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::PutBucketSubresource(
+            crate::metadata_command::PutBucketSubresourceCommand::new(
+                bucket_name("artifact-small"),
+                crate::metadata_command::BucketSubresourceMutation::PutCors(
+                    "<CORSConfiguration/>".to_owned(),
+                ),
+                1,
+            ),
+        ),
+    );
+    let small_artifact =
+        OutageCommandArtifactPage::for_command(&small_artifact_command, certified.cluster_epoch())
+            .unwrap();
+    assert_eq!(small_artifact.len(), 1);
+    snapshots.push(
+        certified
+            .clone()
+            .apply_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: small_artifact[0].clone(),
+            })
+            .unwrap()
+            .into_snapshot(),
+    );
+
+    let large_artifact_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(9),
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        MetadataCommandPayload::PutBucketSubresource(
+            crate::metadata_command::PutBucketSubresourceCommand::new(
+                bucket_name("artifact-large"),
+                crate::metadata_command::BucketSubresourceMutation::PutCors(format!(
+                    "<CORSConfiguration><!--{}--></CORSConfiguration>",
+                    "x".repeat(OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES)
+                )),
+                1,
+            ),
+        ),
+    );
+    let large_artifact =
+        OutageCommandArtifactPage::for_command(&large_artifact_command, certified.cluster_epoch())
+            .unwrap();
+    assert_eq!(large_artifact.len(), 2);
+    let partial_artifact = certified
+        .apply_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+            page: large_artifact[0].clone(),
+        })
+        .unwrap()
+        .into_snapshot();
+    snapshots.push(partial_artifact.clone());
+    snapshots.push(
+        partial_artifact
+            .apply_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: large_artifact[1].clone(),
+            })
+            .unwrap()
+            .into_snapshot(),
+    );
 
     let unavailable_tmp = test_util::tempdir();
     let unavailable_store =
@@ -2968,6 +3058,7 @@ fn canonical_control_plane_state_v45_representative_aggregate_is_stable() {
 
     let mut aggregate = Vec::new();
     let mut aggregate_text = String::new();
+    let mut previous_aggregate = Vec::new();
     for snapshot in snapshots {
         snapshot.validate_current_state_invariants().unwrap();
         let formatted = format_snapshot(&snapshot);
@@ -2975,9 +3066,29 @@ fn canonical_control_plane_state_v45_representative_aggregate_is_stable() {
         aggregate.extend_from_slice(&(formatted.len() as u64).to_be_bytes());
         aggregate.extend_from_slice(formatted.as_bytes());
         aggregate_text.push_str(&formatted);
+        if snapshot.outage_command_artifacts.is_empty() {
+            let previous = formatted.replacen("version=46\n", "version=45\n", 1);
+            previous_aggregate.extend_from_slice(&(previous.len() as u64).to_be_bytes());
+            previous_aggregate.extend_from_slice(previous.as_bytes());
+            assert!(matches!(
+                parse_snapshot(&previous),
+                Err(ControlPlaneError::Parse { line: 1, message })
+                    if message == "unsupported control-plane state version 45"
+            ));
+        }
     }
+    assert_eq!(
+        (
+            previous_aggregate.len(),
+            hex_encode(&checksum::sha256::digest(&previous_aggregate))
+        ),
+        (
+            136_514,
+            "bd8728e6221f0b3b8d2f285719bae8d83b7a9dc255a7a08254ae1b7a52a9c9e0".to_owned()
+        )
+    );
     for required_record in [
-        "version=45\n",
+        "version=46\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -2999,6 +3110,7 @@ fn canonical_control_plane_state_v45_representative_aggregate_is_stable() {
         "metadata_transfer_staging_retired_actor_closure=",
         "metadata_transfer_staging_finalized_floor=",
         "metadata_transfer_staging_evidence=",
+        "outage_command_artifact_page=",
     ] {
         assert!(
             aggregate_text.contains(required_record),
@@ -3061,8 +3173,8 @@ fn canonical_control_plane_state_v45_representative_aggregate_is_stable() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            136_514,
-            "bd8728e6221f0b3b8d2f285719bae8d83b7a9dc255a7a08254ae1b7a52a9c9e0".to_owned()
+            402_184,
+            "93969a0aa9f515677e1bbfdddf7eea7aef1bc385cb9889405c1a9ea78bd30ad3".to_owned()
         )
     );
 }

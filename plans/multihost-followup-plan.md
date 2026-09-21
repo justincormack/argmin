@@ -1603,8 +1603,8 @@ replaces the detail with exact page-membership bindings. Immutable command-v31,
 RPC-v22, and state-v43 aggregates remain rejection evidence, including nested
 journal, Raft WAL, peer, restart, snapshot, and storage-RPC containers. The
 current coordinated version vector is staging-store/evidence/page/apply-receipt
-v4, staged-artifact v3, storage RPC v27, control-plane RPC v25, command v33,
-state v45, and authentication envelope v2.
+v4, staged-artifact v3, storage RPC v28, control-plane RPC v26, command v34,
+state v46, and authentication envelope v2.
 
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Staging-store format v4 owns the
@@ -1877,6 +1877,14 @@ replica for differing from the floor. Recovery of index 15 then waits for the
 powered-off actor before it can abandon or converge the slot. Resolving only
 index 15 would still leave the 10-to-14 floor gap. Implement the outage path as
 one exact, durable proof-lineage handoff:
+
+Implementation status: command v34/state v46 provide bounded, immutable,
+epoch-neutral publication of exact command-byte pages with whole-command
+integrity, replay, and snapshot retention. No production outage worker publishes
+these pages yet. The intent CAS, old-route fence, retained-page retirement, and
+terminal/pending-transfer proof remain gated; page publication alone grants no
+serving or cleanup authority. The artifact identity uses the exact source epoch
+and command identity; command v34 defines this first page format.
 
 - Fence the old route and failed incarnation through a committed, epoch-neutral
   outage-resolution intent before any partial-actor cleanup can remove the
