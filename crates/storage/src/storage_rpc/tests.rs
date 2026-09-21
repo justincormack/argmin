@@ -300,7 +300,12 @@ mod tests {
             45, 114, 112, 99, 45, 102, 114, 97, 109, 101, 30, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3,
             0, 3, 0, 0, 0, 83, 42, 206, 167, 224, 241, 203, 181, 97, 98, 99,
         ];
-        assert_eq!(bytes, V30_FRAME);
+        const V31_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101,
+            45, 114, 112, 99, 45, 102, 114, 97, 109, 101, 31, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3,
+            0, 3, 0, 0, 0, 66, 217, 241, 51, 219, 65, 178, 66, 97, 98, 99,
+        ];
+        assert_eq!(bytes, V31_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
@@ -353,12 +358,16 @@ mod tests {
             decode_storage_rpc_frame(V29_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(29))
         );
+        assert_eq!(
+            decode_storage_rpc_frame(V30_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(30))
+        );
     }
 
     #[test]
-    fn current_storage_rpc_v30_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
+    fn current_storage_rpc_v31_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
     {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 30);
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 31);
         const HISTORICAL_V24_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65180008070605040302013a006801000074c0762f7d94ad7d0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
         const EXPECTED_V26_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d651a0008070605040302013a00680100007e3347f1e84716ca0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
         const EXPECTED_V27_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d651b0008070605040302013a0068010000fbca5f1e22aecb910700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
@@ -441,7 +450,17 @@ mod tests {
             &payload,
             30,
         );
-        assert_eq!(frame, expected_v30_frame);
+        assert_eq!(
+            decode_storage_rpc_frame(&expected_v30_frame),
+            Err(StorageRpcFrameError::UnsupportedVersion(30))
+        );
+        let expected_v31_frame = encode_storage_rpc_frame_with_version_for_test(
+            0x0102_0304_0506_0708,
+            StorageRpcMessageKind::ObjectMultipartUploadMatch,
+            &payload,
+            31,
+        );
+        assert_eq!(frame, expected_v31_frame);
 
         let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
         assert_eq!(
@@ -595,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_v30_metadata_transfer_staging_frames_are_stable() {
+    fn storage_rpc_v31_metadata_transfer_staging_frames_are_stable() {
         const HISTORICAL_V24_STAGING_INTENT_CREATE_FRAME_HEX: &str = concat!(
             "180000006172676d696e2d73746f726167652d7270632d6672616d65180008070605",
             "04030201af0072000000bb7a22bfefcb52a06e0000000000000b0000000000000009",
@@ -837,7 +856,7 @@ mod tests {
             ),
             (
                 2_295,
-                "d06ce1fb66af55de3e5ee34f75bfc808f105947c36ce58b4ceeaf76e66c588e9"
+                "30c8ad2001e14b3a27cc5fa5e530e4a4cd4505ade589787d9a2918954bfb0ce9"
                     .to_owned(),
             )
         );
@@ -872,6 +891,60 @@ mod tests {
                 frame_version,
             )
         };
+        let previous_v30_frames = [
+            encode_historical_frame(
+                36,
+                30,
+                StorageRpcMessageKind::MetadataTransferStagingIntentCreate,
+                &create_payload,
+            ),
+            encode_historical_frame(
+                36,
+                30,
+                StorageRpcMessageKind::MetadataTransferStagingArtifactPublish,
+                &payload,
+            ),
+            encode_historical_frame(
+                36,
+                30,
+                StorageRpcMessageKind::MetadataTransferStagingProofPublish,
+                &proof_payload,
+            ),
+            encode_historical_frame(
+                36,
+                30,
+                StorageRpcMessageKind::MetadataTransferStagingTombstone,
+                &tombstone_payload,
+            ),
+            encode_historical_frame(
+                36,
+                30,
+                StorageRpcMessageKind::MetadataTransferStagingArtifactRead,
+                &read_payload,
+            ),
+        ];
+        let mut previous_v30_aggregate = Vec::new();
+        for previous_frame in &previous_v30_frames {
+            previous_v30_aggregate.extend_from_slice(
+                &u32::try_from(previous_frame.len()).unwrap().to_be_bytes(),
+            );
+            previous_v30_aggregate.extend_from_slice(previous_frame);
+            assert_eq!(
+                decode_storage_rpc_frame(previous_frame),
+                Err(StorageRpcFrameError::UnsupportedVersion(30))
+            );
+        }
+        assert_eq!(
+            (
+                previous_v30_aggregate.len(),
+                hex_bytes(&checksum::sha256::digest(&previous_v30_aggregate)),
+            ),
+            (
+                2_295,
+                "d06ce1fb66af55de3e5ee34f75bfc808f105947c36ce58b4ceeaf76e66c588e9"
+                    .to_owned(),
+            )
+        );
         let previous_v29_frames = [
             encode_historical_frame(
                 35,
@@ -1201,8 +1274,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(29))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(31)),
-            Err(StorageRpcFrameError::UnsupportedVersion(31))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(30)),
+            Err(StorageRpcFrameError::UnsupportedVersion(30))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(32)),
+            Err(StorageRpcFrameError::UnsupportedVersion(32))
         );
     }
 

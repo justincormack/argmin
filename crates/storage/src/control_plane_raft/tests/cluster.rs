@@ -142,6 +142,152 @@ fn control_plane_openraft_reserves_complete_outage_artifacts_before_page_zero() 
 }
 
 #[test]
+fn control_plane_openraft_replicates_stale_outage_artifact_retirement() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let ThreeVoterAuthorityFixture {
+            network: _,
+            config: _,
+            leader_log_store: _,
+            third_log_store: _,
+            authority1,
+            authority2,
+            authority3,
+        } = initialized_three_node_voter_authorities(
+            "control-plane-raft-outage-artifact-retirement-test",
+            1411,
+            1412,
+            1413,
+        )
+        .await;
+        let authority1 = Arc::new(authority1);
+        let authority2 = Arc::new(authority2);
+        let authority3 = Arc::new(authority3);
+        let mut leader = crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost::new_for_test(
+            tokio::runtime::Handle::current(),
+            Arc::clone(&authority1),
+            false,
+        )
+        .unwrap();
+        leader
+            .submit_command_for_test(ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(NodeId::new(1), "/tmp/raft-outage-retirement.sock".into())],
+                pg_ids: vec![PgId::new(7)],
+            })
+            .unwrap();
+        let source_epoch = leader.current_snapshot_for_test().unwrap().cluster_epoch();
+        let command = crate::metadata_command::MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(7),
+                crate::metadata_command::MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            crate::metadata_command::MetadataCommandPayload::PutBucketSubresource(
+                crate::metadata_command::PutBucketSubresourceCommand::new(
+                    crate::types::BucketName::try_from("raft-outage-retirement").unwrap(),
+                    crate::metadata_command::BucketSubresourceMutation::PutCors(
+                        "<CORSConfiguration/>".to_owned(),
+                    ),
+                    1,
+                ),
+            ),
+        );
+        let page = crate::control_plane::OutageCommandArtifactPage::for_command(
+            &command,
+            source_epoch,
+        )
+        .unwrap()
+        .remove(0);
+        leader
+            .submit_command_for_test(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: page.clone(),
+            })
+            .unwrap();
+        leader
+            .submit_command_for_test(ControlPlaneCommand::SetNodeMembership {
+                node_id: NodeId::new(1),
+                membership: crate::control_plane::NodeMembershipState::Draining,
+            })
+            .unwrap();
+
+        let retirement_epoch = leader.current_snapshot_for_test().unwrap().cluster_epoch();
+        let pre_update_gate = Arc::new(ControlPlaneRaftLowPriorityTestGate::new());
+        authority1
+            .set_low_priority_before_update_gate_for_test(Arc::clone(&pre_update_gate));
+        let pre_update_gate_release = LowPriorityGateRelease(Arc::clone(&pre_update_gate));
+        let maintenance = std::thread::spawn(move || {
+            let result = leader.maintain_outage_command_artifacts_once();
+            (leader, result)
+        });
+        ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(1),
+            pre_update_gate.wait_for_arrival(),
+        )
+        .await
+        .expect("outage artifact retirement did not reach low-priority admission");
+
+        let epoch_advance = authority1
+            .submit_control_plane_command(ControlPlaneCommand::SetNodeMembership {
+                node_id: NodeId::new(99),
+                membership: crate::control_plane::NodeMembershipState::Joining,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            epoch_advance.outcome(),
+            ControlPlaneRaftCommandOutcome::Applied(
+                ControlPlaneCommandResponse::SetNodeMembership
+            )
+        ));
+        assert!(
+            authority1
+                .current_control_plane_snapshot()
+                .await
+                .unwrap()
+                .cluster_epoch()
+                > retirement_epoch
+        );
+        pre_update_gate_release.0.release();
+        drop(pre_update_gate_release);
+        let (mut leader, retirement) = maintenance.join().unwrap();
+        assert!(retirement.unwrap());
+        let applied = authority1.status().await.unwrap().applied().unwrap();
+        for authority in [&authority2, &authority3] {
+            authority
+                .wait_for_applied_log_id(
+                    applied,
+                    Duration::from_secs(1),
+                    "follower applied outage artifact retirement",
+                )
+                .await
+                .unwrap();
+        }
+        let expected = leader.current_snapshot_for_test().unwrap();
+        assert!(!crate::control_plane::format_snapshot(&expected)
+            .contains("outage_command_artifact_page="));
+        for authority in [&authority1, &authority2, &authority3] {
+            assert_eq!(
+                authority
+                    .durable_state_machine_snapshot_for_test()
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(leader
+            .submit_command_for_test(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("current cluster epoch"));
+
+        authority1.shutdown().await.unwrap();
+        authority2.shutdown().await.unwrap();
+        authority3.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox() {
     ControlPlaneRaftTypeConfig::run(async {
         let (authority, follower) = initialized_two_node_authorities(

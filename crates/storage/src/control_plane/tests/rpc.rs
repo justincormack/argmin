@@ -462,7 +462,7 @@ fn control_plane_rpc_v21_staging_evidence_frames_remain_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v28_staging_evidence_frames_are_exact() {
+fn control_plane_rpc_v29_staging_evidence_frames_are_exact() {
     let genesis = control_plane_rpc_catalogue_staging_page();
     let genesis_receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&genesis);
     let successor = metadata_transfer_staging_evidence_page_for_test(
@@ -503,21 +503,21 @@ fn control_plane_rpc_v28_staging_evidence_frames_are_exact() {
         [
             (
                 469,
-                "cab25b4cf9544b30da558edc43a6ebe63a885c37aff773671b871ec8abf9aa3e".to_owned(),
+                "ec753b9d598a1bbe041a25625c06612556b357128c70a8370c15dc9237c4a25d".to_owned(),
                 214,
-                "cb14bb802a68a1cd61f770f462b7db9712a77a7c70f597ba478189224aea60b8".to_owned(),
+                "58e84fc806b3e47d8614483052a005411bec384de29cc1a3f9def0e0e16cef2b".to_owned(),
             ),
             (
                 409,
-                "9a944a11f6e8b7c3ea5bd06806dccca330d70700f5b730c283b3539d97846d6b".to_owned(),
+                "58a0c0b211940b542100a0b7ebe2cb71db33253b7a541a8155a51adf9689b0cf".to_owned(),
                 214,
-                "b7cffe71818d1cd1996e4220f3a5b4c26ceac04ab2fef9d9ea2afb61c5b67a79".to_owned(),
+                "7ec4430c8bb479d5aaa07fe58dab76bf4c8edfce0b813a6e4d56634cf983f28a".to_owned(),
             ),
             (
                 734,
-                "1e5b4874d5e14c52d9e748d48db43e0f20a7dffbe254a1996ef7b77538479a9e".to_owned(),
+                "35434cb35de8db1efb7ba2eeb5f7fd96abf7833ed6cc7cb9db3133e8ac28bb32".to_owned(),
                 214,
-                "e059171240b92c99114a7bb2b4af9da7b44ab94984439d1eeeaa9f164f355986".to_owned(),
+                "181c96551f50aecbf8e52dac7275d9e19761c2f49b667746b2b652b67329b17a".to_owned(),
             ),
         ]
     );
@@ -1836,7 +1836,7 @@ fn control_plane_rpc_v21_operation_catalogue_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v28_operation_catalogue_is_exact() {
+fn control_plane_rpc_v29_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -2054,7 +2054,7 @@ fn control_plane_rpc_v28_operation_catalogue_is_exact() {
         ),
         (
             17_072,
-            "ce36911e156b3c78d550b0f478248c5f39228bbd0087fdde6de9e7d5e3e3770c".to_owned()
+            "cff3b4b0b388e1a07e12cfdab9afca52bb090bf3b12a54133dc2dbfda15923a2".to_owned()
         )
     );
 }
@@ -2464,8 +2464,8 @@ fn authenticated_control_plane_rpc_v23_auth_v2_payload_binding_remains_rejected_
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v28_auth_v2_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 28);
+fn authenticated_control_plane_rpc_v29_auth_v2_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 29);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -2650,15 +2650,15 @@ fn authenticated_control_plane_rpc_v28_auth_v2_payload_bindings_are_exact() {
         ),
         (
             182,
-            "4edbeb038bdcdafef198406563c830374b3e8826fca80161550c427b82f86821".to_owned(),
+            "21b905cda70c3187aaaa8d895ec5ec4bf4c723e682f7ad3efa32957a26766172".to_owned(),
             190,
-            "961c634ae77407a5da1ff7253a76b904bdcc8cbe298e9422bb2906e76db5ad8a".to_owned(),
+            "412dae7fb80c3b1469737361ab9338cb343750f41fa5875629ff48cbdff30b4a".to_owned(),
         )
     );
 }
 
 #[test]
-fn authenticated_control_plane_rpc_v28_closure_page_frames_are_exact() {
+fn authenticated_control_plane_rpc_v29_closure_page_frames_are_exact() {
     let kind = ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage;
     let page = control_plane_rpc_catalogue_staging_closure_page();
     assert!(page.actor_closure_candidate().is_some());
@@ -2705,9 +2705,9 @@ fn authenticated_control_plane_rpc_v28_closure_page_frames_are_exact() {
         ),
         (
             867,
-            "8db84b6d0aa2b12e0058e69697ba1ba1417e79fff935277cff5f77c12d981030".to_owned(),
+            "9207cc4f7fe6329201433414141eef867b113dc4f0eec1815cfb651e587c3337".to_owned(),
             348,
-            "31eb78ef0f3bc0fb3a05ee1e6f4535024ab9b87f7609420c77cf5f89b7193e1d".to_owned(),
+            "fd28fcfd149b45b4650a62d5716c1212cb7c38ad1e461ead3920bf74d7ac5e1c".to_owned(),
         )
     );
 }

@@ -1632,8 +1632,8 @@ replaces the detail with exact page-membership bindings. Immutable command-v31,
 RPC-v22, and state-v43 aggregates remain rejection evidence, including nested
 journal, Raft WAL, peer, restart, snapshot, and storage-RPC containers. The
 current coordinated version vector is staging-store/evidence/page/apply-receipt
-v4, staged-artifact v3, storage RPC v30, control-plane RPC v28, command v36,
-state v48, and authentication envelope v2.
+v4, staged-artifact v3, storage RPC v31, control-plane RPC v29, command v37,
+state v49, and authentication envelope v2.
 
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Staging-store format v4 owns the
@@ -1913,6 +1913,19 @@ integrity, replay, and snapshot retention. Command v35/state v47 add the
 epoch-neutral whole-batch outage-resolution intent CAS. Command v36/state v48
 reserve each artifact's complete declared length when page zero is admitted,
 so every accepted partial artifact can finish within the aggregate byte cap.
+Command v37/state v49 add bounded, epoch-neutral exact-manifest retirement for
+stale orphan artifacts. Retirement rejects intent-owned artifacts, retains a
+compact exact tombstone that rejects delayed conflicting first pages, and is
+driven through the same low-priority standalone/Raft maintenance boundary as
+staging-evidence maintenance. Raft derives the retirement command from the
+snapshot protected by that low-priority update gate, so concurrent ordinary
+epoch or ownership mutations cannot turn maintenance into a stale command.
+Automatic maintenance selects only artifacts whose source epoch is older than
+the current cluster epoch; current-epoch publication remains protected from a
+publication-to-intent race and becomes eligible after epoch advancement.
+Storage RPC v31 and control-plane RPC v29
+seal the resulting nested command/state representation; v30/v28 remain exact
+immediate-predecessor rejection evidence.
 Each retained member
 binds the exact source route and epoch, failed incarnation and lease
 observation, certified topology, command identity, complete artifact digest and
@@ -1927,10 +1940,11 @@ reconstruct the exact complete retained batch before
 consulting mutable current epoch, topology, lease-horizon, or artifact lookup;
 response-loss replay therefore survives standalone reopen and Raft leadership
 transfer, while partial or altered candidate vectors fail closed. The
-operational old-route fence and rejoin gate, retained-page retirement, and
-terminal/pending-transfer proof remain gated; retained pages and intents alone
-grant no serving or cleanup authority. Command v34 defines the page format and
-command v35 adds intent tag 27.
+operational old-route fence and rejoin gate, intent-owned artifact retirement,
+and terminal/pending-transfer proof remain gated; retained pages and intents alone
+grant no serving or cleanup authority. Command v34 defines the page format,
+command v35 adds intent tag 27, and command v37 adds artifact-retirement tag
+28.
 
 - Fence the old route and failed incarnation through a committed, epoch-neutral
   outage-resolution intent before any partial-actor cleanup can remove the

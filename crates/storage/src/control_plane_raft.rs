@@ -477,6 +477,8 @@ pub struct ControlPlaneRaftAuthority {
     #[cfg(test)]
     before_heartbeat_update_gate_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
+    low_priority_before_update_gate: Mutex<Option<Arc<ControlPlaneRaftLowPriorityTestGate>>>,
+    #[cfg(test)]
     low_priority_after_update_gate: Mutex<Option<Arc<ControlPlaneRaftLowPriorityTestGate>>>,
     #[cfg(test)]
     ordinary_durable_after_update_gate: Mutex<Option<Arc<ControlPlaneRaftLowPriorityTestGate>>>,
@@ -3170,6 +3172,8 @@ impl ControlPlaneRaftAuthority {
             #[cfg(test)]
             before_heartbeat_update_gate_hook: Mutex::new(None),
             #[cfg(test)]
+            low_priority_before_update_gate: Mutex::new(None),
+            #[cfg(test)]
             low_priority_after_update_gate: Mutex::new(None),
             #[cfg(test)]
             ordinary_durable_after_update_gate: Mutex::new(None),
@@ -3234,6 +3238,8 @@ impl ControlPlaneRaftAuthority {
             linearized_state_machine_response_ready_notify: Mutex::new(None),
             #[cfg(test)]
             before_heartbeat_update_gate_hook: Mutex::new(None),
+            #[cfg(test)]
+            low_priority_before_update_gate: Mutex::new(None),
             #[cfg(test)]
             low_priority_after_update_gate: Mutex::new(None),
             #[cfg(test)]
@@ -3684,6 +3690,34 @@ impl ControlPlaneRaftAuthority {
             .take();
         if let Some(hook) = hook {
             hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_low_priority_before_update_gate_for_test(
+        &self,
+        gate: Arc<ControlPlaneRaftLowPriorityTestGate>,
+    ) {
+        let previous = self
+            .low_priority_before_update_gate
+            .lock()
+            .expect("low-priority pre-update-gate test hook should not be poisoned")
+            .replace(gate);
+        assert!(
+            previous.is_none(),
+            "low-priority pre-update-gate test hook already set"
+        );
+    }
+
+    #[cfg(test)]
+    async fn block_low_priority_before_update_gate_for_test(&self) {
+        let gate = self
+            .low_priority_before_update_gate
+            .lock()
+            .expect("low-priority pre-update-gate test hook should not be poisoned")
+            .take();
+        if let Some(gate) = gate {
+            gate.block().await;
         }
     }
 
@@ -4328,6 +4362,8 @@ impl ControlPlaneRaftAuthority {
         command: ControlPlaneCommand,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
         let queue_started = Instant::now();
+        #[cfg(test)]
+        self.block_low_priority_before_update_gate_for_test().await;
         let mut update_guard = self
             .evidence_submission_admission
             .acquire_evidence_update_gate(&self.volatile_heartbeat_update_gate)
@@ -4350,6 +4386,48 @@ impl ControlPlaneRaftAuthority {
         self.command_metrics
             .record_submission(queue_wait, operation, result.is_ok());
         result
+    }
+
+    pub(crate) async fn submit_low_priority_control_plane_command_derived<F>(
+        &self,
+        derive_command: F,
+    ) -> Result<Option<SubmittedControlPlaneRaftCommand>, ControlPlaneError>
+    where
+        F: FnOnce(
+            &ClusterControlSnapshot,
+        ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError>,
+    {
+        let queue_started = Instant::now();
+        #[cfg(test)]
+        self.block_low_priority_before_update_gate_for_test().await;
+        let mut update_guard = self
+            .evidence_submission_admission
+            .acquire_evidence_update_gate(&self.volatile_heartbeat_update_gate)
+            .await;
+        #[cfg(test)]
+        self.block_low_priority_after_update_gate_for_test().await;
+        let snapshot = self
+            .confirmed_low_priority_preflight_snapshot(&update_guard)
+            .await?;
+        let Some(command) = derive_command(&snapshot)? else {
+            return Ok(None);
+        };
+        let queue_wait = queue_started.elapsed();
+        let operation_started = Instant::now();
+        let result = self
+            .submit_control_plane_command_derived_locked(None, Some(&mut update_guard), move |_| {
+                Ok(command)
+            })
+            .await;
+        let operation = operation_started.elapsed();
+        observability::record_control_plane_raft_command_submission(
+            queue_wait,
+            operation,
+            result.is_ok(),
+        );
+        self.command_metrics
+            .record_submission(queue_wait, operation, result.is_ok());
+        result.map(Some)
     }
 
     pub(crate) async fn submit_low_priority_metadata_transfer_staging_evidence_page(

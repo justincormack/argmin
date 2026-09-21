@@ -5663,6 +5663,14 @@ fn outage_resolution_intent_batch_is_epoch_neutral_durable_and_exactly_replayabl
         .apply_control_plane_command_for_test(command.clone())
         .unwrap();
     assert!(!replay_after_epoch_advance.changed());
+    assert!(
+        authority
+            .snapshot()
+            .next_outage_command_artifact_retirement_command()
+            .unwrap()
+            .is_none(),
+        "intent-owned outage artifacts must not become maintenance candidates"
+    );
     let previous_horizon = authority.snapshot().lease_grant_horizon().unwrap();
     let next_horizon_now = previous_horizon.grant_not_after_ms() + 1;
     authority

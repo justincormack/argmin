@@ -429,6 +429,8 @@ trait ReconciliationAuthority {
         &mut self,
         cursor: &mut MetadataTransferStagingMaintenanceCursor,
     ) -> Result<bool, ControlPlaneError>;
+
+    fn maintain_outage_command_artifacts(&mut self) -> Result<bool, ControlPlaneError>;
 }
 
 impl ReconciliationAuthority for ControlPlaneRaftAuthorityHost {
@@ -483,6 +485,10 @@ impl ReconciliationAuthority for ControlPlaneRaftAuthorityHost {
     ) -> Result<bool, ControlPlaneError> {
         self.maintain_metadata_transfer_staging_evidence_once(cursor)
     }
+
+    fn maintain_outage_command_artifacts(&mut self) -> Result<bool, ControlPlaneError> {
+        self.maintain_outage_command_artifacts_once()
+    }
 }
 
 impl ReconciliationAuthority for SingleAuthorityControlPlane<FileControlPlaneStore> {
@@ -536,6 +542,10 @@ impl ReconciliationAuthority for SingleAuthorityControlPlane<FileControlPlaneSto
         cursor: &mut MetadataTransferStagingMaintenanceCursor,
     ) -> Result<bool, ControlPlaneError> {
         self.maintain_metadata_transfer_staging_evidence_once(cursor)
+    }
+
+    fn maintain_outage_command_artifacts(&mut self) -> Result<bool, ControlPlaneError> {
+        self.maintain_outage_command_artifacts_once()
     }
 }
 
@@ -1957,7 +1967,10 @@ impl UnavailablePgReconciliationWorker {
         if Instant::now() < self.maintenance_retry_not_before {
             return Ok(());
         }
-        match authority.maintain_staging_evidence(&mut self.staging_maintenance_cursor) {
+        let result = authority.maintain_outage_command_artifacts().and_then(|_| {
+            authority.maintain_staging_evidence(&mut self.staging_maintenance_cursor)
+        });
+        match result {
             Ok(_) => {
                 self.last_maintenance_diagnostic = None;
                 Ok(())
@@ -2123,6 +2136,10 @@ mod tests {
         ) -> Result<bool, ControlPlaneError> {
             self.maintenance_count += 1;
             self.maintenance_results.pop_front().unwrap_or(Ok(false))
+        }
+
+        fn maintain_outage_command_artifacts(&mut self) -> Result<bool, ControlPlaneError> {
+            Ok(false)
         }
     }
 

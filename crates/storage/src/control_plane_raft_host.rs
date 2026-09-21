@@ -788,6 +788,26 @@ impl ControlPlaneRaftAuthorityHost {
         Ok(true)
     }
 
+    pub(crate) fn maintain_outage_command_artifacts_once(
+        &mut self,
+    ) -> Result<bool, ControlPlaneError> {
+        let Some(response) = self.submit_low_priority_raft_command_derived(|current| {
+            current.next_outage_command_artifact_retirement_command()
+        })?
+        else {
+            return Ok(false);
+        };
+        if !matches!(
+            response,
+            ControlPlaneCommandResponse::RetireOutageCommandArtifacts
+        ) {
+            return Err(ControlPlaneError::invariant_failure(
+                "outage artifact maintenance returned the wrong response",
+            ));
+        }
+        Ok(true)
+    }
+
     pub fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,
@@ -1007,6 +1027,25 @@ impl ControlPlaneRaftAuthorityHost {
                 .submit_low_priority_control_plane_command(command),
         )?;
         self.finish_submitted_raft_command(submitted, true)
+    }
+
+    fn submit_low_priority_raft_command_derived<F>(
+        &mut self,
+        derive_command: F,
+    ) -> Result<Option<ControlPlaneCommandResponse>, ControlPlaneError>
+    where
+        F: FnOnce(
+            &ClusterControlSnapshot,
+        ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError>,
+    {
+        self.ensure_not_durably_poisoned()?;
+        let submitted = self.block_on(
+            self.authority
+                .submit_low_priority_control_plane_command_derived(derive_command),
+        )?;
+        submitted
+            .map(|submitted| self.finish_submitted_raft_command(submitted, true))
+            .transpose()
     }
 
     fn submit_raft_command_derived<F>(

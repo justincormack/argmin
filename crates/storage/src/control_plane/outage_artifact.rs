@@ -54,7 +54,7 @@ impl OutageCommandArtifactPage {
         Ok(pages)
     }
 
-    pub(super) fn key(&self) -> (PgId, ClusterEpoch, ClusterEpoch, u64) {
+    pub(crate) fn key(&self) -> (PgId, ClusterEpoch, ClusterEpoch, u64) {
         (
             self.pg_id,
             self.source_epoch,
@@ -97,6 +97,65 @@ pub(crate) struct OutageCommandArtifactRecord {
     pub(super) total_length: u32,
     pub(super) digest: [u8; 32],
     pub(super) pages: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutageCommandArtifactRetirement {
+    pub(crate) pg_id: PgId,
+    pub(crate) source_epoch: ClusterEpoch,
+    pub(crate) command_id: MetadataCommandId,
+    pub(crate) total_length: u32,
+    pub(crate) digest: [u8; 32],
+}
+
+impl OutageCommandArtifactRetirement {
+    pub(super) fn from_record(record: &OutageCommandArtifactRecord) -> Self {
+        Self {
+            pg_id: record.pg_id,
+            source_epoch: record.source_epoch,
+            command_id: record.command_id,
+            total_length: record.total_length,
+            digest: record.digest,
+        }
+    }
+
+    pub(crate) fn key(&self) -> (PgId, ClusterEpoch, ClusterEpoch, u64) {
+        (
+            self.pg_id,
+            self.source_epoch,
+            self.command_id.cluster_epoch(),
+            self.command_id.log_index().get(),
+        )
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.command_id.pg_id() != self.pg_id {
+            return Err("outage artifact retirement command PG does not match its subject".into());
+        }
+        if self.command_id.cluster_epoch() > self.source_epoch {
+            return Err("outage artifact retirement command epoch exceeds its source epoch".into());
+        }
+        let total_length = usize::try_from(self.total_length)
+            .map_err(|_| "outage artifact retirement length does not fit usize".to_owned())?;
+        if total_length == 0
+            || total_length > crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN
+        {
+            return Err("outage artifact retirement length is outside the artifact bound".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn matches_page(&self, page: &OutageCommandArtifactPage) -> bool {
+        self.key() == page.key()
+            && self.total_length == page.total_length
+            && self.digest == page.digest
+    }
+
+    pub(super) fn matches_record(&self, record: &OutageCommandArtifactRecord) -> bool {
+        self.key() == record.key()
+            && self.total_length == record.total_length
+            && self.digest == record.digest
+    }
 }
 
 impl OutageCommandArtifactRecord {
@@ -326,6 +385,160 @@ mod tests {
     }
 
     #[test]
+    fn current_epoch_retirement_rejects_delayed_conflicting_publication() {
+        let snapshot = bootstrapped_snapshot();
+        let source_epoch = snapshot.cluster_epoch();
+        let page = OutageCommandArtifactPage::for_command(&command(), source_epoch)
+            .unwrap()
+            .remove(0);
+        let published = snapshot
+            .apply_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: page.clone(),
+            })
+            .unwrap()
+            .into_snapshot();
+        let retirement = OutageCommandArtifactRetirement::from_record(
+            &published.outage_command_artifacts[&page.key()],
+        );
+        let retired = published
+            .apply_control_plane_command(ControlPlaneCommand::RetireOutageCommandArtifacts {
+                retirements: vec![retirement],
+                expected_cluster_epoch: source_epoch,
+            })
+            .unwrap()
+            .into_snapshot();
+        assert!(!retired.outage_command_artifacts.contains_key(&page.key()));
+        assert!(retired
+            .outage_command_artifact_retirements
+            .contains_key(&page.key()));
+        let replay = retired
+            .apply_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: page.clone(),
+            })
+            .unwrap();
+        assert!(!replay.changed());
+
+        let mut conflicting = page;
+        conflicting.digest[0] ^= 1;
+        assert!(retired
+            .apply_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: conflicting,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("durable retirement"));
+        assert_eq!(parse_snapshot(&format_snapshot(&retired)).unwrap(), retired);
+    }
+
+    #[test]
+    fn maintenance_retires_stale_orphans_atomically_and_rejects_old_first_pages() {
+        let snapshot = bootstrapped_snapshot();
+        let source_epoch = snapshot.cluster_epoch();
+        let first = command();
+        let second = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(7),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            first.payload().clone(),
+        );
+        let first_page = OutageCommandArtifactPage::for_command(&first, source_epoch)
+            .unwrap()
+            .remove(0);
+        let second_page = OutageCommandArtifactPage::for_command(&second, source_epoch)
+            .unwrap()
+            .remove(0);
+        let mut published = snapshot;
+        for page in [&first_page, &second_page] {
+            published = published
+                .apply_control_plane_command(
+                    ControlPlaneCommand::PublishOutageCommandArtifactPage { page: page.clone() },
+                )
+                .unwrap()
+                .into_snapshot();
+        }
+        published = published
+            .apply_control_plane_command(ControlPlaneCommand::SetNodeMembership {
+                node_id: NodeId::new(1),
+                membership: crate::control_plane::NodeMembershipState::Draining,
+            })
+            .unwrap()
+            .into_snapshot();
+        assert!(published.cluster_epoch() > source_epoch);
+        let retirement = published
+            .next_outage_command_artifact_retirement_command()
+            .unwrap()
+            .unwrap();
+        let retired = published
+            .apply_control_plane_command(retirement.clone())
+            .unwrap()
+            .into_snapshot();
+        assert!(retired.outage_command_artifacts.is_empty());
+        assert!(retired.outage_command_artifact_retirements.is_empty());
+        let replay = retired
+            .apply_control_plane_command(retirement)
+            .expect("stale retirement must replay after its artifacts are gone");
+        assert!(!replay.changed());
+        assert_eq!(replay.snapshot(), &retired);
+        assert!(retired
+            .apply_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: first_page,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("current cluster epoch"));
+    }
+
+    #[test]
+    fn retirement_batch_rejects_one_changed_manifest_without_mutation() {
+        let snapshot = bootstrapped_snapshot();
+        let source_epoch = snapshot.cluster_epoch();
+        let first = command();
+        let second = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(7),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            first.payload().clone(),
+        );
+        let mut published = snapshot;
+        let mut pages = Vec::new();
+        for command in [&first, &second] {
+            let page = OutageCommandArtifactPage::for_command(command, source_epoch)
+                .unwrap()
+                .remove(0);
+            published = published
+                .apply_control_plane_command(
+                    ControlPlaneCommand::PublishOutageCommandArtifactPage { page: page.clone() },
+                )
+                .unwrap()
+                .into_snapshot();
+            pages.push(page);
+        }
+        let mut retirements = pages
+            .iter()
+            .map(|page| {
+                OutageCommandArtifactRetirement::from_record(
+                    &published.outage_command_artifacts[&page.key()],
+                )
+            })
+            .collect::<Vec<_>>();
+        retirements[1].digest[0] ^= 1;
+        let before = published.clone();
+        assert!(published
+            .apply_control_plane_command(ControlPlaneCommand::RetireOutageCommandArtifacts {
+                retirements,
+                expected_cluster_epoch: source_epoch,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("manifest changed"));
+        assert_eq!(published, before);
+    }
+
+    #[test]
     fn pages_require_contiguous_immutable_bytes_and_exact_digest() {
         let command_id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -500,9 +713,12 @@ mod tests {
                 page: maximum_reservation_page(12, 0),
             })
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("artifact reservations exceed the byte budget"));
+        assert!(
+            error
+                .to_string()
+                .contains("artifact reservations exceed the byte budget"),
+            "{error}"
+        );
         assert_eq!(authority.snapshot(), &full);
 
         drop(authority);
@@ -512,14 +728,19 @@ mod tests {
             full.outage_command_artifacts
         );
         let restarted_full = restarted.snapshot().clone();
+        let mut additional = maximum_reservation_page(12, 0);
+        additional.source_epoch = restarted.snapshot().cluster_epoch();
         let error = restarted
             .submit_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
-                page: maximum_reservation_page(12, 0),
+                page: additional,
             })
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("artifact reservations exceed the byte budget"));
+        assert!(
+            error
+                .to_string()
+                .contains("artifact reservations exceed the byte budget"),
+            "{error}"
+        );
         assert_eq!(restarted.snapshot(), &restarted_full);
 
         restarted
@@ -528,6 +749,56 @@ mod tests {
             })
             .unwrap();
         assert_ne!(restarted.snapshot(), &restarted_full);
+    }
+
+    #[test]
+    fn standalone_maintenance_retires_stale_orphan_across_restart() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("outage-retirement.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(NodeId::new(1), "/tmp/outage-retirement.sock".into())],
+                pg_ids: vec![PgId::new(7)],
+            })
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        let page = OutageCommandArtifactPage::for_command(&command(), source_epoch)
+            .unwrap()
+            .remove(0);
+        authority
+            .submit_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: page.clone(),
+            })
+            .unwrap();
+        authority
+            .submit_control_plane_command(ControlPlaneCommand::SetNodeMembership {
+                node_id: NodeId::new(1),
+                membership: crate::control_plane::NodeMembershipState::Draining,
+            })
+            .unwrap();
+
+        assert!(authority.maintain_outage_command_artifacts_once().unwrap());
+        assert!(!authority.maintain_outage_command_artifacts_once().unwrap());
+        assert!(!format_snapshot(authority.snapshot()).contains("outage_command_artifact_page="));
+        assert!(authority
+            .submit_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: page.clone(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("current cluster epoch"));
+
+        drop(authority);
+        let mut restarted = SingleAuthorityControlPlane::open(store).unwrap();
+        assert!(!restarted.maintain_outage_command_artifacts_once().unwrap());
+        assert!(restarted
+            .submit_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("current cluster epoch"));
     }
 
     #[test]

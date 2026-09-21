@@ -3005,6 +3005,18 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(changed)
     }
 
+    pub(crate) fn maintain_outage_command_artifacts_once(
+        &mut self,
+    ) -> Result<bool, ControlPlaneError> {
+        let Some(command) = self
+            .snapshot
+            .next_outage_command_artifact_retirement_command()?
+        else {
+            return Ok(false);
+        };
+        Ok(self.apply_and_commit_command(command)?.changed())
+    }
+
     pub fn finalize_metadata_transfer_staging_generation(
         &mut self,
         cleanup: FinalizeMetadataTransferStagingGenerationRequest,

@@ -9,9 +9,10 @@ use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, HistoricalPgRouteRecord,
     InitialClusterTopologyCertificate, MetadataCommandLogHash, NodeAvailabilityState,
     NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation, NodeUnavailableObservation,
-    OutageCommandArtifactPage, PendingMetadataCommandObservation, PgMetadataProof,
-    PgMetadataTransferProof, RuntimeMapFreshnessProof, UnavailablePgPayloadDestinationReadiness,
-    UnavailablePgTransitionBeginAuthorization, UnavailablePgTransitionMutationBinding,
+    OutageCommandArtifactPage, OutageCommandArtifactRetirement, PendingMetadataCommandObservation,
+    PgMetadataProof, PgMetadataTransferProof, RuntimeMapFreshnessProof,
+    UnavailablePgPayloadDestinationReadiness, UnavailablePgTransitionBeginAuthorization,
+    UnavailablePgTransitionMutationBinding,
 };
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::types::{PgId, PgState};
@@ -24,7 +25,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 36;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 37;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -458,6 +459,10 @@ pub enum ControlPlaneCommand {
     PublishOutageCommandArtifactPage {
         page: OutageCommandArtifactPage,
     },
+    RetireOutageCommandArtifacts {
+        retirements: Vec<OutageCommandArtifactRetirement>,
+        expected_cluster_epoch: ClusterEpoch,
+    },
     CommitUnavailablePgOutageResolutionIntents {
         intents: Vec<UnavailablePgOutageResolutionIntentRequest>,
         expected_cluster_epoch: ClusterEpoch,
@@ -719,6 +724,15 @@ impl std::fmt::Display for ControlPlaneCommand {
                 page.pg_id.get(),
                 page.page_index,
                 page.bytes.len()
+            ),
+            ControlPlaneCommand::RetireOutageCommandArtifacts {
+                retirements,
+                expected_cluster_epoch,
+            } => write!(
+                f,
+                "retire-outage-command-artifacts(members={},cluster_epoch={})",
+                retirements.len(),
+                expected_cluster_epoch.get()
             ),
             ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
                 intents,
@@ -1207,6 +1221,38 @@ pub(crate) fn encode_control_plane_command_without_replication_limit(
             write_u32(&mut out, page.bytes.len() as u32);
             out.extend_from_slice(&page.bytes);
         }
+        ControlPlaneCommand::RetireOutageCommandArtifacts {
+            retirements,
+            expected_cluster_epoch,
+        } => {
+            if retirements.is_empty()
+                || retirements.len() > crate::control_plane::MAX_UNAVAILABLE_PG_TRANSITION_BATCH
+                || retirements
+                    .windows(2)
+                    .any(|pair| pair[0].key() >= pair[1].key())
+            {
+                return Err(command_protocol_error(
+                    "outage artifact retirements are empty, oversized, or noncanonical",
+                ));
+            }
+            for retirement in retirements {
+                retirement.validate().map_err(command_protocol_error)?;
+            }
+            write_u16(&mut out, 28);
+            write_u64(&mut out, expected_cluster_epoch.get());
+            write_u32(
+                &mut out,
+                len_as_u32(retirements.len(), "outage artifact retirements")?,
+            );
+            for retirement in retirements {
+                write_u32(&mut out, retirement.pg_id.get());
+                write_u64(&mut out, retirement.source_epoch.get());
+                write_u64(&mut out, retirement.command_id.cluster_epoch().get());
+                write_u64(&mut out, retirement.command_id.log_index().get());
+                write_u32(&mut out, retirement.total_length);
+                out.extend_from_slice(&retirement.digest);
+            }
+        }
         ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
             intents,
             expected_cluster_epoch,
@@ -1515,6 +1561,7 @@ pub fn encode_control_plane_command(
             | ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents { .. }
             | ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage { .. }
             | ControlPlaneCommand::PublishOutageCommandArtifactPage { .. }
+            | ControlPlaneCommand::RetireOutageCommandArtifacts { .. }
             | ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents { .. }
             | ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages { .. }
             | ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment { .. }
@@ -2077,6 +2124,59 @@ pub fn decode_control_plane_command(
                 expected_cluster_epoch,
             }
         }
+        28 => {
+            let expected_cluster_epoch =
+                read_cluster_epoch(&mut reader, "outage artifact retirement cluster epoch")?;
+            let count = reader.read_collection_len("outage artifact retirements", 64)?;
+            if count == 0 || count > crate::control_plane::MAX_UNAVAILABLE_PG_TRANSITION_BATCH {
+                return Err(command_protocol_error(
+                    "outage artifact retirement count is outside the bound",
+                ));
+            }
+            let mut retirements = Vec::with_capacity(count);
+            for _ in 0..count {
+                let pg_id = PgId::new(reader.read_u32()?);
+                let source_epoch =
+                    read_cluster_epoch(&mut reader, "outage artifact retirement source epoch")?;
+                let command_epoch =
+                    read_cluster_epoch(&mut reader, "outage artifact retirement command epoch")?;
+                let command_index =
+                    crate::metadata_command::MetadataCommandLogIndex::new(reader.read_u64()?)
+                        .ok_or_else(|| {
+                            command_protocol_error(
+                                "outage artifact retirement command index is zero",
+                            )
+                        })?;
+                let retirement = OutageCommandArtifactRetirement {
+                    pg_id,
+                    source_epoch,
+                    command_id: crate::metadata_command::MetadataCommandId::new(
+                        command_epoch,
+                        pg_id,
+                        command_index,
+                    ),
+                    total_length: reader.read_u32()?,
+                    digest: reader
+                        .read_exact(32)?
+                        .try_into()
+                        .expect("artifact digest has fixed length"),
+                };
+                retirement.validate().map_err(command_protocol_error)?;
+                retirements.push(retirement);
+            }
+            if retirements
+                .windows(2)
+                .any(|pair| pair[0].key() >= pair[1].key())
+            {
+                return Err(command_protocol_error(
+                    "outage artifact retirements are not canonical",
+                ));
+            }
+            ControlPlaneCommand::RetireOutageCommandArtifacts {
+                retirements,
+                expected_cluster_epoch,
+            }
+        }
         21 => {
             let actor_node_id = NodeId::new(reader.read_u32()?);
             let actor_node_incarnation = reader.read_u64()?;
@@ -2379,6 +2479,7 @@ pub fn decode_control_plane_command(
             | ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents { .. }
             | ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage { .. }
             | ControlPlaneCommand::PublishOutageCommandArtifactPage { .. }
+            | ControlPlaneCommand::RetireOutageCommandArtifacts { .. }
             | ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents { .. }
             | ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions { .. }
     ) && bytes.len() > MAX_UNAVAILABLE_PG_TRANSITION_COMMAND_BYTES
@@ -2572,6 +2673,7 @@ pub enum ControlPlaneCommandResponse {
         apply_receipt: Vec<u8>,
     },
     PublishOutageCommandArtifactPage,
+    RetireOutageCommandArtifacts,
     CommitUnavailablePgOutageResolutionIntents,
     CheckpointMetadataTransferStagingEvidencePages,
     CollapseMetadataTransferStagingEvidenceCheckpointSegment,
@@ -4589,6 +4691,20 @@ mod tests {
                     bytes: vec![1, 2, 3],
                 },
             },
+            ControlPlaneCommand::RetireOutageCommandArtifacts {
+                retirements: vec![OutageCommandArtifactRetirement {
+                    pg_id: PgId::new(3),
+                    source_epoch: ClusterEpoch::new(11).unwrap(),
+                    command_id: crate::metadata_command::MetadataCommandId::new(
+                        ClusterEpoch::new(10).unwrap(),
+                        PgId::new(3),
+                        crate::metadata_command::MetadataCommandLogIndex::new(7).unwrap(),
+                    ),
+                    total_length: 3,
+                    digest: [0x7a; 32],
+                }],
+                expected_cluster_epoch: ClusterEpoch::new(11).unwrap(),
+            },
             ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
                 intents: vec![UnavailablePgOutageResolutionIntentRequest {
                     pg_id: PgId::new(3),
@@ -5153,7 +5269,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_command_v36_aggregate_encoding_is_stable() {
+    fn control_plane_command_v37_aggregate_encoding_is_stable() {
         let mut aggregate = Vec::new();
         for command in sample_commands().into_iter().chain(degenerate_commands()) {
             let encoded = encode_control_plane_command(&command).unwrap();
@@ -5171,6 +5287,36 @@ mod tests {
         assert_eq!(
             (aggregate.len(), digest),
             (
+                4_612,
+                [
+                    98, 1, 92, 143, 233, 43, 135, 160, 170, 21, 56, 190, 17, 222, 84, 86, 139, 12,
+                    48, 197, 24, 221, 108, 112, 184, 78, 171, 137, 181, 89, 37, 253,
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn control_plane_command_v36_aggregate_remains_rejected_evidence() {
+        let mut aggregate = Vec::new();
+        for command in sample_commands()
+            .into_iter()
+            .filter(|command| {
+                !matches!(
+                    command,
+                    ControlPlaneCommand::RetireOutageCommandArtifacts { .. }
+                )
+            })
+            .chain(degenerate_commands())
+        {
+            let encoded = encode_control_plane_command_with_version_for_test(&command, 36).unwrap();
+            write_u32(&mut aggregate, encoded.len() as u32);
+            aggregate.extend_from_slice(&encoded);
+        }
+        let digest = checksum::sha256::digest(&aggregate);
+        assert_eq!(
+            (aggregate.len(), digest),
+            (
                 4_512,
                 [
                     250, 130, 81, 223, 72, 66, 194, 21, 40, 245, 113, 194, 193, 34, 173, 143, 120,
@@ -5178,12 +5324,33 @@ mod tests {
                 ],
             )
         );
+        let mut remaining = aggregate.as_slice();
+        while !remaining.is_empty() {
+            let (raw_len, tail) = remaining.split_at(4);
+            let len = u32::from_be_bytes(raw_len.try_into().unwrap()) as usize;
+            let (command, tail) = tail.split_at(len);
+            assert!(matches!(
+                decode_control_plane_command(command),
+                Err(ControlPlaneError::CommandDecode { message })
+                    if message == "unsupported control-plane command version 36"
+            ));
+            remaining = tail;
+        }
     }
 
     #[test]
     fn control_plane_command_v35_aggregate_remains_rejected_evidence() {
         let mut aggregate = Vec::new();
-        for command in sample_commands().into_iter().chain(degenerate_commands()) {
+        for command in sample_commands()
+            .into_iter()
+            .filter(|command| {
+                !matches!(
+                    command,
+                    ControlPlaneCommand::RetireOutageCommandArtifacts { .. }
+                )
+            })
+            .chain(degenerate_commands())
+        {
             let encoded = encode_control_plane_command_with_version_for_test(&command, 35).unwrap();
             write_u32(&mut aggregate, encoded.len() as u32);
             aggregate.extend_from_slice(&encoded);
@@ -5221,7 +5388,8 @@ mod tests {
             .filter(|command| {
                 !matches!(
                     command,
-                    ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents { .. }
+                    ControlPlaneCommand::RetireOutageCommandArtifacts { .. }
+                        | ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents { .. }
                 )
             })
             .chain(degenerate_commands())
@@ -5264,6 +5432,7 @@ mod tests {
                 !matches!(
                     command,
                     ControlPlaneCommand::PublishOutageCommandArtifactPage { .. }
+                        | ControlPlaneCommand::RetireOutageCommandArtifacts { .. }
                         | ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents { .. }
                 )
             })
@@ -5576,7 +5745,7 @@ mod tests {
 
         for version in [
             15_u16, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
-            37,
+            36, 38,
         ] {
             let mut unsupported = Vec::from(CONTROL_PLANE_COMMAND_MAGIC.as_slice());
             unsupported.extend_from_slice(&version.to_be_bytes());
@@ -5819,7 +5988,7 @@ mod tests {
 
         for version in [
             14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
-            37,
+            36, 38,
         ] {
             let encoded = encode_control_plane_command_with_version_for_test(
                 &ControlPlaneCommand::ExpireHeartbeatLeases {
@@ -5853,8 +6022,8 @@ mod tests {
 
     #[test]
     fn control_plane_command_codec_rejects_semantic_decode_errors() {
-        let unknown_tag = command_frame(28, |_| {});
-        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 28");
+        let unknown_tag = command_frame(29, |_| {});
+        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 29");
 
         let reversed_certified_pgs = ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
             nodes: vec![(NodeId::new(1), "/tmp/node-1.sock".to_owned())],
@@ -6365,7 +6534,8 @@ mod tests {
         const PREVIOUS_V44: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=44\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x9c\x42\x7b\x2e\x81\x1d\x4e\x13";
         const PREVIOUS_V46: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=46\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x09\x9c\xe7\xcf\x42\xa6\xbe\x42";
         const PREVIOUS_V47: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=47\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xd9\x1f\x3a\x96\x0f\x30\x8f\xdf";
-        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=48\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xbd\xee\x5b\x9f\xe1\x3d\xda\x48";
+        const PREVIOUS_V48: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=48\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xbd\xee\x5b\x9f\xe1\x3d\xda\x48";
+        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=49\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\x6d\x6d\x86\xc6\xac\xab\xeb\xd5";
         let encoded = encode_control_plane_snapshot(&ClusterControlSnapshot::empty()).unwrap();
 
         assert_eq!(encoded, EXPECTED);
@@ -6373,6 +6543,11 @@ mod tests {
             decode_control_plane_snapshot(EXPECTED).unwrap(),
             ClusterControlSnapshot::empty()
         );
+        assert!(matches!(
+            decode_control_plane_snapshot(PREVIOUS_V48),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "unsupported control-plane state version 48"
+        ));
         assert!(matches!(
             decode_control_plane_snapshot(PREVIOUS_V47),
             Err(ControlPlaneError::Parse { message, .. })
@@ -6549,10 +6724,10 @@ mod tests {
     fn replicated_snapshot_install_rejects_noncurrent_state_versions_before_mutation() {
         let current_contents = format_snapshot(&sample_snapshot());
         for version in [
-            28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49,
+            28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 50,
         ] {
             let unsupported_contents =
-                current_contents.replacen("version=48\n", &format!("version={version}\n"), 1);
+                current_contents.replacen("version=49\n", &format!("version={version}\n"), 1);
             let payload =
                 snapshot_frame_with_version(CONTROL_PLANE_SNAPSHOT_VERSION, &unsupported_contents);
             let mut installed = replay_sample_state_machine();

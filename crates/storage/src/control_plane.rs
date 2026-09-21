@@ -21,6 +21,7 @@ use thiserror::Error;
 mod outage_artifact;
 pub use outage_artifact::OutageCommandArtifactPage;
 use outage_artifact::OutageCommandArtifactRecord;
+pub(crate) use outage_artifact::OutageCommandArtifactRetirement;
 pub(crate) use outage_artifact::OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES;
 
 use crate::control_plane_auth::{
@@ -135,7 +136,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 28;
+const CONTROL_PLANE_RPC_VERSION: u16 = 29;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -148,7 +149,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 48;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 49;
 const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS: usize = 64;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
@@ -932,6 +933,8 @@ pub struct ClusterControlSnapshot {
         BTreeMap<(PgId, ClusterEpoch), UnavailablePgPlacementTransition>,
     outage_command_artifacts:
         BTreeMap<(PgId, ClusterEpoch, ClusterEpoch, u64), Arc<OutageCommandArtifactRecord>>,
+    outage_command_artifact_retirements:
+        BTreeMap<(PgId, ClusterEpoch, ClusterEpoch, u64), OutageCommandArtifactRetirement>,
     outage_resolution_intents: BTreeMap<PgId, UnavailablePgOutageResolutionIntent>,
     metadata_transfer_staging_evidence_pages:
         BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidencePageRecord>,
@@ -2577,6 +2580,7 @@ impl ClusterControlSnapshot {
             retained_unavailable_pg_placement_transitions: BTreeMap::new(),
             metadata_transfer_staging_evidence_pages: BTreeMap::new(),
             outage_command_artifacts: BTreeMap::new(),
+            outage_command_artifact_retirements: BTreeMap::new(),
             outage_resolution_intents: BTreeMap::new(),
             metadata_transfer_staging_evidence_checkpoint_segments: BTreeMap::new(),
             metadata_transfer_staging_evidence_checkpoint_anchors: BTreeMap::new(),
@@ -6019,14 +6023,39 @@ impl ClusterControlSnapshot {
     ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
         page.validate()
             .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-        if page.source_epoch > self.cluster_epoch || !self.pgs.contains_key(&page.pg_id) {
+        if !self.pgs.contains_key(&page.pg_id) {
             return Err(ControlPlaneError::CommandDecode {
-                message: "outage artifact references a future route or unknown PG".into(),
+                message: "outage artifact references an unknown PG".into(),
             });
         }
         let key = page.key();
+        if let Some(retirement) = self.outage_command_artifact_retirements.get(&key) {
+            if !retirement.matches_page(&page) {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: "outage artifact page conflicts with its durable retirement".into(),
+                });
+            }
+            return Ok(applied_control_plane_command(
+                self,
+                self.clone(),
+                ControlPlaneCommandResponse::PublishOutageCommandArtifactPage,
+                false,
+            ));
+        }
+        if !self.outage_command_artifacts.contains_key(&key)
+            && page.source_epoch != self.cluster_epoch
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "new outage artifact does not bind the current cluster epoch".into(),
+            });
+        }
         let mut next = self.clone();
-        let changed = if let Some(existing) = next.outage_command_artifacts.get(&key) {
+        let retirement_count = next.outage_command_artifact_retirements.len();
+        next.outage_command_artifact_retirements
+            .retain(|_, retirement| retirement.source_epoch >= self.cluster_epoch);
+        let retired_state_changed =
+            next.outage_command_artifact_retirements.len() != retirement_count;
+        let artifact_changed = if let Some(existing) = next.outage_command_artifacts.get(&key) {
             let mut record = (**existing).clone();
             let changed = record
                 .append(&page)
@@ -6041,6 +6070,7 @@ impl ClusterControlSnapshot {
             next.outage_command_artifacts.insert(key, Arc::new(record));
             true
         };
+        let changed = artifact_changed || retired_state_changed;
         if changed {
             next.validate_current_state_invariants()
                 .map_err(|message| ControlPlaneError::CommandDecode { message })?;
@@ -6051,6 +6081,120 @@ impl ClusterControlSnapshot {
             ControlPlaneCommandResponse::PublishOutageCommandArtifactPage,
             changed,
         ))
+    }
+
+    fn apply_outage_command_artifact_retirements(
+        &self,
+        retirements: Vec<OutageCommandArtifactRetirement>,
+        expected_cluster_epoch: ClusterEpoch,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        if expected_cluster_epoch != self.cluster_epoch
+            || retirements.is_empty()
+            || retirements.len() > MAX_UNAVAILABLE_PG_TRANSITION_BATCH
+            || retirements
+                .windows(2)
+                .any(|pair| pair[0].key() >= pair[1].key())
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "outage artifact retirement epoch or member vector is invalid".into(),
+            });
+        }
+        for retirement in &retirements {
+            retirement
+                .validate()
+                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+            match self.outage_command_artifacts.get(&retirement.key()) {
+                Some(record) => {
+                    if !retirement.matches_record(record) {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: "outage artifact retirement manifest changed".into(),
+                        });
+                    }
+                    if self.outage_resolution_intents.values().any(|intent| {
+                        intent.request.pg_id == retirement.pg_id
+                            && intent.request.source_epoch == retirement.source_epoch
+                            && intent.request.command_epoch == retirement.command_id.cluster_epoch()
+                            && intent.request.command_log_index
+                                == retirement.command_id.log_index().get()
+                    }) {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message:
+                                "outage artifact retirement is still owned by a durable intent"
+                                    .into(),
+                        });
+                    }
+                }
+                None if self
+                    .outage_command_artifact_retirements
+                    .get(&retirement.key())
+                    .is_some_and(|retained| retained == retirement)
+                    || retirement.source_epoch < self.cluster_epoch => {}
+                None => {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: "outage artifact retirement does not name a retained artifact"
+                            .into(),
+                    });
+                }
+            }
+        }
+        let mut next = self.clone();
+        let previous_retirement_count = next.outage_command_artifact_retirements.len();
+        next.outage_command_artifact_retirements
+            .retain(|_, retirement| retirement.source_epoch >= self.cluster_epoch);
+        let mut changed =
+            next.outage_command_artifact_retirements.len() != previous_retirement_count;
+        for retirement in retirements {
+            changed |= next
+                .outage_command_artifacts
+                .remove(&retirement.key())
+                .is_some();
+            if retirement.source_epoch == self.cluster_epoch {
+                changed |= next
+                    .outage_command_artifact_retirements
+                    .insert(retirement.key(), retirement.clone())
+                    .as_ref()
+                    != Some(&retirement);
+            }
+        }
+        if changed {
+            next.validate_current_state_invariants()
+                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+        }
+        Ok(applied_control_plane_command(
+            self,
+            next,
+            ControlPlaneCommandResponse::RetireOutageCommandArtifacts,
+            changed,
+        ))
+    }
+
+    pub(crate) fn next_outage_command_artifact_retirement_command(
+        &self,
+    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
+        let retirements = self
+            .outage_command_artifacts
+            .values()
+            .filter(|record| record.source_epoch < self.cluster_epoch)
+            .filter(|record| {
+                !self.outage_resolution_intents.values().any(|intent| {
+                    intent.request.pg_id == record.pg_id
+                        && intent.request.source_epoch == record.source_epoch
+                        && intent.request.command_epoch == record.command_id.cluster_epoch()
+                        && intent.request.command_log_index == record.command_id.log_index().get()
+                })
+            })
+            .take(MAX_UNAVAILABLE_PG_TRANSITION_BATCH)
+            .map(|record| OutageCommandArtifactRetirement::from_record(record))
+            .collect::<Vec<_>>();
+        if retirements.is_empty() {
+            return Ok(None);
+        }
+        let command = ControlPlaneCommand::RetireOutageCommandArtifacts {
+            retirements,
+            expected_cluster_epoch: self.cluster_epoch,
+        };
+        self.apply_control_plane_command(command.clone())?;
+        Ok(Some(command))
     }
 
     pub(crate) fn commit_unavailable_pg_outage_resolution_intents_batch_command(
@@ -10521,8 +10665,14 @@ impl ClusterControlSnapshot {
             }
         }
         self.validate_lease_grant_horizon_invariant()?;
-        if self.outage_command_artifacts.len() > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS {
-            return Err("too many retained outage command artifacts".into());
+        if self
+            .outage_command_artifacts
+            .len()
+            .checked_add(self.outage_command_artifact_retirements.len())
+            .ok_or("retained outage artifact count overflows")?
+            > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS
+        {
+            return Err("too many retained outage command artifacts and retirements".into());
         }
         let mut reserved_artifact_bytes = 0usize;
         for (key, record) in &self.outage_command_artifacts {
@@ -10539,6 +10689,16 @@ impl ClusterControlSnapshot {
         }
         if reserved_artifact_bytes > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES {
             return Err("outage command artifact reservations exceed the byte budget".into());
+        }
+        for (key, retirement) in &self.outage_command_artifact_retirements {
+            retirement.validate()?;
+            if *key != retirement.key()
+                || retirement.source_epoch > self.cluster_epoch
+                || !self.pgs.contains_key(&retirement.pg_id)
+                || self.outage_command_artifacts.contains_key(key)
+            {
+                return Err("outage command artifact retirement is invalid".into());
+            }
         }
         let mut intent_batches = BTreeMap::<
             (ClusterEpoch, Vec<PgId>, [u8; 32]),
@@ -10625,6 +10785,17 @@ impl ClusterControlSnapshot {
             }) {
                 return Err(format!(
                     "outage-resolution intent for PG {} lacks its exact complete artifact",
+                    pg_id.get()
+                ));
+            }
+            if self.outage_command_artifact_retirements.contains_key(&(
+                *pg_id,
+                request.source_epoch,
+                request.command_epoch,
+                request.command_log_index,
+            )) {
+                return Err(format!(
+                    "outage-resolution intent for PG {} references a retired artifact",
                     pg_id.get()
                 ));
             }
@@ -12220,6 +12391,12 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
             } => self.apply_metadata_transfer_staging_evidence_page(operation_payload, page_digest),
             ControlPlaneCommand::PublishOutageCommandArtifactPage { page } => {
                 self.apply_outage_command_artifact_page(page)
+            }
+            ControlPlaneCommand::RetireOutageCommandArtifacts {
+                retirements,
+                expected_cluster_epoch,
+            } => {
+                self.apply_outage_command_artifact_retirements(retirements, expected_cluster_epoch)
             }
             ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
                 intents,
@@ -18012,6 +18189,17 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             ));
         }
     }
+    for retirement in snapshot.outage_command_artifact_retirements.values() {
+        out.push_str(&format!(
+            "outage_command_artifact_retirement={},{},{},{},{},{}\n",
+            retirement.pg_id.get(),
+            retirement.source_epoch.get(),
+            retirement.command_id.cluster_epoch().get(),
+            retirement.command_id.log_index().get(),
+            retirement.total_length,
+            hex_encode(&retirement.digest),
+        ));
+    }
     for intent in snapshot.outage_resolution_intents.values() {
         out.push_str(&format!(
             "outage_resolution_intent={}\n",
@@ -19721,6 +19909,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut unavailable_pg_placement_transitions = BTreeMap::new();
     let mut retained_unavailable_pg_placement_transitions = BTreeMap::new();
     let mut outage_command_artifacts = BTreeMap::new();
+    let mut outage_command_artifact_retirements = BTreeMap::new();
     let mut outage_resolution_intents = BTreeMap::new();
     let mut outage_command_artifact_reserved_bytes = 0usize;
     let mut metadata_transfer_staging_evidence_pages = BTreeMap::new();
@@ -20023,6 +20212,65 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                 }
                 outage_command_artifacts.insert(key, Arc::new(record));
             }
+        } else if let Some(value) = line.strip_prefix("outage_command_artifact_retirement=") {
+            let fields = value.split(',').collect::<Vec<_>>();
+            if fields.len() != 6 {
+                return Err(parse_error(
+                    line_number,
+                    "outage artifact retirement must have six fields",
+                ));
+            }
+            let pg_id = PgId::new(parse_u32(
+                line_number,
+                fields[0],
+                "outage artifact retirement PG",
+            )?);
+            let source_epoch = ClusterEpoch::new(parse_u64(
+                line_number,
+                fields[1],
+                "outage artifact retirement source epoch",
+            )?)
+            .ok_or_else(|| parse_error(line_number, "outage artifact source epoch is zero"))?;
+            let command_epoch = ClusterEpoch::new(parse_u64(
+                line_number,
+                fields[2],
+                "outage artifact retirement command epoch",
+            )?)
+            .ok_or_else(|| parse_error(line_number, "outage artifact command epoch is zero"))?;
+            let command_index = crate::metadata_command::MetadataCommandLogIndex::new(parse_u64(
+                line_number,
+                fields[3],
+                "outage artifact retirement command index",
+            )?)
+            .ok_or_else(|| parse_error(line_number, "outage artifact command index is zero"))?;
+            let retirement = OutageCommandArtifactRetirement {
+                pg_id,
+                source_epoch,
+                command_id: crate::metadata_command::MetadataCommandId::new(
+                    command_epoch,
+                    pg_id,
+                    command_index,
+                ),
+                total_length: parse_u32(
+                    line_number,
+                    fields[4],
+                    "outage artifact retirement length",
+                )?,
+                digest: hex_decode(line_number, fields[5])?
+                    .try_into()
+                    .map_err(|_| {
+                        parse_error(line_number, "outage artifact digest must be 32 bytes")
+                    })?,
+            };
+            if outage_command_artifact_retirements
+                .insert(retirement.key(), retirement)
+                .is_some()
+            {
+                return Err(parse_error(
+                    line_number,
+                    "duplicate outage artifact retirement",
+                ));
+            }
         } else if let Some(value) = line.strip_prefix("outage_resolution_intent=") {
             let intent = parse_unavailable_pg_outage_resolution_intent(line_number, value)?;
             if outage_resolution_intents
@@ -20256,6 +20504,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         unavailable_pg_placement_transitions,
         retained_unavailable_pg_placement_transitions,
         outage_command_artifacts,
+        outage_command_artifact_retirements,
         outage_resolution_intents,
         metadata_transfer_staging_evidence_pages,
         metadata_transfer_staging_evidence_checkpoint_segments,
