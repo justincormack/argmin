@@ -2903,19 +2903,18 @@
                 (proof(floor_state), proof(tip_state))
             };
             if mark_during_read {
-                let db_path = config.data_dir.join("pg-0000/metadata.db");
+                let writer = crate::PgStore::open(&config.data_dir.join("pg-0000"), 0).unwrap();
+                let pending_for_write = pending.clone();
                 server
                     ._node
                     .get_pg(0)
                     .unwrap()
                     .test_after_pending_slot_row_read(move || {
-                        rusqlite::Connection::open(db_path)
-                            .unwrap()
-                            .execute(
-                                "UPDATE metadata_command_pending_slot SET publication_started = 1 WHERE singleton = 0",
-                                [],
+                        assert!(writer
+                            .test_mark_pending_metadata_command_publication_started(
+                                &pending_for_write,
                             )
-                            .unwrap();
+                            .unwrap());
                     });
             }
             let socket_path = config.socket_path.clone();

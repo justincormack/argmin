@@ -2979,6 +2979,14 @@ impl PgStore {
         *self.after_pending_slot_row_read.lock().unwrap() = Some(Box::new(hook));
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_mark_pending_metadata_command_publication_started(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        self.update_pending_metadata_command_publication_started(command)
+    }
+
     pub(crate) fn pending_metadata_command_slot_any_epoch(
         &self,
         node_id: u32,
@@ -3187,21 +3195,9 @@ impl PgStore {
             self.invalidate_clean_metadata_digest_revision();
 
             let changed = self
-                .execute_cached(
-                    "UPDATE metadata_command_pending_slot SET publication_started = 1 \
-                     WHERE singleton = 0 AND cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3 \
-                       AND command_checksum = ?4 AND command_bytes = ?5",
-                    params![
-                        command.id().cluster_epoch().get() as i64,
-                        command.id().pg_id().get() as i64,
-                        command.id().log_index().get() as i64,
-                        command.checksum_crc64() as i64,
-                        command.command_bytes(),
-                    ],
-                    "mark pending metadata command publication started",
-                )
+                .update_pending_metadata_command_publication_started(command)
                 .map_err(BucketSnapshotLoadError::Store)?;
-            if changed == 1
+            if changed
                 || self
                     .pending_metadata_command_publication_started(node_id, command)
                     .map_err(BucketSnapshotLoadError::Store)?
@@ -3229,6 +3225,26 @@ impl PgStore {
                 Err(error)
             }
         }
+    }
+
+    fn update_pending_metadata_command_publication_started(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        self.execute_cached(
+            "UPDATE metadata_command_pending_slot SET publication_started = 1 \
+             WHERE singleton = 0 AND cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3 \
+               AND command_checksum = ?4 AND command_bytes = ?5",
+            params![
+                command.id().cluster_epoch().get() as i64,
+                command.id().pg_id().get() as i64,
+                command.id().log_index().get() as i64,
+                command.checksum_crc64() as i64,
+                command.command_bytes(),
+            ],
+            "mark pending metadata command publication started",
+        )
+        .map(|changed| changed == 1)
     }
 
     /// Remove one exact, unpublished pending command from an older epoch.
