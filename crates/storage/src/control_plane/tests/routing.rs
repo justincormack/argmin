@@ -3265,10 +3265,16 @@ fn storage_cluster_runtime_map_workers_resample_time_for_each_operation() {
     assert_ne!(discovery_now_ms, u64::MAX);
     assert_ne!(refresh_now_ms, u64::MAX);
     assert_eq!(recovery_now_ms.len(), 2);
-    assert_ne!(discovery_now_ms, refresh_now_ms);
+    let mut operation_now_ms = [
+        discovery_now_ms,
+        refresh_now_ms,
+        recovery_now_ms[0],
+        recovery_now_ms[1],
+    ];
+    operation_now_ms.sort_unstable();
     assert!(
-        recovery_now_ms.windows(2).all(|times| times[0] < times[1]),
-        "recovery operations did not resample time: {recovery_now_ms:?}"
+        operation_now_ms.windows(2).all(|times| times[0] < times[1]),
+        "runtime-map operations did not each resample time: {operation_now_ms:?}"
     );
 }
 
