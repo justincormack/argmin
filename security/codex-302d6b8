@@ -1,0 +1,255 @@
+Full-page batching can retain over 1 GiB of transfer data
+Link: https://chatgpt.com/codex/cloud/security/findings/9bf653bb7814819183abfa5d12eda2be?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+Fixed in commit [`17f186d45f6c4469aa3c15aedadc0e0994f54e47`](https://github.com/justincormack/argmin/commit/17f186d45f6c4469aa3c15aedadc0e0994f54e47) (`Bound unavailable PG transfer batching`).
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 302d6b8
+Author: justin@specialbusservice.com
+Created: 19/09/2026, 20:19:59
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the new drain-the-whole-page scheduling policy causes prepared artifacts from successive four-worker waves to accumulate in `prepared_for_authorization` until all work from the 16-PG page has completed. The commit adds no corresponding aggregate memory limit.
+The changed scheduling order dispatches pending transfers and returns until both the pending queue and all in-flight work are empty. Completed preparation jobs are meanwhile appended to `prepared_for_authorization`, and authorization—which consumes those owners—does not run until the whole selected page has drained. A scan page can contain 16 PGs, while the transfer pool has only four workers, so the new behavior intentionally accumulates multiple worker waves in memory.
+
+Each `PreparedUnavailablePgMetadataTransfer` retains both a boxed decoded `PreparedLivePgMetadataTransfer` and a separate `staged_artifact: Vec<u8>`. An individual encoded artifact is allowed to be as large as 63 MiB. Consequently, one full page can retain 16 × 63 MiB = 1008 MiB of encoded data alone, in addition to the decoded checkpoints/log entries, worker-local encoding buffers, and normal process memory. There is no aggregate byte budget before the authorization stage; queue byte metrics are observational only.
+
+An authenticated S3 client can grow the metadata checkpoints and retained command logs by creating large numbers of objects and associated metadata across the configured PGs. If those PGs subsequently enter unavailable-PG reconciliation—for example after a storage-node lease expiry or a node outage—the retained artifacts can drive the process into OOM. The state remains present after restart, so reconciliation can reproduce the allocation and create a crash loop. Attack complexity is high because the attacker must groom metadata across multiple PGs and cause or wait for a placement transition, but no privileged control-plane access is needed to create the metadata.
+
+Before this commit, when a four-worker preparation wave completed, the worker authorized that wave before dispatching the next pending wave. The new drain-before-advance ordering increases the encoded-artifact retention bound from approximately one worker wave to the full 16-member page. The batching should enforce an aggregate prepared-artifact byte limit, authorize bounded sub-batches, or spill encoded artifacts to bounded on-disk storage rather than retaining an entire page in memory.
+
+# Validation
+## Rubric
+- [x] Confirm production scheduling can select 16 PGs, uses four workers, and defers authorization until pending and in-flight work fully drain.
+- [x] Confirm every completed prepared transfer remains concurrently owned and retains decoded transfer state plus a separate encoded artifact.
+- [x] Confirm a valid artifact can be as large as 63 MiB and no aggregate prepared-queue byte budget limits the 16-member page.
+- [x] Confirm authenticated S3-created object/multipart metadata feeds checkpoints and reconciliation is production-reachable after unavailable-node grace expiry.
+- [x] Dynamically exercise the closest real harness and demonstrate retention beyond one worker wave, reaching all 16 page members before authorization.
+## Report
+Confirmed the candidate’s core vulnerability chain at commit 302d6b80981d657a2afa8c07af05117a945f734a.
+
+Attacker input and preconditions: An authenticated S3 client can create many objects, versions, multipart records, tags, and metadata across configured PGs. The canonical metadata checkpoint includes all rows from object and multipart tables, including object keys, tags, metadata blobs, parts, and segments (`crates/storage/src/pg_store/command_log.rs:567-889`, especially the `objects` table at 811-847), and checkpoint construction materializes those table blocks (`command_log.rs:4448-4523`). Per-object user metadata is limited to 2 KiB (`crates/server-core/src/metadata_blob.rs:19-23`), but there is no aggregate per-PG metadata-size quota in this path, so many ordinary records can grow a transfer artifact. Exploitation additionally requires up to 16 groomed PGs to become reconciliation candidates in one scan page, typically after a storage-node observation exceeds the configured replacement grace (`crates/storage/src/control_plane.rs:2737-2777`). The client does not directly control lease expiry, so this remains a high-complexity precondition.
+
+Scheduling/control evidence: The production transfer pool has four workers (`crates/storage/src/unavailable_pg_reconciliation.rs:29-30`, `459-524`), while the scan page and transition batch limits are 16 (`crates/storage/src/control_plane.rs:108-115`). Batch scanning can return candidates from all 16 examined PGs (`control_plane.rs:2690-2735`). Completed preparation results are appended to `prepared_for_authorization` (`unavailable_pg_reconciliation.rs:824-855`). At `unavailable_pg_reconciliation.rs:1371-1385`, the changed scheduler dispatches further pending work and returns while either pending or in-flight work exists; it reaches authorization only after the whole page drains. Authorization then takes the complete retained vector with `std::mem::take` (`unavailable_pg_reconciliation.rs:1035-1046`). Comparing the parent with `git show HEAD^:crates/storage/src/unavailable_pg_reconciliation.rs` shows the prior code authorized whenever `in_flight` became empty and withheld further dispatch while prepared owners existed, bounding normal retention to approximately one four-worker wave. Thus the page-wide behavior is introduced by this commit.
+
+Dynamic evidence: The repository’s existing composed live-transfer test was temporarily instrumented and expanded from five to 16 PGs. It uses real control-plane transitions, lease expiry, storage metadata export, `LivePgMetadataTransferAdmin`, and the production four-worker reconciliation worker. Calling `observe_transfer_workers()` received completions without executing authorization, allowing inspection at the exact stage boundary. Command: `cargo test -p storage reconciliation_accumulates_more_pgs_than_transfer_workers_into_one_install -- --nocapture`. It passed and printed `VALIDATION prepared_for_authorization depth=16 artifact_bytes=5248`; assertions also established that both pending and in-flight depths were zero. This directly demonstrates that all 16 real prepared owners from four successive worker waves coexist before authorization. The fixture artifacts were deliberately small; the test did not intentionally consume 1 GiB or crash the runner.
+
+Memory sink and bound: Each prepared owner simultaneously retains a boxed decoded `PreparedLivePgMetadataTransfer` and a separate encoded `staged_artifact: Vec<u8>` (`crates/storage/src/live_pg_transfer.rs:334-342`). Preparation first retains the decoded artifact, separately encodes it, and returns both (`live_pg_transfer.rs:1248-1319`). Encoding rejects only lengths greater than 63 MiB (`crates/storage/src/pg_store/metadata_transfer_staging.rs:528-593`), with the protocol maximum defined as `63 * 1024 * 1024` (`metadata_transfer_staging.rs:64-67`). Therefore the encoded-only page bound is 16 × 63 MiB = 1008 MiB (1,056,964,608 bytes), excluding decoded checkpoints/log entries, temporary encoding/RPC buffers, and ordinary service memory. The worker only sums queue bytes for observability (`unavailable_pg_reconciliation.rs:581-610`); no aggregate prepared-queue byte budget or backpressure is enforced. The destination staging store’s later 4 GiB disk-oriented limit (`crates/storage/src/storage_node_server/server.rs:4-5`, `934-942`) does not bound this pre-authorization in-memory queue.
+
+Impact assessment: On a process with insufficient headroom, valid near-limit artifacts can exhaust memory and terminate the service. Durable object metadata/checkpoints and unavailable-PG control-plane transitions support regeneration after restart, but an actual allocator OOM and repeated crash loop were not executed. The precise amount of decoded-state duplication and the memory threshold at which a particular deployment dies remain environment-dependent. These are impact-quantification gaps rather than counterevidence against the confirmed page-wide accumulation and missing aggregate control.
+
+Artifacts contain the final passing test output, temporary instrumentation patch, bound calculation, and source-reference summary. The instrumentation was removed afterward and the checkout was restored cleanly.
+
+# Evidence
+crates/storage/src/control_plane.rs (L108 to 115)
+  Note: The reconciliation page and transition batch can contain 16 PGs, four times the transfer-worker count.
+```
+// PG backfill can lag a burst of placement changes; retain enough recent
+// snapshots that scanner references can still reconstruct historical routes.
+const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
+pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
+pub const DEFAULT_UNAVAILABLE_PLACEMENT_GRACE_MS: u64 = 30_000;
+pub const UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE: usize = 16;
+pub(crate) const METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE: usize = 16;
+pub const MAX_UNAVAILABLE_PG_TRANSITION_BATCH: usize = 16;
+```
+
+crates/storage/src/live_pg_transfer.rs (L337 to 342)
+  Note: Each prepared owner retains a separate encoded `Vec<u8>` as well as the boxed decoded transfer representation.
+```
+pub(crate) struct PreparedUnavailablePgMetadataTransfer {
+    work: UnavailablePgReconciliationWork,
+    prepared: Box<PreparedLivePgMetadataTransfer>,
+    intent: MetadataTransferStagingIntent,
+    staged_artifact: Vec<u8>,
+}
+```
+
+crates/storage/src/pg_store/metadata_transfer_staging.rs (L64 to 67)
+  Note: A single retained encoded artifact may be up to 63 MiB, allowing approximately 1008 MiB of encoded artifacts in one 16-PG page.
+```
+const STAGED_ARTIFACT_MAGIC: &[u8] = b"ARGMIN-METADATA-TRANSFER-ARTIFACT-V3\0";
+pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION: u16 = 3;
+pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES: u64 = 63 * 1_024 * 1_024;
+pub(crate) const METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES: u32 = 1_024 * 1_024;
+```
+
+crates/storage/src/unavailable_pg_reconciliation.rs (L1371 to 1385)
+  Note: The introduced ordering drains all pending and in-flight transfers before authorizing any accumulated prepared artifacts.
+```
+        // Drain the whole selected page before advancing an epoch-bound stage.
+        // Otherwise the four transfer workers turn one page into four-member
+        // install batches and every later member must rebase its proof again.
+        self.dispatch_pending_transfers();
+        if !self.in_flight.is_empty() || !self.pending_transfers.is_empty() {
+            return;
+        }
+        if !self.tombstoned_for_finalization.is_empty() {
+            self.finalize_tombstoned(authority);
+            return;
+        }
+        if !self.prepared_for_authorization.is_empty() {
+            self.authorize_prepared_batch(authority);
+            self.dispatch_pending_transfers();
+            return;
+```
+
+crates/storage/src/unavailable_pg_reconciliation.rs (L824 to 855)
+  Note: Every completed preparation is retained in the unbounded-by-bytes `prepared_for_authorization` vector while subsequent waves are dispatched.
+```
+    fn receive_completion(&mut self) {
+        loop {
+            let event = match self.completion_rx.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("unavailable PG reconciliation transfer workers terminated unexpectedly")
+                }
+            };
+            let completion = match event {
+                TransferWorkerEvent::Completed(completion) => *completion,
+                TransferWorkerEvent::Panicked => {
+                    panic!("unavailable PG reconciliation transfer worker terminated unexpectedly")
+                }
+            };
+            let retained = self
+                .in_flight
+                .remove(&completion.work.pg_id())
+                .expect("transfer worker returned work that was not in flight");
+            assert_eq!(
+                retained, completion.work,
+                "transfer worker returned a result for a different transition"
+            );
+            match completion.result {
+                Ok(TransferOutcome::LegacyReady) => {
+                    self.ready_for_activation
+                        .push(ActivationOwner::Legacy(completion.work));
+                    self.clear_diagnostic();
+                }
+                Ok(TransferOutcome::Prepared(prepared)) => {
+                    self.prepared_for_authorization.push(prepared);
+                    self.clear_diagnostic();
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: high | Policy adjusted: high
+## Rationale
+Hard suppression does not apply: the impact is not self-only, the path uses a real production workflow, an ordinary authorized S3 writer is lower-privileged than the affected control-plane process, and node outage or lease expiry is a plausible operational event rather than an operator-only attack step. The issue remains reportable despite strong authentication and unknown public ingress because it crosses from authorized client-controlled metadata into an unbudgeted trusted reconciliation allocation. Calibrated impact is high due to possible process termination and repeat outage; calibrated likelihood is medium because grooming 16 large PGs and waiting for a placement transition is complex. Applying the required matrix mechanically, high impact multiplied by medium likelihood yields medium adjusted criticality. This retains the original medium rating.
+## Likelihood
+high - The attacker-controlled input is reachable through normal network S3 operations and requires only ordinary write authorization, not host or control-plane privilege. However, exploitation requires substantial metadata grooming across many PGs, co-selection of up to 16 heavy PGs, a node outage or lease-expiry transition the client does not directly control, and a process with inadequate memory headroom. Default loopback binding and unknown deployment ingress further reduce confidence in broad remote exposure. These factors support medium rather than high likelihood. | Remote network vector
+## Impact
+high - Successful exploitation can exhaust the control-plane or all-in-one service process and cause an OOM termination. The durable metadata and transition state may regenerate the same allocations after restart, potentially extending the outage. The impact is availability-only: repository evidence does not establish confidentiality loss, unauthorized modification, or code execution. The exact crash threshold and whether replicas preserve overall service availability remain deployment-dependent.
+## Assumptions
+- The S3 listener is deployed where an untrusted authenticated client can reach it; the repository default is loopback-only, but ARGMIN_LISTEN_ADDR is configurable.
+- The deployment has a static cluster topology with enough placement groups for up to 16 metadata-heavy PGs to be selected in one reconciliation page.
+- The attacker has ordinary S3 write authorization for one or more buckets, or a bucket is deliberately configured for public write; no control-plane or host privilege is assumed.
+- A storage-node outage, lease expiry, or equivalent placement transition eventually makes the groomed PGs unavailable-reconciliation candidates.
+- The affected process has insufficient memory headroom for approximately 1008 MiB of encoded artifacts plus decoded artifacts and temporary buffers.
+- Network reachability to the configured S3 HTTP listener
+- Authorization to create objects, versions, tags, or multipart metadata
+- Enough metadata records distributed across up to 16 placement groups to create large transfer artifacts
+- A storage-node lease expiry, outage, or existing unavailable-PG transition affecting those placement groups
+- Insufficient process memory headroom for the retained encoded and decoded transfer state
+## Path
+[S3 client] --authorized metadata writes--> [HTTP frontend] --> [durable PG metadata]
+      --node outage/lease expiry--> [16-PG reconciliation page]
+      --> [4 preparation workers, multiple waves]
+      --> [prepared_for_authorization: decoded + encoded artifacts]
+      --> [approximately 1008 MiB encoded alone] --> [OOM/service crash]
+## Path evidence
+- `crates/argmin-s3/src/config.rs:640-669` - Loads the S3 access secret from the environment and configures the HTTP listener, whose default is 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:3999-4109` - Builds the production HTTP frontends, binds the configured TCP listener, and serves HTTP or TLS with connection and in-flight limits.
+- `crates/server-http/src/http/mod.rs:3741-3770` - Shows the S3 request authentication boundary: SigV4 requests are authenticated, while missing authentication becomes an anonymous context subject to later authorization.
+- `crates/server-http/src/http/mod.rs:2198-2260` - Normal PutObject parses attacker-provided tags and metadata and passes them into the coordinator's authorized storage path.
+- `crates/server-core/src/coordinator/authz/modern.rs:158-197` - Enforces bucket-policy authorization for PutObject, establishing that the realistic attacker is an authorized S3 writer rather than a control-plane administrator.
+- `crates/storage/src/pg_store/command_log.rs:811-847` - The canonical objects checkpoint table includes attacker-influenced keys, tags, metadata blobs, multipart completion fields, and other per-object metadata.
+- `crates/storage/src/pg_store/command_log.rs:4448-4470` - Checkpoint construction materializes metadata table blocks and iterates their rows, making durable client-created records part of transfer state.
+- `crates/server-core/src/metadata_blob.rs:19-22` - Provides counterevidence in the form of a 2 KiB per-object user-metadata limit; it does not impose an aggregate per-PG limit.
+- `crates/storage/src/control_plane.rs:108-115` - Sets the unavailable-PG scan page and transition batch limits to 16.
+- `crates/storage/src/control_plane.rs:2690-2767` - Scans up to 16 PG records and makes a PG a reconciliation candidate after an unavailable-node observation exceeds the configured placement grace.
+- `crates/storage/src/unavailable_pg_reconciliation.rs:29-33` - The metadata-transfer preparation pool has four workers, allowing a 16-PG page to complete in four waves.
+- `crates/storage/src/unavailable_pg_reconciliation.rs:824-855` - Every successful preparation completion is appended to prepared_for_authorization.
+- `crates/storage/src/unavailable_pg_reconciliation.rs:581-610` - Prepared artifact bytes are summed only for observability; this code does not enforce a byte budget or backpressure.
+- `crates/storage/src/unavailable_pg_reconciliation.rs:1035-1046` - Authorization consumes the complete prepared vector only after the scheduler reaches this stage.
+- `crates/storage/src/unavailable_pg_reconciliation.rs:1371-1385` - Exact introduced scheduling behavior: dispatch pending work and return while any pending or in-flight transfer remains, postponing authorization until the whole selected page drains.
+- `crates/storage/src/live_pg_transfer.rs:334-342` - Each prepared owner retains both a boxed decoded PreparedLivePgMetadataTransfer and a separate staged_artifact Vec<u8>.
+- `crates/storage/src/live_pg_transfer.rs:1292-1319` - The preparation path encodes the already-retained decoded artifact and returns both representations in the prepared owner.
+- `crates/storage/src/pg_store/metadata_transfer_staging.rs:64-67` - Defines the maximum encoded artifact size as 63 MiB.
+- `crates/storage/src/pg_store/metadata_transfer_staging.rs:576-593` - Checks only the individual artifact's encoded length; it does not constrain the aggregate prepared queue.
+- `crates/argmin-s3/src/main.rs:1817-1889` - Instantiates and continuously polls the unavailable-PG reconciler in the production control-plane workflow and treats fatal reconciliation failure as process-fatal.
+## Narrative
+Attacker story: a client with ordinary S3 write permission creates enough objects, versions, tags, and multipart state across configured PGs to enlarge their canonical metadata checkpoints. The checkpoint inventory includes object keys, tags, metadata blobs, multipart fields, and related state. If a storage-node observation later exceeds the replacement grace period, the production unavailable-PG reconciler can select 16 affected PGs in one page. Although only four transfer workers exist, the scheduler dispatches subsequent waves and returns until both pending and in-flight work are empty. Completed preparation results accumulate in prepared_for_authorization, and each owner retains a boxed decoded transfer plus a separate encoded artifact. Since each encoded artifact may be 63 MiB, the encoded-only page bound is 16 times 63 MiB, or 1,056,964,608 bytes, before decoded state and temporary buffers are counted.
+
+The strongest counterevidence is that the default listener is 127.0.0.1:9000, no repository ingress or load-balancer manifest establishes public exposure, S3 writes are subject to SigV4 and bucket-policy or ACL authorization, user metadata is limited to 2 KiB per object, each transfer artifact is capped at 63 MiB, and the page is capped at 16 PGs. The client also cannot directly force lease expiry, and the executable validation used small artifacts and demonstrated depth 16 rather than an actual OOM. These points reduce likelihood and prevent a high or critical rating, but they are not dispositive: the listener is explicitly configurable, the required attacker is only an ordinary authorized S3 writer rather than an administrator, many normal records can overcome the per-object limit, the aggregate encoded bound still exceeds 1 GiB, queue-byte accounting is observational rather than enforcing, and node failure is an expected production condition. The supplied passing storage test exercised real reconciliation and confirmed that all 16 prepared owners can coexist before authorization. No secret disclosure, integrity violation, or code-execution sink is established.
+## Controls
+- AWS Signature Version 4 authentication at the S3 HTTP boundary
+- Bucket policy, ACL, expected-owner, and object-write authorization
+- Optional public-access-block controls for public-write buckets
+- 2 KiB limit on each object's user-metadata blob
+- 63 MiB maximum for each encoded metadata-transfer artifact
+- 16-PG reconciliation page and transition-batch limits
+- Four transfer preparation workers
+- Configured maximum HTTP connections and in-flight requests
+- Prepared queue depth and byte observability metrics
+- Default loopback listener at 127.0.0.1:9000
+- Dedicated non-root process requirement
+- No aggregate prepared-artifact byte budget or memory backpressure
+## Blindspots
+- No repository deployment manifest establishes whether ARGMIN_LISTEN_ADDR is exposed publicly, on a private network, or only through a local proxy.
+- The default listener is loopback-only, so remote exposure depends on deployment configuration not present in the checkout.
+- The executable validation confirmed depth 16 with small real artifacts but deliberately did not allocate approximately 1 GiB or demonstrate an allocator OOM.
+- The exact amount of decoded-state duplication and temporary encoder or RPC memory was not measured.
+- Available process memory, cgroup limits, restart policy, replica count, leader failover behavior, and resulting fleet-level availability are not represented in repository artifacts.
+- The number and distribution of object operations needed to approach 63 MiB in each of 16 PGs depend on workload, routing, versions, and multipart state.
+- The attacker cannot directly force an honest storage node's lease to expire based on the established repository path.
+
+# Resolution
+
+The finding was valid. Reconciliation now reserves one protocol-maximum
+artifact charge before every operation that can materialize transfer bytes.
+The fixed aggregate budget admits at most four such operations, matching the
+transfer-worker bound, and the reservation follows a prepared artifact through
+authorization and destination publication.
+
+Successful destination publication is now the heavy-ownership boundary.
+`StagedUnavailablePgMetadataTransfer` retains only the durable intent,
+authorization, transfer proof, and publication bindings; it no longer retains
+the decoded artifact or encoded bytes. Rebase and post-install import read one
+exact digest-bound artifact from authenticated destination staging under the
+same admission budget. This allows all 16 scan-page members to retain
+lightweight state and share one plural install epoch without retaining a full
+page of artifacts in manager memory.
+
+Artifact reconstruction validates every authorized destination one body at a
+time before re-reading and retaining one selected copy. This preserves the
+one-artifact memory bound while ensuring later authentication, protocol, or
+integrity failures cannot be hidden by an earlier valid destination.
+
+Activation response uncertainty retains only the exact command prefix derived
+and submitted by the authority. Definite member rejections and the unsubmitted
+encoded-size suffix are handled separately, and transient replay failures keep
+that prefix immutable. RPC response loss and retryable OpenRaft leadership or
+quorum outcomes after derivation use the same partition, while replay scheduling
+rotates explicitly among replay, ordinary activation, and discovery so failures
+in two continuously eligible classes cannot starve the third. Durable
+completion by another leader or differently grouped batch is classified from
+the retained transition and advances the local owner to cleanup instead of
+leaving stale foreground ownership.
+
+The composed five-PG regression exceeds the four-worker boundary, reaches one
+shared install epoch, verifies that peak artifact admission equals the fixed
+252 MiB encoded-artifact budget, and verifies that durable staging releases all
+artifact-memory admission before activation. Existing restart, proof-rebase,
+publication-lag, and authenticated staging coverage exercises artifact
+reconstruction from destination staging.
+
+Verification completed with the 9,076-test workspace suite,
+`cargo clippy --all-targets --all-features -- -D warnings`, the storage-cluster
+boundary checker, formatting, and diff validation all passing. The explicit
+three-way replay/ordinary-activation/discovery fairness regression also passed
+100 stress iterations.
