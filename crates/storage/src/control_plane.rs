@@ -37,9 +37,9 @@ use crate::control_plane_command::{
     ExpiredNodeHeartbeatLease, FinalizeMetadataTransferStagingGenerationRequest,
     MetadataTransferStagingCleanupDisposition, MetadataTransferStagingTombstoneBinding,
     PromotedNodeHeartbeatLease, ReadyPgPeeringCompletion,
-    UnavailablePgStagingIntentAuthorizationRequest, UnavailablePgStagingPublicationBinding,
-    UnavailablePgTransitionBeginRequest, UnavailablePgTransitionCompletionRequest,
-    UnavailablePgTransitionInstallRequest,
+    UnavailablePgOutageResolutionIntentRequest, UnavailablePgStagingIntentAuthorizationRequest,
+    UnavailablePgStagingPublicationBinding, UnavailablePgTransitionBeginRequest,
+    UnavailablePgTransitionCompletionRequest, UnavailablePgTransitionInstallRequest,
 };
 
 pub(crate) struct AuthorityPublishedStagingAuthorizationSeal {
@@ -135,19 +135,20 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 26;
+const CONTROL_PLANE_RPC_VERSION: u16 = 27;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
 const CONTROL_PLANE_RPC_TLS_ALPN: &[u8] = InternalTlsProtocol::ControlPlaneRpc.alpn();
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 pub const CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+const OUTAGE_RESOLUTION_MAX_IN_FLIGHT_OPERATION_MS: u64 = 15_000;
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 46;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 47;
 const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS: usize = 64;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
@@ -931,6 +932,7 @@ pub struct ClusterControlSnapshot {
         BTreeMap<(PgId, ClusterEpoch), UnavailablePgPlacementTransition>,
     outage_command_artifacts:
         BTreeMap<(PgId, ClusterEpoch, ClusterEpoch, u64), Arc<OutageCommandArtifactRecord>>,
+    outage_resolution_intents: BTreeMap<PgId, UnavailablePgOutageResolutionIntent>,
     metadata_transfer_staging_evidence_pages:
         BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidencePageRecord>,
     metadata_transfer_staging_evidence_checkpoint_segments:
@@ -1517,6 +1519,26 @@ pub struct UnavailablePgPlacementTransition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailablePgOutageResolutionIntent {
+    request: UnavailablePgOutageResolutionIntentRequest,
+    committed_epoch: ClusterEpoch,
+    batch_member_pg_ids: Vec<PgId>,
+    batch_members_digest: [u8; 32],
+}
+
+impl UnavailablePgOutageResolutionIntent {
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.request.pg_id
+    }
+
+    #[must_use]
+    pub fn fence_cutoff_ms(&self) -> u64 {
+        self.request.fence_cutoff_ms
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnavailablePgStagingIntentAuthorization {
     staging_generation: u64,
     artifact_target_epoch: ClusterEpoch,
@@ -1736,6 +1758,41 @@ fn unavailable_pg_transition_begin_batch_identity(
             .try_into()
             .expect("SHA-256 unavailable transition batch digest must contain 32 bytes"),
     }
+}
+
+fn unavailable_pg_outage_resolution_intent_batch_digest(
+    requests: &[UnavailablePgOutageResolutionIntentRequest],
+    expected_cluster_epoch: ClusterEpoch,
+) -> [u8; 32] {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(
+        &mut hasher,
+        b"argmin-unavailable-pg-outage-resolution-intent-batch-v1",
+    );
+    digest_u64(&mut hasher, expected_cluster_epoch.get());
+    digest_len(&mut hasher, requests.len());
+    for request in requests {
+        digest_u32(&mut hasher, request.pg_id.get());
+        digest_u64(&mut hasher, request.source_epoch.get());
+        digest_bytes(
+            &mut hasher,
+            format_historical_pg_route_record(&request.source_route).as_bytes(),
+        );
+        digest_unavailable_node_observation(&mut hasher, &request.unavailable_node);
+        digest_u64(&mut hasher, request.topology_generation);
+        digest_bytes(&mut hasher, &request.topology_digest);
+        digest_u64(&mut hasher, request.command_epoch.get());
+        digest_u64(&mut hasher, request.command_log_index);
+        digest_u32(&mut hasher, request.artifact_length);
+        digest_bytes(&mut hasher, &request.artifact_digest);
+        digest_u64(&mut hasher, request.lease_grant_not_after_ms);
+        digest_u64(&mut hasher, request.fence_cutoff_ms);
+    }
+    hasher
+        .finalize()
+        .bytes()
+        .try_into()
+        .expect("SHA-256 outage-resolution batch digest must contain 32 bytes")
 }
 
 fn unavailable_pg_transition_completion_batch_identity(
@@ -2471,6 +2528,14 @@ impl ClusterControlSnapshot {
         }
     }
 
+    #[must_use]
+    pub fn outage_resolution_intent(
+        &self,
+        pg_id: PgId,
+    ) -> Option<&UnavailablePgOutageResolutionIntent> {
+        self.outage_resolution_intents.get(&pg_id)
+    }
+
     pub(crate) fn next_cluster_epoch(&self) -> Result<ClusterEpoch, ControlPlaneError> {
         next_epoch(self.cluster_epoch)
     }
@@ -2512,6 +2577,7 @@ impl ClusterControlSnapshot {
             retained_unavailable_pg_placement_transitions: BTreeMap::new(),
             metadata_transfer_staging_evidence_pages: BTreeMap::new(),
             outage_command_artifacts: BTreeMap::new(),
+            outage_resolution_intents: BTreeMap::new(),
             metadata_transfer_staging_evidence_checkpoint_segments: BTreeMap::new(),
             metadata_transfer_staging_evidence_checkpoint_anchors: BTreeMap::new(),
             metadata_transfer_staging_actor_closures: BTreeMap::new(),
@@ -5987,6 +6053,307 @@ impl ClusterControlSnapshot {
         ))
     }
 
+    pub(crate) fn commit_unavailable_pg_outage_resolution_intents_batch_command(
+        &self,
+        candidates: &[(PgId, NodeId, ClusterEpoch, u64)],
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "outage-resolution intent",
+            candidates.iter().map(|(pg_id, _, _, _)| *pg_id),
+        )?;
+        let candidate_pg_ids = candidates
+            .iter()
+            .map(|(pg_id, _, _, _)| *pg_id)
+            .collect::<Vec<_>>();
+        if let Some(retained) = candidates
+            .iter()
+            .find_map(|(pg_id, _, _, _)| self.outage_resolution_intents.get(pg_id))
+        {
+            if retained.batch_member_pg_ids != candidate_pg_ids {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: "outage-resolution candidates do not match retained batch ownership"
+                        .into(),
+                });
+            }
+            let mut intents = Vec::with_capacity(candidates.len());
+            for (pg_id, unavailable_node_id, command_epoch, command_log_index) in candidates {
+                let member = self.outage_resolution_intents.get(pg_id).ok_or_else(|| {
+                    ControlPlaneError::invariant_failure(
+                        "retained outage-resolution batch is missing a member",
+                    )
+                })?;
+                if member.committed_epoch != retained.committed_epoch
+                    || member.batch_member_pg_ids != retained.batch_member_pg_ids
+                    || member.batch_members_digest != retained.batch_members_digest
+                    || member.request.pg_id != *pg_id
+                    || member.request.unavailable_node.node_id != *unavailable_node_id
+                    || member.request.command_epoch != *command_epoch
+                    || member.request.command_log_index != *command_log_index
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message:
+                            "outage-resolution candidates conflict with retained batch ownership"
+                                .into(),
+                    });
+                }
+                intents.push(member.request.clone());
+            }
+            let batch_members_digest = unavailable_pg_outage_resolution_intent_batch_digest(
+                &intents,
+                retained.committed_epoch,
+            );
+            if batch_members_digest != retained.batch_members_digest {
+                return Err(ControlPlaneError::invariant_failure(
+                    "retained outage-resolution batch digest is invalid",
+                ));
+            }
+            return Ok(
+                ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
+                    intents,
+                    expected_cluster_epoch: retained.committed_epoch,
+                },
+            );
+        }
+        let topology =
+            self.initial_topology
+                .as_ref()
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: "outage-resolution intent requires certified topology".into(),
+                })?;
+        let horizon = self
+            .lease_grant_horizon
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "outage-resolution intent requires a committed lease horizon".into(),
+            })?;
+        let lease_grant_not_after_ms = horizon.grant_not_after_ms();
+        let fence_cutoff_ms = lease_grant_not_after_ms
+            .checked_add(CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS)
+            .and_then(|value| value.checked_add(OUTAGE_RESOLUTION_MAX_IN_FLIGHT_OPERATION_MS))
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "outage-resolution fence cutoff overflows".into(),
+            })?;
+        let mut intents = Vec::with_capacity(candidates.len());
+        for (pg_id, unavailable_node_id, command_epoch, command_log_index) in candidates {
+            let command_index =
+                crate::metadata_command::MetadataCommandLogIndex::new(*command_log_index)
+                    .ok_or_else(|| ControlPlaneError::CommandDecode {
+                        message: "outage-resolution command index is zero".into(),
+                    })?;
+            let command_id = crate::metadata_command::MetadataCommandId::new(
+                *command_epoch,
+                *pg_id,
+                command_index,
+            );
+            let pg = self
+                .pg(*pg_id)
+                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+            let unavailable_node = self
+                .unavailable_node_observations
+                .get(unavailable_node_id)
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "node {} has no durable unavailable observation",
+                        unavailable_node_id.as_u32()
+                    ),
+                })?
+                .clone();
+            let artifact = self
+                .outage_command_artifacts
+                .get(&(
+                    *pg_id,
+                    self.cluster_epoch,
+                    command_id.cluster_epoch(),
+                    command_id.log_index().get(),
+                ))
+                .filter(|artifact| artifact.is_complete())
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} has no complete outage command artifact for {:?}",
+                        pg_id.get(),
+                        command_id
+                    ),
+                })?;
+            intents.push(UnavailablePgOutageResolutionIntentRequest {
+                pg_id: *pg_id,
+                source_epoch: self.cluster_epoch,
+                source_route: HistoricalPgRouteRecord::from(pg),
+                unavailable_node,
+                topology_generation: topology.topology_generation(),
+                topology_digest: *topology.topology_digest(),
+                command_epoch: command_id.cluster_epoch(),
+                command_log_index: command_id.log_index().get(),
+                artifact_length: artifact.total_length,
+                artifact_digest: artifact.digest,
+                lease_grant_not_after_ms,
+                fence_cutoff_ms,
+            });
+        }
+        Ok(
+            ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
+                intents,
+                expected_cluster_epoch: self.cluster_epoch,
+            },
+        )
+    }
+
+    fn apply_unavailable_pg_outage_resolution_intents(
+        &self,
+        intents: Vec<UnavailablePgOutageResolutionIntentRequest>,
+        expected_cluster_epoch: ClusterEpoch,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        validate_canonical_unavailable_pg_batch(
+            "outage-resolution intent",
+            intents.iter().map(|intent| intent.pg_id),
+        )?;
+        let batch_member_pg_ids = intents
+            .iter()
+            .map(|intent| intent.pg_id)
+            .collect::<Vec<_>>();
+        let batch_members_digest =
+            unavailable_pg_outage_resolution_intent_batch_digest(&intents, expected_cluster_epoch);
+        let replay = intents.iter().all(|request| {
+            self.outage_resolution_intents
+                .get(&request.pg_id)
+                .is_some_and(|intent| {
+                    intent.request == *request
+                        && intent.committed_epoch == expected_cluster_epoch
+                        && intent.batch_member_pg_ids == batch_member_pg_ids
+                        && intent.batch_members_digest == batch_members_digest
+                })
+        });
+        if replay {
+            return Ok(applied_control_plane_command(
+                self,
+                self.clone(),
+                ControlPlaneCommandResponse::CommitUnavailablePgOutageResolutionIntents,
+                false,
+            ));
+        }
+        if intents
+            .iter()
+            .any(|request| self.outage_resolution_intents.contains_key(&request.pg_id))
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "outage-resolution intent conflicts with retained batch ownership".into(),
+            });
+        }
+        if expected_cluster_epoch != self.cluster_epoch {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "outage-resolution intent source epoch changed".into(),
+            });
+        }
+        let topology =
+            self.initial_topology
+                .as_ref()
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: "outage-resolution intent requires certified topology".into(),
+                })?;
+        let horizon = self
+            .lease_grant_horizon
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "outage-resolution intent requires a committed lease horizon".into(),
+            })?;
+        let expected_cutoff = horizon
+            .grant_not_after_ms()
+            .checked_add(CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS)
+            .and_then(|value| value.checked_add(OUTAGE_RESOLUTION_MAX_IN_FLIGHT_OPERATION_MS))
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "outage-resolution fence cutoff overflows".into(),
+            })?;
+        for request in &intents {
+            let pg = self.pg(request.pg_id).ok_or(ControlPlaneError::UnknownPg {
+                pg_id: request.pg_id.get(),
+            })?;
+            let observation = self
+                .unavailable_node_observations
+                .get(&request.unavailable_node.node_id)
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "node {} has no durable unavailable observation",
+                        request.unavailable_node.node_id.as_u32()
+                    ),
+                })?;
+            let grace_cutoff = observation
+                .observed_at_ms
+                .checked_add(
+                    topology
+                        .placement_policy()
+                        .unavailable_replacement_grace_ms(),
+                )
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: "outage-resolution grace cutoff overflows".into(),
+                })?;
+            if request.source_epoch != self.cluster_epoch
+                || request.source_route != HistoricalPgRouteRecord::from(pg)
+                || request.source_route.pg_id != request.pg_id
+                || !request
+                    .source_route
+                    .acting_set
+                    .contains(&request.unavailable_node.node_id)
+                || observation != &request.unavailable_node
+                || topology.topology_generation() != request.topology_generation
+                || topology.topology_digest() != &request.topology_digest
+                || request.command_log_index == 0
+                || request.command_epoch > request.source_epoch
+                || request.lease_grant_not_after_ms != horizon.grant_not_after_ms()
+                || request.fence_cutoff_ms != expected_cutoff
+                || self
+                    .max_committed_timestamp_ms
+                    .is_none_or(|now| now < grace_cutoff)
+                || self
+                    .unavailable_pg_placement_transitions
+                    .contains_key(&request.pg_id)
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} outage-resolution intent no longer matches durable authority state",
+                        request.pg_id.get()
+                    ),
+                });
+            }
+            let artifact = self
+                .outage_command_artifacts
+                .get(&(
+                    request.pg_id,
+                    request.source_epoch,
+                    request.command_epoch,
+                    request.command_log_index,
+                ))
+                .filter(|artifact| artifact.is_complete());
+            if artifact.is_none_or(|artifact| {
+                artifact.total_length != request.artifact_length
+                    || artifact.digest != request.artifact_digest
+            }) {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "PG {} outage-resolution artifact is incomplete or changed",
+                        request.pg_id.get()
+                    ),
+                });
+            }
+        }
+        let mut next = self.clone();
+        for request in intents {
+            next.outage_resolution_intents.insert(
+                request.pg_id,
+                UnavailablePgOutageResolutionIntent {
+                    request,
+                    committed_epoch: expected_cluster_epoch,
+                    batch_member_pg_ids: batch_member_pg_ids.clone(),
+                    batch_members_digest,
+                },
+            );
+        }
+        next.validate_current_state_invariants()
+            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+        Ok(applied_control_plane_command(
+            self,
+            next,
+            ControlPlaneCommandResponse::CommitUnavailablePgOutageResolutionIntents,
+            true,
+        ))
+    }
+
     pub(crate) fn classify_metadata_transfer_staging_evidence_page(
         &self,
         operation_payload: &[u8],
@@ -9341,6 +9708,7 @@ impl ClusterControlSnapshot {
             self.unavailable_pg_placement_transitions
                 .values()
                 .chain(self.retained_unavailable_pg_placement_transitions.values()),
+            self.outage_resolution_intents.values(),
         );
         let historical_pg_routes = self.historical_pg_routes_for_storage_node_refresh(
             node.retained_cluster_map_history_route_references(),
@@ -10172,6 +10540,127 @@ impl ClusterControlSnapshot {
         if retained_artifact_bytes > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES {
             return Err("retained outage command artifacts exceed the byte budget".into());
         }
+        let mut intent_batches = BTreeMap::<
+            (ClusterEpoch, Vec<PgId>, [u8; 32]),
+            BTreeMap<PgId, &UnavailablePgOutageResolutionIntent>,
+        >::new();
+        for (pg_id, intent) in &self.outage_resolution_intents {
+            let request = &intent.request;
+            if *pg_id != request.pg_id
+                || request.source_epoch != intent.committed_epoch
+                || intent.committed_epoch > self.cluster_epoch
+                || intent.batch_member_pg_ids.is_empty()
+                || intent.batch_member_pg_ids.len() > MAX_UNAVAILABLE_PG_TRANSITION_BATCH
+                || intent
+                    .batch_member_pg_ids
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || intent.batch_member_pg_ids.binary_search(pg_id).is_err()
+                || request.source_route.pg_id != *pg_id
+                || !request
+                    .source_route
+                    .acting_set
+                    .contains(&request.unavailable_node.node_id)
+                || request.unavailable_node.endpoint.is_empty()
+                || request.unavailable_node.lease_deadline_ms == 0
+                || request.unavailable_node.lease_deadline_ms
+                    > request.unavailable_node.observed_at_ms
+                || request.command_log_index == 0
+                || request.command_epoch > request.source_epoch
+                || request.fence_cutoff_ms
+                    != request
+                        .lease_grant_not_after_ms
+                        .checked_add(CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS)
+                        .and_then(|value| {
+                            value.checked_add(OUTAGE_RESOLUTION_MAX_IN_FLIGHT_OPERATION_MS)
+                        })
+                        .ok_or("outage-resolution fence cutoff overflows")?
+            {
+                return Err(format!(
+                    "outage-resolution intent for PG {} is structurally invalid",
+                    pg_id.get()
+                ));
+            }
+            let topology = self
+                .initial_topology
+                .as_ref()
+                .ok_or("outage-resolution intent requires certified topology")?;
+            if request.topology_generation != topology.topology_generation()
+                || request.topology_digest != *topology.topology_digest()
+            {
+                return Err(format!(
+                    "outage-resolution intent for PG {} has invalid topology authority",
+                    pg_id.get()
+                ));
+            }
+            validate_historical_pg_route_record(
+                &request.source_route,
+                request.source_epoch,
+                |node_id| self.nodes.contains_key(&node_id),
+            )?;
+            if historical_pg_route_record_at_epoch(
+                &self.history,
+                &self.pgs,
+                *pg_id,
+                request.source_epoch,
+            )
+            .as_ref()
+                != Some(&request.source_route)
+            {
+                return Err(format!(
+                    "outage-resolution intent for PG {} does not match retained route history",
+                    pg_id.get()
+                ));
+            }
+            let artifact = self.outage_command_artifacts.get(&(
+                *pg_id,
+                request.source_epoch,
+                request.command_epoch,
+                request.command_log_index,
+            ));
+            if artifact.is_none_or(|artifact| {
+                !artifact.is_complete()
+                    || artifact.total_length != request.artifact_length
+                    || artifact.digest != request.artifact_digest
+            }) {
+                return Err(format!(
+                    "outage-resolution intent for PG {} lacks its exact complete artifact",
+                    pg_id.get()
+                ));
+            }
+            let batch_key = (
+                intent.committed_epoch,
+                intent.batch_member_pg_ids.clone(),
+                intent.batch_members_digest,
+            );
+            if intent_batches
+                .entry(batch_key)
+                .or_default()
+                .insert(*pg_id, intent)
+                .is_some()
+            {
+                return Err("duplicate outage-resolution batch member".into());
+            }
+        }
+        for ((committed_epoch, member_pg_ids, members_digest), members) in intent_batches {
+            if members.len() != member_pg_ids.len()
+                || !members.keys().copied().eq(member_pg_ids.iter().copied())
+            {
+                return Err(
+                    "outage-resolution batch receipt does not retain its complete member vector"
+                        .into(),
+                );
+            }
+            let requests = member_pg_ids
+                .iter()
+                .map(|pg_id| members[pg_id].request.clone())
+                .collect::<Vec<_>>();
+            if unavailable_pg_outage_resolution_intent_batch_digest(&requests, committed_epoch)
+                != members_digest
+            {
+                return Err("outage-resolution batch receipt digest is invalid".into());
+            }
+        }
         self.validate_metadata_transfer_staging_evidence_invariants()?;
         for (node_id, observation) in &self.unavailable_node_observations {
             if *node_id != observation.node_id {
@@ -10766,6 +11255,7 @@ impl ClusterControlSnapshot {
             self.unavailable_pg_placement_transitions
                 .values()
                 .chain(self.retained_unavailable_pg_placement_transitions.values()),
+            self.outage_resolution_intents.values(),
         );
         prune_cluster_map_history(&mut self.history, &protection, self.cluster_epoch);
     }
@@ -11730,6 +12220,12 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
             } => self.apply_metadata_transfer_staging_evidence_page(operation_payload, page_digest),
             ControlPlaneCommand::PublishOutageCommandArtifactPage { page } => {
                 self.apply_outage_command_artifact_page(page)
+            }
+            ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
+                intents,
+                expected_cluster_epoch,
+            } => {
+                self.apply_unavailable_pg_outage_resolution_intents(intents, expected_cluster_epoch)
             }
             ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
                 actor_node_id,
@@ -17431,6 +17927,7 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
                     .retained_unavailable_pg_placement_transitions
                     .values(),
             ),
+        snapshot.outage_resolution_intents.values(),
     );
     prune_cluster_map_history(&mut history_records, &protection, snapshot.cluster_epoch);
     for history in &history_records {
@@ -17514,6 +18011,12 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
                 hex_encode(bytes)
             ));
         }
+    }
+    for intent in snapshot.outage_resolution_intents.values() {
+        out.push_str(&format!(
+            "outage_resolution_intent={}\n",
+            format_unavailable_pg_outage_resolution_intent(intent)
+        ));
     }
     for transition in snapshot
         .retained_unavailable_pg_placement_transitions
@@ -18526,6 +19029,36 @@ fn format_unavailable_node_observation(observation: &NodeUnavailableObservation)
     )
 }
 
+fn format_unavailable_pg_outage_resolution_intent(
+    intent: &UnavailablePgOutageResolutionIntent,
+) -> String {
+    let request = &intent.request;
+    let members = intent
+        .batch_member_pg_ids
+        .iter()
+        .map(|pg_id| pg_id.get().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    format!(
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        request.pg_id.get(),
+        request.source_epoch.get(),
+        hex_encode(format_historical_pg_route_record(&request.source_route).as_bytes()),
+        hex_encode(format_unavailable_node_observation(&request.unavailable_node).as_bytes()),
+        request.topology_generation,
+        hex_encode(&request.topology_digest),
+        request.command_epoch.get(),
+        request.command_log_index,
+        request.artifact_length,
+        hex_encode(&request.artifact_digest),
+        request.lease_grant_not_after_ms,
+        request.fence_cutoff_ms,
+        intent.committed_epoch.get(),
+        members,
+        hex_encode(&intent.batch_members_digest)
+    )
+}
+
 fn format_unavailable_pg_placement_transition(
     transition: &UnavailablePgPlacementTransition,
 ) -> String {
@@ -19188,6 +19721,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut unavailable_pg_placement_transitions = BTreeMap::new();
     let mut retained_unavailable_pg_placement_transitions = BTreeMap::new();
     let mut outage_command_artifacts = BTreeMap::new();
+    let mut outage_resolution_intents = BTreeMap::new();
     let mut outage_command_artifact_bytes = 0usize;
     let mut metadata_transfer_staging_evidence_pages = BTreeMap::new();
     let mut metadata_transfer_staging_evidence_checkpoint_segments = BTreeMap::new();
@@ -19485,6 +20019,17 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                     .map_err(|message| parse_error(line_number, &message))?;
                 outage_command_artifacts.insert(key, Arc::new(record));
             }
+        } else if let Some(value) = line.strip_prefix("outage_resolution_intent=") {
+            let intent = parse_unavailable_pg_outage_resolution_intent(line_number, value)?;
+            if outage_resolution_intents
+                .insert(intent.pg_id(), intent)
+                .is_some()
+            {
+                return Err(parse_error(
+                    line_number,
+                    "duplicate outage-resolution intent",
+                ));
+            }
         } else if let Some(value) = line.strip_prefix("metadata_transfer_staging_evidence_page=") {
             let fields: Vec<_> = value.split(',').collect();
             if fields.len() != 3 {
@@ -19673,6 +20218,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         unavailable_pg_placement_transitions
             .values()
             .chain(retained_unavailable_pg_placement_transitions.values()),
+        outage_resolution_intents.values(),
     );
     prune_cluster_map_history(&mut history, &protection, cluster_epoch);
     validate_metadata_transfer_route_references(
@@ -19706,6 +20252,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         unavailable_pg_placement_transitions,
         retained_unavailable_pg_placement_transitions,
         outage_command_artifacts,
+        outage_resolution_intents,
         metadata_transfer_staging_evidence_pages,
         metadata_transfer_staging_evidence_checkpoint_segments,
         metadata_transfer_staging_evidence_checkpoint_anchors,
@@ -20564,6 +21111,90 @@ fn parse_unavailable_node_observation(
         endpoint,
         lease_deadline_ms: parse_u64(line, fields[3], "unavailable node lease deadline")?,
         observed_at_ms: parse_u64(line, fields[4], "unavailable node observation time")?,
+    })
+}
+
+fn parse_unavailable_pg_outage_resolution_intent(
+    line: usize,
+    value: &str,
+) -> Result<UnavailablePgOutageResolutionIntent, ControlPlaneError> {
+    let fields: Vec<_> = value.split(',').collect();
+    if fields.len() != 15 {
+        return Err(parse_error(
+            line,
+            "outage-resolution intent must have fifteen fields",
+        ));
+    }
+    let pg_id = PgId::new(parse_u32(line, fields[0], "outage-resolution PG")?);
+    let source_epoch = ClusterEpoch::new(parse_u64(
+        line,
+        fields[1],
+        "outage-resolution source epoch",
+    )?)
+    .ok_or_else(|| parse_error(line, "outage-resolution source epoch is zero"))?;
+    let source_route_encoded = String::from_utf8(hex_decode(line, fields[2])?)
+        .map_err(|_| parse_error(line, "outage-resolution source route is not UTF-8"))?;
+    let source_route = parse_historical_pg_route_record(line, &source_route_encoded)?;
+    let unavailable_encoded = String::from_utf8(hex_decode(line, fields[3])?)
+        .map_err(|_| parse_error(line, "outage-resolution observation is not UTF-8"))?;
+    let unavailable_node = parse_unavailable_node_observation(line, &unavailable_encoded)?;
+    let topology_digest = hex_decode(line, fields[5])?
+        .try_into()
+        .map_err(|_| parse_error(line, "outage-resolution topology digest must be 32 bytes"))?;
+    let command_epoch = ClusterEpoch::new(parse_u64(
+        line,
+        fields[6],
+        "outage-resolution command epoch",
+    )?)
+    .ok_or_else(|| parse_error(line, "outage-resolution command epoch is zero"))?;
+    let command_index = crate::metadata_command::MetadataCommandLogIndex::new(parse_u64(
+        line,
+        fields[7],
+        "outage-resolution command index",
+    )?)
+    .ok_or_else(|| parse_error(line, "outage-resolution command index is zero"))?;
+    let artifact_digest = hex_decode(line, fields[9])?
+        .try_into()
+        .map_err(|_| parse_error(line, "outage-resolution artifact digest must be 32 bytes"))?;
+    let committed_epoch = ClusterEpoch::new(parse_u64(
+        line,
+        fields[12],
+        "outage-resolution committed epoch",
+    )?)
+    .ok_or_else(|| parse_error(line, "outage-resolution committed epoch is zero"))?;
+    let batch_member_pg_ids = fields[13]
+        .split(':')
+        .map(|value| parse_u32(line, value, "outage-resolution batch member").map(PgId::new))
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch_members_digest = hex_decode(line, fields[14])?
+        .try_into()
+        .map_err(|_| parse_error(line, "outage-resolution batch digest must be 32 bytes"))?;
+    Ok(UnavailablePgOutageResolutionIntent {
+        request: UnavailablePgOutageResolutionIntentRequest {
+            pg_id,
+            source_epoch,
+            source_route,
+            unavailable_node,
+            topology_generation: parse_u64(
+                line,
+                fields[4],
+                "outage-resolution topology generation",
+            )?,
+            topology_digest,
+            command_epoch,
+            command_log_index: command_index.get(),
+            artifact_length: parse_u32(line, fields[8], "outage-resolution artifact length")?,
+            artifact_digest,
+            lease_grant_not_after_ms: parse_u64(
+                line,
+                fields[10],
+                "outage-resolution lease horizon",
+            )?,
+            fence_cutoff_ms: parse_u64(line, fields[11], "outage-resolution fence cutoff")?,
+        },
+        committed_epoch,
+        batch_member_pg_ids,
+        batch_members_digest,
     })
 }
 
@@ -22536,6 +23167,7 @@ fn required_cluster_map_history_protection<'a, 'b>(
     pgs: impl IntoIterator<Item = &'a PgControlRecord>,
     nodes: impl IntoIterator<Item = &'b NodeControlRecord>,
     transitions: impl IntoIterator<Item = &'a UnavailablePgPlacementTransition>,
+    outage_intents: impl IntoIterator<Item = &'a UnavailablePgOutageResolutionIntent>,
 ) -> ClusterMapHistoryProtection {
     let mut exact_routes = BTreeSet::new();
     for pg in pgs {
@@ -22562,6 +23194,9 @@ fn required_cluster_map_history_protection<'a, 'b>(
             exact_routes.insert((receipt.source_epoch, transition.pg_id));
             exact_routes.insert((receipt.target_epoch, transition.pg_id));
         }
+    }
+    for intent in outage_intents {
+        exact_routes.insert((intent.request.source_epoch, intent.request.pg_id));
     }
     ClusterMapHistoryProtection { exact_routes }
 }

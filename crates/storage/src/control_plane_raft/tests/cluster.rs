@@ -5595,6 +5595,95 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
             .unwrap()
             .observed_at_ms()
             + 1;
+        let intent_source = leader.current_snapshot_for_test().unwrap();
+        let intent_commands = pg_ids
+            .iter()
+            .enumerate()
+            .map(|(index, pg_id)| {
+                crate::metadata_command::MetadataCommandEnvelope::new(
+                    crate::metadata_command::MetadataCommandId::new(
+                        intent_source.cluster_epoch(),
+                        *pg_id,
+                        crate::metadata_command::MetadataCommandLogIndex::new(
+                            10 + u64::try_from(index).unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                    crate::metadata_command::MetadataCommandPayload::PutBucketSubresource(
+                        crate::metadata_command::PutBucketSubresourceCommand::new(
+                            crate::types::BucketName::try_from(format!(
+                                "raft-outage-intent-{}",
+                                pg_id.get()
+                            ))
+                            .unwrap(),
+                            crate::metadata_command::BucketSubresourceMutation::PutCors(
+                                "<CORSConfiguration/>".to_owned(),
+                            ),
+                            1,
+                        ),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        for command in &intent_commands {
+            for page in crate::control_plane::OutageCommandArtifactPage::for_command(
+                command,
+                intent_source.cluster_epoch(),
+            )
+            .unwrap()
+            {
+                leader
+                    .submit_command_for_test(
+                        ControlPlaneCommand::PublishOutageCommandArtifactPage { page },
+                    )
+                    .unwrap();
+            }
+        }
+        let intent_candidates = intent_commands
+            .iter()
+            .map(|command| {
+                (
+                    command.id().pg_id(),
+                    NodeId::new(1),
+                    command.id().cluster_epoch(),
+                    command.id().log_index().get(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let intent_epoch = leader.current_snapshot_for_test().unwrap().cluster_epoch();
+        let intent_snapshot = leader
+            .commit_unavailable_pg_outage_resolution_intents_batch(&intent_candidates)
+            .unwrap();
+        assert_eq!(intent_snapshot.cluster_epoch(), intent_epoch);
+        assert!(pg_ids.iter().all(|pg_id| intent_snapshot
+            .outage_resolution_intent(*pg_id)
+            .is_some()));
+        let intent_applied = authority1.status().await.unwrap().applied().unwrap();
+        authority2
+            .wait_for_applied_log_id(
+                intent_applied,
+                Duration::from_secs(1),
+                "second voter applied plural outage-resolution intent",
+            )
+            .await
+            .unwrap();
+        authority3
+            .wait_for_applied_log_id(
+                intent_applied,
+                Duration::from_secs(1),
+                "third voter applied plural outage-resolution intent",
+            )
+            .await
+            .unwrap();
+        for authority in [&authority1, &authority2, &authority3] {
+            assert_eq!(
+                authority
+                    .durable_state_machine_snapshot_for_test()
+                    .await
+                    .unwrap(),
+                intent_snapshot
+            );
+        }
         let mut cursor = crate::control_plane::UnavailablePgReconciliationCursor::start();
         let begun = leader
             .poll_unavailable_pg_reconciliation_batch(&mut cursor, begin_at_ms)
@@ -6101,6 +6190,25 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
             );
         }
 
+        assert!(collapsed.cluster_epoch() > intent_epoch);
+        let previous_horizon = collapsed.lease_grant_horizon().unwrap();
+        leader
+            .submit_command_for_test(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: previous_horizon.authority(),
+                authority_now_ms: previous_horizon.grant_not_after_ms() + 1,
+                horizon_duration_ms:
+                    crate::control_plane::CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS,
+            })
+            .unwrap();
+        let replay_expected = leader.current_snapshot_for_test().unwrap();
+        assert!(
+            replay_expected
+                .lease_grant_horizon()
+                .unwrap()
+                .grant_not_after_ms()
+                > previous_horizon.grant_not_after_ms()
+        );
+
         authority1.transfer_leadership_to(1202).await.unwrap();
         authority2
             .wait_for_current_leader(
@@ -6124,6 +6232,10 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 false,
             )
             .unwrap();
+        let replayed_intent = successor
+            .commit_unavailable_pg_outage_resolution_intents_batch(&intent_candidates)
+            .expect("new leader must exactly replay the plural outage-resolution intent");
+        assert_eq!(replayed_intent, replay_expected);
         for actor in &evidence_actors {
             let replayed_checkpoint = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::checkpoint_metadata_transfer_staging_evidence_pages(
                 &mut successor,
@@ -6133,7 +6245,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 1,
             )
             .unwrap();
-            assert_eq!(replayed_checkpoint, collapsed);
+            assert_eq!(replayed_checkpoint, replay_expected);
             let replayed_collapse = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::collapse_metadata_transfer_staging_evidence_checkpoint_segment(
                 &mut successor,
                 actor.node_id(),
@@ -6141,7 +6253,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 1,
                 1,
             ).unwrap();
-            assert_eq!(replayed_collapse, collapsed);
+            assert_eq!(replayed_collapse, replay_expected);
             let replayed_second_collapse = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::collapse_metadata_transfer_staging_evidence_checkpoint_segment(
                 &mut successor,
                 actor.node_id(),
@@ -6149,7 +6261,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 2,
                 4,
             ).unwrap();
-            assert_eq!(replayed_second_collapse, collapsed);
+            assert_eq!(replayed_second_collapse, replay_expected);
             let replayed_coalescing = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
                 &mut successor,
                 actor.node_id(),
@@ -6157,28 +6269,28 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 1,
                 4,
             ).unwrap();
-            assert_eq!(replayed_coalescing, collapsed);
+            assert_eq!(replayed_coalescing, replay_expected);
         }
         let replayed_authorization = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::authorize_unavailable_pg_staging_intents_batch(
             &mut successor,
             &authorizations,
         )
         .unwrap();
-        assert_eq!(replayed_authorization, collapsed);
+        assert_eq!(replayed_authorization, replay_expected);
         let replayed_install = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::install_unavailable_pg_placement_transitions_batch(
             &mut successor,
             &install_requests,
             destination_epoch,
         )
         .unwrap();
-        assert_eq!(replayed_install, collapsed);
+        assert_eq!(replayed_install, replay_expected);
         for cleanup in cleanups {
             let replayed_cleanup = <crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost as crate::control_plane::ControlPlaneAdmin>::finalize_metadata_transfer_staging_generation(
                 &mut successor,
                 cleanup,
             )
             .unwrap();
-            assert_eq!(replayed_cleanup, collapsed);
+            assert_eq!(replayed_cleanup, replay_expected);
         }
 
         let replay_applied = authority2.status().await.unwrap().applied().unwrap();
@@ -6204,7 +6316,7 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                     .durable_state_machine_snapshot_for_test()
                     .await
                     .unwrap(),
-                    collapsed
+                replay_expected
             );
         }
 

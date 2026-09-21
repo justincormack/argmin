@@ -589,6 +589,25 @@ impl ControlPlaneRaftAuthorityHost {
         self.current_snapshot()
     }
 
+    pub fn commit_unavailable_pg_outage_resolution_intents_batch(
+        &mut self,
+        candidates: &[(PgId, NodeId, ClusterEpoch, u64)],
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let candidates = candidates.to_vec();
+        let response = self.submit_raft_command_derived(move |current| {
+            current.commit_unavailable_pg_outage_resolution_intents_batch_command(&candidates)
+        })?;
+        if !matches!(
+            response,
+            ControlPlaneCommandResponse::CommitUnavailablePgOutageResolutionIntents
+        ) {
+            return Err(ControlPlaneError::invariant_failure(
+                "outage-resolution intent batch returned the wrong response",
+            ));
+        }
+        self.current_snapshot()
+    }
+
     pub fn install_unavailable_pg_placement_transitions_batch(
         &mut self,
         transitions: &[UnavailablePgTransitionInstallRequest],

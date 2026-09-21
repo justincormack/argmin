@@ -2863,6 +2863,17 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    pub fn commit_unavailable_pg_outage_resolution_intents_batch(
+        &mut self,
+        candidates: &[(PgId, NodeId, ClusterEpoch, u64)],
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let command = self
+            .snapshot
+            .commit_unavailable_pg_outage_resolution_intents_batch_command(candidates)?;
+        self.apply_and_commit_command(command)?;
+        Ok(self.snapshot.clone())
+    }
+
     pub fn authorize_unavailable_pg_staging_intents_batch(
         &mut self,
         authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],

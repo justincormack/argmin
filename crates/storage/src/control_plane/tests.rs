@@ -379,10 +379,13 @@ fn control_plane_rpc_v25_frame_remains_rejected_evidence() {
 }
 
 #[test]
-fn control_plane_rpc_v26_frame_encoding_is_exact() {
-    let frame =
-        encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
-            .unwrap();
+fn control_plane_rpc_v26_frame_remains_rejected_evidence() {
+    let frame = encode_control_plane_rpc_frame_with_version(
+        ControlPlaneRpcKind::RuntimeMapStatus,
+        &[0x01, 0x02, 0x03],
+        26,
+    )
+    .unwrap();
 
     assert_eq!(
         frame,
@@ -392,6 +395,11 @@ fn control_plane_rpc_v26_frame_encoding_is_exact() {
             43, 1, 2, 3,
         ]
     );
+    assert!(matches!(
+        read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
+        Err(ControlPlaneError::RpcProtocol { diagnostic })
+            if diagnostic.as_str() == "unsupported control-plane RPC version 26"
+    ));
 }
 
 #[test]
@@ -1729,7 +1737,7 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         Err(ControlPlaneStateVersionError::Missing)
     );
     for version in [
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 47,
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 48,
     ] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
@@ -1737,8 +1745,8 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(46)),
-        Ok(46)
+        require_current_control_plane_state_version(Some(47)),
+        Ok(47)
     );
 
     assert!(matches!(
@@ -2109,11 +2117,11 @@ fn canonical_control_plane_state_v43_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v46_text_is_exact() {
+fn canonical_control_plane_state_v47_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=46\n",
+            "version=47\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -2279,7 +2287,7 @@ fn canonical_control_plane_state_v36_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v46_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v47_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -2483,6 +2491,62 @@ fn canonical_control_plane_state_v46_representative_aggregate_is_stable() {
         .unwrap()
         .observed_at_ms()
         + 50;
+    let outage_resolution_intent_snapshot = {
+        let horizon_now = unavailable_authority
+            .snapshot()
+            .max_committed_timestamp_ms()
+            .unwrap()
+            .saturating_add(1)
+            .max(begin_at_ms);
+        let source = unavailable_authority
+            .snapshot()
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: LeaseHorizonAuthorityBinding::checked_new(1, None).unwrap(),
+                authority_now_ms: horizon_now,
+                horizon_duration_ms: CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS,
+            })
+            .unwrap()
+            .into_snapshot();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                source.cluster_epoch(),
+                PgId::new(7),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketSubresource(
+                crate::metadata_command::PutBucketSubresourceCommand::new(
+                    bucket_name("outage-resolution-intent"),
+                    crate::metadata_command::BucketSubresourceMutation::PutCors(
+                        "<CORSConfiguration/>".to_owned(),
+                    ),
+                    1,
+                ),
+            ),
+        );
+        let mut with_artifact = source;
+        for page in
+            OutageCommandArtifactPage::for_command(&command, with_artifact.cluster_epoch()).unwrap()
+        {
+            with_artifact = with_artifact
+                .apply_control_plane_command(
+                    ControlPlaneCommand::PublishOutageCommandArtifactPage { page },
+                )
+                .unwrap()
+                .into_snapshot();
+        }
+        let intent_command = with_artifact
+            .commit_unavailable_pg_outage_resolution_intents_batch_command(&[(
+                PgId::new(7),
+                NodeId::new(1),
+                command.id().cluster_epoch(),
+                command.id().log_index().get(),
+            )])
+            .unwrap();
+        with_artifact
+            .apply_control_plane_command(intent_command)
+            .unwrap()
+            .into_snapshot()
+    };
     unavailable_authority
         .begin_unavailable_pg_placement_transition(PgId::new(7), NodeId::new(1), begin_at_ms)
         .unwrap();
@@ -3056,6 +3120,31 @@ fn canonical_control_plane_state_v46_representative_aggregate_is_stable() {
     snapshots.push(transitions::finalized_staging_floor_snapshot_fixture());
     snapshots.push(transitions::collapsed_staging_checkpoint_snapshot_fixture());
 
+    let previous_version_snapshots = snapshots.clone();
+    snapshots.push(outage_resolution_intent_snapshot);
+
+    let mut historical_v46_aggregate = Vec::new();
+    for snapshot in &previous_version_snapshots {
+        let previous = format_snapshot(snapshot).replacen("version=47\n", "version=46\n", 1);
+        historical_v46_aggregate.extend_from_slice(&(previous.len() as u64).to_be_bytes());
+        historical_v46_aggregate.extend_from_slice(previous.as_bytes());
+        assert!(matches!(
+            parse_snapshot(&previous),
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 46"
+        ));
+    }
+    assert_eq!(
+        (
+            historical_v46_aggregate.len(),
+            hex_encode(&checksum::sha256::digest(&historical_v46_aggregate))
+        ),
+        (
+            402_184,
+            "93969a0aa9f515677e1bbfdddf7eea7aef1bc385cb9889405c1a9ea78bd30ad3".to_owned()
+        )
+    );
+
     let mut aggregate = Vec::new();
     let mut aggregate_text = String::new();
     let mut previous_aggregate = Vec::new();
@@ -3067,7 +3156,7 @@ fn canonical_control_plane_state_v46_representative_aggregate_is_stable() {
         aggregate.extend_from_slice(formatted.as_bytes());
         aggregate_text.push_str(&formatted);
         if snapshot.outage_command_artifacts.is_empty() {
-            let previous = formatted.replacen("version=46\n", "version=45\n", 1);
+            let previous = formatted.replacen("version=47\n", "version=45\n", 1);
             previous_aggregate.extend_from_slice(&(previous.len() as u64).to_be_bytes());
             previous_aggregate.extend_from_slice(previous.as_bytes());
             assert!(matches!(
@@ -3088,7 +3177,7 @@ fn canonical_control_plane_state_v46_representative_aggregate_is_stable() {
         )
     );
     for required_record in [
-        "version=46\n",
+        "version=47\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -3111,6 +3200,7 @@ fn canonical_control_plane_state_v46_representative_aggregate_is_stable() {
         "metadata_transfer_staging_finalized_floor=",
         "metadata_transfer_staging_evidence=",
         "outage_command_artifact_page=",
+        "outage_resolution_intent=",
     ] {
         assert!(
             aggregate_text.contains(required_record),
@@ -3173,8 +3263,8 @@ fn canonical_control_plane_state_v46_representative_aggregate_is_stable() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            402_184,
-            "93969a0aa9f515677e1bbfdddf7eea7aef1bc385cb9889405c1a9ea78bd30ad3".to_owned()
+            404_630,
+            "dc590f51b2a8f80557f1674c122eee7126c348decffd3c7917ecd03fbed69759".to_owned()
         )
     );
 }

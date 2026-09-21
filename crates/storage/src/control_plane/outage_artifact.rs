@@ -194,6 +194,11 @@ impl OutageCommandArtifactRecord {
         self.pages.iter().map(Vec::len).sum()
     }
 
+    pub(super) fn is_complete(&self) -> bool {
+        self.pages.len()
+            == (self.total_length as usize).div_ceil(OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES)
+    }
+
     #[cfg(test)]
     pub(super) fn assembled_bytes(&self) -> Option<Vec<u8>> {
         (self.pages.len()

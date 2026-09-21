@@ -4,6 +4,48 @@
 use super::*;
 use crate::control_plane_command::ReplicatedControlPlaneStateMachine;
 
+fn outage_resolution_command(
+    pg_id: PgId,
+    epoch: ClusterEpoch,
+    log_index: u64,
+) -> crate::metadata_command::MetadataCommandEnvelope {
+    let owner = crate::types::OwnerIdentity::from_principal(format!(
+        "outage-resolution-owner-{}",
+        pg_id.get()
+    ));
+    let bucket =
+        crate::types::BucketName::try_from(format!("outage-resolution-bucket-{}", pg_id.get()))
+            .unwrap();
+    let config = crate::types::CreateBucketConfig {
+        name: bucket.as_str(),
+        owner_principal: &owner.principal,
+        owner_canonical_id: &owner.canonical_id,
+        acl_grants: &s3_types::AclGrants::default(),
+        public_read: false,
+        public_write: false,
+        versioning: s3_types::BucketVersioningState::Disabled,
+        object_lock: s3_types::BucketObjectLockConfig::default(),
+        ownership_controls: crate::types::BucketOwnershipControls {
+            object_ownership: crate::types::BucketObjectOwnership::ObjectWriter,
+        },
+    };
+    crate::metadata_command::MetadataCommandEnvelope::new(
+        crate::metadata_command::MetadataCommandId::new(
+            epoch,
+            pg_id,
+            crate::metadata_command::MetadataCommandLogIndex::new(log_index).unwrap(),
+        ),
+        crate::metadata_command::MetadataCommandPayload::CreateBucket(
+            crate::metadata_command::CreateBucketCommand::from_config_with_fixed_upload_id_key_for_test(
+                &config,
+                u64::from(pg_id.get()),
+                log_index,
+            )
+            .unwrap(),
+        ),
+    )
+}
+
 fn certified_spare_authority() -> (
     test_util::TempDir,
     FileControlPlaneStore,
@@ -5431,6 +5473,256 @@ fn unavailable_pg_transition_batch_limit_is_owned_by_command_mutation() {
         .unwrap_err()
         .to_string()
         .contains("member limit"));
+}
+
+#[test]
+fn outage_resolution_intent_batch_is_epoch_neutral_durable_and_exactly_replayable() {
+    let pg_ids = [PgId::new(7), PgId::new(8)];
+    let (tmp, store, mut authority, _) = certified_spare_authority_with_policy_and_pgs(
+        4,
+        test_certified_storage_placement_policy((1..=4).map(NodeId::new), 3, 50),
+        pg_ids.to_vec(),
+    );
+    for node_id in 1..=4 {
+        heartbeat_spare_node(&mut authority, node_id, 1_000 + u64::from(node_id));
+    }
+    let active_proof = PgMetadataProof::current(17, 0x1717, 0x2727);
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proofs_and_lease_duration(
+            &mut authority,
+            node_id,
+            &pg_ids,
+            PgState::Peering,
+            active_proof,
+            2_000 + u64::from(node_id),
+            10_000,
+        );
+    }
+    authority.complete_ready_pg_peerings(2_004).unwrap();
+    for node_id in 1..=3 {
+        heartbeat_with_pg_proofs_and_lease_duration(
+            &mut authority,
+            node_id,
+            &pg_ids,
+            PgState::Active,
+            active_proof,
+            3_000 + u64::from(node_id),
+            if node_id == 1 { 100 } else { 10_000 },
+        );
+    }
+    let failed_deadline = authority
+        .snapshot()
+        .node(NodeId::new(1))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+    authority.expire_heartbeat_leases(failed_deadline).unwrap();
+    let grace_at = authority
+        .snapshot()
+        .unavailable_node_observation(NodeId::new(1))
+        .unwrap()
+        .observed_at_ms()
+        + 50;
+    heartbeat_spare_node(&mut authority, 4, grace_at + 1);
+    let horizon_now = authority.snapshot().max_committed_timestamp_ms().unwrap() + 1;
+    authority
+        .apply_control_plane_command_for_test(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+            authority: LeaseHorizonAuthorityBinding::checked_new(1, None).unwrap(),
+            authority_now_ms: horizon_now,
+            horizon_duration_ms: CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS,
+        })
+        .unwrap();
+
+    let source_epoch = authority.snapshot().cluster_epoch();
+    let commands = pg_ids
+        .iter()
+        .enumerate()
+        .map(|(index, pg_id)| outage_resolution_command(*pg_id, source_epoch, 18 + index as u64))
+        .collect::<Vec<_>>();
+    for command in &commands {
+        for page in OutageCommandArtifactPage::for_command(command, source_epoch).unwrap() {
+            authority
+                .apply_control_plane_command_for_test(
+                    ControlPlaneCommand::PublishOutageCommandArtifactPage { page },
+                )
+                .unwrap();
+        }
+    }
+    let candidates = commands
+        .iter()
+        .map(|command| {
+            (
+                command.id().pg_id(),
+                NodeId::new(1),
+                command.id().cluster_epoch(),
+                command.id().log_index().get(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let command = authority
+        .snapshot()
+        .commit_unavailable_pg_outage_resolution_intents_batch_command(&candidates)
+        .unwrap();
+    let ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
+        intents,
+        expected_cluster_epoch,
+    } = command.clone()
+    else {
+        unreachable!("outage-resolution builder returned the wrong command");
+    };
+    let encoded = crate::control_plane_command::encode_control_plane_command(&command).unwrap();
+    assert_eq!(
+        crate::control_plane_command::decode_control_plane_command(&encoded).unwrap(),
+        command
+    );
+    let mut wrong_artifact = intents.clone();
+    wrong_artifact[0].artifact_digest[0] ^= 0xff;
+    let wrong_artifact = ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
+        intents: wrong_artifact,
+        expected_cluster_epoch,
+    };
+    assert!(authority
+        .apply_control_plane_command_for_test(wrong_artifact)
+        .unwrap_err()
+        .to_string()
+        .contains("artifact is incomplete or changed"));
+    assert!(pg_ids.iter().all(|pg_id| authority
+        .snapshot()
+        .outage_resolution_intent(*pg_id)
+        .is_none()));
+    let mut wrong_route = intents.clone();
+    wrong_route[0].source_route.acting_set.swap(0, 1);
+    let wrong_route = ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
+        intents: wrong_route,
+        expected_cluster_epoch,
+    };
+    assert!(authority
+        .apply_control_plane_command_for_test(wrong_route)
+        .unwrap_err()
+        .to_string()
+        .contains("no longer matches durable authority state"));
+    assert!(pg_ids.iter().all(|pg_id| authority
+        .snapshot()
+        .outage_resolution_intent(*pg_id)
+        .is_none()));
+    let epoch_before = authority.snapshot().cluster_epoch();
+    let applied = authority
+        .apply_control_plane_command_for_test(command.clone())
+        .unwrap();
+    assert!(applied.changed());
+    assert_eq!(authority.snapshot().cluster_epoch(), epoch_before);
+    for pg_id in pg_ids {
+        let intent = authority
+            .snapshot()
+            .outage_resolution_intent(pg_id)
+            .unwrap();
+        assert_eq!(intent.pg_id(), pg_id);
+        assert!(intent.fence_cutoff_ms() > grace_at);
+    }
+
+    let replay = authority
+        .apply_control_plane_command_for_test(command.clone())
+        .unwrap();
+    assert!(!replay.changed());
+    authority
+        .apply_control_plane_command_for_test(ControlPlaneCommand::MarkNodeAvailability {
+            node_id: NodeId::new(4),
+            availability: NodeAvailabilityState::Suspect,
+        })
+        .unwrap();
+    assert!(authority.snapshot().cluster_epoch() > epoch_before);
+    let replay_after_epoch_advance = authority
+        .apply_control_plane_command_for_test(command.clone())
+        .unwrap();
+    assert!(!replay_after_epoch_advance.changed());
+    let previous_horizon = authority.snapshot().lease_grant_horizon().unwrap();
+    let next_horizon_now = previous_horizon.grant_not_after_ms() + 1;
+    authority
+        .apply_control_plane_command_for_test(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+            authority: previous_horizon.authority(),
+            authority_now_ms: next_horizon_now,
+            horizon_duration_ms: CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS,
+        })
+        .unwrap();
+    assert!(
+        authority
+            .snapshot()
+            .lease_grant_horizon()
+            .unwrap()
+            .grant_not_after_ms()
+            > previous_horizon.grant_not_after_ms()
+    );
+    let before_rejected_replay = authority.snapshot().clone();
+    assert!(authority
+        .commit_unavailable_pg_outage_resolution_intents_batch(&candidates[..1])
+        .unwrap_err()
+        .to_string()
+        .contains("retained batch ownership"));
+    let mut conflicting_candidates = candidates.clone();
+    conflicting_candidates[0].3 += 1;
+    assert!(authority
+        .commit_unavailable_pg_outage_resolution_intents_batch(&conflicting_candidates)
+        .unwrap_err()
+        .to_string()
+        .contains("conflict with retained batch ownership"));
+    assert_eq!(authority.snapshot(), &before_rejected_replay);
+    let subset = ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
+        intents: vec![intents[0].clone()],
+        expected_cluster_epoch,
+    };
+    assert!(authority
+        .apply_control_plane_command_for_test(subset)
+        .unwrap_err()
+        .to_string()
+        .contains("batch ownership"));
+    let mut malformed = intents;
+    malformed[0].artifact_digest[0] ^= 0xff;
+    let malformed = ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
+        intents: malformed,
+        expected_cluster_epoch,
+    };
+    assert!(authority
+        .apply_control_plane_command_for_test(malformed)
+        .unwrap_err()
+        .to_string()
+        .contains("batch ownership"));
+
+    let expected = authority.snapshot().clone();
+    assert_eq!(
+        parse_snapshot(&format_snapshot(&expected)).unwrap(),
+        expected
+    );
+    let mut forged_digest = expected.clone();
+    for intent in forged_digest.outage_resolution_intents.values_mut() {
+        intent.batch_members_digest[0] ^= 0xff;
+    }
+    assert!(forged_digest
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .contains("batch receipt digest"));
+    let mut incomplete_batch = expected.clone();
+    incomplete_batch
+        .outage_resolution_intents
+        .remove(&PgId::new(8));
+    assert!(incomplete_batch
+        .validate_current_state_invariants()
+        .unwrap_err()
+        .contains("complete member vector"));
+    drop(authority);
+    let mut reopened = SingleAuthorityControlPlane::open(store).unwrap();
+    let reopened_before_replay = reopened.snapshot().clone();
+    let replayed = reopened
+        .commit_unavailable_pg_outage_resolution_intents_batch(&candidates)
+        .unwrap();
+    assert_eq!(replayed, reopened_before_replay);
+    for pg_id in pg_ids {
+        assert_eq!(
+            reopened.snapshot().outage_resolution_intent(pg_id),
+            expected.outage_resolution_intent(pg_id)
+        );
+    }
+    drop(reopened);
+    drop(tmp);
 }
 
 #[test]
