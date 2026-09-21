@@ -1089,7 +1089,7 @@ impl ControlPlaneError {
     }
 
     #[must_use]
-    fn is_unconfirmed_control_plane_mutation(&self) -> bool {
+    pub(crate) fn is_unconfirmed_control_plane_mutation(&self) -> bool {
         self.is_maybe_applied_control_plane_rpc_response_loss()
             || matches!(self, Self::RpcUnconfirmed { .. })
     }

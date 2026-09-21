@@ -5898,6 +5898,12 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 ready_snapshot.max_committed_timestamp_ms().unwrap() + 1,
             )
             .unwrap();
+        let crate::control_plane::UnavailablePgReconciliationCompletionAttempt::Classified(
+            completion,
+        ) = completion
+        else {
+            panic!("durable Raft completion unexpectedly remained unconfirmed");
+        };
         assert!(
             completion.rejected.is_empty(),
             "unexpected completion rejection: {:?}",

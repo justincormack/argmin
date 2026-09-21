@@ -1425,9 +1425,38 @@ recoverable, and cannot race delayed writes because the tombstone precedes
 physical removal. Tests must cover source loss before and after staging, leader
 failure after install but before import, cleanup racing a delayed stage and
 publish response, partial destination import, stale-batch cleanup, and
-destination loss during each phase. Prepared and staged artifact bytes must
-have aggregate bounds and must not accumulate unboundedly in manager memory or
-destination storage.
+destination loss during each phase. Prepared artifact ownership carries a
+fixed worst-case byte reservation from export through durable destination
+publication. The initial implementation admits at most four protocol-maximum
+artifacts (252 MiB of encoded artifact capacity) across workers and retained
+preparation state. Once every destination has returned an authenticated
+publication receipt, the manager drops both the encoded bytes and decoded
+artifact and retains only the intent, authorization, proof, and publication
+bindings. Rebase and post-install import recover one exact digest-bound copy
+from destination staging under the same admission budget. Recovery first
+validates every authorized destination one body at a time, dropping each body
+after validation so later fatal authentication, protocol, or integrity evidence
+wins; after that pass it re-reads one validated source and retains only that
+body. Thus all 16 members can still share one plural install epoch without a
+full page of artifact bytes accumulating in manager memory. Destination staging
+remains governed by its separate durable capacity bound.
+
+An unconfirmed plural activation retains the exact ordered command member
+vector actually derived and dispatched as one immutable replay unit; rejected
+members and an encoded-size suffix remain separate ordinary work. It is never
+flattened into the ordinary ready queue or regrouped with later work merely
+because a retry encounters leadership loss, a transient read failure, or other
+inconclusive authority outcome. RPC response loss and retryable OpenRaft
+leadership/quorum outcomes returned after command derivation both carry this
+exact prepared partition because either can follow an append. Replay, ordinary
+activation, and discovery use an explicit three-way rotation independent of
+poll cadence, so continuously due failures in any two classes cannot starve the
+third class or cleanup discovery. On retry, the authority classifies durable completion before
+requiring an active transition or validating a new timestamp. Exact receipt
+replay therefore releases cleanup ownership without another epoch advance,
+while a member completed by another authority in a differently grouped batch is
+independently recognized as durable completion and advances its staged owner to
+cleanup rather than retaining stale foreground ownership.
 
 Replace the manager's singleton in-flight state with bounded, per-PG stage
 queues for begin candidates, transfer preparation, prepared installation,

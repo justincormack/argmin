@@ -2330,8 +2330,29 @@ pub(crate) struct PreparedUnavailablePgBeginBatch {
 
 pub(crate) struct PreparedUnavailablePgCompletionBatch {
     pub(crate) command: Option<ControlPlaneCommand>,
+    pub(crate) already_completed: Vec<UnavailablePgReconciliationWork>,
     pub(crate) included: Vec<UnavailablePgReconciliationWork>,
     pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
+}
+
+impl PreparedUnavailablePgCompletionBatch {
+    pub(crate) fn rederive_from(
+        &self,
+        requested: &[UnavailablePgReconciliationWork],
+    ) -> Vec<UnavailablePgReconciliationWork> {
+        let classified_pg_ids = self
+            .already_completed
+            .iter()
+            .chain(&self.included)
+            .map(UnavailablePgReconciliationWork::pg_id)
+            .chain(self.rejected.iter().map(|(work, _)| work.pg_id()))
+            .collect::<BTreeSet<_>>();
+        requested
+            .iter()
+            .filter(|work| !classified_pg_ids.contains(&work.pg_id()))
+            .cloned()
+            .collect()
+    }
 }
 
 pub(crate) struct PreparedUnavailablePgInstallBatch {
@@ -2351,6 +2372,19 @@ pub(crate) struct UnavailablePgReconciliationCompletionBatch {
     pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
     pub(crate) rederive: Vec<UnavailablePgReconciliationWork>,
     pub(crate) snapshot: ClusterControlSnapshot,
+}
+
+pub(crate) struct UnconfirmedUnavailablePgReconciliationCompletionBatch {
+    pub(crate) already_completed: Vec<UnavailablePgReconciliationWork>,
+    pub(crate) submitted: Vec<UnavailablePgReconciliationWork>,
+    pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
+    pub(crate) rederive: Vec<UnavailablePgReconciliationWork>,
+    pub(crate) error: ControlPlaneError,
+}
+
+pub(crate) enum UnavailablePgReconciliationCompletionAttempt {
+    Classified(Box<UnavailablePgReconciliationCompletionBatch>),
+    Unconfirmed(UnconfirmedUnavailablePgReconciliationCompletionBatch),
 }
 
 impl UnavailablePgPlacementTransition {
@@ -8547,9 +8581,14 @@ impl ClusterControlSnapshot {
             "completion preparation",
             work.iter().map(UnavailablePgReconciliationWork::pg_id),
         )?;
+        let mut already_completed = Vec::new();
         let mut included = Vec::new();
         let mut rejected = Vec::new();
         for candidate in work {
+            if self.unavailable_pg_completion_is_durably_completed(candidate) {
+                already_completed.push(candidate.clone());
+                continue;
+            }
             let singleton = match self
                 .complete_unavailable_pg_placement_transition_command(candidate, ready_at_ms)
             {
@@ -8606,9 +8645,33 @@ impl ClusterControlSnapshot {
         };
         Ok(PreparedUnavailablePgCompletionBatch {
             command,
+            already_completed,
             included,
             rejected,
         })
+    }
+
+    fn unavailable_pg_completion_is_durably_completed(
+        &self,
+        work: &UnavailablePgReconciliationWork,
+    ) -> bool {
+        self.retained_unavailable_pg_placement_transitions
+            .get(&(work.pg_id(), work.transition_epoch()))
+            .is_some_and(|transition| {
+                work.mutation_binding().matches_transition(transition)
+                    && transition.completion.is_some()
+                    && transition
+                        .completion_batch_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| {
+                            receipt.identity.stage == UnavailablePgTransitionBatchStage::Completion
+                                && receipt
+                                    .identity
+                                    .member_pg_ids
+                                    .binary_search(&work.pg_id())
+                                    .is_ok()
+                        })
+            })
     }
 
     fn validate_unavailable_pg_transition_completion(

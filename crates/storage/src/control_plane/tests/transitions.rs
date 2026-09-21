@@ -7051,6 +7051,28 @@ fn unavailable_pg_begin_batch_is_atomic_durable_and_requires_whole_batch_replay(
     assert!(!exact_completion_replay.changed());
     assert_eq!(exact_completion_replay.snapshot(), &completed);
 
+    let recovered_completion = completed
+        .prepare_unavailable_pg_placement_completion_batch(&completion_work, ready_at_ms + 1_000)
+        .unwrap();
+    assert!(recovered_completion.command.is_none());
+    assert_eq!(recovered_completion.already_completed, completion_work);
+    assert!(recovered_completion.included.is_empty());
+    assert!(recovered_completion.rejected.is_empty());
+
+    let completed_elsewhere = completed
+        .prepare_unavailable_pg_placement_completion_batch(
+            std::slice::from_ref(&completion_work[0]),
+            ready_at_ms + 2_000,
+        )
+        .unwrap();
+    assert!(completed_elsewhere.command.is_none());
+    assert_eq!(
+        completed_elsewhere.already_completed,
+        vec![completion_work[0].clone()]
+    );
+    assert!(completed_elsewhere.included.is_empty());
+    assert!(completed_elsewhere.rejected.is_empty());
+
     let subset_completion = completed
         .apply_control_plane_command(
             ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {

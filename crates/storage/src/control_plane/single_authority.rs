@@ -3144,37 +3144,24 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &mut self,
         work: &[UnavailablePgReconciliationWork],
         now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
+    ) -> Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError> {
         let prepared = self
             .snapshot
             .prepare_unavailable_pg_placement_completion_batch(work, now_ms)?;
+        let rederive = prepared.rederive_from(work);
+        let mut completed = prepared.already_completed;
         if let Some(command) = prepared.command {
             self.apply_and_commit_command(command)?;
+            completed.extend(prepared.included);
         }
-        let included_pg_ids = prepared
-            .included
-            .iter()
-            .map(UnavailablePgReconciliationWork::pg_id)
-            .collect::<BTreeSet<_>>();
-        let rejected_pg_ids = prepared
-            .rejected
-            .iter()
-            .map(|(work, _)| work.pg_id())
-            .collect::<BTreeSet<_>>();
-        let rederive = work
-            .iter()
-            .filter(|work| {
-                !included_pg_ids.contains(&work.pg_id())
-                    && !rejected_pg_ids.contains(&work.pg_id())
-            })
-            .cloned()
-            .collect();
-        Ok(UnavailablePgReconciliationCompletionBatch {
-            completed: prepared.included,
-            rejected: prepared.rejected,
-            rederive,
-            snapshot: self.snapshot.clone(),
-        })
+        Ok(UnavailablePgReconciliationCompletionAttempt::Classified(
+            Box::new(UnavailablePgReconciliationCompletionBatch {
+                completed,
+                rejected: prepared.rejected,
+                rederive,
+                snapshot: self.snapshot.clone(),
+            }),
+        ))
     }
 
     pub fn set_pg_acting_set_with_metadata_transfer(

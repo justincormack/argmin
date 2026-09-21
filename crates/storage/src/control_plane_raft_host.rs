@@ -18,10 +18,11 @@ use crate::control_plane::{
     ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRpcResponsePublication,
     ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapSource,
     ControlPlaneRuntimeMapStatus, FencedPgMetadataTransferSnapshot, LeaseHorizonAuthorityBinding,
-    NodeHeartbeat, PgMetadataTransferProof, UnavailablePgReconciliationCandidate,
+    NodeHeartbeat, PgMetadataTransferProof, PreparedUnavailablePgCompletionBatch,
+    UnavailablePgReconciliationCandidate, UnavailablePgReconciliationCompletionAttempt,
     UnavailablePgReconciliationCompletionBatch, UnavailablePgReconciliationCursor,
     UnavailablePgReconciliationPollBatch, UnavailablePgReconciliationStage,
-    UnavailablePgReconciliationWork,
+    UnavailablePgReconciliationWork, UnconfirmedUnavailablePgReconciliationCompletionBatch,
 };
 use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse,
@@ -796,7 +797,7 @@ impl ControlPlaneRaftAuthorityHost {
         &mut self,
         work: &[UnavailablePgReconciliationWork],
         supplied_now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationCompletionBatch, ControlPlaneError> {
+    ) -> Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError> {
         let now_ms = self.authority_now_ms(supplied_now_ms)?;
         #[cfg(test)]
         self.run_after_unavailable_reconciliation_time_sampled_hook(now_ms);
@@ -824,32 +825,22 @@ impl ControlPlaneRaftAuthorityHost {
             submit_result,
             "unavailable transition completion derivation returned without preparation state",
         )?;
-        if prepared.command.is_some() {
-            submit_result?;
-        }
-        let included_pg_ids = prepared
-            .included
-            .iter()
-            .map(UnavailablePgReconciliationWork::pg_id)
-            .collect::<BTreeSet<_>>();
-        let rejected_pg_ids = prepared
-            .rejected
-            .iter()
-            .map(|(work, _)| work.pg_id())
-            .collect::<BTreeSet<_>>();
-        let rederive = work
-            .iter()
-            .filter(|work| {
-                !included_pg_ids.contains(&work.pg_id()) && !rejected_pg_ids.contains(&work.pg_id())
-            })
-            .cloned()
-            .collect();
-        Ok(UnavailablePgReconciliationCompletionBatch {
-            completed: prepared.included,
-            rejected: prepared.rejected,
-            rederive,
-            snapshot: self.current_snapshot()?,
-        })
+        let prepared =
+            match resolve_unavailable_pg_completion_submission(prepared, work, submit_result)? {
+                UnavailablePgCompletionSubmission::Applied(prepared) => prepared,
+                UnavailablePgCompletionSubmission::Unconfirmed(attempt) => return Ok(attempt),
+            };
+        let rederive = prepared.rederive_from(work);
+        let mut completed = prepared.already_completed;
+        completed.extend(prepared.included);
+        Ok(UnavailablePgReconciliationCompletionAttempt::Classified(
+            Box::new(UnavailablePgReconciliationCompletionBatch {
+                completed,
+                rejected: prepared.rejected,
+                rederive,
+                snapshot: self.current_snapshot()?,
+            }),
+        ))
     }
 
     fn block_on<F: Future>(&self, future: F) -> F::Output {
@@ -1745,6 +1736,51 @@ fn resolve_derived_preparation<T, R>(
     }
 }
 
+fn unconfirmed_unavailable_pg_completion_attempt(
+    prepared: PreparedUnavailablePgCompletionBatch,
+    requested: &[UnavailablePgReconciliationWork],
+    error: ControlPlaneError,
+) -> UnavailablePgReconciliationCompletionAttempt {
+    debug_assert!(prepared.command.is_some());
+    let rederive = prepared.rederive_from(requested);
+    UnavailablePgReconciliationCompletionAttempt::Unconfirmed(
+        UnconfirmedUnavailablePgReconciliationCompletionBatch {
+            already_completed: prepared.already_completed,
+            submitted: prepared.included,
+            rejected: prepared.rejected,
+            rederive,
+            error,
+        },
+    )
+}
+
+enum UnavailablePgCompletionSubmission {
+    Applied(PreparedUnavailablePgCompletionBatch),
+    Unconfirmed(UnavailablePgReconciliationCompletionAttempt),
+}
+
+fn resolve_unavailable_pg_completion_submission<R>(
+    prepared: PreparedUnavailablePgCompletionBatch,
+    requested: &[UnavailablePgReconciliationWork],
+    submit_result: Result<R, ControlPlaneError>,
+) -> Result<UnavailablePgCompletionSubmission, ControlPlaneError> {
+    if prepared.command.is_none() {
+        return Ok(UnavailablePgCompletionSubmission::Applied(prepared));
+    }
+    match submit_result {
+        Ok(_) => Ok(UnavailablePgCompletionSubmission::Applied(prepared)),
+        Err(error)
+            if error.is_unconfirmed_control_plane_mutation()
+                || error.is_retryable_openraft_leadership_error() =>
+        {
+            Ok(UnavailablePgCompletionSubmission::Unconfirmed(
+                unconfirmed_unavailable_pg_completion_attempt(prepared, requested, error),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Output {
     if Handle::try_current().is_ok() {
         tokio::task::block_in_place(|| runtime.block_on(future))
@@ -1781,6 +1817,64 @@ mod tests {
                 current_term: 8,
             }
         ));
+    }
+
+    #[test]
+    fn ambiguous_openraft_completion_preserves_the_exact_prepared_partition() {
+        let work = |pg_id| {
+            UnavailablePgReconciliationWork::new(
+                PgId::new(pg_id),
+                ClusterEpoch::new(11).unwrap(),
+                ClusterEpoch::new(10).unwrap(),
+                vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+                vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
+                UnavailablePgReconciliationStage::PayloadReadiness,
+            )
+        };
+        let completed = work(6);
+        let submitted = work(7);
+        let rejected = work(8);
+        let suffix = work(9);
+        let requested = vec![
+            completed.clone(),
+            submitted.clone(),
+            rejected.clone(),
+            suffix.clone(),
+        ];
+        let submission = resolve_unavailable_pg_completion_submission(
+            PreparedUnavailablePgCompletionBatch {
+                command: Some(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(1),
+                    availability: crate::control_plane::NodeAvailabilityState::Healthy,
+                }),
+                already_completed: vec![completed.clone()],
+                included: vec![submitted.clone()],
+                rejected: vec![(
+                    rejected.clone(),
+                    ControlPlaneError::CommandDecode {
+                        message: "injected definitive rejection".to_owned(),
+                    },
+                )],
+            },
+            &requested,
+            Err::<(), _>(ControlPlaneError::OpenRaftOperation {
+                kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                message: "injected changed-tip leadership rejection".to_owned(),
+            }),
+        )
+        .unwrap();
+
+        let UnavailablePgCompletionSubmission::Unconfirmed(attempt) = submission else {
+            panic!("ambiguous OpenRaft submission was not retained as unconfirmed");
+        };
+        let UnavailablePgReconciliationCompletionAttempt::Unconfirmed(attempt) = attempt else {
+            panic!("unconfirmed submission was not preserved");
+        };
+        assert_eq!(attempt.already_completed, vec![completed]);
+        assert_eq!(attempt.submitted, vec![submitted]);
+        assert_eq!(attempt.rejected[0].0, rejected);
+        assert_eq!(attempt.rederive, vec![suffix]);
+        assert!(attempt.error.is_retryable_openraft_leadership_error());
     }
 
     impl ReconciliationCommandRelease {
