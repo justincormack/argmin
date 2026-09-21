@@ -49,6 +49,99 @@ fn control_plane_openraft_single_node_initialize_uses_bootstrap_membership() {
 }
 
 #[test]
+fn control_plane_openraft_reserves_complete_outage_artifacts_before_page_zero() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("authority.state");
+        let wal_path = tmp.path().join("authority.wal");
+        let authority_node_id = 1401;
+        let authority = Arc::new(
+            ControlPlaneRaftAuthority::new_single_node_durable_with_wal(
+                "control-plane-raft-outage-artifact-reservation-test",
+                authority_node_id,
+                &artifact_path,
+                &wal_path,
+            )
+            .await
+            .unwrap(),
+        );
+        authority
+            .initialize_single_node_membership(authority_node_id)
+            .await
+            .unwrap();
+        authority
+            .wait_for_current_leader(
+                authority_node_id,
+                Duration::from_secs(1),
+                "outage artifact reservation leadership",
+            )
+            .await
+            .unwrap();
+        wait_for_authority_status_matching(
+            &authority,
+            Duration::from_secs(1),
+            "outage artifact reservation serving state",
+            ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+        )
+        .await;
+        let mut host = crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost::new_for_test(
+            tokio::runtime::Handle::current(),
+            Arc::clone(&authority),
+            true,
+        )
+        .unwrap();
+        host.submit_command_for_test(ControlPlaneCommand::BootstrapInitialClusterMap {
+            nodes: vec![(NodeId::new(1), "/tmp/outage-reservation.sock".into())],
+            pg_ids: vec![PgId::new(7)],
+        })
+        .unwrap();
+        let source_epoch = host.current_snapshot_for_test().unwrap().cluster_epoch();
+        let page = |log_index: u64, page_index: u16| {
+            crate::control_plane::OutageCommandArtifactPage {
+                pg_id: PgId::new(7),
+                source_epoch,
+                command_id: crate::metadata_command::MetadataCommandId::new(
+                    ClusterEpoch::INITIAL,
+                    PgId::new(7),
+                    crate::metadata_command::MetadataCommandLogIndex::new(log_index).unwrap(),
+                ),
+                total_length: crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN
+                    as u32,
+                digest: [u8::try_from(log_index).unwrap(); 32],
+                page_index,
+                bytes: vec![
+                    u8::try_from(log_index).unwrap();
+                    crate::control_plane::OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES
+                ],
+            }
+        };
+        for log_index in [10, 11] {
+            host.submit_command_for_test(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: page(log_index, 0),
+            })
+            .unwrap();
+        }
+        let full = host.current_snapshot_for_test().unwrap();
+        let error = host
+            .submit_command_for_test(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: page(12, 0),
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("artifact reservations exceed the byte budget"));
+        assert_eq!(host.current_snapshot_for_test().unwrap(), full);
+
+        host.submit_command_for_test(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+            page: page(10, 1),
+        })
+        .unwrap();
+        assert_ne!(host.current_snapshot_for_test().unwrap(), full);
+        authority.shutdown().await.unwrap();
+    });
+}
+
+#[test]
 fn post_dispatch_evidence_uncertainty_crosses_rpc_and_defers_the_durable_outbox() {
     ControlPlaneRaftTypeConfig::run(async {
         let (authority, follower) = initialized_two_node_authorities(
@@ -5617,7 +5710,14 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                             ))
                             .unwrap(),
                             crate::metadata_command::BucketSubresourceMutation::PutCors(
-                                "<CORSConfiguration/>".to_owned(),
+                                if index == 1 {
+                                    format!(
+                                        "<CORSConfiguration><!--{}--></CORSConfiguration>",
+                                        "x".repeat(crate::control_plane::OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES)
+                                    )
+                                } else {
+                                    "<CORSConfiguration/>".to_owned()
+                                },
                             ),
                             1,
                         ),
@@ -5625,19 +5725,24 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 )
             })
             .collect::<Vec<_>>();
+        let committed_prefix = crate::control_plane::OutageCommandArtifactPage::for_command(
+            &intent_commands[1],
+            intent_source.cluster_epoch(),
+        )
+        .unwrap();
+        assert_eq!(committed_prefix.len(), 2);
+        leader
+            .submit_command_for_test(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: committed_prefix[0].clone(),
+            })
+            .unwrap();
         for command in &intent_commands {
-            for page in crate::control_plane::OutageCommandArtifactPage::for_command(
-                command,
-                intent_source.cluster_epoch(),
-            )
-            .unwrap()
-            {
-                leader
-                    .submit_command_for_test(
-                        ControlPlaneCommand::PublishOutageCommandArtifactPage { page },
-                    )
-                    .unwrap();
-            }
+            leader
+                .publish_unavailable_pg_outage_command_artifact(
+                    command,
+                    intent_source.cluster_epoch(),
+                )
+                .unwrap();
         }
         let intent_candidates = intent_commands
             .iter()
@@ -6232,6 +6337,15 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
                 false,
             )
             .unwrap();
+        for command in &intent_commands {
+            let replayed_artifact = successor
+                .publish_unavailable_pg_outage_command_artifact(
+                    command,
+                    intent_source.cluster_epoch(),
+                )
+                .expect("new leader must exactly replay the outage command artifact");
+            assert_eq!(replayed_artifact, replay_expected);
+        }
         let replayed_intent = successor
             .commit_unavailable_pg_outage_resolution_intents_batch(&intent_candidates)
             .expect("new leader must exactly replay the plural outage-resolution intent");

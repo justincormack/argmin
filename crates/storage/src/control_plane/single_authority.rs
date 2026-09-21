@@ -2874,6 +2874,22 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(self.snapshot.clone())
     }
 
+    #[allow(dead_code)] // Production outage reconciliation wiring is the next protocol slice.
+    pub(crate) fn publish_unavailable_pg_outage_command_artifact(
+        &mut self,
+        command: &crate::metadata_command::MetadataCommandEnvelope,
+        source_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let pages = OutageCommandArtifactPage::for_command(command, source_epoch)
+            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+        for page in pages {
+            self.apply_and_commit_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page,
+            })?;
+        }
+        Ok(self.snapshot.clone())
+    }
+
     pub fn authorize_unavailable_pg_staging_intents_batch(
         &mut self,
         authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],

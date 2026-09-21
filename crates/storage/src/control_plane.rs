@@ -135,7 +135,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 27;
+const CONTROL_PLANE_RPC_VERSION: u16 = 28;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -148,7 +148,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 47;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 48;
 const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS: usize = 64;
 const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
@@ -10524,7 +10524,7 @@ impl ClusterControlSnapshot {
         if self.outage_command_artifacts.len() > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS {
             return Err("too many retained outage command artifacts".into());
         }
-        let mut retained_artifact_bytes = 0usize;
+        let mut reserved_artifact_bytes = 0usize;
         for (key, record) in &self.outage_command_artifacts {
             if *key != record.key() || record.source_epoch > self.cluster_epoch {
                 return Err("outage command artifact key or source epoch is invalid".into());
@@ -10533,12 +10533,12 @@ impl ClusterControlSnapshot {
                 return Err("outage command artifact references unknown PG".into());
             }
             // Records are immutable after validated publication or snapshot decoding.
-            retained_artifact_bytes = retained_artifact_bytes
-                .checked_add(record.total_retained_bytes())
-                .ok_or("outage command artifact retained-byte count overflows")?;
+            reserved_artifact_bytes = reserved_artifact_bytes
+                .checked_add(record.reserved_bytes())
+                .ok_or("outage command artifact reserved-byte count overflows")?;
         }
-        if retained_artifact_bytes > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES {
-            return Err("retained outage command artifacts exceed the byte budget".into());
+        if reserved_artifact_bytes > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES {
+            return Err("outage command artifact reservations exceed the byte budget".into());
         }
         let mut intent_batches = BTreeMap::<
             (ClusterEpoch, Vec<PgId>, [u8; 32]),
@@ -19722,7 +19722,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut retained_unavailable_pg_placement_transitions = BTreeMap::new();
     let mut outage_command_artifacts = BTreeMap::new();
     let mut outage_resolution_intents = BTreeMap::new();
-    let mut outage_command_artifact_bytes = 0usize;
+    let mut outage_command_artifact_reserved_bytes = 0usize;
     let mut metadata_transfer_staging_evidence_pages = BTreeMap::new();
     let mut metadata_transfer_staging_evidence_checkpoint_segments = BTreeMap::new();
     let mut metadata_transfer_staging_evidence_checkpoint_anchors = BTreeMap::new();
@@ -19948,15 +19948,6 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                     "outage artifact digest must contain 32 bytes",
                 ));
             }
-            outage_command_artifact_bytes = outage_command_artifact_bytes
-                .checked_add(fields[7].len() / 2)
-                .ok_or_else(|| parse_error(line_number, "outage artifact byte count overflows"))?;
-            if outage_command_artifact_bytes > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES {
-                return Err(parse_error(
-                    line_number,
-                    "retained outage artifacts exceed the byte budget",
-                ));
-            }
             let pg_id = PgId::new(parse_u32(line_number, fields[0], "outage artifact PG")?);
             let source_epoch = ClusterEpoch::new(parse_u64(
                 line_number,
@@ -20017,6 +20008,19 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                 }
                 let record = OutageCommandArtifactRecord::from_first_page(&page)
                     .map_err(|message| parse_error(line_number, &message))?;
+                outage_command_artifact_reserved_bytes = outage_command_artifact_reserved_bytes
+                    .checked_add(record.reserved_bytes())
+                    .ok_or_else(|| {
+                        parse_error(line_number, "outage artifact reserved-byte count overflows")
+                    })?;
+                if outage_command_artifact_reserved_bytes
+                    > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES
+                {
+                    return Err(parse_error(
+                        line_number,
+                        "outage artifact reservations exceed the byte budget",
+                    ));
+                }
                 outage_command_artifacts.insert(key, Arc::new(record));
             }
         } else if let Some(value) = line.strip_prefix("outage_resolution_intent=") {

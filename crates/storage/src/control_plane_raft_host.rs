@@ -18,11 +18,12 @@ use crate::control_plane::{
     ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRpcResponsePublication,
     ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapSource,
     ControlPlaneRuntimeMapStatus, FencedPgMetadataTransferSnapshot, LeaseHorizonAuthorityBinding,
-    NodeHeartbeat, PgMetadataTransferProof, PreparedUnavailablePgCompletionBatch,
-    UnavailablePgReconciliationCandidate, UnavailablePgReconciliationCompletionAttempt,
-    UnavailablePgReconciliationCompletionBatch, UnavailablePgReconciliationCursor,
-    UnavailablePgReconciliationPollBatch, UnavailablePgReconciliationStage,
-    UnavailablePgReconciliationWork, UnconfirmedUnavailablePgReconciliationCompletionBatch,
+    NodeHeartbeat, OutageCommandArtifactPage, PgMetadataTransferProof,
+    PreparedUnavailablePgCompletionBatch, UnavailablePgReconciliationCandidate,
+    UnavailablePgReconciliationCompletionAttempt, UnavailablePgReconciliationCompletionBatch,
+    UnavailablePgReconciliationCursor, UnavailablePgReconciliationPollBatch,
+    UnavailablePgReconciliationStage, UnavailablePgReconciliationWork,
+    UnconfirmedUnavailablePgReconciliationCompletionBatch,
 };
 use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse,
@@ -604,6 +605,31 @@ impl ControlPlaneRaftAuthorityHost {
             return Err(ControlPlaneError::invariant_failure(
                 "outage-resolution intent batch returned the wrong response",
             ));
+        }
+        self.current_snapshot()
+    }
+
+    #[allow(dead_code)] // Production outage reconciliation wiring is the next protocol slice.
+    pub(crate) fn publish_unavailable_pg_outage_command_artifact(
+        &mut self,
+        command: &crate::metadata_command::MetadataCommandEnvelope,
+        source_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let pages = OutageCommandArtifactPage::for_command(command, source_epoch)
+            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
+        for page in pages {
+            let response =
+                self.submit_raft_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                    page,
+                })?;
+            if !matches!(
+                response,
+                ControlPlaneCommandResponse::PublishOutageCommandArtifactPage
+            ) {
+                return Err(ControlPlaneError::invariant_failure(
+                    "outage command artifact publication returned the wrong response",
+                ));
+            }
         }
         self.current_snapshot()
     }

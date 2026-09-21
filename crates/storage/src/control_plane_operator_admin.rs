@@ -371,7 +371,7 @@ mod tests {
 
         fn trigger_raft_snapshot_and_purge(&mut self) -> Result<Option<u64>, ControlPlaneError> {
             self.snapshot_triggers += 1;
-            Ok(Some(47))
+            Ok(Some(48))
         }
 
         fn trigger_raft_election(&mut self) -> Result<(), ControlPlaneError> {
@@ -485,7 +485,7 @@ mod tests {
         .unwrap();
         let client = ControlPlaneRaftAdminClient::from_bootstrap(&bootstrap);
         client.transfer_leadership_to(91).unwrap();
-        assert_eq!(client.trigger_snapshot_and_purge().unwrap(), Some(47));
+        assert_eq!(client.trigger_snapshot_and_purge().unwrap(), Some(48));
         client.trigger_election().unwrap();
         server.join().unwrap();
 

@@ -1737,7 +1737,7 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         Err(ControlPlaneStateVersionError::Missing)
     );
     for version in [
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 48,
+        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49,
     ] {
         assert_eq!(
             require_current_control_plane_state_version(Some(version)),
@@ -1745,8 +1745,8 @@ fn control_plane_state_version_failures_are_typed_before_state_construction() {
         );
     }
     assert_eq!(
-        require_current_control_plane_state_version(Some(47)),
-        Ok(47)
+        require_current_control_plane_state_version(Some(48)),
+        Ok(48)
     );
 
     assert!(matches!(
@@ -2117,11 +2117,11 @@ fn canonical_control_plane_state_v43_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v47_text_is_exact() {
+fn canonical_control_plane_state_v48_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
         concat!(
-            "version=47\n",
+            "version=48\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
             "initial_topology=-\n",
@@ -2287,7 +2287,7 @@ fn canonical_control_plane_state_v36_representative_aggregate_remains_rejected_e
 }
 
 #[test]
-fn canonical_control_plane_state_v47_representative_aggregate_is_stable() {
+fn canonical_control_plane_state_v48_representative_aggregate_is_stable() {
     let mut snapshots = vec![canonical_snapshot_with_node()];
 
     let certified_nodes = vec![
@@ -3125,7 +3125,7 @@ fn canonical_control_plane_state_v47_representative_aggregate_is_stable() {
 
     let mut historical_v46_aggregate = Vec::new();
     for snapshot in &previous_version_snapshots {
-        let previous = format_snapshot(snapshot).replacen("version=47\n", "version=46\n", 1);
+        let previous = format_snapshot(snapshot).replacen("version=48\n", "version=46\n", 1);
         historical_v46_aggregate.extend_from_slice(&(previous.len() as u64).to_be_bytes());
         historical_v46_aggregate.extend_from_slice(previous.as_bytes());
         assert!(matches!(
@@ -3145,6 +3145,28 @@ fn canonical_control_plane_state_v47_representative_aggregate_is_stable() {
         )
     );
 
+    let mut historical_v47_aggregate = Vec::new();
+    for snapshot in &snapshots {
+        let previous = format_snapshot(snapshot).replacen("version=48\n", "version=47\n", 1);
+        historical_v47_aggregate.extend_from_slice(&(previous.len() as u64).to_be_bytes());
+        historical_v47_aggregate.extend_from_slice(previous.as_bytes());
+        assert!(matches!(
+            parse_snapshot(&previous),
+            Err(ControlPlaneError::Parse { line: 1, message })
+                if message == "unsupported control-plane state version 47"
+        ));
+    }
+    assert_eq!(
+        (
+            historical_v47_aggregate.len(),
+            hex_encode(&checksum::sha256::digest(&historical_v47_aggregate))
+        ),
+        (
+            404_630,
+            "dc590f51b2a8f80557f1674c122eee7126c348decffd3c7917ecd03fbed69759".to_owned()
+        )
+    );
+
     let mut aggregate = Vec::new();
     let mut aggregate_text = String::new();
     let mut previous_aggregate = Vec::new();
@@ -3156,7 +3178,7 @@ fn canonical_control_plane_state_v47_representative_aggregate_is_stable() {
         aggregate.extend_from_slice(formatted.as_bytes());
         aggregate_text.push_str(&formatted);
         if snapshot.outage_command_artifacts.is_empty() {
-            let previous = formatted.replacen("version=47\n", "version=45\n", 1);
+            let previous = formatted.replacen("version=48\n", "version=45\n", 1);
             previous_aggregate.extend_from_slice(&(previous.len() as u64).to_be_bytes());
             previous_aggregate.extend_from_slice(previous.as_bytes());
             assert!(matches!(
@@ -3177,7 +3199,7 @@ fn canonical_control_plane_state_v47_representative_aggregate_is_stable() {
         )
     );
     for required_record in [
-        "version=47\n",
+        "version=48\n",
         "initial_topology=9,",
         "lease_grant_horizon=7,11,2500\n",
         "history=",
@@ -3264,7 +3286,7 @@ fn canonical_control_plane_state_v47_representative_aggregate_is_stable() {
         ),
         (
             404_630,
-            "dc590f51b2a8f80557f1674c122eee7126c348decffd3c7917ecd03fbed69759".to_owned()
+            "ece827f5968482cce792607c7a2ed0029b2f8a975448287e6f6425e7eac6fa61".to_owned()
         )
     );
 }

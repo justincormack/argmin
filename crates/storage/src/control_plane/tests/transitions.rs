@@ -8,6 +8,7 @@ fn outage_resolution_command(
     pg_id: PgId,
     epoch: ClusterEpoch,
     log_index: u64,
+    large: bool,
 ) -> crate::metadata_command::MetadataCommandEnvelope {
     let owner = crate::types::OwnerIdentity::from_principal(format!(
         "outage-resolution-owner-{}",
@@ -16,6 +17,25 @@ fn outage_resolution_command(
     let bucket =
         crate::types::BucketName::try_from(format!("outage-resolution-bucket-{}", pg_id.get()))
             .unwrap();
+    if large {
+        return crate::metadata_command::MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                epoch,
+                pg_id,
+                crate::metadata_command::MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            crate::metadata_command::MetadataCommandPayload::PutBucketSubresource(
+                crate::metadata_command::PutBucketSubresourceCommand::new(
+                    bucket,
+                    crate::metadata_command::BucketSubresourceMutation::PutCors(format!(
+                        "<CORSConfiguration><!--{}--></CORSConfiguration>",
+                        "x".repeat(OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES)
+                    )),
+                    1,
+                ),
+            ),
+        );
+    }
     let config = crate::types::CreateBucketConfig {
         name: bucket.as_str(),
         owner_principal: &owner.principal,
@@ -5537,16 +5557,24 @@ fn outage_resolution_intent_batch_is_epoch_neutral_durable_and_exactly_replayabl
     let commands = pg_ids
         .iter()
         .enumerate()
-        .map(|(index, pg_id)| outage_resolution_command(*pg_id, source_epoch, 18 + index as u64))
+        .map(|(index, pg_id)| {
+            outage_resolution_command(*pg_id, source_epoch, 18 + index as u64, index == 1)
+        })
         .collect::<Vec<_>>();
+    let committed_prefix =
+        OutageCommandArtifactPage::for_command(&commands[1], source_epoch).unwrap();
+    assert_eq!(committed_prefix.len(), 2);
+    authority
+        .apply_control_plane_command_for_test(
+            ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: committed_prefix[0].clone(),
+            },
+        )
+        .unwrap();
     for command in &commands {
-        for page in OutageCommandArtifactPage::for_command(command, source_epoch).unwrap() {
-            authority
-                .apply_control_plane_command_for_test(
-                    ControlPlaneCommand::PublishOutageCommandArtifactPage { page },
-                )
-                .unwrap();
-        }
+        authority
+            .publish_unavailable_pg_outage_command_artifact(command, source_epoch)
+            .unwrap();
     }
     let candidates = commands
         .iter()
@@ -5711,6 +5739,12 @@ fn outage_resolution_intent_batch_is_epoch_neutral_durable_and_exactly_replayabl
     drop(authority);
     let mut reopened = SingleAuthorityControlPlane::open(store).unwrap();
     let reopened_before_replay = reopened.snapshot().clone();
+    for command in &commands {
+        let replayed = reopened
+            .publish_unavailable_pg_outage_command_artifact(command, source_epoch)
+            .unwrap();
+        assert_eq!(replayed, reopened_before_replay);
+    }
     let replayed = reopened
         .commit_unavailable_pg_outage_resolution_intents_batch(&candidates)
         .unwrap();

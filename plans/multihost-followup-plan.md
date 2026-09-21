@@ -1632,8 +1632,8 @@ replaces the detail with exact page-membership bindings. Immutable command-v31,
 RPC-v22, and state-v43 aggregates remain rejection evidence, including nested
 journal, Raft WAL, peer, restart, snapshot, and storage-RPC containers. The
 current coordinated version vector is staging-store/evidence/page/apply-receipt
-v4, staged-artifact v3, storage RPC v29, control-plane RPC v27, command v35,
-state v47, and authentication envelope v2.
+v4, staged-artifact v3, storage RPC v30, control-plane RPC v28, command v36,
+state v48, and authentication envelope v2.
 
 Durable artifact staging uses a separate storage-owned format rather than
 silently extending the PG schema. Staging-store format v4 owns the
@@ -1910,15 +1910,20 @@ one exact, durable proof-lineage handoff:
 Implementation status: command v34/state v46 provide bounded, immutable,
 epoch-neutral publication of exact command-byte pages with whole-command
 integrity, replay, and snapshot retention. Command v35/state v47 add the
-epoch-neutral whole-batch outage-resolution intent CAS. Each retained member
+epoch-neutral whole-batch outage-resolution intent CAS. Command v36/state v48
+reserve each artifact's complete declared length when page zero is admitted,
+so every accepted partial artifact can finish within the aggregate byte cap.
+Each retained member
 binds the exact source route and epoch, failed incarnation and lease
 observation, certified topology, command identity, complete artifact digest and
 length, committed lease-grant horizon, conservative in-flight-operation
 allowance, and canonical complete batch receipt. Exact replay is accepted after
 unrelated epoch advancement; subset, superset, regrouped, stale-route, stale-
-topology, and incomplete-artifact submissions reject atomically. No production
-outage worker publishes these pages or commits the intent yet. Public standalone
-and Raft admin retries reconstruct the exact complete retained batch before
+topology, and incomplete-artifact submissions reject atomically. Public
+standalone and Raft authority APIs now publish canonical command envelopes as
+bounded pages with exact per-page replay, but no production outage worker calls
+those APIs or commits the intent yet. Public standalone and Raft admin retries
+reconstruct the exact complete retained batch before
 consulting mutable current epoch, topology, lease-horizon, or artifact lookup;
 response-loss replay therefore survives standalone reopen and Raft leadership
 transfer, while partial or altered candidate vectors fail closed. The

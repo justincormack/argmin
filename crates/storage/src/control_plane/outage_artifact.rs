@@ -190,8 +190,8 @@ impl OutageCommandArtifactRecord {
         Ok(())
     }
 
-    pub(super) fn total_retained_bytes(&self) -> usize {
-        self.pages.iter().map(Vec::len).sum()
+    pub(super) fn reserved_bytes(&self) -> usize {
+        self.total_length as usize
     }
 
     pub(super) fn is_complete(&self) -> bool {
@@ -268,6 +268,22 @@ mod tests {
             })
             .unwrap()
             .into_snapshot()
+    }
+
+    fn maximum_reservation_page(log_index: u64, page_index: u16) -> OutageCommandArtifactPage {
+        OutageCommandArtifactPage {
+            pg_id: PgId::new(7),
+            source_epoch: ClusterEpoch::new(2).unwrap(),
+            command_id: MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(7),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            total_length: STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN as u32,
+            digest: [u8::try_from(log_index).unwrap(); 32],
+            page_index,
+            bytes: vec![u8::try_from(log_index).unwrap(); OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES],
+        }
     }
 
     #[test]
@@ -456,6 +472,62 @@ mod tests {
             Some(command.command_bytes())
         );
         assert!(reopened.snapshot().cluster_epoch() > source_epoch);
+    }
+
+    #[test]
+    fn standalone_restart_preserves_complete_artifact_reservations() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("outage-reservation.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(NodeId::new(1), "/tmp/outage-reservation.sock".into())],
+                pg_ids: vec![PgId::new(7)],
+            })
+            .unwrap();
+        for log_index in [10, 11] {
+            authority
+                .submit_control_plane_command(
+                    ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                        page: maximum_reservation_page(log_index, 0),
+                    },
+                )
+                .unwrap();
+        }
+        let full = authority.snapshot().clone();
+        let error = authority
+            .submit_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: maximum_reservation_page(12, 0),
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("artifact reservations exceed the byte budget"));
+        assert_eq!(authority.snapshot(), &full);
+
+        drop(authority);
+        let mut restarted = SingleAuthorityControlPlane::open(store).unwrap();
+        assert_eq!(
+            restarted.snapshot().outage_command_artifacts,
+            full.outage_command_artifacts
+        );
+        let restarted_full = restarted.snapshot().clone();
+        let error = restarted
+            .submit_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: maximum_reservation_page(12, 0),
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("artifact reservations exceed the byte budget"));
+        assert_eq!(restarted.snapshot(), &restarted_full);
+
+        restarted
+            .submit_control_plane_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
+                page: maximum_reservation_page(10, 1),
+            })
+            .unwrap();
+        assert_ne!(restarted.snapshot(), &restarted_full);
     }
 
     #[test]
