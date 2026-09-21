@@ -4240,6 +4240,108 @@ fn begin_bucket_delete_accepts_its_concurrently_applied_mark_after_install() {
 }
 
 #[test]
+fn begin_bucket_delete_accepts_applied_mark_after_slot_advances_to_unrelated_command() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let (bucket, unrelated_bucket) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        (
+            bucket_for_pg(topology, 1, "delete-applied-before-unrelated-command-"),
+            bucket_for_pg(topology, 1, "delete-unrelated-command-"),
+        )
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let hook_unrelated_bucket = unrelated_bucket.clone();
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_hook = Arc::clone(&hook_ran);
+    let _hook = cluster.test_install_after_bucket_delete_pending_install_response_loss_hook(
+        Arc::new(move |command| {
+            let MetadataCommandPayload::MarkBucketDeleting(mark) = command.payload() else {
+                return false;
+            };
+            if mark.bucket_name() != &hook_bucket {
+                return false;
+            }
+
+            for node_id in node_ids {
+                let pg = hook_map
+                    .node(node_id)
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(command.id().pg_id().get())
+                    .unwrap();
+                pg.apply_metadata_command_and_record(node_id.as_u32(), command)
+                    .unwrap();
+            }
+            let primary = hook_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, command.id().pg_id())
+                .unwrap();
+            let primary_pg = primary
+                .storage_node()
+                .get_pg(command.id().pg_id().get())
+                .unwrap();
+            assert!(primary_pg
+                .remove_pending_metadata_command_slot(primary.node_id().as_u32(), command)
+                .unwrap());
+            drop(primary_pg);
+
+            let unrelated = create_bucket_metadata_command(
+                command.id().pg_id(),
+                hook_map
+                    .test_next_metadata_command_log_index(command.id().pg_id())
+                    .get(),
+                hook_unrelated_bucket.clone(),
+            );
+            force_insert_pending_metadata_command_for_test(
+                &hook_map,
+                command.id().pg_id(),
+                &hook_unrelated_bucket,
+                &unrelated,
+            );
+            hook_ran_for_hook.store(true, Ordering::SeqCst);
+            true
+        }),
+    );
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect("an applied mark remains successful after the PG slot advances");
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "the test must advance the pending slot after applying the delete mark"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(1), &unrelated_bucket).is_some(),
+        "DeleteBucket reconciliation must not drain the unrelated successor command"
+    );
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Deleting,
+            "the target delete mark must be applied on node {node_id:?}"
+        );
+    }
+}
+
+#[test]
 fn concurrent_bucket_delete_adopters_preserve_drain_on_mark_validation_failure() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -5239,20 +5341,23 @@ fn begin_bucket_delete_post_publication_route_loss_returns_success_and_retains_r
 }
 
 #[test]
-fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_deleting_as_success() {
+fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_and_slot_advance_as_success() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
-    let bucket = {
+    let (bucket, unrelated_bucket) = {
         let topology = map
             .nodes
             .get(&NodeId::new(0))
             .unwrap()
             .storage_node()
             .pg_topology();
-        bucket_for_pg(topology, 1, "delete-concurrent-mark-success-")
+        (
+            bucket_for_pg(topology, 1, "delete-concurrent-mark-success-"),
+            bucket_for_pg(topology, 1, "delete-concurrent-mark-success-unrelated-"),
+        )
     };
     set_route_primary(&mut map, 1, NodeId::new(1));
 
@@ -5265,6 +5370,8 @@ fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_deleting_as_
     let hook_ran = Arc::new(AtomicBool::new(false));
     let hook_ran_for_hook = Arc::clone(&hook_ran);
     let hook_bucket = bucket.clone();
+    let hook_map = Arc::clone(&map);
+    let hook_unrelated_bucket = unrelated_bucket.clone();
     let _proven_hook_guard = cluster.test_install_after_bucket_delete_final_visibility_proven_hook(
         Arc::new(move || {
             if hook_ran_for_hook.swap(true, Ordering::SeqCst) {
@@ -5273,8 +5380,20 @@ fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_deleting_as_
             concurrent_cluster
                 .test_begin_bucket_delete_if_current(&hook_bucket)
                 .expect("concurrent begin should mark the same bucket incarnation deleting");
+            let pg_id = PgId::new(concurrent_cluster.bucket_metadata_pg_id(&hook_bucket));
+            let unrelated = create_bucket_metadata_command(
+                pg_id,
+                hook_map.test_next_metadata_command_log_index(pg_id).get(),
+                hook_unrelated_bucket.clone(),
+            );
+            force_insert_pending_metadata_command_for_test(
+                &hook_map,
+                pg_id,
+                &hook_unrelated_bucket,
+                &unrelated,
+            );
             Err(StoreError::MetadataCommandContention {
-                context: "injected retryable error after concurrent mark deleting",
+                context: "injected retryable error after concurrent mark and slot advance",
             })
         }),
     );
@@ -5290,6 +5409,10 @@ fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_deleting_as_
         cluster.try_take_reclaim_work(),
         None,
         "stale retryable exit should not enqueue begin work after observing Deleting"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(1), &unrelated_bucket).is_some(),
+        "DeleteBucket reconciliation must preserve the unrelated successor command"
     );
 
     let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));

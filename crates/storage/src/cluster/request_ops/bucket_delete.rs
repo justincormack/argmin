@@ -3955,7 +3955,10 @@ impl super::StorageCluster {
                     }
                 } else if matches!(
                     error,
-                    BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
+                    BucketWriteDrainError::Store(
+                        StoreError::MetadataCommandContention { .. }
+                            | StoreError::MetadataCommandOutcomeUnconfirmed { .. }
+                    )
                 ) {
                     match metadata_route.head_bucket_raw() {
                         Ok(current)
@@ -4022,7 +4025,32 @@ impl super::StorageCluster {
                                             );
                                             return Ok(());
                                         }
-                                        Ok(false) => {}
+                                        Ok(false) => {
+                                            let _ = observability::emit_flight_event(
+                                                super::TRACE_TARGET,
+                                                "bucket_delete_begin_retryable_error_observed_deleting_with_nonmatching_pending",
+                                                format!(
+                                                    "bucket={:?} pg_id={} phase={:?} elapsed_us={} original_error={:?} pending_command_kind={}",
+                                                    bucket,
+                                                    pg_id.get(),
+                                                    attempt_phase,
+                                                    started.elapsed().as_micros(),
+                                                    error,
+                                                    command.payload().kind_name()
+                                                ),
+                                            );
+                                            let _ = observability::emit_flight_event(
+                                                super::TRACE_TARGET,
+                                                "bucket_delete_begin_done",
+                                                format!(
+                                                    "bucket={:?} pg_id={} elapsed_us={}",
+                                                    bucket,
+                                                    pg_id.get(),
+                                                    started.elapsed().as_micros()
+                                                ),
+                                            );
+                                            return Ok(());
+                                        }
                                         Err(recheck_error) => {
                                             let _ = observability::emit_flight_event(
                                                 super::TRACE_TARGET,
