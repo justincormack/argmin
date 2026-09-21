@@ -279,6 +279,56 @@ type StagingArtifactPublishFailures = std::sync::Mutex<
     std::collections::BTreeMap<NodeId, std::collections::VecDeque<StagingArtifactPublishFailure>>,
 >;
 
+#[cfg(test)]
+struct InProcessMetadataTransferStagingStores {
+    data_dir: std::path::PathBuf,
+    stores: std::sync::Mutex<
+        std::collections::BTreeMap<
+            MetadataTransferStagingNodeIdentity,
+            Arc<MetadataTransferStagingStore>,
+        >,
+    >,
+}
+
+#[cfg(test)]
+impl InProcessMetadataTransferStagingStores {
+    fn new(data_dir: std::path::PathBuf) -> Self {
+        Self {
+            data_dir,
+            stores: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    fn store(
+        &self,
+        identity: MetadataTransferStagingNodeIdentity,
+    ) -> Result<Arc<MetadataTransferStagingStore>, crate::pg_store::MetadataTransferStagingError>
+    {
+        let mut stores = self
+            .stores
+            .lock()
+            .expect("in-process metadata-transfer staging stores poisoned");
+        if let Some(store) = stores.get(&identity) {
+            return Ok(Arc::clone(store));
+        }
+        let node_id = identity.node_id();
+        let limits = MetadataTransferStagingLimits::new(
+            256,
+            METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
+            4 * 1024 * 1024 * 1024,
+        )?;
+        let store = Arc::new(MetadataTransferStagingStore::open(
+            &self
+                .data_dir
+                .join(format!("staging-node-{}", node_id.as_u32())),
+            identity.clone(),
+            limits,
+        )?);
+        stores.insert(identity, Arc::clone(&store));
+        Ok(store)
+    }
+}
+
 enum LivePgMetadataTransferStorageTransport {
     Unix {
         auth: Option<LivePgMetadataTransferStorageAuth>,
@@ -290,6 +340,7 @@ enum LivePgMetadataTransferStorageTransport {
     #[cfg(test)]
     InProcess {
         data_dir: std::path::PathBuf,
+        staging_stores: Arc<InProcessMetadataTransferStagingStores>,
         generation: std::sync::atomic::AtomicU64,
         export_route_refresh_failures: std::sync::atomic::AtomicU64,
         import_route_refresh_failures: std::sync::atomic::AtomicU64,
@@ -1073,12 +1124,31 @@ impl LivePgMetadataTransferAdmin {
         default_ec_shape: EcShape,
         data_dir: std::path::PathBuf,
     ) -> Self {
+        let staging_stores = Arc::new(InProcessMetadataTransferStagingStores::new(
+            data_dir.clone(),
+        ));
+        Self::with_in_process_storage_nodes_and_staging_stores(
+            control_plane,
+            default_ec_shape,
+            data_dir,
+            staging_stores,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_in_process_storage_nodes_and_staging_stores(
+        control_plane: LivePgMetadataTransferControlPlaneClient,
+        default_ec_shape: EcShape,
+        data_dir: std::path::PathBuf,
+        staging_stores: Arc<InProcessMetadataTransferStagingStores>,
+    ) -> Self {
         Self {
             control_plane,
             default_ec_shape,
             admission_settings: LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
             transport: LivePgMetadataTransferStorageTransport::InProcess {
                 data_dir,
+                staging_stores,
                 generation: std::sync::atomic::AtomicU64::new(0),
                 export_route_refresh_failures: std::sync::atomic::AtomicU64::new(0),
                 import_route_refresh_failures: std::sync::atomic::AtomicU64::new(0),
@@ -1532,7 +1602,7 @@ impl LivePgMetadataTransferAdmin {
             })?;
             #[cfg(test)]
             let read_outcome = if let LivePgMetadataTransferStorageTransport::InProcess {
-                data_dir,
+                staging_stores,
                 staging_artifact_read_failures,
                 ..
             } = &self.transport
@@ -1557,18 +1627,9 @@ impl LivePgMetadataTransferAdmin {
                         node.endpoint().to_owned(),
                     )
                     .map_err(staging_local_failure)?;
-                    let limits = MetadataTransferStagingLimits::new(
-                        256,
-                        METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-                        4 * 1024 * 1024 * 1024,
-                    )
-                    .map_err(staging_local_failure)?;
-                    let read_result = MetadataTransferStagingStore::open(
-                        &data_dir.join(format!("staging-node-{}", node_id.as_u32())),
-                        identity,
-                        limits,
-                    )
-                    .and_then(|store| store.read_artifact(&intent));
+                    let read_result = staging_stores
+                        .store(identity)
+                        .and_then(|store| store.read_artifact(&intent));
                     staging_artifact_local_read_outcome(read_result)
                 }
             } else {
@@ -1906,7 +1967,8 @@ impl LivePgMetadataTransferAdmin {
                 ))
             })?;
         #[cfg(test)]
-        if let LivePgMetadataTransferStorageTransport::InProcess { data_dir, .. } = &self.transport
+        if let LivePgMetadataTransferStorageTransport::InProcess { staging_stores, .. } =
+            &self.transport
         {
             let identity = MetadataTransferStagingNodeIdentity::new(
                 node_id,
@@ -1914,18 +1976,9 @@ impl LivePgMetadataTransferAdmin {
                 actor.endpoint().to_owned(),
             )
             .map_err(staging_local_failure)?;
-            let limits = MetadataTransferStagingLimits::new(
-                256,
-                METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-                4 * 1024 * 1024 * 1024,
-            )
-            .map_err(staging_local_failure)?;
-            let store = MetadataTransferStagingStore::open(
-                &data_dir.join(format!("staging-node-{}", node_id.as_u32())),
-                identity,
-                limits,
-            )
-            .map_err(staging_local_failure)?;
+            let store = staging_stores
+                .store(identity)
+                .map_err(staging_local_failure)?;
             return store
                 .tombstone_authorized(authorization, &staged.intent)
                 .map_err(staging_local_failure);
@@ -2124,46 +2177,34 @@ impl LivePgMetadataTransferAdmin {
                     ))
                 })?;
             #[cfg(test)]
-            let receipt =
-                if let LivePgMetadataTransferStorageTransport::InProcess { data_dir, .. } =
-                    &self.transport
-                {
-                    let identity = MetadataTransferStagingNodeIdentity::new(
-                        node_id,
-                        node.node_incarnation(),
-                        node.endpoint().to_owned(),
-                    )
+            let receipt = if let LivePgMetadataTransferStorageTransport::InProcess {
+                staging_stores,
+                ..
+            } = &self.transport
+            {
+                let identity = MetadataTransferStagingNodeIdentity::new(
+                    node_id,
+                    node.node_incarnation(),
+                    node.endpoint().to_owned(),
+                )
+                .map_err(staging_local_failure)?;
+                let store = staging_stores
+                    .store(identity)
                     .map_err(staging_local_failure)?;
-                    let limits = MetadataTransferStagingLimits::new(
-                        256,
-                        METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-                        4 * 1024 * 1024 * 1024,
+                store
+                    .publish_proof_for_epoch_authorized(authorization, &staged.intent, target_epoch)
+                    .map_err(staging_local_failure)?
+            } else {
+                let client =
+                    self.staging_rpc_client(runtime.cluster_epoch(), node_id, node.endpoint())?;
+                client
+                    .publish_metadata_transfer_staging_proof(
+                        authorization,
+                        &staged.intent,
+                        target_epoch,
                     )
-                    .map_err(staging_local_failure)?;
-                    let store = MetadataTransferStagingStore::open(
-                        &data_dir.join(format!("staging-node-{}", node_id.as_u32())),
-                        identity,
-                        limits,
-                    )
-                    .map_err(staging_local_failure)?;
-                    store
-                        .publish_proof_for_epoch_authorized(
-                            authorization,
-                            &staged.intent,
-                            target_epoch,
-                        )
-                        .map_err(staging_local_failure)?
-                } else {
-                    let client =
-                        self.staging_rpc_client(runtime.cluster_epoch(), node_id, node.endpoint())?;
-                    client
-                        .publish_metadata_transfer_staging_proof(
-                            authorization,
-                            &staged.intent,
-                            target_epoch,
-                        )
-                        .map_err(staging_rpc_failure)?
-                };
+                    .map_err(staging_rpc_failure)?
+            };
             #[cfg(not(test))]
             let receipt = {
                 let client =
@@ -2281,7 +2322,7 @@ impl LivePgMetadataTransferAdmin {
             })?;
         #[cfg(test)]
         if let LivePgMetadataTransferStorageTransport::InProcess {
-            data_dir,
+            staging_stores,
             staging_artifact_publish_failures,
             ..
         } = &self.transport
@@ -2309,18 +2350,9 @@ impl LivePgMetadataTransferAdmin {
                 node.endpoint().to_owned(),
             )
             .map_err(staging_local_failure)?;
-            let limits = MetadataTransferStagingLimits::new(
-                256,
-                METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-                4 * 1024 * 1024 * 1024,
-            )
-            .map_err(staging_local_failure)?;
-            let store = MetadataTransferStagingStore::open(
-                &data_dir.join(format!("staging-node-{}", node_id.as_u32())),
-                identity,
-                limits,
-            )
-            .map_err(staging_local_failure)?;
+            let store = staging_stores
+                .store(identity)
+                .map_err(staging_local_failure)?;
             store
                 .create_intent_authorized(authorization, &authorized.intent)
                 .map_err(staging_local_failure)?;
@@ -3855,29 +3887,36 @@ mod tests {
         )
     }
 
-    fn publish_staging_pages_for_test(
+    fn live_transfer_admin_with_staging_stores(
         root: &std::path::Path,
+        socket_path: &std::path::Path,
+        staging_stores: Arc<InProcessMetadataTransferStagingStores>,
+    ) -> LivePgMetadataTransferAdmin {
+        LivePgMetadataTransferAdmin::with_in_process_storage_nodes_and_staging_stores(
+            bound_plain_control_plane(socket_path),
+            EcShape { k: 1, m: 0 },
+            root.join("storage"),
+            staging_stores,
+        )
+    }
+
+    fn publish_staging_pages_for_test(
+        staging_stores: &InProcessMetadataTransferStagingStores,
         authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
         node_ids: &[u32],
     ) {
         for node_id in node_ids.iter().copied() {
             let node = authority.snapshot().node(NodeId::new(node_id)).unwrap();
-            let store = MetadataTransferStagingStore::open(
-                &root.join("storage").join(format!("staging-node-{node_id}")),
-                MetadataTransferStagingNodeIdentity::new(
-                    NodeId::new(node_id),
-                    node.node_incarnation(),
-                    node.endpoint().to_owned(),
+            let store = staging_stores
+                .store(
+                    MetadataTransferStagingNodeIdentity::new(
+                        NodeId::new(node_id),
+                        node.node_incarnation(),
+                        node.endpoint().to_owned(),
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-                MetadataTransferStagingLimits::new(
-                    256,
-                    METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-                    4 * 1024 * 1024 * 1024,
-                )
-                .unwrap(),
-            )
-            .unwrap();
+                .unwrap();
             while let Some(page) = store.next_evidence_page().unwrap() {
                 let apply_receipt = <SingleAuthorityControlPlane<FileControlPlaneStore> as crate::control_plane::ControlPlaneAdmin>::apply_metadata_transfer_staging_evidence_page(
                     authority,
@@ -3895,17 +3934,17 @@ mod tests {
     }
 
     fn poll_composed_reconciliation_after_publishing_staging(
-        root: &std::path::Path,
+        staging_stores: &InProcessMetadataTransferStagingStores,
         worker: &mut UnavailablePgReconciliationWorker,
         authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
         now_ms: u64,
     ) {
         worker.observe_transfer_workers();
-        publish_staging_pages_for_test(root, authority, &[2, 3, 4]);
+        publish_staging_pages_for_test(staging_stores, authority, &[2, 3, 4]);
         if worker.retained_test_state().0 == 0 {
             worker.poll_single_authority(authority, now_ms).unwrap();
         }
-        publish_staging_pages_for_test(root, authority, &[2, 3, 4]);
+        publish_staging_pages_for_test(staging_stores, authority, &[2, 3, 4]);
     }
 
     const COMPOSED_TRANSFER_TOPOLOGY_DIGEST: &str =
@@ -4485,6 +4524,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn in_process_staging_transport_reuses_one_store_per_actor() {
+        let tmp = test_util::tempdir();
+        let stores = InProcessMetadataTransferStagingStores::new(tmp.path().to_path_buf());
+        let identity = MetadataTransferStagingNodeIdentity::new(
+            NodeId::new(4),
+            7,
+            "unix:///run/argmin/storage-4.sock".to_owned(),
+        )
+        .unwrap();
+        let first = stores.store(identity.clone()).unwrap();
+        let second = stores.store(identity).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
     fn concurrent_reconciliation_transfers_rebase_and_activate(
         failure: ConcurrentReconciliationFailure,
         pg_count: usize,
@@ -4541,6 +4596,9 @@ mod tests {
         store.checkpoint(None, &snapshot).unwrap();
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
         let storage_root = tmp.path().join("storage");
+        let staging_stores = Arc::new(InProcessMetadataTransferStagingStores::new(
+            storage_root.clone(),
+        ));
         let commands = pg_ids
             .iter()
             .map(|pg_id| {
@@ -4697,7 +4755,7 @@ mod tests {
                 | ConcurrentReconciliationFailure::PublicationWaitExpiry
                 | ConcurrentReconciliationFailure::MixedPublicationLagAndPreparationRejection
         ) {
-            publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+            publish_staging_pages_for_test(&staging_stores, &mut authority, &[2, 3, 4]);
         }
         for pg_id in &pg_ids {
             let route = authority.snapshot().pg_route(*pg_id, begin_at_ms).unwrap();
@@ -4725,21 +4783,25 @@ mod tests {
         let (stage_blocked_tx, stage_blocked_rx) = mpsc::sync_channel(pg_count);
         let (stage_release_tx, stage_release_rx) = mpsc::sync_channel(pg_count);
         let stage_release_rx = Arc::new(Mutex::new(stage_release_rx));
-        let mut admin = live_transfer_admin(tmp.path(), &socket_path)
-            .with_clock_override(begin_at_ms + 1_000)
-            .with_after_transfer_prepare_hook(move |pg_id, destination_epoch| {
-                prepared_tx.send((pg_id, destination_epoch)).unwrap();
-                prepare_release
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("concurrent transfer preparation was not released");
-            })
-            .with_after_transfer_import_hook(move |pg_id, destination_epoch| {
-                imported_tx
-                    .try_send((pg_id, destination_epoch))
-                    .expect("staged import retried beyond the bounded regression budget");
-            });
+        let mut admin = live_transfer_admin_with_staging_stores(
+            tmp.path(),
+            &socket_path,
+            Arc::clone(&staging_stores),
+        )
+        .with_clock_override(begin_at_ms + 1_000)
+        .with_after_transfer_prepare_hook(move |pg_id, destination_epoch| {
+            prepared_tx.send((pg_id, destination_epoch)).unwrap();
+            prepare_release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("concurrent transfer preparation was not released");
+        })
+        .with_after_transfer_import_hook(move |pg_id, destination_epoch| {
+            imported_tx
+                .try_send((pg_id, destination_epoch))
+                .expect("staged import retried beyond the bounded regression budget");
+        });
         if matches!(
             failure,
             ConcurrentReconciliationFailure::PublicationWaitExpiry
@@ -4893,7 +4955,7 @@ mod tests {
             }
             {
                 let mut authority = authority.lock().unwrap();
-                publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+                publish_staging_pages_for_test(&staging_stores, &mut authority, &[2, 3, 4]);
             }
             for _ in 0..pg_count - 2 {
                 stage_release_tx.send(()).unwrap();
@@ -4961,7 +5023,7 @@ mod tests {
             }
             {
                 let mut authority = authority.lock().unwrap();
-                publish_staging_pages_for_test(tmp.path(), &mut authority, &[2, 3, 4]);
+                publish_staging_pages_for_test(&staging_stores, &mut authority, &[2, 3, 4]);
             }
         }
 
@@ -4980,7 +5042,7 @@ mod tests {
                 {
                     let mut authority = authority.lock().unwrap();
                     poll_composed_reconciliation_after_publishing_staging(
-                        tmp.path(),
+                        &staging_stores,
                         &mut worker,
                         &mut authority,
                         begin_at_ms + 1,
@@ -5037,7 +5099,7 @@ mod tests {
                 let successful_imported = {
                     let mut authority = authority.lock().unwrap();
                     poll_composed_reconciliation_after_publishing_staging(
-                        tmp.path(),
+                        &staging_stores,
                         &mut worker,
                         &mut authority,
                         begin_at_ms + 1,
@@ -5077,7 +5139,7 @@ mod tests {
             {
                 let mut authority = authority.lock().unwrap();
                 poll_composed_reconciliation_after_publishing_staging(
-                    tmp.path(),
+                    &staging_stores,
                     &mut worker,
                     &mut authority,
                     begin_at_ms + 1,
@@ -5241,7 +5303,7 @@ mod tests {
                 }
                 let activation_now_ms = readiness_at_ms + 100 + readiness_round * 10 + 9;
                 poll_composed_reconciliation_after_publishing_staging(
-                    tmp.path(),
+                    &staging_stores,
                     &mut worker,
                     &mut authority,
                     activation_now_ms,
@@ -5290,8 +5352,12 @@ mod tests {
         // without requiring the staged artifact bytes.
         drop(worker);
         let mut worker = UnavailablePgReconciliationWorker::spawn(
-            live_transfer_admin(tmp.path(), &socket_path)
-                .with_clock_override(readiness_at_ms + 1_000),
+            live_transfer_admin_with_staging_stores(
+                tmp.path(),
+                &socket_path,
+                Arc::clone(&staging_stores),
+            )
+            .with_clock_override(readiness_at_ms + 1_000),
         );
         if failure == ConcurrentReconciliationFailure::FinalizationDeferred {
             worker.defer_next_finalization_for_test();
@@ -5303,7 +5369,7 @@ mod tests {
             let finalized = {
                 let mut authority = authority.lock().unwrap();
                 poll_composed_reconciliation_after_publishing_staging(
-                    tmp.path(),
+                    &staging_stores,
                     &mut worker,
                     &mut authority,
                     readiness_at_ms + 11,
@@ -6155,7 +6221,7 @@ mod tests {
         };
         assert_eq!(partial_cleanup.stage, LivePgMetadataTransferStage::Cleanup);
         assert!(
-            partial_cleanup.retained_diagnostic_contains("prepare staging-store data directory"),
+            partial_cleanup.retained_diagnostic_contains("remove staged artifact"),
             "unexpected partial-cleanup failure: {}",
             partial_cleanup._diagnostic
         );
@@ -6166,9 +6232,10 @@ mod tests {
             staging_store(&completed_snapshot, 4).read_artifact(&staged.intent),
             Err(crate::pg_store::MetadataTransferStagingError::GenerationRetired)
         ));
-        assert!(staging_store(&completed_snapshot, 2)
-            .read_artifact(&staged.intent)
-            .is_ok());
+        assert!(matches!(
+            staging_store(&completed_snapshot, 2).read_artifact(&staged.intent),
+            Err(crate::pg_store::MetadataTransferStagingError::GenerationRetired)
+        ));
         assert!(staging_store(&completed_snapshot, 3)
             .read_artifact(&staged.intent)
             .is_ok());
