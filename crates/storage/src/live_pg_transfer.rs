@@ -5289,6 +5289,7 @@ mod tests {
         let mut imported = BTreeMap::new();
         let mut import_callback_count = 0_usize;
         let mut observed_definitive_authorization_rejection = false;
+        let mut observed_unconfirmed_install_retention = false;
         while imported.len() < pg_count {
             {
                 let mut authority = authority.lock().unwrap();
@@ -5313,6 +5314,23 @@ mod tests {
                         begin_at_ms + 1,
                     );
                 }
+            }
+            if failure == ConcurrentReconciliationFailure::InstallResponseLoss
+                && !observed_unconfirmed_install_retention
+                && !worker.install_response_failure_is_pending_for_test()
+            {
+                assert_eq!(
+                    worker.staged_install_depth_for_test(),
+                    pg_count,
+                    "an unconfirmed install must retain the exact staged batch"
+                );
+                assert!(
+                    pg_ids
+                        .iter()
+                        .all(|pg_id| worker.foreground_owns_pg_for_test(*pg_id)),
+                    "an unconfirmed install must retain every staged owner"
+                );
+                observed_unconfirmed_install_retention = true;
             }
             while let Ok(value) = imported_rx.try_recv() {
                 import_callback_count += 1;
@@ -5370,6 +5388,10 @@ mod tests {
                 .all(|pg_id| imported[pg_id] == shared_epoch));
         }
         if failure == ConcurrentReconciliationFailure::InstallResponseLoss {
+            assert!(
+                observed_unconfirmed_install_retention,
+                "the regression did not observe retained ownership after response loss"
+            );
             assert!(
                 !worker.install_response_failure_is_pending_for_test(),
                 "the injected post-commit installation response loss was never consumed"
