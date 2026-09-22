@@ -5303,7 +5303,7 @@ fn run_cross_pg_checked_client_schedule(
     (result, report)
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingCommandLifecycleCase {
     snapshot: ClusterControlSnapshot,
     model: PendingCommandLifecycleModel,
@@ -5359,6 +5359,14 @@ impl PendingCommandLifecycleCase {
     }
 
     fn apply(&mut self, op: PendingCommandLifecycleOp, trace: &[PendingCommandLifecycleOp]) {
+        self.transition(op)
+            .unwrap_or_else(|error| panic!("lifecycle trace {trace:?}: {error}"));
+        self.assert_matches_model(trace);
+    }
+
+    // One abstract action: no sockets, pending-slot database IO, or crashable
+    // persistence boundary is represented by this fixture.
+    fn transition(&mut self, op: PendingCommandLifecycleOp) -> Result<(), String> {
         self.now_ms += 1;
         match op {
             PendingCommandLifecycleOp::InstallPending
@@ -5399,77 +5407,73 @@ impl PendingCommandLifecycleCase {
                         lease_deadline_ms,
                         lease_horizon_authority: None,
                     })
-                    .unwrap_or_else(|error| {
-                        panic!("heartbeat failed for lifecycle trace {trace:?}: {error}")
-                    });
+                    .map_err(|error| format!("heartbeat failed: {error}"))?;
                 self.snapshot = applied.into_snapshot();
             }
             PendingCommandLifecycleOp::CompleteReadyPeerings => {
                 let ready = self
                     .snapshot
                     .ready_pg_peering_completions(self.now_ms)
-                    .unwrap_or_else(|error| {
-                        panic!("ready-peering scan failed for lifecycle trace {trace:?}: {error}")
-                    });
+                    .map_err(|error| format!("ready-peering scan failed: {error}"))?;
                 let expected_ready =
                     self.model.pg_state == PgState::Peering && self.model.peering_ready;
-                assert_eq!(
-                    ready.len(),
-                    usize::from(expected_ready),
-                    "ready-peering mismatch for lifecycle trace {trace:?}"
-                );
+                if ready.len() != usize::from(expected_ready) {
+                    return Err(format!(
+                        "ready-peering mismatch: expected {expected_ready}, got {ready:?}"
+                    ));
+                }
                 let applied = self
                     .snapshot
                     .apply_control_plane_command(ControlPlaneCommand::CompleteReadyPgPeerings {
                         ready_at_ms: self.now_ms,
                         ready,
                     })
-                    .unwrap_or_else(|error| {
-                        panic!("peering completion failed for lifecycle trace {trace:?}: {error}")
-                    });
+                    .map_err(|error| format!("peering completion failed: {error}"))?;
                 self.snapshot = applied.into_snapshot();
             }
             PendingCommandLifecycleOp::Restart => {
                 let mut restarted = parse_snapshot(&format_snapshot(&self.snapshot))
-                    .unwrap_or_else(|error| {
-                        panic!("restart failed for lifecycle trace {trace:?}: {error}")
-                    });
+                    .map_err(|error| format!("restart decode failed: {error}"))?;
                 let previous = restarted.clone();
                 restarted
                     .bump_authority_after_restart()
-                    .unwrap_or_else(|error| {
-                        panic!("restart bump failed for lifecycle trace {trace:?}: {error}")
-                    });
+                    .map_err(|error| format!("restart bump failed: {error}"))?;
                 restarted.record_history_from(&previous);
                 self.snapshot = restarted;
             }
         }
         self.model.apply(op);
-        self.assert_matches_model(trace);
+        Ok(())
     }
 
     fn assert_matches_model(&self, trace: &[PendingCommandLifecycleOp]) {
+        self.check_matches_model()
+            .unwrap_or_else(|error| panic!("lifecycle trace {trace:?}: {error}"));
+    }
+
+    fn check_matches_model(&self) -> Result<(), String> {
         self.snapshot
             .validate_publication_invariants()
-            .unwrap_or_else(|error| {
-                panic!("snapshot invariant failed for lifecycle trace {trace:?}: {error}")
-            });
+            .map_err(|error| format!("snapshot invariant failed: {error}"))?;
         let pg = self
             .snapshot
             .pg(heartbeat_model_pg_id())
-            .expect("model PG exists");
-        assert_eq!(
-            pg.state(),
-            self.model.pg_state,
-            "PG state mismatch for lifecycle trace {trace:?}"
-        );
+            .ok_or("model PG missing")?;
+        if pg.state() != self.model.pg_state {
+            return Err(format!(
+                "PG state mismatch: expected {:?}, got {:?}",
+                self.model.pg_state,
+                pg.state()
+            ));
+        }
 
         let listing = self.snapshot.pending_metadata_command_recoveries();
-        assert!(
-            listing.failures().is_empty(),
-            "recovery discovery failed for lifecycle trace {trace:?}: {:?}",
-            listing.failures()
-        );
+        if !listing.failures().is_empty() {
+            return Err(format!(
+                "recovery discovery failed: {:?}",
+                listing.failures()
+            ));
+        }
         let expected_tasks =
             self.model
                 .observed_pending
@@ -5477,11 +5481,12 @@ impl PendingCommandLifecycleCase {
                     heartbeat_model_pg_id(),
                     PendingMetadataCommandRecovery::new(NodeId::new(1), self.pending),
                 ));
-        assert_eq!(
-            listing.tasks(),
-            expected_tasks.as_slice(),
-            "recovery task mismatch for lifecycle trace {trace:?}"
-        );
+        if listing.tasks() != expected_tasks.as_slice() {
+            return Err(format!(
+                "recovery task mismatch: expected {expected_tasks:?}, got {:?}",
+                listing.tasks()
+            ));
+        }
 
         let expected_reference = PgClusterMapHistoryRouteReference::new(
             PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
@@ -5491,31 +5496,38 @@ impl PendingCommandLifecycleCase {
         let references = self
             .snapshot
             .node(NodeId::new(1))
-            .expect("model node exists")
+            .ok_or("model node missing")?
             .cluster_map_history_route_references();
-        assert_eq!(
-            references
-                .iter()
-                .any(|reference| reference == expected_reference),
-            self.model.route_protected,
-            "pending route protection mismatch for lifecycle trace {trace:?}"
-        );
+        if references
+            .iter()
+            .any(|reference| reference == expected_reference)
+            != self.model.route_protected
+        {
+            return Err("pending route protection mismatch".to_owned());
+        }
 
         if self.model.observed_pending || self.model.route_protected {
             let historical = self
                 .snapshot
                 .reconstructed_pg_route_at_epoch(heartbeat_model_pg_id(), self.active_epoch)
-                .expect("pending recovery retains historical Active route");
-            assert_eq!(historical.state(), PgState::Active);
-            assert_eq!(historical.primary_node_id(), NodeId::new(1));
-            assert!(
-                self.snapshot
-                    .ready_pg_peering_completions(self.now_ms)
-                    .unwrap()
-                    .is_empty(),
-                "pending recovery must block peering completion for trace {trace:?}"
-            );
+                .map_err(|error| {
+                    format!("pending recovery lost historical Active route: {error}")
+                })?;
+            if historical.state() != PgState::Active
+                || historical.primary_node_id() != NodeId::new(1)
+            {
+                return Err("pending recovery historical route changed".to_owned());
+            }
+            if !self
+                .snapshot
+                .ready_pg_peering_completions(self.now_ms)
+                .map_err(|error| format!("ready-peering scan failed: {error}"))?
+                .is_empty()
+            {
+                return Err("pending recovery must block peering completion".to_owned());
+            }
         }
+        Ok(())
     }
 }
 
@@ -6421,6 +6433,9 @@ mod routing;
 
 #[path = "tests/pg_lifecycle.rs"]
 mod pg_lifecycle;
+
+#[path = "tests/model_checking.rs"]
+mod model_checking;
 
 #[path = "tests/transitions.rs"]
 pub(crate) mod transitions;

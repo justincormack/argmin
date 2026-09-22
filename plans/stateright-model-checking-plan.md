@@ -3,7 +3,9 @@
 
 # Stateright Model-Checking Experiment
 
-Status: proposed; implementation not started.
+Status: initial experiment in progress; depth-six baseline and depth-seven
+recovery harness implemented. Historical-bug detection and tool selection
+remain open.
 
 ## Goal
 
@@ -120,32 +122,104 @@ More aggressive reductions are separate reviewed changes.
 
 ## Phase 0 — Fix The Experiment Contract
 
-- [ ] Inventory the pending-command test's production transitions and abstract
+- [x] Inventory the pending-command test's production transitions and abstract
   actions. Document which operations are atomic and which durability/network
   effects it does not represent.
-- [ ] Define its initial finite configuration, independent safety properties,
+- [x] Define its initial finite configuration, independent safety properties,
   and positive reachability cases, including successful recovery/reactivation.
-- [ ] Select one historical defect for the pilot. Prefer one in the lifecycle
+- [x] Select one historical defect for the pilot. Prefer one in the lifecycle
   transitions; if none is suitable, use the incarnation-renewal regression as
   a second small model. Identify the faulty decision and its current owner;
   do not expand into the entire payload-publication protocol for this gate.
-- [ ] Record model bounds and resource limits, the planned ordinary-test entry
+- [x] Record model bounds and resource limits, the planned ordinary-test entry
   point, and how search exhaustion is distinguished from early termination.
-- [ ] Establish the existing enumerator as the tool-evaluation baseline. Compare
+- [x] Establish the existing enumerator as the tool-evaluation baseline. Compare
   coverage and cost under equivalent bounds, separating improvements from the
   checker from improvements due to changing the model.
 
 Exit: a bounded experiment with a named historical defect and explicit
 implementation coverage. This inventory does not require building a simulator.
 
+### Initial Experiment Contract
+
+The first slice uses `stateright = "=0.31.0"` solely as a `storage`
+development dependency. It adds 16 lockfile packages, including Stateright's
+HTTP explorer dependencies even though the pilot does not start its server.
+This dependency cost is part of the eventual tool evaluation.
+
+The fixture begins with one Active storage node, one Active PG (41), one fixed
+metadata proof, and one possible pending command. The five actions remain
+`InstallPending`, `ConvergePending`, `Heartbeat`, `CompleteReadyPeerings`, and
+`Restart`. Every action advances fixture time by one millisecond, exactly as in
+the original enumerator. Search covers all action sequences of length zero
+through six: at most six restarts and times 2,020 through 2,026 ms. A separate
+depth-seven exploration checks full serving recovery, with at most seven
+restarts and time 2,027 ms. There are no
+queued messages, lease-expiry exploration, concurrency within a command, or
+symmetry reductions in this baseline.
+
+Production coverage and abstractions:
+
+- Heartbeat applies `RecordNodeHeartbeat` to `ClusterControlSnapshot` and
+  checks recovery discovery plus retained historical routes.
+- Completion performs the production readiness scan followed by
+  `CompleteReadyPgPeerings`. That scan/apply pair is one model action; races
+  between them are not covered.
+- Restart round-trips the state codec, then performs the production authority
+  incarnation/epoch bump and history recording as one action. This tests
+  logical restart semantics, not WAL/sidecar ordering or partial file durability.
+- Install/converge update an abstract node slot. The independent lifecycle
+  oracle also supplies simulated node observations; it does not represent
+  actual node database operations, payload cleanup, or replication.
+
+Safety requires agreement with the original lifecycle oracle for PG state,
+exact recovery tasks, route references, historical Active primary, and blocked
+peering completion while recovery requires that route. Production publication
+invariant validation is an additional check, not the independent oracle.
+Positive properties require discoverable pending recovery and convergence after
+rediscovery across restart. A history monitor records that rediscovery and is
+part of state identity. The depth-seven property additionally requires an
+admissible Active route: completion changes the epoch, so a subsequent heartbeat
+is needed before serving. The initially attempted depth-six serving witness
+failed because the bound excluded that last step; the property was not removed
+or treated as a production failure.
+
+The Stateright test compares its exact reachable-state set against exhaustive
+enumeration of all 19,531 trace prefixes. State includes the complete fixture,
+remaining action budget, recovery-history monitor, and any transition failure. Interning compares full
+fixture equality; serialized snapshot text only groups candidates for lookup,
+because that encoder prunes history. Stateright's fingerprint deduplication is
+checked against exact enumeration, and every generated state must have its
+safety property evaluated. No checker timeout or target-state/depth cutoff can
+silently pass; the action bound supplies terminal states, and exceeding the
+97,656-state harness capacity (all prefixes through depth seven) panics.
+Unexpected transition errors become
+failing model states so the checker can report their action path.
+
+The existing enumerator is retained. A deliberately false no-pending property
+checks counterexample discovery and semantic-action replay; it is only a harness
+negative control, not historical-bug evidence. Default-suite entry points are
+`pending_command_stateright_*` in the storage-owned
+[model-checking tests](../crates/storage/src/control_plane/tests/model_checking.rs).
+
+Selected historical defect for the next slice: a same-epoch/content-digest
+renewal extended pinned generations from an older authority incarnation. The
+current owner is `renew_from_runtime_map_status` in
+[runtime_map.rs](../crates/storage/src/cluster/runtime_map.rs); the permanent
+`same_epoch_new_authority_incarnation_does_not_extend_pinned_generation`
+regression exercises installation followed by renewal. Reproduce the former
+epoch/digest-only selection in a second bounded production-connected model,
+without removing the production incarnation check or treating the baseline's
+negative control as completion of Phase 2.
+
 ## Phase 1 — Adapt The Existing Lifecycle Exploration
 
-- [ ] Add the development dependency and a storage-owned Stateright model using
+- [x] Add the development dependency and a storage-owned Stateright model using
   the existing production state-machine transitions and independent oracle.
-- [ ] First preserve the current actions and depth-six semantics. Compare
+- [x] First preserve the current actions and depth-six semantics. Compare
   reachable observations and invariant results with the existing enumerator;
   trace count and deduplicated state count are different measurements.
-- [ ] Record runtime, memory, states and transitions explored, depth, bounds,
+- [x] Record runtime, memory, states and transitions explored, depth, bounds,
   checker configuration, and termination reason. Do not remove the existing
   enumerator until equivalent coverage has been demonstrated.
 - [ ] Separate clock advancement into explicit actions before claiming useful
@@ -154,7 +228,7 @@ implementation coverage. This inventory does not require building a simulator.
 - [ ] Add separately deliverable heartbeat observations, including delayed
   observations across restart, with a bounded message set. Do not combine send
   and receive into one step when their separation is the behavior under test.
-- [ ] Assert positive witnesses as well as safety, so rejecting all work or
+- [x] Assert positive witnesses as well as safety, so rejecting all work or
   never enabling recovery cannot make the test pass vacuously.
 
 Exit: a normal `cargo nextest run` test with a completed declared bounded search
@@ -199,6 +273,61 @@ satisfy this gate.
 Time-box the initial experiment to roughly one engineering week, then review
 results even if a gate is incomplete. This is an estimate, not a deadline that
 permits weakening evidence requirements.
+
+### Initial Slice Results (2026-09-22)
+
+Stateright 0.31.0, single-threaded breadth-first search, no symmetry, ordinary
+unoptimized test profile. Measurements from one warm-build focused run are
+diagnostic observations, not performance thresholds:
+
+| Exploration | Trace prefixes | Exact reachable states | Generated successors | Exploration time |
+| --- | --- | --- | --- | --- |
+| Existing depth-six test, unchanged traversal | 19,531 | Not recorded by that test | 19,530 | 0.825 s for the whole test |
+| Depth-six enumeration with exact-state collection and property monitor | 19,531 | 2,082 | 19,530 | 1.498 s |
+| Stateright depth six, same instrumented state and actions | Not enumerated individually | 2,082 | 3,990 | 0.323 s |
+| Stateright depth seven | Not enumerated individually | 5,096 | 10,410 | 0.867 s |
+
+The depth-six comparison asserts exact state-set equality, not just those
+counts. Both Stateright runs finish the enabled action graph and check every
+generated state. The observer distinguishes histories needed by the positive
+recovery property without changing production transitions. No time abstraction
+or separately delayed messages have been introduced yet.
+
+The serving witness, replayed through the production fixture, is:
+
+```text
+InstallPending -> Restart -> Heartbeat -> ConvergePending
+               -> Heartbeat -> CompleteReadyPeerings -> Heartbeat
+```
+
+The harness negative control discovers and replays
+`InstallPending -> Heartbeat` for its deliberately false no-pending property.
+Neither result is detection of a historical or previously unknown production
+bug. Historical mutation testing remains the next evidence gate.
+
+The six focused tests passed in 3.634 s. `/usr/bin/time -v` around the warm
+nextest invocation reported 89,112 KiB maximum RSS. That is a run-level
+parent/child process high-water measurement, including harness/framework
+overhead, not isolated Stateright heap usage or a memory comparison with the
+original enumerator. The parity test deliberately retains both exact-state
+collections. The measured command was:
+
+```bash
+/usr/bin/time -v cargo nextest run --locked -p storage \
+  -E 'test(pending_command_stateright) | test(pending_command_heartbeat_lifecycle)' \
+  --test-threads 1 --success-output immediate --no-fail-fast
+```
+
+Focused warnings-denied Clippy (`-p storage --all-targets --all-features`),
+formatting, and the storage boundary checker also pass. After review, the full
+`cargo nextest run` passed: 9,097 tests, none skipped, in 221.756 s.
+
+Preliminary assessment: useful reduction in repeated transition execution and
+actionable traces, with no production API or behavior changes. Full-state
+interning and exact comparison add nontrivial harness code because the live
+snapshot has no complete hash representation and its persistence encoder prunes
+history. Retain the original enumerator and evaluate this maintenance cost
+before expanding. Tool selection and the pilot completion gate remain open.
 
 Record:
 

@@ -38,6 +38,7 @@ tls-provider = { path = "../tls-provider", default-features = false }
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 
 [dev-dependencies]
+stateright = "=0.31.0"
 test-util = { path = "../test-util" }
 proptest = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
