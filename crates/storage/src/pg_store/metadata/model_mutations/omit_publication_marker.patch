@@ -1,0 +1,8 @@
+--- a/crates/storage/src/pg_store/command_log.rs
++++ b/crates/storage/src/pg_store/command_log.rs
+@@ -3234,4 +3234,4 @@
+         self.execute_cached(
+-            "UPDATE metadata_command_pending_slot SET publication_started = 1 \
++            "UPDATE metadata_command_pending_slot SET publication_started = 0 \
+              WHERE singleton = 0 AND cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3 \
+                AND command_checksum = ?4 AND command_bytes = ?5",

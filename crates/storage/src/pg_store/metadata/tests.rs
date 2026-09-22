@@ -10,6 +10,9 @@ use crate::metadata_command::{
 use crate::node_runtime::traits::PgMetadataStore;
 use crate::PgTopology;
 
+#[path = "publication_model.rs"]
+mod publication_model;
+
 fn test_owner() -> OwnerIdentity {
     OwnerIdentity::from_principal("owner")
 }

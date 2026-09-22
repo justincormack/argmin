@@ -5,8 +5,9 @@
 
 Status: local explorer selected; Stateright and the temporary comparison adapter
 removed. Lifecycle baseline and historical incarnation-renewal mutation/replay
-are retained. Phase 1's explicit-time and delayed-heartbeat extensions are next;
-the broader publication/payload-ownership model has not started.
+are retained. The follow-on publication model has started at the durable
+slot/reservation boundary. Phase 1's explicit-time and delayed-heartbeat
+extensions remain open; physical payload ownership is not yet modelled.
 
 ## Goal
 
@@ -645,17 +646,104 @@ Storage all-targets/all-features Clippy with warnings denied, formatting and the
 storage boundary checker passed. After review, the full `cargo nextest run
 --locked` passed all 9,110 tests (3 slow, none skipped) in 376.659 s.
 
-Next: finish the existing lifecycle model's explicit clock advancement and
-separately deliverable heartbeat observations before expanding into payload
-ownership. Revisit bounds and independent oracles for those new interleavings.
+The existing lifecycle model's explicit clock advancement and separately
+deliverable heartbeat observations remain open. The follow-on was selected as
+the next work item instead; this does not complete or supersede those extensions.
+Revisit bounds and independent oracles when adding those interleavings.
 
 ## Follow-On Slice — Publication, Recovery, And Payload Ownership
 
-Start after the lifecycle time/message extensions above; the engine decision
-gate is complete. Initial proposed configuration: one PG,
+The engine decision gate is complete. Work begins here while the lifecycle
+time/message extensions remain separately outstanding. Initial configuration: one PG,
 one object, two competing requests, and three replicas (primary, off-primary
 witness, trailing replica). Fix exact command/crash/message bounds before
 implementation. Route-transition and cross-PG composition are later extensions.
+
+### Increment 1 — Durable Slot And Reservation Publication
+
+The default-suite `publication_model_exhausts_slot_reservation_and_replica_schedules`
+in [the PG-store owner](../crates/storage/src/pg_store/metadata/publication_model.rs)
+starts with an existing bucket at log index 1, one object key, and three real
+PG stores. Two competing `ReserveObjectGeneration` requests have the same epoch,
+PG and log index 2 but different reservation IDs, generation IDs and command
+bytes. Either can win the primary's sole pending slot. No production APIs,
+formats or behavior are changed for this model.
+
+The finite action graph contains installation, publication marking, witness
+application, primary application, trailing application, exact primary terminal
+cleanup, one close/reopen of all three stores, and one exact witness replay.
+There are at most eight scheduled actions, two competing reservation commands
+at index 2 (only one publishes), two generation identities, and no time
+advancement or ID recycling. Fixed rejection probes also construct an index-3
+reissue of the winning payload; the seed bucket command occupies index 1.
+The witness
+must apply before primary/trailing, whose relative order is explored; cleanup
+requires a terminal primary but can precede trailing convergence. This is a
+scheduler contract, **not** proof that the cluster publisher enforces this order
+or that primary-only cleanup is sufficient for cluster-wide completion.
+
+Each state retains its full semantic trace and the independent expected-effect
+oracle. Every trace is replayed against fresh copies of a closed, WAL-checkpointed
+seed database, using production `PgStore` operations. No digest/projection is
+used to merge live database states. The 10,000-state resource limit is a failing
+incomplete result. Transactions and their commits are indivisible in this model;
+reopen exercises persistence after completed transactions, not process-kill,
+torn-write recovery, or the full node startup recovery path.
+
+After each action, the independent oracle checks the exact pending envelope and
+publication flag, each replica's applied index, both requests' reservation
+presence/identity, and complete replica-proof equality after convergence.
+Rejected competitor insertion, crossed publication marking and cleanup,
+premature cleanup, exact pending retry, and attempted reissue after publication
+are probed at pending states. Same-index/different-command replay is also
+rejected on every applied replica, including after slot removal. These probes
+run in a fixed order, not every possible probe permutation, and state is
+observed again to reject partial mutation on error. The publication-mark
+transaction must not materialize a reservation before application.
+
+Required positive witnesses cover convergence by **each** request after reopen
+and exact replay, witness-only application, and cleanup with a lagging trailing
+replica. Every reported witness and failure is replayed through the same real
+stores. These are bounded safety/reachability checks, not liveness claims.
+
+The graph contains 493 trace states and 492 edges, pinned in the test. The
+[publication-marker mutation](../crates/storage/src/pg_store/metadata/model_mutations/omit_publication_marker.patch)
+deliberately leaves the durable flag unset while the marking transaction reports
+success. This is sensitivity evidence for the new model, not a claim to
+reproduce a historical payload-ownership defect. Apply it only in an isolated
+worktree without concurrent edits/builds, run the permanent model test, and
+restore it before normal verification:
+
+```bash
+patch --dry-run -p1 -i crates/storage/src/pg_store/metadata/model_mutations/omit_publication_marker.patch
+patch -p1 -i crates/storage/src/pg_store/metadata/model_mutations/omit_publication_marker.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts)' --failure-output immediate
+# Expected failure: a replayable publication counterexample.
+patch -R -p1 -i crates/storage/src/pg_store/metadata/model_mutations/omit_publication_marker.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts)'
+```
+
+Always restore the mutation even if a command fails unexpectedly. Historical
+ownership/publication defect replay remains part of the subsequent increments.
+
+Verification: the mutation failed and replayed `[Install(0), MarkPublication]`
+with a false durable flag where the oracle requires true. After restoring the
+production statement, all 30 focused explorer, slot and direct-PUT ownership
+tests passed. The new model took 14.632 s in that unoptimized run (observation,
+not a performance threshold). Storage all-targets/all-features Clippy with
+warnings denied, formatting and the storage boundary checker passed. After
+review, the full `cargo nextest run --locked` passed all 9,111 tests (1 slow,
+none skipped) in 238.683 s.
+
+### Remaining Increments
+
+The broad checklist below stays open: this first increment establishes a
+production-connected store boundary, not the full publication/ownership model.
+Next connect the cluster publisher and recovery decisions to controlled delivery
+and acknowledgement events, then add physical payload and reservation cleanup.
+In particular, do not model a dropped response as undoing a committed apply.
+Add request-budget expiry, cancellation and recovery takeover with their real
+authority boundaries before claiming ownership-sensitive recovery coverage.
 
 - [ ] Model pending-slot installation, publication-start marking, witness then
   primary application, trailing convergence, exact replay, terminal cleanup,
