@@ -1,0 +1,19 @@
+--- a/crates/storage/src/cluster/runtime_map.rs
++++ b/crates/storage/src/cluster/runtime_map.rs
+@@ -691,7 +691,6 @@
+             })?;
+         let validity = renewal.validity();
+         let digest = renewal.content_digest();
+-        let authority_incarnation = renewal.freshness_proof().authority_incarnation();
+         let mut generations = self
+             .same_epoch_generations
+             .lock()
+@@ -705,8 +704,6 @@
+                     generation.route_authority,
+                     StorageClusterRouteAuthority::Dynamic(proof)
+                         if proof.content_digest == digest
+-                            && proof.freshness_proof.authority_incarnation()
+-                                == authority_incarnation
+                 )
+             {
+                 return true;

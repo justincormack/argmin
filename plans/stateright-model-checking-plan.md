@@ -3,9 +3,9 @@
 
 # Stateright Model-Checking Experiment
 
-Status: initial experiment in progress; depth-six baseline and depth-seven
-recovery harness implemented. Historical-bug detection and tool selection
-remain open.
+Status: initial experiment in progress; lifecycle baseline and historical
+incarnation-renewal mutation/replay implemented. Phase 1's explicit-time and
+delayed-heartbeat extensions and the tool-selection decision remain open.
 
 ## Goal
 
@@ -202,15 +202,15 @@ negative control, not historical-bug evidence. Default-suite entry points are
 `pending_command_stateright_*` in the storage-owned
 [model-checking tests](../crates/storage/src/control_plane/tests/model_checking.rs).
 
-Selected historical defect for the next slice: a same-epoch/content-digest
+Selected historical defect for Phase 2: a same-epoch/content-digest
 renewal extended pinned generations from an older authority incarnation. The
 current owner is `renew_from_runtime_map_status` in
 [runtime_map.rs](../crates/storage/src/cluster/runtime_map.rs); the permanent
 `same_epoch_new_authority_incarnation_does_not_extend_pinned_generation`
-regression exercises installation followed by renewal. Reproduce the former
-epoch/digest-only selection in a second bounded production-connected model,
-without removing the production incarnation check or treating the baseline's
-negative control as completion of Phase 2.
+regression exercises installation followed by renewal. The second bounded model
+and isolated mutation below reproduce the former epoch/digest-only selection.
+The production incarnation check remains in place; the lifecycle baseline's
+negative control is not used as Phase 2 evidence.
 
 ## Phase 1 — Adapt The Existing Lifecycle Exploration
 
@@ -240,16 +240,16 @@ results must be reported only as such.
 
 For the selected defect:
 
-- [ ] Reproduce the old faulty decision with a reviewable isolated mutation,
+- [x] Reproduce the old faulty decision with a reviewable isolated mutation,
   ideally in production logic shared by the model. Keep mutations out of the
   shipped implementation; no runtime switch for unsafe behavior.
-- [ ] Require the checker to find a counterexample without supplying the known
+- [x] Require the checker to find a counterexample without supplying the known
   failing schedule. Prefer single-threaded breadth-first search for a short,
   stable explanation, subject to the model's memory limit.
-- [ ] Require the corrected implementation to complete the same bounded search.
-- [ ] Replay the counterexample through the actual owner implementation using
+- [x] Require the corrected implementation to complete the same bounded search.
+- [x] Replay the counterexample through the actual owner implementation using
   explicit barriers/events, not sleeps. Preserve it as a permanent regression.
-- [ ] Retain the faulty decision description or reproducible mutation patch,
+- [x] Retain the faulty decision description or reproducible mutation patch,
   model version, bounds, and trace. Distinguish a faithful historical mutation
   from a synthetic analogue, and abstract-only detection from shared-code
   detection.
@@ -267,6 +267,115 @@ Exit: at least one real historical defect detected, a clean fixed bounded run,
 and a deterministic implementation regression. An invariant deliberately made
 false or a model-only mutation with no implementation correspondence does not
 satisfy this gate.
+
+### Incarnation Renewal Model v1
+
+The storage-owned [renewal model](../crates/storage/src/cluster/runtime_map_model_checking.rs)
+executes `StorageClusterRouteHandle::install`,
+`renew_from_runtime_map_status`, production conservative lease binding, and
+`require_route_map_valid_now`. It does not implement a second renewal predicate.
+Each schedule replays against a fresh owner fixture with an independent
+expected-deadline oracle. The two new tests run in the default suite under
+`incarnation_renewal_*`; the original incarnation regression is retained.
+
+Bounds and assumptions:
+
+- One frontend publication domain, one node, one Active PG, one fixed epoch
+  and content digest, two authority incarnations. The old cluster remains
+  strongly pinned throughout; the successor can be installed once. There are
+  no admitted requests blocking publication or concurrent operations inside
+  either owner method. Each install/renewal action completes its real locking
+  and publication operation before the next action.
+- At most six events: install, send a renewal from the currently installed
+  incarnation, deliver a selected queued renewal, lose a selected renewal, or
+  advance time. Each incarnation can send once; delivery/loss consumes its
+  message. At most two messages are queued. An old message can cross installation.
+  The status represents trusted authority evidence at the route-handle boundary;
+  authentication, transport bytes, actual RPCs, and authority-side issuance are
+  not modelled.
+- Wall and monotonic clocks are equal and advance only through explicit events.
+  Initial time is 1,000 ms; later samples are 3,999, 4,000, 10,999, and 11,000 ms,
+  chosen to straddle the old and renewed monotonic deadlines. Initial authority
+  deadlines are 5,000/9,000 ms; the renewal deadline is 12,000 ms. With the
+  1,000 ms skew budget the corresponding initial monotonic bounds are
+  4,000/8,000 ms and renewal binds to 11,000 ms (immediately expired at that
+  final sample). Installation is enabled only before the successor lease expires.
+  No clock rollback, unhealthy-clock latch, filesystem restart, renewed content,
+  changed epoch, second replacement, or node serving protocol is represented.
+- The independent oracle assigns each generation exclusively to its issuer.
+  A renewal for the current issuer changes only that generation's authority and
+  monotonic deadlines; a stale issuer changes neither. After every event, actual
+  deadlines and admission outcomes must agree, including strict expiry, and
+  renewal must preserve the current cluster's identity.
+- State identity includes the full semantic trace and observations, including
+  queued messages, time, and error. Every transition replays from scratch rather
+  than cloning live locks or merging states by redacted/partial observations.
+  Random fixture ownership IDs are not compared across replays; this model
+  never crosses domains and tests pointer identity only within one replay.
+  There is no semantic deduplication or symmetry reduction. Stateright must
+  check every generated trace; the exact sets and count are compared, including
+  terminal states. The enabled-action bound terminates exploration, not a
+  checker timeout or depth cutoff. Exceeding 100,000 states fails the harness.
+
+Single-threaded breadth-first exploration of the corrected code completed all
+2,146 trace states through depth six. The initial focused run took approximately
+0.122 s inside the model test (unoptimized test profile, not a performance
+threshold). Positive witnesses demonstrate renewal by each issuer, stale-message
+rejection, and new-authority serving while the old pinned generation is expired.
+These are bounded reachability statements, not liveness claims.
+
+The [isolated mutation patch](../crates/storage/src/cluster/model_mutations/renewal_without_incarnation.patch)
+removes only the incarnation comparison from the pinned-generation renewal
+filter and its now-unused local variable. The current-generation eligibility
+check and install filter remain unchanged. It reconstructs the reported
+historical faulty decision in today's production implementation, not an entire
+historical checkout or a model-only analogue. There is no production runtime
+switch and the patch is not compiled into the normal implementation.
+
+The mutated model run failed and deterministically replayed this counterexample:
+
+```text
+Send(old) -> AdvanceTo(3999) -> Install(new) -> Deliver(old)
+          -> Send(new) -> Deliver(new)
+```
+
+The old renewal is correctly ignored, but the new renewal incorrectly changes
+the old generation from `(authority=5000, monotonic=4000)` to
+`(authority=12000, monotonic=11000)`. This is a production-state mismatch, not an
+intentionally false property. The reported BFS discovery is not claimed to be
+globally shortest. `incarnation_renewal_discovered_schedule_replays_through_route_handle`
+retains that exact schedule and then advances to 4,000 ms, requiring the old
+generation to reject admission while the new generation remains valid. Replay
+uses clock overrides and sequential events, with no sleeps.
+
+To reproduce the mutation from the repository root, in an isolated worktree
+without concurrent builds or edits:
+
+```bash
+patch --dry-run -p1 -i crates/storage/src/cluster/model_mutations/renewal_without_incarnation.patch
+patch -p1 -i crates/storage/src/cluster/model_mutations/renewal_without_incarnation.patch
+cargo nextest run --locked -p storage \
+  -E 'test(incarnation_renewal_stateright_exhausts_bounded_schedules)' \
+  --test-threads 1 --failure-output immediate
+# Expected failure: historical-renewal counterexample, not a compilation error.
+patch -R -p1 -i crates/storage/src/cluster/model_mutations/renewal_without_incarnation.patch
+cargo nextest run --locked -p storage -E 'test(incarnation_renewal_)'
+```
+
+Always restore the mutation even if the command fails unexpectedly. The
+mutation was tested and reversed during this slice. This completes the
+historical-defect gate, not the whole experiment: the separate lifecycle
+model's delayed-heartbeat/time work remains outstanding. For this small
+trace-replay model, an ordinary exhaustive enumerator could also find the bug;
+the evidence establishes production correspondence and actionable checker
+traces, not superior coverage or efficiency over that alternative.
+
+Verification after restoring the production predicate: 54 focused runtime-map
+and lifecycle/model tests passed, as did storage all-targets/all-features Clippy
+with warnings denied, formatting (including the included model source), and
+the storage boundary checker. After review, the full `cargo nextest run` passed:
+9,099 tests, none skipped, in 221.866 s. No production behavior or public API is
+changed.
 
 ## Experiment Decision Gate
 
@@ -303,7 +412,8 @@ InstallPending -> Restart -> Heartbeat -> ConvergePending
 The harness negative control discovers and replays
 `InstallPending -> Heartbeat` for its deliberately false no-pending property.
 Neither result is detection of a historical or previously unknown production
-bug. Historical mutation testing remains the next evidence gate.
+bug. The subsequent Phase 2 mutation/replay above supplies that historical-bug
+evidence separately.
 
 The six focused tests passed in 3.634 s. `/usr/bin/time -v` around the warm
 nextest invocation reported 89,112 KiB maximum RSS. That is a run-level

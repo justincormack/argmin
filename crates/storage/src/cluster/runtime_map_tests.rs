@@ -5,6 +5,10 @@
 mod runtime_map_refresh_invalidation_tests {
     use super::*;
 
+    mod model_checking {
+        include!("runtime_map_model_checking.rs");
+    }
+
     #[test]
     fn pending_recovery_cooldown_is_per_pg_and_exact_command() {
         use crate::control_plane::{
