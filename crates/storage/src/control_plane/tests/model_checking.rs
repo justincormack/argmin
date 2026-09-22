@@ -469,3 +469,106 @@ fn pending_command_stateright_counterexample_replays_semantic_actions() {
         1
     );
 }
+
+#[test]
+fn pending_command_local_explorer_matches_stateright() {
+    for depth in [DEPTH, RECOVERY_DEPTH] {
+        let local = Lifecycle::new(PendingCommandLifecycleCase::new(), depth);
+        let start = Instant::now();
+        let explored = crate::bounded_explorer::explore_stateright_model(&local, MAX_STATES);
+        let local_elapsed = start.elapsed();
+        explored.assert_complete();
+        local.assert_all_generated_states_checked(explored.state_count());
+
+        let start = Instant::now();
+        let checker = Lifecycle::new(PendingCommandLifecycleCase::new(), depth)
+            .checker()
+            .threads(1)
+            .finish_when(HasDiscoveries::AnyFailures)
+            .spawn_bfs()
+            .join();
+        let stateright_elapsed = start.elapsed();
+        checker.assert_properties();
+        assert!(checker.is_done());
+        checker
+            .model()
+            .assert_all_generated_states_checked(checker.unique_state_count());
+        local
+            .states
+            .lock()
+            .unwrap()
+            .assert_same_states(&checker.model().states.lock().unwrap());
+        assert_eq!(explored.state_count(), checker.unique_state_count());
+        assert_eq!(explored.transitions, checker.state_count() - 1);
+
+        // Both engines must reach every positive property; local witnesses are
+        // replayed through the same production fixture and property monitor.
+        for property in local.properties() {
+            if property.expectation != stateright::Expectation::Sometimes {
+                continue;
+            }
+            let actions = explored
+                .witness(property.name)
+                .expect("missing local witness");
+            assert!(checker.discovery(property.name).is_some());
+            let mut state = local.init_states().pop().unwrap();
+            for action in actions {
+                state = local.next_state(&state, action).unwrap();
+            }
+            assert!((property.condition)(&local, &state));
+            assert!(state.data.case.check_matches_model().is_ok());
+        }
+        eprintln!("lifecycle engine comparison: depth={depth}, exact_states={}, transitions={}, local={local_elapsed:?}, stateright={stateright_elapsed:?}",
+            explored.state_count(), explored.transitions);
+    }
+}
+
+#[test]
+fn pending_command_local_explorer_observed_recovery_serves_at_depth_seven() {
+    // Independent entry point also permits process-level resource measurement
+    // without retaining the other engine's state collection in the same test.
+    let model = Lifecycle::new(PendingCommandLifecycleCase::new(), RECOVERY_DEPTH);
+    let explored = crate::bounded_explorer::explore_stateright_model(&model, MAX_STATES);
+    explored.assert_complete();
+    model.assert_all_generated_states_checked(explored.state_count());
+    assert_eq!(explored.state_count(), 5_096);
+    assert_eq!(explored.transitions, 10_410);
+    let actions = explored.witness(RECOVERED).expect("serving witness");
+    assert_eq!(actions.len(), usize::from(RECOVERY_DEPTH));
+    let mut state = model.init_states().pop().unwrap();
+    for action in actions {
+        state = model.next_state(&state, action).unwrap();
+    }
+    let property = model
+        .properties()
+        .into_iter()
+        .find(|p| p.name == RECOVERED)
+        .unwrap();
+    assert!((property.condition)(&model, &state));
+    assert!(state.data.case.check_matches_model().is_ok());
+}
+
+#[test]
+fn pending_command_local_explorer_counterexample_matches_stateright() {
+    let model = NegativeControl(Lifecycle::new(PendingCommandLifecycleCase::new(), DEPTH));
+    let local = crate::bounded_explorer::explore_stateright_model(&model, MAX_STATES);
+    let actions = local.counterexample().expect("false property must fail");
+    let checker = NegativeControl(Lifecycle::new(PendingCommandLifecycleCase::new(), DEPTH))
+        .checker()
+        .threads(1)
+        .finish_when(HasDiscoveries::AnyFailures)
+        .spawn_bfs()
+        .join();
+    assert_eq!(
+        actions,
+        checker
+            .discovery("no pending command is ever observed")
+            .unwrap()
+            .into_actions()
+    );
+    let mut state = model.init_states().pop().unwrap();
+    for action in actions {
+        state = model.next_state(&state, action).unwrap();
+    }
+    assert!(!(model.properties()[0].condition)(&model, &state));
+}

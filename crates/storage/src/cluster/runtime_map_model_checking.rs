@@ -212,11 +212,16 @@ fn replay(trace: &[Event]) -> Observation {
 struct RenewalModel {
     generated: Mutex<BTreeSet<Vec<Event>>>,
     checked: Mutex<BTreeSet<Vec<Event>>>,
+    observations: Mutex<BTreeMap<Vec<Event>, Observation>>,
 }
 
 impl RenewalModel {
     fn state(&self, trace: Vec<Event>) -> State {
         let observation = replay(&trace);
+        self.observations
+            .lock()
+            .unwrap()
+            .insert(trace.clone(), observation.clone());
         let mut generated = self.generated.lock().unwrap();
         generated.insert(trace.clone());
         assert!(
@@ -358,5 +363,70 @@ fn incarnation_renewal_discovered_schedule_replays_through_route_handle() {
     assert_eq!(
         result.leases,
         [(5_000, 4_000, false), (12_000, 11_000, true)]
+    );
+}
+
+#[test]
+fn incarnation_renewal_local_explorer_matches_stateright() {
+    let model = RenewalModel::default();
+    let start = Instant::now();
+    let explored = crate::bounded_explorer::explore_stateright_model(&model, MAX_STATES);
+    let local_elapsed = start.elapsed();
+    if let Some(actions) = explored.counterexample() {
+        let observation = replay(&actions);
+        assert!(observation.error.is_some(), "failure must replay");
+        panic!(
+            "local explorer historical-renewal counterexample: {actions:?}: {:?}",
+            observation.error
+        );
+    }
+    explored.assert_complete();
+    let start = Instant::now();
+    let checker = RenewalModel::default()
+        .checker()
+        .threads(1)
+        .finish_when(HasDiscoveries::AnyFailures)
+        .spawn_bfs()
+        .join();
+    let stateright_elapsed = start.elapsed();
+    checker.assert_properties();
+    assert!(checker.is_done());
+    assert_eq!(explored.state_count(), 2_146);
+    assert_eq!(explored.state_count(), checker.unique_state_count());
+    assert_eq!(explored.transitions, checker.state_count() - 1);
+    assert_eq!(
+        *model.generated.lock().unwrap(),
+        *model.checked.lock().unwrap()
+    );
+    assert_eq!(
+        *model.generated.lock().unwrap(),
+        *checker.model().checked.lock().unwrap()
+    );
+    assert_eq!(
+        *model.observations.lock().unwrap(),
+        *checker.model().observations.lock().unwrap()
+    );
+    for state in explored.states() {
+        assert_eq!(
+            model.observations.lock().unwrap().get(&state.trace),
+            Some(&state.observation)
+        );
+    }
+    for property in model.properties() {
+        if property.expectation != stateright::Expectation::Sometimes {
+            continue;
+        }
+        let trace = explored
+            .witness(property.name)
+            .expect("missing local witness");
+        assert!(checker.discovery(property.name).is_some());
+        let observation = replay(&trace);
+        assert_eq!(observation.error, None);
+        assert!((property.condition)(&model, &State { trace, observation }));
+    }
+    eprintln!(
+        "renewal engine comparison: states={}, transitions={}, local={local_elapsed:?}, stateright={stateright_elapsed:?}",
+        explored.state_count(),
+        explored.transitions
     );
 }

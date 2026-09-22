@@ -3,9 +3,10 @@
 
 # Stateright Model-Checking Experiment
 
-Status: initial experiment in progress; lifecycle baseline and historical
-incarnation-renewal mutation/replay implemented. Phase 1's explicit-time and
-delayed-heartbeat extensions and the tool-selection decision remain open.
+Status: initial experiment in progress; lifecycle baseline, historical
+incarnation-renewal mutation/replay, and a local-explorer comparison implemented.
+Phase 1's explicit-time and delayed-heartbeat extensions and the tool-selection
+decision remain open. Stateright is retained pending review of the comparison.
 
 ## Goal
 
@@ -447,7 +448,7 @@ Record:
 - Whether traces are actionable and replayable against real code.
 - Coverage missing from the existing enumerator/proptest/fault-injection tests.
 
-- [ ] Evaluate Stateright against the baseline: useful exploration depth,
+- [x] Evaluate Stateright against the baseline: useful exploration depth,
   deduplication, runtime/memory cost, counterexample quality, production-code
   reuse, modelling overhead, and default-test-suite integration.
 - [ ] Decide explicitly whether to retain Stateright, narrow its use, evaluate
@@ -466,6 +467,137 @@ correspondence and manageable maintenance cost. A new unknown bug is valuable
 but not required. If state explosion or model drift defeats the pilot, report
 that result and consider narrower models or deterministic simulation; a green
 abstract model alone is not sufficient justification for a broad rewrite.
+
+### Local Explorer Comparison (2026-09-22)
+
+The [storage-owned explorer](../crates/storage/src/bounded_explorer.rs) is a
+test-only, single-threaded breadth-first search with exact `Eq`/`Hash` visited
+states, an append-only FIFO frontier, and parent/action links. Hash collisions
+are resolved by equality, not treated as identical states. It checks safety at
+every visited state, retains the first witness for each reachability property,
+and returns a shortest counterexample in its declared action graph. Finding
+witnesses does not stop exploration. Required reachability properties are
+declared up front in the local contract; `assert_complete()` rejects any missing
+witness even after safe graph exhaustion. Duplicate declarations and undeclared
+witness reports fail as model errors. State-cap exhaustion is a distinct
+incomplete result, never success. An empty initial-state set fails rather than
+passing vacuously. Models still own finite action/budget bounds and complete
+state equality; there is no implicit depth cutoff or clock normalization.
+
+The deliberately narrow scope excludes linearizability/history checking,
+temporal logic, fairness, symmetry, partial-order reduction, networking,
+parallel exploration, and a UI. None of those Stateright facilities is used by
+the current models. This is not an attempt to build a general-purpose checker.
+
+A separate [comparison adapter](../crates/storage/src/bounded_explorer/comparison.rs)
+runs the same existing model actions, transitions and properties through the
+local engine. It registers every `Sometimes` property as required reachability
+and rejects unsupported liveness properties and duplicate property names.
+The engine implementation itself does not use Stateright types. Keeping
+the temporary bridge avoids modifying model semantics while comparing engines;
+removing Stateright later requires replacing the models' trait/property adapters,
+not retaining this bridge. The dependency is unchanged in this slice.
+
+Default-suite comparison tests require:
+
+- Exact lifecycle-state set equality at depths six and seven, plus equality
+  of successor counts. The original depth-six exhaustive enumerator remains.
+- Exact renewal trace and observation equality, not merely equal counts.
+- Evaluation of every generated state, replayable positive witnesses for
+  every existing reachability property, and matching false-property detection.
+- Explorer regressions covering deliberate hash collisions, cycles,
+  diamond joins, deterministic shortest traces, multiple initial states,
+  initial/terminal checks, missing witnesses, budget-sensitive state identity,
+  boundary-state checks, resource exhaustion, and empty initial input. The
+  declared-but-unreachable regression requires completion assertion to fail
+  even when another declared witness was found. Additional regressions reject
+  duplicate/undeclared witnesses and lock registration through the adapter.
+
+Warm unoptimized measurements, with one checker thread and identical bounds:
+
+| Model | Exact states, both engines | Successors, both engines | Local | Stateright |
+| --- | --- | --- | --- | --- |
+| Lifecycle depth six | 2,082 | 3,990 | 0.309 s | 0.324 s |
+| Lifecycle depth seven | 5,096 | 10,410 | 0.792 s | 0.834 s |
+| Incarnation renewal depth six | 2,146 | 2,145 | 0.118 s | 0.119 s |
+
+These are initial comparison-run observations, not benchmark thresholds or a
+claim of a statistically significant speedup. The later focused run also
+passed the exact-set comparisons. The renewal model deliberately retains full
+traces and does not merge semantically equivalent schedules under either engine.
+
+Memory was measured separately using the default-built storage test executable,
+not by timing Cargo or keeping both engines' state sets in one process. Three
+fresh process runs per engine alternated order (`local, Stateright, Stateright,
+local, local, Stateright`) for their depth-seven serving tests:
+
+| Engine | Process peak RSS range | Median peak RSS | Wall time range |
+| --- | --- | --- | --- |
+| Local | 86,308–86,500 KiB | 86,476 KiB | 0.84–0.86 s |
+| Stateright | 89,616–90,072 KiB | 89,804 KiB | 0.88–0.89 s |
+
+Both tests explore the same state/transition counts and replay serving evidence.
+RSS includes the common model/interner, library test harness, allocator, and
+loaded executable pages; it is not isolated engine heap usage. This small
+sample establishes comparable process cost, not a general memory advantage.
+The local engine holds each state in an `Arc` shared between its frontier and
+visited table; the comparison still includes existing model-owned bookkeeping.
+
+Reproduce those resource observations by resolving the storage `binary-path`
+with `cargo nextest list --locked -p storage --list-type binaries-only
+--message-format json`, then invoking each permanent test separately:
+
+```bash
+/usr/bin/time -f 'RESOURCE elapsed_seconds=%e max_rss_kib=%M' <storage-test-binary> \
+  --exact control_plane::tests::model_checking::pending_command_local_explorer_observed_recovery_serves_at_depth_seven --nocapture
+/usr/bin/time -f 'RESOURCE elapsed_seconds=%e max_rss_kib=%M' <storage-test-binary> \
+  --exact control_plane::tests::model_checking::pending_command_stateright_observed_recovery_serves_at_depth_seven --nocapture
+```
+
+The unchanged historical mutation patch was applied to the production renewal
+filter. Both engines failed and replayed the same invalid old-generation lease
+extension. The local engine reported the shorter schedule:
+
+```text
+Install(new) -> Send(new) -> Deliver(new)
+```
+
+Stateright reported the previously recorded six-action schedule. No known
+schedule is supplied to either search. The two failure runs are expected
+mutation evidence, not failures ignored by rerunning. The production filter was
+restored immediately, and all 65 focused explorer, model, and runtime-map tests
+then passed. Storage all-targets/all-features Clippy with warnings denied,
+formatting, and the storage boundary checker passed. Following required-witness
+review hardening, all 15 focused explorer/engine-comparison tests and the same
+Clippy, formatting, and boundary checks passed. The first full workspace run
+failed in `direct_put_command_id_race_retries_abandoned_terminal_cleanup` with
+`metadata_command_recovery_transferred`; that failure was handed off for separate
+investigation without changing the test. The user-requested full-suite retry
+passed all 9,114 tests, none skipped, in 250.014 s. This retry does not resolve
+the original failure. No production behavior changed.
+To repeat the paired mutation run, use the existing patch procedure
+with the filter `test(incarnation_renewal_local_explorer_matches_stateright) |
+test(incarnation_renewal_stateright_exhausts_bounded_schedules)` and
+`--no-fail-fast`; reverse the patch before normal verification.
+
+Maintenance assessment after required-witness hardening: the local engine is
+191 lines, with 213 lines of focused engine tests and 94 lines of temporary
+comparison adapter (including its registration regression), including comments
+and formatting. Differential model tests add temporary integration coverage.
+This slice necessarily increases total harness code because both engines remain.
+The complex part—production correspondence, independent oracles and exact state
+identity—remains model-owned regardless of engine. The local implementation
+replaces only the limited search facilities actually used; it does not eliminate
+that modelling cost or establish whole-system correctness.
+
+Recommendation for review: select the local explorer for these bounded
+safety/reachability models, then remove Stateright and the temporary bridge in
+a follow-up slice while preserving the enumerator, mutation replay, witness,
+and completeness regressions. Comparable coverage/cost and the small owned
+implementation support that choice; a claimed speed advantage is not needed.
+Do not retain both engines indefinitely. The explicit tool-selection decision
+above remains open pending review. Linearizability testing, if needed later,
+should be evaluated against a concrete concurrent-history workload separately.
 
 ## Follow-On Slice — Publication, Recovery, And Payload Ownership
 

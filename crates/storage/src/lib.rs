@@ -22,6 +22,8 @@
     clippy::wildcard_imports
 )]
 
+#[cfg(test)]
+mod bounded_explorer;
 /// Storage layer for argmin2.
 ///
 /// Request-serving code enters storage through [`StorageCluster`]. Storage
