@@ -1,12 +1,12 @@
 <!-- Copyright The Argmin Authors. -->
 <!-- SPDX-License-Identifier: CC-BY-4.0 -->
 
-# Stateright Model-Checking Experiment
+# Bounded Distributed Model-Checking Plan
 
-Status: initial experiment in progress; lifecycle baseline, historical
-incarnation-renewal mutation/replay, and a local-explorer comparison implemented.
-Phase 1's explicit-time and delayed-heartbeat extensions and the tool-selection
-decision remain open. Stateright is retained pending review of the comparison.
+Status: local explorer selected; Stateright and the temporary comparison adapter
+removed. Lifecycle baseline and historical incarnation-renewal mutation/replay
+are retained. Phase 1's explicit-time and delayed-heartbeat extensions are next;
+the broader publication/payload-ownership model has not started.
 
 ## Goal
 
@@ -14,8 +14,9 @@ Evaluate whether bounded model checking can find distributed correctness bugs
 more systematically than selected fault schedules and randomized testing alone.
 Start with a small production-connected model, demonstrate detection of a
 previously fixed defect, and measure the cost before expanding the approach.
-Evaluate Stateright itself as part of this pilot: it is the initial candidate,
-not a preselected long-term tool.
+The pilot evaluated Stateright and selected the smaller storage-owned explorer
+after equivalent-state and historical-mutation comparisons. Preserve that
+evidence below while building the next bounded model slices.
 
 This is an experiment supporting
 [multihost Phase 5: independent correctness evidence](multihost-followup-plan.md#phase-5-independent-correctness-evidence),
@@ -26,11 +27,11 @@ and soak tests remain necessary.
 
 ## Approach And Limits
 
-Trial [Stateright](https://github.com/stateright/stateright) as a development-only
-model checker. Its [Model interface](https://docs.rs/stateright/latest/stateright/trait.Model.html)
-accepts initial states, enabled actions, transitions, and properties; using its
-actor runtime is optional. Do not replace Tokio or OpenRaft to run the experiment.
-Select and record the dependency version when implementing the harness.
+Use the test-only [local explorer](../crates/storage/src/bounded_explorer.rs).
+Models supply initial states, explicitly bounded successors, safety checks and
+required reachability properties. Full-state equality defines deduplication;
+resource exhaustion is not successful completion. No external model-checker
+dependency, actor runtime, Tokio replacement or OpenRaft replacement is needed.
 
 Distinguish three kinds of evidence:
 
@@ -45,9 +46,9 @@ calling the same production decision to obtain both actual and expected results
 does not establish correctness. An abstract-only result is useful but must not
 be reported as checking the implementation.
 
-Initially check safety and non-vacuous reachability. Stateright documents
-liveness checking as experimental/incomplete; do not base general eventual
-recovery claims on it. Bounded recovery checks must explicitly state eventual
+Check safety and non-vacuous reachability. The local explorer does not check
+liveness or fairness; do not base general eventual recovery claims on it.
+Bounded recovery checks must explicitly state eventual
 delivery, worker scheduling, clock progress, and failure cessation assumptions.
 No protocol can guarantee progress under permanent partition or starvation.
 
@@ -143,10 +144,10 @@ implementation coverage. This inventory does not require building a simulator.
 
 ### Initial Experiment Contract
 
-The first slice uses `stateright = "=0.31.0"` solely as a `storage`
-development dependency. It adds 16 lockfile packages, including Stateright's
-HTTP explorer dependencies even though the pilot does not start its server.
-This dependency cost is part of the eventual tool evaluation.
+The first slice evaluated `stateright = "=0.31.0"` solely as a `storage`
+development dependency. It added 16 lockfile packages, including unused HTTP
+explorer dependencies. That dependency and the packages it uniquely required
+have now been removed; the models directly use the local explorer.
 
 The fixture begins with one Active storage node, one Active PG (41), one fixed
 metadata proof, and one possible pending command. The five actions remain
@@ -185,11 +186,11 @@ is needed before serving. The initially attempted depth-six serving witness
 failed because the bound excluded that last step; the property was not removed
 or treated as a production failure.
 
-The Stateright test compares its exact reachable-state set against exhaustive
+The local explorer test compares its exact reachable-state set against exhaustive
 enumeration of all 19,531 trace prefixes. State includes the complete fixture,
 remaining action budget, recovery-history monitor, and any transition failure. Interning compares full
 fixture equality; serialized snapshot text only groups candidates for lookup,
-because that encoder prunes history. Stateright's fingerprint deduplication is
+because that encoder prunes history. Exact-equality deduplication is
 checked against exact enumeration, and every generated state must have its
 safety property evaluated. No checker timeout or target-state/depth cutoff can
 silently pass; the action bound supplies terminal states, and exceeding the
@@ -200,7 +201,7 @@ failing model states so the checker can report their action path.
 The existing enumerator is retained. A deliberately false no-pending property
 checks counterexample discovery and semantic-action replay; it is only a harness
 negative control, not historical-bug evidence. Default-suite entry points are
-`pending_command_stateright_*` in the storage-owned
+`pending_command_model_*` in the storage-owned
 [model-checking tests](../crates/storage/src/control_plane/tests/model_checking.rs).
 
 Selected historical defect for Phase 2: a same-epoch/content-digest
@@ -215,8 +216,9 @@ negative control is not used as Phase 2 evidence.
 
 ## Phase 1 — Adapt The Existing Lifecycle Exploration
 
-- [x] Add the development dependency and a storage-owned Stateright model using
-  the existing production state-machine transitions and independent oracle.
+- [x] Adapt the existing production state-machine transitions and independent
+  oracle to bounded exploration. The initial Stateright pilot is complete;
+  the models now directly use the selected local explorer.
 - [x] First preserve the current actions and depth-six semantics. Compare
   reachable observations and invariant results with the existing enumerator;
   trace count and deduplicated state count are different measurements.
@@ -313,7 +315,7 @@ Bounds and assumptions:
   than cloning live locks or merging states by redacted/partial observations.
   Random fixture ownership IDs are not compared across replays; this model
   never crosses domains and tests pointer identity only within one replay.
-  There is no semantic deduplication or symmetry reduction. Stateright must
+  There is no semantic deduplication or symmetry reduction. The explorer must
   check every generated trace; the exact sets and count are compared, including
   terminal states. The enabled-action bound terminates exploration, not a
   checker timeout or depth cutoff. Exceeding 100,000 states fails the harness.
@@ -333,7 +335,9 @@ historical faulty decision in today's production implementation, not an entire
 historical checkout or a model-only analogue. There is no production runtime
 switch and the patch is not compiled into the normal implementation.
 
-The mutated model run failed and deterministically replayed this counterexample:
+The original Stateright pilot's mutated model run failed and deterministically
+replayed this counterexample (the selected local engine finds the shorter trace
+recorded below):
 
 ```text
 Send(old) -> AdvanceTo(3999) -> Install(new) -> Deliver(old)
@@ -356,7 +360,7 @@ without concurrent builds or edits:
 patch --dry-run -p1 -i crates/storage/src/cluster/model_mutations/renewal_without_incarnation.patch
 patch -p1 -i crates/storage/src/cluster/model_mutations/renewal_without_incarnation.patch
 cargo nextest run --locked -p storage \
-  -E 'test(incarnation_renewal_stateright_exhausts_bounded_schedules)' \
+  -E 'test(incarnation_renewal_model_exhausts_bounded_schedules)' \
   --test-threads 1 --failure-output immediate
 # Expected failure: historical-renewal counterexample, not a compilation error.
 patch -R -p1 -i crates/storage/src/cluster/model_mutations/renewal_without_incarnation.patch
@@ -384,7 +388,11 @@ Time-box the initial experiment to roughly one engineering week, then review
 results even if a gate is incomplete. This is an estimate, not a deadline that
 permits weakening evidence requirements.
 
-### Initial Slice Results (2026-09-22)
+### Historical Initial Slice Results (2026-09-22)
+
+The following measurements describe the Stateright pilot, not the current
+dependency set. Its original test entry points are preserved in commit
+`f9dddf6a`; use that revision for the historical commands below.
 
 Stateright 0.31.0, single-threaded breadth-first search, no symmetry, ordinary
 unoptimized test profile. Measurements from one warm-build focused run are
@@ -438,7 +446,8 @@ actionable traces, with no production API or behavior changes. Full-state
 interning and exact comparison add nontrivial harness code because the live
 snapshot has no complete hash representation and its persistence encoder prunes
 history. Retain the original enumerator and evaluate this maintenance cost
-before expanding. Tool selection and the pilot completion gate remain open.
+before expanding. At this stage tool selection remained open; the subsequent
+comparison and selection below complete that evaluation.
 
 Record:
 
@@ -451,16 +460,17 @@ Record:
 - [x] Evaluate Stateright against the baseline: useful exploration depth,
   deduplication, runtime/memory cost, counterexample quality, production-code
   reuse, modelling overhead, and default-test-suite integration.
-- [ ] Decide explicitly whether to retain Stateright, narrow its use, evaluate
+- [x] Decide explicitly whether to retain Stateright, narrow its use, evaluate
   an alternative, or stop. If independent protocol specification or
   liveness/fairness reasoning dominates, consider TLA+/TLC or P. If the main gap
   is implementation scheduling or integrated fault execution, consider Shuttle
   or deterministic simulation instead. These answer different questions; do not
   treat a simulation run as equivalent to exhaustive model exploration.
 
-A second-tool implementation is not mandatory for the pilot. Identify the
-specific limitation and comparison question before spending time on one. Tool
-selection remains open until this evaluation, even if the model itself is useful.
+A small local explorer was compared on identical models and selected. Future
+tool evaluation should identify a specific missing capability before adding
+another implementation; this decision does not preclude a separate history
+checker or a specification-oriented tool for a different question.
 
 Continue if it provides useful systematic coverage with credible implementation
 correspondence and manageable maintenance cost. A new unknown bug is valuable
@@ -468,7 +478,11 @@ but not required. If state explosion or model drift defeats the pilot, report
 that result and consider narrower models or deterministic simulation; a green
 abstract model alone is not sufficient justification for a broad rewrite.
 
-### Local Explorer Comparison (2026-09-22)
+### Historical Local Explorer Comparison (2026-09-22)
+
+Comparison baseline: commit `98723f7a`. Dual-engine tests, the adapter, and the
+Stateright commands in this subsection refer to that revision. Current tests
+use only the local explorer; retained coverage and selection are recorded below.
 
 The [storage-owned explorer](../crates/storage/src/bounded_explorer.rs) is a
 test-only, single-threaded breadth-first search with exact `Eq`/`Hash` visited
@@ -489,16 +503,14 @@ temporal logic, fairness, symmetry, partial-order reduction, networking,
 parallel exploration, and a UI. None of those Stateright facilities is used by
 the current models. This is not an attempt to build a general-purpose checker.
 
-A separate [comparison adapter](../crates/storage/src/bounded_explorer/comparison.rs)
-runs the same existing model actions, transitions and properties through the
-local engine. It registers every `Sometimes` property as required reachability
-and rejects unsupported liveness properties and duplicate property names.
-The engine implementation itself does not use Stateright types. Keeping
-the temporary bridge avoids modifying model semantics while comparing engines;
-removing Stateright later requires replacing the models' trait/property adapters,
-not retaining this bridge. The dependency is unchanged in this slice.
+A temporary adapter at `98723f7a:crates/storage/src/bounded_explorer/comparison.rs`
+ran identical model actions, transitions and properties through the local engine.
+It registered every `Sometimes` property as required reachability and rejected
+unsupported liveness properties and duplicate property names. This separated
+engine comparison from model adaptation. The adapter is now removed, and each
+model declares its required properties directly to the explorer.
 
-Default-suite comparison tests require:
+The default-suite comparison tests at that baseline required:
 
 - Exact lifecycle-state set equality at depths six and seven, plus equality
   of successor counts. The original depth-six exhaustive enumerator remains.
@@ -580,28 +592,67 @@ with the filter `test(incarnation_renewal_local_explorer_matches_stateright) |
 test(incarnation_renewal_stateright_exhausts_bounded_schedules)` and
 `--no-fail-fast`; reverse the patch before normal verification.
 
-Maintenance assessment after required-witness hardening: the local engine is
+Maintenance assessment at the comparison baseline: the local engine was
 191 lines, with 213 lines of focused engine tests and 94 lines of temporary
 comparison adapter (including its registration regression), including comments
 and formatting. Differential model tests add temporary integration coverage.
-This slice necessarily increases total harness code because both engines remain.
+That slice temporarily increased total harness code because both engines remained.
 The complex part—production correspondence, independent oracles and exact state
 identity—remains model-owned regardless of engine. The local implementation
 replaces only the limited search facilities actually used; it does not eliminate
 that modelling cost or establish whole-system correctness.
 
-Recommendation for review: select the local explorer for these bounded
-safety/reachability models, then remove Stateright and the temporary bridge in
-a follow-up slice while preserving the enumerator, mutation replay, witness,
-and completeness regressions. Comparable coverage/cost and the small owned
-implementation support that choice; a claimed speed advantage is not needed.
-Do not retain both engines indefinitely. The explicit tool-selection decision
-above remains open pending review. Linearizability testing, if needed later,
+### Selected Engine And Retained Coverage
+
+Decision: use the local explorer for these bounded safety/reachability models.
+Comparable coverage/cost and the small owned implementation support that choice;
+a claimed speed advantage is not needed. Stateright, its development dependency,
+and the temporary adapter and dual-engine tests are removed. No production
+behavior or public API is changed. Linearizability testing, if needed later,
 should be evaluated against a concrete concurrent-history workload separately.
+
+The lifecycle model directly declares required pending/converged witnesses and,
+at depth seven, serving recovery. The owner-local zero-action regression locks
+failure when that registration cannot be satisfied. The renewal model directly
+declares all three positive witnesses. `assert_complete()` owns required-witness
+validation; replay assertions are additional evidence, not the sole safeguard.
+
+Retained default-suite entry points:
+
+- `bounded_explorer::tests::*`: exact equality under hash collision, cycles,
+  shortest traces, terminal/initial states, bounds, missing/duplicate/undeclared
+  witnesses, and non-vacuous completion.
+- `pending_command_model_matches_depth_six_enumerator`: exact state-set equality
+  with all 19,531 original trace prefixes, 2,082 states and 3,990 successors.
+- `pending_command_model_observed_recovery_serves_at_depth_seven`: 5,096 states,
+  10,410 successors, complete inspection and replay of every required witness.
+- `pending_command_model_identity_includes_nonserialized_fixture_state`,
+  `pending_command_model_counterexample_replays_semantic_actions`, and
+  `pending_command_model_requires_recovery_witnesses`.
+- `incarnation_renewal_model_exhausts_bounded_schedules`: all 2,146 trace states
+  and 2,145 successors, exact generated/checked trace sets and positive replay.
+- `incarnation_renewal_discovered_schedule_replays_through_route_handle` and
+  the original same-incarnation and historical-renewal regressions, unchanged.
+
+The isolated mutation patch remains reproducible against the production filter;
+the current command is in Phase 2 above. Historical pairwise engine comparisons
+remain evidence at `98723f7a`, not ongoing dependency requirements.
+
+Removal verification: the historical mutation still fails with the local
+counterexample `[Install, Send, Deliver(1)]`. After restoring the production
+filter, all 65 focused explorer, lifecycle and runtime-map tests passed.
+Storage all-targets/all-features Clippy with warnings denied, formatting and the
+storage boundary checker passed. After review, the full `cargo nextest run
+--locked` passed all 9,110 tests (3 slow, none skipped) in 376.659 s.
+
+Next: finish the existing lifecycle model's explicit clock advancement and
+separately deliverable heartbeat observations before expanding into payload
+ownership. Revisit bounds and independent oracles for those new interleavings.
 
 ## Follow-On Slice — Publication, Recovery, And Payload Ownership
 
-Start only after the decision gate. Initial proposed configuration: one PG,
+Start after the lifecycle time/message extensions above; the engine decision
+gate is complete. Initial proposed configuration: one PG,
 one object, two competing requests, and three replicas (primary, off-primary
 witness, trailing replica). Fix exact command/crash/message bounds before
 implementation. Route-transition and cross-PG composition are later extensions.

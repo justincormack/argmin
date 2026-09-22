@@ -5,7 +5,7 @@
 // A semantic trace is the state identity: no merging of opaque live clusters or
 // assumptions that their public observations describe all future behavior.
 use super::*;
-use stateright::{Checker, HasDiscoveries, Model, Property};
+use crate::bounded_explorer::{Checks, Exploration, explore};
 
 const DEPTH: usize = 6;
 const MAX_STATES: usize = 100_000;
@@ -212,16 +212,11 @@ fn replay(trace: &[Event]) -> Observation {
 struct RenewalModel {
     generated: Mutex<BTreeSet<Vec<Event>>>,
     checked: Mutex<BTreeSet<Vec<Event>>>,
-    observations: Mutex<BTreeMap<Vec<Event>, Observation>>,
 }
 
 impl RenewalModel {
     fn state(&self, trace: Vec<Event>) -> State {
         let observation = replay(&trace);
-        self.observations
-            .lock()
-            .unwrap()
-            .insert(trace.clone(), observation.clone());
         let mut generated = self.generated.lock().unwrap();
         generated.insert(trace.clone());
         assert!(
@@ -232,14 +227,7 @@ impl RenewalModel {
     }
 }
 
-impl Model for RenewalModel {
-    type State = State;
-    type Action = Event;
-
-    fn init_states(&self) -> Vec<State> {
-        vec![self.state(Vec::new())]
-    }
-
+impl RenewalModel {
     fn actions(&self, state: &State, actions: &mut Vec<Event>) {
         if state.trace.len() == DEPTH || state.observation.error.is_some() {
             return;
@@ -265,77 +253,100 @@ impl Model for RenewalModel {
         );
     }
 
-    fn next_state(&self, state: &State, event: Event) -> Option<State> {
-        let mut trace = state.trace.clone();
-        trace.push(event);
-        Some(self.state(trace))
+    fn successors(&self, state: &State) -> Vec<(Event, State)> {
+        let mut actions = Vec::new();
+        self.actions(state, &mut actions);
+        actions
+            .into_iter()
+            .map(|event| {
+                let mut trace = state.trace.clone();
+                trace.push(event);
+                (event, self.state(trace))
+            })
+            .collect()
     }
 
-    fn properties(&self) -> Vec<Property<Self>> {
-        vec![
-            Property::always(SAFETY, |model: &Self, state: &State| {
-                model.checked.lock().unwrap().insert(state.trace.clone());
-                state.observation.error.is_none()
-            }),
-            Property::sometimes(RENEWED, |_, state: &State| {
-                let o = &state.observation;
-                o.new_renewed && !o.leases[0].2 && o.leases[1].2
-            }),
-            Property::sometimes(DELAYED, |_, state: &State| {
-                state.observation.delayed_ignored
-            }),
-            Property::sometimes(OLD_RENEWED, |_, state: &State| {
-                state.observation.old_renewed
-            }),
-        ]
+    fn checks(&self, state: &State) -> Checks {
+        self.checked.lock().unwrap().insert(state.trace.clone());
+        let o = &state.observation;
+        let mut checks = Checks {
+            failure: o.error.as_ref().map(|_| SAFETY),
+            witnesses: Vec::new(),
+        };
+        if o.new_renewed && !o.leases[0].2 && o.leases[1].2 {
+            checks.witnesses.push(RENEWED);
+        }
+        if o.delayed_ignored {
+            checks.witnesses.push(DELAYED);
+        }
+        if o.old_renewed {
+            checks.witnesses.push(OLD_RENEWED);
+        }
+        checks
+    }
+
+    fn run(&self) -> Exploration<State, Event> {
+        explore(
+            [self.state(Vec::new())],
+            &[RENEWED, DELAYED, OLD_RENEWED],
+            |state| self.successors(state),
+            |state| self.checks(state),
+            MAX_STATES,
+        )
     }
 }
 
 #[test]
-fn incarnation_renewal_stateright_exhausts_bounded_schedules() {
-    let started = Instant::now();
-    let checker = RenewalModel::default()
-        .checker()
-        .threads(1)
-        .finish_when(HasDiscoveries::AnyFailures)
-        .spawn_bfs()
-        .join();
-    if let Some(failure) = checker.discovery(SAFETY) {
-        let error = failure.last_state().observation.error.clone();
-        let actions = failure.into_actions();
-        // Replay before reporting: the failure must be deterministic in the owner.
-        assert_eq!(replay(&actions).error, error);
-        panic!("historical-renewal counterexample: {actions:?}: {error:?}");
+fn incarnation_renewal_model_exhausts_bounded_schedules() {
+    let model = RenewalModel::default();
+    let start = Instant::now();
+    let explored = model.run();
+    if let Some(actions) = explored.counterexample() {
+        let observation = replay(&actions);
+        assert!(observation.error.is_some(), "failure must replay");
+        panic!(
+            "historical-renewal counterexample: {actions:?}: {:?}",
+            observation.error
+        );
     }
-    checker.assert_properties();
-    assert!(checker.is_done());
-    assert_eq!(checker.max_depth(), DEPTH + 1);
-    assert_eq!(
-        checker.unique_state_count(),
-        2_146,
-        "schedule catalogue changed"
-    );
-    let model = checker.model();
+    explored.assert_complete();
+    assert_eq!(explored.state_count(), 2_146, "schedule catalogue changed");
+    assert_eq!(explored.transitions, 2_145);
     assert_eq!(
         *model.generated.lock().unwrap(),
         *model.checked.lock().unwrap()
     );
     assert_eq!(
         model.generated.lock().unwrap().len(),
-        checker.unique_state_count()
+        explored.state_count()
+    );
+    assert_eq!(
+        explored
+            .states()
+            .map(|state| state.trace.clone())
+            .collect::<BTreeSet<_>>(),
+        *model.generated.lock().unwrap()
     );
     for name in [RENEWED, DELAYED, OLD_RENEWED] {
-        let witness = checker.discovery(name).unwrap();
-        let expected = witness.last_state().observation.clone();
-        let actions = witness.into_actions();
-        assert_eq!(replay(&actions), expected);
-        eprintln!("{name}: {actions:?}");
+        let trace = explored.witness(name).expect("required witness missing");
+        let observation = replay(&trace);
+        assert_eq!(observation.error, None);
+        assert!(
+            model
+                .checks(&State {
+                    trace: trace.clone(),
+                    observation
+                })
+                .witnesses
+                .contains(&name)
+        );
+        eprintln!("{name}: {trace:?}");
     }
     eprintln!(
-        "incarnation renewal: depth={DEPTH}, states={}, generated={}, elapsed={:?}; complete bounded search, no symmetry or semantic deduplication",
-        checker.unique_state_count(),
-        checker.state_count(),
-        started.elapsed()
+        "incarnation renewal: depth={DEPTH}, states={}, transitions={}, elapsed={:?}; complete bounded search, no semantic deduplication",
+        explored.state_count(),
+        explored.transitions,
+        start.elapsed()
     );
 }
 
@@ -363,70 +374,5 @@ fn incarnation_renewal_discovered_schedule_replays_through_route_handle() {
     assert_eq!(
         result.leases,
         [(5_000, 4_000, false), (12_000, 11_000, true)]
-    );
-}
-
-#[test]
-fn incarnation_renewal_local_explorer_matches_stateright() {
-    let model = RenewalModel::default();
-    let start = Instant::now();
-    let explored = crate::bounded_explorer::explore_stateright_model(&model, MAX_STATES);
-    let local_elapsed = start.elapsed();
-    if let Some(actions) = explored.counterexample() {
-        let observation = replay(&actions);
-        assert!(observation.error.is_some(), "failure must replay");
-        panic!(
-            "local explorer historical-renewal counterexample: {actions:?}: {:?}",
-            observation.error
-        );
-    }
-    explored.assert_complete();
-    let start = Instant::now();
-    let checker = RenewalModel::default()
-        .checker()
-        .threads(1)
-        .finish_when(HasDiscoveries::AnyFailures)
-        .spawn_bfs()
-        .join();
-    let stateright_elapsed = start.elapsed();
-    checker.assert_properties();
-    assert!(checker.is_done());
-    assert_eq!(explored.state_count(), 2_146);
-    assert_eq!(explored.state_count(), checker.unique_state_count());
-    assert_eq!(explored.transitions, checker.state_count() - 1);
-    assert_eq!(
-        *model.generated.lock().unwrap(),
-        *model.checked.lock().unwrap()
-    );
-    assert_eq!(
-        *model.generated.lock().unwrap(),
-        *checker.model().checked.lock().unwrap()
-    );
-    assert_eq!(
-        *model.observations.lock().unwrap(),
-        *checker.model().observations.lock().unwrap()
-    );
-    for state in explored.states() {
-        assert_eq!(
-            model.observations.lock().unwrap().get(&state.trace),
-            Some(&state.observation)
-        );
-    }
-    for property in model.properties() {
-        if property.expectation != stateright::Expectation::Sometimes {
-            continue;
-        }
-        let trace = explored
-            .witness(property.name)
-            .expect("missing local witness");
-        assert!(checker.discovery(property.name).is_some());
-        let observation = replay(&trace);
-        assert_eq!(observation.error, None);
-        assert!((property.condition)(&model, &State { trace, observation }));
-    }
-    eprintln!(
-        "renewal engine comparison: states={}, transitions={}, local={local_elapsed:?}, stateright={stateright_elapsed:?}",
-        explored.state_count(),
-        explored.transitions
     );
 }

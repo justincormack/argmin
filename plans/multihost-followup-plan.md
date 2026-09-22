@@ -2405,9 +2405,9 @@ Model Argmin protocols that Raft does not solve:
 Use TLA+, Stateright, or an equivalent test-only model. Model the Raft adapter
 contract rather than reimplementing Raft.
 
-The [Stateright model-checking experiment](stateright-model-checking-plan.md)
-starts with the existing pending-command lifecycle exploration and a historical
-bug-detection gate before expanding into publication and payload ownership.
+The [bounded model-checking plan](bounded-model-checking-plan.md)
+uses the selected storage-owned explorer for pending-command lifecycle and
+historical bug detection before expanding into publication and payload ownership.
 Its completion does not replace this phase's lease/transition and reclaim
 model requirements or its implementation-level evidence.
 

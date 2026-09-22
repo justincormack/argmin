@@ -10,9 +10,6 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 
-mod comparison;
-pub(crate) use comparison::explore_stateright_model;
-
 #[derive(Default)]
 pub(crate) struct Checks {
     pub(crate) failure: Option<&'static str>,

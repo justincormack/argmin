@@ -6,7 +6,7 @@
 //! command application are atomic here. This is not a crash/transport model.
 
 use super::*;
-use stateright::{Checker, HasDiscoveries, Model, Property};
+use crate::bounded_explorer::{explore, Checks, Exploration};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
@@ -47,7 +47,6 @@ impl Hash for State {
     }
 }
 
-/// Stateright deduplicates fingerprints, without comparing the full state.
 /// Intern by *exact* fixture equality before giving a state a numeric identity.
 /// The persisted snapshot text is only a lookup bucket: its encoder prunes
 /// history, so it must not itself define equality of the live snapshot.
@@ -102,7 +101,7 @@ struct Lifecycle {
 }
 
 #[test]
-fn pending_command_stateright_identity_includes_nonserialized_fixture_state() {
+fn pending_command_model_identity_includes_nonserialized_fixture_state() {
     let data = StateData {
         case: PendingCommandLifecycleCase::new(),
         remaining: DEPTH,
@@ -183,21 +182,8 @@ fn observed_recovery_converged(state: &State) -> bool {
             .is_empty()
 }
 
-impl Model for Lifecycle {
-    type State = State;
-    type Action = PendingCommandLifecycleOp;
-
-    fn init_states(&self) -> Vec<State> {
-        vec![self.initial.clone()]
-    }
-
-    fn actions(&self, state: &State, actions: &mut Vec<Self::Action>) {
-        if state.data.remaining > 0 && state.data.transition_error.is_none() {
-            actions.extend(ACTIONS);
-        }
-    }
-
-    fn next_state(&self, state: &State, action: Self::Action) -> Option<State> {
+impl Lifecycle {
+    fn next_state(&self, state: &State, action: PendingCommandLifecycleOp) -> Option<State> {
         if state.data.remaining == 0 || state.data.transition_error.is_some() {
             return None;
         }
@@ -214,35 +200,81 @@ impl Model for Lifecycle {
         Some(self.states.lock().unwrap().intern(data))
     }
 
-    fn properties(&self) -> Vec<Property<Self>> {
-        let mut properties = vec![
-            Property::always(SAFETY, Self::safe),
-            Property::sometimes(PENDING, |_, state: &State| {
-                !state
-                    .data
-                    .case
-                    .snapshot
-                    .pending_metadata_command_recoveries()
-                    .tasks()
-                    .is_empty()
-            }),
-            Property::sometimes(CONVERGED, |_, state: &State| {
-                observed_recovery_converged(state)
-            }),
-        ];
-        // Observation, convergence, activation and the new-epoch heartbeat
-        // require seven actions. Do not mistake insufficient bounds for a bug.
+    fn successors(&self, state: &State) -> Vec<(PendingCommandLifecycleOp, State)> {
+        ACTIONS
+            .into_iter()
+            .filter_map(|action| self.next_state(state, action).map(|next| (action, next)))
+            .collect()
+    }
+
+    fn required_witnesses(&self) -> &'static [&'static str] {
         if self.initial.data.remaining >= RECOVERY_DEPTH {
-            properties.push(Property::sometimes(RECOVERED, |_, state: &State| {
-                let case = &state.data.case;
-                observed_recovery_converged(state)
-                    && case
-                        .snapshot
-                        .active_pg_route(heartbeat_model_pg_id(), case.now_ms)
-                        .is_ok()
-            }));
+            &[PENDING, CONVERGED, RECOVERED]
+        } else {
+            &[PENDING, CONVERGED]
         }
-        properties
+    }
+
+    fn checks(&self, state: &State) -> Checks {
+        let mut checks = Checks {
+            failure: (!self.safe(state)).then_some(SAFETY),
+            witnesses: Vec::new(),
+        };
+        let case = &state.data.case;
+        if !case
+            .snapshot
+            .pending_metadata_command_recoveries()
+            .tasks()
+            .is_empty()
+        {
+            checks.witnesses.push(PENDING);
+        }
+        if observed_recovery_converged(state) {
+            checks.witnesses.push(CONVERGED);
+            // Activation needs a new-epoch heartbeat: only depth seven can
+            // reach this property, retaining the original bounded contract.
+            if self.initial.data.remaining >= RECOVERY_DEPTH
+                && case
+                    .snapshot
+                    .active_pg_route(heartbeat_model_pg_id(), case.now_ms)
+                    .is_ok()
+            {
+                checks.witnesses.push(RECOVERED);
+            }
+        }
+        checks
+    }
+
+    fn run(&self) -> Exploration<State, PendingCommandLifecycleOp> {
+        explore(
+            [self.initial.clone()],
+            self.required_witnesses(),
+            |state| self.successors(state),
+            |state| self.checks(state),
+            MAX_STATES,
+        )
+    }
+
+    fn assert_witness_replays(
+        &self,
+        explored: &Exploration<State, PendingCommandLifecycleOp>,
+        name: &'static str,
+    ) {
+        let actions = explored.witness(name).expect("required witness missing");
+        let mut state = self.initial.clone();
+        for action in actions {
+            state = self.next_state(&state, action).unwrap();
+            assert!(
+                self.safe(&state),
+                "witness replay violated the lifecycle oracle"
+            );
+        }
+        let checks = self.checks(&state);
+        assert_eq!(checks.failure, None);
+        assert!(
+            checks.witnesses.contains(&name),
+            "witness did not replay: {name}"
+        );
     }
 }
 
@@ -282,7 +314,7 @@ fn enumerate(
 }
 
 #[test]
-fn pending_command_stateright_matches_depth_six_enumerator() {
+fn pending_command_model_matches_depth_six_enumerator() {
     let initial = PendingCommandLifecycleCase::new();
     initial.assert_matches_model(&[]);
     let start = Instant::now();
@@ -297,156 +329,72 @@ fn pending_command_stateright_matches_depth_six_enumerator() {
     let baseline_elapsed = start.elapsed();
     assert_eq!(prefixes, TRACE_PREFIXES);
 
-    let model = Lifecycle::new(initial.clone(), DEPTH);
+    let model = Lifecycle::new(initial, DEPTH);
     let start = Instant::now();
-    // No timeout, target-state cap, or checker depth cap: enabled actions encode
-    // the depth bound and all terminal states still undergo property checks.
-    let checker = model
-        .checker()
-        .threads(1)
-        .finish_when(HasDiscoveries::AnyFailures)
-        .spawn_bfs()
-        .join();
-    let checker_elapsed = start.elapsed();
-    checker.assert_properties();
-    assert!(checker.is_done());
-    let states = checker.model().states.lock().unwrap();
-    baseline.assert_same_states(&states);
-    assert_eq!(checker.max_depth(), usize::from(DEPTH) + 1);
-    let exact_states = states.count;
-    drop(states);
-    checker
-        .model()
-        .assert_all_generated_states_checked(checker.unique_state_count());
-
-    // Replay semantic actions, not unstable Stateright action-index paths.
-    for name in [PENDING, CONVERGED] {
-        let discovery = checker.discovery(name).unwrap();
-        let expected = discovery.last_state().data.case.clone();
-        let actions = discovery.into_actions();
-        let mut replay = initial.clone();
-        let mut trace = Vec::new();
-        for action in &actions {
-            trace.push(*action);
-            replay.apply(*action, &trace);
-        }
-        assert_eq!(
-            replay, expected,
-            "discovery must replay the exact production fixture"
-        );
-        eprintln!("{name}: {actions:?}");
+    let explored = model.run();
+    let elapsed = start.elapsed();
+    explored.assert_complete();
+    model.assert_all_generated_states_checked(explored.state_count());
+    baseline.assert_same_states(&model.states.lock().unwrap());
+    assert_eq!(explored.state_count(), 2_082);
+    assert_eq!(explored.transitions, 3_990);
+    for name in model.required_witnesses() {
+        model.assert_witness_replays(&explored, name);
     }
-    eprintln!(
-        "lifecycle pilot: bound={DEPTH} actions, prefixes={prefixes}, exact_states={}, \
-         checker_generated={}, checker_transitions={}, baseline={baseline_elapsed:?}, \
-         stateright={checker_elapsed:?}; completed bounded search, no symmetry",
-        exact_states,
-        checker.state_count(),
-        checker.state_count() - 1,
-    );
+    eprintln!("lifecycle model: bound={DEPTH}, prefixes={prefixes}, exact_states={}, transitions={}, baseline={baseline_elapsed:?}, local={elapsed:?}",
+        explored.state_count(), explored.transitions);
 }
 
 #[test]
-fn pending_command_stateright_observed_recovery_serves_at_depth_seven() {
-    let initial = PendingCommandLifecycleCase::new();
+fn pending_command_model_observed_recovery_serves_at_depth_seven() {
+    let model = Lifecycle::new(PendingCommandLifecycleCase::new(), RECOVERY_DEPTH);
     let start = Instant::now();
-    let checker = Lifecycle::new(initial.clone(), RECOVERY_DEPTH)
-        .checker()
-        .threads(1)
-        .finish_when(HasDiscoveries::AnyFailures)
-        .spawn_bfs()
-        .join();
-    let elapsed = start.elapsed();
-    checker.assert_properties();
-    assert!(checker.is_done());
-    checker
-        .model()
-        .assert_all_generated_states_checked(checker.unique_state_count());
-    assert_eq!(checker.max_depth(), usize::from(RECOVERY_DEPTH) + 1);
-
-    let actions = checker.discovery(RECOVERED).unwrap().into_actions();
+    let explored = model.run();
+    explored.assert_complete();
+    model.assert_all_generated_states_checked(explored.state_count());
+    assert_eq!(explored.state_count(), 5_096);
+    assert_eq!(explored.transitions, 10_410);
+    for name in model.required_witnesses() {
+        model.assert_witness_replays(&explored, name);
+    }
+    let actions = explored.witness(RECOVERED).unwrap();
     assert_eq!(actions.len(), usize::from(RECOVERY_DEPTH));
-    let mut replay = initial;
-    let mut trace = Vec::new();
-    let mut observed = false;
-    for action in &actions {
-        trace.push(*action);
-        replay.apply(*action, &trace);
-        observed |= !replay.model.pending_epoch_current
-            && !replay
+    eprintln!("recovery model: exact_states={}, transitions={}, elapsed={:?}; serving witness={actions:?}",
+        explored.state_count(), explored.transitions, start.elapsed());
+}
+
+#[test]
+#[should_panic(expected = "required reachability witnesses not found")]
+fn pending_command_model_requires_recovery_witnesses() {
+    // Exercise the owner registration after removing the comparison bridge.
+    // The zero-action bound is safe but cannot witness pending recovery.
+    Lifecycle::new(PendingCommandLifecycleCase::new(), 0)
+        .run()
+        .assert_complete();
+}
+
+#[test]
+fn pending_command_model_counterexample_replays_semantic_actions() {
+    // An intentionally false property tests the harness, not a historical bug.
+    let model = Lifecycle::new(PendingCommandLifecycleCase::new(), DEPTH);
+    let explored = explore(
+        [model.initial.clone()],
+        &[],
+        |state| model.successors(state),
+        |state| Checks {
+            failure: (!state
+                .data
+                .case
                 .snapshot
                 .pending_metadata_command_recoveries()
                 .tasks()
-                .is_empty();
-    }
-    assert!(observed);
-    assert_eq!(replay.model.slot, PendingCommandSlotState::Converged);
-    assert!(!replay.model.pending_epoch_current);
-    assert!(replay
-        .snapshot
-        .pending_metadata_command_recoveries()
-        .tasks()
-        .is_empty());
-    assert!(replay
-        .snapshot
-        .active_pg_route(heartbeat_model_pg_id(), replay.now_ms)
-        .is_ok());
-    eprintln!(
-        "recovery pilot: bound={RECOVERY_DEPTH} actions, exact_states={}, generated={}, \
-         elapsed={elapsed:?}; completed bounded search; serving witness={actions:?}",
-        checker.unique_state_count(),
-        checker.state_count(),
+                .is_empty())
+            .then_some("no pending command is ever observed"),
+            witnesses: Vec::new(),
+        },
+        MAX_STATES,
     );
-}
-
-/// An intentionally false property tests the harness, not a historical bug.
-struct NegativeControl(Lifecycle);
-
-impl Model for NegativeControl {
-    type State = State;
-    type Action = PendingCommandLifecycleOp;
-
-    fn init_states(&self) -> Vec<State> {
-        self.0.init_states()
-    }
-
-    fn actions(&self, state: &State, actions: &mut Vec<Self::Action>) {
-        self.0.actions(state, actions);
-    }
-
-    fn next_state(&self, state: &State, action: Self::Action) -> Option<State> {
-        self.0.next_state(state, action)
-    }
-
-    fn properties(&self) -> Vec<Property<Self>> {
-        vec![Property::always(
-            "no pending command is ever observed",
-            |_, state: &State| {
-                state
-                    .data
-                    .case
-                    .snapshot
-                    .pending_metadata_command_recoveries()
-                    .tasks()
-                    .is_empty()
-            },
-        )]
-    }
-}
-
-#[test]
-fn pending_command_stateright_counterexample_replays_semantic_actions() {
-    let initial = PendingCommandLifecycleCase::new();
-    let checker = NegativeControl(Lifecycle::new(initial.clone(), DEPTH))
-        .checker()
-        .threads(1)
-        .finish_when(HasDiscoveries::AnyFailures)
-        .spawn_bfs()
-        .join();
-    let actions = checker
-        .discovery("no pending command is ever observed")
-        .expect("the deliberately false property must produce a counterexample")
-        .into_actions();
+    let actions = explored.counterexample().expect("false property must fail");
     assert_eq!(
         actions,
         [
@@ -454,7 +402,7 @@ fn pending_command_stateright_counterexample_replays_semantic_actions() {
             PendingCommandLifecycleOp::Heartbeat
         ]
     );
-    let mut replay = initial;
+    let mut replay = PendingCommandLifecycleCase::new();
     let mut trace = Vec::new();
     for action in actions {
         trace.push(action);
@@ -468,107 +416,4 @@ fn pending_command_stateright_counterexample_replays_semantic_actions() {
             .len(),
         1
     );
-}
-
-#[test]
-fn pending_command_local_explorer_matches_stateright() {
-    for depth in [DEPTH, RECOVERY_DEPTH] {
-        let local = Lifecycle::new(PendingCommandLifecycleCase::new(), depth);
-        let start = Instant::now();
-        let explored = crate::bounded_explorer::explore_stateright_model(&local, MAX_STATES);
-        let local_elapsed = start.elapsed();
-        explored.assert_complete();
-        local.assert_all_generated_states_checked(explored.state_count());
-
-        let start = Instant::now();
-        let checker = Lifecycle::new(PendingCommandLifecycleCase::new(), depth)
-            .checker()
-            .threads(1)
-            .finish_when(HasDiscoveries::AnyFailures)
-            .spawn_bfs()
-            .join();
-        let stateright_elapsed = start.elapsed();
-        checker.assert_properties();
-        assert!(checker.is_done());
-        checker
-            .model()
-            .assert_all_generated_states_checked(checker.unique_state_count());
-        local
-            .states
-            .lock()
-            .unwrap()
-            .assert_same_states(&checker.model().states.lock().unwrap());
-        assert_eq!(explored.state_count(), checker.unique_state_count());
-        assert_eq!(explored.transitions, checker.state_count() - 1);
-
-        // Both engines must reach every positive property; local witnesses are
-        // replayed through the same production fixture and property monitor.
-        for property in local.properties() {
-            if property.expectation != stateright::Expectation::Sometimes {
-                continue;
-            }
-            let actions = explored
-                .witness(property.name)
-                .expect("missing local witness");
-            assert!(checker.discovery(property.name).is_some());
-            let mut state = local.init_states().pop().unwrap();
-            for action in actions {
-                state = local.next_state(&state, action).unwrap();
-            }
-            assert!((property.condition)(&local, &state));
-            assert!(state.data.case.check_matches_model().is_ok());
-        }
-        eprintln!("lifecycle engine comparison: depth={depth}, exact_states={}, transitions={}, local={local_elapsed:?}, stateright={stateright_elapsed:?}",
-            explored.state_count(), explored.transitions);
-    }
-}
-
-#[test]
-fn pending_command_local_explorer_observed_recovery_serves_at_depth_seven() {
-    // Independent entry point also permits process-level resource measurement
-    // without retaining the other engine's state collection in the same test.
-    let model = Lifecycle::new(PendingCommandLifecycleCase::new(), RECOVERY_DEPTH);
-    let explored = crate::bounded_explorer::explore_stateright_model(&model, MAX_STATES);
-    explored.assert_complete();
-    model.assert_all_generated_states_checked(explored.state_count());
-    assert_eq!(explored.state_count(), 5_096);
-    assert_eq!(explored.transitions, 10_410);
-    let actions = explored.witness(RECOVERED).expect("serving witness");
-    assert_eq!(actions.len(), usize::from(RECOVERY_DEPTH));
-    let mut state = model.init_states().pop().unwrap();
-    for action in actions {
-        state = model.next_state(&state, action).unwrap();
-    }
-    let property = model
-        .properties()
-        .into_iter()
-        .find(|p| p.name == RECOVERED)
-        .unwrap();
-    assert!((property.condition)(&model, &state));
-    assert!(state.data.case.check_matches_model().is_ok());
-}
-
-#[test]
-fn pending_command_local_explorer_counterexample_matches_stateright() {
-    let model = NegativeControl(Lifecycle::new(PendingCommandLifecycleCase::new(), DEPTH));
-    let local = crate::bounded_explorer::explore_stateright_model(&model, MAX_STATES);
-    let actions = local.counterexample().expect("false property must fail");
-    let checker = NegativeControl(Lifecycle::new(PendingCommandLifecycleCase::new(), DEPTH))
-        .checker()
-        .threads(1)
-        .finish_when(HasDiscoveries::AnyFailures)
-        .spawn_bfs()
-        .join();
-    assert_eq!(
-        actions,
-        checker
-            .discovery("no pending command is ever observed")
-            .unwrap()
-            .into_actions()
-    );
-    let mut state = model.init_states().pop().unwrap();
-    for action in actions {
-        state = model.next_state(&state, action).unwrap();
-    }
-    assert!(!(model.properties()[0].condition)(&model, &state));
 }
