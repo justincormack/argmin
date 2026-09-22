@@ -4677,6 +4677,7 @@ impl StorageCluster {
             &mut ignored_may_have_applied,
             evaluated_attempt,
         )
+        .map_err(|failure| failure.source)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4690,7 +4691,7 @@ impl StorageCluster {
         work_budget: &mut RequestWorkBudget,
         install_may_have_applied: &mut bool,
         evaluated_attempt: &mut SnapshotSensitiveEvaluatedAttempt<'_>,
-    ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
+    ) -> Result<SnapshotSensitiveInstallOutcome, SnapshotSensitiveInstallFailure> {
         let outcome = self
             .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified_inner(
                 publisher,
@@ -4717,7 +4718,7 @@ impl StorageCluster {
         effect_fence: Option<AdmittedRouteEffectFence>,
         work_budget: &mut RequestWorkBudget,
         install_may_have_applied: &mut bool,
-    ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
+    ) -> Result<SnapshotSensitiveInstallOutcome, SnapshotSensitiveInstallFailure> {
         match self.try_install_pending_metadata_command_for_bucket_with_effect_fence_until(
             pg_id,
             bucket,
@@ -4814,14 +4815,27 @@ impl StorageCluster {
                             cluster_epoch: id.cluster_epoch(),
                             log_index: id.log_index().get(),
                         },
-                    ));
+                    )
+                    .into());
                 }
-                self.drain_one_pending_object_metadata_command_with_work_budget(
-                    publisher,
+                let Some(contender) = self.pending_metadata_command_for_bucket_until(
                     pg_id,
                     bucket,
+                    work_budget.deadline(),
+                )? else {
+                    return Ok(SnapshotSensitiveInstallOutcome::ContenderDrained);
+                };
+                if let Err(source) = self.drain_pending_object_metadata_command_with_work_budget(
+                    publisher,
+                    pg_id,
+                    &contender,
                     work_budget,
-                )?;
+                ) {
+                    return Err(SnapshotSensitiveInstallFailure {
+                        source,
+                        drained_contender: Some(Box::new(contender)),
+                    });
+                }
                 Ok(SnapshotSensitiveInstallOutcome::ContenderDrained)
             }
             Err(error) => {

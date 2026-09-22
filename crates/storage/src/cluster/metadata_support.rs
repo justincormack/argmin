@@ -244,6 +244,26 @@ enum SnapshotSensitiveInstallOutcome {
     ContenderDrained,
 }
 
+struct SnapshotSensitiveInstallFailure {
+    source: ObjectPgActionError,
+    drained_contender: Option<Box<MetadataCommandEnvelope>>,
+}
+
+impl From<ObjectPgActionError> for SnapshotSensitiveInstallFailure {
+    fn from(source: ObjectPgActionError) -> Self {
+        Self {
+            source,
+            drained_contender: None,
+        }
+    }
+}
+
+impl From<StoreError> for SnapshotSensitiveInstallFailure {
+    fn from(source: StoreError) -> Self {
+        ObjectPgActionError::Store(source).into()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotSensitiveCandidateTerminalState {
     NotTerminal,

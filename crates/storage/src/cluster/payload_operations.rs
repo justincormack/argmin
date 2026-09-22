@@ -4985,7 +4985,7 @@ impl StorageCluster {
                 snapshot_retry_phase.require_snapshot_reinspection();
             }};
         }
-        let (command, new_pending_command) = loop {
+        let (command, new_pending_command) = 'direct_put_metadata: loop {
             require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
                 "direct PUT metadata retry budget exhausted"
@@ -5579,11 +5579,36 @@ impl StorageCluster {
                             ),
                         ) {
                         Ok(install) => break install,
-                        Err(error) => {
+                        Err(failure) => {
+                            let SnapshotSensitiveInstallFailure {
+                                source: error,
+                                drained_contender,
+                            } = failure;
                             if install_may_have_applied {
                                 bucket_write_proof_command_owned = true;
                                 payload_ownership = DirectPutPayloadOwnership::DurableCommand;
                                 disarm_payload_cleanup();
+                            }
+                            if !install_may_have_applied
+                                && matches!(
+                                    error,
+                                    ObjectPgActionError::MetadataCommandRecoveryTransferred
+                                )
+                                && drained_contender.as_deref().is_some_and(|contender| {
+                                    matches!(
+                                        contender.payload(),
+                                        MetadataCommandPayload::CommitDirectPutObject(commit)
+                                            if commit.object.bucket == req.bucket
+                                                && commit.object.key == req.key
+                                    )
+                                })
+                            {
+                                wait_for_same_object_direct_put_recovery!(
+                                    drained_contender
+                                        .as_deref()
+                                        .expect("guard requires the drained contender")
+                                );
+                                continue 'direct_put_metadata;
                             }
                             let retryable = if install_may_have_applied {
                                 request_ops::object_pg_action_error_is_retryable_command_observation(

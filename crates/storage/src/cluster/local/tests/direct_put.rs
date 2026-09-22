@@ -4286,40 +4286,54 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
     let hook_req = winner_req.clone();
     let hook_written_shards = winner_written.written_shards.clone();
     let hook_ran_for_closure = Arc::clone(&hook_ran);
-    let _hook_guard =
-        first_cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
-            if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
-                return Ok(());
-            }
-            let pg_id = PgId::new(2);
-            let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_written_shards
-                .iter()
-                .map(|written| (&written.key, written.ack))
-                .collect();
-            hook_cluster
-                .register_payload_shard_acks(hook_req.data_pg_id, &shard_batch)
-                .unwrap();
-            let primary = hook_map
-                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
-                .unwrap();
-            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-            let command = hook_cluster
-                .prepare_commit_direct_put_object_command(
-                    pg_id,
-                    &pg,
-                    &hook_req,
-                    crate::VersionId::Null,
-                    hook_req.bucket_write_reservation.clone(),
-                )
-                .unwrap();
-            pg.try_insert_pending_metadata_command_slot(
-                primary.node_id().as_u32(),
-                &command,
-                Some(&hook_bucket),
+    let install_winner: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pg_id = PgId::new(2);
+        let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        hook_cluster
+            .register_payload_shard_acks(hook_req.data_pg_id, &shard_batch)
+            .unwrap();
+        let primary = hook_map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        let command = hook_cluster
+            .prepare_commit_direct_put_object_command(
+                pg_id,
+                &pg,
+                &hook_req,
+                crate::VersionId::Null,
+                hook_req.bucket_write_reservation.clone(),
             )
             .unwrap();
-            Ok(())
-        }));
+        pg.try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            &command,
+            Some(&hook_bucket),
+        )
+        .unwrap();
+    });
+    let _command_id_hook_guard = (interleaving
+        != DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup)
+        .then(|| {
+            let install_winner = Arc::clone(&install_winner);
+            first_cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
+                install_winner();
+                Ok(())
+            }))
+        });
+    let _pending_install_hook_guard = (interleaving
+        == DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup)
+        .then(|| {
+            first_cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(
+                move || install_winner(),
+            ))
+        });
 
     let drain_interleaving_pending = Arc::new(AtomicBool::new(true));
     let drain_interleaving_pending_for_hook = Arc::clone(&drain_interleaving_pending);
@@ -4586,9 +4600,14 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
     assert!(hook_ran.load(Ordering::SeqCst));
     assert!(!drain_interleaving_pending.load(Ordering::SeqCst));
     assert!(!terminal_cleanup_blocked.load(Ordering::SeqCst));
+    let expected_action_calls = match interleaving {
+        DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup => 3,
+        DirectPutCommandIdRaceDrainInterleaving::Contention
+        | DirectPutCommandIdRaceDrainInterleaving::AwaitingAuthorizedRecovery => 2,
+    };
     assert_eq!(
         action_calls.load(Ordering::SeqCst),
-        2,
+        expected_action_calls,
         "direct PUT precondition must be rerun after command-id contention changes object state"
     );
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());

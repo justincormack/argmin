@@ -2055,7 +2055,8 @@ impl super::StorageCluster {
                 )
             {
                 Ok(install) => install,
-                Err(error) => {
+                Err(failure) => {
+                    let error = failure.source;
                     let pending_owns_reservation = if install_may_have_applied {
                         self.pending_metadata_command_uses_bucket_write_reservation(
                             pg_id,
@@ -2710,7 +2711,8 @@ impl super::StorageCluster {
                 )
             {
                 Ok(install) => install,
-                Err(error) => {
+                Err(failure) => {
+                    let error = failure.source;
                     let pending_owns_reservation = if install_may_have_applied {
                         self.pending_metadata_command_uses_bucket_write_reservation(
                             pg_id,
