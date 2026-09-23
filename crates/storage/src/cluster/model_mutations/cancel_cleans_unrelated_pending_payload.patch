@@ -1,0 +1,10 @@
+--- a/crates/storage/src/cluster/payload_operations.rs
++++ b/crates/storage/src/cluster/payload_operations.rs
+@@ -4520,6 +4520,7 @@
+                     }
+                     _ => {
++                        self.after_object_metadata_command_abandoned_payload_cleanup(&command);
+                         self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
+                         work_budget
+                             .sleep_after_contention(
+                                 "object generation release pending drain retry budget exhausted",

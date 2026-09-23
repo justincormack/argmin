@@ -9,6 +9,9 @@ use super::*;
 use crate::bounded_explorer::{explore, Checks};
 use std::cell::RefCell;
 
+#[path = "direct_put_cancellation_model.rs"]
+mod cancellation_model;
+
 const DATA: [&[u8]; 2] = [b"owner A staged body", b"owner B different staged body"];
 const REQUIRED: [&str; 6] = [
     "ordinary drop releases only its own staging",
@@ -114,6 +117,7 @@ enum Ownership {
     Pending,
     Visible,
     Released,
+    CancelledPendingRelease,
 }
 
 fn diagnostic(error: impl std::fmt::Debug) -> String {
@@ -290,8 +294,10 @@ impl Fixture {
                     Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. }) => None,
                     Err(error) => return Err(diagnostic(error)),
                 };
-                let expected = if matches!(ownership[owner], Ownership::Caller | Ownership::Pending)
-                {
+                let expected = if matches!(
+                    ownership[owner],
+                    Ownership::Caller | Ownership::Pending | Ownership::CancelledPendingRelease
+                ) {
                     Some(identities[owner].unwrap().segment_vid)
                 } else {
                     None
@@ -377,6 +383,55 @@ impl Fixture {
             )?;
         }
         Ok(())
+    }
+
+    fn leave_pending_after_inspection_failure(
+        &self,
+        owner: usize,
+        route: &crate::ActivePutObjectRoute<'_>,
+        payload: crate::DirectPutPayloadWrite<'_>,
+    ) -> Result<MetadataCommandEnvelope, String> {
+        let prepared = self.prepared(owner);
+        let command = self.install_matching_pending(owner, &payload, &prepared)?;
+        let expected_command = command.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let hook = self
+            .cluster
+            .test_install_before_direct_put_abandoned_log_inspection_hook(Arc::new(
+                move |candidate| {
+                    assert_eq!(
+                        candidate, &expected_command,
+                        "inspection changed exact command"
+                    );
+                    observed_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(StoreError::MetadataCommandLogChecksumMismatch {
+                        node_id: 0,
+                        pg_id: 0,
+                        cluster_epoch: candidate.id().cluster_epoch(),
+                        log_index: candidate.id().log_index().get(),
+                        stored_checksum: 1,
+                        computed_checksum: 2,
+                    }
+                    .into())
+                },
+            ));
+        let result = route.commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()));
+        drop(hook);
+        let error = result
+            .err()
+            .ok_or("pending inspection failure returned success")?;
+        equal(
+            error.diagnostic_cause_label(),
+            "store_integrity_failure",
+            "inspection error identity",
+        )?;
+        equal(
+            calls.load(Ordering::SeqCst),
+            1,
+            "deterministic fatal inspection",
+        )?;
+        Ok(command)
     }
 }
 
@@ -476,47 +531,11 @@ fn replay(state: &State) -> Result<(), String> {
             }
             Step::SettleFirst(FirstOutcome::PendingInspectionFailure) => {
                 let owner = state.owner;
-                let prepared = fixture.prepared(owner);
                 let payload = payloads[owner].take().unwrap();
-                let command = fixture.install_matching_pending(owner, &payload, &prepared)?;
-                let expected_command = command.clone();
-                let calls = Arc::new(AtomicUsize::new(0));
-                let observed_calls = Arc::clone(&calls);
-                let hook = fixture
-                    .cluster
-                    .test_install_before_direct_put_abandoned_log_inspection_hook(Arc::new(
-                        move |candidate| {
-                            assert_eq!(
-                                candidate, &expected_command,
-                                "inspection changed exact command"
-                            );
-                            observed_calls.fetch_add(1, Ordering::SeqCst);
-                            Err(StoreError::MetadataCommandLogChecksumMismatch {
-                                node_id: 0,
-                                pg_id: 0,
-                                cluster_epoch: candidate.id().cluster_epoch(),
-                                log_index: candidate.id().log_index().get(),
-                                stored_checksum: 1,
-                                computed_checksum: 2,
-                            }
-                            .into())
-                        },
-                    ));
-                let result =
-                    routes[owner].commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()));
-                drop(hook);
-                let error = result
-                    .err()
-                    .ok_or("pending inspection failure returned success")?;
-                equal(
-                    error.diagnostic_cause_label(),
-                    "store_integrity_failure",
-                    "inspection error identity",
-                )?;
-                equal(
-                    calls.load(Ordering::SeqCst),
-                    1,
-                    "deterministic fatal inspection",
+                let command = fixture.leave_pending_after_inspection_failure(
+                    owner,
+                    &routes[owner],
+                    payload,
                 )?;
                 ownership[owner] = Ownership::Pending;
                 pending = Some(command);

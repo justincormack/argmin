@@ -1084,6 +1084,77 @@ with warnings denied, formatting and the storage boundary checker passed. After
 review, the full `cargo nextest run --locked --no-fail-fast` passed all 9,116 tests
 (1 slow, none skipped) in 235.786 s.
 
+### Increment 7 — Cancellation Around Authorized Recovery
+
+The default-suite `publication_model_exhausts_cancellation_around_authorized_payload_recovery`
+in [the direct-PUT owner](../crates/storage/src/cluster/local/tests/direct_put_cancellation_model.rs)
+extends the physical-ownership fixture with cancellation before and after a
+retained recovery handoff. It reuses Increment 5's real admitted handles, three
+replica stores, disjoint generations and EC 2+1 payloads, and exact pending-command
+setup. The inspection-failure helper is shared without changing the original
+30-state graph. Production behavior, public APIs, formats and dependencies are
+unchanged.
+
+Two initial states choose the command owner. After both requests stage payload,
+that owner's commit adopts the pending command and encounters the deterministic
+inspection error. `RelinquishRecovery` acquires a real recovery-flight guard and
+calls its production authorized-recovery handoff operation. This is an explicit
+owner-local scheduling boundary, not an end-to-end reproduction of the transport
+or budget failure that can cause a worker to relinquish leadership.
+
+The other request is cancelled by ordinary handle drop or explicit discard,
+either before or after authorized recovery. Before recovery, cancellation must
+remove only caller-owned shard files; its best-effort reservation release cannot
+take over the retained flight, so the reservation remains. An optional early
+release retry must report `MetadataCommandAwaitingAuthorizedRecovery` and leave
+the command, both relevant reservation states and the flight untouched. After
+authorized recovery, a healthy retry must release the cancelled reservation.
+Recovery-first paths require cancellation to finish cleanup immediately.
+
+The bounded full-trace graph contains 38 states and 36 edges, at most seven
+actions, with a failing 1,000-state cap. Every state and eight required witnesses
+replay against fresh storage. After each action, the ownership oracle checks
+every actor's shard identity, both generation reservations on every replica, the
+exact pending envelope, replica-proof agreement and retained-flight count.
+Recovered metadata must name the exact owner layout and its readable body/CRC.
+The new oracle state explicitly separates deleted payload from a still-retained
+generation reservation; it does not treat best-effort cleanup as atomic success.
+
+The final release is an explicitly scheduled call to the same production operation
+used by handle cleanup, with its typed result retained. This demonstrates progress
+under a healthy retry supplied by the model, not that a background worker already
+retries every cancelled direct-PUT reservation. No active-leader waiter races,
+mid-operation cancellation, process crashes, cleanup I/O failures, partial-overlap
+cancellation or transport composition are covered. Prefix teardown disarms any
+remaining test handles before destroying the isolated fixture, rather than
+silently adding unobserved cancellation actions.
+
+The [unrelated-payload cleanup mutation](../crates/storage/src/cluster/model_mutations/cancel_cleans_unrelated_pending_payload.patch)
+incorrectly runs abandoned-command payload deletion when cancellation encounters
+another request's still-pending command. This is a synthetic ownership mutation,
+not a historical commit revert. Applied to the best-effort release path used by handle
+cleanup, it failed and replayed owner A's
+`[StageBoth, LeavePending, RelinquishRecovery, CancelOther(Drop)]`: owner A's shard
+0 was missing while its command remained pending. Production code was restored
+immediately. Run without concurrent edits or builds and always restore the mutation,
+including after an unexpected failure:
+
+```bash
+patch --dry-run -p1 -i crates/storage/src/cluster/model_mutations/cancel_cleans_unrelated_pending_payload.patch
+patch -p1 -i crates/storage/src/cluster/model_mutations/cancel_cleans_unrelated_pending_payload.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_cancellation)' --failure-output immediate
+# Expected failure: pending owner's physical shard was deleted by cancellation.
+patch -R -p1 -i crates/storage/src/cluster/model_mutations/cancel_cleans_unrelated_pending_payload.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_cancellation)'
+```
+
+Verification after restoration: all 24 focused explorer, publication-model,
+direct-PUT ownership and recovery-handoff regressions passed. Storage
+all-targets/all-features Clippy with warnings denied, formatting and the storage
+boundary checker passed. After review, the full
+`cargo nextest run --locked --no-fail-fast` passed all 9,121 tests (1 slow,
+none skipped) in 230.947 s.
+
 ### Remaining Increments
 
 The broad checklist below stays open: these increments establish a
@@ -1093,11 +1164,15 @@ model. The node transport model adds plain-Unix observations and exact retry;
 authenticated transport and its three-replica publisher composition remain open.
 The physical models now cover disjoint staged payloads, deterministic cleanup,
 exact pending ownership, per-shard partial-overlap rejection and healthy recovery.
-Next extend the recovery/cancellation interleavings and cleanup-failure schedules.
+The cancellation model additionally covers disjoint caller cleanup around an
+explicit retained handoff and healthy authorized takeover, with deferred
+reservation-release retries. Active-leader interleavings, cleanup I/O failures,
+partial-overlap cancellation and actual background cleanup progress remain open.
 Retain the transport composition as explicit follow-up evidence.
 In particular, do not model a dropped response as undoing a committed apply.
-Add request-budget expiry, cancellation and recovery takeover with their real
-authority boundaries before claiming ownership-sensitive recovery coverage.
+Add request-budget expiry, in-flight cancellation and active-owner recovery
+takeover at their real authority boundaries before claiming composed recovery
+coverage.
 
 - [ ] Model pending-slot installation, publication-start marking, witness then
   primary application, trailing convergence, exact replay, terminal cleanup,
