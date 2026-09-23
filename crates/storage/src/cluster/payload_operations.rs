@@ -4985,6 +4985,18 @@ impl StorageCluster {
                 snapshot_retry_phase.require_snapshot_reinspection();
             }};
         }
+        macro_rules! wait_for_unrelated_metadata_recovery {
+            ($command:expr) => {{
+                if let Err(error) = self.wait_for_transferred_metadata_command_with_work_budget(
+                    pg_id,
+                    $command,
+                    &mut work_budget,
+                ) {
+                    cleanup_direct_put_attempt_before_command_ownership!();
+                    return Err(error);
+                }
+            }};
+        }
         let (command, new_pending_command) = 'direct_put_metadata: loop {
             require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
@@ -5246,6 +5258,11 @@ impl StorageCluster {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.object.bucket == req.bucket && commit.object.key == req.key
                 );
+                let is_unrelated_direct_put = matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket != req.bucket || commit.object.key != req.key
+                );
                 if let Some(commit) = matching_direct_put {
                     bucket_write_proof_command_owned = true;
                     if Self::direct_put_command_owns_request_payload(commit, req) {
@@ -5493,6 +5510,15 @@ impl StorageCluster {
                         &mut work_budget,
                     )
                 {
+                    if matches!(error, ObjectPgActionError::MetadataCommandRecoveryTransferred)
+                        && !is_unrelated_direct_put
+                    {
+                        // An unrelated direct PUT deliberately preserves terminal handoff
+                        // behavior. Other metadata mutations can be reobserved safely after
+                        // their authorized recovery advances the bucket's pending slot.
+                        wait_for_unrelated_metadata_recovery!(&command);
+                        continue;
+                    }
                     if request_ops::object_pg_action_error_is_retryable_pending_drain(&error) {
                         retry_direct_put_pending_drain_error!(
                             error,
