@@ -1183,6 +1183,36 @@ impl super::StorageCluster {
         reservation_authority: &StorageCluster,
         attempt_context: MetadataCommandApplyAttemptContext,
     ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
+        self.apply_metadata_command_to_acting_set_from_origin_with_retry_wait(
+            origin_node_id,
+            command,
+            execution_route,
+            reservation_authority,
+            attempt_context,
+            |retries, deadline| {
+                super::sleep_after_metadata_contention_retry_until(
+                    "metadata_command_publication_confirmation",
+                    Some(command.id().pg_id()),
+                    "confirm exact witnessed metadata command publication",
+                    retries,
+                    deadline,
+                )
+            },
+        )
+    }
+
+    // The runtime owns backoff/time passage; the policy loop owns publication
+    // classification. Keeping that effect separate permits bounded exploration
+    // without changing retry decisions or duplicating this state machine.
+    fn apply_metadata_command_to_acting_set_from_origin_with_retry_wait(
+        &self,
+        origin_node_id: NodeId,
+        command: &MetadataCommandEnvelope,
+        execution_route: MetadataCommandExecutionRoute<'_>,
+        reservation_authority: &StorageCluster,
+        attempt_context: MetadataCommandApplyAttemptContext,
+        mut wait_for_retry: impl FnMut(&mut usize, Instant) -> bool,
+    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
         let mut progress = attempt_context.progress;
         let deadline = attempt_context.deadline;
         let mut publication_may_have_applied = false;
@@ -1280,13 +1310,7 @@ impl super::StorageCluster {
                         || exact_conflict_retryable
                         || publication_may_have_applied)
                         && !definitive_apply_failure
-                        && super::sleep_after_metadata_contention_retry_until(
-                            "metadata_command_publication_confirmation",
-                            Some(command.id().pg_id()),
-                            "confirm exact witnessed metadata command publication",
-                            &mut retries,
-                            deadline,
-                        )
+                        && wait_for_retry(&mut retries, deadline)
                     {
                         continue;
                     }

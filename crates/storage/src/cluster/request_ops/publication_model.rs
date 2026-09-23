@@ -15,6 +15,9 @@ use crate::metadata_command::{
 use crate::{EcShape, GenerationId, SessionId};
 use std::cell::RefCell;
 
+#[path = "publication_retry_model.rs"]
+mod retry_model;
+
 // Node identities are fixed independently of the publisher's ordering helper.
 const PRIMARY: u32 = 0;
 const WITNESS: u32 = 1;

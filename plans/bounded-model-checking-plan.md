@@ -6,9 +6,10 @@
 Status: local explorer selected; Stateright and the temporary comparison adapter
 removed. Lifecycle baseline and historical incarnation-renewal mutation/replay
 are retained. The follow-on publication model has started at the durable
-slot/reservation boundary and now exercises the publisher's single-attempt
-delivery and pending-command finisher. Phase 1's explicit-time and delayed-heartbeat
-extensions remain open; physical payload ownership is not yet modelled.
+slot/reservation boundary and now exercises publisher delivery, bounded outer
+retry/handoff decisions and the pending-command finisher. Phase 1's explicit-time
+and delayed-heartbeat extensions remain open; physical payload ownership is not
+yet modelled.
 
 ## Goal
 
@@ -804,13 +805,78 @@ After review, the full `cargo nextest run --locked` passed all 9,112 tests
 (3 slow, none skipped) in 282.697 s. There are no production behavior or public
 API changes.
 
+### Increment 3 — Outer Publication Retry And Recovery Handoff
+
+The default-suite `publication_model_exhausts_outer_retry_budget_and_handoff_schedules`
+in [the outer-policy model](../crates/storage/src/cluster/request_ops/publication_retry_model.rs)
+runs the production publisher loop, durable progress observations and exact-command
+finisher. A private callback separates only retry waiting: production still calls
+the same backoff function with the same deadline and counter. The model can
+deterministically end retries or allow one further attempt without sleeping or
+duplicating publication policy. No public API, persisted format or intended
+production behavior changes.
+
+Each of two reservation owners crosses the seven first-attempt delivery schedules
+from increment 2 with three wait schedules: stop, retry successfully, or retry
+with a definite pre-dispatch failure and then stop. Healthy recovery follows,
+optionally replacing the frontend first. The graph retains full traces and initial
+owner identity: 170 states, 168 edges, at most three actions and two publisher
+attempts, with a failing 1,000-state cap. Every generated state and all seven
+required witnesses replay against fresh real three-node stores.
+
+The independent oracle checks exact dispatch and wait ordering, unchanged command
+identity, retained deadline/counter, maximum acknowledged-node count, accumulated
+ambiguity and progress, and the complete outcome classification. In particular,
+a witness's lost acknowledgement must remain ambiguous after a subsequent
+pre-dispatch failure; exhausting retry permission must not turn witnessed work
+back into abortable work. Observed primary application hands off recovery without
+unnecessary retries. After each action, durable observations check the pending
+slot, publication marker, applied indices, issuing reservation and convergence
+proofs. Healthy recovery clears only the terminal slot and keeps the reservation.
+
+Retry permission models the result of budget exhaustion at the wait boundary;
+it does **not** test elapsed-time arithmetic, observation deadlines, or an already
+expired request entering the publisher. The 600-second operation deadlines are
+guards, not model events. Hooks still represent local-client delivery failures,
+not actual socket/authentication failures. Frontend replacement is not a process
+crash, and this increment does not yet stage or reclaim physical payload.
+
+The [accumulated-ambiguity mutation](../crates/storage/src/cluster/model_mutations/forget_prior_publication_ambiguity.patch)
+replaces the publisher's cumulative ambiguity flag with the latest attempt's
+flag. It failed and replayed owner A's
+`[Publish(Scenario { fault: Some(After(1)), wait: RetryNotSent })]`:
+the second attempt incorrectly clears the witness's earlier acknowledgement
+loss. This is controlled sensitivity evidence, not a newly discovered production
+bug. The production accumulation was restored immediately. To repeat in an
+isolated worktree without concurrent edits/builds:
+
+```bash
+patch --dry-run -p1 -i crates/storage/src/cluster/model_mutations/forget_prior_publication_ambiguity.patch
+patch -p1 -i crates/storage/src/cluster/model_mutations/forget_prior_publication_ambiguity.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_outer)' --failure-output immediate
+# Expected failure: the replayable lost-ambiguity counterexample.
+patch -R -p1 -i crates/storage/src/cluster/model_mutations/forget_prior_publication_ambiguity.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_outer)'
+```
+
+Always restore the mutation even after an unexpected command failure.
+
+Verification after restoration: all 47 focused explorer, publication-model and
+existing fanout regressions passed. Storage all-targets/all-features Clippy with
+warnings denied, formatting and the storage boundary checker passed. After
+review, the full `cargo nextest run --locked --no-fail-fast` passed all 9,113
+tests (1 slow, none skipped) in 235.020 s. The preceding full run stopped on
+`direct_put_command_id_race_retries_abandoned_terminal_cleanup`, which was
+already tracked from soak failures and scheduled for separate repair; it passed
+on this user-authorized rerun, without changes to that test or its behavior.
+
 ### Remaining Increments
 
-The broad checklist below stays open: this first increment establishes a
-production-connected store boundary and single publisher attempt/healthy
-finisher, not the full publication/ownership model. Next cover outer publication
-retry/handoff decisions and transport observations, then add physical payload
-and reservation cleanup.
+The broad checklist below stays open: these increments establish a
+production-connected store boundary, publisher attempts, bounded outer retry/
+handoff decisions and a healthy finisher, not the full publication/ownership
+model. Next cover transport observations, then add physical payload and
+reservation cleanup.
 In particular, do not model a dropped response as undoing a committed apply.
 Add request-budget expiry, cancellation and recovery takeover with their real
 authority boundaries before claiming ownership-sensitive recovery coverage.
