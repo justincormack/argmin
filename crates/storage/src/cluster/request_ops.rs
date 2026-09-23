@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 
 use placement::NodeId;
 
+#[cfg(test)]
+#[path = "request_ops/publication_model.rs"]
+mod publication_model;
+
 use super::{
     lock_metadata_command_pg_until, HeldPrimaryMetadataCommandObservation,
     HeldPrimaryMetadataCommandSection, LocalClusterRuntimeState,

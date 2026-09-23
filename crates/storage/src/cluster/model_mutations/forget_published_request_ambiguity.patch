@@ -1,0 +1,9 @@
+--- a/crates/storage/src/cluster/request_ops/support.rs
++++ b/crates/storage/src/cluster/request_ops/support.rs
+@@ -3073,5 +3073,5 @@
+                 applied_nodes,
+                 progress: progress.after_dispatch(is_primary),
+-                may_have_applied: true,
++                may_have_applied: false,
+                 source: source.into(),
+             },
