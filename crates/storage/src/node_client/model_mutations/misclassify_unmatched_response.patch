@@ -1,0 +1,9 @@
+--- a/crates/storage/src/node_client/unix_rpc.rs
++++ b/crates/storage/src/node_client/unix_rpc.rs
+@@ -2159,5 +2159,5 @@
+         };
+         if response.request_id != request_id || response.kind != kind {
+-            return Err(StorageRpcRequestDispatchFailure::MayHaveApplied(
++            return Err(StorageRpcRequestDispatchFailure::NotSent(
+                 self.rpc_payload_error(
+                     "validate storage RPC response",

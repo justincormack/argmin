@@ -7,9 +7,10 @@ Status: local explorer selected; Stateright and the temporary comparison adapter
 removed. Lifecycle baseline and historical incarnation-renewal mutation/replay
 are retained. The follow-on publication model has started at the durable
 slot/reservation boundary and now exercises publisher delivery, bounded outer
-retry/handoff decisions and the pending-command finisher. Phase 1's explicit-time
-and delayed-heartbeat extensions remain open; physical payload ownership is not
-yet modelled.
+retry/handoff decisions and the pending-command finisher. A node-local wire model
+also covers plain-Unix response faults and exact-command retry. Phase 1's
+explicit-time and delayed-heartbeat extensions remain open; physical payload
+ownership is not yet modelled.
 
 ## Goal
 
@@ -870,13 +871,78 @@ tests (1 slow, none skipped) in 235.020 s. The preceding full run stopped on
 already tracked from soak failures and scheduled for separate repair; it passed
 on this user-authorized rerun, without changes to that test or its behavior.
 
+### Increment 4 — Unix Wire Observations And Exact-Command Retry
+
+The default-suite `publication_model_exhausts_unix_transport_observations_and_exact_retry`
+in [the node-client owner](../crates/storage/src/node_client/tests/publication_transport_model.rs)
+runs the production Unix client and storage-node server against a real PG store.
+A one-exchange Unix proxy forwards the exact production-encoded command, waits
+for the real server response, and then controls response delivery. No production
+API, wire format or behavior changes are needed.
+
+The bounded graph has two initial reservation owners and twelve first-exchange
+cases: healthy delivery, absent listener, dropping a received request before
+forwarding it, dropping a response after application, truncated response, invalid
+magic, unsupported frame version, invalid checksum, wrong request ID, wrong
+operation kind, malformed generic response and malformed operation outcome.
+Each is followed by healthy exact-command retry and an attempt to apply the other
+owner's different command at the same epoch/PG/log position. There are 74 full-
+trace states and 72 edges, at most three exchanges, and a failing 1,000-state cap.
+Every state is replayed with a fresh server/store; every exchange uses a fresh
+client/connection. This does not model connection-pool reuse or process restart.
+
+Before injecting post-application faults, the proxy decodes a successful real
+server result. Independent store observations then check the applied index and
+both reservations after every action. Successful replies must carry the exact
+durable replica proof; exact replay and crossed-command rejection must preserve
+that entire proof. An absent listener is `NotSent`; all post-send malformed or
+missing replies are `MayHaveApplied`, even when the proxy knows it did not forward
+the request. A correctly decoded crossed-command rejection is `Definitive`, with
+exact conflict identity. This distinguishes what actually happened from what the
+client can safely infer. Six required witnesses include both reservation owners
+surviving lost replies, retry and crossed-command rejection.
+
+The proxy's steps use socket completion, not sleeps or elapsed-time assertions.
+Read/write deadlines are only deadlock guards. Proxy and server workers are
+joined on normal completion and unwinding; an early client failure wakes proxy
+accept rather than leaving a listener worker behind. This increment covers plain
+Unix framing and operation decoding, not authenticated envelopes, TLS, partial
+request writes, delayed application, real budget expiry, three-replica publisher
+composition or physical payload ownership. Those remain separate boundaries.
+
+The [unmatched-response mutation](../crates/storage/src/node_client/model_mutations/misclassify_unmatched_response.patch)
+changes the real Unix client's response-identity mismatch from `MayHaveApplied`
+to `NotSent`. It failed and replayed owner A's `[Send(WrongRequestId)]` after
+actual server application. This is controlled sensitivity evidence, not a new
+production defect. The production classification was restored immediately.
+To repeat in an isolated worktree without concurrent edits/builds:
+
+```bash
+patch --dry-run -p1 -i crates/storage/src/node_client/model_mutations/misclassify_unmatched_response.patch
+patch -p1 -i crates/storage/src/node_client/model_mutations/misclassify_unmatched_response.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_unix)' --failure-output immediate
+# Expected failure: the replayable wrong-request-ID certainty counterexample.
+patch -R -p1 -i crates/storage/src/node_client/model_mutations/misclassify_unmatched_response.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_unix)'
+```
+
+Always restore the mutation even after an unexpected command failure.
+
+Verification after restoration: all 72 focused explorer, publication-model and
+Unix metadata RPC tests passed. Storage all-targets/all-features Clippy with
+warnings denied, formatting and the storage boundary checker passed. After
+review, the full `cargo nextest run --locked --no-fail-fast` passed all 9,114
+tests (2 slow, none skipped) in 262.487 s.
+
 ### Remaining Increments
 
 The broad checklist below stays open: these increments establish a
 production-connected store boundary, publisher attempts, bounded outer retry/
 handoff decisions and a healthy finisher, not the full publication/ownership
-model. Next cover transport observations, then add physical payload and
-reservation cleanup.
+model. The node transport model adds plain-Unix observations and exact retry;
+authenticated transport and its three-replica publisher composition remain open.
+Next add physical payload and reservation cleanup, retaining those transport
+extensions as explicit follow-up evidence.
 In particular, do not model a dropped response as undoing a committed apply.
 Add request-budget expiry, cancellation and recovery takeover with their real
 authority boundaries before claiming ownership-sensitive recovery coverage.

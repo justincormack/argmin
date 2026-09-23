@@ -4337,5 +4337,8 @@ fn test_metadata_command_recovery_chain(
 mod unix_bucket_rpc;
 #[path = "tests/unix_metadata_rpc.rs"]
 mod unix_metadata_rpc;
+
+#[path = "tests/publication_transport_model.rs"]
+mod publication_transport_model;
 #[path = "tests/unix_object_rpc.rs"]
 mod unix_object_rpc;
