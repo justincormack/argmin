@@ -4,6 +4,9 @@
 use super::*;
 use crate::metadata_command::ReleaseObjectGenerationCommand;
 
+#[path = "direct_put_payload_model.rs"]
+mod payload_model;
+
 #[derive(Clone, Copy)]
 struct DirectPayloadTestIdentity {
     data_pg_id: u32,

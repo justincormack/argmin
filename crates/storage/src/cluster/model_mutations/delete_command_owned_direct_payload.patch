@@ -1,0 +1,14 @@
+--- a/crates/storage/src/cluster/payload_operations.rs
++++ b/crates/storage/src/cluster/payload_operations.rs
+@@ -4754,1 +4754,10 @@
+-                    DirectPutPayloadOwnership::DurableCommand => {}
++                    DirectPutPayloadOwnership::DurableCommand => {
++                        self.delete_direct_put_segment_payload_shards_at_epoch(
++                            effective_bucket_write_reservation.cluster_epoch,
++                            req.data_pg_id,
++                            req.ec,
++                            &req.segment_okh,
++                            req.segment_vid,
++                            written_shards,
++                        );
++                    }

@@ -8,9 +8,10 @@ removed. Lifecycle baseline and historical incarnation-renewal mutation/replay
 are retained. The follow-on publication model has started at the durable
 slot/reservation boundary and now exercises publisher delivery, bounded outer
 retry/handoff decisions and the pending-command finisher. A node-local wire model
-also covers plain-Unix response faults and exact-command retry. Phase 1's
-explicit-time and delayed-heartbeat extensions remain open; physical payload
-ownership is not yet modelled.
+also covers plain-Unix response faults and exact-command retry. The initial
+physical-payload model covers staged handles, cleanup, matching pending ownership
+and healthy recovery. Phase 1's explicit-time and delayed-heartbeat extensions
+remain open; overlapping payloads and concurrent recovery are not yet modelled.
 
 ## Goal
 
@@ -934,6 +935,82 @@ warnings denied, formatting and the storage boundary checker passed. After
 review, the full `cargo nextest run --locked --no-fail-fast` passed all 9,114
 tests (2 slow, none skipped) in 262.487 s.
 
+### Increment 5 — Direct-PUT Payload Ownership And Cleanup
+
+The default-suite `publication_model_exhausts_direct_payload_ownership_and_cleanup_schedules`
+in [the direct-PUT owner](../crates/storage/src/cluster/local/tests/direct_put_payload_model.rs)
+uses real admission-bound payload handles, three local replica stores, one PG,
+EC 2+1 shard files and two requests for the same object. Each request has a
+distinct reservation, generation and body. Production behavior, public APIs and
+formats are unchanged.
+
+Two initial states choose which request settles first. `StageBoth` reserves and
+writes A then B; staging is one atomic model action, not exploration of partial
+shard writes or reservation races. The chosen request is dropped, explicitly
+discarded, conditionally committed, or encounters a fatal inspection error after
+adopting an exact matching pending command. In the last case, healthy authorized
+recovery follows before the other request is touched. Finally the other request
+is dropped or conditionally committed. The first successful commit wins; a later
+conditional rejection must clean only the losing payload. The full-trace graph
+contains 30 states and 28 edges, at most four actions, with a failing 1,000-state
+cap. Each state and all six required witnesses replay against fresh storage.
+
+The pending case uses production command preparation, acknowledgement registration
+and pending-slot insertion, like the existing owner-local regression. The live
+payload handle is **not** manually disarmed: production retry must adopt the
+durable ownership before the injected abandonment-inspection error returns.
+The hook returns a checksum-integrity failure without corrupting stored bytes,
+so subsequent healthy recovery can consume the same exact command. This isolates
+error-path ownership, not recovery from actual durable corruption. Recovery uses
+the existing storage-owned authorized-recovery test entry point and real drain
+state machine, not a direct metadata write.
+
+After every action, the independent ownership oracle checks every request/shard
+identity separately, both generation reservations on every replica, the exact
+pending command and complete replica-proof equality. Caller-owned or pending
+payload must remain; discarded/rejected payload must disappear. Visible metadata
+must name the winning generation and exact segment layout, and reading that
+payload through the storage read path must return the winning body and checksum.
+Commit/recovery must release its generation reservation without touching the
+other request's staged files or reservation. Required witnesses include recovery
+for both owners followed by cancellation of the competing request.
+
+No sleeps, racing test threads, transport faults, process crashes, time advancement
+or ID reuse are scheduled. The model treats each public operation as atomic. It
+does not model partially overlapping physical keys, mid-write cancellation,
+concurrent recovery claim/lease transfer, cleanup failures, route replacement or
+reclamation after overwrite. In particular, cancellation of the other request
+while the command is still pending is deliberately outside this graph, not
+evidence of its safety. Prior increments separately cover publisher and wire
+uncertainty; their composition with these physical ownership states remains open.
+
+The [command-owned cleanup mutation](../crates/storage/src/cluster/model_mutations/delete_command_owned_direct_payload.patch)
+re-enables shard deletion in the lower commit error path after durable command
+ownership has been adopted. It recreates the destructive-cleanup aspect of the
+previously fixed ownership defect, rather than reverting an entire historical
+commit. The model failed and replayed owner A's
+`[StageBoth, SettleFirst(PendingInspectionFailure)]`: physical shard 0 was absent
+while the exact pending command still owned it. The production branch was
+restored immediately. To repeat in an isolated worktree without concurrent edits
+or builds:
+
+```bash
+patch --dry-run -p1 -i crates/storage/src/cluster/model_mutations/delete_command_owned_direct_payload.patch
+patch -p1 -i crates/storage/src/cluster/model_mutations/delete_command_owned_direct_payload.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_direct_payload)' --failure-output immediate
+# Expected failure: replayable deletion of a command-owned physical shard.
+patch -R -p1 -i crates/storage/src/cluster/model_mutations/delete_command_owned_direct_payload.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_direct_payload)'
+```
+
+Always restore the mutation even after an unexpected command failure.
+
+Verification after restoration: all 21 focused explorer, publication-model and
+existing direct-PUT ownership regressions passed. Storage all-targets/all-features
+Clippy with warnings denied, formatting and the storage boundary checker passed.
+After review, the full `cargo nextest run --locked --no-fail-fast` passed all
+9,115 tests (1 slow, none skipped) in 227.209 s.
+
 ### Remaining Increments
 
 The broad checklist below stays open: these increments establish a
@@ -941,8 +1018,11 @@ production-connected store boundary, publisher attempts, bounded outer retry/
 handoff decisions and a healthy finisher, not the full publication/ownership
 model. The node transport model adds plain-Unix observations and exact retry;
 authenticated transport and its three-replica publisher composition remain open.
-Next add physical payload and reservation cleanup, retaining those transport
-extensions as explicit follow-up evidence.
+The initial physical model now covers disjoint staged payloads, deterministic
+cleanup, exact pending ownership and healthy recovery. Next cover partially
+overlapping staging keys and ownership-preserving failure cleanup, then extend
+the recovery/cancellation interleavings. Retain the transport composition as
+explicit follow-up evidence.
 In particular, do not model a dropped response as undoing a committed apply.
 Add request-budget expiry, cancellation and recovery takeover with their real
 authority boundaries before claiming ownership-sensitive recovery coverage.
