@@ -1,0 +1,17 @@
+--- a/crates/storage/src/cluster/payload_operations.rs
++++ b/crates/storage/src/cluster/payload_operations.rs
+@@ -6271,7 +6271,10 @@
+             .collect();
+-        written_shards
++        if written_shards
+             .iter()
+-            .filter(|written| !command_owned_keys.contains(&written.key))
+-            .cloned()
+-            .collect()
++            .any(|written| command_owned_keys.contains(&written.key))
++        {
++            Vec::new()
++        } else {
++            written_shards.to_vec()
++        }
+     }

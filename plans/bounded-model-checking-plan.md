@@ -1011,6 +1011,79 @@ Clippy with warnings denied, formatting and the storage boundary checker passed.
 After review, the full `cargo nextest run --locked --no-fail-fast` passed all
 9,115 tests (1 slow, none skipped) in 227.209 s.
 
+### Increment 6 — Per-Shard Mismatched-Payload Cleanup
+
+The default-suite `publication_model_exhausts_direct_payload_overlap_cleanup_schedules`
+in [the direct-PUT owner](../crates/storage/src/cluster/local/tests/direct_put_overlap_model.rs)
+explores a logically matching pending command with a different physical layout.
+It uses four local replica stores, one PG, real admitted EC 2+2 caller staging,
+and a pending EC 2+1 command prepared through the existing owner-local production
+preparation/store APIs. Both layouts contain real encoded bytes for the same
+body, rather than changing EC metadata over incompatible shard data. No production
+behavior, public API, format or dependency changes are needed.
+
+Four initial states select partial overlap versus disjoint keys and which layout
+is physically written first. Partial overlap shares exactly shard indices 0–2;
+index 3 belongs only to the rejected caller. Disjoint layouts differ in their
+segment key hash. The fixture explicitly verifies the intended path intersection
+and byte equality of shared shards. This is adversarial owner-local setup of a
+physically mismatched command, not a claim that normal issuance can produce those
+two layouts for one reservation.
+
+Because EC shape can change placement ordering, fixture setup searches at most
+128 deterministic reservation candidates for matching shard-0–2 locations,
+releasing each rejected candidate's generation reservation. This bounded setup
+search precedes the schedule; it is not exploration of placement or reservation
+races. Failure to find the required physical intersection fails the model.
+
+`Stage` reserves a generation, writes both layouts and installs the exact pending
+command as one atomic action. The admitted caller's commit must reject the
+mismatch before invoking its authorization callback. It may then restage and be
+rejected once more, or proceed directly to healthy authorized recovery. The graph
+contains 28 full-trace states and 24 edges, at most five actions, with a failing
+1,000-state cap. Every state and all four required positive witnesses replay
+against fresh storage; counterexamples are replayed with their initial layout
+and write order retained.
+
+After every action, an independent per-index oracle checks all physical shard
+paths and their exact bytes. Each rejected attempt must delete every caller-only
+shard while preserving every command-owned shard. The exact pending envelope,
+generation reservation on every replica, absence of premature visible metadata,
+and replica-proof equality are checked. Healthy recovery must consume that exact
+command, release its reservation, and publish its exact segment layout, generation,
+size and ETag. The preserved payload is read and checksum-validated through the
+real storage read path both before and after recovery.
+
+This does not explore partially completed writes, arbitrary shard sets, different
+PGs, cleanup I/O failures, concurrency, budget expiry, recovery takeover, restart
+or transport uncertainty. Rejection and recovery are atomic model actions. Prefix
+fixture teardown explicitly disarms any remaining handle before destroying the
+isolated store; cancellation of a live overlapping request is not a scheduled or
+claimed safe transition. Full transport/recovery/cancellation composition remains
+follow-up work.
+
+The [batch-wide overlap mutation](../crates/storage/src/cluster/model_mutations/preserve_entire_overlapping_direct_payload.patch)
+recreates the earlier defect where any shared key prevents cleanup of the entire
+caller batch. The model failed and replayed `PartialOverlap`, caller written first,
+at `[Stage, Reject]`: caller-only shard 3 remained. The production implementation
+was restored immediately. Run only without concurrent edits or builds, and always
+restore the mutation even after an unexpected failure:
+
+```bash
+patch --dry-run -p1 -i crates/storage/src/cluster/model_mutations/preserve_entire_overlapping_direct_payload.patch
+patch -p1 -i crates/storage/src/cluster/model_mutations/preserve_entire_overlapping_direct_payload.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_direct_payload_overlap)' --failure-output immediate
+# Expected failure: caller-only shard 3 survives rejected mismatched staging.
+patch -R -p1 -i crates/storage/src/cluster/model_mutations/preserve_entire_overlapping_direct_payload.patch
+cargo nextest run --locked -p storage -E 'test(publication_model_exhausts_direct_payload_overlap)'
+```
+
+Verification after restoration: all 21 focused explorer, publication-model and
+direct-PUT ownership regressions passed. Storage all-targets/all-features Clippy
+with warnings denied, formatting and the storage boundary checker passed. After
+review, the full `cargo nextest run --locked --no-fail-fast` passed all 9,116 tests
+(1 slow, none skipped) in 235.786 s.
+
 ### Remaining Increments
 
 The broad checklist below stays open: these increments establish a
@@ -1018,11 +1091,10 @@ production-connected store boundary, publisher attempts, bounded outer retry/
 handoff decisions and a healthy finisher, not the full publication/ownership
 model. The node transport model adds plain-Unix observations and exact retry;
 authenticated transport and its three-replica publisher composition remain open.
-The initial physical model now covers disjoint staged payloads, deterministic
-cleanup, exact pending ownership and healthy recovery. Next cover partially
-overlapping staging keys and ownership-preserving failure cleanup, then extend
-the recovery/cancellation interleavings. Retain the transport composition as
-explicit follow-up evidence.
+The physical models now cover disjoint staged payloads, deterministic cleanup,
+exact pending ownership, per-shard partial-overlap rejection and healthy recovery.
+Next extend the recovery/cancellation interleavings and cleanup-failure schedules.
+Retain the transport composition as explicit follow-up evidence.
 In particular, do not model a dropped response as undoing a committed apply.
 Add request-budget expiry, cancellation and recovery takeover with their real
 authority boundaries before claiming ownership-sensitive recovery coverage.

@@ -7,6 +7,9 @@ use crate::metadata_command::ReleaseObjectGenerationCommand;
 #[path = "direct_put_payload_model.rs"]
 mod payload_model;
 
+#[path = "direct_put_overlap_model.rs"]
+mod overlap_model;
+
 #[derive(Clone, Copy)]
 struct DirectPayloadTestIdentity {
     data_pg_id: u32,
