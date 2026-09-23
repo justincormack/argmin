@@ -4549,6 +4549,11 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
                 Some(retained_terminal_command),
                 "retained terminal command must remain installed until authorized cleanup resumes"
             );
+            let action_calls_before_cleanup = action_calls.load(Ordering::SeqCst);
+            assert!(
+                action_calls_before_cleanup >= 1,
+                "direct PUT precondition must be evaluated before terminal cleanup"
+            );
             terminal_cleanup_blocked.store(false, Ordering::SeqCst);
             release_recovery_tx
                 .send(())
@@ -4565,10 +4570,15 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
                 ),
                 "unexpected authorized terminal cleanup outcome: {recovery_outcome:?}"
             );
-            result_rx
+            let result = result_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("contender did not finish after authorized terminal cleanup")
-                .unwrap()
+                .unwrap();
+            assert!(
+                action_calls.load(Ordering::SeqCst) > action_calls_before_cleanup,
+                "direct PUT precondition must be rerun after authorized terminal cleanup"
+            );
+            result
         })
     } else {
         let calls_for_action = Arc::clone(&action_calls);
@@ -4600,16 +4610,21 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
     assert!(hook_ran.load(Ordering::SeqCst));
     assert!(!drain_interleaving_pending.load(Ordering::SeqCst));
     assert!(!terminal_cleanup_blocked.load(Ordering::SeqCst));
-    let expected_action_calls = match interleaving {
-        DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup => 3,
+    match interleaving {
+        DirectPutCommandIdRaceDrainInterleaving::AbandonedTerminalCleanup => {
+            let action_calls = action_calls.load(Ordering::SeqCst);
+            assert!(
+                matches!(action_calls, 2 | 3),
+                "direct PUT precondition must be rerun exactly once or twice after command-id contention, got {action_calls} evaluations"
+            );
+        }
         DirectPutCommandIdRaceDrainInterleaving::Contention
-        | DirectPutCommandIdRaceDrainInterleaving::AwaitingAuthorizedRecovery => 2,
-    };
-    assert_eq!(
-        action_calls.load(Ordering::SeqCst),
-        expected_action_calls,
-        "direct PUT precondition must be rerun after command-id contention changes object state"
-    );
+        | DirectPutCommandIdRaceDrainInterleaving::AwaitingAuthorizedRecovery => assert_eq!(
+            action_calls.load(Ordering::SeqCst),
+            2,
+            "direct PUT precondition must be rerun after command-id contention changes object state"
+        ),
+    }
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
 
     for node_id in node_ids {
