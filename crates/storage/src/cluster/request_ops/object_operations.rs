@@ -296,9 +296,15 @@ impl super::StorageCluster {
             effect_fence,
         } = route;
         let pg_id = object_pg_id.pg_id();
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("put_object_metadata")
+        .for_pg(pg_id);
         let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
 
-        loop {
+        'request: loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let storage_client = self
                 .local_map
@@ -321,8 +327,11 @@ impl super::StorageCluster {
                         let snapshot_version_id = match requested_version_id {
                             Some(version_id) => {
                                 if version_id != update.object.version_id {
-                                    self.drain_pending_object_metadata_command(
-                                        publisher, pg_id, &command,
+                                    self.drain_snapshot_sensitive_pending_object_metadata_command(
+                                        publisher,
+                                        pg_id,
+                                        &command,
+                                        &mut work_budget,
                                     )?;
                                     continue;
                                 }
@@ -333,7 +342,12 @@ impl super::StorageCluster {
                         let stored = put_object_metadata_route
                             .load_put_object_metadata_snapshot(snapshot_version_id)?;
                         if stored.version_id() != update.object.version_id {
-                            self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
+                            self.drain_snapshot_sensitive_pending_object_metadata_command(
+                                publisher,
+                                pg_id,
+                                &command,
+                                &mut work_budget,
+                            )?;
                             continue;
                         }
                         let (value, version_id, mutation) = match action(&stored) {
@@ -352,15 +366,40 @@ impl super::StorageCluster {
                             ));
                         }
                         require_valid_route().map_err(ObjectPgActionError::Store)?;
-                        self.apply_exact_pending_object_metadata_command(
-                            pg_id,
-                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
-                        )?;
-                        return Ok(Ok(value));
+                        loop {
+                            match self
+                                .apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
+                                    pg_id,
+                                    super::ExactPendingObjectMetadataCommand::for_checked_request(
+                                        &command,
+                                    ),
+                                    &mut work_budget,
+                                )
+                            {
+                                Ok(super::ExactPendingObjectMetadataCommandOutcome::Applied) => {
+                                    return Ok(Ok(value));
+                                }
+                                Ok(
+                                    super::ExactPendingObjectMetadataCommandOutcome::Reinspect,
+                                ) => continue 'request,
+                                Err(error) => self
+                                    .retry_exact_snapshot_sensitive_metadata_command_after_error(
+                                        pg_id,
+                                        &command,
+                                        error,
+                                        &mut work_budget,
+                                    )?,
+                            }
+                        }
                     }
                 }
 
-                self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
+                self.drain_snapshot_sensitive_pending_object_metadata_command(
+                    publisher,
+                    pg_id,
+                    &command,
+                    &mut work_budget,
+                )?;
                 continue;
             }
 
@@ -443,30 +482,67 @@ impl super::StorageCluster {
                     ..
                 })) => {
                     release_bucket_write_proof!()?;
-                    self.drain_one_pending_object_metadata_command(publisher, pg_id, bucket)?;
+                    if let Err(error) = self
+                        .drain_one_pending_object_metadata_command_with_work_budget(
+                            publisher,
+                            pg_id,
+                            bucket,
+                            &mut work_budget,
+                        )
+                    {
+                        self.retry_snapshot_sensitive_metadata_command_install_after_error(
+                            error,
+                            &mut work_budget,
+                        )?;
+                    }
                     continue;
                 }
                 Err(error) => {
                     release_bucket_write_proof!()?;
-                    return Err(error);
+                    self.retry_snapshot_sensitive_metadata_command_install_after_error(
+                        error,
+                        &mut work_budget,
+                    )?;
+                    continue;
                 }
             };
             if let Err(error) = require_valid_route() {
                 release_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
-            let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
-                publisher,
-                pg_id,
-                bucket,
-                &command,
-                Some(effect_fence),
-                &mut evaluated_attempt,
-            ) {
+            let mut install_may_have_applied = false;
+            let install = match self
+                .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    &command,
+                    Some(effect_fence),
+                    &mut work_budget,
+                    &mut install_may_have_applied,
+                    &mut evaluated_attempt,
+                )
+            {
                 Ok(install) => install,
-                Err(error) => {
-                    release_bucket_write_proof!()?;
-                    return Err(error);
+                Err(failure) => {
+                    let error = failure.source;
+                    let pending_owns_reservation = if install_may_have_applied {
+                        self.pending_metadata_command_uses_bucket_write_reservation(
+                            pg_id,
+                            bucket,
+                            &bucket_write_reservation,
+                        )?
+                    } else {
+                        false
+                    };
+                    if !pending_owns_reservation {
+                        release_bucket_write_proof!()?;
+                    }
+                    self.retry_snapshot_sensitive_metadata_command_install_after_error(
+                        error,
+                        &mut work_budget,
+                    )?;
+                    continue 'request;
                 }
             };
             match install {
@@ -477,8 +553,31 @@ impl super::StorageCluster {
                     continue;
                 }
             }
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
-            return Ok(Ok(value));
+            loop {
+                match self.apply_new_object_metadata_command_for_bucket_or_reinspect(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                ) {
+                    Ok(
+                        NewObjectMetadataCommandApplyOutcome::Applied
+                        | NewObjectMetadataCommandApplyOutcome::PublishedPendingRecovery
+                        | NewObjectMetadataCommandApplyOutcome::TerminalCleanupPending,
+                    ) => return Ok(Ok(value)),
+                    Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(_)) => continue 'request,
+                    Ok(NewObjectMetadataCommandApplyOutcome::Abandoned(error)) => {
+                        return Err(error);
+                    }
+                    Err(error) => self
+                        .retry_exact_snapshot_sensitive_metadata_command_after_error(
+                            pg_id,
+                            &command,
+                            error,
+                            &mut work_budget,
+                        )?,
+                }
+            }
         }
     }
 

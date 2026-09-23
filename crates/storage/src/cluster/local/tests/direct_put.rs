@@ -5384,6 +5384,214 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
 }
 
 #[test]
+fn object_tagging_waits_for_direct_put_terminal_cleanup_authorized_recovery() {
+    struct GateRelease(Option<std::sync::mpsc::SyncSender<()>>);
+
+    impl GateRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for GateRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id = crate::tests::stream_session_id("tag-after-put");
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"tag object after direct PUT terminal cleanup handoff";
+    let segment_okh = [0x53; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+
+    let (cleanup_reached_tx, cleanup_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::sync_channel(1);
+    let cleanup_release_rx = Arc::new(Mutex::new(cleanup_release_rx));
+    let cleanup_release_rx_for_hook = Arc::clone(&cleanup_release_rx);
+    let cleanup_blocked = Arc::new(AtomicBool::new(false));
+    let cleanup_blocked_for_hook = Arc::clone(&cleanup_blocked);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let cleanup_hook = cluster.test_install_global_metadata_command_terminal_slot_removal_hook(
+        Arc::new(move |command| {
+            let matches = matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.object.bucket == hook_bucket && commit.object.key == hook_key
+            );
+            if matches && !cleanup_blocked_for_hook.swap(true, Ordering::SeqCst) {
+                cleanup_reached_tx.send(()).unwrap();
+                cleanup_release_rx_for_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("direct PUT terminal cleanup gate was not released");
+            }
+            matches
+        }),
+    );
+    let mut cleanup_release = GateRelease(Some(cleanup_release_tx));
+    let tags =
+        "<Tagging><TagSet><Tag><Key>phase</Key><Value>ready</Value></Tag></TagSet></Tagging>";
+    let expected_tags = crate::tests::object_tags(tags);
+
+    thread::scope(|scope| {
+        let (commit_result_tx, commit_result_rx) = std::sync::mpsc::sync_channel(1);
+        let commit_cluster = &cluster;
+        let commit_shards = &written.written_shards;
+        scope.spawn(move || {
+            commit_result_tx
+                .send(commit_cluster.commit_direct_put_object_from_payload_shards(
+                    &commit_req,
+                    commit_shards,
+                    |_| Ok::<(), ()>(()),
+                ))
+                .unwrap();
+        });
+        cleanup_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("direct PUT did not reach retained terminal cleanup");
+
+        let pg_id = PgId::new(object_pg);
+        let command = pending_metadata_command_for_test(&map, pg_id, &bucket)
+            .expect("retained direct PUT terminal cleanup must preserve the pending command");
+        let command_id = command.id();
+        let (tag_wait_tx, tag_wait_rx) = std::sync::mpsc::sync_channel(1);
+        let wait_observed = Arc::new(AtomicBool::new(false));
+        let wait_observed_for_hook = Arc::clone(&wait_observed);
+        let _wait_hook = cluster
+            .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+                move |candidate| {
+                    if candidate.id() == command_id
+                        && !wait_observed_for_hook.swap(true, Ordering::SeqCst)
+                    {
+                        tag_wait_tx.send(()).unwrap();
+                    }
+                },
+            ));
+
+        let (tag_result_tx, tag_result_rx) = std::sync::mpsc::sync_channel(1);
+        let tag_cluster = &cluster;
+        let tag_bucket = &bucket;
+        let tag_key = &key;
+        scope.spawn(move || {
+            tag_result_tx
+                .send(
+                    tag_cluster.put_object_tags_if(tag_bucket, tag_key, None, tags, |stored| {
+                        Ok::<_, ()>(stored.version_id())
+                    }),
+                )
+                .unwrap();
+        });
+        assert!(matches!(
+            tag_result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        cleanup_release.release();
+        let commit_outcome = commit_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("direct PUT did not return after retaining terminal cleanup")
+            .unwrap()
+            .unwrap();
+        assert_eq!(commit_outcome.live_size, payload.len() as u64);
+        tag_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("object tagging did not wait for authorized direct PUT recovery");
+        assert!(matches!(
+            tag_result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket),
+            Some(command.clone())
+        );
+        assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+
+        drop(cleanup_hook);
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        assert_eq!(
+            tag_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("object tagging did not resume after authorized direct PUT recovery")
+                .unwrap()
+                .unwrap(),
+            crate::VersionId::Null
+        );
+        assert!(wait_observed.load(Ordering::SeqCst));
+    });
+
+    assert!(cleanup_blocked.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_tags(&*pg, &bucket, &key, crate::VersionId::Null)
+                .unwrap(),
+            Some(expected_tags.clone())
+        );
+    }
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn direct_put_irreversible_handoff_wakes_static_authorized_recovery() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

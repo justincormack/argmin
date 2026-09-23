@@ -1444,6 +1444,349 @@ fn object_metadata_update_commands_apply_to_all_acting_object_pg_nodes() {
 }
 
 #[test]
+fn object_metadata_update_waits_for_install_time_authorized_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, contender_key, object_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let (bucket, key, object_pg, _) = bucket_key_with_distinct_object_and_data_pg(topology);
+        let contender_key =
+            key_for_object_pg(topology, &bucket, object_pg, "tag-install-contender-");
+        (bucket, key, contender_key, object_pg)
+    };
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    write_committed_direct_segment_for(&cluster, &bucket, &key, b"tag install handoff");
+
+    let pg_id = PgId::new(object_pg);
+    let contender = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            contender_key,
+            crate::SessionId::try_from("78".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+
+    let install_once = Arc::new(AtomicBool::new(true));
+    let install_once_for_hook = Arc::clone(&install_once);
+    let install_map = Arc::clone(&map);
+    let install_bucket = bucket.clone();
+    let install_contender = contender.clone();
+    let _install_hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            if !install_once_for_hook.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let primary = install_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                primary.node_id().as_u32(),
+                &install_contender,
+                Some(&install_bucket),
+            )
+            .expect("test contender must win the object-tag install-time pending-slot race");
+            let MetadataCommandRecoveryAdmission::Leader(owner) = install_map
+                .runtime_state()
+                .join_metadata_command_recovery(pg_id, &install_contender)
+            else {
+                panic!("test must acquire the object-tag contender recovery flight");
+            };
+            owner.mark_irreversible_handoff(
+                crate::cluster::MetadataCommandRecoveryResolution::IrrevocableConvergencePending,
+            );
+            owner.relinquish_for_authorized_recovery();
+        }));
+
+    let (recovery_wait_tx, recovery_wait_rx) = std::sync::mpsc::sync_channel(1);
+    let contender_id = contender.id();
+    let wait_observed = Arc::new(AtomicBool::new(false));
+    let wait_observed_for_hook = Arc::clone(&wait_observed);
+    let _wait_hook = cluster
+        .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+            move |command| {
+                if command.id() == contender_id
+                    && !wait_observed_for_hook.swap(true, Ordering::SeqCst)
+                {
+                    recovery_wait_tx.send(()).unwrap();
+                }
+            },
+        ));
+    let tags =
+        "<Tagging><TagSet><Tag><Key>phase</Key><Value>installed</Value></Tag></TagSet></Tagging>";
+    let expected_tags = crate::tests::object_tags(tags);
+
+    thread::scope(|scope| {
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let request_cluster = Arc::clone(&cluster);
+        let request_bucket = &bucket;
+        let request_key = &key;
+        scope.spawn(move || {
+            result_tx
+                .send(request_cluster.put_object_tags_if(
+                    request_bucket,
+                    request_key,
+                    None,
+                    tags,
+                    |stored| Ok::<_, ()>(stored.version_id()),
+                ))
+                .unwrap();
+        });
+
+        recovery_wait_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("object tagging did not wait for install-time authorized recovery");
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket),
+            Some(contender.clone())
+        );
+        assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &contender));
+
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &contender, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        assert_eq!(
+            result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("object tagging did not resume after install-time authorized recovery")
+                .unwrap()
+                .unwrap(),
+            crate::VersionId::Null
+        );
+    });
+
+    assert!(!install_once.load(Ordering::SeqCst));
+    assert!(wait_observed.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_tags(&*pg, &bucket, &key, crate::VersionId::Null)
+                .unwrap(),
+            Some(expected_tags.clone())
+        );
+    }
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn object_metadata_update_waits_for_different_version_authorized_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+
+    for requested_version_is_explicit in [true, false] {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let map = Arc::new(
+            LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+                .unwrap(),
+        );
+        let (bucket, key, object_pg, _) = {
+            let topology = map
+                .node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_key_with_distinct_object_and_data_pg(topology)
+        };
+        let cluster =
+            Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+        create_test_bucket_with_versioning(
+            &cluster,
+            &bucket,
+            crate::BucketVersioningState::Enabled,
+        );
+        let older = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0x79; 16],
+            [0x7a; 16],
+            b"older version pending metadata",
+        );
+        let current = write_committed_direct_segment_for_with_versioning(
+            &cluster,
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            [0x7b; 16],
+            [0x7c; 16],
+            b"current version awaiting older metadata",
+        );
+        let pg_id = PgId::new(object_pg);
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(object_pg).unwrap();
+        let older_live =
+            crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, older.version_id)
+                .unwrap()
+                .into_live()
+                .unwrap();
+        drop(pg);
+        let proof = acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        );
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                cluster.operation_epoch(),
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(
+                PutObjectMetadataCommand::from_live_object_and_mutation(
+                    older_live,
+                    PutObjectMetadataMutation::PutLegalHold(crate::StoredLegalHoldStatus::On),
+                    proof,
+                ),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+        let MetadataCommandRecoveryAdmission::Leader(owner) = map
+            .runtime_state()
+            .join_metadata_command_recovery(pg_id, &command)
+        else {
+            panic!("test must acquire the older-version metadata recovery flight");
+        };
+        owner.mark_irreversible_handoff(
+            crate::cluster::MetadataCommandRecoveryResolution::IrrevocableConvergencePending,
+        );
+        owner.relinquish_for_authorized_recovery();
+
+        let (recovery_wait_tx, recovery_wait_rx) = std::sync::mpsc::sync_channel(1);
+        let command_id = command.id();
+        let wait_observed = Arc::new(AtomicBool::new(false));
+        let wait_observed_for_hook = Arc::clone(&wait_observed);
+        let _wait_hook = cluster
+            .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+                move |candidate| {
+                    if candidate.id() == command_id
+                        && !wait_observed_for_hook.swap(true, Ordering::SeqCst)
+                    {
+                        recovery_wait_tx.send(()).unwrap();
+                    }
+                },
+            ));
+        let tags = if requested_version_is_explicit {
+            "<Tagging><TagSet><Tag><Key>route</Key><Value>explicit</Value></Tag></TagSet></Tagging>"
+        } else {
+            "<Tagging><TagSet><Tag><Key>route</Key><Value>current</Value></Tag></TagSet></Tagging>"
+        };
+        let expected_tags = crate::tests::object_tags(tags);
+        let requested_version = requested_version_is_explicit.then_some(current.version_id);
+
+        thread::scope(|scope| {
+            let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+            let request_cluster = Arc::clone(&cluster);
+            let request_bucket = &bucket;
+            let request_key = &key;
+            scope.spawn(move || {
+                result_tx
+                    .send(request_cluster.put_object_tags_if(
+                        request_bucket,
+                        request_key,
+                        requested_version,
+                        tags,
+                        |stored| Ok::<_, ()>(stored.version_id()),
+                    ))
+                    .unwrap();
+            });
+
+            recovery_wait_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("object tagging did not wait for different-version authorized recovery");
+            assert!(matches!(
+                result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                pending_metadata_command_for_test(&map, pg_id, &bucket),
+                Some(command.clone())
+            );
+            assert!(cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command));
+
+            assert_eq!(
+                cluster
+                    .drain_pending_metadata_command_with_authorized_recovery_route(
+                        pg_id, &command, &cluster,
+                    )
+                    .unwrap(),
+                PendingMetadataCommandOutcome::Applied
+            );
+            assert_eq!(
+                result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect(
+                        "object tagging did not resume after different-version authorized recovery",
+                    )
+                    .unwrap()
+                    .unwrap(),
+                current.version_id
+            );
+        });
+
+        assert!(wait_observed.load(Ordering::SeqCst));
+        assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert_eq!(
+                crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, older.version_id,)
+                    .unwrap()
+                    .as_live()
+                    .unwrap()
+                    .object_lock
+                    .legal_hold,
+                crate::StoredLegalHoldStatus::On
+            );
+            assert_eq!(
+                crate::PgMetadataStore::get_object_tags(&*pg, &bucket, &key, current.version_id,)
+                    .unwrap(),
+                Some(expected_tags.clone())
+            );
+        }
+        assert_bucket_write_reservations_released(&map, &bucket);
+    }
+}
+
+#[test]
 fn non_current_epoch_object_metadata_update_fails_closed_without_mutation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
