@@ -5072,7 +5072,7 @@ fn direct_put_retries_irreversible_uncertainty_on_the_active_route() {
 }
 
 #[test]
-fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelated() {
+fn direct_put_terminal_cleanup_handoff_projects_same_object_and_waits_for_unrelated() {
     struct CleanupGateRelease(Option<std::sync::mpsc::SyncSender<()>>);
 
     impl CleanupGateRelease {
@@ -5207,131 +5207,132 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
     let other_reservation_id = crate::tests::stream_session_id("cleanup-other");
     let same_object_reservation_id = crate::tests::stream_session_id("cleanup-same");
     let mut cleanup_release = CleanupGateRelease(Some(cleanup_release_tx));
-    let (outcome, waiter_error, same_object_generation_id, command) = thread::scope(|scope| {
-        let (owner_result_tx, owner_result_rx) = std::sync::mpsc::sync_channel(1);
-        let owner_cluster = &cluster;
-        let owner_request = &commit_req;
-        let owner_shards = &written.written_shards;
-        scope.spawn(move || {
-            owner_result_tx
-                .send(owner_cluster.commit_direct_put_object_from_payload_shards(
-                    owner_request,
-                    owner_shards,
-                    |_| Ok::<(), ()>(()),
-                ))
-                .unwrap();
-        });
-        cleanup_reached_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("direct PUT did not reach terminal cleanup");
+    let (outcome, other_generation_id, same_object_generation_id, command) = thread::scope(
+        |scope| {
+            let (owner_result_tx, owner_result_rx) = std::sync::mpsc::sync_channel(1);
+            let owner_cluster = &cluster;
+            let owner_request = &commit_req;
+            let owner_shards = &written.written_shards;
+            scope.spawn(move || {
+                owner_result_tx
+                    .send(owner_cluster.commit_direct_put_object_from_payload_shards(
+                        owner_request,
+                        owner_shards,
+                        |_| Ok::<(), ()>(()),
+                    ))
+                    .unwrap();
+            });
+            cleanup_reached_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("direct PUT did not reach terminal cleanup");
 
-        let pg_id = PgId::new(object_pg);
-        let command = pending_metadata_command_for_test(&map, pg_id, &bucket)
-            .expect("deferred terminal cleanup must retain the direct PUT command");
+            let pg_id = PgId::new(object_pg);
+            let command = pending_metadata_command_for_test(&map, pg_id, &bucket)
+                .expect("deferred terminal cleanup must retain the direct PUT command");
 
-        let contender_action_calls = Arc::new(AtomicUsize::new(0));
-        let (contender_action_tx, contender_action_rx) = std::sync::mpsc::channel();
-        let (contender_result_tx, contender_result_rx) = std::sync::mpsc::sync_channel(1);
-        let contender_cluster = &cluster;
-        let contender_request = &contender_req;
-        let contender_shards = &contender_written.written_shards;
-        let contender_action_calls_for_thread = Arc::clone(&contender_action_calls);
-        scope.spawn(move || {
-            contender_result_tx
-                .send(
-                    contender_cluster.commit_direct_put_object_from_payload_shards(
-                        contender_request,
-                        contender_shards,
-                        |snapshot| {
-                            contender_action_calls_for_thread.fetch_add(1, Ordering::SeqCst);
-                            contender_action_tx.send(()).unwrap();
-                            if snapshot.existing_etag.is_some() {
-                                Err("object already exists")
-                            } else {
-                                Ok(())
-                            }
-                        },
-                    ),
-                )
-                .unwrap();
-        });
-        contender_action_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("same-object contender did not inspect the published winner");
+            let contender_action_calls = Arc::new(AtomicUsize::new(0));
+            let (contender_action_tx, contender_action_rx) = std::sync::mpsc::channel();
+            let (contender_result_tx, contender_result_rx) = std::sync::mpsc::sync_channel(1);
+            let contender_cluster = &cluster;
+            let contender_request = &contender_req;
+            let contender_shards = &contender_written.written_shards;
+            let contender_action_calls_for_thread = Arc::clone(&contender_action_calls);
+            scope.spawn(move || {
+                contender_result_tx
+                    .send(
+                        contender_cluster.commit_direct_put_object_from_payload_shards(
+                            contender_request,
+                            contender_shards,
+                            |snapshot| {
+                                contender_action_calls_for_thread.fetch_add(1, Ordering::SeqCst);
+                                contender_action_tx.send(()).unwrap();
+                                if snapshot.existing_etag.is_some() {
+                                    Err("object already exists")
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        ),
+                    )
+                    .unwrap();
+            });
+            contender_action_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("same-object contender did not inspect the published winner");
 
-        let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::sync_channel(1);
-        let waiter_cluster = &cluster;
-        let waiter_bucket = &bucket;
-        let waiter_key = &other_key;
-        let waiter_reservation_id = &other_reservation_id;
-        scope.spawn(move || {
-            waiter_result_tx
-                .send(waiter_cluster.reserve_put_object_generation(
-                    waiter_bucket,
-                    waiter_key,
-                    waiter_reservation_id,
-                ))
-                .unwrap();
-        });
-        let waiter_selection_deadline = Instant::now() + Duration::from_secs(5);
-        while !map
-            .runtime_state()
-            .test_metadata_command_recovery_handoff_requested(pg_id, &command)
-        {
-            assert!(
-                Instant::now() < waiter_selection_deadline,
-                "unrelated reservation did not select the direct PUT recovery flight"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-        let waiter_error = waiter_result_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("unrelated reservation waiter remained blocked by terminal cleanup")
-            .unwrap_err();
-        assert!(matches!(
-            cluster.reserve_put_object_generation(&bucket, &other_key, &other_reservation_id),
-            Err(crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery)
-        ));
-        assert_eq!(
-            cleanup_attempts.load(Ordering::SeqCst),
-            1,
-            "an unrelated request must not retry terminal cleanup on its request budget"
-        );
-
-        cleanup_release.release();
-        let outcome = owner_result_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("direct PUT owner did not finish after cleanup release")
-            .unwrap()
-            .unwrap();
-        let retry_observed = Arc::new(AtomicBool::new(false));
-        let retry_observed_for_hook = Arc::clone(&retry_observed);
-        let retry_command_id = command.id();
-        let _retry_hook = cluster
-            .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
-                move |candidate| {
-                    if candidate.id() == retry_command_id {
-                        retry_observed_for_hook.store(true, Ordering::SeqCst);
-                    }
-                },
+            let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::sync_channel(1);
+            let waiter_cluster = &cluster;
+            let waiter_bucket = &bucket;
+            let waiter_key = &other_key;
+            let waiter_reservation_id = &other_reservation_id;
+            scope.spawn(move || {
+                waiter_result_tx
+                    .send(waiter_cluster.reserve_put_object_generation(
+                        waiter_bucket,
+                        waiter_key,
+                        waiter_reservation_id,
+                    ))
+                    .unwrap();
+            });
+            let waiter_selection_deadline = Instant::now() + Duration::from_secs(5);
+            while !map
+                .runtime_state()
+                .test_metadata_command_recovery_handoff_requested(pg_id, &command)
+            {
+                assert!(
+                    Instant::now() < waiter_selection_deadline,
+                    "unrelated reservation did not select the direct PUT recovery flight"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(matches!(
+                waiter_result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
             ));
-        let (same_object_result_tx, same_object_result_rx) = std::sync::mpsc::sync_channel(1);
-        let same_object_cluster = &cluster;
-        let same_object_bucket = &bucket;
-        let same_object_key = &key;
-        let same_object_reservation_id = &same_object_reservation_id;
-        scope.spawn(move || {
-            same_object_result_tx
-                .send(same_object_cluster.reserve_put_object_generation(
-                    same_object_bucket,
-                    same_object_key,
-                    same_object_reservation_id,
-                ))
+            assert_eq!(
+                cleanup_attempts.load(Ordering::SeqCst),
+                1,
+                "an unrelated request must not retry terminal cleanup on its request budget"
+            );
+
+            cleanup_release.release();
+            let outcome = owner_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("direct PUT owner did not finish after cleanup release")
+                .unwrap()
                 .unwrap();
-        });
-        let retry_deadline = Instant::now() + Duration::from_secs(5);
-        while !retry_observed.load(Ordering::SeqCst) {
-            match same_object_result_rx.try_recv() {
+            assert!(matches!(
+                waiter_result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            let retry_observed = Arc::new(AtomicBool::new(false));
+            let retry_observed_for_hook = Arc::clone(&retry_observed);
+            let retry_command_id = command.id();
+            let _retry_hook = cluster
+                .test_install_pending_object_metadata_command_recovery_transferred_hook(Arc::new(
+                    move |candidate| {
+                        if candidate.id() == retry_command_id {
+                            retry_observed_for_hook.store(true, Ordering::SeqCst);
+                        }
+                    },
+                ));
+            let (same_object_result_tx, same_object_result_rx) = std::sync::mpsc::sync_channel(1);
+            let same_object_cluster = &cluster;
+            let same_object_bucket = &bucket;
+            let same_object_key = &key;
+            let same_object_reservation_id = &same_object_reservation_id;
+            scope.spawn(move || {
+                same_object_result_tx
+                    .send(same_object_cluster.reserve_put_object_generation(
+                        same_object_bucket,
+                        same_object_key,
+                        same_object_reservation_id,
+                    ))
+                    .unwrap();
+            });
+            let retry_deadline = Instant::now() + Duration::from_secs(5);
+            while !retry_observed.load(Ordering::SeqCst) {
+                match same_object_result_rx.try_recv() {
                 Ok(result) => panic!(
                     "same-object reservation returned before reobserving authorized recovery: {result:?}"
                 ),
@@ -5340,38 +5341,45 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_rejects_unrelate
                     panic!("same-object reservation result channel disconnected")
                 }
             }
-            assert!(
-                Instant::now() < retry_deadline,
-                "same-object reservation did not reobserve authorized recovery"
+                assert!(
+                    Instant::now() < retry_deadline,
+                    "same-object reservation did not reobserve authorized recovery"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            drop(cleanup_hook);
+            assert_eq!(
+                cluster
+                    .drain_pending_metadata_command_with_authorized_recovery_route(
+                        pg_id, &command, &cluster,
+                    )
+                    .unwrap(),
+                PendingMetadataCommandOutcome::Applied
             );
-            thread::sleep(Duration::from_millis(1));
-        }
-        drop(cleanup_hook);
-        assert_eq!(
-            cluster
-                .drain_pending_metadata_command_with_authorized_recovery_route(
-                    pg_id, &command, &cluster,
-                )
-                .unwrap(),
-            PendingMetadataCommandOutcome::Applied
-        );
-        let same_object_generation_id = same_object_result_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("same-object reservation did not finish after recovery")
-            .expect("same-object reservation must retry the published direct PUT");
-        let contender_result = contender_result_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("same-object contender did not finish cleanup after recovery")
-            .expect("same-object contender must project the published winner");
-        assert!(matches!(contender_result, Err("object already exists")));
-        assert_eq!(contender_action_calls.load(Ordering::SeqCst), 1);
-        (outcome, waiter_error, same_object_generation_id, command)
-    });
+            let other_generation_id = waiter_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("unrelated reservation did not finish after recovery")
+                .expect("unrelated reservation must retry after authorized recovery");
+            let same_object_generation_id = same_object_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("same-object reservation did not finish after recovery")
+                .expect("same-object reservation must retry the published direct PUT");
+            let contender_result = contender_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("same-object contender did not finish cleanup after recovery")
+                .expect("same-object contender must project the published winner");
+            assert!(matches!(contender_result, Err("object already exists")));
+            assert_eq!(contender_action_calls.load(Ordering::SeqCst), 1);
+            (
+                outcome,
+                other_generation_id,
+                same_object_generation_id,
+                command,
+            )
+        },
+    );
     assert_eq!(outcome.live_size, payload.len() as u64);
-    assert!(matches!(
-        waiter_error,
-        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
-    ));
+    assert_eq!(other_generation_id, GenerationId::new(1).unwrap());
     assert!(same_object_generation_id.get() > generation_id.get());
     assert_eq!(cleanup_attempts.load(Ordering::SeqCst), 1);
 

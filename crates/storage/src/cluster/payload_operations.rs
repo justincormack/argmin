@@ -780,14 +780,6 @@ impl StorageCluster {
                 .check("object generation reservation retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-                // Same-object requests must reobserve a published direct PUT so their
-                // conditions see its result. An unrelated direct PUT remains an authorized
-                // recovery handoff that this foreground request must not take over.
-                let unrelated_direct_put = matches!(
-                    command.payload(),
-                    MetadataCommandPayload::CommitDirectPutObject(commit)
-                        if commit.object.bucket != *bucket || commit.object.key != *key
-                );
                 match command.payload() {
                     MetadataCommandPayload::ReserveObjectGeneration(reservation)
                         if reservation.matches_request(bucket, key, reservation_id) =>
@@ -839,9 +831,7 @@ impl StorageCluster {
                     .map(|_| ())
                 {
                     Ok(()) => {}
-                    Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
-                        if !unrelated_direct_put =>
-                    {
+                    Err(ObjectPgActionError::MetadataCommandRecoveryTransferred) => {
                         // This request selected the recovery flight and then relinquished it.
                         // Do not rejoin the drain, but do wait for authorized recovery to
                         // advance that exact command before reobserving generation state.
@@ -852,9 +842,7 @@ impl StorageCluster {
                         )?;
                         continue;
                     }
-                    Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery)
-                        if !unrelated_direct_put =>
-                    {
+                    Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery) => {
                         #[cfg(test)]
                         request_ops::maybe_run_pending_object_metadata_command_recovery_transferred_hook(
                             self.metadata_command_apply_test_hook_scope_id(),
@@ -938,16 +926,7 @@ impl StorageCluster {
                 }
                 AllocatorCleanupFreshInstallOutcome::PendingContenderAwaitingRecovery {
                     command,
-                    error,
                 } => {
-                    let unrelated_direct_put = matches!(
-                        command.payload(),
-                        MetadataCommandPayload::CommitDirectPutObject(commit)
-                            if commit.object.bucket != *bucket || commit.object.key != *key
-                    );
-                    if unrelated_direct_put {
-                        return Err(error);
-                    }
                     self.wait_for_transferred_metadata_command_with_work_budget(
                         pg_id,
                         &command,
@@ -5258,11 +5237,6 @@ impl StorageCluster {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.object.bucket == req.bucket && commit.object.key == req.key
                 );
-                let is_unrelated_direct_put = matches!(
-                    command.payload(),
-                    MetadataCommandPayload::CommitDirectPutObject(commit)
-                        if commit.object.bucket != req.bucket || commit.object.key != req.key
-                );
                 if let Some(commit) = matching_direct_put {
                     bucket_write_proof_command_owned = true;
                     if Self::direct_put_command_owns_request_payload(commit, req) {
@@ -5342,10 +5316,11 @@ impl StorageCluster {
                     Ok(
                         request_ops::MetadataCommandAbandonmentObservation::PublishedPendingRecovery,
                     ) => {
-                        cleanup_direct_put_attempt_before_command_ownership!();
-                        return Err(conflicting_pending_object_metadata_command(
-                            "unrelated published metadata command awaiting recovery",
-                        ));
+                        // Publication belongs to another object, so it cannot change this
+                        // request's object snapshot or staged payload. Wait without joining
+                        // its recovery flight, then retry after the bucket slot advances.
+                        wait_for_unrelated_metadata_recovery!(&command);
+                        continue;
                     }
                     Err(error) => {
                         let error = bucket_snapshot_error_to_object_pg_action_error(error);
@@ -5510,12 +5485,7 @@ impl StorageCluster {
                         &mut work_budget,
                     )
                 {
-                    if matches!(error, ObjectPgActionError::MetadataCommandRecoveryTransferred)
-                        && !is_unrelated_direct_put
-                    {
-                        // An unrelated direct PUT deliberately preserves terminal handoff
-                        // behavior. Other metadata mutations can be reobserved safely after
-                        // their authorized recovery advances the bucket's pending slot.
+                    if matches!(error, ObjectPgActionError::MetadataCommandRecoveryTransferred) {
                         wait_for_unrelated_metadata_recovery!(&command);
                         continue;
                     }

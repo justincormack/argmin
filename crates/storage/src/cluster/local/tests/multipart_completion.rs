@@ -615,7 +615,7 @@ fn direct_put_open_time_convergence_releases_bucket_write_reservation() {
 }
 
 #[test]
-fn object_generation_reservation_transfers_pending_direct_put_commit_to_recovery() {
+fn object_generation_reservation_waits_for_pending_direct_put_recovery() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -707,34 +707,54 @@ fn object_generation_reservation_transfers_pending_direct_put_commit_to_recovery
 
     let unrelated_key = crate::ObjectKey::try_from(format!("{key}-unrelated")).unwrap();
     let next_reservation_id = crate::SessionId::try_from("23".repeat(16)).unwrap();
-    let error = cluster
-        .reserve_put_object_generation(&bucket, &unrelated_key, &next_reservation_id)
-        .expect_err("unrelated reservation must leave published trailing work to recovery");
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery
-    ));
-    let pending_command = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
-        .expect("transferred direct PUT command must remain pending");
-    assert!(cluster.test_metadata_command_recovery_awaiting_authorized(
-        PgId::new(object_pg),
-        &pending_command,
-    ));
-    assert_eq!(
-        cluster
-            .drain_pending_metadata_command_with_authorized_recovery_route(
-                PgId::new(object_pg),
-                &pending_command,
-                &cluster,
-            )
-            .unwrap(),
-        PendingMetadataCommandOutcome::Applied
-    );
-    let next_generation_id = cluster
-        .reserve_put_object_generation(&bucket, &unrelated_key, &next_reservation_id)
-        .unwrap();
+    let pg_id = PgId::new(object_pg);
+    let next_generation_id = thread::scope(|scope| {
+        let (reservation_tx, reservation_rx) = std::sync::mpsc::sync_channel(1);
+        let reservation_cluster = &cluster;
+        let reservation_bucket = &bucket;
+        let reservation_key = &unrelated_key;
+        let reservation_id = &next_reservation_id;
+        scope.spawn(move || {
+            reservation_tx
+                .send(reservation_cluster.reserve_put_object_generation(
+                    reservation_bucket,
+                    reservation_key,
+                    reservation_id,
+                ))
+                .unwrap();
+        });
+
+        let pending_command = pending_metadata_command_for_test(&map, pg_id, &bucket)
+            .expect("transferred direct PUT command must remain pending");
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &pending_command) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "unrelated reservation did not relinquish direct PUT recovery authority"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            reservation_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id,
+                    &pending_command,
+                    &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        reservation_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("unrelated reservation did not finish after direct PUT recovery")
+            .expect("unrelated reservation must retry after authorized recovery")
+    });
     assert_eq!(next_generation_id.get(), generation_id.get());
-    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
 
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();

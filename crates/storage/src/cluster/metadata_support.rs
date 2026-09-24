@@ -314,7 +314,6 @@ enum AllocatorCleanupFreshInstallOutcome {
     PendingContenderDrained,
     PendingContenderAwaitingRecovery {
         command: Box<MetadataCommandEnvelope>,
-        error: ObjectPgActionError,
     },
     LogConflictHandled,
 }

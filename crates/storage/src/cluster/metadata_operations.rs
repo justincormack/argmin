@@ -4912,8 +4912,8 @@ impl StorageCluster {
             work_budget,
         ) {
             Ok(_) => Ok(drained_outcome),
-            Err(error @ ObjectPgActionError::MetadataCommandRecoveryTransferred)
-            | Err(error @ ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery) => {
+            Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
+            | Err(ObjectPgActionError::MetadataCommandAwaitingAuthorizedRecovery) => {
                 #[cfg(test)]
                 request_ops::maybe_run_pending_object_metadata_command_recovery_transferred_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
@@ -4921,7 +4921,6 @@ impl StorageCluster {
                 );
                 Ok(AllocatorCleanupFreshInstallOutcome::PendingContenderAwaitingRecovery {
                     command: Box::new(command),
-                    error,
                 })
             }
             Err(error) => Err(error),
