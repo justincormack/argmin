@@ -251,7 +251,7 @@ Startup validates its ownership and topology before opening PG state.
 | `pg-NNNN/tmp/` | Ephemeral/recoverable residue | Holds unpublished shard files and may retain or resurrect the source name after either shard publication protocol because the source-directory removal is not its durability boundary. No entry here is S3-visible or authoritative once the final shard name is published. Startup removes abandoned entries under bounded rules. |
 | PG durable identity row | Authoritative identity | Stored inside `metadata.db`; binds the PG number and deployment identity before the PG may be reused or served. It is not a separate replaceable file. |
 | `control-plane-node-incarnation` | Authoritative process-incarnation counter | Advanced on storage-node startup through a synced temporary file, rename, and data-directory sync. Prevents a restarted node process from reusing its prior control-plane incarnation. |
-| `control-plane-runtime-config-v1` | Authoritative restart configuration | Canonical, versioned text binding installed routes and runtime authority. This path has a known durability gap described below and must not be used as an example until fixed. |
+| `control-plane-runtime-config-v1` | Authoritative restart configuration | Canonical, versioned text binding installed routes and runtime authority. Replacement writes and syncs a private staging file, atomically renames it, then syncs the storage-node data directory before acknowledging publication. |
 | `.argmin-storage-node.lock` | Ephemeral coordination | Exclusive storage-node data-directory lock. Its contents and continued directory presence are not restart authority. |
 | `.argmin-static-storage.identity` | Authoritative static-deployment identity | Binds the storage directory to the cluster, topology, process, and storage-node identity supplied by the static manifest. Published only after initialization state is durable. |
 | `.argmin-static-storage.initializing` and `.next` companions | Durable transition markers | Prevent partial static storage initialization from being mistaken for either an empty directory or an established node. Creation, replacement, and removal are file/directory synced. |
@@ -373,24 +373,11 @@ map, the inventory, format evidence, and the relevant recovery tests together.
 | single-authority command | replayable journal frame and required file/directory sync before durable command acknowledgement |
 | Raft log mutation | OpenRaft durability completion only after the corresponding WAL durability operation |
 | checkpoint replacement | complete temporary file sync, atomic rename, and parent-directory sync, with its journal/WAL offset relationship preserved |
+| storage-node runtime-config replacement | complete staging-file `sync_all`, atomic rename, and storage-node data-directory sync before the installed route state becomes visible |
 | staged transfer publication | durable artifact plus durable catalogue transition, in the owner-defined order, before returning publication evidence |
 | authority-clock recovery | replacement clock checkpoint and directory entry durable before restored serving authority is acknowledged |
 
 ## Known gaps and required follow-up
-
-### DUR-1: storage-node runtime configuration replacement
-
-`control-plane-runtime-config-v1` is described and consumed as persisted restart
-configuration. Its current writer writes a temporary file, closes it, and
-renames it into place, but does not explicitly sync the temporary file or the
-data-directory entry before reporting publication success. Close plus rename
-provides atomic reader behavior but not the required power-loss guarantee.
-
-The fix should use the standard replacement protocol: write, `sync_all`,
-rename, sync the data directory, and inject failures around both sync points.
-Restart tests should cover an old complete config, a durable new config, and
-every interrupted temporary/replacement state without accepting a partially
-published route map.
 
 ### DUR-2: newly created shard-prefix directory durability
 
@@ -456,6 +443,28 @@ Real-filesystem UATs should separately fill bytes and inodes, exercise restart
 at the reserve boundary, and verify both the wire error and eventual recovery.
 
 ## Resolved inventory findings
+
+### DUR-1: storage-node runtime configuration replacement
+
+`control-plane-runtime-config-v1` now uses the standard durable replacement
+protocol. The writer completes and `sync_all`s the private staging file before
+returning a staged configuration. Publication atomically renames that complete
+file and syncs the storage-node data directory before the in-memory route state
+is changed or success is returned. A pre-rename failure therefore preserves
+the previous complete restart configuration. Failure of the post-rename
+directory sync is a may-have-applied durability failure: the live namespace
+contains the completely written rename target, but the code makes no claim
+about which directory state survives power loss because the required barrier
+was not confirmed. The install is not acknowledged, and retry repeats the
+complete protocol.
+
+Owner-local regressions inject failures at both barriers, verify that the
+post-write handoff is unreachable after a staging-file sync failure, verify
+that an unpublished staging file cannot replace the prior restart state, and
+verify that the live namespace after an ambiguous post-rename directory-sync
+failure contains the complete rename target and can safely repeat the full
+replacement protocol. This injected syscall failure is not a power-loss test
+and establishes no stronger crash-recovery guarantee.
 
 ### Managed storage-node root creation
 

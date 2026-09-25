@@ -997,6 +997,134 @@
     }
 
     #[test]
+    fn storage_node_runtime_config_staging_sync_failure_preserves_previous_config() {
+        let tmp = test_util::tempdir();
+        let current = test_config(&tmp);
+        current.persist_control_plane_runtime_config().unwrap();
+        let current_contents = encode_control_plane_runtime_config(&current);
+        let mut next = current.clone();
+        next.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next.pg_routes[0].cluster_epoch = next.cluster_epoch;
+        let post_write_called = std::cell::Cell::new(false);
+
+        let stage_result = next.stage_control_plane_runtime_config_with_file_sync(
+            || post_write_called.set(true),
+            |_| Err(io::Error::other("injected runtime-config file sync failure")),
+        );
+        let error = match stage_result {
+            Ok(_) => panic!("runtime-config staging unexpectedly survived file sync failure"),
+            Err(error) => error,
+        };
+
+        let path = control_plane_runtime_config_path(&current.data_dir);
+        assert!(matches!(
+            error,
+            StorageNodeServerError::RuntimeConfigWrite {
+                path: error_path,
+                source,
+            } if error_path == path.with_extension("tmp")
+                && source.kind() == io::ErrorKind::Other
+        ));
+        assert!(
+            !post_write_called.get(),
+            "a config whose file sync failed must not reach the staged handoff"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), current_contents);
+        assert!(!path.with_extension("tmp").exists());
+        let restarted = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &current.data_dir,
+            current.node_id,
+            current.default_ec_shape,
+            &current.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_storage_node_process_config_eq(&restarted, &current);
+    }
+
+    #[test]
+    fn storage_node_runtime_config_directory_sync_failure_is_may_have_applied_and_retryable() {
+        let tmp = test_util::tempdir();
+        let current = test_config(&tmp);
+        current.persist_control_plane_runtime_config().unwrap();
+        let mut next = current.clone();
+        next.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next.pg_routes[0].cluster_epoch = next.cluster_epoch;
+        let next_contents = encode_control_plane_runtime_config(&next);
+        let path = control_plane_runtime_config_path(&current.data_dir);
+
+        let staged = next.stage_control_plane_runtime_config().unwrap();
+        let error = staged
+            .publish_with_directory_sync(|directory| {
+                assert_eq!(directory, current.data_dir);
+                assert_eq!(fs::read_to_string(&path).unwrap(), next_contents);
+                assert!(!path.with_extension("tmp").exists());
+                Err(io::Error::other(
+                    "injected runtime-config directory sync failure",
+                ))
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageNodeServerError::RuntimeConfigWrite {
+                path: error_path,
+                source,
+            } if error_path == current.data_dir && source.kind() == io::ErrorKind::Other
+        ));
+        let live_namespace_after_ambiguous_publish =
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &current.data_dir,
+                current.node_id,
+                current.default_ec_shape,
+                &current.socket_path,
+            )
+            .unwrap()
+            .unwrap();
+        assert_storage_node_process_config_eq(&live_namespace_after_ambiguous_publish, &next);
+
+        next.persist_control_plane_runtime_config().unwrap();
+        let restarted_after_retry = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &current.data_dir,
+            current.node_id,
+            current.default_ec_shape,
+            &current.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_storage_node_process_config_eq(&restarted_after_retry, &next);
+    }
+
+    #[test]
+    fn storage_node_runtime_config_unpublished_staging_keeps_previous_restart_config() {
+        let tmp = test_util::tempdir();
+        let current = test_config(&tmp);
+        current.persist_control_plane_runtime_config().unwrap();
+        let mut next = current.clone();
+        next.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next.pg_routes[0].cluster_epoch = next.cluster_epoch;
+        let path = control_plane_runtime_config_path(&current.data_dir);
+
+        let staged = next.stage_control_plane_runtime_config().unwrap();
+        assert_eq!(
+            fs::read_to_string(path.with_extension("tmp")).unwrap(),
+            encode_control_plane_runtime_config(&next)
+        );
+        drop(staged);
+
+        assert!(!path.with_extension("tmp").exists());
+        let restarted = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &current.data_dir,
+            current.node_id,
+            current.default_ec_shape,
+            &current.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_storage_node_process_config_eq(&restarted, &current);
+    }
+
+    #[test]
     fn storage_node_runtime_refresh_persists_control_plane_runtime_config() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);

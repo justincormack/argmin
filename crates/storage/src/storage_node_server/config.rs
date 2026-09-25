@@ -400,6 +400,18 @@ impl StorageNodeProcessConfig {
     where
         F: FnOnce(),
     {
+        self.stage_control_plane_runtime_config_with_file_sync(post_write, File::sync_all)
+    }
+
+    fn stage_control_plane_runtime_config_with_file_sync<F, S>(
+        &self,
+        post_write: F,
+        sync_file: S,
+    ) -> Result<StagedControlPlaneRuntimeConfig, StorageNodeServerError>
+    where
+        F: FnOnce(),
+        S: FnOnce(&File) -> io::Result<()>,
+    {
         prepare_private_data_dir(&self.data_dir).map_err(|source| {
             StorageNodeServerError::RuntimeConfigWrite {
                 path: self.data_dir.clone(),
@@ -418,19 +430,25 @@ impl StorageNodeProcessConfig {
             ));
         }
         let mut tmp_file = create_control_plane_runtime_config_staging_file(&tmp_path)?;
+        let staged = StagedControlPlaneRuntimeConfig {
+            tmp_path: tmp_path.clone(),
+            path,
+            data_dir: self.data_dir.clone(),
+            published: false,
+        };
         tmp_file.write_all(contents.as_bytes()).map_err(|source| {
             StorageNodeServerError::RuntimeConfigWrite {
                 path: tmp_path.clone(),
                 source,
             }
         })?;
+        sync_file(&tmp_file).map_err(|source| StorageNodeServerError::RuntimeConfigWrite {
+            path: tmp_path,
+            source,
+        })?;
         drop(tmp_file);
         post_write();
-        Ok(StagedControlPlaneRuntimeConfig {
-            tmp_path,
-            path,
-            published: false,
-        })
+        Ok(staged)
     }
 
     pub(crate) fn control_plane_heartbeat(
@@ -524,14 +542,34 @@ fn standalone_storage_node_digest_routes(
 struct StagedControlPlaneRuntimeConfig {
     tmp_path: PathBuf,
     path: PathBuf,
+    data_dir: PathBuf,
     published: bool,
 }
 
 impl StagedControlPlaneRuntimeConfig {
-    fn publish(mut self) -> Result<(), StorageNodeServerError> {
+    fn publish(self) -> Result<(), StorageNodeServerError> {
+        self.publish_with_directory_sync(sync_control_plane_runtime_config_directory)
+    }
+
+    fn publish_with_directory_sync<S>(
+        mut self,
+        sync_directory: S,
+    ) -> Result<(), StorageNodeServerError>
+    where
+        S: FnOnce(&Path) -> io::Result<()>,
+    {
         fs::rename(&self.tmp_path, &self.path).map_err(|source| {
             StorageNodeServerError::RuntimeConfigWrite {
                 path: self.path.clone(),
+                source,
+            }
+        })?;
+        // Once rename succeeds, a sync failure is a may-have-applied durability
+        // outcome. Do not acknowledge publication; a retry must repeat the
+        // complete replacement protocol.
+        sync_directory(&self.data_dir).map_err(|source| {
+            StorageNodeServerError::RuntimeConfigWrite {
+                path: self.data_dir.clone(),
                 source,
             }
         })?;
@@ -648,6 +686,14 @@ fn protected_route_keys_for_refresh(
 
 fn control_plane_runtime_config_path(data_dir: &Path) -> PathBuf {
     data_dir.join(StorageNodeProcessConfig::CONTROL_PLANE_RUNTIME_CONFIG_FILE)
+}
+
+fn sync_control_plane_runtime_config_directory(path: &Path) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options.open(path)?.sync_all()
 }
 
 fn create_control_plane_runtime_config_staging_file(
