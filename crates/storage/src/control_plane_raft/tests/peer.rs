@@ -1061,7 +1061,7 @@ fn control_plane_raft_peer_rpc_frame_decode_fails_closed() {
             if message.contains("invalid control-plane OpenRaft peer RPC frame magic")
     ));
 
-    for version in [1_u16, 2, 4] {
+    for version in [1_u16, 2, 3, 5] {
         let mut unsupported_version = encoded.clone();
         unsupported_version[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len()
             ..CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2]
@@ -1271,8 +1271,47 @@ fn assert_raft_peer_rpc_v2_catalogue_is_exact_and_rejected(
 }
 
 #[test]
-fn control_plane_raft_peer_rpc_v3_catalogue_is_exact() {
-    assert_eq!(CONTROL_PLANE_RAFT_PEER_RPC_VERSION, 3);
+fn control_plane_raft_peer_rpc_v3_catalogue_remains_exact_and_rejected() {
+    let aggregate = raft_test_decode_hex(include_str!("peer_rpc_v3_current_aggregate.hex"));
+    assert_eq!(
+        (
+            aggregate.len(),
+            raft_test_hex(&checksum::sha256::digest(&aggregate))
+        ),
+        (
+            2_402,
+            "40b998f30d8e86c27386fdc3574c706dfb5f5e189d4c5d0d4139a82253d2bd6a"
+                .to_owned()
+        )
+    );
+
+    let mut offset = 0;
+    let mut expected_sample = 1_u8;
+    while offset < aggregate.len() {
+        assert_eq!(aggregate[offset], expected_sample);
+        offset += 1;
+        let frame_len = u32::from_be_bytes(
+            aggregate[offset..offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset += std::mem::size_of::<u32>();
+        let frame = &aggregate[offset..offset + frame_len];
+        offset += frame_len;
+        assert!(matches!(
+            raft_peer_rpc_frame_reader_classified(frame),
+            Err(ControlPlaneRaftPeerRpcFrameDecodeError::Format(
+                ControlPlaneRaftPeerRpcFrameFormatError::UnsupportedVersion(3)
+            ))
+        ));
+        expected_sample = expected_sample.checked_add(1).unwrap();
+    }
+    assert_eq!(expected_sample, 21);
+}
+
+#[test]
+fn control_plane_raft_peer_rpc_v4_catalogue_is_exact() {
+    assert_eq!(CONTROL_PLANE_RAFT_PEER_RPC_VERSION, 4);
     assert_raft_peer_rpc_wire_registries_are_complete();
     let optional_capture = ControlPlaneRaftPeerRpcOptionCapture::begin();
     let identity_without_topology =
@@ -1723,7 +1762,7 @@ fn control_plane_raft_peer_rpc_v3_catalogue_is_exact() {
         ),
         (
             2_402,
-            "40b998f30d8e86c27386fdc3574c706dfb5f5e189d4c5d0d4139a82253d2bd6a".to_owned()
+            "9c121218069841f0c72c62a75c47233c1876fadc53cb9aae7f6077ede82ddf54".to_owned()
         )
     );
 }
@@ -1757,7 +1796,10 @@ fn historical_state_v43_command_v31_peer_rpc_v3_catalogue_remains_rejected_evide
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let frame = &AGGREGATE[offset..offset + frame_len];
+        let resealed_frame = reseal_historical_peer_rpc_frame_for_nested_evidence(
+            &AGGREGATE[offset..offset + frame_len],
+        );
+        let frame = resealed_frame.as_slice();
         offset += frame_len;
         let tag_offset = CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + std::mem::size_of::<u16>();
         let result = match frame[tag_offset] {
@@ -1818,7 +1860,10 @@ fn historical_state_v42_command_v30_peer_rpc_v3_catalogue_remains_rejected_evide
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let frame = &AGGREGATE[offset..offset + frame_len];
+        let resealed_frame = reseal_historical_peer_rpc_frame_for_nested_evidence(
+            &AGGREGATE[offset..offset + frame_len],
+        );
+        let frame = resealed_frame.as_slice();
         offset += frame_len;
         let tag_offset = CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + std::mem::size_of::<u16>();
         let result = match frame[tag_offset] {
@@ -1879,7 +1924,10 @@ fn historical_state_v41_command_v29_peer_rpc_v3_catalogue_remains_rejected_evide
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let frame = &AGGREGATE[offset..offset + frame_len];
+        let resealed_frame = reseal_historical_peer_rpc_frame_for_nested_evidence(
+            &AGGREGATE[offset..offset + frame_len],
+        );
+        let frame = resealed_frame.as_slice();
         offset += frame_len;
         let tag_offset = CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + std::mem::size_of::<u16>();
         let result = match frame[tag_offset] {
@@ -1940,7 +1988,10 @@ fn historical_state_v40_command_v28_peer_rpc_v3_catalogue_remains_rejected_evide
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let frame = &AGGREGATE[offset..offset + frame_len];
+        let resealed_frame = reseal_historical_peer_rpc_frame_for_nested_evidence(
+            &AGGREGATE[offset..offset + frame_len],
+        );
+        let frame = resealed_frame.as_slice();
         offset += frame_len;
         let tag_offset = CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + std::mem::size_of::<u16>();
         let result = match frame[tag_offset] {
@@ -2001,7 +2052,10 @@ fn historical_state_v39_command_v27_peer_rpc_v3_catalogue_remains_rejected_evide
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let frame = &AGGREGATE[offset..offset + frame_len];
+        let resealed_frame = reseal_historical_peer_rpc_frame_for_nested_evidence(
+            &AGGREGATE[offset..offset + frame_len],
+        );
+        let frame = resealed_frame.as_slice();
         offset += frame_len;
         let tag_offset = CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + std::mem::size_of::<u16>();
         let result = match frame[tag_offset] {
@@ -2062,7 +2116,10 @@ fn historical_state_v38_command_v26_peer_rpc_v3_catalogue_remains_rejected_evide
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let frame = &AGGREGATE[offset..offset + frame_len];
+        let resealed_frame = reseal_historical_peer_rpc_frame_for_nested_evidence(
+            &AGGREGATE[offset..offset + frame_len],
+        );
+        let frame = resealed_frame.as_slice();
         offset += frame_len;
         let tag_offset = CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + std::mem::size_of::<u16>();
         let result = match frame[tag_offset] {
@@ -2127,7 +2184,10 @@ fn historical_state_v37_command_v25_peer_rpc_v3_catalogue_remains_rejected_evide
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let frame = &AGGREGATE[offset..offset + frame_len];
+        let resealed_frame = reseal_historical_peer_rpc_frame_for_nested_evidence(
+            &AGGREGATE[offset..offset + frame_len],
+        );
+        let frame = resealed_frame.as_slice();
         offset += frame_len;
         let tag_offset = CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + std::mem::size_of::<u16>();
         let result = match frame[tag_offset] {
@@ -2951,7 +3011,7 @@ fn control_plane_raft_peer_server_rejects_authenticated_peer_rpc_versions_before
     .encode_frame_for_peer(&identity)
     .unwrap();
 
-    for (index, version) in [1_u16, 2, 4].into_iter().enumerate() {
+    for (index, version) in [1_u16, 2, 3, 5].into_iter().enumerate() {
         let mut unsupported = current.clone();
         unsupported[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len()
             ..CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2]

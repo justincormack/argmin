@@ -138,9 +138,34 @@ fn control_plane_raft_wal_v2_full_file_layout_is_exact() {
         ),
         (
             714,
-            "f3dfc773aee8b2304ed3215cec1108730f4eb6cf17ba6246f562fcbe8e16e836".to_owned()
+            "1ef19cd3fcbd35de83e6f83d24903b67069ab4ffec35a5a45207e254405ed715".to_owned()
         )
     );
+}
+
+#[test]
+fn control_plane_raft_wal_v2_frame_v1_file_remains_exact_and_rejected() {
+    let bytes = raft_test_decode_hex(include_str!("raft_wal_v2_frame_v1_current.hex"));
+    assert_eq!(
+        (bytes.len(), raft_test_hex(&checksum::sha256::digest(&bytes))),
+        (
+            714,
+            "f3dfc773aee8b2304ed3215cec1108730f4eb6cf17ba6246f562fcbe8e16e836"
+                .to_owned()
+        )
+    );
+    let tmp = test_util::tempdir();
+    let wal_path = tmp.path().join("raft.wal");
+    fs::write(&wal_path, &bytes).unwrap();
+    let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+    let error = wal.read_records_from(0).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported control-plane OpenRaft WAL frame version 1"),
+        "unexpected previous WAL rejection: {error:?}"
+    );
+    assert_eq!(fs::read(&wal_path).unwrap(), bytes);
 }
 
 #[test]
@@ -162,7 +187,7 @@ fn historical_command_v31_wal_v2_file_remains_rejected_evidence() {
     assert!(
         error
             .to_string()
-            .contains("unsupported control-plane command version 31"),
+            .contains("unsupported control-plane OpenRaft WAL frame version 1"),
         "unexpected historical WAL rejection: {error:?}"
     );
     assert_eq!(fs::read(&wal_path).unwrap(), BYTES);
@@ -187,7 +212,7 @@ fn historical_command_v30_wal_v2_file_remains_rejected_evidence() {
     assert!(
         error
             .to_string()
-            .contains("unsupported control-plane command version 30"),
+            .contains("unsupported control-plane OpenRaft WAL frame version 1"),
         "unexpected historical WAL rejection: {error:?}"
     );
     assert_eq!(fs::read(&wal_path).unwrap(), BYTES);
@@ -212,7 +237,7 @@ fn historical_command_v29_wal_v2_file_remains_rejected_evidence() {
     assert!(
         error
             .to_string()
-            .contains("unsupported control-plane command version 29"),
+            .contains("unsupported control-plane OpenRaft WAL frame version 1"),
         "unexpected historical WAL rejection: {error:?}"
     );
     assert_eq!(fs::read(&wal_path).unwrap(), BYTES);
@@ -237,7 +262,7 @@ fn historical_command_v28_wal_v2_file_remains_rejected_evidence() {
     assert!(
         error
             .to_string()
-            .contains("unsupported control-plane command version 28"),
+            .contains("unsupported control-plane OpenRaft WAL frame version 1"),
         "unexpected historical WAL rejection: {error:?}"
     );
     assert_eq!(fs::read(&wal_path).unwrap(), BYTES);
@@ -262,7 +287,7 @@ fn historical_command_v27_wal_v2_file_remains_rejected_evidence() {
     assert!(
         error
             .to_string()
-            .contains("unsupported control-plane command version 27"),
+            .contains("unsupported control-plane OpenRaft WAL frame version 1"),
         "unexpected historical WAL rejection: {error:?}"
     );
     assert_eq!(fs::read(&wal_path).unwrap(), BYTES);
@@ -287,7 +312,7 @@ fn historical_command_v26_wal_v2_file_remains_rejected_evidence() {
     assert!(
         error
             .to_string()
-            .contains("unsupported control-plane command version 26"),
+            .contains("unsupported control-plane OpenRaft WAL frame version 1"),
         "unexpected historical WAL rejection: {error:?}"
     );
     assert_eq!(fs::read(&wal_path).unwrap(), BYTES);
@@ -312,7 +337,7 @@ fn historical_command_v25_wal_v2_file_remains_rejected_evidence() {
     assert!(
         error
             .to_string()
-            .contains("unsupported control-plane command version 25"),
+            .contains("unsupported control-plane OpenRaft WAL frame version 1"),
         "unexpected historical WAL rejection: {error:?}"
     );
     assert_eq!(fs::read(&wal_path).unwrap(), BYTES);
@@ -702,7 +727,8 @@ fn historical_state_v38_restart_compaction_artifact_remains_rejected_evidence() 
             "bdba2f7fe0755c9dbb53d846a874b6037b7e2a829e9c6474e613218c0307d453".to_owned()
         )
     );
-    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(BYTES).unwrap_err();
+    let resealed = reseal_historical_restart_artifact_for_nested_evidence(BYTES);
+    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(&resealed).unwrap_err();
     assert!(
         error
             .to_string()
@@ -723,7 +749,8 @@ fn historical_state_v40_restart_compaction_artifact_remains_rejected_evidence() 
             "0f6decaba938357fe7eb70ea34c07f91cf3f219710f862034f44f80a04975175".to_owned()
         )
     );
-    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(BYTES).unwrap_err();
+    let resealed = reseal_historical_restart_artifact_for_nested_evidence(BYTES);
+    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(&resealed).unwrap_err();
     assert!(
         error
             .to_string()
@@ -744,7 +771,8 @@ fn historical_state_v41_restart_compaction_artifact_remains_rejected_evidence() 
             "be4df37cdc06eac3978a18a842e52135adf4c2bcb25e4fb5f701f261ecc4ba1c".to_owned()
         )
     );
-    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(BYTES).unwrap_err();
+    let resealed = reseal_historical_restart_artifact_for_nested_evidence(BYTES);
+    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(&resealed).unwrap_err();
     assert!(
         error
             .to_string()
@@ -765,7 +793,8 @@ fn historical_state_v39_restart_compaction_artifact_remains_rejected_evidence() 
             "0afd29ed98527f5a9a6c872f65d4315afed97c3a94e9f5640925db1adbd98b64".to_owned()
         )
     );
-    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(BYTES).unwrap_err();
+    let resealed = reseal_historical_restart_artifact_for_nested_evidence(BYTES);
+    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(&resealed).unwrap_err();
     assert!(
         error
             .to_string()
@@ -786,13 +815,63 @@ fn historical_state_v37_restart_compaction_artifact_remains_rejected_evidence() 
             "2d47f6bad67257801f48529cea7ed3ea6cce4f3f9a4e6b5c1769a696ea1d9f8d".to_owned()
         )
     );
-    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(BYTES).unwrap_err();
+    let resealed = reseal_historical_restart_artifact_for_nested_evidence(BYTES);
+    let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(&resealed).unwrap_err();
     assert!(
         error
             .to_string()
             .contains("unsupported control-plane state version 37"),
         "unexpected historical compaction artifact rejection: {error:?}"
     );
+}
+
+#[test]
+fn previous_openraft_checkpoint_pair_remains_exact_and_rejected() {
+    let artifact = raft_test_decode_hex(include_str!("restart_v5_checkpoint_current.hex"));
+    assert_eq!(
+        (
+            artifact.len(),
+            raft_test_hex(&checksum::sha256::digest(&artifact))
+        ),
+        (
+            236,
+            "85c3792be2c0d22886bd4774eb8ba55538e8951a229ce70e4a0473090a47a13d"
+                .to_owned()
+        )
+    );
+    assert!(matches!(
+        ControlPlaneRaftRestartArtifact::decode_durable_artifact_before_restore_validation_classified(
+            &artifact
+        ),
+        Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+            ControlPlaneRaftRestartArtifactFormatError::UnsupportedVersion(5)
+        ))
+    ));
+
+    let wal_bytes = raft_test_decode_hex(include_str!("wal_v2_frame_v1_compacted_current.hex"));
+    assert_eq!(
+        (
+            wal_bytes.len(),
+            raft_test_hex(&checksum::sha256::digest(&wal_bytes))
+        ),
+        (
+            112,
+            "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62"
+                .to_owned()
+        )
+    );
+    let tmp = test_util::tempdir();
+    let wal_path = tmp.path().join("raft.wal");
+    fs::write(&wal_path, &wal_bytes).unwrap();
+    let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+    let error = wal.read_records_from(75).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported control-plane OpenRaft WAL frame version 1"),
+        "unexpected previous compacted WAL rejection: {error:?}"
+    );
+    assert_eq!(fs::read(&wal_path).unwrap(), wal_bytes);
 }
 
 #[test]
@@ -810,10 +889,11 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
             "8ccaea1b423cdeb0876b048301d15e985af7f6aaf5ff9d55cfd106161cd9e37b".to_owned()
         )
     );
-    let historical_error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(
+    let historical = reseal_historical_restart_artifact_for_nested_evidence(
         HISTORICAL_STATE_V43_CHECKPOINT,
-    )
-    .unwrap_err();
+    );
+    let historical_error =
+        ControlPlaneRaftRestartArtifact::decode_durable_artifact(&historical).unwrap_err();
     assert!(
         historical_error
             .to_string()
@@ -834,10 +914,11 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
             "75a25ee0a0248e9759ff8f608570c762ac584f2609367593e544b4b915897f97".to_owned()
         )
     );
-    let historical_error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(
+    let historical = reseal_historical_restart_artifact_for_nested_evidence(
         HISTORICAL_STATE_V42_CHECKPOINT,
-    )
-    .unwrap_err();
+    );
+    let historical_error =
+        ControlPlaneRaftRestartArtifact::decode_durable_artifact(&historical).unwrap_err();
     assert!(
         historical_error
             .to_string()
@@ -899,9 +980,9 @@ fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         (
             75,
             236,
-            "85c3792be2c0d22886bd4774eb8ba55538e8951a229ce70e4a0473090a47a13d".to_owned(),
+            "99f82cbfd574d9751b328f6f3f6ca85b2890c4a75ddc9762abefdf9a95e773f4".to_owned(),
             112,
-            "8b4fb9ff0d05a667fe24a461aaf2f731cdc9b9933ae81a288372bf4ada1b3d62".to_owned()
+            "93e59ed1fe3d5152075c2974b5ca291b4942c958fefe2fc62782eff760c58f29".to_owned()
         )
     );
     assert_eq!(

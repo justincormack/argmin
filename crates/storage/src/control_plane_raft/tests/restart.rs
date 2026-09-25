@@ -401,9 +401,48 @@ fn assert_raft_restart_v4_aggregate_is_exact_and_rejected(
 }
 
 #[test]
-fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complete() {
+fn control_plane_raft_durable_restart_artifact_v5_aggregate_remains_exact_and_rejected() {
+    let aggregate = raft_test_decode_hex(include_str!("restart_artifact_v5_current_aggregate.hex"));
+    assert_eq!(
+        (
+            aggregate.len(),
+            raft_test_hex(&checksum::sha256::digest(&aggregate))
+        ),
+        (
+            2_200,
+            "ce1313accdcd32f655e46b906fa561c1cd981b8034210d34a55547c6372131c5"
+                .to_owned()
+        )
+    );
+
+    let mut offset = 0;
+    let mut artifact_count = 0;
+    while offset < aggregate.len() {
+        let artifact_len = u32::from_be_bytes(
+            aggregate[offset..offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset += std::mem::size_of::<u32>();
+        let artifact = &aggregate[offset..offset + artifact_len];
+        offset += artifact_len;
+        assert!(matches!(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact_before_restore_validation_classified(
+                artifact
+            ),
+            Err(ControlPlaneRaftRestartArtifactDecodeError::Format(
+                ControlPlaneRaftRestartArtifactFormatError::UnsupportedVersion(5)
+            ))
+        ));
+        artifact_count += 1;
+    }
+    assert_eq!(artifact_count, 4);
+}
+
+#[test]
+fn control_plane_raft_durable_restart_artifact_v6_aggregate_is_exact_and_complete() {
     let empty = ControlPlaneRaftRestartArtifact {
-        cluster_name: "restart-v5-empty".to_string(),
+        cluster_name: "restart-v6-empty".to_string(),
         local_node_id: 1,
         wal_replay_offset: 0,
         log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
@@ -413,7 +452,7 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
     let mut empty_snapshot_state_machine = ControlPlaneRaftStateMachine::empty();
     empty_snapshot_state_machine.build_snapshot().unwrap();
     let empty_snapshot = ControlPlaneRaftRestartArtifact {
-        cluster_name: "restart-v5-empty-snapshot".to_string(),
+        cluster_name: "restart-v6-empty-snapshot".to_string(),
         local_node_id: 2,
         wal_replay_offset: 17,
         log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
@@ -426,7 +465,7 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
         1,
         1,
         ControlPlaneCommand::BootstrapInitialClusterMap {
-            nodes: vec![(NodeId::new(1), "/tmp/restart-v5-node-1.sock".to_string())],
+            nodes: vec![(NodeId::new(1), "/tmp/restart-v6-node-1.sock".to_string())],
             pg_ids: vec![PgId::new(7)],
         },
     );
@@ -441,7 +480,7 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
     }
     populated_state_machine.build_snapshot().unwrap();
     let populated = ControlPlaneRaftRestartArtifact {
-        cluster_name: "restart-v5-populated".to_string(),
+        cluster_name: "restart-v6-populated".to_string(),
         local_node_id: 1,
         wal_replay_offset: 0x0102_0304_0506_0708,
         log_store: ControlPlaneRaftLogStoreRestartArtifact {
@@ -459,7 +498,7 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
         .apply_entry(bootstrap_membership.clone())
         .unwrap();
     let purged = ControlPlaneRaftRestartArtifact {
-        cluster_name: "restart-v5-purged".to_string(),
+        cluster_name: "restart-v6-purged".to_string(),
         local_node_id: 1,
         wal_replay_offset: 23,
         log_store: ControlPlaneRaftLogStoreRestartArtifact {
@@ -527,7 +566,7 @@ fn control_plane_raft_durable_restart_artifact_v5_aggregate_is_exact_and_complet
         ),
         (
             2200,
-            "ce1313accdcd32f655e46b906fa561c1cd981b8034210d34a55547c6372131c5"
+            "819699e13a149a697582fae7a5bf6f23eb6494999b4fd8df922204d8af69c08b"
                 .to_string()
         )
     );
@@ -560,7 +599,10 @@ fn historical_state_v43_command_v31_restart_v5_aggregate_remains_rejected_eviden
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let artifact = &AGGREGATE[offset..offset + artifact_len];
+        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
+            &AGGREGATE[offset..offset + artifact_len],
+        );
+        let artifact = resealed_artifact.as_slice();
         offset += artifact_len;
         let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
         let rendered = error.to_string();
@@ -605,7 +647,10 @@ fn historical_state_v42_command_v30_restart_v5_aggregate_remains_rejected_eviden
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let artifact = &AGGREGATE[offset..offset + artifact_len];
+        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
+            &AGGREGATE[offset..offset + artifact_len],
+        );
+        let artifact = resealed_artifact.as_slice();
         offset += artifact_len;
         let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
         let rendered = error.to_string();
@@ -650,7 +695,10 @@ fn historical_state_v41_command_v29_restart_v5_aggregate_remains_rejected_eviden
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let artifact = &AGGREGATE[offset..offset + artifact_len];
+        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
+            &AGGREGATE[offset..offset + artifact_len],
+        );
+        let artifact = resealed_artifact.as_slice();
         offset += artifact_len;
         let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
         let rendered = error.to_string();
@@ -695,7 +743,10 @@ fn historical_state_v40_command_v28_restart_v5_aggregate_remains_rejected_eviden
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let artifact = &AGGREGATE[offset..offset + artifact_len];
+        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
+            &AGGREGATE[offset..offset + artifact_len],
+        );
+        let artifact = resealed_artifact.as_slice();
         offset += artifact_len;
         let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
         let rendered = error.to_string();
@@ -740,7 +791,10 @@ fn historical_state_v39_command_v27_restart_v5_aggregate_remains_rejected_eviden
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let artifact = &AGGREGATE[offset..offset + artifact_len];
+        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
+            &AGGREGATE[offset..offset + artifact_len],
+        );
+        let artifact = resealed_artifact.as_slice();
         offset += artifact_len;
         let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
         let rendered = error.to_string();
@@ -785,7 +839,10 @@ fn historical_state_v38_command_v26_restart_v5_aggregate_remains_rejected_eviden
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let artifact = &AGGREGATE[offset..offset + artifact_len];
+        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
+            &AGGREGATE[offset..offset + artifact_len],
+        );
+        let artifact = resealed_artifact.as_slice();
         offset += artifact_len;
         let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
         let rendered = error.to_string();
@@ -830,7 +887,10 @@ fn historical_state_v37_command_v25_restart_v5_aggregate_remains_rejected_eviden
                 .unwrap(),
         ) as usize;
         offset += std::mem::size_of::<u32>();
-        let artifact = &AGGREGATE[offset..offset + artifact_len];
+        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
+            &AGGREGATE[offset..offset + artifact_len],
+        );
+        let artifact = resealed_artifact.as_slice();
         offset += artifact_len;
         let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
         let rendered = error.to_string();
@@ -849,7 +909,7 @@ fn historical_state_v37_command_v25_restart_v5_aggregate_remains_rejected_eviden
 }
 
 #[test]
-fn control_plane_raft_restart_v5_rejects_noncurrent_nested_versions() {
+fn control_plane_raft_restart_v6_rejects_noncurrent_nested_versions() {
     let command = ControlPlaneCommand::SetNodeMembership {
         node_id: NodeId::new(7),
         membership: NodeMembershipState::Active,
@@ -858,7 +918,7 @@ fn control_plane_raft_restart_v5_rejects_noncurrent_nested_versions() {
     let mut state_machine = ControlPlaneRaftStateMachine::empty();
     let current_snapshot = state_machine.build_snapshot().unwrap().snapshot.into_inner();
     let artifact = ControlPlaneRaftRestartArtifact {
-        cluster_name: "restart-v5-nested-version-evidence".to_owned(),
+        cluster_name: "restart-v6-nested-version-evidence".to_owned(),
         local_node_id: 1,
         wal_replay_offset: 0,
         log_store: ControlPlaneRaftLogStoreRestartArtifact {
@@ -888,7 +948,7 @@ fn control_plane_raft_restart_v5_rejects_noncurrent_nested_versions() {
                 (candidate == current_command.as_slice()).then_some(offset)
             })
             .collect::<Vec<_>>();
-        assert!(!offsets.is_empty(), "nested fixture must occur in restart v5");
+        assert!(!offsets.is_empty(), "nested fixture must occur in restart v6");
         for offset in offsets {
             let mut unsupported = encoded.clone();
             unsupported[offset..offset + previous.len()].copy_from_slice(&previous);
@@ -920,7 +980,7 @@ fn control_plane_raft_restart_v5_rejects_noncurrent_nested_versions() {
                 (candidate == current_snapshot.as_slice()).then_some(offset)
             })
             .collect::<Vec<_>>();
-        assert!(!offsets.is_empty(), "nested fixture must occur in restart v5");
+        assert!(!offsets.is_empty(), "nested fixture must occur in restart v6");
         for offset in offsets {
             let mut unsupported = encoded.clone();
             unsupported[offset..offset + previous.len()].copy_from_slice(&previous);
@@ -1832,7 +1892,7 @@ fn control_plane_openraft_durable_startup_rejects_unsupported_wal_frame_without_
 fn control_plane_openraft_durable_startup_rejects_unsupported_restart_artifact_without_replay() {
     ControlPlaneRaftTypeConfig::run(async {
         let cluster_name = "control-plane-raft-unsupported-restart-artifact-startup-test";
-        for version in [3, 4, CONTROL_PLANE_RAFT_RESTART_VERSION + 1] {
+        for version in [3, 4, 5, CONTROL_PLANE_RAFT_RESTART_VERSION + 1] {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.state");
             let sentinel_path = durable_artifact_sentinel_path(&path);
@@ -3063,7 +3123,7 @@ fn control_plane_raft_durable_restart_artifact_codec_rejects_malformed_frames() 
         ))
     ));
 
-    for version in [3, 4, CONTROL_PLANE_RAFT_RESTART_VERSION + 1] {
+    for version in [3, 4, 5, CONTROL_PLANE_RAFT_RESTART_VERSION + 1] {
         let mut unsupported_version = encoded.clone();
         let version_offset = CONTROL_PLANE_RAFT_RESTART_MAGIC.len();
         unsupported_version[version_offset..version_offset + std::mem::size_of::<u16>()]

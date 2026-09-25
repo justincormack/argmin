@@ -18,7 +18,8 @@ use std::time::Duration;
 use super::*;
 use futures_util::stream;
 use openraft::errors::{
-    Fatal, NetworkError, NotInMembers, RPCError, ReplicationClosed, StreamingError, Unreachable,
+    Fatal, ForwardToLeader, NetworkError, NotInMembers, PreconditionFailed, RPCError,
+    ReplicationClosed, StreamingError, Unreachable,
 };
 use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
 use openraft::raft::{
@@ -27,6 +28,7 @@ use openraft::raft::{
 };
 use openraft::testing::log::{StoreBuilder, Suite as OpenRaftLogSuite};
 use openraft::type_config::TypeConfigExt;
+use openraft::vote::RaftLeaderId;
 use openraft::{AnyError, Config, Membership, Raft, ReadPolicy, StorageError};
 use proptest::prelude::*;
 
@@ -40,6 +42,98 @@ use crate::control_plane_command::LeaseHorizonAuthorityBinding;
 use crate::types::PgId;
 
 const IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn reseal_historical_peer_rpc_frame_for_nested_evidence(frame: &[u8]) -> Vec<u8> {
+    let mut resealed = frame.to_vec();
+    let version_offset = CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len();
+    resealed[version_offset..version_offset + std::mem::size_of::<u16>()]
+        .copy_from_slice(&CONTROL_PLANE_RAFT_PEER_RPC_VERSION.to_be_bytes());
+    refresh_raft_peer_frame_checksum(&mut resealed);
+    resealed
+}
+
+fn reseal_historical_restart_artifact_for_nested_evidence(artifact: &[u8]) -> Vec<u8> {
+    let mut resealed = artifact.to_vec();
+    let version_offset = CONTROL_PLANE_RAFT_RESTART_MAGIC.len();
+    resealed[version_offset..version_offset + std::mem::size_of::<u16>()]
+        .copy_from_slice(&CONTROL_PLANE_RAFT_RESTART_VERSION.to_be_bytes());
+    refresh_raft_restart_artifact_checksum(&mut resealed);
+    resealed
+}
+
+#[test]
+fn discarded_openraft_client_write_maps_to_unconfirmed_result() {
+    let error: RaftError<ControlPlaneRaftTypeConfig, ClientWriteError<ControlPlaneRaftTypeConfig>> =
+        RaftError::APIError(ClientWriteError::LogEntryDiscarded(
+            ForwardToLeader::empty().with_reason(ForwardReason::NotLeader),
+        ));
+
+    let mapped = openraft_client_write_error("client-write", error);
+    assert!(matches!(
+        mapped,
+        ControlPlaneError::RpcUnconfirmed { message }
+            if message.contains("discarded the local log entry")
+                && message.contains("commit status is unknown")
+    ));
+}
+
+#[test]
+fn openraft_write_precondition_failure_is_a_rejection() {
+    let error: RaftError<ControlPlaneRaftTypeConfig, ClientWriteError<ControlPlaneRaftTypeConfig>> =
+        RaftError::APIError(ClientWriteError::PreconditionFailed(
+            PreconditionFailed::LastLogIdMismatch {
+                expected: None,
+                actual: Some(raft_log_id(3, 1, 7)),
+            },
+        ));
+
+    let mapped = openraft_client_write_error("client-write", error);
+    assert!(matches!(
+        mapped,
+        ControlPlaneError::OpenRaftOperation {
+            kind: ControlPlaneRaftOperationErrorKind::Rejected,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn openraft_membership_precondition_failure_is_unconfirmed() {
+    let error: RaftError<ControlPlaneRaftTypeConfig, ClientWriteError<ControlPlaneRaftTypeConfig>> =
+        RaftError::APIError(ClientWriteError::PreconditionFailed(
+            PreconditionFailed::LastMembershipLogIdMismatch {
+                expected: Some(raft_log_id(3, 1, 7)),
+                actual: Some(raft_log_id(3, 1, 8)),
+            },
+        ));
+
+    let mapped = openraft_client_write_error("change-membership", error);
+    assert!(matches!(
+        mapped,
+        ControlPlaneError::RpcUnconfirmed { message }
+            if message.contains("possible committed joint configuration")
+                && message.contains("membership result is partial or unknown")
+    ));
+}
+
+#[test]
+fn openraft_committed_leader_precondition_failure_is_unconfirmed() {
+    let error: RaftError<ControlPlaneRaftTypeConfig, ClientWriteError<ControlPlaneRaftTypeConfig>> =
+        RaftError::APIError(ClientWriteError::PreconditionFailed(
+            PreconditionFailed::CommittedLeaderIdMismatch {
+                expected: LeaderId::new(3, 1),
+                actual: Some(LeaderId::new(4, 2)),
+            },
+        ));
+
+    let mapped = openraft_client_write_error("change-membership", error);
+    assert!(matches!(
+        mapped,
+        ControlPlaneError::RpcUnconfirmed { message }
+            if message.contains("possible committed joint configuration")
+                && message.contains("membership result is partial or unknown")
+    ));
+}
 
 #[test]
 fn low_priority_evidence_submission_yields_to_an_ordinary_waiter() {

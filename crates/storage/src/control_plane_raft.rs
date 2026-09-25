@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use futures_util::future::{select, Either};
 use futures_util::{Stream, StreamExt};
 use openraft::errors::{
-    ClientWriteError, InitializeError, LinearizableReadError, NetworkError, RPCError, RaftError,
-    ReplicationClosed, StreamingError, Unreachable,
+    ClientWriteError, ForwardReason, InitializeError, LinearizableReadError, NetworkError,
+    PreconditionFailed, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
 };
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::impls::Entry;
@@ -100,8 +100,9 @@ pub type ControlPlaneRaftNodeId = u64;
 pub type ControlPlaneRaftTerm = u64;
 pub type ControlPlaneRaftLeaderId = LeaderId<ControlPlaneRaftTerm, ControlPlaneRaftNodeId>;
 pub type ControlPlaneRaftLogId = LogId<ControlPlaneRaftLeaderId>;
-pub type ControlPlaneRaftEntry =
-    Entry<ControlPlaneRaftLeaderId, ControlPlaneCommand, ControlPlaneRaftNodeId, BasicNode>;
+pub type ControlPlaneRaftPayload =
+    EntryPayload<ControlPlaneCommand, ControlPlaneRaftNodeId, BasicNode>;
+pub type ControlPlaneRaftEntry = Entry<ControlPlaneRaftLeaderId, ControlPlaneRaftPayload>;
 mod peer_server;
 mod peer_transport;
 mod state_machine;
@@ -5032,19 +5033,18 @@ impl ControlPlaneRaftAuthority {
         let lease_rejection = matches!(
             error,
             RaftError::APIError(ClientWriteError::ForwardToLeader(forward))
-                if forward.leader_id.is_none()
+                if forward.reason == ForwardReason::LeaseExpired
         );
         if !lease_rejection || Instant::now() >= retry_deadline {
             return Ok(false);
         }
 
-        // An empty ForwardToLeader is also used when OpenRaft rejects an
-        // expired proposal lease before append. It is not sufficient by
-        // itself: leadership loss after append can produce the same error.
-        // Retry only while the exact leader generation and local log tip from
-        // immediately before dispatch are unchanged. Any append, including a
-        // partial membership transition, makes the result ambiguous and is
-        // returned to the caller without automatic resubmission.
+        // LeaseExpired proves OpenRaft rejected the proposal before append.
+        // Still retry only while the exact leader generation and local log tip
+        // from immediately before dispatch are unchanged. Any append,
+        // including a partial membership transition, makes the result
+        // ambiguous and is returned to the caller without automatic
+        // resubmission.
         let Ok(leader) = self.raft.as_leader() else {
             return Ok(false);
         };
@@ -6638,6 +6638,7 @@ openraft::declare_raft_types!(
         Term = ControlPlaneRaftTerm,
         LeaderId = ControlPlaneRaftLeaderId,
         Vote = Vote<ControlPlaneRaftLeaderId>,
+        Payload = ControlPlaneRaftPayload,
         Entry = ControlPlaneRaftEntry,
 );
 
@@ -6869,6 +6870,29 @@ fn openraft_client_write_error(
     context: &'static str,
     error: RaftError<ControlPlaneRaftTypeConfig, ClientWriteError<ControlPlaneRaftTypeConfig>>,
 ) -> ControlPlaneError {
+    if matches!(
+        &error,
+        RaftError::APIError(ClientWriteError::LogEntryDiscarded(_))
+    ) {
+        return ControlPlaneError::RpcUnconfirmed {
+            message: format!(
+                "OpenRaft {context} discarded the local log entry during leader change; commit status is unknown: {error}"
+            ),
+        };
+    }
+    if matches!(
+        &error,
+        RaftError::APIError(ClientWriteError::PreconditionFailed(
+            PreconditionFailed::CommittedLeaderIdMismatch { .. }
+                | PreconditionFailed::LastMembershipLogIdMismatch { .. }
+        ))
+    ) {
+        return ControlPlaneError::RpcUnconfirmed {
+            message: format!(
+                "OpenRaft {context} precondition failed after a possible committed joint configuration; membership result is partial or unknown: {error}"
+            ),
+        };
+    }
     let kind = match &error {
         RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => {
             ControlPlaneRaftOperationErrorKind::ForwardToLeader
@@ -6876,6 +6900,20 @@ fn openraft_client_write_error(
         RaftError::APIError(ClientWriteError::ChangeMembershipError(_)) => {
             ControlPlaneRaftOperationErrorKind::Rejected
         }
+        RaftError::APIError(ClientWriteError::PreconditionFailed(
+            PreconditionFailed::LastLogIdMismatch { .. },
+        )) => {
+            ControlPlaneRaftOperationErrorKind::Rejected
+        }
+        RaftError::APIError(ClientWriteError::PreconditionFailed(
+            PreconditionFailed::CommittedLeaderIdMismatch { .. }
+            | PreconditionFailed::LastMembershipLogIdMismatch { .. },
+        )) => unreachable!(
+            "possibly post-joint-consensus precondition failures are returned as unconfirmed before operation classification"
+        ),
+        RaftError::APIError(ClientWriteError::LogEntryDiscarded(_)) => unreachable!(
+            "discarded client writes are returned as unconfirmed before operation classification"
+        ),
         RaftError::Fatal(_) => ControlPlaneRaftOperationErrorKind::Fatal,
     };
     ControlPlaneError::OpenRaftOperation {
@@ -7443,7 +7481,7 @@ fn read_control_plane_raft_restart_sentinel_bytes<'a>(
 }
 
 const CONTROL_PLANE_RAFT_RESTART_MAGIC: &[u8] = b"ARGMINCPRAFT";
-const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 5;
+const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 6;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC: &[u8] = b"ARGMINCPRAFTSEEN";
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION: u16 = 1;
@@ -7452,14 +7490,14 @@ const CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS: u64 = 1_024;
 const CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const CONTROL_PLANE_RAFT_WAL_MAGIC: &[u8] = b"ARGMINCPRAFTWAL";
-const CONTROL_PLANE_RAFT_WAL_VERSION: u16 = 1;
+const CONTROL_PLANE_RAFT_WAL_VERSION: u16 = 2;
 const CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_WAL_FILE_MAGIC: &[u8] = b"ARGMINCPRAFTWALFILE";
 const CONTROL_PLANE_RAFT_WAL_FILE_VERSION: u16 = 2;
 #[cfg(test)]
 const CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
-const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 3;
+const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 4;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
 const RAFT_ENTRY_MIN_LEN: usize = 8 + 8 + 8 + 1;
 const RAFT_MEMBERSHIP_CONFIG_MIN_LEN: usize = 4;

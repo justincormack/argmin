@@ -2259,6 +2259,27 @@ With Argmin's 250 ms heartbeat setting the new tick interval is 50 ms; this
 preserves the 1.5-3 s election window and the explicit proposal-lease
 confirmation margin.
 
+The 2026-09-25 review upgraded the exact pin to 0.10.0-alpha.35. OpenRaft now
+makes the entry payload an explicit `RaftTypeConfig` associated type, reports
+the reason for leader forwarding, and distinguishes a pre-append routing
+rejection from `LogEntryDiscarded`, whose commit result is unknown after a
+leader change. Argmin binds its existing command/membership entry payload
+explicitly, retries only `LeaseExpired` pre-append rejections under the
+existing leader/log-tip proof, and maps discarded entries to the existing
+unconfirmed-result reconciliation path rather than resubmitting them.
+`LastMembershipLogIdMismatch` and `CommittedLeaderIdMismatch` are likewise
+unconfirmed because OpenRaft can raise either while flattening an already
+committed joint configuration; only `LastLogIdMismatch` is unconditionally a
+pre-append rejection. The
+release also shares concurrent read-index heartbeats and includes election,
+replication-clock, flush-ordering, and snapshot-overflow corrections; the
+existing quorum and durability regressions remain the acceptance boundary.
+Because pre-release deployments do not support binary or durable-state
+upgrade, this dependency boundary advances peer RPC to v4, restart artifacts
+to v6, and WAL frames to v2. Exact v3/v5/v1 evidence is retained and rejected;
+the unchanged transport record, TLS ALPN, WAL file header, and restart sentinel
+keep their independent versions.
+
 ### 4.3 Complete Operational Metrics And Resource Bounds
 
 - add bounded runtime counters for storage RPC connection, session, admission,
