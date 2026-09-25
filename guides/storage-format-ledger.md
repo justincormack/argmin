@@ -12,6 +12,8 @@ implementation work is archived in
 [`storage-format-baseline-and-containment-plan.md`](../plans/completed/storage-format-baseline-and-containment-plan.md).
 Future migration and mixed-version support is tracked separately in
 [`storage-upgrade-versioning-plan.md`](../plans/storage-upgrade-versioning-plan.md).
+The physical artifact inventory, sync/rename ordering, acknowledgement boundaries,
+and crash-recovery rules live in [`durable-storage.md`](durable-storage.md).
 
 This ledger records the exact-current format vector, each owning crate, containing-format
 dependencies, and the immutable evidence retained for current and rejected versions. It does not

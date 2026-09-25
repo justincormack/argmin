@@ -184,12 +184,14 @@ physical paths derive from storage identities, and durable readers validate
 format and logical invariants. These controls reduce injection, traversal, and
 corruption risks; they do not make arbitrary locally modified data trustworthy.
 
-Journals, replication, fsync/publication ordering, reservations, route admission,
-payload leases, and subject-bound handles protect concurrent writes, reads,
-recovery, and deletion. Storage-owned reclaim, repair, backfill, scavenging,
-and abandoned-session cleanup must respect those lifetimes. S3-visible lifecycle
-and Object Lock decisions remain part of the API semantics, not permission for
-physical maintenance to delete any old-looking payload.
+[The durable-storage guide](durable-storage.md) inventories journals, databases,
+shard files, restart artifacts, and transition markers and defines their
+fsync/publication ordering. Replication, reservations, route admission, payload
+leases, and subject-bound handles protect concurrent writes, reads, recovery,
+and deletion. Storage-owned reclaim, repair, backfill, scavenging, and
+abandoned-session cleanup must respect those lifetimes. S3-visible lifecycle and
+Object Lock decisions remain part of the API semantics, not permission for physical
+maintenance to delete any old-looking payload.
 
 Checksums and metadata proofs detect accidental corruption and inconsistent
 state; CRCs are not cryptographic authentication against malicious rewriting.

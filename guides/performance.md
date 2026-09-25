@@ -6,6 +6,8 @@
 While some performance work has taken place, this has not been a high priority.
 Much of the performance however is due to necessary work, such as writing disks,
 fsync, and the erasure coding, encryption and checksum paths documented below.
+The persistence barriers are correctness boundaries, not optional tuning knobs;
+their normative contract is in the [durable-storage guide](durable-storage.md).
 
 There are not yet optimisations for small objects, either on the read side
 or batched fsync on the write side.

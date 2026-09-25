@@ -8,6 +8,10 @@ transition. Phase 6.1 is moving metadata reads and writes from the
 metadata-primary bridge to cluster-owned PG-primary routing; later Phase 6 work
 will turn those routed operations into replicated commands.
 
+The physical persistence surfaces beneath these routing rules, their sync and
+publication ordering, and their crash-recovery classifications are inventoried
+in the [durable-storage guide](durable-storage.md).
+
 ## Operation Classes
 
 Every public `StorageCluster` operation must fit one of these classes:

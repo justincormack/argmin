@@ -10,6 +10,9 @@ containment boundaries is archived in
 [`storage-format-baseline-and-containment-plan.md`](../plans/completed/storage-format-baseline-and-containment-plan.md).
 Future migration and mixed-version implementation work is tracked in
 [`storage-upgrade-versioning-plan.md`](../plans/storage-upgrade-versioning-plan.md).
+Physical persistence ordering, acknowledgement, and crash recovery are governed
+separately by [`durable-storage.md`](durable-storage.md); changing bytes and changing
+when those bytes become durable are both reviewable storage-boundary changes.
 Plans are allowed to change as work progresses; this guide states the
 engineering rules that should remain true.
 
