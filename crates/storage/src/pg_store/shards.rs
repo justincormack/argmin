@@ -10,6 +10,51 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn prepare_durable_shard_prefix<S>(
+    shards_dir: &Path,
+    shard_path: &Path,
+    sync_shards_dir: S,
+) -> Result<(), StoreError>
+where
+    S: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let prefix_dir = shard_path
+        .parent()
+        .expect("canonical shard paths always have a prefix directory");
+    match fs::create_dir(prefix_dir) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(prefix_dir).map_err(|source| StoreError::Io {
+                context: "inspect shard prefix dir",
+                source,
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StoreError::Io {
+                    context: "inspect shard prefix dir",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "shard prefix path is not a real directory",
+                    ),
+                });
+            }
+        }
+        Err(source) => {
+            return Err(StoreError::Io {
+                context: "create shard prefix dir",
+                source,
+            });
+        }
+    }
+
+    // A concurrent writer can observe a newly created prefix before its
+    // creator has synced `shards/`. Sync on every publication attempt so no
+    // writer can acknowledge a shard through an unconfirmed prefix entry.
+    sync_shards_dir(shards_dir).map_err(|source| StoreError::Io {
+        context: "fsync shard root dir",
+        source,
+    })
+}
+
 impl PgStore {
     #[cfg(test)]
     pub(crate) fn test_delete_shard_row(&self, key: &ShardKey) -> Result<(), StoreError> {
@@ -54,8 +99,23 @@ impl PgStore {
         key: &ShardKey,
         data: &[u8],
     ) -> Result<WriteAck, StoreError> {
+        Self::write_shard_file_durable_with_prefix_sync(tmp_dir, shards_dir, key, data, fsync_dir)
+    }
+
+    fn write_shard_file_durable_with_prefix_sync<S>(
+        tmp_dir: &Path,
+        shards_dir: &Path,
+        key: &ShardKey,
+        data: &[u8],
+        sync_shards_dir: S,
+    ) -> Result<WriteAck, StoreError>
+    where
+        S: FnOnce(&Path) -> std::io::Result<()>,
+    {
         let crc = checksum::crc64::checksum(data);
         let stored_size = data.len() as u64;
+        let shard_path = Self::shard_path_for_shards_dir(shards_dir, key);
+        prepare_durable_shard_prefix(shards_dir, &shard_path, sync_shards_dir)?;
 
         // Write to temp file with O_EXCL (unique name via pid + timestamp).
         let tmp_name = format!("shard-{}-{}-{key}", std::process::id(), Self::now_secs());
@@ -87,18 +147,6 @@ impl PgStore {
             }
         })?;
 
-        // Ensure prefix subdirectory exists.
-        let shard_path = Self::shard_path_for_shards_dir(shards_dir, key);
-        if let Some(parent) = shard_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                let _ = fs::remove_file(&tmp_path);
-                StoreError::Io {
-                    context: "create shard prefix dir",
-                    source: e,
-                }
-            })?;
-        }
-
         // Atomic rename.
         fs::rename(&tmp_path, &shard_path).map_err(|e| {
             let _ = fs::remove_file(&tmp_path);
@@ -128,11 +176,29 @@ impl PgStore {
         key: &ShardKey,
         data: &[u8],
     ) -> Result<WriteAck, StoreError> {
+        Self::write_shard_file_durable_if_absent_with_directory_syncs(
+            tmp_dir, shards_dir, key, data, fsync_dir, fsync_dir,
+        )
+    }
+
+    fn write_shard_file_durable_if_absent_with_directory_syncs<R, P>(
+        tmp_dir: &Path,
+        shards_dir: &Path,
+        key: &ShardKey,
+        data: &[u8],
+        sync_shards_dir: R,
+        mut sync_prefix_dir: P,
+    ) -> Result<WriteAck, StoreError>
+    where
+        R: FnOnce(&Path) -> std::io::Result<()>,
+        P: FnMut(&Path) -> std::io::Result<()>,
+    {
         let expected = WriteAck {
             crc64: checksum::crc64::checksum(data),
             stored_size: data.len() as u64,
         };
         let shard_path = Self::shard_path_for_shards_dir(shards_dir, key);
+        prepare_durable_shard_prefix(shards_dir, &shard_path, sync_shards_dir)?;
 
         for _ in 0..2 {
             let sequence = SHARD_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -163,21 +229,11 @@ impl PgStore {
             })?;
             drop(file);
 
-            if let Some(parent) = shard_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    let _ = fs::remove_file(&tmp_path);
-                    StoreError::Io {
-                        context: "create shard prefix dir",
-                        source: e,
-                    }
-                })?;
-            }
-
             match fs::hard_link(&tmp_path, &shard_path) {
                 Ok(()) => {
                     let _ = fs::remove_file(&tmp_path);
                     if let Some(parent) = shard_path.parent() {
-                        fsync_dir(parent).map_err(|e| StoreError::Io {
+                        sync_prefix_dir(parent).map_err(|e| StoreError::Io {
                             context: "fsync shard parent dir",
                             source: e,
                         })?;
@@ -195,6 +251,12 @@ impl PgStore {
                             if actual.stored_size == expected.stored_size
                                 && actual.crc64 == expected.crc64
                             {
+                                if let Some(parent) = shard_path.parent() {
+                                    sync_prefix_dir(parent).map_err(|e| StoreError::Io {
+                                        context: "fsync shard parent dir",
+                                        source: e,
+                                    })?;
+                                }
                                 return Ok(actual);
                             }
                             return Err(StoreError::ShardAckMismatch {
@@ -721,6 +783,185 @@ impl ShardStore for PgStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_renamed_shard_requires_durable_prefix_and_retry_reestablishes_barrier() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+        let key = ShardKey::new(&[0xC1; 16], 17, 0);
+        let shard_path = store.shard_path(&key);
+        let prefix_dir = shard_path.parent().unwrap().to_path_buf();
+        assert!(!prefix_dir.exists());
+
+        let error = PgStore::write_shard_file_durable_with_prefix_sync(
+            &store.tmp_dir,
+            &store.shards_dir,
+            &key,
+            b"first renamed shard",
+            |shards_dir| {
+                assert_eq!(shards_dir, store.shards_dir);
+                assert!(prefix_dir.is_dir());
+                assert!(!shard_path.exists());
+                Err(std::io::Error::other("injected shard-root sync failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::Io {
+                context: "fsync shard root dir",
+                source,
+            } if source.kind() == std::io::ErrorKind::Other
+        ));
+        assert!(!shard_path.exists());
+        assert!(fs::read_dir(&store.tmp_dir).unwrap().next().is_none());
+
+        let retry_synced_existing_prefix = std::cell::Cell::new(false);
+        let ack = PgStore::write_shard_file_durable_with_prefix_sync(
+            &store.tmp_dir,
+            &store.shards_dir,
+            &key,
+            b"first renamed shard",
+            |shards_dir| {
+                assert!(prefix_dir.is_dir());
+                retry_synced_existing_prefix.set(true);
+                fsync_dir(shards_dir)
+            },
+        )
+        .unwrap();
+        assert!(retry_synced_existing_prefix.get());
+        store.register_written_shard(&key, ack).unwrap();
+        drop(store);
+
+        let reopened = PgStore::open(tmp.path(), 0).unwrap();
+        assert_eq!(
+            reopened.read_shard(&key).unwrap().data,
+            b"first renamed shard"
+        );
+    }
+
+    #[test]
+    fn first_linked_shard_requires_durable_prefix_before_publication() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+        let key = ShardKey::new(&[0xD1; 16], 19, 0);
+        let shard_path = store.shard_path(&key);
+        let prefix_dir = shard_path.parent().unwrap().to_path_buf();
+        assert!(!prefix_dir.exists());
+
+        let error = PgStore::write_shard_file_durable_if_absent_with_directory_syncs(
+            &store.tmp_dir,
+            &store.shards_dir,
+            &key,
+            b"first linked shard",
+            |_| Err(std::io::Error::other("injected shard-root sync failure")),
+            fsync_dir,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::Io {
+                context: "fsync shard root dir",
+                source,
+            } if source.kind() == std::io::ErrorKind::Other
+        ));
+        assert!(prefix_dir.is_dir());
+        assert!(!shard_path.exists());
+        assert!(fs::read_dir(&store.tmp_dir).unwrap().next().is_none());
+
+        let ack = PgStore::write_shard_file_durable_if_absent(
+            &store.tmp_dir,
+            &store.shards_dir,
+            &key,
+            b"first linked shard",
+        )
+        .unwrap();
+        store.register_written_shard(&key, ack).unwrap();
+        drop(store);
+
+        let reopened = PgStore::open(tmp.path(), 0).unwrap();
+        assert_eq!(
+            reopened.read_shard(&key).unwrap().data,
+            b"first linked shard"
+        );
+    }
+
+    #[test]
+    fn matching_link_writer_establishes_its_own_durability_barrier() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+        let key = ShardKey::new(&[0xD2; 16], 20, 0);
+        let shard_path = store.shard_path(&key);
+        let prefix_dir = shard_path.parent().unwrap().to_path_buf();
+        let payload = b"concurrent matching shard";
+
+        let writer_tmp_dir = store.tmp_dir.clone();
+        let writer_shards_dir = store.shards_dir.clone();
+        let writer_key = key.clone();
+        let writer_shard_path = shard_path.clone();
+        let writer_prefix_dir = prefix_dir.clone();
+        let (linked_tx, linked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_writer = std::thread::spawn(move || {
+            PgStore::write_shard_file_durable_if_absent_with_directory_syncs(
+                &writer_tmp_dir,
+                &writer_shards_dir,
+                &writer_key,
+                payload,
+                fsync_dir,
+                |parent| {
+                    assert_eq!(parent, writer_prefix_dir);
+                    assert!(writer_shard_path.exists());
+                    linked_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    Err(std::io::Error::other(
+                        "injected first-writer prefix sync failure",
+                    ))
+                },
+            )
+        });
+
+        linked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(shard_path.exists());
+
+        let matching_writer_synced_prefix = std::cell::Cell::new(false);
+        let ack = PgStore::write_shard_file_durable_if_absent_with_directory_syncs(
+            &store.tmp_dir,
+            &store.shards_dir,
+            &key,
+            payload,
+            fsync_dir,
+            |parent| {
+                assert_eq!(parent, prefix_dir);
+                matching_writer_synced_prefix.set(true);
+                fsync_dir(parent)
+            },
+        )
+        .unwrap();
+        assert!(matching_writer_synced_prefix.get());
+
+        release_tx.send(()).unwrap();
+        let first_error = first_writer.join().unwrap().unwrap_err();
+        assert!(matches!(
+            first_error,
+            StoreError::Io {
+                context: "fsync shard parent dir",
+                source,
+            } if source.kind() == std::io::ErrorKind::Other
+        ));
+
+        store.register_written_shard(&key, ack).unwrap();
+        drop(store);
+
+        let reopened = PgStore::open(tmp.path(), 0).unwrap();
+        assert_eq!(reopened.read_shard(&key).unwrap().data, payload);
+    }
 
     #[test]
     fn stat_shard_after_quarantine() {

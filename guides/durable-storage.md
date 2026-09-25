@@ -247,7 +247,7 @@ Startup validates its ownership and topology before opening PG state.
 | --- | --- | --- |
 | storage-node data-directory path and ancestors to its filesystem anchor | Authoritative namespace | Managed startup traverses components using directory descriptors with no-follow semantics, creates missing components privately, and syncs the complete chain from the data directory through its anchor on every preparation. Retrying after any failed barrier therefore reconstructs the complete durability proof before publishing child state. Static and standalone establishment additionally apply their identity/transition protocols. |
 | `pg-NNNN/metadata.db` and SQLite companions | Authoritative | Per-PG metadata, command log, reservations, sessions, reclaim/repair/backfill state, shard catalogue, durable PG identity, and checkpoints. WAL mode and `synchronous=FULL`; transaction commit is the metadata boundary. The initialized database and PG directory are explicitly synced before publication. |
-| `pg-NNNN/shards/<prefix>/<shard-key>` | Authoritative only through matching durable metadata; otherwise recoverable residue | Both writers first create and `sync_data` a same-filesystem temporary file. The overwrite-capable path publishes by rename; the write-if-absent path publishes by hard link and then removes the temporary name. Both sync the destination prefix directory before returning `WriteAck`. A shard may exist before catalogue/object publication. Reads require durable metadata and validate size/checksum. Unindexed files are scavenger input, not visible payload. Creation of a previously absent prefix has the ancestor-directory gap described below. |
+| `pg-NNNN/shards/<prefix>/<shard-key>` | Authoritative only through matching durable metadata; otherwise recoverable residue | Both writers validate or create the real prefix directory and sync `shards/` before publishing through it. They then create and `sync_data` a same-filesystem temporary file. The overwrite-capable path publishes by rename; the write-if-absent path publishes by hard link and then removes the temporary name. Both sync the destination prefix directory before returning `WriteAck`. A shard may exist before catalogue/object publication. Reads require durable metadata and validate size/checksum. Unindexed files are scavenger input, not visible payload. |
 | `pg-NNNN/tmp/` | Ephemeral/recoverable residue | Holds unpublished shard files and may retain or resurrect the source name after either shard publication protocol because the source-directory removal is not its durability boundary. No entry here is S3-visible or authoritative once the final shard name is published. Startup removes abandoned entries under bounded rules. |
 | PG durable identity row | Authoritative identity | Stored inside `metadata.db`; binds the PG number and deployment identity before the PG may be reused or served. It is not a separate replaceable file. |
 | `control-plane-node-incarnation` | Authoritative process-incarnation counter | Advanced on storage-node startup through a synced temporary file, rename, and data-directory sync. Prevents a restarted node process from reusing its prior control-plane incarnation. |
@@ -367,7 +367,7 @@ map, the inventory, format evidence, and the relevant recovery tests together.
 
 | Operation | Durable success requires |
 | --- | --- |
-| shard write | complete bytes, file `sync_data`, atomic destination publication by rename or create-if-absent hard link, and destination parent-directory sync; returned `WriteAck` describes those exact bytes, while any surviving temporary source name is recoverable residue |
+| shard write | durable prefix reachability through a shard-root directory sync, complete bytes, file `sync_data`, atomic destination publication by rename or create-if-absent hard link, and destination prefix-directory sync; returned `WriteAck` describes those exact bytes, while any surviving temporary source name is recoverable residue |
 | PG metadata mutation | successful SQLite transaction commit under the configured WAL/`synchronous=FULL` connection |
 | object or part publication | every referenced shard durably acknowledged before the replicated metadata command becomes visible |
 | single-authority command | replayable journal frame and required file/directory sync before durable command acknowledgement |
@@ -378,19 +378,6 @@ map, the inventory, format evidence, and the relevant recovery tests together.
 | authority-clock recovery | replacement clock checkpoint and directory entry durable before restored serving authority is acknowledged |
 
 ## Known gaps and required follow-up
-
-### DUR-2: newly created shard-prefix directory durability
-
-Shard creation uses `create_dir_all` for `shards/<prefix>`, renames the synced
-file into that directory, and syncs the prefix directory. If the prefix was
-created by that operation, its directory entry in `shards/` is not explicitly
-synced. The common protocol requires syncing every newly created ancestor, not
-only the directory containing the final file.
-
-The fix should distinguish existing and newly created prefixes or use a helper
-that durably creates the directory chain, then add a failure/restart regression
-for the first shard written under a prefix. Metadata publication must not
-proceed unless the complete reachable path is durable.
 
 ### DUR-3: shard unlink durability classification
 
@@ -465,6 +452,30 @@ verify that the live namespace after an ambiguous post-rename directory-sync
 failure contains the complete rename target and can safely repeat the full
 replacement protocol. This injected syscall failure is not a power-loss test
 and establishes no stronger crash-recovery guarantee.
+
+### DUR-2: newly created shard-prefix directory durability
+
+Both shard publication protocols now validate or create the derived prefix as
+a real directory and sync the `shards/` directory before creating or
+publishing a shard through it. The shard-write hot path is deliberately outside
+the PG metadata mutex, so the parent sync runs for every publication attempt:
+syncing only after a successful `mkdir` would allow a concurrent writer to
+observe the prefix and acknowledge a descendant before the creator completed
+the ancestor barrier. The prefix sync after rename or hard link makes the final
+shard name durable. A create-if-absent writer that observes a matching existing
+hard link also performs that sync itself before acknowledging; it never relies
+on the winning writer to complete the barrier.
+
+Owner-local regressions inject failure at the shard-root barrier for both the
+rename and create-if-absent hard-link protocols. They verify that no shard or
+temporary payload is published, then retry through an already existing prefix,
+register the acknowledgement, reopen the PG store, and read the durable shard.
+The retry regression explicitly proves that an existing directory left by a
+failed first attempt does not suppress the required parent sync. A concurrent
+regression pauses the winning hard-link writer before its prefix sync, lets a
+matching contender establish and acknowledge its own barrier, then injects a
+sync failure into the winner and verifies that the acknowledged shard remains
+readable after reopening the store.
 
 ### Managed storage-node root creation
 
