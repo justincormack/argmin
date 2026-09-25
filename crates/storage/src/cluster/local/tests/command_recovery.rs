@@ -2640,6 +2640,117 @@ fn object_generation_reservation_waits_after_transferring_authorized_recovery() 
 }
 
 #[test]
+fn object_version_reservation_waits_after_transferring_unrelated_authorized_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::tests::stream_session_id("version-wait"),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let checksum = command.checksum_crc64();
+    let inject_transfer = Arc::new(AtomicBool::new(true));
+    let inject_transfer_for_hook = Arc::clone(&inject_transfer);
+    let (transfer_reached_tx, transfer_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let _apply_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate.checksum_crc64() == checksum
+                && inject_transfer_for_hook.swap(false, Ordering::SeqCst)
+            {
+                transfer_reached_tx.send(()).unwrap();
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: candidate.id().cluster_epoch(),
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                });
+            }
+            Ok(())
+        }));
+
+    let reservation_result = thread::scope(|scope| {
+        let (reservation_tx, reservation_rx) = std::sync::mpsc::sync_channel(1);
+        let reservation_cluster = &cluster;
+        let reservation_bucket = &bucket;
+        let reservation_key = &key;
+        scope.spawn(move || {
+            reservation_tx
+                .send(reservation_cluster.reserve_next_object_version(
+                    pg_id,
+                    reservation_bucket,
+                    reservation_key,
+                ))
+                .unwrap();
+        });
+
+        transfer_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("version reservation did not transfer the unrelated pending command");
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &command) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "version reservation did not relinquish unrelated recovery authority"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            matches!(
+                reservation_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "version reservation returned before authorized recovery advanced the command"
+        );
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &command, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        reservation_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("version reservation did not finish after authorized recovery")
+    });
+
+    assert_eq!(
+        reservation_result.expect(
+            "version reservation must observe unrelated authorized recovery instead of exposing contention",
+        ),
+        crate::VersionId::from_u64(1)
+    );
+    assert!(!inject_transfer.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
 fn object_generation_install_race_waits_for_authorized_recovery() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

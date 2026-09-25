@@ -1239,7 +1239,17 @@ impl StorageCluster {
                         }
                     }
                 }
-                self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
+                // A preceding allocator or object mutation may have published successfully
+                // while its retained terminal slot awaits authorized recovery. Version
+                // allocation is internal to the enclosing write, so wait for that recovery to
+                // advance the slot and then allocate from the newly observed object state.
+                let _ = self
+                    .drain_pending_object_metadata_command_outcome_or_wait_with_work_budget(
+                        publisher,
+                        pg_id,
+                        &command,
+                        &mut work_budget,
+                    )?;
                 work_budget
                     .sleep_after_contention(
                         "object version reservation unrelated pending retry budget exhausted",
