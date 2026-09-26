@@ -3849,6 +3849,7 @@ impl StorageCluster {
         Ok(())
     }
 
+    #[cfg(test)]
     fn drain_pending_object_metadata_commands_for_publisher_collect(
         &self,
         publisher: impl crate::metadata_command::MetadataCommandPublisher,
@@ -3926,7 +3927,7 @@ impl StorageCluster {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn install_snapshot_sensitive_stream_create_command_or_wait_for_recovery(
+    fn install_snapshot_sensitive_metadata_command_or_wait_for_recovery(
         &self,
         publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
         pg_id: PgId,
@@ -3981,7 +3982,7 @@ impl StorageCluster {
         }
     }
 
-    fn apply_new_stream_create_command_or_wait_for_recovery(
+    fn apply_new_snapshot_sensitive_metadata_command_or_wait_for_recovery(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
@@ -6740,7 +6741,7 @@ impl StorageCluster {
             );
             self.maybe_run_before_metadata_command_pending_install_hook();
             let install = self
-                .install_snapshot_sensitive_stream_create_command_or_wait_for_recovery(
+                .install_snapshot_sensitive_metadata_command_or_wait_for_recovery(
                 publisher,
                 pg_id,
                 bucket,
@@ -6779,7 +6780,7 @@ impl StorageCluster {
                     continue;
                 }
             }
-            match self.apply_new_stream_create_command_or_wait_for_recovery(
+            match self.apply_new_snapshot_sensitive_metadata_command_or_wait_for_recovery(
                 pg_id,
                 bucket,
                 &command,

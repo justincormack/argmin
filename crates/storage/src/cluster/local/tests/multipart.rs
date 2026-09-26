@@ -1841,6 +1841,138 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
 }
 
 #[test]
+fn multipart_create_waits_after_transferring_unrelated_authorized_recovery() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let pending = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::tests::stream_session_id("mpu-wait"),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending);
+
+    let checksum = pending.checksum_crc64();
+    let inject_transfer = Arc::new(AtomicBool::new(true));
+    let inject_transfer_for_hook = Arc::clone(&inject_transfer);
+    let (transfer_reached_tx, transfer_reached_rx) = std::sync::mpsc::sync_channel(1);
+    let _apply_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate.checksum_crc64() == checksum
+                && inject_transfer_for_hook.swap(false, Ordering::SeqCst)
+            {
+                transfer_reached_tx.send(()).unwrap();
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: candidate.id().cluster_epoch(),
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                });
+            }
+            Ok(())
+        }));
+
+    let upload_id = upload_id_from_label("mpuauthwait");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+
+    let create_result = thread::scope(|scope| {
+        let (create_tx, create_rx) = std::sync::mpsc::sync_channel(1);
+        let create_cluster = &cluster;
+        let create_bucket = &bucket;
+        let create_key = &key;
+        let create_request = &create;
+        scope.spawn(move || {
+            create_tx
+                .send(create_cluster.create_multipart_upload(
+                    create_bucket,
+                    create_key,
+                    crate::BucketSnapshotRequest::default(),
+                    |_snapshot, existing_object| {
+                        assert!(existing_object.is_none());
+                        Ok::<_, ()>(((), create_request.clone()))
+                    },
+                ))
+                .unwrap();
+        });
+
+        transfer_reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("multipart create did not transfer the unrelated pending command");
+        let handoff_deadline = Instant::now() + Duration::from_secs(5);
+        while !cluster.test_metadata_command_recovery_awaiting_authorized(pg_id, &pending) {
+            assert!(
+                Instant::now() < handoff_deadline,
+                "multipart create did not relinquish unrelated recovery authority"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            matches!(
+                create_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "multipart create returned before authorized recovery advanced the command"
+        );
+        assert_eq!(
+            cluster
+                .drain_pending_metadata_command_with_authorized_recovery_route(
+                    pg_id, &pending, &cluster,
+                )
+                .unwrap(),
+            PendingMetadataCommandOutcome::Applied
+        );
+        create_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("multipart create did not finish after authorized recovery")
+    });
+
+    let outcome = create_result
+        .expect("multipart create must wait for unrelated authorized recovery")
+        .expect("multipart create action must succeed");
+    assert_eq!(outcome.upload_id, upload_id);
+    assert!(!inject_transfer.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
 fn multipart_create_partial_apply_reopens_and_converges() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

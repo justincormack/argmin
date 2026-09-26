@@ -339,7 +339,7 @@ impl super::StorageCluster {
                 }
                 self.maybe_run_before_metadata_command_pending_install_hook();
                 let install = match self
-                    .install_snapshot_sensitive_stream_create_command_or_wait_for_recovery(
+                    .install_snapshot_sensitive_metadata_command_or_wait_for_recovery(
                         publisher,
                         pg_id,
                         bucket,
@@ -392,7 +392,7 @@ impl super::StorageCluster {
                         return Ok(Ok(Attempt::Retry));
                     }
                 }
-                match self.apply_new_stream_create_command_or_wait_for_recovery(
+                match self.apply_new_snapshot_sensitive_metadata_command_or_wait_for_recovery(
                     pg_id,
                     bucket,
                     &command,
@@ -1121,11 +1121,23 @@ impl super::StorageCluster {
         let pg_id = object_pg_id.pg_id();
         let mut authorized_issuance = AuthorizedMultipartUploadCreateIssuance::default();
         let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
+        let mut work_budget = super::RequestWorkBudget::new(
+            super::BUCKET_WRITE_DRAIN_RETRY_BUDGET,
+            None,
+        )
+        .for_operation("create_multipart_upload")
+        .for_pg(pg_id);
         loop {
             require_valid_route()?;
+            work_budget
+                .check("multipart create retry budget exhausted")
+                .map_err(BucketSnapshotLoadError::Store)?;
             let applied_commands = if snapshot_retry_phase.pending_drain_allowed() {
-                self.drain_pending_object_metadata_commands_for_publisher_collect(
-                    publisher, pg_id, bucket,
+                self.drain_pending_object_metadata_commands_for_publisher_collect_waiting_for_recovery(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    &mut work_budget,
                 )
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
             } else {
@@ -1243,8 +1255,13 @@ impl super::StorageCluster {
                     Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                         ..
                     })) => {
-                        self.drain_one_pending_object_metadata_command(publisher, pg_id, bucket)
-                            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                        self.drain_one_pending_object_metadata_command_waiting_for_recovery(
+                            publisher,
+                            pg_id,
+                            bucket,
+                            &mut work_budget,
+                        )
+                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                         return Ok(Ok(Attempt::Retry));
                     }
                     Err(error) => {
@@ -1271,12 +1288,13 @@ impl super::StorageCluster {
                 self.maybe_run_before_multipart_create_command_install_hook(&command);
                 require_valid_route()?;
                 match self
-                    .install_snapshot_sensitive_metadata_command_or_drain(
+                    .install_snapshot_sensitive_metadata_command_or_wait_for_recovery(
                         publisher,
                         pg_id,
                         bucket,
                         &command,
                         Some(effect_fence),
+                        &mut work_budget,
                         &mut evaluated_attempt,
                     )
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
@@ -1287,27 +1305,36 @@ impl super::StorageCluster {
                         return Ok(Ok(Attempt::Retry));
                     }
                 }
-                if let Err(error) =
-                    self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)
-                {
-                    match self.pending_metadata_command_uses_bucket_write_reservation(
-                        pg_id, bucket, &proof,
-                    ) {
-                        Ok(true) => {
-                            disposition =
-                                super::BucketWriteReservationDisposition::TransferredToCommand;
-                        }
-                        Ok(false) => {}
-                        Err(lookup_error) => {
-                            disposition = super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure;
-                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                lookup_error,
-                            ));
-                        }
+                match self.apply_new_snapshot_sensitive_metadata_command_or_wait_for_recovery(
+                    pg_id,
+                    bucket,
+                    &command,
+                    &mut work_budget,
+                ) {
+                    Ok(super::ExactPendingObjectMetadataCommandOutcome::Applied) => {}
+                    Ok(super::ExactPendingObjectMetadataCommandOutcome::Reinspect) => {
+                        return Ok(Ok(Attempt::Retry));
                     }
-                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                        error,
-                    ));
+                    Err(error) => {
+                        match self.pending_metadata_command_uses_bucket_write_reservation(
+                            pg_id, bucket, &proof,
+                        ) {
+                            Ok(true) => {
+                                disposition =
+                                    super::BucketWriteReservationDisposition::TransferredToCommand;
+                            }
+                            Ok(false) => {}
+                            Err(lookup_error) => {
+                                disposition = super::BucketWriteReservationDisposition::PreserveForOwnershipCheckFailure;
+                                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                    lookup_error,
+                                ));
+                            }
+                        }
+                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                            error,
+                        ));
+                    }
                 }
                 disposition = super::BucketWriteReservationDisposition::TransferredToCommand;
 
@@ -1785,7 +1812,7 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             match self
-                .install_snapshot_sensitive_stream_create_command_or_wait_for_recovery(
+                .install_snapshot_sensitive_metadata_command_or_wait_for_recovery(
                     publisher,
                     pg_id,
                     bucket,
@@ -1817,7 +1844,7 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             }
-            match self.apply_new_stream_create_command_or_wait_for_recovery(
+            match self.apply_new_snapshot_sensitive_metadata_command_or_wait_for_recovery(
                 pg_id,
                 bucket,
                 &command,
