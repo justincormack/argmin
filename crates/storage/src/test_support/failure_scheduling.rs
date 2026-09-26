@@ -126,7 +126,7 @@ impl StorageClusterFailureTestSupport for StorageCluster {
         let guard = self.test_install_before_retained_stream_abort_hook(Arc::new(move || {
             hook_invocations.fetch_add(1, Ordering::SeqCst);
             if hook_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()
@@ -203,7 +203,7 @@ impl StorageClusterFailureTestSupport for StorageCluster {
             move |location, _| {
                 hook_invocations.fetch_add(1, Ordering::SeqCst);
                 if hook_remaining
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()

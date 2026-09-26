@@ -1791,7 +1791,7 @@ impl SharedStorageNode {
         let cluster_map_history_route_references = self.cluster_map_history_route_references()?;
         let cluster_map_history_route_scan_generation = self
             .cluster_map_history_route_scan_generation
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map(|previous| {

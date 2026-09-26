@@ -946,7 +946,7 @@ impl StorageClusterRouteHandle {
                     if recover_pending_commands
                         && !worker_refresh_outage_active.swap(true, Ordering::AcqRel)
                     {
-                        let _ = worker_recovery_request_generation.fetch_update(
+                        let _ = worker_recovery_request_generation.try_update(
                             Ordering::AcqRel,
                             Ordering::Acquire,
                             |generation| generation.checked_add(1),

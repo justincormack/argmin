@@ -6756,7 +6756,7 @@ fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
                 }
             } else if retry_phase_for_hook.load(Ordering::SeqCst)
                 && retry_gates_remaining_for_hook
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()

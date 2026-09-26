@@ -7,6 +7,10 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+[lints.cargo]
+# Fuzz target names match their source files, corpus directories, and CLI names.
+non_kebab_case_bins = "allow"
+
 [dependencies]
 auth = { path = "../crates/auth" }
 base64 = "0.22"
