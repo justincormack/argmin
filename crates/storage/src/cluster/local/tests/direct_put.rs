@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::metadata_command::ReleaseObjectGenerationCommand;
 
 #[derive(Clone, Copy)]
 struct DirectPayloadTestIdentity {
@@ -4674,12 +4675,20 @@ fn direct_put_command_id_race_retries_abandoned_terminal_cleanup() {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirectPutLateConflictHandoff {
     Complete,
+    CleanupDerivative,
     ExpireWaitBudget,
 }
 
 #[test]
 fn direct_put_late_log_conflict_waits_for_same_object_recovery_handoff() {
     assert_direct_put_late_log_conflict_recovery_handoff(DirectPutLateConflictHandoff::Complete);
+}
+
+#[test]
+fn direct_put_late_log_conflict_waits_for_recovery_cleanup_derivative() {
+    assert_direct_put_late_log_conflict_recovery_handoff(
+        DirectPutLateConflictHandoff::CleanupDerivative,
+    );
 }
 
 #[test]
@@ -4811,6 +4820,20 @@ fn assert_direct_put_late_log_conflict_recovery_handoff(handoff: DirectPutLateCo
                     hook_req.bucket_write_reservation.clone(),
                 )
                 .unwrap();
+            let command = if handoff == DirectPutLateConflictHandoff::CleanupDerivative {
+                MetadataCommandEnvelope::new(
+                    command.id(),
+                    MetadataCommandPayload::ReleaseObjectGeneration(
+                        ReleaseObjectGenerationCommand::new(
+                            hook_bucket.clone(),
+                            hook_req.key.clone(),
+                            hook_req.generation_reservation_id.clone(),
+                        ),
+                    ),
+                )
+            } else {
+                command
+            };
             pg.try_insert_pending_metadata_command_slot(
                 primary.node_id().as_u32(),
                 &command,
@@ -4826,12 +4849,19 @@ fn assert_direct_put_late_log_conflict_recovery_handoff(handoff: DirectPutLateCo
     let (transfer_reached_tx, transfer_reached_rx) = std::sync::mpsc::sync_channel(1);
     let _apply_hook =
         first_cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
-            if matches!(
-                command.payload(),
-                MetadataCommandPayload::CommitDirectPutObject(commit)
-                    if commit.object.generation_id == winner_generation_id
-            ) && transfer_once_for_hook.swap(false, Ordering::SeqCst)
-            {
+            let is_transfer_candidate = match handoff {
+                DirectPutLateConflictHandoff::CleanupDerivative => matches!(
+                    command.payload(),
+                    MetadataCommandPayload::ReleaseObjectGeneration(_)
+                ),
+                DirectPutLateConflictHandoff::Complete
+                | DirectPutLateConflictHandoff::ExpireWaitBudget => matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.generation_id == winner_generation_id
+                ),
+            };
+            if is_transfer_candidate && transfer_once_for_hook.swap(false, Ordering::SeqCst) {
                 transfer_reached_tx.send(()).unwrap();
                 return Err(StoreError::RouteMapExpired {
                     cluster_epoch: command.id().cluster_epoch(),
@@ -4908,7 +4938,8 @@ fn assert_direct_put_late_log_conflict_recovery_handoff(handoff: DirectPutLateCo
             .expect("late conflict did not retain the winner command");
         let pg_id = PgId::new(2);
         match handoff {
-            DirectPutLateConflictHandoff::Complete => {
+            DirectPutLateConflictHandoff::Complete
+            | DirectPutLateConflictHandoff::CleanupDerivative => {
                 let handoff_deadline = Instant::now() + Duration::from_secs(5);
                 while !first_cluster
                     .test_metadata_command_recovery_awaiting_authorized(pg_id, &command)
@@ -4949,6 +4980,14 @@ fn assert_direct_put_late_log_conflict_recovery_handoff(handoff: DirectPutLateCo
             assert_eq!(action_calls.load(Ordering::SeqCst), 2);
             assert_eq!(transferred_wait_hook_calls.load(Ordering::SeqCst), 0);
         }
+        DirectPutLateConflictHandoff::CleanupDerivative => {
+            let outcome = result
+                .expect("cleanup-derivative recovery wait must not expose contention")
+                .expect("contender must publish after the cleanup derivative");
+            assert_eq!(outcome.live_size, loser_payload.len() as u64);
+            assert_eq!(action_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(transferred_wait_hook_calls.load(Ordering::SeqCst), 0);
+        }
         DirectPutLateConflictHandoff::ExpireWaitBudget => {
             assert!(matches!(
                 result,
@@ -4966,19 +5005,32 @@ fn assert_direct_put_late_log_conflict_recovery_handoff(handoff: DirectPutLateCo
     assert!(install_ran.load(Ordering::SeqCst));
     assert!(!transfer_once.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
-    assert_direct_payload_staging_cleaned(
-        &first_map,
-        &first_cluster,
-        &bucket,
-        &key,
-        &loser_req.generation_reservation_id,
-        DirectPayloadTestIdentity {
-            data_pg_id: loser_written.data_pg_id,
-            ec: loser_written.ec,
-            segment_okh: loser_segment_okh,
-            segment_vid: loser_generation_id,
-        },
-    );
+    if handoff == DirectPutLateConflictHandoff::CleanupDerivative {
+        second_cluster
+            .release_bucket_write_reservation_proof(&winner_req.bucket_write_reservation)
+            .unwrap();
+        second_cluster.delete_direct_put_segment_payload_shards(
+            winner_req.data_pg_id,
+            winner_req.ec,
+            &winner_req.segment_okh,
+            winner_req.segment_vid,
+            &winner_written.written_shards,
+        );
+    } else {
+        assert_direct_payload_staging_cleaned(
+            &first_map,
+            &first_cluster,
+            &bucket,
+            &key,
+            &loser_req.generation_reservation_id,
+            DirectPayloadTestIdentity {
+                data_pg_id: loser_written.data_pg_id,
+                ec: loser_written.ec,
+                segment_okh: loser_segment_okh,
+                segment_vid: loser_generation_id,
+            },
+        );
+    }
     assert_bucket_write_reservations_released(&first_map, &bucket);
 }
 

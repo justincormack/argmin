@@ -4987,6 +4987,37 @@ impl StorageCluster {
                 }
             }};
         }
+        macro_rules! wait_for_direct_put_contender_recovery {
+            ($command:expr) => {{
+                let contender = $command;
+                if matches!(
+                    contender.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket == req.bucket && commit.object.key == req.key
+                ) {
+                    wait_for_same_object_direct_put_recovery!(contender);
+                } else {
+                    // Recovery may have replaced a contender with an authorized cleanup
+                    // derivative whose payload no longer identifies the original operation.
+                    // Wait for that exact lineage to advance, then rebuild from a fresh
+                    // snapshot instead of exposing the internal handoff to the caller.
+                    wait_for_unrelated_metadata_recovery!(contender);
+                    snapshot_retry_phase.require_snapshot_reinspection();
+                }
+            }};
+        }
+        let contender_requires_direct_put_recovery_wait =
+            |contender: &MetadataCommandEnvelope| {
+                matches!(
+                    contender.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.bucket == req.bucket && commit.object.key == req.key
+                ) || matches!(
+                    contender.payload(),
+                    MetadataCommandPayload::ReleaseObjectGeneration(release)
+                        if release.bucket == req.bucket && release.key == req.key
+                )
+            };
         let (command, new_pending_command) = 'direct_put_metadata: loop {
             require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
@@ -5173,25 +5204,19 @@ impl StorageCluster {
                             match drain_result {
                                 Ok(()) => {}
                                 Err(ObjectPgActionError::MetadataCommandRecoveryTransferred)
-                                    if late_conflict_command.as_ref().is_some_and(|command| {
-                                        matches!(
-                                            command.payload(),
-                                            MetadataCommandPayload::CommitDirectPutObject(commit)
-                                                if commit.object.bucket == req.bucket
-                                                    && commit.object.key == req.key
-                                        )
-                                    }) =>
+                                    if late_conflict_command.as_ref().is_some_and(
+                                        &contender_requires_direct_put_recovery_wait,
+                                    ) =>
                                 {
-                                    // The competing direct PUT targets this object. This request
-                                    // relinquished recovery for its exact command, so wait without
-                                    // rejoining that recovery flight and then rerun the condition
+                                    // This request relinquished recovery for the exact contender.
+                                    // Wait without rejoining that flight, then rerun the condition
                                     // against the resulting object state.
                                     #[cfg(test)]
                                     request_ops::maybe_run_direct_put_pending_drain_hook(
                                         self.metadata_command_apply_test_hook_scope_id(),
                                         &mut work_budget,
                                     );
-                                    wait_for_same_object_direct_put_recovery!(
+                                    wait_for_direct_put_contender_recovery!(
                                         late_conflict_command
                                             .as_ref()
                                             .expect("guard requires a pending command")
@@ -5601,16 +5626,11 @@ impl StorageCluster {
                                     error,
                                     ObjectPgActionError::MetadataCommandRecoveryTransferred
                                 )
-                                && drained_contender.as_deref().is_some_and(|contender| {
-                                    matches!(
-                                        contender.payload(),
-                                        MetadataCommandPayload::CommitDirectPutObject(commit)
-                                            if commit.object.bucket == req.bucket
-                                                && commit.object.key == req.key
-                                    )
-                                })
+                                && drained_contender.as_deref().is_some_and(
+                                    &contender_requires_direct_put_recovery_wait,
+                                )
                             {
-                                wait_for_same_object_direct_put_recovery!(
+                                wait_for_direct_put_contender_recovery!(
                                     drained_contender
                                         .as_deref()
                                         .expect("guard requires the drained contender")
