@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::error::Error as _;
 use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -158,10 +157,7 @@ fn build_tls_config_with_custom_ca(tls_ca_pem: &[u8]) -> ClientConfig {
 
 fn classify_hyper_error(err: hyper_util::client::legacy::Error) -> ConnectorError {
     let is_connect = err.is_connect();
-    let is_transient_http = err
-        .source()
-        .and_then(|source| source.downcast_ref::<hyper::Error>())
-        .is_some_and(|source| source.is_closed() || source.is_incomplete_message());
+    let is_transient_http = error_chain_is_retryable_transport(&err);
     let boxed = Box::new(err);
     if is_connect {
         ConnectorError::io(boxed).never_connected()
@@ -169,5 +165,62 @@ fn classify_hyper_error(err: hyper_util::client::legacy::Error) -> ConnectorErro
         ConnectorError::io(boxed)
     } else {
         ConnectorError::other(boxed, None)
+    }
+}
+
+fn error_chain_is_retryable_transport(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<std::io::Error>().is_some()
+            || source
+                .downcast_ref::<hyper::Error>()
+                .is_some_and(|error| error.is_closed() || error.is_incomplete_message())
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_chain_is_retryable_transport;
+    use std::error::Error;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct NestedError {
+        source: Box<dyn Error + Send + Sync>,
+    }
+
+    impl fmt::Display for NestedError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("nested transport error")
+        }
+    }
+
+    impl Error for NestedError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(self.source.as_ref())
+        }
+    }
+
+    #[test]
+    fn nested_io_error_is_retryable_transport() {
+        let error = NestedError {
+            source: Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        };
+
+        assert!(error_chain_is_retryable_transport(&error));
+    }
+
+    #[test]
+    fn unrelated_nested_error_is_not_retryable_transport() {
+        let error = NestedError {
+            source: Box::new(fmt::Error),
+        };
+
+        assert!(!error_chain_is_retryable_transport(&error));
     }
 }
