@@ -6588,6 +6588,27 @@ fn control_plane_openraft_plural_staging_and_install_replicate_and_replay_after_
 
 #[test]
 fn authenticated_staging_evidence_preflight_suppresses_invalid_pages_and_exact_replays() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct DurabilityWorkCounts {
+        command_submissions: u64,
+        wal_appends: Option<u64>,
+        checkpoint_encodes: u64,
+        checkpoint_stores: u64,
+        checkpoint_compactions: u64,
+    }
+
+    fn durability_work_counts(
+        metrics: ControlPlaneRaftDurabilityMetricSnapshots,
+    ) -> DurabilityWorkCounts {
+        DurabilityWorkCounts {
+            command_submissions: metrics.command.submit_total,
+            wal_appends: metrics.wal.map(|wal| wal.append_total),
+            checkpoint_encodes: metrics.checkpoint.encode_total,
+            checkpoint_stores: metrics.checkpoint.store_total,
+            checkpoint_compactions: metrics.checkpoint.compaction_total,
+        }
+    }
+
     ControlPlaneRaftTypeConfig::run(async {
         let tmp = test_util::tempdir();
         let cluster_id = "authenticated-staging-evidence-preflight";
@@ -6936,9 +6957,12 @@ fn authenticated_staging_evidence_preflight_suppresses_invalid_pages_and_exact_r
             authority.status().await.unwrap().last_log_id(),
             Some(baseline_log_id)
         );
+        // A completed durability request wakes its caller before the worker records
+        // the request's outer operation latency. Compare causal work counters so a
+        // latency sample settling for earlier work cannot look like a submission.
         assert_eq!(
-            authority.durability_metric_snapshots_for_test(),
-            baseline_metrics,
+            durability_work_counts(authority.durability_metric_snapshots_for_test()),
+            durability_work_counts(baseline_metrics),
             "preflight rejection must not submit, append, or checkpoint"
         );
 
@@ -7019,8 +7043,8 @@ fn authenticated_staging_evidence_preflight_suppresses_invalid_pages_and_exact_r
             Some(capped_log_id)
         );
         assert_eq!(
-            authority.durability_metric_snapshots_for_test(),
-            capped_metrics,
+            durability_work_counts(authority.durability_metric_snapshots_for_test()),
+            durability_work_counts(capped_metrics),
             "excess evidence must not submit, append, or checkpoint"
         );
         let capped_snapshot = authority
@@ -7052,8 +7076,8 @@ fn authenticated_staging_evidence_preflight_suppresses_invalid_pages_and_exact_r
             Some(capped_log_id)
         );
         assert_eq!(
-            authority.durability_metric_snapshots_for_test(),
-            capped_metrics,
+            durability_work_counts(authority.durability_metric_snapshots_for_test()),
+            durability_work_counts(capped_metrics),
             "exact replay must return its receipt without submitting or checkpointing"
         );
 
