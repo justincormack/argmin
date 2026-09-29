@@ -6689,6 +6689,9 @@ fn reclaim_worker_pool_executes_distinct_roots_concurrently() {
 fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
     const HOLD_FIRST_WORKER: DeterministicFaultToken =
         DeterministicFaultToken::new("reclaim-shared-deferred-hold-first-worker");
+    const HOLD_RETRY_WORKERS: DeterministicFaultToken =
+        DeterministicFaultToken::new("reclaim-shared-deferred-hold-retry-workers");
+    const WORKER_POOL_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -6735,9 +6738,8 @@ fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
     let retry_gates_remaining_for_hook = Arc::clone(&retry_gates_remaining);
     let (deferred_tx, deferred_rx) = mpsc::channel();
     let (retry_arrived_tx, retry_arrived_rx) = mpsc::channel();
-    let (retry_release_tx, retry_release_rx) = mpsc::channel();
-    let retry_release_rx = Arc::new(Mutex::new(retry_release_rx));
-    let retry_release_rx_for_hook = Arc::clone(&retry_release_rx);
+    let retry_worker_gate = DeterministicFaultGate::new(HOLD_RETRY_WORKERS);
+    let retry_worker_gate_for_hook = Arc::clone(&retry_worker_gate);
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         reclaim_worker_parallelism_override: Some(2),
         before_reclaim_work_execute: Some(Arc::new(move |_execution_cluster| {
@@ -6762,11 +6764,7 @@ fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
                     .is_ok()
             {
                 retry_arrived_tx.send(()).unwrap();
-                retry_release_rx_for_hook
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .recv_timeout(TEST_EVENT_TIMEOUT)
-                    .expect("test must release every deferred reclaim worker");
+                retry_worker_gate_for_hook.wait_at(HOLD_RETRY_WORKERS);
             }
         })),
         after_reclaim_work_deferred: Some(Arc::new(move || {
@@ -6776,7 +6774,8 @@ fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
     });
     let worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
     let _first_worker_release_guard = first_worker_gate.release_on_drop();
-    first_worker_gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+    let _retry_worker_release_guard = retry_worker_gate.release_on_drop();
+    first_worker_gate.wait_until_arrived(WORKER_POOL_EVENT_TIMEOUT);
 
     for bucket in &buckets {
         direct_coord
@@ -6793,10 +6792,10 @@ fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
     drop(direct_coord);
 
     deferred_rx
-        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .recv_timeout(WORKER_POOL_EVENT_TIMEOUT)
         .expect("one worker must defer the first finalizer root");
     deferred_rx
-        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .recv_timeout(WORKER_POOL_EVENT_TIMEOUT)
         .expect("the same worker must remain available to defer the second finalizer root");
 
     retry_phase.store(true, Ordering::SeqCst);
@@ -6804,13 +6803,12 @@ fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
     first_worker_gate.release();
 
     retry_arrived_rx
-        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .recv_timeout(WORKER_POOL_EVENT_TIMEOUT)
         .expect("one worker must execute a shared deferred root");
     retry_arrived_rx
-        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .recv_timeout(WORKER_POOL_EVENT_TIMEOUT)
         .expect("another worker must steal the other deferred root concurrently");
-    retry_release_tx.send(()).unwrap();
-    retry_release_tx.send(()).unwrap();
+    retry_worker_gate.release();
 
     for bucket in &buckets {
         wait_until_bucket_deleting_or_missing(
@@ -6819,7 +6817,7 @@ fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
             "shared deferred bucket finalizer did not converge after route refresh",
         );
     }
-    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    let deadline = Instant::now() + WORKER_POOL_EVENT_TIMEOUT;
     while (initial.test_bucket_delete_finalize_outstanding_depth() != 0
         || independent.test_bucket_delete_finalize_outstanding_depth() != 0
         || replacement.test_bucket_delete_finalize_outstanding_depth() != 0)
