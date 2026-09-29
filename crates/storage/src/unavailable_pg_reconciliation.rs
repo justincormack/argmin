@@ -2176,6 +2176,7 @@ mod tests {
         let expected = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
         let transfer_gate = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let worker_gate = Arc::clone(&transfer_gate);
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
             move |work| {
@@ -2185,6 +2186,7 @@ mod tests {
                 while !*released {
                     released = ready.wait(released).unwrap();
                 }
+                finished_tx.send(()).unwrap();
                 Ok(())
             },
             Duration::ZERO,
@@ -2209,10 +2211,20 @@ mod tests {
         let (lock, ready) = &*transfer_gate;
         *lock.lock().unwrap() = true;
         ready.notify_all();
-        for _ in 0..1_000 {
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("released transfer worker did not finish its transfer body");
+        let publication_deadline = Instant::now() + Duration::from_secs(1);
+        while authority.published.is_empty() {
             worker.poll(&mut authority, 102).unwrap();
             if !authority.published.is_empty() {
                 break;
+            }
+            if Instant::now() >= publication_deadline {
+                panic!(
+                    "completed transfer was not published before the deadline; retained state: {:?}",
+                    worker.retained_test_state()
+                );
             }
             thread::yield_now();
         }
