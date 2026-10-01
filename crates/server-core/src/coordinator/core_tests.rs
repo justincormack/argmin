@@ -6604,11 +6604,17 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
 fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
-    let coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&initial));
-    coord
+    let setup_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    setup_coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    drop(setup_coord);
+
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&initial));
 
     install_same_store_same_epoch_runtime_map(&runtime_handle);
     thread::sleep(Duration::from_millis(250));
