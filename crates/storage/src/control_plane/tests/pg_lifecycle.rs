@@ -2673,6 +2673,84 @@ fn stale_historical_primary_heartbeat_reports_pending_after_acting_set_change() 
         )],
         "idempotent retransmission must retain historical recovery evidence"
     );
+    heartbeat_with_pg_observation(&mut authority, 2, pg_id.get(), PgState::Peering, 3_109);
+    assert!(authority
+        .snapshot()
+        .ready_pg_peering_completions(3_110)
+        .unwrap()
+        .is_empty());
+    let completion = authority.complete_pg_peering(
+        pg_id,
+        NodeId::new(2),
+        node_incarnation(&authority, 2),
+        3_110,
+    );
+    assert!(
+        matches!(
+            &completion,
+            Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id: 116,
+                node_id: 1,
+                pending: reported,
+                ..
+            }) if *reported == pending
+        ),
+        "unexpected completion result: {completion:?}"
+    );
+    assert_eq!(
+        authority.snapshot().pg(pg_id).unwrap().state(),
+        PgState::Peering
+    );
+
+    let mut invalid_active = authority.snapshot().clone();
+    let primary_observation = *invalid_active
+        .node(NodeId::new(2))
+        .unwrap()
+        .pg_observation(pg_id)
+        .unwrap();
+    let current_epoch = invalid_active.cluster_epoch();
+    let invalid_pg = invalid_active.pgs.get_mut(&pg_id).unwrap();
+    invalid_pg.state = PgState::Active;
+    invalid_pg.active_primary = Some(NodeId::new(2));
+    invalid_pg.active_metadata_proof = Some(primary_observation.metadata_proof());
+    invalid_pg.active_metadata_proof_epoch = Some(current_epoch);
+    invalid_pg.active_metadata_log_epoch = Some(primary_observation.metadata_log_epoch());
+    invalid_pg.previous_primary_lease = None;
+    invalid_pg.peering_metadata_proof_floor = None;
+    invalid_pg.peering_metadata_proof_floor_epoch = None;
+    invalid_pg.peering_metadata_proof_floor_imported = false;
+    invalid_pg.peering_metadata_transfer = None;
+    invalid_pg.peering_metadata_transfer_source_route_epoch = None;
+    invalid_pg.peering_metadata_transfer_source_node_id = None;
+    let parse_error = parse_snapshot(&format_snapshot(&invalid_active)).unwrap_err();
+    assert!(
+        parse_error
+            .to_string()
+            .contains("historical pending PG observation must retain a Peering fence"),
+        "unexpected canonical snapshot rejection: {parse_error}"
+    );
+    let mut invalid_active_secondary = invalid_active;
+    invalid_active_secondary
+        .pgs
+        .get_mut(&pg_id)
+        .unwrap()
+        .acting_set
+        .push(NodeId::new(1));
+    let invariant_error = invalid_active_secondary
+        .validate_current_state_invariants()
+        .unwrap_err();
+    assert!(
+        invariant_error
+            .contains("historical pending observation for PG 116 must retain a Peering fence"),
+        "unexpected in-memory invariant rejection: {invariant_error}"
+    );
+    let parse_error = parse_snapshot(&format_snapshot(&invalid_active_secondary)).unwrap_err();
+    assert!(
+        parse_error
+            .to_string()
+            .contains("historical pending PG observation must retain a Peering fence"),
+        "unexpected secondary historical-pending rejection: {parse_error}"
+    );
     assert_eq!(
         FileControlPlaneStore::new(tmp.path().join("control-plane.state"))
             .load()

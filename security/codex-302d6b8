@@ -5,6 +5,11 @@ Status: fixed
 
 Fixed in commit [`17f186d45f6c4469aa3c15aedadc0e0994f54e47`](https://github.com/justincormack/argmin/commit/17f186d45f6c4469aa3c15aedadc0e0994f54e47) (`Bound unavailable PG transfer batching`).
 
+The batching, prepared-artifact queue, and staging protocol described below
+were subsequently removed when unavailable-PG reconciliation returned to
+singleton commands. This record is retained as historical evidence; the
+affected production path no longer exists.
+
 # Metadata
 Repo: justincormack/argmin
 Commit: 302d6b8

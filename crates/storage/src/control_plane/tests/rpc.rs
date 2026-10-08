@@ -2,10 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::pg_store::{
-    metadata_transfer_staging_evidence_page_for_test, MetadataTransferStagingEvidenceKind,
-    MetadataTransferStagingNodeIdentity, METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-};
 
 const CONTROL_PLANE_RPC_CATALOGUE_PG_STATES: [PgState; 5] = [
     PgState::Active,
@@ -21,7 +17,7 @@ const CONTROL_PLANE_RPC_CATALOGUE_HISTORY_KINDS: [PgClusterMapHistoryRouteRefere
     PgClusterMapHistoryRouteReferenceKind::MetadataCommandResource,
     PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
 ];
-const CONTROL_PLANE_RPC_CATALOGUE_METRIC_KINDS: [observability::ControlPlaneRpcMetricKind; 18] = {
+const CONTROL_PLANE_RPC_CATALOGUE_METRIC_KINDS: [observability::ControlPlaneRpcMetricKind; 17] = {
     use observability::ControlPlaneRpcMetricKind as Kind;
     [
         Kind::RuntimeMapSnapshot,
@@ -41,7 +37,6 @@ const CONTROL_PLANE_RPC_CATALOGUE_METRIC_KINDS: [observability::ControlPlaneRpcM
         Kind::RuntimeMapDiagnostics,
         Kind::Unknown,
         Kind::ServingPgRuntimeMapSnapshot,
-        Kind::ApplyMetadataTransferStagingEvidencePage,
     ]
 };
 const CONTROL_PLANE_RPC_CATALOGUE_RECOVERY_FAILURE_KINDS:
@@ -71,31 +66,6 @@ const CONTROL_PLANE_RPC_CATALOGUE_BLOCKED_REASONS: [Option<
 
 fn control_plane_rpc_catalogue_snapshot() -> ClusterRuntimeMapSnapshot {
     runtime_map_test_snapshot_with_active_route()
-}
-
-fn control_plane_rpc_catalogue_authorized_snapshot() -> ClusterRuntimeMapSnapshot {
-    let mut snapshot = control_plane_rpc_catalogue_snapshot();
-    let committed_epoch = ClusterEpoch::new(16).unwrap();
-    snapshot.cluster_epoch = committed_epoch;
-    snapshot.pg_routes[0].cluster_epoch = committed_epoch;
-    let authorizations = vec![UnavailablePgStagingIntentAuthorizationRequest {
-        unavailable_transition: control_plane_rpc_catalogue_transition_binding(),
-        staging_generation: 15,
-        artifact_target_epoch: ClusterEpoch::new(17).unwrap(),
-        artifact_digest: [0x5a; 32],
-        artifact_length: 12_345,
-        artifact_format_version: METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-    }];
-    let digest = unavailable_pg_staging_authorization_members_digest(&authorizations);
-    snapshot.staging_authorizations = vec![
-        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
-            authorizations,
-            committed_epoch,
-            digest,
-        )
-        .unwrap(),
-    ];
-    snapshot
 }
 
 fn control_plane_rpc_catalogue_freshness_kind(
@@ -348,238 +318,6 @@ fn control_plane_rpc_catalogue_transition_binding() -> UnavailablePgTransitionMu
     )
 }
 
-fn control_plane_rpc_catalogue_staging_page() -> MetadataTransferStagingEvidencePage {
-    metadata_transfer_staging_evidence_page_for_test(
-        MetadataTransferStagingNodeIdentity::new(
-            NodeId::new(3),
-            4,
-            "unix:///catalogue/storage-3.sock".to_owned(),
-        )
-        .unwrap(),
-        &control_plane_rpc_catalogue_transition_binding(),
-        [0x5a; 32],
-        12_345,
-        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-        MetadataTransferStagingEvidenceKind::Publication,
-        None,
-    )
-}
-
-fn control_plane_rpc_catalogue_staging_closure_page() -> MetadataTransferStagingEvidencePage {
-    crate::pg_store::metadata_transfer_staging_closure_evidence_page_for_test(
-        MetadataTransferStagingNodeIdentity::new(
-            NodeId::new(3),
-            3,
-            "unix:///catalogue/storage-3-old.sock".to_owned(),
-        )
-        .unwrap(),
-        MetadataTransferStagingNodeIdentity::new(
-            NodeId::new(3),
-            4,
-            "unix:///catalogue/storage-3.sock".to_owned(),
-        )
-        .unwrap(),
-        &control_plane_rpc_catalogue_transition_binding(),
-        [0x7c; 32],
-        67_890,
-        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-        MetadataTransferStagingEvidenceKind::Publication,
-    )
-}
-
-#[test]
-fn control_plane_rpc_v20_staging_evidence_frames_remain_rejected_evidence() {
-    for (frame, expected_len, expected_digest) in [
-        (
-            include_bytes!("../testdata/rpc_v20_staging_request_genesis.frame").as_slice(),
-            468,
-            "15bc016bd360627200cfb3b98248a6ebd1f9bbfb636c6effebae08a255f32bfe",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v20_staging_response_genesis.frame").as_slice(),
-            214,
-            "bee0379f5da51fc501859b8379c35a80d961e49ef142f030ae71104db9087a3b",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v20_staging_request_successor.frame").as_slice(),
-            408,
-            "5a80f9b90c622202a9675218177b22a9e95415c64139cf5a4197845894e24bef",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v20_staging_response_successor.frame").as_slice(),
-            214,
-            "4968d40ed671495bf7dfc6538f7ab0ed56dc0aea7418f00adf0d4616baf2ad4d",
-        ),
-    ] {
-        assert_eq!(frame.len(), expected_len);
-        assert_eq!(
-            hex_encode(&checksum::sha256::digest(frame)),
-            expected_digest
-        );
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 20"
-        ));
-    }
-}
-
-#[test]
-fn control_plane_rpc_v21_staging_evidence_frames_remain_rejected_evidence() {
-    for (frame, expected_len, expected_digest) in [
-        (
-            include_bytes!("../testdata/rpc_v21_staging_request_genesis.frame").as_slice(),
-            468,
-            "9735d5c659430811cb6dd82184bf5643053391128ad31b81a142f575a5a94aed",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v21_staging_response_genesis.frame").as_slice(),
-            214,
-            "10e4f160d95a586c5a67346a2bf5f53d2ddc63ad6d9fa4f05961386863c1c898",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v21_staging_request_successor.frame").as_slice(),
-            408,
-            "be75dff9edcde7b3d1d31a4b64083125e6319a626fcc62d9bf64af443a94fd15",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v21_staging_response_successor.frame").as_slice(),
-            214,
-            "b2d46c47ea1cb0658dbb8498250c73fdce0b72f90f5db5bf8326c15c208884ad",
-        ),
-    ] {
-        assert_eq!(frame.len(), expected_len);
-        assert_eq!(
-            hex_encode(&checksum::sha256::digest(frame)),
-            expected_digest
-        );
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 21"
-        ));
-    }
-}
-
-#[test]
-fn control_plane_rpc_v29_staging_evidence_frames_are_exact() {
-    let genesis = control_plane_rpc_catalogue_staging_page();
-    let genesis_receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&genesis);
-    let successor = metadata_transfer_staging_evidence_page_for_test(
-        genesis.actor().clone(),
-        &control_plane_rpc_catalogue_transition_binding(),
-        [0x6b; 32],
-        54_321,
-        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-        MetadataTransferStagingEvidenceKind::Tombstone,
-        Some(&genesis_receipt),
-    );
-    let mut evidence = Vec::new();
-    let closure = control_plane_rpc_catalogue_staging_closure_page();
-    for page in [&genesis, &successor, &closure] {
-        let mut request = Vec::new();
-        write_staging_evidence_publication_request(&mut request, page).unwrap();
-        let request_frame = encode_control_plane_rpc_frame(
-            ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage,
-            &request,
-        )
-        .unwrap();
-        let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(page);
-        let response = encode_control_plane_rpc_response(Ok(receipt.as_bytes().to_vec())).unwrap();
-        let response_frame = encode_control_plane_rpc_frame(
-            ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage,
-            &response,
-        )
-        .unwrap();
-        evidence.push((
-            request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&request_frame)),
-            response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&response_frame)),
-        ));
-    }
-    assert_eq!(
-        evidence,
-        [
-            (
-                469,
-                "ec753b9d598a1bbe041a25625c06612556b357128c70a8370c15dc9237c4a25d".to_owned(),
-                214,
-                "58e84fc806b3e47d8614483052a005411bec384de29cc1a3f9def0e0e16cef2b".to_owned(),
-            ),
-            (
-                409,
-                "58a0c0b211940b542100a0b7ebe2cb71db33253b7a541a8155a51adf9689b0cf".to_owned(),
-                214,
-                "7ec4430c8bb479d5aaa07fe58dab76bf4c8edfce0b813a6e4d56634cf983f28a".to_owned(),
-            ),
-            (
-                734,
-                "35434cb35de8db1efb7ba2eeb5f7fd96abf7833ed6cc7cb9db3133e8ac28bb32".to_owned(),
-                214,
-                "181c96551f50aecbf8e52dac7275d9e19761c2f49b667746b2b652b67329b17a".to_owned(),
-            ),
-        ]
-    );
-}
-
-#[test]
-fn control_plane_rpc_v23_staging_evidence_frames_remain_rejected_evidence() {
-    for (frame, expected_len, expected_digest) in [
-        (
-            include_bytes!("../testdata/rpc_v23_staging_request_0.frame").as_slice(),
-            469,
-            "2bb0c492d844f0052ef449bada1f6fcd1d77964a53e28326cce99b1dbe53bf58",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v23_staging_response_0.frame").as_slice(),
-            214,
-            "28354d0822fd054b3d9e7f27697f2ac78d2817c180e799f5c8c5e3af74c09ecf",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v23_staging_request_1.frame").as_slice(),
-            409,
-            "eb627fff873460c97929c1c2a33375a74a2dcdd200a267844baabccb473d9e67",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v23_staging_response_1.frame").as_slice(),
-            214,
-            "f198765c5d17e6425b40acd10bde28f2fcd4e2b1875db77074a5a46062209e88",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v23_staging_request_2.frame").as_slice(),
-            734,
-            "bc52ca5ee8802e2bd3154c1a30b21ab03f006266dc80dd532852ccd8bee78dfe",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v23_staging_response_2.frame").as_slice(),
-            214,
-            "086c8b09cfcfccc0a04a54e455907914477f4ecb79f6ed543923ba83f730e1bd",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v23_closure_auth_request.frame").as_slice(),
-            867,
-            "cc686c006d5b77ad5931d0f5811372503fb86eaf07222dcc6622c39018c930b6",
-        ),
-        (
-            include_bytes!("../testdata/rpc_v23_closure_auth_response.frame").as_slice(),
-            348,
-            "f2531ff0070216e32017deb45cf6b55a81e88c3dd7c19bd29799fddb2712d3ee",
-        ),
-    ] {
-        assert_eq!(frame.len(), expected_len);
-        assert_eq!(
-            hex_encode(&checksum::sha256::digest(frame)),
-            expected_digest
-        );
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 23"
-        ));
-    }
-}
-
 fn control_plane_rpc_catalogue_request(
     kind: ControlPlaneRpcKind,
 ) -> Result<Vec<u8>, ControlPlaneError> {
@@ -624,11 +362,16 @@ fn control_plane_rpc_catalogue_request(
                 &control_plane_rpc_catalogue_transition_binding(),
             )?;
         }
-        ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage => {
-            write_staging_evidence_publication_request(
+        ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap => {
+            write_unavailable_pg_transition_mutation_binding(
                 &mut payload,
-                &control_plane_rpc_catalogue_staging_page(),
+                &control_plane_rpc_catalogue_transition_binding(),
             )?;
+            write_rpc_pg_metadata_transfer_proof(
+                &mut payload,
+                control_plane_rpc_catalogue_transfer(),
+            );
+            write_u64(&mut payload, 16);
         }
         ControlPlaneRpcKind::TransferRaftLeadership => write_u64(&mut payload, 17),
     }
@@ -684,13 +427,16 @@ fn validate_control_plane_rpc_catalogue_request(
                 control_plane_rpc_catalogue_transition_binding()
             );
         }
-        ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage => {
-            let (operation_payload, page_digest) =
-                read_staging_evidence_publication_request(payload)?;
-            let page =
-                decode_staging_evidence_page_payload(&operation_payload, page_digest).unwrap();
-            assert_eq!(page, control_plane_rpc_catalogue_staging_page());
-            return Ok(());
+        ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap => {
+            assert_eq!(
+                read_unavailable_pg_transition_mutation_binding(&mut reader)?,
+                control_plane_rpc_catalogue_transition_binding()
+            );
+            assert_eq!(
+                read_rpc_pg_metadata_transfer_proof(&mut reader)?,
+                control_plane_rpc_catalogue_transfer()
+            );
+            assert_eq!(reader.read_u64()?, 16);
         }
         ControlPlaneRpcKind::TransferRaftLeadership => assert_eq!(reader.read_u64()?, 17),
     }
@@ -825,68 +571,6 @@ fn control_plane_rpc_catalogue_diagnostics() -> ControlPlaneRuntimeMapDiagnostic
             operation_us_total: 525,
             operation_us_max: 526,
         },
-        unavailable_pg_batch_metrics: observability::UnavailablePgBatchStage::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, stage)| {
-                let base = 600 + u64::try_from(index).unwrap() * 20;
-                observability::UnavailablePgBatchMetricSample {
-                    stage,
-                    submitted_total: base + 1,
-                    applied_total: base + 2,
-                    replayed_total: base + 3,
-                    rejected_total: base + 4,
-                    members_total: base + 5,
-                    members_max: base + 6,
-                    encoded_bytes_total: base + 7,
-                    encoded_bytes_max: base + 8,
-                    encoded_fill_ppm_total: base + 9,
-                    encoded_fill_ppm_max: base + 10,
-                    epoch_advance_total: base + 11,
-                    recovered_pg_total: base + 12,
-                }
-            })
-            .collect(),
-        unavailable_pg_worker_stage_metrics: observability::UnavailablePgWorkerStage::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, stage)| {
-                let base = 700 + u64::try_from(index).unwrap() * 10;
-                observability::UnavailablePgWorkerStageMetricSample {
-                    stage,
-                    total: base + 1,
-                    succeeded_total: base + 2,
-                    deferred_total: base + 3,
-                    fatal_total: base + 4,
-                    elapsed_us_total: base + 5,
-                    elapsed_us_max: base + 6,
-                }
-            })
-            .collect(),
-        unavailable_pg_worker_queue_metrics:
-            observability::UnavailablePgWorkerQueueMetricSnapshot {
-                pending_transfer_depth: 801,
-                in_flight_transfer_depth: 802,
-                prepared_artifact_depth: 803,
-                prepared_artifact_bytes: 804,
-                staged_install_depth: 805,
-                staged_install_bytes: 806,
-                ready_activation_depth: 807,
-                pending_finalization_depth: 808,
-                deferred_depth: 809,
-                blocked_depth: 810,
-            },
-        metadata_transfer_staging_retention_metrics:
-            observability::MetadataTransferStagingRetentionMetricSnapshot {
-                retained_page_depth: 821,
-                retained_segment_depth: 822,
-                retained_anchor_depth: 823,
-                retained_evidence_depth: 824,
-                finalized_floor_depth: 825,
-                active_closure_depth: 826,
-                retired_closure_depth: 827,
-                prune_applied_total: 828,
-            },
         history_reference_samples: vec![observability::ControlPlaneHistoryReferenceSample {
             node_id: 1,
             observed_epoch: 1,
@@ -969,6 +653,7 @@ fn control_plane_rpc_catalogue_success(
     match kind {
         ControlPlaneRpcKind::RuntimeMapSnapshot
         | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
+        | ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap
         | ControlPlaneRpcKind::PgRuntimeMapSnapshot
         | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot => {
             write_runtime_map_snapshot(&mut payload, &control_plane_rpc_catalogue_snapshot())?;
@@ -1024,14 +709,6 @@ fn control_plane_rpc_catalogue_success(
         | ControlPlaneRpcKind::ReestablishAuthorityClock => {
             write_authority_clock_status(&mut payload, control_plane_rpc_catalogue_clock_status());
         }
-        ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage => {
-            payload.extend_from_slice(
-                MetadataTransferStagingEvidenceApplyReceipt::for_page(
-                    &control_plane_rpc_catalogue_staging_page(),
-                )
-                .as_bytes(),
-            );
-        }
     }
     Ok(payload)
 }
@@ -1044,6 +721,7 @@ fn validate_control_plane_rpc_catalogue_success(
     match kind {
         ControlPlaneRpcKind::RuntimeMapSnapshot
         | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
+        | ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap
         | ControlPlaneRpcKind::PgRuntimeMapSnapshot
         | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot => {
             assert_eq!(
@@ -1108,11 +786,6 @@ fn validate_control_plane_rpc_catalogue_success(
                 read_authority_clock_status(&mut reader)?,
                 control_plane_rpc_catalogue_clock_status()
             );
-        }
-        ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage => {
-            let receipt = decode_staging_evidence_apply_receipt(payload).unwrap();
-            assert!(receipt.is_for_page(&control_plane_rpc_catalogue_staging_page()));
-            return Ok(());
         }
     }
     reader.finish()
@@ -1199,10 +872,6 @@ fn control_plane_rpc_catalogue_errors() -> Vec<ControlPlaneError> {
         ControlPlaneError::AuthorityClockSampleWindowTooWide {
             narrowest_window_ms: 36,
             max_window_ms: 37,
-        },
-        ControlPlaneError::StagingEvidencePublicationDeferred,
-        ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed {
-            message: "catalogue staging evidence publication uncertainty".to_owned(),
         },
     ];
     errors.extend(
@@ -1292,8 +961,6 @@ enum ControlPlaneRpcCatalogueRejection {
         narrowest_window_ms: u64,
         max_window_ms: u64,
     },
-    StagingEvidencePublicationDeferred,
-    StagingEvidencePublicationOutcomeUnconfirmed(String),
 }
 
 #[derive(Clone, Copy)]
@@ -1483,14 +1150,6 @@ fn control_plane_rpc_catalogue_rejection(
             narrowest_window_ms: *narrowest_window_ms,
             max_window_ms: *max_window_ms,
         },
-        (_, ControlPlaneError::StagingEvidencePublicationDeferred) => {
-            ControlPlaneRpcCatalogueRejection::StagingEvidencePublicationDeferred
-        }
-        (_, ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed { message }) => {
-            ControlPlaneRpcCatalogueRejection::StagingEvidencePublicationOutcomeUnconfirmed(
-                message.clone(),
-            )
-        }
         (side, error) => panic!(
             "unexpected {side} control-plane RPC catalogue rejection: {error:?}",
             side = match side {
@@ -1738,105 +1397,11 @@ fn control_plane_rpc_v17_operation_catalogue_remains_rejected_evidence() {
         remaining = tail;
         count += 1;
     }
-    assert!(count > ControlPlaneRpcKind::ALL.len());
+    assert!(count > 1, "v17 aggregate must contain the operation corpus");
 }
 
 #[test]
-fn control_plane_rpc_v18_operation_catalogue_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v18_operation.aggregate");
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            hex_encode(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            14_902,
-            "4d88aaa66c8c1428ace65d34b78a558f16fef921d3ae64150365da5ee2a32d13".to_owned()
-        )
-    );
-    let mut remaining = AGGREGATE;
-    let mut count = 0_usize;
-    while !remaining.is_empty() {
-        let (_section, tail) = remaining.split_first().unwrap();
-        let (raw_len, tail) = tail.split_at(4);
-        let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
-        let (frame, tail) = tail.split_at(len);
-        let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)).unwrap_err();
-        assert!(matches!(
-            error,
-            ControlPlaneError::RpcProtocol { diagnostic }
-                if diagnostic.as_str() == "unsupported control-plane RPC version 18"
-        ));
-        remaining = tail;
-        count += 1;
-    }
-    assert!(count > ControlPlaneRpcKind::ALL.len());
-}
-
-#[test]
-fn control_plane_rpc_v20_operation_catalogue_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v20_operation.aggregate");
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            hex_encode(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            15_117,
-            "094ddb4121c20cc79579482e0e98b80f27421a865790b647fad5f3029a2c12dd".to_owned()
-        )
-    );
-    let mut remaining = AGGREGATE;
-    let mut count = 0_usize;
-    while !remaining.is_empty() {
-        let (_section, tail) = remaining.split_first().unwrap();
-        let (raw_len, tail) = tail.split_at(4);
-        let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
-        let (frame, tail) = tail.split_at(len);
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 20"
-        ));
-        remaining = tail;
-        count += 1;
-    }
-    assert!(count > ControlPlaneRpcKind::ALL.len());
-}
-
-#[test]
-fn control_plane_rpc_v21_operation_catalogue_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v21_operation.aggregate");
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            hex_encode(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            15_193,
-            "c4560adbeb5be3d23db767c7f3275caa64b7059448023d12ab34030d81ff735f".to_owned()
-        )
-    );
-    let mut remaining = AGGREGATE;
-    let mut count = 0_usize;
-    while !remaining.is_empty() {
-        let (_section, tail) = remaining.split_first().unwrap();
-        let (raw_len, tail) = tail.split_at(4);
-        let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().unwrap())).unwrap();
-        let (frame, tail) = tail.split_at(len);
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 21"
-        ));
-        remaining = tail;
-        count += 1;
-    }
-    assert!(count > ControlPlaneRpcKind::ALL.len());
-}
-
-#[test]
-fn control_plane_rpc_v29_operation_catalogue_is_exact() {
+fn control_plane_rpc_v18_operation_catalogue_is_exact() {
     assert_control_plane_rpc_catalogue_registries_are_complete();
     let decoded_kinds = (0..=u16::MAX)
         .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
@@ -1848,12 +1413,8 @@ fn control_plane_rpc_v29_operation_catalogue_is_exact() {
         control_plane_rpc_catalogue_recovery_snapshot(),
         control_plane_rpc_catalogue_current_recovery_snapshot(),
         control_plane_rpc_catalogue_empty_snapshot(),
-        control_plane_rpc_catalogue_authorized_snapshot(),
     ];
     assert_control_plane_rpc_catalogue_runtime_map_branches(&runtime_map_snapshots);
-    assert!(runtime_map_snapshots
-        .iter()
-        .any(|snapshot| !snapshot.staging_authorizations.is_empty()));
     assert_eq!(
         runtime_map_snapshots
             .iter()
@@ -2053,419 +1614,15 @@ fn control_plane_rpc_v29_operation_catalogue_is_exact() {
             hex_encode(&checksum::sha256::digest(&aggregate))
         ),
         (
-            17_072,
-            "cff3b4b0b388e1a07e12cfdab9afca52bb090bf3b12a54133dc2dbfda15923a2".to_owned()
+            14_125,
+            "d6a3d04b98c7d2a2c6dfdcbc2e38a4d5fa5d45512235b33b0f40bbd0ba84f3ab".to_owned()
         )
     );
 }
 
 #[test]
-fn control_plane_rpc_v25_nonempty_authorization_remains_rejected_evidence() {
-    let snapshot = control_plane_rpc_catalogue_authorized_snapshot();
-    let mut payload = Vec::new();
-    write_runtime_map_snapshot(&mut payload, &snapshot).unwrap();
-    let mut reader = PayloadReader::new(&payload);
-    assert_eq!(read_runtime_map_snapshot(&mut reader).unwrap(), snapshot);
-    reader.finish().unwrap();
-
-    let authorization = &snapshot.staging_authorizations[0];
-    let current_command = authorization.encode_command().unwrap();
-    let historical_command =
-        crate::control_plane_command::encode_control_plane_command_with_version_for_test(
-            &ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
-                authorizations: authorization.authorizations().to_vec(),
-            },
-            33,
-        )
-        .unwrap();
-    assert_eq!(current_command.len(), historical_command.len());
-    let offsets = payload
-        .windows(current_command.len())
-        .enumerate()
-        .filter_map(|(offset, window)| (window == current_command).then_some(offset))
-        .collect::<Vec<_>>();
-    assert_eq!(offsets.len(), 1);
-    let offset = offsets[0];
-    payload[offset..offset + historical_command.len()].copy_from_slice(&historical_command);
-    let response = encode_control_plane_rpc_response(Ok(payload)).unwrap();
-    let frame = encode_control_plane_rpc_frame_with_version(
-        ControlPlaneRpcKind::RuntimeMapSnapshot,
-        &response,
-        25,
-    )
-    .unwrap();
-    assert_eq!(
-        (frame.len(), hex_encode(&checksum::sha256::digest(&frame))),
-        (
-            378,
-            "c7d1c13f347523358f877ece9e77c18d98691facf2fc89dc72cd3eba94ce3915".to_owned(),
-        ),
-    );
-    assert!(matches!(
-        read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-        Err(ControlPlaneError::RpcProtocol { diagnostic })
-            if diagnostic.as_str() == "unsupported control-plane RPC version 25"
-    ));
-}
-
-#[test]
-fn control_plane_rpc_v26_nonempty_authorization_remains_rejected_evidence() {
-    let snapshot = control_plane_rpc_catalogue_authorized_snapshot();
-    let mut payload = Vec::new();
-    write_runtime_map_snapshot(&mut payload, &snapshot).unwrap();
-    let authorization = &snapshot.staging_authorizations[0];
-    let current_command = authorization.encode_command().unwrap();
-    let historical_command =
-        crate::control_plane_command::encode_control_plane_command_with_version_for_test(
-            &ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
-                authorizations: authorization.authorizations().to_vec(),
-            },
-            34,
-        )
-        .unwrap();
-    assert_eq!(current_command.len(), historical_command.len());
-    let offsets = payload
-        .windows(current_command.len())
-        .enumerate()
-        .filter_map(|(offset, window)| (window == current_command).then_some(offset))
-        .collect::<Vec<_>>();
-    assert_eq!(offsets.len(), 1);
-    let offset = offsets[0];
-    payload[offset..offset + historical_command.len()].copy_from_slice(&historical_command);
-    let response = encode_control_plane_rpc_response(Ok(payload)).unwrap();
-    let frame = encode_control_plane_rpc_frame_with_version(
-        ControlPlaneRpcKind::RuntimeMapSnapshot,
-        &response,
-        26,
-    )
-    .unwrap();
-    assert_eq!(
-        (frame.len(), hex_encode(&checksum::sha256::digest(&frame))),
-        (
-            378,
-            "1d7ad48c3cbe15cbbe4cb599394a68ee63ed2ed842994e48ca659c1c9064093c".to_owned(),
-        ),
-    );
-    assert!(matches!(
-        read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-        Err(ControlPlaneError::RpcProtocol { diagnostic })
-            if diagnostic.as_str() == "unsupported control-plane RPC version 26"
-    ));
-}
-
-#[test]
-fn control_plane_rpc_v27_nonempty_authorization_remains_rejected_evidence() {
-    let snapshot = control_plane_rpc_catalogue_authorized_snapshot();
-    let mut payload = Vec::new();
-    write_runtime_map_snapshot(&mut payload, &snapshot).unwrap();
-    let authorization = &snapshot.staging_authorizations[0];
-    let current_command = authorization.encode_command().unwrap();
-    let historical_command =
-        crate::control_plane_command::encode_control_plane_command_with_version_for_test(
-            &ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
-                authorizations: authorization.authorizations().to_vec(),
-            },
-            35,
-        )
-        .unwrap();
-    assert_eq!(current_command.len(), historical_command.len());
-    let offsets = payload
-        .windows(current_command.len())
-        .enumerate()
-        .filter_map(|(offset, window)| (window == current_command).then_some(offset))
-        .collect::<Vec<_>>();
-    assert_eq!(offsets.len(), 1);
-    let offset = offsets[0];
-    payload[offset..offset + historical_command.len()].copy_from_slice(&historical_command);
-    let response = encode_control_plane_rpc_response(Ok(payload)).unwrap();
-    let frame = encode_control_plane_rpc_frame_with_version(
-        ControlPlaneRpcKind::RuntimeMapSnapshot,
-        &response,
-        27,
-    )
-    .unwrap();
-    assert_eq!(
-        (frame.len(), hex_encode(&checksum::sha256::digest(&frame))),
-        (
-            378,
-            "99a29e117fe45d7aa2c5ddc75f2afd52a24851364922ccd8e620a902a6ae98d2".to_owned(),
-        ),
-    );
-    assert!(matches!(
-        read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-        Err(ControlPlaneError::RpcProtocol { diagnostic })
-            if diagnostic.as_str() == "unsupported control-plane RPC version 27"
-    ));
-}
-
-#[test]
-fn control_plane_rpc_v22_operation_catalogue_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v22_operation.aggregate");
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            hex_encode(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            15_194,
-            "e14fdaa8c1ac38e2af2d68f7e6219169cca55561af3306201a2dca0659b1216a".to_owned()
-        )
-    );
-
-    let mut remaining = AGGREGATE;
-    while !remaining.is_empty() {
-        let (_section, tail) = remaining.split_first().unwrap();
-        let (length, tail) = tail.split_at(std::mem::size_of::<u32>());
-        let length = usize::try_from(u32::from_be_bytes(length.try_into().unwrap())).unwrap();
-        let (frame, tail) = tail.split_at(length);
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 22"
-        ));
-        remaining = tail;
-    }
-}
-
-#[test]
-fn control_plane_rpc_v23_operation_catalogue_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!("../testdata/rpc_v23_operation.aggregate");
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            hex_encode(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            14_825,
-            "1ec11d2014208fbdd8aef3880b46b47477bab3271ad21e214c6b701cd6eb7d82".to_owned()
-        )
-    );
-    let mut remaining = AGGREGATE;
-    let mut count = 0_usize;
-    while !remaining.is_empty() {
-        let (_section, tail) = remaining.split_first().unwrap();
-        let (length, tail) = tail.split_at(std::mem::size_of::<u32>());
-        let length = usize::try_from(u32::from_be_bytes(length.try_into().unwrap())).unwrap();
-        let (frame, tail) = tail.split_at(length);
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 23"
-        ));
-        remaining = tail;
-        count += 1;
-    }
-    assert!(count > ControlPlaneRpcKind::ALL.len());
-}
-
-#[test]
-fn authenticated_control_plane_rpc_v14_through_v17_auth_v1_payload_bindings_remain_rejected_evidence(
-) {
-    let kind = ControlPlaneRpcKind::RuntimeMapStatus;
-    let credential = frontend_auth_credential("auth-cluster", "frontend-1");
-    let request_payload = write_authenticated_control_plane_rpc_payload(kind, &[]);
-    let request = credential
-        .sign_envelope_frame_with_version_for_test(
-            crate::control_plane_auth::ControlPlaneAuthSignInput {
-                target: ControlPlaneAuthTarget::Service(ControlPlaneAuthService::ControlPlane),
-                operation: ControlPlaneAuthOperation::FrontendRuntimeMapRead,
-                issued_at_ms: Some(1_000),
-                expires_at_ms: Some(6_000),
-                sequence: None,
-                nonce: Vec::new(),
-                payload: request_payload,
-            },
-            1,
-        )
-        .unwrap();
-    let logical_response = encode_control_plane_rpc_response(Ok(vec![0xa5, 0x5a])).unwrap();
-    let response_payload = write_authenticated_control_plane_rpc_payload(kind, &logical_response);
-    let response = credential
-        .runtime_map_response_credential_for_frontend()
-        .unwrap()
-        .sign_envelope_frame_with_version_for_test(
-            crate::control_plane_auth::ControlPlaneAuthSignInput {
-                target: ControlPlaneAuthTarget::Principal(credential.principal().clone()),
-                operation: ControlPlaneAuthOperation::RuntimeMapResponse,
-                issued_at_ms: Some(1_001),
-                expires_at_ms: Some(6_001),
-                sequence: None,
-                nonce: Vec::new(),
-                payload: response_payload,
-            },
-            1,
-        )
-        .unwrap();
-    for (version, request_hash, response_hash) in [
-        (
-            14,
-            "8e6ced7925437cef8aae609508634cdcd86e76088d8e4b5816654f77652f4419",
-            "72f5e379703b62bcd438281d63ac0dcc9c937400004d8c75e4014bb43b1128b7",
-        ),
-        (
-            15,
-            "37645109ed5bf0542da0101873aebdfffd5f2eae42bd51d2b4a7956cb31584da",
-            "ae755056e5f6f4308f6e28c788cdfcd204f74e8d383bf0188cbb08b7873bce9d",
-        ),
-        (
-            16,
-            "7e3502c39d454c15a2fd8040e056422482506bb5dfb8c5c916fd5413e5e9b737",
-            "91cb6a680b0305c3c6e87404f0b2a77e1f94ee6634ff9c1207532d6e30292059",
-        ),
-        (
-            17,
-            "752be58b60e37ca4de03c01e7c59ecd9d0f80c8065ede4c7b686ddf844048f0b",
-            "c8b16884cbaf7d6a13c2d39e2493f7ade78490c0d2eeceacd3624372e984d9b8",
-        ),
-    ] {
-        let request_frame =
-            encode_control_plane_rpc_frame_with_version(kind, &request, version).unwrap();
-        let response_frame =
-            encode_control_plane_rpc_frame_with_version(kind, &response, version).unwrap();
-        assert_eq!(request_frame.len(), 182);
-        assert_eq!(response_frame.len(), 190);
-        assert_eq!(
-            hex_encode(&checksum::sha256::digest(&request_frame)),
-            request_hash
-        );
-        assert_eq!(
-            hex_encode(&checksum::sha256::digest(&response_frame)),
-            response_hash
-        );
-        assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(request_frame)).is_err());
-        assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(response_frame)).is_err());
-    }
-}
-
-#[test]
-fn authenticated_control_plane_rpc_v18_auth_v2_payload_binding_remains_rejected_evidence() {
-    let kind = ControlPlaneRpcKind::RuntimeMapStatus;
-    let credential = frontend_auth_credential("auth-cluster", "frontend-1");
-    let request = signed_frontend_runtime_map_request(
-        kind,
-        &credential,
-        Vec::new(),
-        Some(1_000),
-        Some(6_000),
-    );
-    let response = signed_runtime_map_response_payload(kind, &credential, vec![0xa5, 0x5a], 1_001);
-    let request_frame =
-        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 18).unwrap();
-    let response_frame = encode_control_plane_rpc_frame_with_version(kind, &response, 18).unwrap();
-    assert_eq!(
-        (
-            request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&request_frame)),
-            response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&response_frame)),
-        ),
-        (
-            182,
-            "b64adac57bae0595adc3830fc68116a51db21174ee298a25e806fbb77ea32931".to_owned(),
-            190,
-            "1c01eb88c30a8f4326f2c02fda21658f1831bc7d2c9c9f67347daba5714b3098".to_owned(),
-        )
-    );
-    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(request_frame)).is_err());
-    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(response_frame)).is_err());
-}
-
-#[test]
-fn authenticated_control_plane_rpc_v19_auth_v2_payload_binding_remains_rejected_evidence() {
-    let kind = ControlPlaneRpcKind::RuntimeMapStatus;
-    let credential = frontend_auth_credential("auth-cluster", "frontend-1");
-    let request = signed_frontend_runtime_map_request(
-        kind,
-        &credential,
-        Vec::new(),
-        Some(1_000),
-        Some(6_000),
-    );
-    let response = signed_runtime_map_response_payload(kind, &credential, vec![0xa5, 0x5a], 1_001);
-    let request_frame =
-        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 19).unwrap();
-    let response_frame = encode_control_plane_rpc_frame_with_version(kind, &response, 19).unwrap();
-    assert_eq!(
-        (
-            request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&request_frame)),
-            response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&response_frame)),
-        ),
-        (
-            182,
-            "7f0f26416b3d44b483263180346bf4216fc79f539df75aecbc45ea46750e7160".to_owned(),
-            190,
-            "6a35ac60562ceb3bc41f153ddcc46481ae41bf6823861684ec1be536bc4cbd77".to_owned(),
-        )
-    );
-    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(request_frame)).is_err());
-    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(response_frame)).is_err());
-}
-
-#[test]
-fn authenticated_control_plane_rpc_v20_auth_v2_payload_binding_remains_rejected_evidence() {
-    let kind = ControlPlaneRpcKind::RuntimeMapStatus;
-    let credential = frontend_auth_credential("auth-cluster", "frontend-1");
-    let request = signed_frontend_runtime_map_request(
-        kind,
-        &credential,
-        Vec::new(),
-        Some(1_000),
-        Some(6_000),
-    );
-    let response = signed_runtime_map_response_payload(kind, &credential, vec![0xa5, 0x5a], 1_001);
-    let request_frame =
-        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 20).unwrap();
-    let response_frame = encode_control_plane_rpc_frame_with_version(kind, &response, 20).unwrap();
-    assert_eq!(
-        (
-            request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&request_frame)),
-            response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&response_frame)),
-        ),
-        (
-            182,
-            "51d44a3b6a3b2fd7b5a2023f5295404fdbd4bb0c22763fc1c465ba18221cc0d5".to_owned(),
-            190,
-            "134a93cdda52e552d882626b326e0ffb755f9418aeb5457b36e71f54c614d3e0".to_owned(),
-        )
-    );
-    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(request_frame)).is_err());
-    assert!(read_control_plane_rpc_frame(&mut std::io::Cursor::new(response_frame)).is_err());
-}
-
-#[test]
-fn authenticated_control_plane_rpc_v23_auth_v2_payload_binding_remains_rejected_evidence() {
-    let request = include_bytes!("../testdata/rpc_v23_auth_request.frame");
-    let response = include_bytes!("../testdata/rpc_v23_auth_response.frame");
-    assert_eq!(
-        (
-            request.len(),
-            hex_encode(&checksum::sha256::digest(request)),
-            response.len(),
-            hex_encode(&checksum::sha256::digest(response)),
-        ),
-        (
-            182,
-            "c535fc7c2d7e050a6cc7fb5f77ce3be011fe7ff4d6178d611108746efb94e45e".to_owned(),
-            190,
-            "bc77a904f7a8a8a7a80fe14f290ed95ddb82c30e847c5901277a09da19ef96e0".to_owned(),
-        )
-    );
-    for frame in [request.as_slice(), response.as_slice()] {
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 23"
-        ));
-    }
-}
-
-#[test]
-fn authenticated_control_plane_rpc_v29_auth_v2_payload_bindings_are_exact() {
-    assert_eq!(CONTROL_PLANE_RPC_VERSION, 29);
+fn authenticated_control_plane_rpc_v14_through_v18_auth_v1_payload_bindings_are_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 18);
     let kind = ControlPlaneRpcKind::RuntimeMapStatus;
     let credential = frontend_auth_credential("auth-cluster", "frontend-1");
     let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -2476,238 +1633,131 @@ fn authenticated_control_plane_rpc_v29_auth_v2_payload_bindings_are_exact() {
         Some(1_000),
         Some(6_000),
     );
-    assert!(request.payload.starts_with(b"ARGCPAUT\x00\x02"));
+    assert!(request.payload.starts_with(b"ARGCPAUT\x00\x01"));
+    let request_envelope =
+        ControlPlaneAuthEnvelope::decode_frame(&request.payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
+            .unwrap();
+    assert_eq!(request_envelope.payload(), &[0x00, 0x0c]);
+    let request_frame = encode_control_plane_rpc_frame(kind, &request.payload).unwrap();
+    assert!(request_frame.starts_with(b"argmin-control-plane-rpc\x00\x12"));
+    let v14_request_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 14).unwrap();
+    assert_eq!(
+        (
+            v14_request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v14_request_frame))
+        ),
+        (
+            182,
+            "8e6ced7925437cef8aae609508634cdcd86e76088d8e4b5816654f77652f4419".to_owned()
+        )
+    );
+    let v15_request_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 15).unwrap();
+    assert_eq!(
+        (
+            v15_request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v15_request_frame))
+        ),
+        (
+            182,
+            "37645109ed5bf0542da0101873aebdfffd5f2eae42bd51d2b4a7956cb31584da".to_owned()
+        )
+    );
+    let v16_request_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &request.payload, 16).unwrap();
+    assert_eq!(
+        (
+            v16_request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v16_request_frame))
+        ),
+        (
+            182,
+            "7e3502c39d454c15a2fd8040e056422482506bb5dfb8c5c916fd5413e5e9b737".to_owned()
+        )
+    );
     let verified = verify_control_plane_unix_request(request, Some(&verifier), 1_000).unwrap();
     assert_eq!(verified.kind, kind);
     assert!(verified.payload.is_empty());
+    assert!(verified.response_auth.is_some());
 
-    let response = signed_runtime_map_response_payload(kind, &credential, vec![0xa5, 0x5a], 1_001);
+    let logical_response = vec![0xa5, 0x5a];
+    let encoded_response = encode_control_plane_rpc_response(Ok(logical_response.clone())).unwrap();
+    let response =
+        signed_runtime_map_response_payload(kind, &credential, logical_response.clone(), 1_001);
+    let response_envelope =
+        ControlPlaneAuthEnvelope::decode_frame(&response, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
+            .unwrap();
+    assert_eq!(
+        response_envelope.payload(),
+        &[0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x02, 0xa5, 0x5a]
+    );
     let client = AuthenticatedUnixControlPlaneClient::new(
         UnixControlPlaneClient::new("unused-test-socket"),
         credential,
     );
-    client
-        .verify_runtime_map_response(kind, 1_001, &response)
-        .unwrap();
-    let historical_request = signed_frontend_runtime_map_request(
-        kind,
-        client.credential(),
-        Vec::new(),
-        Some(1_000),
-        Some(6_000),
-    );
-    let historical_request_frame =
-        encode_control_plane_rpc_frame_with_version(kind, &historical_request.payload, 21).unwrap();
-    let historical_response_frame =
-        encode_control_plane_rpc_frame_with_version(kind, &response, 21).unwrap();
     assert_eq!(
-        (
-            historical_request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&historical_request_frame)),
-            historical_response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&historical_response_frame)),
-        ),
-        (
-            182,
-            "2b27c639ed0c6ccd8b6c781ad6e321fed4a1464fd8f12cb5a868543ce5bc91bf".to_owned(),
-            190,
-            "54745c61058a7d6ae389e4df5337b586f73c71cee3c20d39a3464f0b738c6063".to_owned(),
-        )
+        client
+            .verify_runtime_map_response(kind, 1_001, &response)
+            .unwrap(),
+        encoded_response
     );
-    assert!(
-        read_control_plane_rpc_frame(&mut std::io::Cursor::new(historical_request_frame)).is_err()
-    );
-    assert!(
-        read_control_plane_rpc_frame(&mut std::io::Cursor::new(historical_response_frame)).is_err()
-    );
-    let previous_request_frame = encode_control_plane_rpc_frame_with_version(
-        kind,
-        &signed_frontend_runtime_map_request(
-            kind,
-            client.credential(),
-            Vec::new(),
-            Some(1_000),
-            Some(6_000),
-        )
-        .payload,
-        25,
-    )
-    .unwrap();
-    let previous_response_frame =
-        encode_control_plane_rpc_frame_with_version(kind, &response, 25).unwrap();
-    assert_eq!(
-        (
-            previous_request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&previous_request_frame)),
-            previous_response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&previous_response_frame)),
-        ),
-        (
-            182,
-            "e5e3784da42baa34200dd8216ee8121300ad772e7cc5ae65a1f33ccd649c410c".to_owned(),
-            190,
-            "a47102ffe567167ef965f14144c80485ec10bce6f0b32f06e29836a0d632d23a".to_owned(),
-        )
-    );
-    for frame in [previous_request_frame, previous_response_frame] {
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 25"
-        ));
-    }
-    let previous_request_frame = encode_control_plane_rpc_frame_with_version(
-        kind,
-        &signed_frontend_runtime_map_request(
-            kind,
-            client.credential(),
-            Vec::new(),
-            Some(1_000),
-            Some(6_000),
-        )
-        .payload,
-        26,
-    )
-    .unwrap();
-    let previous_response_frame =
-        encode_control_plane_rpc_frame_with_version(kind, &response, 26).unwrap();
-    assert_eq!(
-        (
-            previous_request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&previous_request_frame)),
-            previous_response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&previous_response_frame)),
-        ),
-        (
-            182,
-            "ff002336534e2d043876019c7041e9d36ec1686a177b582233f86a9362e21712".to_owned(),
-            190,
-            "a3d3037ea3267ae91f3ca0a8028015b60cb91de88e9e704230c70899fdfe1c1c".to_owned(),
-        )
-    );
-    for frame in [previous_request_frame, previous_response_frame] {
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 26"
-        ));
-    }
-    let previous_request_frame = encode_control_plane_rpc_frame_with_version(
-        kind,
-        &signed_frontend_runtime_map_request(
-            kind,
-            client.credential(),
-            Vec::new(),
-            Some(1_000),
-            Some(6_000),
-        )
-        .payload,
-        27,
-    )
-    .unwrap();
-    let previous_response_frame =
-        encode_control_plane_rpc_frame_with_version(kind, &response, 27).unwrap();
-    assert_eq!(
-        (
-            previous_request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&previous_request_frame)),
-            previous_response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&previous_response_frame)),
-        ),
-        (
-            182,
-            "f249e61c7dab4fc74f9f663df0b09ca1511cbc95ec7c2c56479a7323e5486bbb".to_owned(),
-            190,
-            "9e680b31d2555df958360d197ce60d0a264491ab2a2ed38b9712095a53ebad49".to_owned(),
-        )
-    );
-    for frame in [previous_request_frame, previous_response_frame] {
-        assert!(matches!(
-            read_control_plane_rpc_frame(&mut std::io::Cursor::new(frame)),
-            Err(ControlPlaneError::RpcProtocol { diagnostic })
-                if diagnostic.as_str() == "unsupported control-plane RPC version 27"
-        ));
-    }
-    let request_frame = encode_control_plane_rpc_frame(
-        kind,
-        &signed_frontend_runtime_map_request(
-            kind,
-            client.credential(),
-            Vec::new(),
-            Some(1_000),
-            Some(6_000),
-        )
-        .payload,
-    )
-    .unwrap();
     let response_frame = encode_control_plane_rpc_frame(kind, &response).unwrap();
+    let v14_response_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &response, 14).unwrap();
+    assert_eq!(
+        (
+            v14_response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v14_response_frame))
+        ),
+        (
+            190,
+            "72f5e379703b62bcd438281d63ac0dcc9c937400004d8c75e4014bb43b1128b7".to_owned()
+        )
+    );
+    let v15_response_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &response, 15).unwrap();
+    assert_eq!(
+        (
+            v15_response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v15_response_frame))
+        ),
+        (
+            190,
+            "ae755056e5f6f4308f6e28c788cdfcd204f74e8d383bf0188cbb08b7873bce9d".to_owned()
+        )
+    );
+    let v16_response_frame =
+        encode_control_plane_rpc_frame_with_version(kind, &response, 16).unwrap();
+    assert_eq!(
+        (
+            v16_response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&v16_response_frame))
+        ),
+        (
+            190,
+            "91cb6a680b0305c3c6e87404f0b2a77e1f94ee6634ff9c1207532d6e30292059".to_owned()
+        )
+    );
+
     assert_eq!(
         (
             request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&request_frame)),
-            response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&response_frame)),
+            hex_encode(&checksum::sha256::digest(&request_frame))
         ),
         (
             182,
-            "21b905cda70c3187aaaa8d895ec5ec4bf4c723e682f7ad3efa32957a26766172".to_owned(),
-            190,
-            "412dae7fb80c3b1469737361ab9338cb343750f41fa5875629ff48cbdff30b4a".to_owned(),
+            "5261e9e25d892d569ab7a828ebd15c38995bcec3c618571c5022faab01c2573a".to_owned()
         )
     );
-}
-
-#[test]
-fn authenticated_control_plane_rpc_v29_closure_page_frames_are_exact() {
-    let kind = ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage;
-    let page = control_plane_rpc_catalogue_staging_closure_page();
-    assert!(page.actor_closure_candidate().is_some());
-    let credential = storage_node_auth_credential("auth-cluster", 3, 4);
-    let client = AuthenticatedUnixControlPlaneClient::new(
-        UnixControlPlaneClient::new("unused-test-socket"),
-        credential.clone(),
-    );
-    let mut logical_request = Vec::new();
-    write_staging_evidence_publication_request(&mut logical_request, &page).unwrap();
-    let signed_request = client
-        .sign_staging_evidence_request(1_000, logical_request)
-        .unwrap();
-    let request_frame = encode_control_plane_rpc_frame(kind, &signed_request).unwrap();
-
-    let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
-    let logical_response =
-        encode_control_plane_rpc_response(Ok(receipt.as_bytes().to_vec())).unwrap();
-    let response_payload = write_authenticated_control_plane_rpc_payload(kind, &logical_response);
-    let response_credential = credential
-        .staging_evidence_response_credential_for_storage_node()
-        .unwrap();
-    let signed_response = response_credential
-        .sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
-            target: ControlPlaneAuthTarget::Principal(credential.principal().clone()),
-            operation: ControlPlaneAuthOperation::StagingEvidenceResponse,
-            issued_at_ms: Some(1_001),
-            expires_at_ms: Some(6_001),
-            sequence: None,
-            nonce: Vec::new(),
-            payload: response_payload,
-        })
-        .unwrap()
-        .encode_frame()
-        .unwrap();
-    let response_frame = encode_control_plane_rpc_frame(kind, &signed_response).unwrap();
-
     assert_eq!(
         (
-            request_frame.len(),
-            hex_encode(&checksum::sha256::digest(&request_frame)),
             response_frame.len(),
-            hex_encode(&checksum::sha256::digest(&response_frame)),
+            hex_encode(&checksum::sha256::digest(&response_frame))
         ),
         (
-            867,
-            "9207cc4f7fe6329201433414141eef867b113dc4f0eec1815cfb651e587c3337".to_owned(),
-            348,
-            "fd28fcfd149b45b4650a62d5716c1212cb7c38ad1e461ead3920bf74d7ac5e1c".to_owned(),
+            190,
+            "4495d60d3e3b5cc2bd733ff0b9e92c28af038c505b61fd8718e68d5a8a908ad5".to_owned()
         )
     );
 }
@@ -4347,7 +3397,7 @@ fn authenticated_control_plane_rejects_resigned_admin_inner_kind_before_dispatch
 
 #[test]
 fn authenticated_control_plane_rejects_resigned_auth_versions_before_dispatch() {
-    for auth_version in [0_u16, 1, 3] {
+    for auth_version in [0_u16, 2] {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -6907,8 +5957,6 @@ struct RecordingRaftAdminAuthority {
     transferred_to: Vec<u64>,
     snapshot_purge_triggers: usize,
     election_triggers: usize,
-    staging_evidence_pages: Vec<[u8; 32]>,
-    staging_evidence_receipt_override: Option<MetadataTransferStagingEvidenceApplyReceipt>,
 }
 
 impl RecordingRaftAdminAuthority {
@@ -6920,22 +5968,6 @@ impl RecordingRaftAdminAuthority {
 }
 
 impl ControlPlaneAdmin for RecordingRaftAdminAuthority {
-    fn apply_metadata_transfer_staging_evidence_page(
-        &mut self,
-        operation_payload: Vec<u8>,
-        page_digest: [u8; 32],
-    ) -> Result<Vec<u8>, ControlPlaneError> {
-        let page = decode_staging_evidence_page_payload(&operation_payload, page_digest)
-            .map_err(|error| ControlPlaneError::rpc_protocol(error.to_string()))?;
-        self.staging_evidence_pages.push(page_digest);
-        Ok(self
-            .staging_evidence_receipt_override
-            .clone()
-            .unwrap_or_else(|| MetadataTransferStagingEvidenceApplyReceipt::for_page(&page))
-            .as_bytes()
-            .to_vec())
-    }
-
     fn set_pg_acting_set(
         &mut self,
         _pg_id: PgId,
@@ -6984,947 +6016,6 @@ impl ControlPlaneAdmin for RecordingRaftAdminAuthority {
         self.election_triggers += 1;
         Ok(())
     }
-}
-
-fn assert_authenticated_staging_evidence_publication(
-    client: AuthenticatedUnixControlPlaneClient,
-    page: &MetadataTransferStagingEvidencePage,
-    authority: &Arc<Mutex<RecordingRaftAdminAuthority>>,
-) {
-    let receipt = client
-        .publish_metadata_transfer_staging_evidence_page(page, 2_000)
-        .unwrap();
-    assert!(receipt.is_for_page(page));
-    assert_eq!(
-        authority
-            .lock()
-            .expect("recording authority mutex poisoned")
-            .staging_evidence_pages,
-        [page.page_digest()]
-    );
-}
-
-#[test]
-fn staging_evidence_publication_rejects_actor_mismatch_before_dispatch() {
-    let page = control_plane_rpc_catalogue_staging_page();
-    let mut logical_payload = Vec::new();
-    write_staging_evidence_publication_request(&mut logical_payload, &page).unwrap();
-    let client = AuthenticatedUnixControlPlaneClient::new(
-        UnixControlPlaneClient::new("unused-test-socket"),
-        storage_node_auth_credential("auth-cluster", 4, 4),
-    );
-    let request = ControlPlaneRpcRequest {
-        kind: ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage,
-        payload: client
-            .sign_staging_evidence_request(1_999, logical_payload)
-            .unwrap(),
-    };
-    let verifier = storage_node_auth_verifier(
-        "auth-cluster",
-        vec![
-            storage_node_auth_node_credential(3),
-            storage_node_auth_node_credential(4),
-        ],
-    );
-    let mut authority = RecordingRaftAdminAuthority::default();
-
-    let error = build_control_plane_unix_response_with_auth(
-        &mut authority,
-        request,
-        2_000,
-        Some(&verifier),
-    )
-    .unwrap_err();
-
-    assert!(
-        matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
-            if message.contains("staging evidence auth rejected")),
-        "unexpected error: {error}"
-    );
-    assert!(authority.staging_evidence_pages.is_empty());
-    assert_eq!(
-        verifier
-            .metrics_snapshot()
-            .rejected_for_operation(ControlPlaneAuthOperation::StorageStagingEvidencePublish),
-        1
-    );
-}
-
-#[test]
-fn staging_evidence_publication_requires_authentication_before_dispatch() {
-    let page = control_plane_rpc_catalogue_staging_page();
-    let mut payload = Vec::new();
-    write_staging_evidence_publication_request(&mut payload, &page).unwrap();
-    let verifier =
-        storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(3)]);
-    let mut authority = RecordingRaftAdminAuthority::default();
-
-    let error = build_control_plane_unix_response_with_auth(
-        &mut authority,
-        ControlPlaneRpcRequest {
-            kind: ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage,
-            payload,
-        },
-        2_000,
-        Some(&verifier),
-    )
-    .unwrap_err();
-
-    assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
-    assert!(authority.staging_evidence_pages.is_empty());
-    assert_eq!(
-        verifier
-            .metrics_snapshot()
-            .rejected_for_operation(ControlPlaneAuthOperation::StorageStagingEvidencePublish),
-        1
-    );
-}
-
-#[test]
-fn staging_evidence_publication_rejects_valid_heartbeat_auth_before_dispatch() {
-    let page = control_plane_rpc_catalogue_staging_page();
-    let mut logical_payload = Vec::new();
-    write_staging_evidence_publication_request(&mut logical_payload, &page).unwrap();
-    let kind = ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage;
-    let credential = storage_node_auth_credential("auth-cluster", 3, 4);
-    let payload = write_authenticated_control_plane_rpc_payload(kind, &logical_payload);
-    let payload = credential
-        .sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
-            target: ControlPlaneAuthTarget::Service(ControlPlaneAuthService::ControlPlane),
-            operation: ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
-            issued_at_ms: Some(1_999),
-            expires_at_ms: Some(2_999),
-            sequence: None,
-            nonce: Vec::new(),
-            payload,
-        })
-        .unwrap()
-        .encode_frame()
-        .unwrap();
-    let verifier =
-        storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(3)]);
-    let mut authority = RecordingRaftAdminAuthority::default();
-
-    let error = build_control_plane_unix_response_with_auth(
-        &mut authority,
-        ControlPlaneRpcRequest { kind, payload },
-        2_000,
-        Some(&verifier),
-    )
-    .unwrap_err();
-
-    assert!(
-        matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
-            if message.contains("staging evidence auth rejected")),
-        "unexpected error: {error}"
-    );
-    assert!(authority.staging_evidence_pages.is_empty());
-    let metrics = verifier.metrics_snapshot();
-    assert_eq!(
-        metrics.rejected_for_operation(ControlPlaneAuthOperation::StorageStagingEvidencePublish),
-        1
-    );
-    assert_eq!(
-        metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::WrongRole),
-        1
-    );
-}
-
-#[test]
-fn authenticated_unix_staging_evidence_publication_returns_exact_receipt() {
-    let tmp = test_util::tempdir();
-    let socket_path = tmp.path().join("staging-evidence.sock");
-    let listener = ControlPlaneRpcServerListener::unix(
-        UnixListener::bind(&socket_path).unwrap(),
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-        Duration::from_secs(1),
-    )
-    .unwrap();
-    let policy = ControlPlaneRpcServerPolicy::new(
-        ControlPlaneRpcServerRole::Ordinary,
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-    )
-    .unwrap()
-    .with_auth_verifier(Arc::new(storage_node_auth_verifier(
-        "auth-cluster",
-        vec![storage_node_auth_node_credential(3)],
-    )));
-    let authority = Arc::new(Mutex::new(RecordingRaftAdminAuthority::default()));
-    let authority_for_server = Arc::clone(&authority);
-    let server = std::thread::spawn(move || {
-        listener
-            .serve_shared_requests_for_test(authority_for_server, policy, [2_000], |_| {})
-            .unwrap();
-    });
-    let page = control_plane_rpc_catalogue_staging_page();
-    let client = AuthenticatedUnixControlPlaneClient::new(
-        UnixControlPlaneClient::new(&socket_path),
-        storage_node_auth_credential("auth-cluster", 3, 4),
-    );
-
-    assert_authenticated_staging_evidence_publication(client, &page, &authority);
-    server.join().unwrap();
-}
-
-#[test]
-fn global_evidence_saturation_returns_typed_deferral_without_consuming_heartbeat_workers() {
-    struct ConfirmationGate {
-        state: Mutex<(usize, bool)>,
-        changed: std::sync::Condvar,
-    }
-
-    impl ConfirmationGate {
-        fn block_evidence(&self) {
-            let mut state = self.state.lock().expect("confirmation gate poisoned");
-            state.0 += 1;
-            self.changed.notify_all();
-            let (state, timeout) = self
-                .changed
-                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.1)
-                .expect("confirmation gate poisoned while waiting");
-            assert!(state.1, "evidence confirmation gate timed out");
-            assert!(!timeout.timed_out(), "evidence confirmation gate timed out");
-        }
-
-        fn wait_for_arrivals(&self, expected: usize) {
-            let state = self.state.lock().expect("confirmation gate poisoned");
-            let (state, timeout) = self
-                .changed
-                .wait_timeout_while(state, Duration::from_secs(2), |state| state.0 < expected)
-                .expect("confirmation gate poisoned while observing arrivals");
-            assert_eq!(state.0, expected, "unexpected confirmation arrivals");
-            assert!(!timeout.timed_out(), "confirmation arrival timed out");
-        }
-
-        fn release(&self) {
-            let mut state = self.state.lock().expect("confirmation gate poisoned");
-            state.1 = true;
-            self.changed.notify_all();
-        }
-
-        fn arrivals(&self) -> usize {
-            self.state.lock().expect("confirmation gate poisoned").0
-        }
-    }
-
-    struct ConfirmationRelease(Arc<ConfirmationGate>);
-
-    impl Drop for ConfirmationRelease {
-        fn drop(&mut self) {
-            self.0.release();
-        }
-    }
-
-    let tmp = test_util::tempdir();
-    let socket_path = tmp.path().join("staging-evidence-admission.sock");
-    let listener = ControlPlaneRpcServerListener::unix(
-        UnixListener::bind(&socket_path).unwrap(),
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-        Duration::from_secs(2),
-    )
-    .unwrap();
-    let gate = Arc::new(ConfirmationGate {
-        state: Mutex::new((0, false)),
-        changed: std::sync::Condvar::new(),
-    });
-    let release = ConfirmationRelease(Arc::clone(&gate));
-    let saturation_gate = Arc::new(ConfirmationGate {
-        state: Mutex::new((0, false)),
-        changed: std::sync::Condvar::new(),
-    });
-    let saturation_release = ConfirmationRelease(Arc::clone(&saturation_gate));
-    let gate_for_hook = Arc::clone(&gate);
-    let saturation_gate_for_hook = Arc::clone(&saturation_gate);
-    let authority_confirmations = Arc::new(AtomicUsize::new(0));
-    let authority_confirmations_for_hook = Arc::clone(&authority_confirmations);
-    let policy = ControlPlaneRpcServerPolicy::new(
-        ControlPlaneRpcServerRole::Ordinary,
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-    )
-    .unwrap()
-    .with_auth_verifier(Arc::new(storage_node_auth_verifier(
-        "auth-cluster",
-        vec![
-            storage_node_auth_node_credential(3),
-            storage_node_auth_node_credential(4),
-            storage_node_auth_node_credential(5),
-        ],
-    )))
-    .with_authority_confirmation(Arc::new(move || {
-        authority_confirmations_for_hook.fetch_add(1, Ordering::AcqRel);
-        Ok(())
-    }))
-    .with_after_staging_evidence_actor_admission(Arc::new(move || {
-        gate_for_hook.block_evidence();
-    }))
-    .with_after_staging_evidence_saturation_responder_admission(Arc::new(move || {
-        saturation_gate_for_hook.block_evidence();
-    }));
-    let policy_for_assert = policy.clone();
-    let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
-        tmp.path().join("control-plane.state"),
-    ))
-    .unwrap();
-    authority
-        .set_node_membership(NodeId::new(3), NodeMembershipState::Active)
-        .unwrap();
-    authority
-        .set_pg_acting_set(PgId::new(7), vec![NodeId::new(3)])
-        .unwrap();
-    let heartbeat_epoch = authority.snapshot().cluster_epoch();
-    let authority = Arc::new(Mutex::new(authority));
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let authority_for_server = Arc::clone(&authority);
-    let stop_for_server = Arc::clone(&stop);
-    let server = std::thread::spawn(move || {
-        listener
-            .serve_shared_until_stop_for_test(authority_for_server, policy, 2_000, &stop_for_server)
-            .unwrap();
-    });
-    let page_for_actor = |node_id: u32, artifact_digest: [u8; 32]| {
-        metadata_transfer_staging_evidence_page_for_test(
-            MetadataTransferStagingNodeIdentity::new(
-                NodeId::new(node_id),
-                4,
-                format!("unix:///catalogue/storage-{node_id}.sock"),
-            )
-            .unwrap(),
-            &control_plane_rpc_catalogue_transition_binding(),
-            artifact_digest,
-            12_345 + u64::from(node_id),
-            METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-            MetadataTransferStagingEvidenceKind::Publication,
-            None,
-        )
-    };
-    let first_page = page_for_actor(3, [0x31; 32]);
-    let second_page = page_for_actor(4, [0x42; 32]);
-    let saturated_page = page_for_actor(5, [0x53; 32]);
-    let overflow_page = saturated_page.clone();
-    let first_socket = socket_path.clone();
-    let first = std::thread::spawn(move || {
-        AuthenticatedUnixControlPlaneClient::new(
-            UnixControlPlaneClient::new(first_socket),
-            storage_node_auth_credential("auth-cluster", 3, 4),
-        )
-        .publish_metadata_transfer_staging_evidence_page(&first_page, 2_000)
-    });
-
-    let second_socket = socket_path.clone();
-    let second = std::thread::spawn(move || {
-        AuthenticatedUnixControlPlaneClient::new(
-            UnixControlPlaneClient::new(second_socket),
-            storage_node_auth_credential("auth-cluster", 4, 4),
-        )
-        .publish_metadata_transfer_staging_evidence_page(&second_page, 2_000)
-    });
-    gate.wait_for_arrivals(2);
-
-    let saturated_socket = socket_path.clone();
-    let (saturated_tx, saturated_rx) = std::sync::mpsc::sync_channel(1);
-    let saturated = std::thread::spawn(move || {
-        let result = AuthenticatedUnixControlPlaneClient::new(
-            UnixControlPlaneClient::new(saturated_socket),
-            storage_node_auth_credential("auth-cluster", 5, 4),
-        )
-        .publish_metadata_transfer_staging_evidence_page(&saturated_page, 2_000);
-        saturated_tx.send(result).unwrap();
-    });
-    saturation_gate.wait_for_arrivals(1);
-    assert_eq!(
-        policy_for_assert.active_evidence_saturation_responders(),
-        1,
-        "global saturation admitted more than one responder"
-    );
-
-    let overflow_socket = socket_path.clone();
-    let (overflow_tx, overflow_rx) = std::sync::mpsc::sync_channel(1);
-    let overflow = std::thread::spawn(move || {
-        let result = AuthenticatedUnixControlPlaneClient::new(
-            UnixControlPlaneClient::new(overflow_socket),
-            storage_node_auth_credential("auth-cluster", 5, 4),
-        )
-        .publish_metadata_transfer_staging_evidence_page(&overflow_page, 2_000);
-        overflow_tx.send(result).unwrap();
-    });
-    let overflow_result = overflow_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("overflow evidence request queued behind saturation responder");
-    assert!(
-        overflow_result.is_err(),
-        "unadmitted overflow evidence request unexpectedly reached dispatch"
-    );
-    assert_eq!(
-        policy_for_assert.active_evidence_saturation_responders(),
-        1,
-        "overflow evidence request acquired an unbounded responder"
-    );
-    let evidence_authority_confirmations = authority_confirmations.load(Ordering::Acquire);
-
-    let heartbeat_socket = socket_path.clone();
-    let (heartbeat_tx, heartbeat_rx) = std::sync::mpsc::sync_channel(1);
-    let heartbeat = std::thread::spawn(move || {
-        let mut client = AuthenticatedUnixControlPlaneClient::new(
-            UnixControlPlaneClient::new(heartbeat_socket),
-            storage_node_auth_credential("auth-cluster", 3, 4),
-        );
-        let result = client.refresh_node_heartbeat_with_clock(
-            NodeHeartbeat {
-                node_id: NodeId::new(3),
-                node_incarnation: 4,
-                endpoint: "unix:///node-3".to_owned(),
-                observed_epoch: heartbeat_epoch,
-                requested_lease_duration_ms: 5_000,
-                cluster_map_history_route_scan_generation: NonZeroU64::new(1).unwrap(),
-                cluster_map_history_route_references: Default::default(),
-                pg_observations: Vec::new(),
-            },
-            || Ok(2_000),
-        );
-        heartbeat_tx.send(result).unwrap();
-    });
-    let heartbeat_result = heartbeat_rx.recv_timeout(Duration::from_secs(2));
-    heartbeat.join().unwrap();
-
-    saturation_release.0.release();
-    drop(saturation_release);
-    let saturated_result = saturated_rx.recv_timeout(Duration::from_secs(2));
-    release.0.release();
-    drop(release);
-    let _ = first.join().unwrap();
-    let _ = second.join().unwrap();
-    saturated.join().unwrap();
-    overflow.join().unwrap();
-    stop.store(true, Ordering::Release);
-    drop(UnixStream::connect(&socket_path).unwrap());
-    server.join().unwrap();
-    assert_eq!(
-        policy_for_assert.active_evidence_saturation_responders(),
-        0,
-        "saturation responder permit leaked"
-    );
-
-    assert!(
-        saturated_result.is_ok(),
-        "saturated evidence request retained an ordinary worker"
-    );
-    assert!(matches!(
-        saturated_result,
-        Ok(Err(ControlPlaneError::StagingEvidencePublicationDeferred))
-    ));
-    assert_eq!(
-        gate.arrivals(),
-        2,
-        "globally saturated evidence request reached actor admission"
-    );
-    assert_eq!(
-        evidence_authority_confirmations, 2,
-        "globally saturated evidence request reached authority confirmation"
-    );
-    let heartbeat_refresh = heartbeat_result.expect("heartbeat was blocked by evidence admission");
-    let heartbeat_refresh = heartbeat_refresh.unwrap_or_else(|error| {
-        panic!(
-            "heartbeat failed while evidence confirmation was blocked: {}",
-            error.retained_diagnostic_message()
-        )
-    });
-    assert_eq!(heartbeat_refresh.lease().node_id(), NodeId::new(3));
-}
-
-#[test]
-fn authenticated_saturation_defers_the_durable_staging_outbox() {
-    struct ConfirmationGate {
-        state: Mutex<(usize, bool)>,
-        changed: std::sync::Condvar,
-    }
-
-    impl ConfirmationGate {
-        fn block(&self) {
-            let mut state = self.state.lock().expect("confirmation gate poisoned");
-            state.0 += 1;
-            self.changed.notify_all();
-            let (state, timeout) = self
-                .changed
-                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.1)
-                .expect("confirmation gate poisoned while waiting");
-            assert!(state.1, "confirmation gate timed out");
-            assert!(!timeout.timed_out(), "confirmation gate timed out");
-        }
-
-        fn wait_for_first_arrival(&self) {
-            let state = self.state.lock().expect("confirmation gate poisoned");
-            let (state, timeout) = self
-                .changed
-                .wait_timeout_while(state, Duration::from_secs(2), |state| state.0 == 0)
-                .expect("confirmation gate poisoned while observing arrival");
-            assert_eq!(state.0, 1, "unexpected confirmation arrivals");
-            assert!(!timeout.timed_out(), "confirmation arrival timed out");
-        }
-
-        fn release(&self) {
-            let mut state = self.state.lock().expect("confirmation gate poisoned");
-            state.1 = true;
-            self.changed.notify_all();
-        }
-    }
-
-    struct ConfirmationRelease(Arc<ConfirmationGate>);
-
-    impl Drop for ConfirmationRelease {
-        fn drop(&mut self) {
-            self.0.release();
-        }
-    }
-
-    let tmp = test_util::tempdir();
-    let socket_path = tmp.path().join("staging-evidence-outbox-admission.sock");
-    let identity = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
-        NodeId::new(3),
-        4,
-        "unix:///node-3".to_owned(),
-    )
-    .unwrap();
-    let store = Arc::new(
-        crate::pg_store::MetadataTransferStagingStore::open(
-            tmp.path(),
-            identity,
-            crate::pg_store::MetadataTransferStagingLimits::new(8, 1024 * 1024, 4 * 1024 * 1024)
-                .unwrap(),
-        )
-        .unwrap(),
-    );
-    let transition = control_plane_rpc_catalogue_transition_binding();
-    let artifact = crate::pg_store::canonical_nonempty_staged_metadata_transfer_artifact_for_test(
-        &transition,
-        next_epoch(transition.transition_epoch()).unwrap(),
-    );
-    let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
-        &transition,
-        checksum::sha256::digest(&artifact),
-        u64::try_from(artifact.len()).unwrap(),
-        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-    )
-    .unwrap();
-    store.create_intent(&intent).unwrap();
-    store.publish_artifact(&intent, &artifact).unwrap();
-    let page = store.next_evidence_page().unwrap().unwrap();
-
-    let listener = ControlPlaneRpcServerListener::unix(
-        UnixListener::bind(&socket_path).unwrap(),
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-        Duration::from_secs(2),
-    )
-    .unwrap();
-    let gate = Arc::new(ConfirmationGate {
-        state: Mutex::new((0, false)),
-        changed: std::sync::Condvar::new(),
-    });
-    let release = ConfirmationRelease(Arc::clone(&gate));
-    let gate_for_hook = Arc::clone(&gate);
-    let policy = ControlPlaneRpcServerPolicy::new(
-        ControlPlaneRpcServerRole::Ordinary,
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-    )
-    .unwrap()
-    .with_auth_verifier(Arc::new(storage_node_auth_verifier(
-        "auth-cluster",
-        vec![storage_node_auth_node_credential(3)],
-    )))
-    .with_authority_confirmation(Arc::new(|| Ok(())))
-    .with_after_staging_evidence_actor_admission(Arc::new(move || {
-        gate_for_hook.block();
-    }));
-    let authority = Arc::new(Mutex::new(RecordingRaftAdminAuthority::default()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let authority_for_server = Arc::clone(&authority);
-    let stop_for_server = Arc::clone(&stop);
-    let server = std::thread::spawn(move || {
-        listener
-            .serve_shared_until_stop_for_test(authority_for_server, policy, 2_000, &stop_for_server)
-            .unwrap();
-    });
-
-    let first_socket = socket_path.clone();
-    let first_page = page.clone();
-    let first = std::thread::spawn(move || {
-        AuthenticatedUnixControlPlaneClient::new(
-            UnixControlPlaneClient::new(first_socket),
-            storage_node_auth_credential("auth-cluster", 3, 4),
-        )
-        .publish_metadata_transfer_staging_evidence_page(&first_page, 2_000)
-    });
-    gate.wait_for_first_arrival();
-
-    let control_plane = crate::ControlPlaneStorageNodeClient::with_socket_paths(
-        [socket_path.clone()],
-        Some("auth-cluster"),
-        3,
-        4,
-        vec![ControlPlaneStorageNodeAuthCredentialInput {
-            node_id: NodeId::new(3),
-            credential_id: "storage-node-3".to_owned(),
-            credential_version: 1,
-            secret: b"storage-node-3-secret".to_vec(),
-        }],
-        Some(("storage-node-3".to_owned(), 1)),
-    )
-    .unwrap();
-    let (fatal_tx, fatal_rx) = std::sync::mpsc::sync_channel(1);
-    let mut outbox = crate::StorageNodeMetadataTransferStagingOutbox::spawn(
-        Arc::clone(&store),
-        control_plane,
-        || 2_000,
-        move |error| fatal_tx.send(error).unwrap(),
-    )
-    .unwrap();
-    let deferred_deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let status = outbox.status();
-        if status.publication_failures != 0 {
-            assert!(!status.failed, "typed saturation became fatal: {status:?}");
-            break;
-        }
-        assert!(
-            Instant::now() < deferred_deadline,
-            "outbox did not observe typed saturation"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(matches!(
-        fatal_rx.try_recv(),
-        Err(std::sync::mpsc::TryRecvError::Empty)
-    ));
-
-    release.0.release();
-    drop(release);
-    first.join().unwrap().unwrap();
-    let success_deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let status = outbox.status();
-        assert!(!status.failed, "outbox failed after saturation: {status:?}");
-        if status.publication_successes != 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < success_deadline,
-            "outbox did not retry after saturation"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(store.next_evidence_page().unwrap().is_none());
-    outbox.stop();
-    stop.store(true, Ordering::Release);
-    drop(UnixStream::connect(&socket_path).unwrap());
-    server.join().unwrap();
-}
-
-#[derive(Clone, Copy)]
-enum StagingEvidenceTestResponseCredential {
-    StagingEvidence,
-    RuntimeMap,
-}
-
-fn staging_evidence_client_error_for_signed_response(
-    socket_name: &str,
-    response_credential_kind: StagingEvidenceTestResponseCredential,
-    response_operation: ControlPlaneAuthOperation,
-) -> ControlPlaneError {
-    let tmp = test_util::tempdir();
-    let socket_path = tmp.path().join(socket_name);
-    let listener = UnixListener::bind(&socket_path).unwrap();
-    let page = control_plane_rpc_catalogue_staging_page();
-    let receipt = MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
-    let credential = storage_node_auth_credential("auth-cluster", 3, 4);
-    let response_signer = credential.clone();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _addr) = listener.accept().unwrap();
-        let (kind, request) = read_control_plane_rpc_frame(&mut stream).unwrap();
-        assert_eq!(
-            kind,
-            ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage
-        );
-        ControlPlaneAuthEnvelope::decode_frame(&request, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
-            .unwrap();
-        let logical_response =
-            encode_control_plane_rpc_response(Ok(receipt.as_bytes().to_vec())).unwrap();
-        let payload = write_authenticated_control_plane_rpc_payload(kind, &logical_response);
-        let response_credential = match response_credential_kind {
-            StagingEvidenceTestResponseCredential::StagingEvidence => {
-                response_signer.staging_evidence_response_credential_for_storage_node()
-            }
-            StagingEvidenceTestResponseCredential::RuntimeMap => {
-                response_signer.runtime_map_response_credential_for_storage_node()
-            }
-        }
-        .unwrap();
-        let response = response_credential
-            .sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
-                target: ControlPlaneAuthTarget::Principal(response_signer.principal().clone()),
-                operation: response_operation,
-                issued_at_ms: Some(2_000),
-                expires_at_ms: Some(7_000),
-                sequence: None,
-                nonce: Vec::new(),
-                payload,
-            })
-            .unwrap()
-            .encode_frame()
-            .unwrap();
-        write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
-    });
-    let client = AuthenticatedUnixControlPlaneClient::new(
-        UnixControlPlaneClient::new(&socket_path),
-        credential,
-    );
-
-    let error = client
-        .publish_metadata_transfer_staging_evidence_page(&page, 2_000)
-        .unwrap_err();
-
-    server.join().unwrap();
-    error
-}
-
-#[derive(Clone, Copy)]
-enum StagingEvidenceOuterResponseFailure {
-    CorruptChecksum,
-    WrongKind,
-}
-
-fn staging_evidence_client_error_for_outer_response_failure(
-    socket_name: &str,
-    failure: StagingEvidenceOuterResponseFailure,
-) -> ControlPlaneError {
-    let tmp = test_util::tempdir();
-    let socket_path = tmp.path().join(socket_name);
-    let listener = UnixListener::bind(&socket_path).unwrap();
-    let page = control_plane_rpc_catalogue_staging_page();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _addr) = listener.accept().unwrap();
-        let (kind, _request) = read_control_plane_rpc_frame(&mut stream).unwrap();
-        assert_eq!(
-            kind,
-            ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage
-        );
-        match failure {
-            StagingEvidenceOuterResponseFailure::CorruptChecksum => {
-                let mut frame = encode_control_plane_rpc_frame(kind, &[]).unwrap();
-                let checksum_offset = CONTROL_PLANE_RPC_MAGIC.len() + 2 + 2 + 4;
-                frame[checksum_offset] ^= 1;
-                stream.write_all(&frame).unwrap();
-            }
-            StagingEvidenceOuterResponseFailure::WrongKind => {
-                write_control_plane_rpc_frame(
-                    &mut stream,
-                    ControlPlaneRpcKind::RuntimeMapStatus,
-                    &[],
-                )
-                .unwrap();
-            }
-        }
-    });
-    let client = AuthenticatedUnixControlPlaneClient::new(
-        UnixControlPlaneClient::new(&socket_path),
-        storage_node_auth_credential("auth-cluster", 3, 4),
-    );
-
-    let error = client
-        .publish_metadata_transfer_staging_evidence_page(&page, 2_000)
-        .unwrap_err();
-
-    server.join().unwrap();
-    error
-}
-
-#[test]
-fn authenticated_staging_evidence_client_rejects_wrong_response_operation() {
-    let error = staging_evidence_client_error_for_signed_response(
-        "staging-evidence-wrong-operation.sock",
-        StagingEvidenceTestResponseCredential::StagingEvidence,
-        ControlPlaneAuthOperation::RuntimeMapResponse,
-    );
-
-    assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
-    assert!(!error.is_retryable_staging_evidence_publication_error());
-}
-
-#[test]
-fn authenticated_staging_evidence_client_rejects_runtime_map_response_capability() {
-    let error = staging_evidence_client_error_for_signed_response(
-        "staging-evidence-runtime-map-capability.sock",
-        StagingEvidenceTestResponseCredential::RuntimeMap,
-        ControlPlaneAuthOperation::RuntimeMapResponse,
-    );
-
-    assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
-    assert!(!error.is_retryable_staging_evidence_publication_error());
-}
-
-#[test]
-fn authenticated_staging_evidence_client_fails_closed_on_outer_response_protocol_errors() {
-    for (socket_name, failure) in [
-        (
-            "staging-evidence-corrupt-outer-checksum.sock",
-            StagingEvidenceOuterResponseFailure::CorruptChecksum,
-        ),
-        (
-            "staging-evidence-wrong-outer-kind.sock",
-            StagingEvidenceOuterResponseFailure::WrongKind,
-        ),
-    ] {
-        let error = staging_evidence_client_error_for_outer_response_failure(socket_name, failure);
-        assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
-        assert!(!error.is_retryable_staging_evidence_publication_error());
-    }
-}
-
-#[test]
-fn staging_evidence_post_send_io_uncertainty_is_bounded_to_transport_loss() {
-    for (context, kind) in [
-        ("write control-plane RPC frame", ErrorKind::BrokenPipe),
-        (
-            "write control-plane TLS/TCP request frame",
-            ErrorKind::ConnectionReset,
-        ),
-        ("read control-plane RPC magic", ErrorKind::UnexpectedEof),
-        ("read control-plane RPC header", ErrorKind::TimedOut),
-    ] {
-        let error = ControlPlaneRpcFrameExchangeError::after_request_started(
-            ControlPlaneError::io(context, std::io::Error::from(kind)),
-        );
-        assert!(
-            error.request_outcome_may_be_unconfirmed(),
-            "transient {context} {kind:?} was not classified as uncertain"
-        );
-    }
-
-    for (context, kind) in [
-        ("write control-plane RPC frame", ErrorKind::InvalidData),
-        ("read control-plane RPC payload", ErrorKind::InvalidData),
-        (
-            "complete control-plane TLS client handshake",
-            ErrorKind::ConnectionReset,
-        ),
-    ] {
-        let error = ControlPlaneRpcFrameExchangeError::after_request_started(
-            ControlPlaneError::io(context, std::io::Error::from(kind)),
-        );
-        assert!(
-            !error.request_outcome_may_be_unconfirmed(),
-            "fatal {context} {kind:?} was classified as response loss"
-        );
-    }
-}
-
-#[test]
-fn authenticated_staging_evidence_client_rejects_signed_receipt_for_another_page() {
-    let tmp = test_util::tempdir();
-    let socket_path = tmp.path().join("staging-evidence-wrong-receipt.sock");
-    let listener = ControlPlaneRpcServerListener::unix(
-        UnixListener::bind(&socket_path).unwrap(),
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-        Duration::from_secs(1),
-    )
-    .unwrap();
-    let policy = ControlPlaneRpcServerPolicy::new(
-        ControlPlaneRpcServerRole::Ordinary,
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-    )
-    .unwrap()
-    .with_auth_verifier(Arc::new(storage_node_auth_verifier(
-        "auth-cluster",
-        vec![storage_node_auth_node_credential(3)],
-    )));
-    let requested_page = control_plane_rpc_catalogue_staging_page();
-    let other_page = metadata_transfer_staging_evidence_page_for_test(
-        requested_page.actor().clone(),
-        &control_plane_rpc_catalogue_transition_binding(),
-        [0x6b; 32],
-        54_321,
-        METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-        MetadataTransferStagingEvidenceKind::Tombstone,
-        Some(&MetadataTransferStagingEvidenceApplyReceipt::for_page(
-            &requested_page,
-        )),
-    );
-    let authority = Arc::new(Mutex::new(RecordingRaftAdminAuthority {
-        staging_evidence_receipt_override: Some(
-            MetadataTransferStagingEvidenceApplyReceipt::for_page(&other_page),
-        ),
-        ..RecordingRaftAdminAuthority::default()
-    }));
-    let authority_for_server = Arc::clone(&authority);
-    let server = std::thread::spawn(move || {
-        listener
-            .serve_shared_requests_for_test(authority_for_server, policy, [2_000], |_| {})
-            .unwrap();
-    });
-    let client = AuthenticatedUnixControlPlaneClient::new(
-        UnixControlPlaneClient::new(&socket_path),
-        storage_node_auth_credential("auth-cluster", 3, 4),
-    );
-
-    let error = client
-        .publish_metadata_transfer_staging_evidence_page(&requested_page, 2_000)
-        .unwrap_err();
-
-    server.join().unwrap();
-    assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
-    assert!(!error.is_retryable_staging_evidence_publication_error());
-    assert_eq!(
-        authority
-            .lock()
-            .expect("recording authority mutex poisoned")
-            .staging_evidence_pages,
-        [requested_page.page_digest()]
-    );
-}
-
-#[test]
-fn authenticated_tls_staging_evidence_publication_returns_exact_receipt() {
-    let raw_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = raw_listener.local_addr().unwrap();
-    let listener = ControlPlaneRpcServerListener::tls_tcp(
-        raw_listener,
-        control_plane_test_tls_certified_key(),
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-        Duration::from_secs(1),
-    )
-    .unwrap();
-    let policy = ControlPlaneRpcServerPolicy::new(
-        ControlPlaneRpcServerRole::Ordinary,
-        4,
-        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-    )
-    .unwrap()
-    .with_auth_verifier(Arc::new(storage_node_auth_verifier(
-        "auth-cluster",
-        vec![storage_node_auth_node_credential(3)],
-    )));
-    let authority = Arc::new(Mutex::new(RecordingRaftAdminAuthority::default()));
-    let authority_for_server = Arc::clone(&authority);
-    let server = std::thread::spawn(move || {
-        listener
-            .serve_shared_requests_for_test(authority_for_server, policy, [2_000], |_| {})
-            .unwrap();
-    });
-    let page = control_plane_rpc_catalogue_staging_page();
-    let client = AuthenticatedUnixControlPlaneClient::new(
-        UnixControlPlaneClient::with_endpoints([control_plane_test_tls_endpoint(address)]).unwrap(),
-        storage_node_auth_credential("auth-cluster", 3, 4),
-    );
-
-    assert_authenticated_staging_evidence_publication(client, &page, &authority);
-    server.join().unwrap();
 }
 
 impl ControlPlaneHeartbeatRuntimeMapSource for RecordingRaftAdminAuthority {
@@ -8161,7 +6252,6 @@ fn operator_raft_admin_facade_treats_every_invalid_post_application_response_as_
                 kind,
                 payload,
                 response_auth,
-                staging_evidence_actor: _,
             } = request;
             assert_eq!(kind, ControlPlaneRpcKind::TransferRaftLeadership);
             let mut reader = PayloadReader::new(&payload);
@@ -8403,23 +6493,25 @@ fn assert_authenticated_stale_unavailable_transition_mutations_are_rejected<S>(
     let verifier = admin_auth_verifier("auth-cluster", "admin-1");
     let server = std::thread::spawn(move || {
         let mut authority = authority;
-        let mut stream = accept();
-        let request = read_control_plane_unix_request(&mut stream).unwrap();
-        assert_eq!(
-            request.kind,
-            ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap
-        );
-        let response = build_control_plane_unix_response_with_auth_and_response_clock(
-            &mut authority,
-            request,
-            2_003,
-            Some(&verifier),
-            || Ok(2_003),
-        )
-        .unwrap();
-        write_control_plane_unix_response(&mut stream, response).unwrap();
-        stream.flush().unwrap();
-        assert_eq!(authority.snapshot(), &before);
+        for expected_kind in [
+            ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap,
+            ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap,
+        ] {
+            let mut stream = accept();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, expected_kind);
+            let response = build_control_plane_unix_response_with_auth_and_response_clock(
+                &mut authority,
+                request,
+                2_003,
+                Some(&verifier),
+                || Ok(2_003),
+            )
+            .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+            stream.flush().unwrap();
+            assert_eq!(authority.snapshot(), &before);
+        }
     });
 
     let client = AuthenticatedUnixControlPlaneClient::new(
@@ -8437,11 +6529,22 @@ fn assert_authenticated_stale_unavailable_transition_mutations_are_rejected<S>(
     let fence_error = client
         .fence_unavailable_pg_transition_runtime_map_with_source_lease_checked(&binding, 2_003)
         .unwrap_err();
+    let install_error = client
+        .install_unavailable_pg_transition_runtime_map_checked(
+            &binding,
+            PgMetadataTransferProof::new(ClusterEpoch::new(11).unwrap(), PgMetadataProof::empty()),
+            ClusterEpoch::new(13).unwrap(),
+            2_003,
+        )
+        .unwrap_err();
+
     server.join().unwrap();
-    assert!(
-        matches!(fence_error, ControlPlaneError::RpcRemote { .. }),
-        "unexpected stale transition error: {fence_error:?}"
-    );
+    for error in [fence_error, install_error] {
+        assert!(
+            matches!(error, ControlPlaneError::RpcRemote { .. }),
+            "unexpected stale transition error: {error:?}"
+        );
+    }
 }
 
 #[test]
@@ -11523,10 +9626,6 @@ fn control_plane_rpc_kinds_have_explicit_auth_operations() {
         ControlPlaneRpcKind::RefreshNodeHeartbeat.auth_operation(),
         ControlPlaneAuthOperation::StorageRuntimeMapRefresh
     );
-    assert_eq!(
-        ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage.auth_operation(),
-        ControlPlaneAuthOperation::StorageStagingEvidencePublish
-    );
 
     let admin_kinds = [
         ControlPlaneRpcKind::SetPgActingSet,
@@ -11534,6 +9633,7 @@ fn control_plane_rpc_kinds_have_explicit_auth_operations() {
         ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap,
         ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
         ControlPlaneRpcKind::FenceUnavailablePgTransitionRuntimeMap,
+        ControlPlaneRpcKind::InstallUnavailablePgTransitionRuntimeMap,
         ControlPlaneRpcKind::TransferRaftLeadership,
         ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
         ControlPlaneRpcKind::TriggerRaftElection,
@@ -11551,7 +9651,6 @@ fn control_plane_rpc_kinds_have_explicit_auth_operations() {
     let mut classified_kinds = frontend_read_kinds
         .into_iter()
         .chain([ControlPlaneRpcKind::RefreshNodeHeartbeat])
-        .chain([ControlPlaneRpcKind::ApplyMetadataTransferStagingEvidencePage])
         .chain(admin_kinds)
         .collect::<Vec<_>>();
     classified_kinds.sort_by_key(|kind| kind.as_u16());
@@ -11566,7 +9665,6 @@ fn control_plane_rpc_raft_admission_classifies_verified_requests() {
         kind,
         payload: Vec::new(),
         response_auth: None,
-        staging_evidence_actor: None,
     };
 
     let status = request(ControlPlaneRpcKind::AuthorityClockStatus);
@@ -12225,10 +10323,6 @@ fn runtime_map_diagnostics_reports_rpc_and_snapshot_metrics() {
         "durable commands after initial creation should be journaled"
     );
     assert!(diagnostics.journal_metrics().frame_bytes_last > 0);
-    assert_eq!(
-        diagnostics.metadata_transfer_staging_retention_metrics(),
-        observability::metadata_transfer_staging_retention_metrics_snapshot()
-    );
     assert_eq!(
         diagnostics.history_reference_samples(),
         &[expected_stale_sample]
@@ -13141,7 +11235,7 @@ fn write_runtime_map_test_single_authority_proof(out: &mut Vec<u8>) {
     write_u64(out, 1_000);
 }
 
-pub(super) fn decode_runtime_map_test_snapshot(
+fn decode_runtime_map_test_snapshot(
     snapshot: ClusterRuntimeMapSnapshot,
 ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
     let mut payload = Vec::new();
@@ -13163,7 +11257,6 @@ fn runtime_map_test_snapshot(
         pg_routes: Vec::new(),
         historical_pg_routes: Vec::new(),
         historical_cluster_epochs: Vec::new(),
-        staging_authorizations: Vec::new(),
     }
 }
 
@@ -13198,7 +11291,6 @@ pub(super) fn runtime_map_test_snapshot_with_active_route() -> ClusterRuntimeMap
         }],
         historical_pg_routes: Vec::new(),
         historical_cluster_epochs: Vec::new(),
-        staging_authorizations: Vec::new(),
     }
 }
 
@@ -13452,7 +11544,6 @@ fn route_map_validity_rejects_reserved_unbounded_deadline() {
     write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);
-    write_u32(&mut payload, 0);
 
     let mut reader = PayloadReader::new(&payload);
     assert!(matches!(
@@ -13468,7 +11559,6 @@ fn control_plane_rpc_rejects_unbounded_runtime_map_validity() {
     write_u64(&mut payload, ClusterEpoch::INITIAL.get());
     write_option_u64(&mut payload, None);
     write_runtime_map_test_single_authority_proof(&mut payload);
-    write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);
     write_u32(&mut payload, 0);

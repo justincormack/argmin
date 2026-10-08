@@ -443,67 +443,8 @@ fn previous_v30_v17_journal_chain_vectors_remain_immutable_evidence() {
 }
 
 #[test]
-fn previous_v31_v19_single_authority_journal_chain_remains_immutable_evidence() {
-    const EMPTY_STATE_V31: &str = concat!(
-        "version=31\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const SNAPSHOT_SEED: u64 = 0xe4f6_8c40_ea55_9033;
-    const FIRST_COMMAND_V19: &[u8] = &[
-        65, 82, 71, 67, 80, 67, 77, 68, 0, 19, 0, 2, 0, 0, 0, 7, 2, 150, 234, 161, 103, 115, 68,
-        169, 129,
-    ];
-    const FIRST_CHAIN_DIGEST: u64 = 0xf65f_9524_9d3f_56ee;
-    const SECOND_COMMAND_V19: &[u8] = &[
-        65, 82, 71, 67, 80, 67, 77, 68, 0, 19, 0, 3, 0, 0, 0, 9, 3, 166, 125, 52, 138, 147, 241,
-        69, 3,
-    ];
-    const SECOND_CHAIN_DIGEST: u64 = 0x9239_1747_bf63_856e;
-    const COMMAND_RECORD_V2: &[u8] = &[
-        65, 82, 71, 67, 80, 83, 74, 82, 0, 2, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 228, 246, 140, 64, 234, 85,
-        144, 51, 246, 95, 149, 36, 157, 63, 86, 238, 2, 0, 0, 0, 25, 65, 82, 71, 67, 80, 67, 77,
-        68, 0, 19, 0, 2, 0, 0, 0, 7, 2, 150, 234, 161, 103, 115, 68, 169, 129, 63, 91, 31, 210,
-        248, 109, 4, 108,
-    ];
-
-    assert_eq!(
-        checksum::crc64::checksum(EMPTY_STATE_V31.as_bytes()),
-        SNAPSHOT_SEED
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(SNAPSHOT_SEED, FIRST_COMMAND_V19),
-        FIRST_CHAIN_DIGEST
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(FIRST_CHAIN_DIGEST, SECOND_COMMAND_V19),
-        SECOND_CHAIN_DIGEST
-    );
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V31),
-        Err(ControlPlaneError::Parse { message, .. })
-            if message == "unsupported control-plane state version 31"
-    ));
-    for command in [FIRST_COMMAND_V19, SECOND_COMMAND_V19] {
-        assert!(matches!(
-            decode_control_plane_command(command),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 19"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(COMMAND_RECORD_V2),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 19"
-    ));
-}
-
-#[test]
-fn previous_v32_v20_single_authority_journal_chain_remains_immutable_evidence() {
+fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_requires_version_bump()
+{
     const EMPTY_STATE_V32: &str = concat!(
         "version=32\n",
         "authority_incarnation=1\n",
@@ -531,341 +472,29 @@ fn previous_v32_v20_single_authority_journal_chain_remains_immutable_evidence() 
         185, 36, 132, 52,
     ];
 
-    assert_eq!(
-        checksum::crc64::checksum(EMPTY_STATE_V32.as_bytes()),
-        SNAPSHOT_SEED
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(SNAPSHOT_SEED, FIRST_COMMAND_V20),
-        FIRST_CHAIN_DIGEST
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(FIRST_CHAIN_DIGEST, SECOND_COMMAND_V20),
-        SECOND_CHAIN_DIGEST
-    );
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V32),
-        Err(ControlPlaneError::Parse { message, .. })
-            if message == "unsupported control-plane state version 32"
-    ));
-    for command in [FIRST_COMMAND_V20, SECOND_COMMAND_V20] {
-        assert!(matches!(
-            decode_control_plane_command(command),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 20"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(COMMAND_RECORD_V2),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 20"
-    ));
-}
-
-#[test]
-fn previous_v33_v21_single_authority_journal_chain_remains_immutable_evidence() {
-    const EMPTY_STATE_V33: &str = concat!(
-        "version=33\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const SNAPSHOT_SEED: u64 = 0x7128_10a1_29ee_6062;
-    const FIRST_CHAIN_DIGEST: u64 = 0x1276_1465_0423_8987;
-    const SECOND_CHAIN_DIGEST: u64 = 0x5f3d_c239_8b95_617b;
-    let first_command =
-        hex_decode(0, "4152474350434d44001500020000000702529d9523ad906c69").unwrap();
-    let second_command =
-        hex_decode(0, "4152474350434d44001500030000000903620a00ce4d2580eb").unwrap();
-    let command_record = hex_decode(
-        0,
-        "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f712810a129ee6062127614650423898702000000194152474350434d44001500020000000702529d9523ad906c69c71cbb50fc798244",
-    )
-    .unwrap();
-
-    assert_eq!(
-        checksum::crc64::checksum(EMPTY_STATE_V33.as_bytes()),
-        SNAPSHOT_SEED
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(SNAPSHOT_SEED, &first_command),
-        FIRST_CHAIN_DIGEST
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(FIRST_CHAIN_DIGEST, &second_command),
-        SECOND_CHAIN_DIGEST
-    );
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V33),
-        Err(ControlPlaneError::Parse { message, .. })
-            if message == "unsupported control-plane state version 33"
-    ));
-    for command in [&first_command, &second_command] {
-        assert!(matches!(
-            decode_control_plane_command(command),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 21"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&command_record),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 21"
-    ));
-}
-
-#[test]
-fn v34_v22_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V34: &str = concat!(
-        "version=34\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d4400160002000000070230a60f01c2fa0e9d";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2b114e897823d26730ace8bc9690feaf02000000194152474350434d4400160002000000070230a60f01c2fa0e9dfecda3b57b9d51ed";
-
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V34),
-        Err(ControlPlaneError::Parse { message, .. })
-            if message == "unsupported control-plane state version 34"
-    ));
-    assert!(matches!(
-        decode_control_plane_command(&hex_decode(0, FIRST_COMMAND).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 22"
-    ));
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 22"
-    ));
-}
-
-#[test]
-fn historical_v36_v24_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V36: &str = concat!(
-        "version=36\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d44001800020000000702cf43ade76d88557e";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fbecfd268bb98223630fc84080feee32b02000000194152474350434d44001800020000000702cf43ade76d88557e0edec5be94cdd840";
-
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V36),
-        Err(ControlPlaneError::Parse { message, .. })
-            if message == "unsupported control-plane state version 36"
-    ));
-    assert!(matches!(
-        decode_control_plane_command(&hex_decode(0, FIRST_COMMAND).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 24"
-    ));
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 24"
-    ));
-}
-
-#[test]
-fn historical_v37_v25_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V37: &str = concat!(
-        "version=37\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d44001900020000000702eeaadbf948ae74d2";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f6e4c0f31f60e13abbfadca871367c15e02000000194152474350434d44001900020000000702eeaadbf948ae74d21eff83f4d190de30";
-
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V37),
-        Err(ControlPlaneError::Parse { message, .. })
-            if message == "unsupported control-plane state version 37"
-    ));
-    assert!(matches!(
-        decode_control_plane_command(&hex_decode(0, FIRST_COMMAND).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 25"
-    ));
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 25"
-    ));
-}
-
-#[test]
-fn historical_v39_v27_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V39: &str = concat!(
-        "version=39\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d44001b00020000000702ad7837c502e2378a";
-    const SECOND_COMMAND: &str = "4152474350434d44001b000300000009039defa228e257db08";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fda3eb361559577a145938dcd59affc7502000000194152474350434d44001b00020000000702ad7837c502e2378aa669b4bd5638f839";
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V39),
-        Err(ControlPlaneError::Parse { line: 1, message })
-            if message == "unsupported control-plane state version 39"
-    ));
-    for command in [FIRST_COMMAND, SECOND_COMMAND] {
-        assert!(matches!(
-            decode_control_plane_command(&hex_decode(0, command).unwrap()),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 27"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 27"
-    ));
-}
-
-#[test]
-fn historical_v40_v28_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V40: &str = concat!(
-        "version=40\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d44001c0002000000070248e6759ff910d3ce";
-    const SECOND_COMMAND: &str = "4152474350434d44001c000300000009037871e07219a53f4c";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f82237dfc27e653eadd9414b2cf480f4802000000194152474350434d44001c0002000000070248e6759ff910d3ce08a46afa5d762af0";
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V40),
-        Err(ControlPlaneError::Parse { line: 1, message })
-            if message == "unsupported control-plane state version 40"
-    ));
-    for command in [FIRST_COMMAND, SECOND_COMMAND] {
-        assert!(matches!(
-            decode_control_plane_command(&hex_decode(0, command).unwrap()),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 28"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 28"
-    ));
-}
-
-#[test]
-fn historical_v41_v29_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V41: &str = concat!(
-        "version=41\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d44001d00020000000702690f0381dc36f262";
-    const SECOND_COMMAND: &str = "4152474350434d44001d000300000009035998966c3c831ee0";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f52a0a0a56a70627752c55a3dd3c12d3d02000000194152474350434d44001d00020000000702690f0381dc36f26218852cb0182b2c80";
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V41),
-        Err(ControlPlaneError::Parse { line: 1, message })
-            if message == "unsupported control-plane state version 41"
-    ));
-    for command in [FIRST_COMMAND, SECOND_COMMAND] {
-        assert!(matches!(
-            decode_control_plane_command(&hex_decode(0, command).unwrap()),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 29"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 29"
-    ));
-}
-
-#[test]
-fn previous_v42_v30_single_authority_journal_chain_vectors_remain_immutable_evidence() {
-    const EMPTY_STATE_V42: &str = concat!(
-        "version=42\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d44001e000200000007020b3499a3b35c9096";
-    const SECOND_COMMAND: &str = "4152474350434d44001e000300000009033ba30c4e53e97c14";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f17fde11de45da3bbcc1a3f0999e4506102000000194152474350434d44001e000200000007020b3499a3b35c90964af2ce2b6b079e20";
-    assert_eq!(
-        checksum::crc64::checksum(EMPTY_STATE_V42.as_bytes()),
-        1_728_785_350_481_781_691
-    );
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V42),
-        Err(ControlPlaneError::Parse { line: 1, message })
-            if message == "unsupported control-plane state version 42"
-    ));
-    for command in [FIRST_COMMAND, SECOND_COMMAND] {
-        assert!(matches!(
-            decode_control_plane_command(&hex_decode(0, command).unwrap()),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 30"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 30"
-    ));
-}
-
-#[test]
-fn current_v49_v37_single_authority_journal_chain_matches_frozen_v3_vectors() {
-    const EMPTY_STATE_V49: &str = concat!(
-        "version=49\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const SNAPSHOT_SEED: u64 = 7_811_668_946_543_740_389;
-
     let snapshot = ClusterControlSnapshot::empty();
-    assert_eq!(format_snapshot(&snapshot), EMPTY_STATE_V49);
+    assert_eq!(format_snapshot(&snapshot), EMPTY_STATE_V32);
     assert_eq!(single_authority_snapshot_digest(&snapshot), SNAPSHOT_SEED);
     let first_command = ControlPlaneCommand::SetNodeMembership {
         node_id: NodeId::new(7),
         membership: NodeMembershipState::Active,
     };
     let encoded_first = encode_control_plane_command(&first_command).unwrap();
-    let first_chain_digest = single_authority_command_chain_digest(SNAPSHOT_SEED, &encoded_first);
+    assert_eq!(encoded_first, FIRST_COMMAND_V20);
+    assert_eq!(
+        single_authority_command_chain_digest(SNAPSHOT_SEED, FIRST_COMMAND_V20),
+        FIRST_CHAIN_DIGEST
+    );
     let second_command = ControlPlaneCommand::MarkNodeAvailability {
         node_id: NodeId::new(9),
         availability: NodeAvailabilityState::Unavailable,
     };
     let encoded_second = encode_control_plane_command(&second_command).unwrap();
-    let second_chain_digest =
-        single_authority_command_chain_digest(first_chain_digest, &encoded_second);
+    assert_eq!(encoded_second, SECOND_COMMAND_V20);
+    assert_eq!(
+        single_authority_command_chain_digest(FIRST_CHAIN_DIGEST, SECOND_COMMAND_V20),
+        SECOND_CHAIN_DIGEST
+    );
     let binding = ControlPlaneAuthorityClockCheckpointBinding([
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
         0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
@@ -874,241 +503,15 @@ fn current_v49_v37_single_authority_journal_chain_matches_frozen_v3_vectors() {
     let record = SingleAuthorityJournalRecord {
         binding,
         previous_chain_digest: SNAPSHOT_SEED,
-        resulting_chain_digest: first_chain_digest,
+        resulting_chain_digest: FIRST_CHAIN_DIGEST,
         command: Some(first_command),
     };
-    let encoded_record = record.encode().unwrap();
-    let decoded = SingleAuthorityJournalRecord::decode(&encoded_record).unwrap();
+    assert_eq!(record.encode().unwrap(), COMMAND_RECORD_V2);
+    let decoded = SingleAuthorityJournalRecord::decode(COMMAND_RECORD_V2).unwrap();
     assert_eq!(decoded.binding, binding);
     assert_eq!(decoded.previous_chain_digest, SNAPSHOT_SEED);
-    assert_eq!(decoded.resulting_chain_digest, first_chain_digest);
+    assert_eq!(decoded.resulting_chain_digest, FIRST_CHAIN_DIGEST);
     assert_eq!(decoded.command, record.command);
-    assert_eq!(
-        (
-            hex_encode(&encoded_first),
-            first_chain_digest,
-            hex_encode(&encoded_second),
-            second_chain_digest,
-            hex_encode(&encoded_record),
-        ),
-        (
-            "4152474350434d44002500020000000702cbf2e2ee88472853".to_owned(),
-            1_955_946_695_228_040_290,
-            "4152474350434d44002500030000000903fb65770368f2c4d1".to_owned(),
-            4_118_051_328_815_767_420,
-            "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f6c689f84d5b085e51b24eb2800aaa46202000000194152474350434d44002500020000000702cbf2e2ee8847285393b75384d70ae24d".to_owned(),
-        )
-    );
-}
-
-#[test]
-fn previous_v47_v35_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V47: &str = concat!(
-        "version=47\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d440023000200000007020f85d6aa5693edbb";
-    const SECOND_COMMAND: &str = "4152474350434d440023000300000009033f124347b6260139";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fd81a23d4762be1ef14bd069885d2190902000000194152474350434d440023000200000007020f85d6aa5693edbb9130649e62c7f6bc";
-    let seed = 15_571_798_057_009_537_519;
-    assert_eq!(checksum::crc64::checksum(EMPTY_STATE_V47.as_bytes()), seed);
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V47),
-        Err(ControlPlaneError::Parse { line: 1, message })
-            if message == "unsupported control-plane state version 47"
-    ));
-    let first = hex_decode(0, FIRST_COMMAND).unwrap();
-    let second = hex_decode(0, SECOND_COMMAND).unwrap();
-    assert_eq!(
-        single_authority_command_chain_digest(seed, &first),
-        1_494_357_903_506_807_049
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(1_494_357_903_506_807_049, &second),
-        3_026_029_493_812_756_615
-    );
-    for command in [first, second] {
-        assert!(matches!(
-            decode_control_plane_command(&command),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 35"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 35"
-    ));
-}
-
-#[test]
-fn previous_v46_v34_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V46: &str = concat!(
-        "version=46\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d440022000200000007022e6ca0b473b5cc17";
-    const SECOND_COMMAND: &str = "4152474350434d440022000300000009031efb355993002095";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0899fe8d3bbdd0729bec4817995b3b7c02000000194152474350434d440022000200000007022e6ca0b473b5cc17811122d4279af0cc";
-    let seed = 619_806_306_286_293_106;
-    assert_eq!(checksum::crc64::checksum(EMPTY_STATE_V46.as_bytes()), seed);
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V46),
-        Err(ControlPlaneError::Parse { line: 1, message })
-            if message == "unsupported control-plane state version 46"
-    ));
-    let first = hex_decode(0, FIRST_COMMAND).unwrap();
-    let second = hex_decode(0, SECOND_COMMAND).unwrap();
-    assert_eq!(
-        single_authority_command_chain_digest(seed, &first),
-        11_235_434_436_576_885_628
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(11_235_434_436_576_885_628, &second),
-        11_039_588_779_142_796_906
-    );
-    for command in [first, second] {
-        assert!(matches!(
-            decode_control_plane_command(&command),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 34"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 34"
-    ));
-}
-
-#[test]
-fn previous_v45_v33_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V45: &str = concat!(
-        "version=45\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d440021000200000007024c573a961cdfaee3";
-    const SECOND_COMMAND: &str = "4152474350434d440021000300000009037cc0af7bfc6a4261";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f4dc4bf35b59011be05332d23d37e462002000000194152474350434d440021000200000007024c573a961cdfaee3d366c04f54b6426c";
-    let seed = 5_603_814_073_756_029_374;
-    assert_eq!(checksum::crc64::checksum(EMPTY_STATE_V45.as_bytes()), seed);
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V45),
-        Err(ControlPlaneError::Parse { line: 1, message })
-            if message == "unsupported control-plane state version 45"
-    ));
-    let first = hex_decode(0, FIRST_COMMAND).unwrap();
-    let second = hex_decode(0, SECOND_COMMAND).unwrap();
-    assert_eq!(
-        single_authority_command_chain_digest(seed, &first),
-        374_692_825_897_256_480
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(374_692_825_897_256_480, &second),
-        17_421_690_413_885_996_762
-    );
-    for command in [&first, &second] {
-        assert!(matches!(
-            decode_control_plane_command(command),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 33"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 33"
-    ));
-}
-
-#[test]
-fn previous_v44_v32_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V44: &str = concat!(
-        "version=44\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d440020000200000007026dbe4c8839f98f4f";
-    const SECOND_COMMAND: &str = "4152474350434d440020000300000009035d29d965d94c63cd";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f9d47626cf80620238a6263accff7645502000000194152474350434d440020000200000007026dbe4c8839f98f4fc347860511eb441c";
-    assert_eq!(
-        checksum::crc64::checksum(EMPTY_STATE_V44.as_bytes()),
-        11_333_135_207_458_283_555,
-    );
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V44),
-        Err(ControlPlaneError::Parse { line: 1, message })
-            if message == "unsupported control-plane state version 44"
-    ));
-    let first = hex_decode(0, FIRST_COMMAND).unwrap();
-    let second = hex_decode(0, SECOND_COMMAND).unwrap();
-    assert_eq!(
-        single_authority_command_chain_digest(11_333_135_207_458_283_555, &first),
-        9_971_642_118_826_320_981,
-    );
-    assert_eq!(
-        single_authority_command_chain_digest(9_971_642_118_826_320_981, &second),
-        4_687_303_192_359_331_895,
-    );
-    for command in [&first, &second] {
-        assert!(matches!(
-            decode_control_plane_command(command),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 32"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 32"
-    ));
-}
-
-#[test]
-fn historical_v38_v26_single_authority_journal_chain_remains_rejected_evidence() {
-    const EMPTY_STATE_V38: &str = concat!(
-        "version=38\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const FIRST_COMMAND: &str = "4152474350434d44001a000200000007028c9141db27c41626";
-    const SECOND_COMMAND: &str = "4152474350434d44001a00030000000903bc06d436c771faa4";
-    const RECORD: &str = "4152474350534a520002000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0abd6e381803463ccac2c3424526de0002000000194152474350434d44001a000200000007028c9141db27c41626b648f2f71365fe49";
-    assert!(matches!(
-        parse_snapshot(EMPTY_STATE_V38),
-        Err(ControlPlaneError::Parse { line: 1, message })
-            if message == "unsupported control-plane state version 38"
-    ));
-    for command in [FIRST_COMMAND, SECOND_COMMAND] {
-        assert!(matches!(
-            decode_control_plane_command(&hex_decode(0, command).unwrap()),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message == "unsupported control-plane command version 26"
-        ));
-    }
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&hex_decode(0, RECORD).unwrap()),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 26"
-    ));
 }
 
 #[test]
@@ -1245,150 +648,6 @@ fn single_authority_journal_record_v2_format_failures_are_exact() {
 }
 
 #[test]
-fn historical_v36_v24_single_authority_journal_file_remains_rejected_evidence() {
-    const BYTES: &[u8] = include_bytes!("../testdata/single_authority_journal_v36_v24.bin");
-    assert_eq!(
-        (BYTES.len(), hex_encode(&checksum::sha256::digest(BYTES))),
-        (
-            209,
-            "545afdca86e2ee56fe457b494a7c17ba6b3474d249c660550ef72828ff3efa19".to_owned()
-        )
-    );
-    let tmp = test_util::tempdir();
-    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-    std::fs::write(store.journal_path(), BYTES).unwrap();
-    let frames = store.journal.read_frames_from(0).unwrap();
-    assert_eq!(frames.frames.len(), 2);
-    SingleAuthorityJournalRecord::decode(&frames.frames[0]).unwrap();
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&frames.frames[1]),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 24"
-    ));
-    assert_eq!(std::fs::read(store.journal_path()).unwrap(), BYTES);
-}
-
-#[test]
-fn historical_v37_v25_single_authority_journal_file_remains_rejected_evidence() {
-    const BYTES: &[u8] = include_bytes!("../testdata/single_authority_journal_v37_v25.bin");
-    assert_eq!(
-        (BYTES.len(), hex_encode(&checksum::sha256::digest(BYTES))),
-        (
-            209,
-            "cff94f34f97b18d905df19e069cf85b2d5771426239daa5e7fa0b472277f1321".to_owned()
-        )
-    );
-    let tmp = test_util::tempdir();
-    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-    std::fs::write(store.journal_path(), BYTES).unwrap();
-    let frames = store.journal.read_frames_from(0).unwrap();
-    assert_eq!(frames.frames.len(), 2);
-    SingleAuthorityJournalRecord::decode(&frames.frames[0]).unwrap();
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&frames.frames[1]),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 25"
-    ));
-    assert_eq!(std::fs::read(store.journal_path()).unwrap(), BYTES);
-}
-
-#[test]
-fn historical_v38_v26_single_authority_journal_file_remains_rejected_evidence() {
-    const BYTES: &[u8] = include_bytes!("../testdata/single_authority_journal_v38_v26.bin");
-    assert_eq!(
-        (BYTES.len(), hex_encode(&checksum::sha256::digest(BYTES))),
-        (
-            209,
-            "affaa37a0c1c52f05be1941257e53e004d17e4b4de04972a438ddd9cf1da7096".to_owned()
-        )
-    );
-    let tmp = test_util::tempdir();
-    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-    std::fs::write(store.journal_path(), BYTES).unwrap();
-    let frames = store.journal.read_frames_from(0).unwrap();
-    assert_eq!(frames.frames.len(), 2);
-    SingleAuthorityJournalRecord::decode(&frames.frames[0]).unwrap();
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&frames.frames[1]),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 26"
-    ));
-    assert_eq!(std::fs::read(store.journal_path()).unwrap(), BYTES);
-}
-
-#[test]
-fn historical_v39_v27_single_authority_journal_file_remains_rejected_evidence() {
-    const BYTES: &[u8] = include_bytes!("../testdata/single_authority_journal_v39_v27.bin");
-    assert_eq!(
-        (BYTES.len(), hex_encode(&checksum::sha256::digest(BYTES))),
-        (
-            209,
-            "5fb3fc0bcdd3c13708fd5a5f73df50c3ea8edf9d2fcb35c49f27f0fd44ab3734".to_owned()
-        )
-    );
-    let tmp = test_util::tempdir();
-    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-    std::fs::write(store.journal_path(), BYTES).unwrap();
-    let frames = store.journal.read_frames_from(0).unwrap();
-    assert_eq!(frames.frames.len(), 2);
-    SingleAuthorityJournalRecord::decode(&frames.frames[0]).unwrap();
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&frames.frames[1]),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 27"
-    ));
-    assert_eq!(std::fs::read(store.journal_path()).unwrap(), BYTES);
-}
-
-#[test]
-fn historical_v42_v30_single_authority_journal_file_remains_rejected_evidence() {
-    const BYTES: &[u8] = include_bytes!("../testdata/journal_v2_state_v42_command_v30.bin");
-    assert_eq!(
-        (BYTES.len(), hex_encode(&checksum::sha256::digest(BYTES))),
-        (
-            209,
-            "2492f0a42c0988fbf1ebc797d3c2d0aa816648066f1b535a42651a3474aa05a8".to_owned()
-        )
-    );
-    let tmp = test_util::tempdir();
-    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-    std::fs::write(store.journal_path(), BYTES).unwrap();
-    let frames = store.journal.read_frames_from(0).unwrap();
-    assert_eq!(frames.frames.len(), 2);
-    SingleAuthorityJournalRecord::decode(&frames.frames[0]).unwrap();
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&frames.frames[1]),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 30"
-    ));
-    assert_eq!(std::fs::read(store.journal_path()).unwrap(), BYTES);
-}
-
-#[test]
-fn historical_v43_v31_single_authority_journal_file_remains_rejected_evidence() {
-    const BYTES: &[u8] = include_bytes!("../testdata/journal_v2_state_v43_command_v31.bin");
-    assert_eq!(
-        (BYTES.len(), hex_encode(&checksum::sha256::digest(BYTES))),
-        (
-            209,
-            "719e6fa3d6b09dfc6b86d022066d8f9e5b0e056e7789814d596235e6835b7edf".to_owned()
-        )
-    );
-    let tmp = test_util::tempdir();
-    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-    std::fs::write(store.journal_path(), BYTES).unwrap();
-    let frames = store.journal.read_frames_from(0).unwrap();
-    assert_eq!(frames.frames.len(), 2);
-    SingleAuthorityJournalRecord::decode(&frames.frames[0]).unwrap();
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&frames.frames[1]),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 31"
-    ));
-    assert_eq!(std::fs::read(store.journal_path()).unwrap(), BYTES);
-}
-
-#[test]
 fn single_authority_journal_v2_full_file_layout_is_exact() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -1440,59 +699,9 @@ fn single_authority_journal_v2_full_file_layout_is_exact() {
         (bytes.len(), hex_encode(&checksum::sha256::digest(&bytes))),
         (
             209,
-            "e05a5cda04888d7f7cfb188748a76e6427c1911e2d2f063d85d2df3cd0bc2771".to_owned()
+            "040692eac2748d67e7766770492afa9203195c62aed25404dff39fdd482224fd".to_owned()
         )
     );
-}
-
-#[test]
-fn previous_v47_v35_single_authority_journal_file_remains_rejected_evidence() {
-    const EMPTY_STATE_V47: &str = concat!(
-        "version=47\n",
-        "authority_incarnation=1\n",
-        "cluster_epoch=1\n",
-        "initial_topology=-\n",
-        "max_committed_timestamp_ms=-\n",
-        "lease_grant_horizon=-\n",
-    );
-    const COMMAND_V35: &str = "4152474350434d440023000200000007020f85d6aa5693edbb";
-    let tmp = test_util::tempdir();
-    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-    let binding = ControlPlaneAuthorityClockCheckpointBinding([0x5a; 32]);
-    let snapshot_digest = checksum::crc64::checksum(EMPTY_STATE_V47.as_bytes());
-    let checkpoint = SingleAuthorityJournalRecord {
-        binding,
-        previous_chain_digest: snapshot_digest,
-        resulting_chain_digest: snapshot_digest,
-        command: None,
-    }
-    .encode()
-    .unwrap();
-    let encoded_command = hex_decode(0, COMMAND_V35).unwrap();
-    let command_record = SingleAuthorityJournalRecord::encode_command_bytes_for_test(
-        binding,
-        snapshot_digest,
-        &encoded_command,
-    )
-    .unwrap();
-    store.journal.append_frame(&checkpoint).unwrap();
-    store.journal.append_frame(&command_record).unwrap();
-
-    let bytes = std::fs::read(store.journal_path()).unwrap();
-    assert_eq!(
-        (bytes.len(), hex_encode(&checksum::sha256::digest(&bytes))),
-        (
-            209,
-            "97b839649b93e613feb33f90601c38257489aa8f54dd971568e7340186e76954".to_owned()
-        )
-    );
-    let frames = store.journal.read_frames_from(0).unwrap();
-    SingleAuthorityJournalRecord::decode(&frames.frames[0]).unwrap();
-    assert!(matches!(
-        SingleAuthorityJournalRecord::decode(&frames.frames[1]),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message == "unsupported control-plane command version 35"
-    ));
 }
 
 #[test]
@@ -1706,13 +915,11 @@ fn file_backed_authority_rejects_pre_v7_state() {
 
 #[test]
 fn file_backed_authority_rejects_previous_and_future_state_versions() {
-    for version in [
-        28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 50,
-    ] {
+    for version in [28, 29, 30, 31, 33] {
         let tmp = test_util::tempdir();
         let path = tmp.path().join(format!("control-plane-v{version}.state"));
         let current = format_snapshot(&canonical_snapshot_with_node());
-        let unsupported = current.replacen("version=49\n", &format!("version={version}\n"), 1);
+        let unsupported = current.replacen("version=32\n", &format!("version={version}\n"), 1);
         std::fs::write(&path, &unsupported).unwrap();
 
         assert!(matches!(
@@ -1730,10 +937,7 @@ fn file_backed_authority_rejects_previous_and_future_state_versions() {
 
 #[test]
 fn file_backed_authority_rejects_noncurrent_nested_command_versions_before_replay() {
-    for version in [
-        14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
-        38,
-    ] {
+    for version in [14, 15, 16, 17, 18, 19] {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(
             tmp.path()
@@ -1784,7 +988,7 @@ fn file_backed_authority_rejects_current_state_missing_timestamp_high_water() {
     let path = tmp.path().join("control-plane.state");
     std::fs::write(
         &path,
-        "version=49\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\n",
+        "version=32\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\n",
     )
     .unwrap();
     let store = FileControlPlaneStore::new(path);
@@ -3367,7 +2571,7 @@ fn file_backed_authority_rejects_duplicate_pg_acting_set_nodes() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=1\n",
@@ -3390,12 +2594,12 @@ fn file_backed_authority_rejects_current_pg_nodes_absent_from_current_map() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-            "pg=7,active,1:99,1,1,1,2,5,3,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,1\n",
+            "pg=7,active,1:99,1,1,1,2,5,3,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
         ),
     )
     .unwrap();
@@ -3414,7 +2618,7 @@ fn file_backed_authority_rejects_current_pg_future_metadata_transfer_epoch() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -3439,12 +2643,12 @@ fn file_backed_authority_rejects_active_imported_provenance_without_epoch() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-            "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,1,-,0,-,-,0,-,-,-,-,0,-,1\n",
+            "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,1,-,0,-,-,0,-,-,-,-,0,-,2\n",
         ),
     )
     .unwrap();
@@ -3482,7 +2686,7 @@ fn file_backed_authority_rejects_current_or_future_history_epochs() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -3505,7 +2709,7 @@ fn file_backed_authority_rejects_history_pg_nodes_absent_from_history_map() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=3\n",
@@ -3530,7 +2734,7 @@ fn file_backed_authority_rejects_reconstructible_observations_in_history() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=3\n",
@@ -3560,7 +2764,7 @@ fn file_backed_authority_rejects_history_pg_future_metadata_transfer_epoch() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=4\n",
@@ -3596,7 +2800,7 @@ fn file_backed_authority_rejects_incomplete_compact_history_routes() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join(format!("control-plane-{index}.state"));
         let contents = format!(
-            "version=49\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
+            "version=32\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
         );
         std::fs::write(&path, contents).unwrap();
 
@@ -3664,7 +2868,7 @@ fn file_backed_authority_rejects_broken_compact_history_transfer_chains() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join(format!("control-plane-{name}.state"));
         let contents = format!(
-            "version=49\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}"
+            "version=32\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}"
         );
         std::fs::write(&path, contents).unwrap();
 
@@ -3732,7 +2936,7 @@ fn file_backed_authority_rejects_invalid_pg_introduction_history() {
         std::fs::write(
             &path,
             format!(
-                "version=49\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}{current_node}{current_pg}"
+                "version=32\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}{current_node}{current_pg}"
             ),
         )
         .unwrap();
@@ -3756,7 +2960,7 @@ fn file_backed_authority_rejects_noncanonical_absent_pg_order() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
@@ -3808,13 +3012,13 @@ fn file_backed_authority_rejects_current_pg_observation_outside_acting_set() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
             "node=2,active,1,healthy,12,2,100,200,-,6e6f64652d322e736f636b\n",
-            "node_pg=2,7,peering,2,100,0,1,0,5,0,-,-,-,1\n",
+            "node_pg=2,7,peering,2,100,0,1,0,5,0,-,-,-,2\n",
             "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0,-,-\n",
         ),
     )
@@ -3834,12 +3038,12 @@ fn file_backed_authority_rejects_current_pg_observation_wrong_epoch() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=3\n",
             "node=1,active,1,healthy,11,3,100,200,-,6e6f64652d312e736f636b\n",
-            "node_pg=1,7,peering,2,100,0,1,0,5,0,-,-,-,1\n",
+            "node_pg=1,7,peering,2,100,0,1,0,5,0,-,-,-,2\n",
             "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0,-,-\n",
         ),
     )
@@ -3859,13 +3063,13 @@ fn file_backed_authority_rejects_active_pg_observation_with_mismatched_proof() {
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-            "node_pg=1,7,active,2,100,9,1,10,5,12,-,-,-,1\n",
-            "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,1\n",
+            "node_pg=1,7,active,2,100,9,1,10,5,12,-,-,-,2\n",
+            "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
         ),
     )
     .unwrap();
@@ -3885,14 +3089,14 @@ fn file_backed_authority_accepts_active_pg_observation_after_metadata_progress()
     let store = FileControlPlaneStore::new(&path);
     let initial = SingleAuthorityControlPlane::open(store.clone()).unwrap();
     let snapshot = parse_snapshot(concat!(
-            "version=49\n",
+        "version=32\n",
         "authority_incarnation=1\n",
         "cluster_epoch=2\n",
         "initial_topology=-\n",
         "max_committed_timestamp_ms=100\nlease_grant_horizon=-\n",
         "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-        "node_pg=1,7,active,2,100,10,1,20,5,30,-,-,-,1\n",
-        "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,1\n",
+        "node_pg=1,7,active,2,100,10,1,20,5,30,-,-,-,2\n",
+        "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
     ))
     .unwrap();
     store
@@ -3913,14 +3117,14 @@ fn file_backed_authority_accepts_active_pg_observation_after_metadata_progress()
 #[test]
 fn control_plane_state_rejects_each_unsupported_metadata_proof_carrier() {
     let current = concat!(
-            "version=49\n",
+        "version=32\n",
         "authority_incarnation=1\n",
         "cluster_epoch=2\n",
         "initial_topology=-\n",
         "max_committed_timestamp_ms=100\nlease_grant_horizon=-\n",
         "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-        "node_pg=1,7,active,2,100,10,1,20,5,30,-,-,-,1\n",
-        "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,1\n",
+        "node_pg=1,7,active,2,100,10,1,20,5,30,-,-,-,2\n",
+        "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
     );
     parse_snapshot(current).unwrap();
 
@@ -4277,10 +3481,10 @@ fn captured_checkpoint_preparation_failure_latches_poison() {
         .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
         .unwrap_err();
     assert!(matches!(
-        error,
-        ControlPlaneError::CommandDecode { message }
-            if message.contains("durability is poisoned")
+        &error,
+        ControlPlaneError::DurabilityFailure { .. }
     ));
+    assert!(error.retained_diagnostic_contains("durability is poisoned"));
 }
 
 #[test]
@@ -4382,10 +3586,10 @@ fn checkpoint_failure_latches_poison_before_concurrent_command_can_append() {
         ControlPlaneError::Io { diagnostic } if diagnostic.context() == "publish prepared single-authority control-plane checkpoint"
     ));
     assert!(matches!(
-        command_error,
-        ControlPlaneError::CommandDecode { message }
-            if message.contains("durability is poisoned")
+        &command_error,
+        ControlPlaneError::DurabilityFailure { .. }
     ));
+    assert!(command_error.retained_diagnostic_contains("durability is poisoned"));
 
     let restarted = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(path)).unwrap();
     assert!(restarted.snapshot().node(NodeId::new(1)).is_some());
@@ -5071,16 +4275,19 @@ fn file_backed_authority_poisoned_by_ambiguous_journal_append_stops_serving() {
         .unwrap_err();
 
     assert!(matches!(
-        error,
-        ControlPlaneError::CommandDecode { message }
-            if message.contains("durability poisoned after ambiguous journal append")
+        &error,
+        ControlPlaneError::DurabilityFailure { .. }
     ));
+    assert!(
+        error.retained_diagnostic_contains("durability poisoned after ambiguous journal append")
+    );
     assert!(authority.snapshot().node(NodeId::new(1)).is_none());
+    let error = authority.runtime_map_snapshot(1).unwrap_err();
     assert!(matches!(
-        authority.runtime_map_snapshot(1),
-        Err(ControlPlaneError::CommandDecode { message })
-            if message.contains("durability is poisoned")
+        &error,
+        ControlPlaneError::DurabilityFailure { .. }
     ));
+    assert!(error.retained_diagnostic_contains("durability is poisoned"));
 
     let restarted = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)).unwrap();
     assert_eq!(
@@ -5100,20 +4307,29 @@ fn file_backed_authority_rejects_active_pg_observation_with_non_current_pending_
     std::fs::write(
         &path,
         concat!(
-            "version=49\ninitial_topology=-\n",
+            "version=32\ninitial_topology=-\n",
             "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
+            "history=1,1\n",
+            "history_node=1,1\n",
+            "history_pg=1,7,active,1,1,-,-,-,-,-,-,0,-,-,-,-,-,-,-,-,-,-,-,-,-\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-            "node_pg=1,7,active,2,100,9,1,10,5,11,1,1,1,1\n",
-            "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,1\n",
+            "node_pg=1,7,active,2,100,9,1,10,5,11,1,1,1,2\n",
+            "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
         ),
     )
     .unwrap();
     let store = FileControlPlaneStore::new(path);
-    assert!(matches!(
-        SingleAuthorityControlPlane::open(store),
-        Err(ControlPlaneError::Parse { message, .. })
-            if message == "active node PG observation has a non-current pending metadata command"
-    ));
+    let Err(error) = SingleAuthorityControlPlane::open(store) else {
+        panic!("active PG with historical pending evidence must be rejected");
+    };
+    assert!(
+        matches!(
+            &error,
+            ControlPlaneError::Parse { message, .. }
+                if message == "historical pending PG observation must retain a Peering fence"
+        ),
+        "unexpected persisted-state rejection: {error:?}"
+    );
 }

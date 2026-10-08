@@ -566,431 +566,71 @@ fn control_plane_raft_durable_restart_artifact_v6_aggregate_is_exact_and_complet
         ),
         (
             2200,
-            "819699e13a149a697582fae7a5bf6f23eb6494999b4fd8df922204d8af69c08b"
+            "f2bad0b00233933f316c405db8836c12749f69d8d6e2496d5c6e609100a72dc0"
                 .to_string()
         )
     );
 }
 
 #[test]
-fn historical_state_v43_command_v31_restart_v5_aggregate_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!(
-        "../../control_plane/testdata/raft_restart_v5_state_v43_command_v31.aggregate"
-    );
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            raft_test_hex(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            2_196,
-            "d67aa11d97e31b59beb66ccdfd92ab21c518627cc6c3b090ae2e76562f64b0a7".to_owned()
-        )
-    );
-
-    let mut offset = 0;
-    let mut artifact_count = 0;
-    let mut command_rejections = 0;
-    let mut state_rejections = 0;
-    while offset < AGGREGATE.len() {
-        let artifact_len = u32::from_be_bytes(
-            AGGREGATE[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += std::mem::size_of::<u32>();
-        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
-            &AGGREGATE[offset..offset + artifact_len],
-        );
-        let artifact = resealed_artifact.as_slice();
-        offset += artifact_len;
-        let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
-        let rendered = error.to_string();
-        if rendered.contains("unsupported control-plane command version 31") {
-            command_rejections += 1;
-        } else if rendered.contains("unsupported control-plane state version 43") {
-            state_rejections += 1;
-        } else {
-            panic!("unexpected historical restart artifact rejection: {error:?}");
-        }
-        artifact_count += 1;
-    }
-    assert_eq!(artifact_count, 4);
-    assert!(command_rejections > 0);
-    assert!(state_rejections > 0);
-}
-
-#[test]
-fn historical_state_v42_command_v30_restart_v5_aggregate_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!(
-        "../../control_plane/testdata/raft_restart_v5_state_v42_command_v30.aggregate"
-    );
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            raft_test_hex(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            2_196,
-            "5baf4c54d1ce6d31ad1a69937deade23f8b9efbc4bcbd1d09f8e2e6083b30380".to_owned()
-        )
-    );
-
-    let mut offset = 0;
-    let mut artifact_count = 0;
-    let mut command_rejections = 0;
-    let mut state_rejections = 0;
-    while offset < AGGREGATE.len() {
-        let artifact_len = u32::from_be_bytes(
-            AGGREGATE[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += std::mem::size_of::<u32>();
-        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
-            &AGGREGATE[offset..offset + artifact_len],
-        );
-        let artifact = resealed_artifact.as_slice();
-        offset += artifact_len;
-        let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
-        let rendered = error.to_string();
-        if rendered.contains("unsupported control-plane command version 30") {
-            command_rejections += 1;
-        } else if rendered.contains("unsupported control-plane state version 42") {
-            state_rejections += 1;
-        } else {
-            panic!("unexpected historical restart artifact rejection: {error:?}");
-        }
-        artifact_count += 1;
-    }
-    assert_eq!(artifact_count, 4);
-    assert!(command_rejections > 0);
-    assert!(state_rejections > 0);
-}
-
-#[test]
-fn historical_state_v41_command_v29_restart_v5_aggregate_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!(
-        "../../control_plane/testdata/raft_restart_v5_state_v41_command_v29.aggregate"
-    );
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            raft_test_hex(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            2_196,
-            "c15df3148228ab0207428540380f205dc91193d7b864fae984131a8346a21d75".to_owned()
-        )
-    );
-
-    let mut offset = 0;
-    let mut artifact_count = 0;
-    let mut command_rejections = 0;
-    let mut state_rejections = 0;
-    while offset < AGGREGATE.len() {
-        let artifact_len = u32::from_be_bytes(
-            AGGREGATE[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += std::mem::size_of::<u32>();
-        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
-            &AGGREGATE[offset..offset + artifact_len],
-        );
-        let artifact = resealed_artifact.as_slice();
-        offset += artifact_len;
-        let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
-        let rendered = error.to_string();
-        if rendered.contains("unsupported control-plane command version 29") {
-            command_rejections += 1;
-        } else if rendered.contains("unsupported control-plane state version 41") {
-            state_rejections += 1;
-        } else {
-            panic!("unexpected historical restart artifact rejection: {error:?}");
-        }
-        artifact_count += 1;
-    }
-    assert_eq!(artifact_count, 4);
-    assert!(command_rejections > 0);
-    assert!(state_rejections > 0);
-}
-
-#[test]
-fn historical_state_v40_command_v28_restart_v5_aggregate_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!(
-        "../../control_plane/testdata/raft_restart_v5_state_v40_command_v28.aggregate"
-    );
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            raft_test_hex(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            2_196,
-            "08e0ed85a6dd29121523384efdc612d825df838d632384eb8887a250a7c3fb4f".to_owned()
-        )
-    );
-
-    let mut offset = 0;
-    let mut artifact_count = 0;
-    let mut command_rejections = 0;
-    let mut state_rejections = 0;
-    while offset < AGGREGATE.len() {
-        let artifact_len = u32::from_be_bytes(
-            AGGREGATE[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += std::mem::size_of::<u32>();
-        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
-            &AGGREGATE[offset..offset + artifact_len],
-        );
-        let artifact = resealed_artifact.as_slice();
-        offset += artifact_len;
-        let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
-        let rendered = error.to_string();
-        if rendered.contains("unsupported control-plane command version 28") {
-            command_rejections += 1;
-        } else if rendered.contains("unsupported control-plane state version 40") {
-            state_rejections += 1;
-        } else {
-            panic!("unexpected historical restart artifact rejection: {error:?}");
-        }
-        artifact_count += 1;
-    }
-    assert_eq!(artifact_count, 4);
-    assert!(command_rejections > 0);
-    assert!(state_rejections > 0);
-}
-
-#[test]
-fn historical_state_v39_command_v27_restart_v5_aggregate_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!(
-        "../../control_plane/testdata/raft_restart_v5_state_v39_command_v27.aggregate"
-    );
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            raft_test_hex(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            2_196,
-            "a82464c4e059837e3363b37a95d4f14acc7e4c1d8f018e406689b6098734e6ac".to_owned()
-        )
-    );
-
-    let mut offset = 0;
-    let mut artifact_count = 0;
-    let mut command_rejections = 0;
-    let mut state_rejections = 0;
-    while offset < AGGREGATE.len() {
-        let artifact_len = u32::from_be_bytes(
-            AGGREGATE[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += std::mem::size_of::<u32>();
-        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
-            &AGGREGATE[offset..offset + artifact_len],
-        );
-        let artifact = resealed_artifact.as_slice();
-        offset += artifact_len;
-        let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
-        let rendered = error.to_string();
-        if rendered.contains("unsupported control-plane command version 27") {
-            command_rejections += 1;
-        } else if rendered.contains("unsupported control-plane state version 39") {
-            state_rejections += 1;
-        } else {
-            panic!("unexpected historical restart artifact rejection: {error:?}");
-        }
-        artifact_count += 1;
-    }
-    assert_eq!(artifact_count, 4);
-    assert!(command_rejections > 0);
-    assert!(state_rejections > 0);
-}
-
-#[test]
-fn historical_state_v38_command_v26_restart_v5_aggregate_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!(
-        "../../control_plane/testdata/raft_restart_v5_state_v38_command_v26.aggregate"
-    );
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            raft_test_hex(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            2_196,
-            "0baa2d75c98fcd134df188fed0bab6425f08a86d87d43692d86dbffe1829a45d".to_owned()
-        )
-    );
-
-    let mut offset = 0;
-    let mut artifact_count = 0;
-    let mut command_rejections = 0;
-    let mut state_rejections = 0;
-    while offset < AGGREGATE.len() {
-        let artifact_len = u32::from_be_bytes(
-            AGGREGATE[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += std::mem::size_of::<u32>();
-        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
-            &AGGREGATE[offset..offset + artifact_len],
-        );
-        let artifact = resealed_artifact.as_slice();
-        offset += artifact_len;
-        let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
-        let rendered = error.to_string();
-        if rendered.contains("unsupported control-plane command version 26") {
-            command_rejections += 1;
-        } else if rendered.contains("unsupported control-plane state version 38") {
-            state_rejections += 1;
-        } else {
-            panic!("unexpected historical restart artifact rejection: {error:?}");
-        }
-        artifact_count += 1;
-    }
-    assert_eq!(artifact_count, 4);
-    assert!(command_rejections > 0);
-    assert!(state_rejections > 0);
-}
-
-#[test]
-fn historical_state_v37_command_v25_restart_v5_aggregate_remains_rejected_evidence() {
-    const AGGREGATE: &[u8] = include_bytes!(
-        "../../control_plane/testdata/raft_restart_v5_state_v37_command_v25.aggregate"
-    );
-    assert_eq!(
-        (
-            AGGREGATE.len(),
-            raft_test_hex(&checksum::sha256::digest(AGGREGATE))
-        ),
-        (
-            2_196,
-            "bb03ca7958a9206082281c2b0a5369eae025465ec527541159bf8b6d2a6d89c8".to_owned()
-        )
-    );
-
-    let mut offset = 0;
-    let mut artifact_count = 0;
-    let mut command_rejections = 0;
-    let mut state_rejections = 0;
-    while offset < AGGREGATE.len() {
-        let artifact_len = u32::from_be_bytes(
-            AGGREGATE[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        offset += std::mem::size_of::<u32>();
-        let resealed_artifact = reseal_historical_restart_artifact_for_nested_evidence(
-            &AGGREGATE[offset..offset + artifact_len],
-        );
-        let artifact = resealed_artifact.as_slice();
-        offset += artifact_len;
-        let error = ControlPlaneRaftRestartArtifact::decode_durable_artifact(artifact).unwrap_err();
-        let rendered = error.to_string();
-        if rendered.contains("unsupported control-plane command version 25") {
-            command_rejections += 1;
-        } else if rendered.contains("unsupported control-plane state version 37") {
-            state_rejections += 1;
-        } else {
-            panic!("unexpected historical restart artifact rejection: {error:?}");
-        }
-        artifact_count += 1;
-    }
-    assert_eq!(artifact_count, 4);
-    assert!(command_rejections > 0);
-    assert!(state_rejections > 0);
-}
-
-#[test]
-fn control_plane_raft_restart_v6_rejects_noncurrent_nested_versions() {
+fn control_plane_raft_restart_v6_rejects_v16_commands_and_v29_state() {
     let command = ControlPlaneCommand::SetNodeMembership {
         node_id: NodeId::new(7),
         membership: NodeMembershipState::Active,
     };
     let current_command = encode_control_plane_command(&command).unwrap();
+    let previous_command =
+        crate::control_plane_command::encode_control_plane_command_with_version_for_test(
+            &command, 16,
+        )
+        .unwrap();
     let mut state_machine = ControlPlaneRaftStateMachine::empty();
     let current_snapshot = state_machine.build_snapshot().unwrap().snapshot.into_inner();
+    let previous_snapshot =
+        crate::control_plane_command::reseal_control_plane_snapshot_state_version_for_test(
+            &current_snapshot,
+            29,
+        )
+        .unwrap();
     let artifact = ControlPlaneRaftRestartArtifact {
         cluster_name: "restart-v6-nested-version-evidence".to_owned(),
         local_node_id: 1,
         wal_replay_offset: 0,
         log_store: ControlPlaneRaftLogStoreRestartArtifact {
-            entries: vec![
-                bootstrap_membership_entry(1),
-                normal_entry(3, 1, 1, command.clone()),
-            ],
+            entries: vec![bootstrap_membership_entry(1), normal_entry(3, 1, 1, command)],
             ..Default::default()
         },
         state_machine: state_machine.export_restart_artifact(),
     };
     let encoded = artifact.encode_durable_artifact().unwrap();
 
-    for version in [
-        16, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38,
+    for (current, previous, expected_message) in [
+        (
+            current_command.as_slice(),
+            previous_command.as_slice(),
+            "unsupported control-plane command version 16",
+        ),
+        (
+            current_snapshot.as_slice(),
+            previous_snapshot.as_slice(),
+            "unsupported control-plane state version 29",
+        ),
     ] {
-        let previous =
-            crate::control_plane_command::encode_control_plane_command_with_version_for_test(
-                &command, version,
-            )
-            .unwrap();
-        assert_eq!(current_command.len(), previous.len());
+        assert_eq!(current.len(), previous.len());
         let offsets = encoded
-            .windows(current_command.len())
+            .windows(current.len())
             .enumerate()
-            .filter_map(|(offset, candidate)| {
-                (candidate == current_command.as_slice()).then_some(offset)
-            })
+            .filter_map(|(offset, candidate)| (candidate == current).then_some(offset))
             .collect::<Vec<_>>();
-        assert!(!offsets.is_empty(), "nested fixture must occur in restart v6");
+        assert!(!offsets.is_empty(), "nested fixture must occur in restart v5");
         for offset in offsets {
             let mut unsupported = encoded.clone();
-            unsupported[offset..offset + previous.len()].copy_from_slice(&previous);
+            unsupported[offset..offset + previous.len()].copy_from_slice(previous);
             refresh_raft_restart_artifact_checksum(&mut unsupported);
             let error =
                 ControlPlaneRaftRestartArtifact::decode_durable_artifact(&unsupported).unwrap_err();
             assert!(
-                error.to_string().contains(&format!(
-                    "unsupported control-plane command version {version}"
-                )),
-                "unexpected nested restart error: {error:?}"
-            );
-        }
-    }
-    for version in [
-        29, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 50,
-    ] {
-        let previous =
-            crate::control_plane_command::reseal_control_plane_snapshot_state_version_for_test(
-                &current_snapshot,
-                version,
-            )
-            .unwrap();
-        assert_eq!(current_snapshot.len(), previous.len());
-        let offsets = encoded
-            .windows(current_snapshot.len())
-            .enumerate()
-            .filter_map(|(offset, candidate)| {
-                (candidate == current_snapshot.as_slice()).then_some(offset)
-            })
-            .collect::<Vec<_>>();
-        assert!(!offsets.is_empty(), "nested fixture must occur in restart v6");
-        for offset in offsets {
-            let mut unsupported = encoded.clone();
-            unsupported[offset..offset + previous.len()].copy_from_slice(&previous);
-            refresh_raft_restart_artifact_checksum(&mut unsupported);
-            let error =
-                ControlPlaneRaftRestartArtifact::decode_durable_artifact(&unsupported).unwrap_err();
-            assert!(
-                error.to_string().contains(&format!(
-                    "unsupported control-plane state version {version}"
-                )),
+                error.to_string().contains(expected_message),
                 "unexpected nested restart error: {error:?}"
             );
         }

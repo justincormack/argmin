@@ -19,7 +19,6 @@ use super::ObjectMetadataPgId;
 use super::ObjectMetadataScanPgId;
 use super::PreparedRetainedStreamUploadAbort;
 use crate::control_plane::{CanonicalStateDigest, MetadataCommandLogHash, PgMetadataReadRoute};
-use crate::control_plane_command::CommittedUnavailablePgStagingAuthorization;
 use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceMultipartCompletionBarrierCommand, BucketPropertyMutation,
@@ -37,9 +36,8 @@ use crate::metadata_command::{
     COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node_runtime::pg_store::{
-    MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus, MetadataTransferStagingIntent,
-    MetadataTransferStagingReceipt, PgStore, ScavengerShardFileScan, ScavengerShardRow,
-    METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES,
+    MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus, PgStore, ScavengerShardFileScan,
+    ScavengerShardRow,
 };
 use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
@@ -75,10 +73,6 @@ use crate::storage_rpc::{
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
-    decode_metadata_transfer_staging_artifact_read_response,
-    decode_metadata_transfer_staging_epoch_bound_receipt_response,
-    decode_metadata_transfer_staging_receipt_response,
-    decode_metadata_transfer_staging_tombstone_receipt_response,
     decode_multipart_completion_barrier_command_build_response,
     decode_multipart_completion_preflight_response, decode_multipart_completion_snapshot_response,
     decode_multipart_completion_stale_source_response, decode_multipart_management_lookup_response,
@@ -145,11 +139,6 @@ use crate::storage_rpc::{
     encode_metadata_command_transfer_checkpoint_base_request,
     encode_metadata_command_transfer_empty_state_request,
     encode_metadata_command_transfer_matching_state_request,
-    encode_metadata_transfer_staging_artifact_publish_request,
-    encode_metadata_transfer_staging_artifact_read_request,
-    encode_metadata_transfer_staging_intent_create_request,
-    encode_metadata_transfer_staging_proof_publish_request,
-    encode_metadata_transfer_staging_tombstone_request,
     encode_multipart_completion_barrier_command_build_request,
     encode_multipart_completion_preflight_request, encode_multipart_completion_snapshot_request,
     encode_multipart_parts_list_request, encode_multipart_upload_load_request,
@@ -182,12 +171,11 @@ use crate::storage_rpc::{
     encode_stream_upload_bucket_write_reservation_update_request,
     encode_stream_upload_match_request, encode_stream_upload_session_request,
     encode_stream_uploads_list_request, encode_stream_uploads_pg_list_request,
-    read_storage_rpc_frame_from_with_limit, storage_rpc_response_max_payload_len,
-    write_storage_rpc_frame_to, StorageRpcAbortMultipartCleanupRequest,
-    StorageRpcAbortMultipartCommandBuildRequest, StorageRpcAdmittedRouteEffectDeadline,
-    StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
-    StorageRpcBucketDeleteAttemptOutcomeRecordRequest, StorageRpcBucketDeleteBeginRootsRequest,
-    StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
+    read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
+    StorageRpcAdmittedRouteEffectDeadline, StorageRpcAuthorizedAbortMultipartCommandBuildRequest,
+    StorageRpcBucketBatchRequest, StorageRpcBucketDeleteAttemptOutcomeRecordRequest,
+    StorageRpcBucketDeleteBeginRootsRequest, StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
     StorageRpcBucketInfoOutcome, StorageRpcBucketListRequest,
     StorageRpcBucketMarkDeletingCommandBuildOutcome,
@@ -230,11 +218,6 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandTransferCheckpointBaseRequest,
     StorageRpcMetadataCommandTransferEmptyStateRequest,
     StorageRpcMetadataCommandTransferMatchingStateRequest,
-    StorageRpcMetadataTransferStagingArtifactPublishRequest,
-    StorageRpcMetadataTransferStagingArtifactReadRequest,
-    StorageRpcMetadataTransferStagingIntentCreateRequest,
-    StorageRpcMetadataTransferStagingProofPublishRequest,
-    StorageRpcMetadataTransferStagingTombstoneRequest,
     StorageRpcMultipartCompletionBarrierCommandBuildRequest,
     StorageRpcMultipartCompletionPreflightOutcome, StorageRpcMultipartCompletionPreflightRequest,
     StorageRpcMultipartCompletionSnapshotOutcome, StorageRpcMultipartCompletionSnapshotRequest,
@@ -287,7 +270,7 @@ use crate::storage_rpc::{
     decode_shard_read_response, encode_shard_read_request, StorageRpcShardReadRequest,
 };
 use crate::storage_rpc_auth::{
-    read_storage_rpc_auth_transport_frame_with_limit, storage_rpc_auth_response_envelope_limit,
+    read_storage_rpc_auth_transport_frame_with_limit,
     write_storage_rpc_auth_transport_frame_with_limit, StorageRpcClientAuthConfig,
     StorageRpcRequestProof,
 };
@@ -1638,18 +1621,11 @@ fn read_unix_storage_rpc_response<R: Read>(
     node_id: NodeId,
     auth: Option<&StorageRpcClientAuthConfig>,
     request_proof: Option<&StorageRpcRequestProof>,
-    kind: StorageRpcMessageKind,
     operation: &'static str,
 ) -> Result<StorageRpcFrame, StoreError> {
     let Some(auth) = auth else {
-        return read_storage_rpc_frame_from_with_limit(
-            reader,
-            storage_rpc_response_max_payload_len(
-                kind,
-                crate::storage_rpc::STORAGE_RPC_MAX_PAYLOAD_LEN,
-            ),
-        )
-        .map_err(|error| storage_rpc_stream_error(node_id, operation, error));
+        return read_storage_rpc_frame_from(reader)
+            .map_err(|error| storage_rpc_stream_error(node_id, operation, error));
     };
     let request_proof = request_proof.ok_or_else(|| {
         storage_rpc_auth_store_error(
@@ -1660,7 +1636,7 @@ fn read_unix_storage_rpc_response<R: Read>(
     })?;
     let envelope = read_storage_rpc_auth_transport_frame_with_limit(
         reader,
-        storage_rpc_auth_response_envelope_limit(kind, auth.transport_limits().max_frame_bytes()),
+        auth.transport_limits().max_frame_bytes(),
     )
     .map_err(|error| {
         storage_rpc_stream_error(node_id, operation, StorageRpcStreamError::Io(error))

@@ -1,15 +1,10 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-const METADATA_TRANSFER_STAGING_MAX_ENTRIES: usize = 256;
-const METADATA_TRANSFER_STAGING_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
 #[derive(Clone)]
 struct StorageNodeRuntimeRouteState {
     config: Arc<StorageNodeProcessConfig>,
     route_map_lease: Option<BoundRouteMapLease>,
-    staging_authorizations:
-        crate::control_plane::AuthorityPublishedUnavailablePgStagingAuthorizations,
 }
 #[derive(Clone)]
 pub struct StorageNodeRpcListenerConfig {
@@ -150,7 +145,6 @@ pub struct StorageNodeServer {
     _data_dir_lock: StorageNodeDataDirLock,
     control_plane_incarnation_lock: Mutex<()>,
     _node: Arc<SharedStorageNode>,
-    metadata_transfer_staging_store: Option<Arc<MetadataTransferStagingStore>>,
     listeners: Vec<StorageNodeRpcListener>,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     active_sessions: Arc<StorageNodeActiveSessions>,
@@ -470,10 +464,10 @@ impl StorageNodeBootstrap {
             });
         }
         config.persist_control_plane_runtime_config()?;
-        Ok(
-            PreparedStorageNodeServer::with_data_dir_guard(config, self.data_dir_guard)
-                .with_authority_runtime_map(runtime_map),
-        )
+        Ok(PreparedStorageNodeServer::with_data_dir_guard(
+            config,
+            self.data_dir_guard,
+        ))
     }
 }
 
@@ -488,9 +482,6 @@ pub struct PreparedStorageNodeServer {
     data_dir_guard: Option<StorageNodeDataDirGuard>,
     rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
     rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
-    metadata_transfer_staging_node_incarnation: Option<u64>,
-    staging_authorizations:
-        crate::control_plane::AuthorityPublishedUnavailablePgStagingAuthorizations,
 }
 
 impl PreparedStorageNodeServer {
@@ -501,8 +492,6 @@ impl PreparedStorageNodeServer {
             data_dir_guard: None,
             rpc_auth: None,
             rpc_listeners: None,
-            metadata_transfer_staging_node_incarnation: None,
-            staging_authorizations: Default::default(),
         }
     }
 
@@ -515,26 +504,7 @@ impl PreparedStorageNodeServer {
             data_dir_guard: Some(data_dir_guard),
             rpc_auth: None,
             rpc_listeners: None,
-            metadata_transfer_staging_node_incarnation: None,
-            staging_authorizations: Default::default(),
         }
-    }
-
-    fn with_authority_runtime_map(mut self, runtime_map: &ClusterRuntimeMapSnapshot) -> Self {
-        self.staging_authorizations = runtime_map.authority_published_staging_authorizations();
-        self
-    }
-
-    #[cfg(test)]
-    fn verifies_staging_authorization_for_test(
-        &self,
-        node_id: NodeId,
-        pg_id: PgId,
-        presented: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
-    ) -> bool {
-        self.staging_authorizations
-            .verify(node_id, pg_id, self.config.cluster_epoch(), presented)
-            .is_ok()
     }
 
     #[must_use]
@@ -550,15 +520,6 @@ impl PreparedStorageNodeServer {
     }
 
     #[must_use]
-    pub fn with_metadata_transfer_staging_node_incarnation(
-        mut self,
-        node_incarnation: u64,
-    ) -> Self {
-        self.metadata_transfer_staging_node_incarnation = Some(node_incarnation);
-        self
-    }
-
-    #[must_use]
     pub fn config(&self) -> &StorageNodeProcessConfig {
         &self.config
     }
@@ -570,15 +531,11 @@ impl PreparedStorageNodeServer {
                 data_dir_guard,
                 self.rpc_auth,
                 self.rpc_listeners,
-                self.metadata_transfer_staging_node_incarnation,
-                self.staging_authorizations,
             ),
             None => StorageNodeServer::bind_with_rpc_auth(
                 self.config,
                 self.rpc_auth,
                 self.rpc_listeners,
-                self.metadata_transfer_staging_node_incarnation,
-                self.staging_authorizations,
             ),
         }
     }
@@ -873,7 +830,7 @@ fn bind_storage_node_rpc_listeners(
 
 impl StorageNodeServer {
     pub fn bind(config: StorageNodeProcessConfig) -> Result<Self, StorageNodeServerError> {
-        Self::bind_with_rpc_auth(config, None, None, None, Default::default())
+        Self::bind_with_rpc_auth(config, None, None)
     }
 
     #[cfg(test)]
@@ -885,18 +842,9 @@ impl StorageNodeServer {
         config: StorageNodeProcessConfig,
         rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
         rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
-        metadata_transfer_staging_node_incarnation: Option<u64>,
-        staging_authorizations: crate::control_plane::AuthorityPublishedUnavailablePgStagingAuthorizations,
     ) -> Result<Self, StorageNodeServerError> {
         let data_dir_guard = StorageNodeDataDirGuard::acquire(&config.data_dir)?;
-        Self::bind_with_data_dir_guard(
-            config,
-            data_dir_guard,
-            rpc_auth,
-            rpc_listeners,
-            metadata_transfer_staging_node_incarnation,
-            staging_authorizations,
-        )
+        Self::bind_with_data_dir_guard(config, data_dir_guard, rpc_auth, rpc_listeners)
     }
 
     fn bind_with_data_dir_guard(
@@ -904,8 +852,6 @@ impl StorageNodeServer {
         data_dir_guard: StorageNodeDataDirGuard,
         rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
         rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
-        metadata_transfer_staging_node_incarnation: Option<u64>,
-        staging_authorizations: crate::control_plane::AuthorityPublishedUnavailablePgStagingAuthorizations,
     ) -> Result<Self, StorageNodeServerError> {
         validate_process_config_route_table(&config)?;
         let data_dir_lock = data_dir_guard.into_lock_for(&config.data_dir)?;
@@ -916,36 +862,6 @@ impl StorageNodeServer {
             config.default_ec_shape,
         )?;
         node.recover_pg_metadata_command_state(config.node_id)?;
-        let metadata_transfer_staging_store = metadata_transfer_staging_node_incarnation
-            .map(|node_incarnation| {
-                let endpoint = config.socket_path.to_str().ok_or_else(|| {
-                    StorageNodeServerError::SocketPathNotUtf8 {
-                        path: config.socket_path.clone(),
-                    }
-                })?;
-                let identity = MetadataTransferStagingNodeIdentity::new(
-                    config.node_id,
-                    node_incarnation,
-                    endpoint.to_owned(),
-                )
-                .map_err(|error| StorageNodeServerError::MetadataTransferStaging {
-                    message: error.to_string(),
-                })?;
-                let limits = MetadataTransferStagingLimits::new(
-                    METADATA_TRANSFER_STAGING_MAX_ENTRIES,
-                    METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-                    METADATA_TRANSFER_STAGING_MAX_TOTAL_BYTES,
-                )
-                .map_err(|error| StorageNodeServerError::MetadataTransferStaging {
-                    message: error.to_string(),
-                })?;
-                MetadataTransferStagingStore::open(&config.data_dir, identity, limits)
-                    .map(Arc::new)
-                    .map_err(|error| StorageNodeServerError::MetadataTransferStaging {
-                        message: error.to_string(),
-                    })
-            })
-            .transpose()?;
         let rpc_listeners = rpc_listeners
             .unwrap_or_else(|| vec![StorageNodeRpcListenerConfig::unix(&config.socket_path)]);
         let listeners = bind_storage_node_rpc_listeners(rpc_listeners, rpc_auth.as_deref())?;
@@ -954,14 +870,12 @@ impl StorageNodeServer {
             runtime_route_state: Arc::new(RwLock::new(StorageNodeRuntimeRouteState {
                 config: Arc::new(config),
                 route_map_lease,
-                staging_authorizations,
             })),
             runtime_config_install_lock: Mutex::new(()),
             route_admission: StorageNodeRouteAdmissionGate::default(),
             _data_dir_lock: data_dir_lock,
             control_plane_incarnation_lock: Mutex::new(()),
             _node: Arc::new(node),
-            metadata_transfer_staging_store,
             listeners,
             read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
             active_sessions: Arc::new(StorageNodeActiveSessions::default()),
@@ -994,29 +908,6 @@ impl StorageNodeServer {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         advance_storage_node_incarnation(&self.config_snapshot().data_dir)
-    }
-
-    pub fn spawn_metadata_transfer_staging_outbox<F, E>(
-        &self,
-        control_plane: ControlPlaneStorageNodeClient,
-        authority_now_ms: F,
-        on_fatal: E,
-    ) -> Result<StorageNodeMetadataTransferStagingOutbox, StorageNodeServerError>
-    where
-        F: Fn() -> u64 + Send + 'static,
-        E: Fn(String) + Send + 'static,
-    {
-        let store = self
-            .metadata_transfer_staging_store
-            .as_ref()
-            .ok_or(StorageNodeServerError::MetadataTransferStagingNotConfigured)?;
-        StorageNodeMetadataTransferStagingOutbox::spawn(
-            Arc::clone(store),
-            control_plane,
-            authority_now_ms,
-            on_fatal,
-        )
-        .map_err(|source| StorageNodeServerError::MetadataTransferStagingOutboxSpawn { source })
     }
 
     pub fn accept_one(&self) -> Result<(), StorageNodeServerError> {
@@ -1378,38 +1269,14 @@ impl StorageNodeServer {
         &self,
         refresh: StorageNodeControlPlaneRefresh,
     ) -> Result<HeartbeatLease, StorageNodeServerError> {
-        let (lease, runtime_map, next_config) = refresh.into_parts();
-        self.install_control_plane_runtime_config_inner(
-            next_config,
-            Some(runtime_map.authority_published_staging_authorizations()),
-        )?;
+        let (lease, _runtime_map, next_config) = refresh.into_parts();
+        self.install_control_plane_runtime_config(next_config)?;
         Ok(lease)
     }
 
     pub fn install_control_plane_runtime_config(
         &self,
         next_config: StorageNodeProcessConfig,
-    ) -> Result<(), StorageNodeServerError> {
-        self.install_control_plane_runtime_config_inner(next_config, None)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_authority_runtime_map_for_test(
-        &self,
-        runtime_map: &ClusterRuntimeMapSnapshot,
-    ) {
-        self.runtime_route_state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .staging_authorizations = runtime_map.authority_published_staging_authorizations();
-    }
-
-    fn install_control_plane_runtime_config_inner(
-        &self,
-        next_config: StorageNodeProcessConfig,
-        staging_authorizations: Option<
-            crate::control_plane::AuthorityPublishedUnavailablePgStagingAuthorizations,
-        >,
     ) -> Result<(), StorageNodeServerError> {
         let _install_guard = self
             .runtime_config_install_lock
@@ -1451,8 +1318,6 @@ impl StorageNodeServer {
                 *current_state = StorageNodeRuntimeRouteState {
                     config: Arc::new(next_config),
                     route_map_lease: next_route_map_lease,
-                    staging_authorizations: staging_authorizations
-                        .unwrap_or_else(|| current_state.staging_authorizations.clone()),
                 };
                 return Ok(());
             }
@@ -1502,8 +1367,6 @@ impl StorageNodeServer {
         *current_state = StorageNodeRuntimeRouteState {
             config: Arc::new(next_config),
             route_map_lease: next_route_map_lease,
-            staging_authorizations: staging_authorizations
-                .unwrap_or_else(|| current_state.staging_authorizations.clone()),
         };
         Ok(())
     }
@@ -1627,7 +1490,6 @@ impl StorageNodeServer {
             runtime_route_source: Arc::clone(&self.runtime_route_state),
             route_admission: self.route_admission.clone(),
             node: Arc::clone(&self._node),
-            metadata_transfer_staging_store: self.metadata_transfer_staging_store.clone(),
             read_handles: Arc::clone(&self.read_handles),
             metadata_command_locks: self.metadata_command_locks.clone(),
             rpc_auth: self.rpc_auth.clone(),

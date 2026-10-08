@@ -53,11 +53,6 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandPublicationStart = 172,
     PlacedSegmentBackfillReferencePage = 169,
     ShardScavengerReferencePage = 174,
-    MetadataTransferStagingIntentCreate = 175,
-    MetadataTransferStagingArtifactPublish = 176,
-    MetadataTransferStagingProofPublish = 177,
-    MetadataTransferStagingTombstone = 178,
-    MetadataTransferStagingArtifactRead = 179,
     ShardScavengerReferenceMatch = 173,
     ObjectPayloadReclaimCommandBuild = 170,
     MetadataCommandRetainedAbortApply = 165,
@@ -222,7 +217,6 @@ pub(crate) enum StorageRpcWireErrorCode {
     MultipartConditionalRequestConflict = 25,
     MetadataCommandIntegrity = 26,
     MetadataCommandMutationUncertain = 27,
-    StagingAuthorizationNotObserved = 28,
 }
 
 pub(crate) type StorageRpcErrorCode = StorageNodeFailure;
@@ -269,8 +263,6 @@ impl StorageNodeFailure {
         Self(StorageRpcWireErrorCode::MetadataCommandIntegrity);
     pub(crate) const MetadataCommandMutationUncertain: Self =
         Self(StorageRpcWireErrorCode::MetadataCommandMutationUncertain);
-    pub(crate) const StagingAuthorizationNotObserved: Self =
-        Self(StorageRpcWireErrorCode::StagingAuthorizationNotObserved);
 
     fn from_u16(value: u16) -> Result<Self, StorageRpcPayloadError> {
         match value {
@@ -301,7 +293,6 @@ impl StorageNodeFailure {
             25 => Ok(Self::MultipartConditionalRequestConflict),
             26 => Ok(Self::MetadataCommandIntegrity),
             27 => Ok(Self::MetadataCommandMutationUncertain),
-            28 => Ok(Self::StagingAuthorizationNotObserved),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),
@@ -357,21 +348,6 @@ impl StorageRpcMessageKind {
                 "placed segment backfill reference page"
             }
             Self::ShardScavengerReferencePage => "shard scavenger reference page",
-            Self::MetadataTransferStagingIntentCreate => {
-                "metadata transfer staging intent create"
-            }
-            Self::MetadataTransferStagingArtifactPublish => {
-                "metadata transfer staging artifact publish"
-            }
-            Self::MetadataTransferStagingProofPublish => {
-                "metadata transfer staging proof publish"
-            }
-            Self::MetadataTransferStagingTombstone => {
-                "metadata transfer staging tombstone"
-            }
-            Self::MetadataTransferStagingArtifactRead => {
-                "metadata transfer staging artifact read"
-            }
             Self::ShardScavengerReferenceMatch => "shard scavenger reference match",
             Self::ShardScavengerObservationRecord => "shard scavenger observation record",
             Self::ShardScavengerObservations => "shard scavenger observations",
@@ -630,11 +606,6 @@ impl StorageRpcMessageKind {
             172 => Ok(Self::MetadataCommandPublicationStart),
             169 => Ok(Self::PlacedSegmentBackfillReferencePage),
             174 => Ok(Self::ShardScavengerReferencePage),
-            175 => Ok(Self::MetadataTransferStagingIntentCreate),
-            176 => Ok(Self::MetadataTransferStagingArtifactPublish),
-            177 => Ok(Self::MetadataTransferStagingProofPublish),
-            178 => Ok(Self::MetadataTransferStagingTombstone),
-            179 => Ok(Self::MetadataTransferStagingArtifactRead),
             173 => Ok(Self::ShardScavengerReferenceMatch),
             170 => Ok(Self::ObjectPayloadReclaimCommandBuild),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
@@ -836,8 +807,6 @@ pub(crate) enum StorageRpcPayloadError {
     UnsupportedMetadataProofCarrier(&'static str),
     #[error("invalid bucket metadata request: {0}")]
     InvalidBucketMetadataRequest(&'static str),
-    #[error("invalid metadata-transfer staging request: {0}")]
-    InvalidMetadataTransferStaging(&'static str),
     #[error("invalid object metadata request: {0}")]
     InvalidObjectMetadataRequest(&'static str),
     #[error("shard write size mismatch: expected {expected}, actual {actual}")]
@@ -2692,45 +2661,6 @@ pub(crate) struct StorageRpcMetadataCommandTransferCheckpointBaseRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) checkpoint: MetadataCommandCheckpoint,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcMetadataTransferStagingIntentCreateRequest {
-    pub(crate) authorization:
-        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
-    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcMetadataTransferStagingArtifactPublishRequest {
-    pub(crate) authorization:
-        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
-    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
-    pub(crate) artifact: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcMetadataTransferStagingProofPublishRequest {
-    pub(crate) authorization:
-        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
-    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
-    pub(crate) target_epoch: ClusterEpoch,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcMetadataTransferStagingTombstoneRequest {
-    pub(crate) authorization:
-        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
-    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcMetadataTransferStagingArtifactReadRequest {
-    pub(crate) authorization:
-        crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
-    pub(crate) intent: crate::pg_store::MetadataTransferStagingIntent,
-    pub(crate) offset: u64,
-    pub(crate) max_bytes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

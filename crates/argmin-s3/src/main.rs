@@ -69,7 +69,7 @@ use storage::{
     ControlPlaneRpcServerListenerInput, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgState,
     RouteMapValidity, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
-    StorageNodeMetadataTransferStagingOutbox, UnavailablePgReconciliationWorker,
+    UnavailablePgReconciliationWorker,
 };
 #[cfg(test)]
 use storage::{
@@ -1327,12 +1327,6 @@ fn format_control_plane_runtime_map_diagnostics(
             diagnostics.raft_wal_metrics(),
             diagnostics.raft_command_metrics(),
         ),
-        (
-            diagnostics.unavailable_pg_batch_metrics(),
-            diagnostics.unavailable_pg_worker_stage_metrics(),
-            diagnostics.unavailable_pg_worker_queue_metrics(),
-            diagnostics.metadata_transfer_staging_retention_metrics(),
-        ),
         diagnostics.history_reference_samples(),
     )
 }
@@ -1350,18 +1344,10 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         observability::ControlPlaneRaftWalMetricSnapshot,
         observability::ControlPlaneRaftCommandMetricSnapshot,
     ),
-    reconciliation_metrics: (
-        &[observability::UnavailablePgBatchMetricSample],
-        &[observability::UnavailablePgWorkerStageMetricSample],
-        observability::UnavailablePgWorkerQueueMetricSnapshot,
-        observability::MetadataTransferStagingRetentionMetricSnapshot,
-    ),
     history_reference_samples: &[observability::ControlPlaneHistoryReferenceSample],
 ) -> String {
     let (runtime_map, node_leases) = runtime_map;
     let (snapshot, journal, raft_checkpoint, raft_wal, raft_command) = durability_metrics;
-    let (batch_metrics, worker_stage_metrics, worker_queue_metrics, retention_metrics) =
-        reconciliation_metrics;
     let active_serving_pg_routes = runtime_map
         .pg_routes()
         .iter()
@@ -1554,64 +1540,6 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         raft_command.queue_wait_us_max,
         raft_command.operation_us_total,
         raft_command.operation_us_max,
-    ));
-    for metric in batch_metrics {
-        output.push('\n');
-        output.push_str(&format!(
-            "unavailable_pg_batch stage={} submitted_total={} applied_total={} replayed_total={} rejected_total={} members_total={} members_max={} encoded_bytes_total={} encoded_bytes_max={} encoded_fill_ppm_total={} encoded_fill_ppm_max={} epoch_advance_total={} recovered_pg_total={}",
-            metric.stage.as_str(),
-            metric.submitted_total,
-            metric.applied_total,
-            metric.replayed_total,
-            metric.rejected_total,
-            metric.members_total,
-            metric.members_max,
-            metric.encoded_bytes_total,
-            metric.encoded_bytes_max,
-            metric.encoded_fill_ppm_total,
-            metric.encoded_fill_ppm_max,
-            metric.epoch_advance_total,
-            metric.recovered_pg_total,
-        ));
-    }
-    for metric in worker_stage_metrics {
-        output.push('\n');
-        output.push_str(&format!(
-            "unavailable_pg_worker stage={} total={} succeeded_total={} deferred_total={} fatal_total={} elapsed_us_total={} elapsed_us_max={}",
-            metric.stage.as_str(),
-            metric.total,
-            metric.succeeded_total,
-            metric.deferred_total,
-            metric.fatal_total,
-            metric.elapsed_us_total,
-            metric.elapsed_us_max,
-        ));
-    }
-    output.push('\n');
-    output.push_str(&format!(
-        "unavailable_pg_queue pending_transfer_depth={} in_flight_transfer_depth={} prepared_artifact_depth={} prepared_artifact_bytes={} staged_install_depth={} staged_install_bytes={} ready_activation_depth={} pending_finalization_depth={} deferred_depth={} blocked_depth={}",
-        worker_queue_metrics.pending_transfer_depth,
-        worker_queue_metrics.in_flight_transfer_depth,
-        worker_queue_metrics.prepared_artifact_depth,
-        worker_queue_metrics.prepared_artifact_bytes,
-        worker_queue_metrics.staged_install_depth,
-        worker_queue_metrics.staged_install_bytes,
-        worker_queue_metrics.ready_activation_depth,
-        worker_queue_metrics.pending_finalization_depth,
-        worker_queue_metrics.deferred_depth,
-        worker_queue_metrics.blocked_depth,
-    ));
-    output.push('\n');
-    output.push_str(&format!(
-        "metadata_transfer_staging_retention retained_page_depth={} retained_segment_depth={} retained_anchor_depth={} retained_evidence_depth={} finalized_floor_depth={} active_closure_depth={} retired_closure_depth={} prune_applied_total={}",
-        retention_metrics.retained_page_depth,
-        retention_metrics.retained_segment_depth,
-        retention_metrics.retained_anchor_depth,
-        retention_metrics.retained_evidence_depth,
-        retention_metrics.finalized_floor_depth,
-        retention_metrics.active_closure_depth,
-        retention_metrics.retired_closure_depth,
-        retention_metrics.prune_applied_total,
     ));
     output
 }
@@ -1862,10 +1790,6 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
             }
         }
         let reconciliation = (|| {
-            // Worker loss is process-fatal even while authority time is unavailable.
-            if let Some(reconciler) = unavailable_pg_reconciler.as_mut() {
-                reconciler.observe_transfer_workers();
-            }
             let now_ms = authority_clock
                 .lock()
                 .expect("control-plane authority clock mutex poisoned")
@@ -1874,19 +1798,14 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 .lock()
                 .expect("control-plane authority mutex poisoned");
             if let Some(reconciler) = unavailable_pg_reconciler.as_mut() {
-                reconciler.poll_single_authority(&mut authority, now_ms)?;
+                reconciler.poll_single_authority(&mut authority, now_ms);
             }
             Ok::<(), ControlPlaneError>(())
         })();
         if let Err(error) = reconciliation {
-            if error.is_retryable_authority_clock_wait_error() {
-                eprintln!(
-                    "unavailable PG reconciliation deferred because authority time is unavailable: {error}"
-                );
-            } else {
-                eprintln!("unavailable PG staging maintenance failed fatally: {error}");
-                std::process::exit(1);
-            }
+            eprintln!(
+                "unavailable PG reconciliation deferred because authority time is unavailable: {error}"
+            );
         }
         thread::sleep(config.control_plane_lease_scan_interval);
     }
@@ -2356,14 +2275,9 @@ fn run_raft_control_plane_process(config: &ServerConfig) -> ! {
             }
         }
         if let Some(reconciler) = unavailable_pg_reconciler.as_mut() {
-            reconciler.observe_transfer_workers();
+            reconciler.observe_transfer_worker();
             if local_raft_authority_serving {
-                reconciler
-                    .poll_raft(authority_service.host_mut(), expiry_now_ms)
-                    .unwrap_or_else(|error| {
-                        eprintln!("unavailable PG staging maintenance failed fatally: {error}");
-                        std::process::exit(1);
-                    });
+                reconciler.poll_raft(authority_service.host_mut(), expiry_now_ms);
             }
         }
         thread::sleep(config.control_plane_lease_scan_interval);
@@ -3133,7 +3047,7 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
     server: Arc<StorageNodeServer>,
     config: &ServerConfig,
     initial_node_incarnation: Option<u64>,
-) -> Option<StorageNodeControlPlaneWorkers> {
+) -> Option<StorageNodeControlPlaneRefreshLoop> {
     let socket_path = config.control_plane_socket_path.as_deref()?;
     let node_incarnation = match initial_node_incarnation {
         Some(node_incarnation) => node_incarnation,
@@ -3160,15 +3074,7 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
                 eprintln!("failed to configure storage-node control-plane auth client: {error}");
                 std::process::exit(1);
             });
-    let staging_evidence_client =
-        build_storage_node_control_plane_client(config, socket_path, node_id, node_incarnation)
-            .unwrap_or_else(|error| {
-                eprintln!(
-            "failed to configure storage-node staging evidence control-plane client: {error}"
-        );
-                std::process::exit(1);
-            });
-    let refresh = Arc::clone(&server)
+    let loop_handle = server
         .spawn_control_plane_refresh_loop(
             control_plane_client,
             node_incarnation,
@@ -3179,19 +3085,6 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
             eprintln!("failed to start storage-node control-plane refresh loop: {error}");
             std::process::exit(1);
         });
-    let staging_evidence = server
-        .spawn_metadata_transfer_staging_outbox(
-            staging_evidence_client,
-            storage::clock::current_time_millis,
-            |error| {
-                eprintln!("storage-node metadata-transfer staging outbox failed: {error}");
-                std::process::exit(1);
-            },
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("failed to start storage-node staging evidence outbox: {error}");
-            std::process::exit(1);
-        });
     process_info!(
         "argmin-s3 storage-node control-plane refresh using {} (incarnation {}, lease-derived jittered renewal capped at {} ms, lease {} ms)",
         socket_path,
@@ -3199,15 +3092,7 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
         storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS,
         config.control_plane_heartbeat_lease_duration.as_millis()
     );
-    Some(StorageNodeControlPlaneWorkers {
-        _staging_evidence: staging_evidence,
-        _refresh: refresh,
-    })
-}
-
-struct StorageNodeControlPlaneWorkers {
-    _staging_evidence: StorageNodeMetadataTransferStagingOutbox,
-    _refresh: StorageNodeControlPlaneRefreshLoop,
+    Some(loop_handle)
 }
 
 fn build_storage_node_process_config(
@@ -3424,8 +3309,7 @@ where
     let (_lease, runtime_map) = refresh.into_parts();
     let mut prepared_server = bootstrap
         .prepare(&runtime_map)
-        .map_err(|error| error.to_string())?
-        .with_metadata_transfer_staging_node_incarnation(node_incarnation);
+        .map_err(|error| error.to_string())?;
     match config.storage_rpc_server_auth.clone() {
         Some(rpc_auth) => prepared_server = prepared_server.with_rpc_auth(rpc_auth),
         None if config.allow_unauthenticated_internal_rpc_for_tests => {}

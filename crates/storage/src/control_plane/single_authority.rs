@@ -306,7 +306,7 @@ impl FileControlPlaneStore {
     }
 
     #[cfg(test)]
-    fn fail_next_journal_file_sync(&self) {
+    pub(crate) fn fail_next_journal_file_sync(&self) {
         self.journal_observer
             .fail_next_file_sync
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1971,8 +1971,10 @@ impl ControlPlaneStore for FileControlPlaneStore {
         let _publication =
             self.checkpoint_publication
                 .lock()
-                .map_err(|_| ControlPlaneError::CommandDecode {
-                    message: "single-authority checkpoint publication lock poisoned".to_owned(),
+                .map_err(|_| {
+                    ControlPlaneError::durability_failure(
+                        "single-authority checkpoint publication lock poisoned",
+                    )
                 })?;
         let save_started = Instant::now();
         let result = (|| {
@@ -2052,15 +2054,13 @@ impl ControlPlaneStore for FileControlPlaneStore {
                 DurableJournalAppendError::BeforeReplayableRecord(error) => Err(error),
                 DurableJournalAppendError::AmbiguousRecordMayExist(error)
                 | DurableJournalAppendError::ReplayableRecordMayExist(error) => {
+                    let error = error.into_durability_failure(
+                        "single-authority control-plane durability poisoned after ambiguous journal append",
+                    );
                     Self::latch_durability_failure(&mut durability, &error);
-                    let result = Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "single-authority control-plane durability poisoned after ambiguous journal append: {error}"
-                        ),
-                    });
                     drop(durability);
                     Self::log_durability_failure("journal_append", &error);
-                    result
+                    Err(error)
                 }
             };
         }
@@ -2092,8 +2092,10 @@ impl ControlPlaneStore for FileControlPlaneStore {
         let _publication =
             self.checkpoint_publication
                 .lock()
-                .map_err(|_| ControlPlaneError::CommandDecode {
-                    message: "single-authority checkpoint publication lock poisoned".to_owned(),
+                .map_err(|_| {
+                    ControlPlaneError::durability_failure(
+                        "single-authority checkpoint publication lock poisoned",
+                    )
                 })?;
         let mut durability = self.lock_durability()?;
         self.ensure_healthy_locked(&durability)?;
@@ -2139,8 +2141,10 @@ impl FileControlPlaneStore {
     ) -> Result<std::sync::MutexGuard<'_, FileControlPlaneStoreDurability>, ControlPlaneError> {
         self.durability
             .lock()
-            .map_err(|_| ControlPlaneError::CommandDecode {
-                message: "single-authority control-plane durability lock poisoned".to_owned(),
+            .map_err(|_| {
+                ControlPlaneError::durability_failure(
+                    "single-authority control-plane durability lock poisoned",
+                )
             })
     }
 
@@ -2149,9 +2153,9 @@ impl FileControlPlaneStore {
         durability: &FileControlPlaneStoreDurability,
     ) -> Result<(), ControlPlaneError> {
         if let Some(reason) = &durability.poisoned {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!("single-authority control-plane durability is poisoned: {reason}"),
-            });
+            return Err(ControlPlaneError::durability_failure(format!(
+                "single-authority control-plane durability is poisoned: {reason}"
+            )));
         }
         Ok(())
     }
@@ -2195,8 +2199,10 @@ impl FileControlPlaneStore {
         let _publication =
             self.checkpoint_publication
                 .lock()
-                .map_err(|_| ControlPlaneError::CommandDecode {
-                    message: "single-authority checkpoint publication lock poisoned".to_owned(),
+                .map_err(|_| {
+                    ControlPlaneError::durability_failure(
+                        "single-authority checkpoint publication lock poisoned",
+                    )
                 })?;
         self.validate_checkpoint_capture(&capture)?;
         let save_started = Instant::now();
@@ -2404,7 +2410,7 @@ impl FileControlPlaneStore {
             Ok(())
         })();
         if let Err(error) = &publication_result {
-            durability.poisoned = Some(error.to_string());
+            Self::latch_durability_failure(&mut durability, error);
         }
         publication_result
     }
@@ -2657,10 +2663,6 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             &snapshot,
         )?;
         store.checkpoint(previous_snapshot.as_ref(), &snapshot)?;
-        observability::record_metadata_transfer_staging_retention(
-            snapshot.metadata_transfer_staging_retention_metrics(),
-            false,
-        );
         Ok(Self {
             store,
             durable_snapshot: snapshot.clone(),
@@ -2683,71 +2685,18 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         command = self
             .snapshot
             .bind_metadata_transfer_fence_command(&self.durable_snapshot, command)?;
-        let batch_metric = unavailable_pg_batch_metric_descriptor(&command);
-        let staging_prune =
-            crate::control_plane_command::is_metadata_transfer_staging_prune_command(&command);
-        if let Some(batch_metric) = batch_metric {
-            batch_metric.record_submission(&command)?;
-        }
-        let previous_epoch = self.durable_snapshot.cluster_epoch();
-        let live_applied = match self.snapshot.apply_control_plane_command(command.clone()) {
-            Ok(applied) => applied,
-            Err(error) => {
-                if let Some(batch_metric) = batch_metric {
-                    batch_metric.record_rejected();
-                }
-                return Err(error);
-            }
-        };
-        let durable_applied = match self
+        let live_applied = self.snapshot.apply_control_plane_command(command.clone())?;
+        let durable_applied = self
             .durable_snapshot
-            .apply_control_plane_command(command.clone())
-        {
-            Ok(applied) => applied,
-            Err(error) => {
-                if let Some(batch_metric) = batch_metric {
-                    batch_metric.record_rejected();
-                }
-                return Err(error);
-            }
-        };
+            .apply_control_plane_command(command.clone())?;
         if live_applied.changed() != durable_applied.changed() {
-            if let Some(batch_metric) = batch_metric {
-                batch_metric.record_rejected();
-            }
             return Err(ControlPlaneError::SnapshotInvariantViolation {
                 context: "single-authority volatile heartbeat command rebase",
                 message: "command mutation outcome differs between live and durable state"
                     .to_owned(),
             });
         }
-        let changed = durable_applied.changed();
-        let expected_durable_snapshot = durable_applied.snapshot().clone();
-        let result = self.commit_rebased_command(command, live_applied, durable_applied);
-        let committed = result.is_ok() || self.durable_snapshot == expected_durable_snapshot;
-        if committed {
-            if let Some(batch_metric) = batch_metric {
-                batch_metric.record_committed(
-                    changed,
-                    previous_epoch,
-                    self.durable_snapshot.cluster_epoch(),
-                );
-            }
-            observability::record_metadata_transfer_staging_retention(
-                self.durable_snapshot
-                    .metadata_transfer_staging_retention_metrics(),
-                staging_prune && changed,
-            );
-        }
-        result
-    }
-
-    #[cfg(test)]
-    pub(crate) fn apply_control_plane_command_for_test(
-        &mut self,
-        command: ControlPlaneCommand,
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        self.apply_and_commit_command(command)
+        self.commit_rebased_command(command, live_applied, durable_applied)
     }
 
     fn apply_heartbeat_command(
@@ -2845,185 +2794,13 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         unavailable_node_id: NodeId,
         begin_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.begin_unavailable_pg_placement_transition_batch(
-            &[(pg_id, unavailable_node_id)],
-            begin_at_ms,
-        )
-    }
-
-    pub(crate) fn begin_unavailable_pg_placement_transition_batch(
-        &mut self,
-        candidates: &[(PgId, NodeId)],
-        begin_at_ms: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         let command = self
             .snapshot
-            .begin_unavailable_pg_placement_transition_batch_command(candidates, begin_at_ms)?;
-        self.apply_and_commit_command(command)?;
-        Ok(self.snapshot.clone())
-    }
-
-    pub fn commit_unavailable_pg_outage_resolution_intents_batch(
-        &mut self,
-        candidates: &[(PgId, NodeId, ClusterEpoch, u64)],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .snapshot
-            .commit_unavailable_pg_outage_resolution_intents_batch_command(candidates)?;
-        self.apply_and_commit_command(command)?;
-        Ok(self.snapshot.clone())
-    }
-
-    #[allow(dead_code)] // Production outage reconciliation wiring is the next protocol slice.
-    pub(crate) fn publish_unavailable_pg_outage_command_artifact(
-        &mut self,
-        command: &crate::metadata_command::MetadataCommandEnvelope,
-        source_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let pages = OutageCommandArtifactPage::for_command(command, source_epoch)
-            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-        for page in pages {
-            self.apply_and_commit_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
-                page,
-            })?;
-        }
-        Ok(self.snapshot.clone())
-    }
-
-    pub fn authorize_unavailable_pg_staging_intents_batch(
-        &mut self,
-        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .snapshot
-            .authorize_unavailable_pg_staging_intents_batch_command(authorizations)?;
-        self.apply_and_commit_command(command)?;
-        Ok(self.snapshot.clone())
-    }
-
-    pub fn install_unavailable_pg_placement_transitions_batch(
-        &mut self,
-        transitions: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .snapshot
-            .install_unavailable_pg_placement_transitions_batch_command(
-                transitions,
-                expected_destination_epoch,
+            .begin_unavailable_pg_placement_transition_command(
+                pg_id,
+                unavailable_node_id,
+                begin_at_ms,
             )?;
-        self.apply_and_commit_command(command)?;
-        Ok(self.snapshot.clone())
-    }
-
-    pub fn checkpoint_metadata_transfer_staging_evidence_pages(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .snapshot
-            .checkpoint_metadata_transfer_staging_evidence_pages_command(
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-            )?;
-        self.apply_and_commit_command(command)?;
-        Ok(self.snapshot.clone())
-    }
-
-    pub fn collapse_metadata_transfer_staging_evidence_checkpoint_segment(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .snapshot
-            .collapse_metadata_transfer_staging_evidence_checkpoint_segment_command(
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-            )?;
-        self.apply_and_commit_command(command)?;
-        Ok(self.snapshot.clone())
-    }
-
-    pub fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .snapshot
-            .coalesce_metadata_transfer_staging_evidence_checkpoint_anchors_command(
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-            )?;
-        self.apply_and_commit_command(command)?;
-        Ok(self.snapshot.clone())
-    }
-
-    pub fn retire_metadata_transfer_staging_actor_closure(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .snapshot
-            .retire_metadata_transfer_staging_actor_closure_command(
-                actor_node_id,
-                actor_node_incarnation,
-            )?;
-        self.apply_and_commit_command(command)?;
-        Ok(self.snapshot.clone())
-    }
-
-    pub(crate) fn maintain_metadata_transfer_staging_evidence_once(
-        &mut self,
-        cursor: &mut crate::control_plane::MetadataTransferStagingMaintenanceCursor,
-    ) -> Result<bool, ControlPlaneError> {
-        let mut next_cursor = *cursor;
-        let Some(command) = self
-            .snapshot
-            .next_metadata_transfer_staging_maintenance_command(&mut next_cursor)?
-        else {
-            *cursor = next_cursor;
-            return Ok(false);
-        };
-        let changed = self.apply_and_commit_command(command)?.changed();
-        *cursor = next_cursor;
-        Ok(changed)
-    }
-
-    pub(crate) fn maintain_outage_command_artifacts_once(
-        &mut self,
-    ) -> Result<bool, ControlPlaneError> {
-        let Some(command) = self
-            .snapshot
-            .next_outage_command_artifact_retirement_command()?
-        else {
-            return Ok(false);
-        };
-        Ok(self.apply_and_commit_command(command)?.changed())
-    }
-
-    pub fn finalize_metadata_transfer_staging_generation(
-        &mut self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .snapshot
-            .finalize_metadata_transfer_staging_generation_command(cleanup)?;
         self.apply_and_commit_command(command)?;
         Ok(self.snapshot.clone())
     }
@@ -3033,20 +2810,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         work: &UnavailablePgReconciliationWork,
         ready_at_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.complete_unavailable_pg_placement_transition_batch(
-            std::slice::from_ref(work),
-            ready_at_ms,
-        )
-    }
-
-    pub(crate) fn complete_unavailable_pg_placement_transition_batch(
-        &mut self,
-        work: &[UnavailablePgReconciliationWork],
-        ready_at_ms: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         let command = self
             .snapshot
-            .complete_unavailable_pg_placement_transition_batch_command(work, ready_at_ms)?;
+            .complete_unavailable_pg_placement_transition_command(work, ready_at_ms)?;
         self.apply_and_commit_command(command)?;
         Ok(self.snapshot.clone())
     }
@@ -3091,73 +2857,6 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         }
     }
 
-    pub(crate) fn poll_unavailable_pg_reconciliation_batch(
-        &mut self,
-        cursor: &mut UnavailablePgReconciliationCursor,
-        now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
-        let scan = self
-            .snapshot
-            .scan_unavailable_pg_reconciliation_batch(*cursor, now_ms);
-        *cursor = scan.next_cursor;
-        let begin_candidates = scan
-            .candidates
-            .iter()
-            .filter_map(|candidate| match candidate {
-                UnavailablePgReconciliationCandidate::Begin {
-                    pg_id,
-                    unavailable_node_id,
-                } => Some((*pg_id, *unavailable_node_id)),
-                UnavailablePgReconciliationCandidate::Resume(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let mut begun = Vec::new();
-        let mut rejected = Vec::new();
-        if !begin_candidates.is_empty() {
-            let prepared = self
-                .snapshot
-                .prepare_unavailable_pg_placement_transition_batch(
-                    &begin_candidates,
-                    now_ms,
-                )?;
-            let included = prepared.included;
-            rejected.extend(prepared.rejected);
-            if let Some(command) = prepared.command {
-                self.apply_and_commit_command(command)?;
-                begun.extend(included.into_iter().map(|(pg_id, _)| pg_id));
-            }
-        }
-        let cleanup_fallbacks = scan.cleanup_fallbacks;
-        let mut work = scan
-            .candidates
-            .into_iter()
-            .filter_map(|candidate| match candidate {
-                UnavailablePgReconciliationCandidate::Resume(work) => Some(work),
-                UnavailablePgReconciliationCandidate::Begin { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        for pg_id in begun {
-            let transition = self
-                .snapshot
-                .unavailable_pg_placement_transition(pg_id)
-                .ok_or_else(|| {
-                    ControlPlaneError::invariant_failure(
-                        "committed unavailable PG transition is absent from current state",
-                    )
-                })?;
-            work.push(UnavailablePgReconciliationWork::from_transition(
-                transition,
-                UnavailablePgReconciliationStage::MetadataTransfer,
-            ));
-        }
-        work.sort_by_key(UnavailablePgReconciliationWork::pg_id);
-        Ok(UnavailablePgReconciliationPollBatch {
-            work,
-            cleanup_fallbacks,
-            rejected,
-        })
-    }
-
     pub fn complete_unavailable_pg_reconciliation(
         &mut self,
         work: &UnavailablePgReconciliationWork,
@@ -3177,30 +2876,6 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             .complete_unavailable_pg_placement_transition_command(work, now_ms)?;
         self.apply_and_commit_command(command)?;
         Ok(true)
-    }
-
-    pub(crate) fn complete_unavailable_pg_reconciliation_batch(
-        &mut self,
-        work: &[UnavailablePgReconciliationWork],
-        now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError> {
-        let prepared = self
-            .snapshot
-            .prepare_unavailable_pg_placement_completion_batch(work, now_ms)?;
-        let rederive = prepared.rederive_from(work);
-        let mut completed = prepared.already_completed;
-        if let Some(command) = prepared.command {
-            self.apply_and_commit_command(command)?;
-            completed.extend(prepared.included);
-        }
-        Ok(UnavailablePgReconciliationCompletionAttempt::Classified(
-            Box::new(UnavailablePgReconciliationCompletionBatch {
-                completed,
-                rejected: prepared.rejected,
-                rederive,
-                snapshot: self.snapshot.clone(),
-            }),
-        ))
     }
 
     pub fn set_pg_acting_set_with_metadata_transfer(
@@ -3230,6 +2905,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             acting_set,
             transfer,
             expected_destination_epoch,
+            unavailable_transition: None,
         })?;
         Ok(self.snapshot.clone())
     }
@@ -3289,6 +2965,24 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             self.snapshot.clone(),
             source_primary_lease_deadline_ms,
         ))
+    }
+
+    pub fn install_unavailable_pg_transition_metadata_transfer(
+        &mut self,
+        binding: UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.apply_and_commit_command(
+            ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
+                pg_id: binding.pg_id(),
+                acting_set: binding.destination_acting_set().to_vec(),
+                transfer,
+                expected_destination_epoch,
+                unavailable_transition: Some(binding),
+            },
+        )?;
+        Ok(self.snapshot.clone())
     }
 
     pub fn set_pg_state(
@@ -4031,115 +3725,6 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         )
     }
 
-    fn authorize_unavailable_pg_staging_intents_batch(
-        &mut self,
-        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::authorize_unavailable_pg_staging_intents_batch(
-            self,
-            authorizations,
-        )
-    }
-
-    fn install_unavailable_pg_placement_transitions_batch(
-        &mut self,
-        transitions: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::install_unavailable_pg_placement_transitions_batch(
-            self,
-            transitions,
-            expected_destination_epoch,
-        )
-    }
-
-    fn apply_metadata_transfer_staging_evidence_page(
-        &mut self,
-        operation_payload: Vec<u8>,
-        page_digest: [u8; 32],
-    ) -> Result<Vec<u8>, ControlPlaneError> {
-        let applied = self.apply_and_commit_command(
-            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
-                operation_payload,
-                page_digest,
-            },
-        )?;
-        let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
-            apply_receipt,
-        } = applied.response()
-        else {
-            unreachable!("staging evidence command returned the wrong response");
-        };
-        Ok(apply_receipt.clone())
-    }
-
-    fn checkpoint_metadata_transfer_staging_evidence_pages(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::checkpoint_metadata_transfer_staging_evidence_pages(
-            self,
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        )
-    }
-
-    fn collapse_metadata_transfer_staging_evidence_checkpoint_segment(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::collapse_metadata_transfer_staging_evidence_checkpoint_segment(
-            self,
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        )
-    }
-
-    fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
-            self,
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        )
-    }
-
-    fn retire_metadata_transfer_staging_actor_closure(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::retire_metadata_transfer_staging_actor_closure(
-            self,
-            actor_node_id,
-            actor_node_incarnation,
-        )
-    }
-
-    fn finalize_metadata_transfer_staging_generation(
-        &mut self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::finalize_metadata_transfer_staging_generation(self, cleanup)
-    }
-
     fn fence_pg_for_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -4179,4 +3764,17 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         )
     }
 
+    fn install_unavailable_pg_transition_metadata_transfer(
+        &mut self,
+        binding: UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::install_unavailable_pg_transition_metadata_transfer(
+            self,
+            binding,
+            transfer,
+            expected_destination_epoch,
+        )
+    }
 }

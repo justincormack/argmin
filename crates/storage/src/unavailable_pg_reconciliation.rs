@@ -1,385 +1,51 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::control_plane::{
-    ClusterControlSnapshot, ControlPlaneError, FileControlPlaneStore,
-    MetadataTransferStagingMaintenanceCursor, SingleAuthorityControlPlane,
-    UnavailablePgReconciliationCompletionAttempt, UnavailablePgReconciliationCursor,
-    UnavailablePgReconciliationPollBatch, UnavailablePgReconciliationStage,
-    UnavailablePgReconciliationWork, UnconfirmedUnavailablePgReconciliationCompletionBatch,
-    MAX_UNAVAILABLE_PG_TRANSITION_BATCH,
+    ControlPlaneError, FileControlPlaneStore, SingleAuthorityControlPlane,
+    UnavailablePgReconciliationCursor, UnavailablePgReconciliationStage,
+    UnavailablePgReconciliationWork,
 };
-use crate::control_plane_command::{
-    FinalizeMetadataTransferStagingGenerationRequest,
-    UnavailablePgStagingIntentAuthorizationRequest, UnavailablePgTransitionInstallRequest,
-};
-use crate::live_pg_transfer::{
-    AuthorizedUnavailablePgMetadataTransfer, CleanupUnavailablePgMetadataTransfer,
-    PreparedUnavailablePgMetadataTransfer, StagedUnavailablePgMetadataTransfer,
-    TombstonedUnavailablePgMetadataTransfer,
-};
-use crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES;
 use crate::{ClusterEpoch, ControlPlaneRaftAuthorityHost, LivePgMetadataTransferAdmin, PgId};
 
-#[cfg(test)]
-use crate::control_plane::UnavailablePgReconciliationCompletionBatch;
-
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
-const TRANSFER_WORKER_COUNT: usize = 4;
-const STAGING_AUTHORIZATION_OBSERVATION_WAIT: Duration = Duration::from_secs(2);
-const STAGING_AUTHORIZATION_OBSERVATION_RETRY: Duration = Duration::from_millis(250);
-const STAGING_EVIDENCE_INSTALL_WAIT: Duration = Duration::from_secs(5);
-pub(crate) const TRANSFER_ARTIFACT_MEMORY_BUDGET_BYTES: u64 =
-    METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES * TRANSFER_WORKER_COUNT as u64;
+const MAX_CONCURRENT_TRANSFERS: usize = 4;
+const MAX_COMPLETION_ATTEMPTS_PER_POLL: usize = MAX_CONCURRENT_TRANSFERS;
+const MAX_SCAN_ATTEMPTS_PER_POLL: usize = 16;
 
-struct TransferArtifactMemoryBudget {
-    reserved_bytes: AtomicU64,
-    peak_reserved_bytes: AtomicU64,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationAuthorityErrorDisposition {
+    ContinueScan,
+    Backoff,
+    FailStop,
 }
 
-impl TransferArtifactMemoryBudget {
-    fn new() -> Self {
-        Self {
-            reserved_bytes: AtomicU64::new(0),
-            peak_reserved_bytes: AtomicU64::new(0),
-        }
-    }
-
-    fn try_reserve(self: &Arc<Self>) -> Option<TransferArtifactMemoryReservation> {
-        let reserved =
-            self.reserved_bytes
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-                    reserved
-                        .checked_add(METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES)
-                        .filter(|total| *total <= TRANSFER_ARTIFACT_MEMORY_BUDGET_BYTES)
-                });
-        reserved.ok()?;
-        self.peak_reserved_bytes.fetch_max(
-            self.reserved_bytes.load(Ordering::Acquire),
-            Ordering::AcqRel,
-        );
-        Some(TransferArtifactMemoryReservation {
-            budget: Arc::clone(self),
-        })
-    }
-
-    #[cfg(test)]
-    fn reserved_bytes(&self) -> u64 {
-        self.reserved_bytes.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    fn peak_reserved_bytes(&self) -> u64 {
-        self.peak_reserved_bytes.load(Ordering::Acquire)
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationCompletionErrorDisposition {
+    Retry,
+    Quarantine,
+    FailStop,
 }
 
-struct TransferArtifactMemoryReservation {
-    budget: Arc<TransferArtifactMemoryBudget>,
-}
-
-impl Drop for TransferArtifactMemoryReservation {
-    fn drop(&mut self) {
-        self.budget.reserved_bytes.fetch_sub(
-            METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-            Ordering::AcqRel,
-        );
-    }
-}
-
-struct TransferCompletion {
-    work: UnavailablePgReconciliationWork,
-    result: Result<TransferOutcome, ReconciliationTransferError>,
-}
-
-struct TransferJob {
-    operation: TransferOperation,
-    artifact_memory: Option<TransferArtifactMemoryReservation>,
-}
-
-enum TransferOperation {
-    Legacy(UnavailablePgReconciliationWork),
-    Prepare(UnavailablePgReconciliationWork),
-    ResumeAuthorized(UnavailablePgReconciliationWork, Box<ClusterControlSnapshot>),
-    Stage(AuthorizedUnavailablePgMetadataTransfer),
-    ResumeInstalled(UnavailablePgReconciliationWork, Box<ClusterControlSnapshot>),
-    ResumeCleanup(UnavailablePgReconciliationWork, Box<ClusterControlSnapshot>),
-    Rebase(StagedUnavailablePgMetadataTransfer, ClusterEpoch),
-    Import(StagedUnavailablePgMetadataTransfer),
-    Tombstone(
-        CleanupUnavailablePgMetadataTransfer,
-        Box<ClusterControlSnapshot>,
-    ),
-}
-
-impl TransferJob {
-    fn work(&self) -> &UnavailablePgReconciliationWork {
-        match &self.operation {
-            TransferOperation::Legacy(work) | TransferOperation::Prepare(work) => work,
-            TransferOperation::ResumeAuthorized(work, _)
-            | TransferOperation::ResumeInstalled(work, _)
-            | TransferOperation::ResumeCleanup(work, _) => work,
-            TransferOperation::Stage(authorized) => authorized.work(),
-            TransferOperation::Rebase(staged, _) | TransferOperation::Import(staged) => {
-                staged.work()
-            }
-            TransferOperation::Tombstone(cleanup, _) => cleanup.work(),
-        }
-    }
-
-    fn metric_stage(&self) -> observability::UnavailablePgWorkerStage {
-        match &self.operation {
-            TransferOperation::Legacy(_) | TransferOperation::Prepare(_) => {
-                observability::UnavailablePgWorkerStage::Prepare
-            }
-            TransferOperation::ResumeAuthorized(_, _)
-            | TransferOperation::Stage(_)
-            | TransferOperation::Rebase(_, _) => observability::UnavailablePgWorkerStage::Stage,
-            TransferOperation::ResumeInstalled(_, _) | TransferOperation::Import(_) => {
-                observability::UnavailablePgWorkerStage::Import
-            }
-            TransferOperation::ResumeCleanup(_, _) | TransferOperation::Tombstone(_, _) => {
-                observability::UnavailablePgWorkerStage::Tombstone
-            }
-        }
-    }
-
-    fn new(operation: TransferOperation) -> Self {
-        Self {
-            operation,
-            artifact_memory: None,
-        }
-    }
-
-    fn with_artifact_memory(
-        operation: TransferOperation,
-        artifact_memory: TransferArtifactMemoryReservation,
-    ) -> Self {
-        Self {
-            operation,
-            artifact_memory: Some(artifact_memory),
-        }
-    }
-
-    fn requires_artifact_memory(&self) -> bool {
-        matches!(
-            &self.operation,
-            TransferOperation::Prepare(_)
-                | TransferOperation::ResumeAuthorized(_, _)
-                | TransferOperation::Stage(_)
-                | TransferOperation::Rebase(_, _)
-                | TransferOperation::Import(_)
-        )
-    }
-}
-
-enum TransferOutcome {
-    LegacyReady,
-    Prepared(
-        PreparedUnavailablePgMetadataTransfer,
-        TransferArtifactMemoryReservation,
-    ),
-    Authorized(
-        AuthorizedUnavailablePgMetadataTransfer,
-        TransferArtifactMemoryReservation,
-    ),
-    ReadyInstall(StagedUnavailablePgMetadataTransfer),
-    ReadyImport(StagedUnavailablePgMetadataTransfer),
-    ReadyCleanup(
-        CleanupUnavailablePgMetadataTransfer,
-        Box<ClusterControlSnapshot>,
-    ),
-    Imported(StagedUnavailablePgMetadataTransfer),
-    Tombstoned(TombstonedUnavailablePgMetadataTransfer),
-}
-
-struct RetainedPreparedTransfer {
-    transfer: PreparedUnavailablePgMetadataTransfer,
-    artifact_memory: TransferArtifactMemoryReservation,
-}
-
-impl RetainedPreparedTransfer {
-    fn work(&self) -> &UnavailablePgReconciliationWork {
-        self.transfer.work()
-    }
-
-    fn artifact_length(&self) -> u64 {
-        self.transfer.artifact_length()
-    }
-}
-
-type LegacyTransfer = dyn Fn(&UnavailablePgReconciliationWork) -> Result<(), ReconciliationTransferError>
-    + Send
-    + Sync;
-
-enum TransferExecutor {
-    #[allow(dead_code)] // Used only by owner-local unit-test executors.
-    Legacy(Arc<LegacyTransfer>),
-    Staged(Arc<LivePgMetadataTransferAdmin>),
-}
-
-impl TransferExecutor {
-    fn execute(&self, job: TransferJob) -> Result<TransferOutcome, ReconciliationTransferError> {
-        let TransferJob {
-            operation,
-            artifact_memory,
-        } = job;
-        match (self, operation) {
-            (Self::Legacy(transfer), TransferOperation::Legacy(work)) => {
-                transfer(&work)?;
-                Ok(TransferOutcome::LegacyReady)
-            }
-            (Self::Staged(admin), TransferOperation::Prepare(work)) => {
-                let reservation = artifact_memory
-                    .expect("metadata transfer preparation requires artifact memory admission");
-                admin
-                    .prepare_unavailable_pg_reconciliation_staging(work)
-                    .map(|prepared| TransferOutcome::Prepared(prepared, reservation))
-                    .map_err(reconciliation_transfer_failure)
-            }
-            (Self::Staged(admin), TransferOperation::ResumeAuthorized(work, snapshot)) => {
-                let reservation = artifact_memory
-                    .expect("authorized transfer recovery requires artifact memory admission");
-                admin
-                    .resume_authorized_unavailable_pg_reconciliation(work, &snapshot)
-                    .map(|authorized| TransferOutcome::Authorized(authorized, reservation))
-                    .map_err(reconciliation_transfer_failure)
-            }
-            (Self::Staged(admin), TransferOperation::Stage(authorized)) => {
-                let _reservation = artifact_memory
-                    .expect("metadata transfer staging requires artifact memory admission");
-                let observation_deadline = Instant::now() + STAGING_AUTHORIZATION_OBSERVATION_WAIT;
-                let published = loop {
-                    match admin.stage_prepared_unavailable_pg_reconciliation(&authorized) {
-                        Ok(published) => break published,
-                        Err(error) if error.is_staging_authorization_not_observed() => {
-                            let remaining =
-                                observation_deadline.saturating_duration_since(Instant::now());
-                            if remaining.is_zero() {
-                                return Err(reconciliation_transfer_error(error));
-                            }
-                            // The committed authorization is epoch-neutral, but the
-                            // destination may not have refreshed its runtime map yet.
-                            thread::sleep(remaining.min(STAGING_AUTHORIZATION_OBSERVATION_RETRY));
-                        }
-                        Err(error) => return Err(reconciliation_transfer_error(error)),
-                    }
-                };
-                authorized
-                    .bind_publications(published)
-                    .map(TransferOutcome::ReadyInstall)
-                    .map_err(reconciliation_transfer_error)
-            }
-            (Self::Staged(admin), TransferOperation::ResumeInstalled(work, snapshot)) => admin
-                .resume_installed_unavailable_pg_reconciliation(work, &snapshot)
-                .map(TransferOutcome::ReadyImport)
-                .map_err(reconciliation_transfer_failure),
-            (Self::Staged(admin), TransferOperation::ResumeCleanup(work, snapshot)) => admin
-                .resume_cleanup_unavailable_pg_reconciliation(work, &snapshot)
-                .map(|cleanup| TransferOutcome::ReadyCleanup(cleanup, snapshot))
-                .map_err(reconciliation_transfer_failure),
-            (Self::Staged(admin), TransferOperation::Rebase(mut staged, target_epoch)) => {
-                let _reservation = artifact_memory
-                    .expect("metadata transfer proof rebasing requires artifact memory admission");
-                admin
-                    .rebase_staged_unavailable_pg_reconciliation(&mut staged, target_epoch)
-                    .map_err(reconciliation_transfer_failure)?;
-                Ok(TransferOutcome::ReadyInstall(staged))
-            }
-            (Self::Staged(admin), TransferOperation::Import(staged)) => {
-                let _reservation = artifact_memory
-                    .expect("metadata transfer import requires artifact memory admission");
-                admin
-                    .import_staged_unavailable_pg_reconciliation(&staged)
-                    .map_err(reconciliation_transfer_failure)?;
-                Ok(TransferOutcome::Imported(staged))
-            }
-            (Self::Staged(admin), TransferOperation::Tombstone(staged, snapshot)) => admin
-                .tombstone_unavailable_pg_reconciliation(&staged, &snapshot)
-                .map(TransferOutcome::Tombstoned)
-                .map_err(reconciliation_transfer_failure),
-            (Self::Legacy(_), _) | (Self::Staged(_), TransferOperation::Legacy(_)) => {
-                panic!("unavailable PG reconciliation executor received the wrong job kind")
-            }
-        }
-    }
-}
-
-fn reconciliation_transfer_failure(
-    error: crate::LivePgMetadataTransferError,
-) -> ReconciliationTransferError {
-    reconciliation_transfer_error(error)
-}
-
-fn reconciliation_transfer_error(
-    error: crate::LivePgMetadataTransferError,
-) -> ReconciliationTransferError {
-    let diagnostic = error.to_string();
-    if error.is_fatal() {
-        ReconciliationTransferError::Fatal(diagnostic)
-    } else {
-        ReconciliationTransferError::Retryable(diagnostic)
-    }
-}
-
-fn record_authority_stage_result<T>(
-    stage: observability::UnavailablePgWorkerStage,
-    started_at: Instant,
-    result: &Result<T, ControlPlaneError>,
-) {
-    let outcome = match result {
-        Ok(_) => observability::UnavailablePgWorkerStageOutcome::Succeeded,
-        Err(error) if reconciliation_completion_error_is_fatal(error) => {
-            observability::UnavailablePgWorkerStageOutcome::Fatal
-        }
-        Err(_) => observability::UnavailablePgWorkerStageOutcome::Deferred,
-    };
-    record_worker_stage_outcome(stage, started_at, outcome);
-}
-
-fn record_worker_stage_outcome(
-    stage: observability::UnavailablePgWorkerStage,
-    started_at: Instant,
-    outcome: observability::UnavailablePgWorkerStageOutcome,
-) {
-    observability::record_unavailable_pg_worker_stage(stage, outcome, started_at.elapsed());
-}
-
-enum TransferWorkerEvent {
-    Completed(Box<TransferCompletion>),
-    Panicked,
+enum TransferEvent {
+    Completed {
+        work: UnavailablePgReconciliationWork,
+        result: Result<(), ReconciliationTransferError>,
+        elapsed: Duration,
+    },
+    WorkerPanicked,
 }
 
 enum ReconciliationTransferError {
     Retryable(String),
     Fatal(String),
-}
-
-enum ActivationOwner {
-    Legacy(UnavailablePgReconciliationWork),
-    Staged(Box<StagedUnavailablePgMetadataTransfer>),
-}
-
-struct RetainedActivationReplay {
-    owners: Vec<ActivationOwner>,
-    retry_not_before: Instant,
-}
-
-impl ActivationOwner {
-    fn work(&self) -> &UnavailablePgReconciliationWork {
-        match self {
-            Self::Legacy(work) => work,
-            Self::Staged(staged) => staged.work(),
-        }
-    }
 }
 
 impl ReconciliationTransferError {
@@ -395,229 +61,91 @@ impl ReconciliationTransferError {
 }
 
 trait ReconciliationAuthority {
-    fn reconciliation_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError>;
-
-    fn poll_reconciliation_batch(
+    fn poll_reconciliation(
         &mut self,
         cursor: &mut UnavailablePgReconciliationCursor,
         now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError>;
+    ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError>;
 
-    fn complete_reconciliation_batch(
+    fn complete_reconciliation(
         &mut self,
-        work: &[UnavailablePgReconciliationWork],
+        work: &UnavailablePgReconciliationWork,
         now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError>;
-
-    fn authorize_staging_batch(
-        &mut self,
-        requests: &[UnavailablePgStagingIntentAuthorizationRequest],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
-
-    fn install_staged_batch(
-        &mut self,
-        requests: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
-
-    fn finalize_staging_generation(
-        &mut self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
-
-    fn maintain_staging_evidence(
-        &mut self,
-        cursor: &mut MetadataTransferStagingMaintenanceCursor,
     ) -> Result<bool, ControlPlaneError>;
-
-    fn maintain_outage_command_artifacts(&mut self) -> Result<bool, ControlPlaneError>;
 }
 
 impl ReconciliationAuthority for ControlPlaneRaftAuthorityHost {
-    fn reconciliation_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.unavailable_pg_reconciliation_snapshot()
-    }
-
-    fn poll_reconciliation_batch(
+    fn poll_reconciliation(
         &mut self,
         cursor: &mut UnavailablePgReconciliationCursor,
         now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
-        self.poll_unavailable_pg_reconciliation_batch(cursor, now_ms)
+    ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError> {
+        self.poll_unavailable_pg_reconciliation(cursor, now_ms)
     }
 
-    fn complete_reconciliation_batch(
+    fn complete_reconciliation(
         &mut self,
-        work: &[UnavailablePgReconciliationWork],
+        work: &UnavailablePgReconciliationWork,
         now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError> {
-        self.complete_unavailable_pg_reconciliation_batch(work, now_ms)
-    }
-
-    fn authorize_staging_batch(
-        &mut self,
-        requests: &[UnavailablePgStagingIntentAuthorizationRequest],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.authorize_unavailable_pg_staging_intents_batch(requests)
-    }
-
-    fn install_staged_batch(
-        &mut self,
-        requests: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.install_unavailable_pg_placement_transitions_batch(
-            requests,
-            expected_destination_epoch,
-        )
-    }
-
-    fn finalize_staging_generation(
-        &mut self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.finalize_metadata_transfer_staging_generation(cleanup)
-    }
-
-    fn maintain_staging_evidence(
-        &mut self,
-        cursor: &mut MetadataTransferStagingMaintenanceCursor,
     ) -> Result<bool, ControlPlaneError> {
-        self.maintain_metadata_transfer_staging_evidence_once(cursor)
-    }
-
-    fn maintain_outage_command_artifacts(&mut self) -> Result<bool, ControlPlaneError> {
-        self.maintain_outage_command_artifacts_once()
+        self.complete_unavailable_pg_reconciliation(work, now_ms)
     }
 }
 
 impl ReconciliationAuthority for SingleAuthorityControlPlane<FileControlPlaneStore> {
-    fn reconciliation_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        Ok(self.snapshot().clone())
-    }
-
-    fn poll_reconciliation_batch(
+    fn poll_reconciliation(
         &mut self,
         cursor: &mut UnavailablePgReconciliationCursor,
         now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
-        self.poll_unavailable_pg_reconciliation_batch(cursor, now_ms)
+    ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError> {
+        self.poll_unavailable_pg_reconciliation(cursor, now_ms)
     }
 
-    fn complete_reconciliation_batch(
+    fn complete_reconciliation(
         &mut self,
-        work: &[UnavailablePgReconciliationWork],
+        work: &UnavailablePgReconciliationWork,
         now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError> {
-        self.complete_unavailable_pg_reconciliation_batch(work, now_ms)
-    }
-
-    fn authorize_staging_batch(
-        &mut self,
-        requests: &[UnavailablePgStagingIntentAuthorizationRequest],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.authorize_unavailable_pg_staging_intents_batch(requests)
-    }
-
-    fn install_staged_batch(
-        &mut self,
-        requests: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.install_unavailable_pg_placement_transitions_batch(
-            requests,
-            expected_destination_epoch,
-        )
-    }
-
-    fn finalize_staging_generation(
-        &mut self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.finalize_metadata_transfer_staging_generation(cleanup)
-    }
-
-    fn maintain_staging_evidence(
-        &mut self,
-        cursor: &mut MetadataTransferStagingMaintenanceCursor,
     ) -> Result<bool, ControlPlaneError> {
-        self.maintain_metadata_transfer_staging_evidence_once(cursor)
-    }
-
-    fn maintain_outage_command_artifacts(&mut self) -> Result<bool, ControlPlaneError> {
-        self.maintain_outage_command_artifacts_once()
-    }
-}
-
-type ReconciliationRetryKey = (PgId, ClusterEpoch, UnavailablePgReconciliationStage);
-
-fn reconciliation_retry_key(work: &UnavailablePgReconciliationWork) -> ReconciliationRetryKey {
-    (work.pg_id(), work.transition_epoch(), work.stage())
-}
-
-#[derive(Clone, Copy)]
-enum ReconciliationPollTurn {
-    ActivationReplay,
-    OrdinaryActivation,
-    Discovery,
-}
-
-impl ReconciliationPollTurn {
-    fn next(self) -> Self {
-        match self {
-            Self::ActivationReplay => Self::OrdinaryActivation,
-            Self::OrdinaryActivation => Self::Discovery,
-            Self::Discovery => Self::ActivationReplay,
-        }
+        self.complete_unavailable_pg_reconciliation(work, now_ms)
     }
 }
 
 pub struct UnavailablePgReconciliationWorker {
-    work_tx: SyncSender<TransferJob>,
-    completion_rx: Receiver<TransferWorkerEvent>,
-    staged_protocol: bool,
+    work_tx: SyncSender<UnavailablePgReconciliationWork>,
+    completion_rx: Receiver<TransferEvent>,
     cursor: UnavailablePgReconciliationCursor,
-    staging_maintenance_cursor: MetadataTransferStagingMaintenanceCursor,
     in_flight: BTreeMap<PgId, UnavailablePgReconciliationWork>,
-    pending_transfers: VecDeque<TransferJob>,
-    prepared_for_authorization: Vec<RetainedPreparedTransfer>,
-    staged_for_install: Vec<StagedUnavailablePgMetadataTransfer>,
-    artifact_memory_budget: Arc<TransferArtifactMemoryBudget>,
-    install_evidence_wait_started_at: Option<Instant>,
-    ready_for_activation: Vec<ActivationOwner>,
-    activation_replays: VecDeque<RetainedActivationReplay>,
-    reconciliation_poll_turn: ReconciliationPollTurn,
-    tombstoned_for_finalization: Vec<TombstonedUnavailablePgMetadataTransfer>,
+    ready_to_complete: VecDeque<UnavailablePgReconciliationWork>,
+    completion_retries: BTreeMap<PgId, (UnavailablePgReconciliationWork, Instant)>,
+    completion_retry_cursor: Option<PgId>,
     authority_retry_not_before: Instant,
-    maintenance_retry_not_before: Instant,
-    deferred: BTreeMap<ReconciliationRetryKey, Instant>,
-    blocked: BTreeSet<ReconciliationRetryKey>,
+    deferred: BTreeMap<PgId, (ClusterEpoch, Instant)>,
+    blocked: BTreeMap<PgId, ClusterEpoch>,
     retry_backoff: Duration,
     last_diagnostic: Option<String>,
-    last_maintenance_diagnostic: Option<String>,
-    #[cfg(test)]
-    next_authorization_response_error: Option<ControlPlaneError>,
-    #[cfg(test)]
-    next_install_response_error: Option<ControlPlaneError>,
-    #[cfg(test)]
-    next_activation_response_error: Option<ControlPlaneError>,
-    #[cfg(test)]
-    next_install_preparation_rejection: Option<ControlPlaneError>,
-    #[cfg(test)]
-    next_finalization_error: Option<ControlPlaneError>,
 }
 
 impl UnavailablePgReconciliationWorker {
     #[must_use]
     pub fn spawn(admin: LivePgMetadataTransferAdmin) -> Self {
-        Self::spawn_with_executor(
-            TransferExecutor::Staged(Arc::new(admin)),
+        Self::spawn_with_transfer(
+            move |work| {
+                admin
+                    .transfer_unavailable_pg_reconciliation(work)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        let diagnostic = error.to_string();
+                        if error.is_fatal() {
+                            ReconciliationTransferError::Fatal(diagnostic)
+                        } else {
+                            ReconciliationTransferError::Retryable(diagnostic)
+                        }
+                    })
+            },
             RETRY_BACKOFF,
-            true,
         )
     }
 
-    #[allow(dead_code)] // Used only by owner-local unit-test executors.
     fn spawn_with_transfer(
         transfer: impl Fn(&UnavailablePgReconciliationWork) -> Result<(), ReconciliationTransferError>
             + Send
@@ -625,323 +153,74 @@ impl UnavailablePgReconciliationWorker {
             + 'static,
         retry_backoff: Duration,
     ) -> Self {
-        Self::spawn_with_executor(
-            TransferExecutor::Legacy(Arc::new(transfer)),
-            retry_backoff,
-            false,
-        )
-    }
-
-    fn spawn_with_executor(
-        executor: TransferExecutor,
-        retry_backoff: Duration,
-        staged_protocol: bool,
-    ) -> Self {
-        let (work_tx, work_rx) = mpsc::sync_channel::<TransferJob>(TRANSFER_WORKER_COUNT);
+        let (work_tx, work_rx) = mpsc::sync_channel(MAX_CONCURRENT_TRANSFERS);
         let (completion_tx, completion_rx) = mpsc::channel();
         let work_rx = Arc::new(Mutex::new(work_rx));
-        let executor = Arc::new(executor);
-        for worker_index in 0..TRANSFER_WORKER_COUNT {
+        let transfer = Arc::new(transfer);
+        for worker_index in 0..MAX_CONCURRENT_TRANSFERS {
             let work_rx = Arc::clone(&work_rx);
             let completion_tx = completion_tx.clone();
-            let executor = Arc::clone(&executor);
+            let transfer = Arc::clone(&transfer);
             thread::Builder::new()
                 .name(format!("unavailable-pg-reconciler-{worker_index}"))
                 .spawn(move || loop {
-                    let job = {
-                        let receiver = work_rx
-                            .lock()
-                            .expect("unavailable PG reconciliation work queue poisoned");
-                        receiver.recv()
+                    let work = {
+                        let receiver = work_rx.lock().unwrap_or_else(|error| error.into_inner());
+                        match receiver.recv() {
+                            Ok(work) => work,
+                            Err(_) => break,
+                        }
                     };
-                    let Ok(job) = job else {
-                        break;
-                    };
-                    let work = job.work().clone();
-                    let metric_stage = job.metric_stage();
                     let started_at = Instant::now();
-                    let result = panic::catch_unwind(AssertUnwindSafe(|| executor.execute(job)));
-                    let panicked = result.is_err();
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| transfer(&work)));
+                    let elapsed = started_at.elapsed();
+                    let worker_panicked = result.is_err();
                     let event = match result {
-                        Ok(result) => {
-                            let outcome = match &result {
-                                Ok(_) => observability::UnavailablePgWorkerStageOutcome::Succeeded,
-                                Err(ReconciliationTransferError::Retryable(_)) => {
-                                    observability::UnavailablePgWorkerStageOutcome::Deferred
-                                }
-                                Err(ReconciliationTransferError::Fatal(_)) => {
-                                    observability::UnavailablePgWorkerStageOutcome::Fatal
-                                }
-                            };
-                            observability::record_unavailable_pg_worker_stage(
-                                metric_stage,
-                                outcome,
-                                started_at.elapsed(),
-                            );
-                            TransferWorkerEvent::Completed(Box::new(TransferCompletion {
-                                work,
-                                result,
-                            }))
-                        }
-                        Err(_) => {
-                            record_worker_stage_outcome(
-                                metric_stage,
-                                started_at,
-                                observability::UnavailablePgWorkerStageOutcome::Fatal,
-                            );
-                            TransferWorkerEvent::Panicked
-                        }
+                        Ok(result) => TransferEvent::Completed {
+                            work,
+                            result,
+                            elapsed,
+                        },
+                        Err(_) => TransferEvent::WorkerPanicked,
                     };
-                    if completion_tx.send(event).is_err() || panicked {
+                    if completion_tx.send(event).is_err() || worker_panicked {
                         break;
                     }
                 })
                 .expect("failed to spawn unavailable PG reconciliation worker");
         }
         drop(completion_tx);
-        let worker = Self {
+        Self {
             work_tx,
             completion_rx,
-            staged_protocol,
             cursor: UnavailablePgReconciliationCursor::start(),
-            staging_maintenance_cursor: MetadataTransferStagingMaintenanceCursor::start(),
             in_flight: BTreeMap::new(),
-            pending_transfers: VecDeque::new(),
-            prepared_for_authorization: Vec::new(),
-            staged_for_install: Vec::new(),
-            artifact_memory_budget: Arc::new(TransferArtifactMemoryBudget::new()),
-            install_evidence_wait_started_at: None,
-            ready_for_activation: Vec::new(),
-            activation_replays: VecDeque::new(),
-            reconciliation_poll_turn: ReconciliationPollTurn::ActivationReplay,
-            tombstoned_for_finalization: Vec::new(),
+            ready_to_complete: VecDeque::new(),
+            completion_retries: BTreeMap::new(),
+            completion_retry_cursor: None,
             authority_retry_not_before: Instant::now(),
-            maintenance_retry_not_before: Instant::now(),
             deferred: BTreeMap::new(),
-            blocked: BTreeSet::new(),
+            blocked: BTreeMap::new(),
             retry_backoff,
             last_diagnostic: None,
-            last_maintenance_diagnostic: None,
-            #[cfg(test)]
-            next_authorization_response_error: None,
-            #[cfg(test)]
-            next_install_response_error: None,
-            #[cfg(test)]
-            next_activation_response_error: None,
-            #[cfg(test)]
-            next_install_preparation_rejection: None,
-            #[cfg(test)]
-            next_finalization_error: None,
-        };
-        worker.record_queue_metrics();
-        worker
+        }
     }
 
     pub fn poll_single_authority(
         &mut self,
         authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
         now_ms: u64,
-    ) -> Result<(), ControlPlaneError> {
-        self.poll(authority, now_ms)
+    ) {
+        self.poll(authority, now_ms);
     }
 
-    pub fn poll_raft(
-        &mut self,
-        authority: &mut ControlPlaneRaftAuthorityHost,
-        now_ms: u64,
-    ) -> Result<(), ControlPlaneError> {
-        self.poll(authority, now_ms)
+    pub fn poll_raft(&mut self, authority: &mut ControlPlaneRaftAuthorityHost, now_ms: u64) {
+        self.poll(authority, now_ms);
     }
 
     /// Observe transfer completion and fail-stop worker loss independently of authority role.
-    pub fn observe_transfer_workers(&mut self) {
+    pub fn observe_transfer_worker(&mut self) {
         self.receive_completion();
-        self.record_queue_metrics();
-    }
-
-    fn record_queue_metrics(&self) {
-        let prepared_artifact_bytes = self
-            .prepared_for_authorization
-            .iter()
-            .map(RetainedPreparedTransfer::artifact_length)
-            .fold(0_u64, u64::saturating_add);
-        let staged_install_bytes = self
-            .staged_for_install
-            .iter()
-            .map(StagedUnavailablePgMetadataTransfer::artifact_length)
-            .fold(0_u64, u64::saturating_add);
-        observability::record_unavailable_pg_worker_queue(
-            observability::UnavailablePgWorkerQueueMetricSnapshot {
-                pending_transfer_depth: u64::try_from(self.pending_transfers.len())
-                    .unwrap_or(u64::MAX),
-                in_flight_transfer_depth: u64::try_from(self.in_flight.len()).unwrap_or(u64::MAX),
-                prepared_artifact_depth: u64::try_from(self.prepared_for_authorization.len())
-                    .unwrap_or(u64::MAX),
-                prepared_artifact_bytes,
-                staged_install_depth: u64::try_from(self.staged_for_install.len())
-                    .unwrap_or(u64::MAX),
-                staged_install_bytes,
-                ready_activation_depth: u64::try_from(
-                    self.ready_for_activation.len()
-                        + self
-                            .activation_replays
-                            .iter()
-                            .map(|replay| replay.owners.len())
-                            .sum::<usize>(),
-                )
-                .unwrap_or(u64::MAX),
-                pending_finalization_depth: u64::try_from(self.tombstoned_for_finalization.len())
-                    .unwrap_or(u64::MAX),
-                deferred_depth: u64::try_from(self.deferred.len()).unwrap_or(u64::MAX),
-                blocked_depth: u64::try_from(self.blocked.len()).unwrap_or(u64::MAX),
-            },
-        );
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_test_state(&self) -> (usize, usize, usize, Option<&str>) {
-        (
-            self.in_flight.len(),
-            self.pending_transfers.len(),
-            self.blocked.len(),
-            self.last_diagnostic.as_deref(),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn staged_install_depth_for_test(&self) -> usize {
-        self.staged_for_install.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn ready_activation_depth_for_test(&self) -> usize {
-        self.ready_for_activation.len()
-            + self
-                .activation_replays
-                .iter()
-                .map(|replay| replay.owners.len())
-                .sum::<usize>()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn advance_transfer_workers_for_test(&mut self) {
-        self.observe_transfer_workers();
-        self.dispatch_pending_transfers();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn artifact_memory_reserved_bytes_for_test(&self) -> u64 {
-        self.artifact_memory_budget.reserved_bytes()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn peak_artifact_memory_reserved_bytes_for_test(&self) -> u64 {
-        self.artifact_memory_budget.peak_reserved_bytes()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn expire_install_evidence_wait_for_test(&mut self) {
-        assert!(
-            self.install_evidence_wait_started_at.is_some(),
-            "test must enter the evidence wait before expiring it"
-        );
-        self.install_evidence_wait_started_at =
-            Some(Instant::now() - STAGING_EVIDENCE_INSTALL_WAIT);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_evidence_wait_is_pending_for_test(&self) -> bool {
-        self.install_evidence_wait_started_at.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn foreground_owns_pg_for_test(&self, pg_id: PgId) -> bool {
-        self.in_flight.contains_key(&pg_id)
-            || self
-                .pending_transfers
-                .iter()
-                .any(|job| job.work().pg_id() == pg_id)
-            || self
-                .prepared_for_authorization
-                .iter()
-                .any(|owner| owner.work().pg_id() == pg_id)
-            || self
-                .staged_for_install
-                .iter()
-                .any(|owner| owner.work().pg_id() == pg_id)
-            || self
-                .ready_for_activation
-                .iter()
-                .any(|owner| owner.work().pg_id() == pg_id)
-            || self.activation_replays.iter().any(|replay| {
-                replay
-                    .owners
-                    .iter()
-                    .any(|owner| owner.work().pg_id() == pg_id)
-            })
-            || self
-                .tombstoned_for_finalization
-                .iter()
-                .any(|owner| owner.work().pg_id() == pg_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pg_is_deferred_for_test(&self, pg_id: PgId) -> bool {
-        self.deferred
-            .keys()
-            .any(|(candidate, _, _)| *candidate == pg_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_authorization_response_for_test(&mut self) {
-        self.next_authorization_response_error = Some(ControlPlaneError::RpcUnconfirmed {
-            message: "injected staging authorization response loss".to_owned(),
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reject_next_authorization_response_for_test(&mut self) {
-        self.next_authorization_response_error = Some(ControlPlaneError::CommandDecode {
-            message: "injected definitive staging authorization rejection".to_owned(),
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_install_response_for_test(&mut self) {
-        self.next_install_response_error = Some(ControlPlaneError::RpcUnconfirmed {
-            message: "injected destination installation response loss".to_owned(),
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_response_failure_is_pending_for_test(&self) -> bool {
-        self.next_install_response_error.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_activation_response_for_test(&mut self) {
-        self.next_activation_response_error = Some(ControlPlaneError::RpcUnconfirmed {
-            message: "injected activation response loss".to_owned(),
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn activation_response_failure_is_pending_for_test(&self) -> bool {
-        self.next_activation_response_error.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reject_next_install_preparation_for_test(&mut self) {
-        self.next_install_preparation_rejection = Some(ControlPlaneError::CommandDecode {
-            message: "injected stale destination installation member".to_owned(),
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn defer_next_finalization_for_test(&mut self) {
-        self.next_finalization_error = Some(ControlPlaneError::CommandDecode {
-            message: "injected missing staging tombstone evidence".to_owned(),
-        });
     }
 
     fn record_diagnostic(&mut self, diagnostic: String) {
@@ -955,215 +234,110 @@ impl UnavailablePgReconciliationWorker {
         self.last_diagnostic = None;
     }
 
-    fn dispatch(&mut self, job: TransferJob) {
-        let work = job.work().clone();
+    fn dispatch(&mut self, work: UnavailablePgReconciliationWork) {
         let pg_id = work.pg_id();
-        assert!(
-            !self.in_flight.contains_key(&pg_id),
-            "unavailable PG reconciliation dispatched duplicate PG work"
-        );
-        match self.work_tx.try_send(job) {
+        if self.in_flight.contains_key(&pg_id) {
+            return;
+        }
+        if work.stage() == UnavailablePgReconciliationStage::PayloadReadiness {
+            self.in_flight.insert(pg_id, work.clone());
+            observability::record_unavailable_pg_reconciliation_dispatch();
+            observability::set_unavailable_pg_reconciliation_in_flight(self.in_flight.len());
+            self.ready_to_complete.push_back(work);
+            self.clear_diagnostic();
+            return;
+        }
+        match self.work_tx.try_send(work.clone()) {
             Ok(()) => {
                 self.in_flight.insert(pg_id, work);
+                observability::record_unavailable_pg_reconciliation_dispatch();
+                observability::set_unavailable_pg_reconciliation_in_flight(self.in_flight.len());
                 self.clear_diagnostic();
             }
-            Err(TrySendError::Full(_)) => {
-                panic!("unavailable PG reconciliation transfer queue exceeded its bound")
+            Err(error) => {
+                self.record_diagnostic(format!("transfer worker is unavailable: {error}"));
+                self.authority_retry_not_before = Instant::now() + self.retry_backoff;
             }
-            Err(TrySendError::Disconnected(_)) => {
-                panic!("unavailable PG reconciliation transfer workers terminated unexpectedly")
-            }
-        }
-    }
-
-    fn dispatch_pending_transfers(&mut self) {
-        while self.in_flight.len() < TRANSFER_WORKER_COUNT {
-            let Some(mut job) = self.pending_transfers.pop_front() else {
-                break;
-            };
-            if job.requires_artifact_memory() && job.artifact_memory.is_none() {
-                let Some(reservation) = self.artifact_memory_budget.try_reserve() else {
-                    self.pending_transfers.push_front(job);
-                    break;
-                };
-                job.artifact_memory = Some(reservation);
-            }
-            self.dispatch(job);
         }
     }
 
     fn defer(&mut self, work: &UnavailablePgReconciliationWork) {
+        observability::record_unavailable_pg_reconciliation_deferred();
         self.deferred.insert(
-            reconciliation_retry_key(work),
-            Instant::now() + self.retry_backoff,
+            work.pg_id(),
+            (work.transition_epoch(), Instant::now() + self.retry_backoff),
         );
     }
 
-    fn retain_activation_retry(&mut self, owners: Vec<ActivationOwner>) {
-        let retry_not_before = Instant::now() + self.retry_backoff;
-        for owner in &owners {
-            self.deferred
-                .insert(reconciliation_retry_key(owner.work()), retry_not_before);
-        }
-        self.ready_for_activation.extend(owners);
+    fn defer_completion(&mut self, work: UnavailablePgReconciliationWork) {
+        debug_assert_eq!(
+            work.stage(),
+            UnavailablePgReconciliationStage::PayloadReadiness
+        );
+        self.defer(&work);
+        self.completion_retries
+            .insert(work.pg_id(), (work, Instant::now() + self.retry_backoff));
     }
 
-    fn retain_activation_replay(&mut self, owners: Vec<ActivationOwner>) {
-        debug_assert!(!owners.is_empty());
-        debug_assert!(owners.len() <= MAX_UNAVAILABLE_PG_TRANSITION_BATCH);
-        let mut pg_ids = BTreeSet::new();
-        debug_assert!(owners
-            .iter()
-            .all(|owner| pg_ids.insert(owner.work().pg_id())));
-        let retry_not_before = Instant::now() + self.retry_backoff;
-        for owner in &owners {
-            self.deferred
-                .insert(reconciliation_retry_key(owner.work()), retry_not_before);
+    fn promote_due_completion_retries(&mut self, limit: usize) {
+        if limit == 0 {
+            return;
         }
-        self.activation_replays.push_back(RetainedActivationReplay {
-            owners,
-            retry_not_before,
-        });
-    }
-
-    fn take_due_activation_replay(&mut self) -> Option<RetainedActivationReplay> {
-        let replay = self.activation_replays.front()?;
-        if Instant::now() < replay.retry_not_before {
-            return None;
-        }
-        let replay = self
-            .activation_replays
-            .pop_front()
-            .expect("activation replay front disappeared");
-        for owner in &replay.owners {
-            self.deferred
-                .remove(&reconciliation_retry_key(owner.work()));
-        }
-        Some(replay)
-    }
-
-    fn take_ready_activation_batch(&mut self) -> Vec<ActivationOwner> {
         let now = Instant::now();
-        let mut eligible = Vec::new();
-        let mut waiting = Vec::new();
-        let mut selected_pg_ids = BTreeSet::new();
-        for owner in std::mem::take(&mut self.ready_for_activation) {
-            let key = reconciliation_retry_key(owner.work());
-            if self
-                .deferred
-                .get(&key)
-                .is_some_and(|retry_not_before| now < *retry_not_before)
-                || eligible.len() == MAX_UNAVAILABLE_PG_TRANSITION_BATCH
-                || !selected_pg_ids.insert(owner.work().pg_id())
-            {
-                waiting.push(owner);
-            } else {
-                self.deferred.remove(&key);
-                eligible.push(owner);
-            }
+        let mut due = self
+            .completion_retries
+            .iter()
+            .filter_map(|(pg_id, (_, retry_not_before))| {
+                (*retry_not_before <= now).then_some(*pg_id)
+            })
+            .collect::<Vec<_>>();
+        if let Some(cursor) = self.completion_retry_cursor {
+            let split = due.partition_point(|pg_id| *pg_id <= cursor);
+            due.rotate_left(split);
         }
-        self.ready_for_activation = waiting;
-        eligible
+        due.truncate(limit);
+        for pg_id in due {
+            let Some((work, _)) = self.completion_retries.remove(&pg_id) else {
+                continue;
+            };
+            self.completion_retry_cursor = Some(pg_id);
+            if self.in_flight.contains_key(&pg_id) {
+                self.completion_retries.insert(pg_id, (work, now));
+                continue;
+            }
+            self.deferred.remove(&pg_id);
+            self.in_flight.insert(pg_id, work.clone());
+            observability::record_unavailable_pg_reconciliation_dispatch();
+            observability::set_unavailable_pg_reconciliation_in_flight(self.in_flight.len());
+            self.ready_to_complete.push_back(work);
+        }
     }
 
     fn candidate_is_deferred_or_blocked(&mut self, work: &UnavailablePgReconciliationWork) -> bool {
-        let key = reconciliation_retry_key(work);
-        if self.blocked.contains(&key) {
-            return true;
-        }
-        let Some(retry_not_before) = self.deferred.get(&key).copied() else {
-            return false;
-        };
-        if Instant::now() < retry_not_before {
-            return true;
-        }
-        self.deferred.remove(&key);
-        false
-    }
-
-    fn clear_work_retry_state(&mut self, work: &UnavailablePgReconciliationWork) {
         let pg_id = work.pg_id();
         let transition_epoch = work.transition_epoch();
-        self.deferred
-            .retain(|(candidate_pg_id, candidate_epoch, _), _| {
-                *candidate_pg_id != pg_id || *candidate_epoch != transition_epoch
-            });
-        self.blocked
-            .retain(|(candidate_pg_id, candidate_epoch, _)| {
-                *candidate_pg_id != pg_id || *candidate_epoch != transition_epoch
-            });
-    }
-
-    fn select_reconciliation_work(
-        &mut self,
-        primary: Vec<UnavailablePgReconciliationWork>,
-        cleanup_fallbacks: Vec<UnavailablePgReconciliationWork>,
-        rejected_pg_ids: &[PgId],
-    ) -> Vec<UnavailablePgReconciliationWork> {
-        let mut cleanup_fallbacks = cleanup_fallbacks
-            .into_iter()
-            .map(|work| (work.pg_id(), work))
-            .collect::<BTreeMap<_, _>>();
-        let mut selected = Vec::with_capacity(primary.len() + rejected_pg_ids.len());
-        for primary in primary {
-            if self.foreground_owns_transition(&primary)
-                || self.candidate_is_deferred_or_blocked(&primary)
-            {
-                if let Some(cleanup) = cleanup_fallbacks.remove(&primary.pg_id()) {
-                    if !self.foreground_owns_transition(&cleanup)
-                        && !self.candidate_is_deferred_or_blocked(&cleanup)
-                    {
-                        selected.push(cleanup);
-                    }
-                }
-            } else {
-                cleanup_fallbacks.remove(&primary.pg_id());
-                selected.push(primary);
-            }
+        if self
+            .blocked
+            .get(&pg_id)
+            .is_some_and(|blocked_epoch| *blocked_epoch == transition_epoch)
+        {
+            return true;
         }
-        for pg_id in rejected_pg_ids {
-            if let Some(cleanup) = cleanup_fallbacks.remove(pg_id) {
-                if !self.foreground_owns_transition(&cleanup)
-                    && !self.candidate_is_deferred_or_blocked(&cleanup)
-                {
-                    selected.push(cleanup);
-                }
+        self.blocked.remove(&pg_id);
+        if let Some((retained, _)) = self.completion_retries.get(&pg_id) {
+            if retained.transition_epoch() == transition_epoch {
+                return true;
             }
+            self.completion_retries.remove(&pg_id);
         }
-        selected
-    }
-
-    fn foreground_owns_transition(&self, work: &UnavailablePgReconciliationWork) -> bool {
-        let owns_transition = |owned: &UnavailablePgReconciliationWork| {
-            owned.pg_id() == work.pg_id() && owned.transition_epoch() == work.transition_epoch()
+        let Some((deferred_epoch, retry_not_before)) = self.deferred.get(&pg_id).copied() else {
+            return false;
         };
-        self.in_flight.values().any(owns_transition)
-            || self
-                .pending_transfers
-                .iter()
-                .any(|job| owns_transition(job.work()))
-            || self
-                .prepared_for_authorization
-                .iter()
-                .any(|owner| owns_transition(owner.work()))
-            || self
-                .staged_for_install
-                .iter()
-                .any(|owner| owns_transition(owner.work()))
-            || self
-                .ready_for_activation
-                .iter()
-                .any(|owner| owns_transition(owner.work()))
-            || self.activation_replays.iter().any(|replay| {
-                replay
-                    .owners
-                    .iter()
-                    .any(|owner| owns_transition(owner.work()))
-            })
-            || self
-                .tombstoned_for_finalization
-                .iter()
-                .any(|owner| owns_transition(owner.work()))
+        if deferred_epoch == transition_epoch && Instant::now() < retry_not_before {
+            return true;
+        }
+        self.deferred.remove(&pg_id);
+        false
     }
 
     fn receive_completion(&mut self) {
@@ -1172,833 +346,212 @@ impl UnavailablePgReconciliationWorker {
                 Ok(event) => event,
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
+                    observability::record_unavailable_pg_reconciliation_fatal();
                     panic!("unavailable PG reconciliation transfer workers terminated unexpectedly")
                 }
             };
-            let completion = match event {
-                TransferWorkerEvent::Completed(completion) => *completion,
-                TransferWorkerEvent::Panicked => {
-                    panic!("unavailable PG reconciliation transfer worker terminated unexpectedly")
-                }
+            let TransferEvent::Completed {
+                work,
+                result,
+                elapsed,
+            } = event
+            else {
+                observability::record_unavailable_pg_reconciliation_fatal();
+                panic!("unavailable PG reconciliation transfer worker panicked")
             };
-            let retained = self
-                .in_flight
-                .remove(&completion.work.pg_id())
-                .expect("transfer worker returned work that was not in flight");
+            observability::record_unavailable_pg_reconciliation_transfer(elapsed, result.is_ok());
+            let pg_id = work.pg_id();
             assert_eq!(
-                retained, completion.work,
+                self.in_flight.get(&pg_id),
+                Some(&work),
                 "transfer worker returned a result for a different transition"
             );
-            match completion.result {
-                Ok(TransferOutcome::LegacyReady) => {
-                    self.ready_for_activation
-                        .push(ActivationOwner::Legacy(completion.work));
-                    self.clear_diagnostic();
-                }
-                Ok(TransferOutcome::Prepared(prepared, artifact_memory)) => {
-                    self.prepared_for_authorization
-                        .push(RetainedPreparedTransfer {
-                            transfer: prepared,
-                            artifact_memory,
-                        });
-                    self.clear_diagnostic();
-                }
-                Ok(TransferOutcome::Authorized(authorized, artifact_memory)) => {
-                    self.pending_transfers
-                        .push_front(TransferJob::with_artifact_memory(
-                            TransferOperation::Stage(authorized),
-                            artifact_memory,
-                        ));
-                    self.clear_diagnostic();
-                }
-                Ok(TransferOutcome::ReadyInstall(staged)) => {
-                    self.staged_for_install.push(staged);
-                    self.clear_diagnostic();
-                }
-                Ok(TransferOutcome::ReadyImport(staged)) => {
-                    self.pending_transfers
-                        .push_front(TransferJob::new(TransferOperation::Import(staged)));
-                    self.clear_diagnostic();
-                }
-                Ok(TransferOutcome::ReadyCleanup(staged, snapshot)) => {
-                    self.pending_transfers.push_front(TransferJob::new(
-                        TransferOperation::Tombstone(staged, snapshot),
-                    ));
-                    self.clear_diagnostic();
-                }
-                Ok(TransferOutcome::Imported(staged)) => {
-                    self.ready_for_activation
-                        .push(ActivationOwner::Staged(Box::new(staged)));
-                    self.clear_diagnostic();
-                }
-                Ok(TransferOutcome::Tombstoned(tombstoned)) => {
-                    self.tombstoned_for_finalization.push(tombstoned);
+            match result {
+                Ok(()) => {
+                    self.ready_to_complete.push_back(
+                        work.with_stage(UnavailablePgReconciliationStage::PayloadReadiness),
+                    );
                     self.clear_diagnostic();
                 }
                 Err(error) => {
                     let fatal = error.is_fatal();
                     let diagnostic = error.diagnostic();
                     if fatal {
+                        observability::record_unavailable_pg_reconciliation_fatal();
                         eprintln!(
                             "unavailable PG reconciliation blocked by fatal transfer error: {diagnostic}"
                         );
-                        self.blocked
-                            .insert(reconciliation_retry_key(&completion.work));
+                        self.blocked.insert(pg_id, work.transition_epoch());
                     } else {
                         self.record_diagnostic(diagnostic);
-                        self.defer(&completion.work);
-                    }
-                }
-            }
-        }
-    }
-
-    fn record_completion_error(
-        &mut self,
-        work: &UnavailablePgReconciliationWork,
-        error: ControlPlaneError,
-    ) {
-        let diagnostic = error.to_string();
-        if reconciliation_completion_error_is_fatal(&error) {
-            eprintln!("unavailable PG reconciliation blocked by fatal error: {diagnostic}");
-            self.blocked.insert(reconciliation_retry_key(work));
-        } else {
-            self.record_diagnostic(diagnostic);
-            self.defer(work);
-        }
-    }
-
-    fn complete_ready_batch(
-        &mut self,
-        authority: &mut impl ReconciliationAuthority,
-        mut owners: Vec<ActivationOwner>,
-        now_ms: u64,
-        retained_replay: bool,
-    ) {
-        if owners.is_empty() {
-            return;
-        }
-        owners.sort_by_key(|owner| owner.work().pg_id());
-        let work = owners
-            .iter()
-            .map(|owner| owner.work().clone())
-            .collect::<Vec<_>>();
-        let started_at = Instant::now();
-        let result = authority.complete_reconciliation_batch(&work, now_ms);
-        #[cfg(test)]
-        let result = if result.is_ok() {
-            self.next_activation_response_error
-                .take()
-                .map_or(result, Err)
-        } else {
-            result
-        };
-        match result {
-            Ok(UnavailablePgReconciliationCompletionAttempt::Classified(outcome)) => {
-                let mut metric_outcome = observability::UnavailablePgWorkerStageOutcome::Succeeded;
-                let mut retry_owners = Vec::new();
-                let mut owners = owners
-                    .into_iter()
-                    .map(|owner| (owner.work().pg_id(), owner))
-                    .collect::<BTreeMap<_, _>>();
-                for work in outcome.completed {
-                    self.clear_work_retry_state(&work);
-                    match owners.remove(&work.pg_id()) {
-                        Some(ActivationOwner::Staged(staged)) => {
-                            self.pending_transfers.push_back(TransferJob::new(
-                                TransferOperation::Tombstone(
-                                    (*staged).into_cleanup(),
-                                    Box::new(outcome.snapshot.clone()),
-                                ),
-                            ));
-                        }
-                        Some(ActivationOwner::Legacy(_)) => {}
-                        None => panic!(
-                            "activation batch completed work without retained transfer ownership"
-                        ),
-                    }
-                }
-                for (work, error) in outcome.rejected {
-                    let owner = owners.remove(&work.pg_id());
-                    if reconciliation_completion_error_is_fatal(&error) {
-                        metric_outcome = observability::UnavailablePgWorkerStageOutcome::Fatal;
-                        self.record_completion_error(&work, error);
-                    } else {
-                        if metric_outcome != observability::UnavailablePgWorkerStageOutcome::Fatal {
-                            metric_outcome =
-                                observability::UnavailablePgWorkerStageOutcome::Deferred;
-                        }
-                        self.record_diagnostic(error.to_string());
-                        if let Some(owner) = owner {
-                            retry_owners.push(owner);
-                        }
-                    }
-                }
-                if !outcome.rederive.is_empty()
-                    && metric_outcome != observability::UnavailablePgWorkerStageOutcome::Fatal
-                {
-                    metric_outcome = observability::UnavailablePgWorkerStageOutcome::Deferred;
-                }
-                for work in outcome.rederive {
-                    if let Some(owner) = owners.remove(&work.pg_id()) {
-                        retry_owners.push(owner);
-                    } else {
                         self.defer(&work);
                     }
-                }
-                if !owners.is_empty()
-                    && metric_outcome != observability::UnavailablePgWorkerStageOutcome::Fatal
-                {
-                    metric_outcome = observability::UnavailablePgWorkerStageOutcome::Deferred;
-                }
-                for (_, owner) in owners {
-                    retry_owners.push(owner);
-                }
-                if !retry_owners.is_empty() {
-                    self.retain_activation_retry(retry_owners);
-                }
-                if metric_outcome == observability::UnavailablePgWorkerStageOutcome::Succeeded {
-                    self.clear_diagnostic();
-                }
-                record_worker_stage_outcome(
-                    observability::UnavailablePgWorkerStage::Activation,
-                    started_at,
-                    metric_outcome,
-                );
-            }
-            Ok(UnavailablePgReconciliationCompletionAttempt::Unconfirmed(outcome)) => {
-                self.handle_unconfirmed_completion(owners, outcome, started_at);
-            }
-            Err(error) => {
-                let diagnostic = error.to_string();
-                let fatal = reconciliation_completion_error_is_fatal(&error);
-                if fatal {
-                    for owner in owners {
-                        let work = owner.work();
-                        self.blocked.insert(reconciliation_retry_key(work));
-                    }
-                } else if retained_replay || error.is_unconfirmed_control_plane_mutation() {
-                    self.retain_activation_replay(owners);
-                } else {
-                    self.retain_activation_retry(owners);
-                }
-                if fatal {
-                    eprintln!(
-                        "unavailable PG reconciliation batch blocked by fatal error: {diagnostic}"
+                    self.in_flight.remove(&pg_id);
+                    observability::set_unavailable_pg_reconciliation_in_flight(
+                        self.in_flight.len(),
                     );
-                } else {
-                    self.record_diagnostic(diagnostic);
-                }
-                record_worker_stage_outcome(
-                    observability::UnavailablePgWorkerStage::Activation,
-                    started_at,
-                    if fatal {
-                        observability::UnavailablePgWorkerStageOutcome::Fatal
-                    } else {
-                        observability::UnavailablePgWorkerStageOutcome::Deferred
-                    },
-                );
-            }
-        }
-    }
-
-    fn handle_unconfirmed_completion(
-        &mut self,
-        owners: Vec<ActivationOwner>,
-        outcome: UnconfirmedUnavailablePgReconciliationCompletionBatch,
-        started_at: Instant,
-    ) {
-        let UnconfirmedUnavailablePgReconciliationCompletionBatch {
-            already_completed,
-            submitted,
-            rejected,
-            rederive,
-            error,
-        } = outcome;
-        let mut owners = owners
-            .into_iter()
-            .map(|owner| (owner.work().pg_id(), owner))
-            .collect::<BTreeMap<_, _>>();
-        let mut retry_owners = Vec::new();
-        let mut replay_owners = Vec::with_capacity(submitted.len());
-        let mut metric_outcome = observability::UnavailablePgWorkerStageOutcome::Deferred;
-
-        for work in already_completed {
-            if let Some(owner) = owners.remove(&work.pg_id()) {
-                retry_owners.push(owner);
-            }
-        }
-        for work in submitted {
-            if let Some(owner) = owners.remove(&work.pg_id()) {
-                replay_owners.push(owner);
-            }
-        }
-        for (work, rejection) in rejected {
-            let owner = owners.remove(&work.pg_id());
-            if reconciliation_completion_error_is_fatal(&rejection) {
-                metric_outcome = observability::UnavailablePgWorkerStageOutcome::Fatal;
-                self.record_completion_error(&work, rejection);
-            } else {
-                self.record_diagnostic(rejection.to_string());
-                if let Some(owner) = owner {
-                    retry_owners.push(owner);
-                }
-            }
-        }
-        for work in rederive {
-            if let Some(owner) = owners.remove(&work.pg_id()) {
-                retry_owners.push(owner);
-            } else {
-                self.defer(&work);
-            }
-        }
-        retry_owners.extend(owners.into_values());
-        if !replay_owners.is_empty() {
-            self.retain_activation_replay(replay_owners);
-        }
-        if !retry_owners.is_empty() {
-            self.retain_activation_retry(retry_owners);
-        }
-        self.record_diagnostic(error.to_string());
-        record_worker_stage_outcome(
-            observability::UnavailablePgWorkerStage::Activation,
-            started_at,
-            metric_outcome,
-        );
-    }
-
-    fn authorize_prepared_batch(&mut self, authority: &mut impl ReconciliationAuthority) {
-        let mut prepared = std::mem::take(&mut self.prepared_for_authorization);
-        if prepared.is_empty() {
-            return;
-        }
-        prepared.sort_by_key(|owner| owner.work().pg_id());
-        let requests = prepared
-            .iter()
-            .map(|owner| owner.transfer.authorization_request())
-            .collect::<Vec<_>>();
-        let started_at = Instant::now();
-        let authorization_result = authority.authorize_staging_batch(&requests);
-        #[cfg(test)]
-        let authorization_result = if authorization_result.is_ok() {
-            self.next_authorization_response_error
-                .take()
-                .map_or(authorization_result, Err)
-        } else {
-            authorization_result
-        };
-        record_authority_stage_result(
-            observability::UnavailablePgWorkerStage::Authorization,
-            started_at,
-            &authorization_result,
-        );
-        match authorization_result {
-            Ok(snapshot) => {
-                for owner in prepared {
-                    let work = owner.work().clone();
-                    match owner.transfer.bind_committed_authorization(&snapshot) {
-                        Ok(authorized) => {
-                            self.pending_transfers
-                                .push_front(TransferJob::with_artifact_memory(
-                                    TransferOperation::Stage(authorized),
-                                    owner.artifact_memory,
-                                ))
-                        }
-                        Err(error) => self.record_transfer_error(work, error),
-                    }
-                }
-            }
-            Err(error) => {
-                if reconciliation_completion_error_is_fatal(&error) {
-                    self.record_authority_batch_error(
-                        prepared.into_iter().map(|owner| owner.work().clone()),
-                        error,
-                        "staging authorization",
-                    );
-                } else {
-                    for owner in &prepared {
-                        self.defer(owner.work());
-                    }
-                    self.record_diagnostic(format!(
-                        "unavailable PG staging authorization deferred: {error}"
-                    ));
                 }
             }
         }
     }
 
-    fn install_staged_batch(&mut self, authority: &mut impl ReconciliationAuthority) {
-        let mut staged = std::mem::take(&mut self.staged_for_install);
-        if staged.is_empty() {
-            self.install_evidence_wait_started_at = None;
-            return;
-        }
-        staged.sort_by_key(|owner| owner.work().pg_id());
-        let snapshot = match authority.reconciliation_snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.install_evidence_wait_started_at = None;
-                self.record_authority_batch_error(
-                    staged.into_iter().map(|owner| owner.work().clone()),
-                    error,
-                    "destination installation snapshot",
-                );
-                return;
-            }
-        };
-        let target_epoch = match snapshot.next_cluster_epoch() {
-            Ok(target_epoch) => target_epoch,
-            Err(error) => {
-                self.install_evidence_wait_started_at = None;
-                self.record_authority_batch_error(
-                    staged.into_iter().map(|owner| owner.work().clone()),
-                    error,
-                    "destination installation epoch",
-                );
-                return;
-            }
-        };
-        let mut ready = Vec::new();
-        for owner in staged {
-            match snapshot.committed_unavailable_pg_staged_transfer_if_present(owner.work()) {
-                Ok(Some(_)) => {
-                    self.pending_transfers.push_front(TransferJob::new(
-                        TransferOperation::ResumeInstalled(
-                            owner.work().clone(),
-                            Box::new(snapshot.clone()),
-                        ),
-                    ));
-                }
-                Ok(None) if owner.target_epoch() == target_epoch => ready.push(owner),
-                Ok(None) => {
-                    self.pending_transfers
-                        .push_front(TransferJob::new(TransferOperation::Rebase(
-                            owner,
-                            target_epoch,
-                        )));
-                }
-                Err(error) => self.record_completion_error(owner.work(), error),
-            }
-        }
-        if ready.is_empty() {
-            self.install_evidence_wait_started_at = None;
-            return;
-        }
-        let requests = ready
-            .iter()
-            .map(StagedUnavailablePgMetadataTransfer::install_request)
-            .collect::<Vec<_>>();
-        let prepared = match snapshot
-            .prepare_unavailable_pg_placement_install_batch(&requests, target_epoch)
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.install_evidence_wait_started_at = None;
-                self.record_authority_batch_error(
-                    ready.into_iter().map(|owner| owner.work().clone()),
-                    error,
-                    "destination installation preparation",
-                );
-                return;
-            }
-        };
-        #[cfg(test)]
-        let mut prepared = prepared;
-        #[cfg(test)]
-        if let Some(error) = self.next_install_preparation_rejection.take() {
-            if !prepared.included.is_empty() {
-                let rejected = prepared.included.remove(0);
-                let mut existing_rejections = std::mem::take(&mut prepared.rejected);
-                if prepared.included.is_empty() {
-                    prepared.command = None;
-                } else {
-                    prepared = snapshot
-                        .prepare_unavailable_pg_placement_install_batch(
-                            &prepared.included,
-                            target_epoch,
-                        )
-                        .expect("test install-preparation remainder must remain valid");
-                }
-                existing_rejections.append(&mut prepared.rejected);
-                prepared.rejected = existing_rejections;
-                prepared.rejected.push((rejected, error));
-            }
-        }
-        let mut owners = ready
-            .into_iter()
-            .map(|owner| (owner.work().pg_id(), owner))
-            .collect::<BTreeMap<_, _>>();
-        let mut awaiting_publication = Vec::new();
-        for (request, error) in prepared.rejected {
-            let pg_id = request.unavailable_transition.pg_id();
-            let owner = owners
-                .remove(&pg_id)
-                .expect("install preparation rejected an unknown staged owner");
-            if !reconciliation_completion_error_is_fatal(&error)
-                && snapshot.unavailable_pg_install_awaits_publication(&request)
-            {
-                awaiting_publication.push(owner);
-            } else if reconciliation_completion_error_is_fatal(&error) {
-                self.record_completion_error(owner.work(), error);
-            } else {
-                self.record_diagnostic(error.to_string());
-                self.defer(owner.work());
-            }
-        }
-        let included_pg_ids = prepared
-            .included
-            .iter()
-            .map(|request| request.unavailable_transition.pg_id())
-            .collect::<Vec<_>>();
-        let included = included_pg_ids
-            .iter()
-            .map(|pg_id| {
-                owners
-                    .remove(pg_id)
-                    .expect("install preparation included an unknown staged owner")
-            })
-            .collect::<Vec<_>>();
-        self.staged_for_install.extend(owners.into_values());
-        if !awaiting_publication.is_empty() {
-            let started_at = self
-                .install_evidence_wait_started_at
-                .get_or_insert_with(Instant::now);
-            if started_at.elapsed() < STAGING_EVIDENCE_INSTALL_WAIT {
-                self.staged_for_install.extend(included);
-                self.staged_for_install.extend(awaiting_publication);
-                return;
-            }
-            for owner in awaiting_publication {
-                self.defer(owner.work());
-            }
-        }
-        self.install_evidence_wait_started_at = None;
-        if prepared.command.is_none() {
-            return;
-        }
-        let started_at = Instant::now();
-        let install_result = authority.install_staged_batch(&prepared.included, target_epoch);
-        #[cfg(test)]
-        let install_result = if install_result.is_ok() {
-            self.next_install_response_error
-                .take()
-                .map_or(install_result, Err)
-        } else {
-            install_result
-        };
-        record_authority_stage_result(
-            observability::UnavailablePgWorkerStage::Install,
-            started_at,
-            &install_result,
-        );
-        match install_result {
-            Ok(_) => {
-                for owner in included {
-                    self.pending_transfers
-                        .push_front(TransferJob::new(TransferOperation::Import(owner)));
-                }
-            }
-            Err(error) => {
-                if reconciliation_completion_error_is_fatal(&error) {
-                    self.record_authority_batch_error(
-                        included.into_iter().map(|owner| owner.work().clone()),
-                        error,
-                        "destination installation",
-                    );
-                } else if error.is_unconfirmed_control_plane_mutation() {
-                    self.staged_for_install.extend(included);
-                    self.authority_retry_not_before = Instant::now() + self.retry_backoff;
-                    self.record_diagnostic(format!(
-                        "unavailable PG destination installation outcome is unconfirmed: {error}"
-                    ));
-                } else {
-                    for owner in &included {
-                        self.defer(owner.work());
-                    }
-                    self.record_diagnostic(format!(
-                        "unavailable PG destination installation deferred: {error}"
-                    ));
-                }
-            }
-        }
-    }
-
-    fn finalize_tombstoned(&mut self, authority: &mut impl ReconciliationAuthority) {
-        let tombstoned = std::mem::take(&mut self.tombstoned_for_finalization);
-        for owner in tombstoned {
-            let work = owner.work().clone();
-            let started_at = Instant::now();
-            #[cfg(test)]
-            let result = if let Some(error) = self.next_finalization_error.take() {
-                Err(error)
-            } else {
-                authority.finalize_staging_generation(owner.cleanup_request().clone())
-            };
-            #[cfg(not(test))]
-            let result = authority.finalize_staging_generation(owner.cleanup_request().clone());
-            record_authority_stage_result(
-                observability::UnavailablePgWorkerStage::Finalization,
-                started_at,
-                &result,
-            );
-            match result {
-                Ok(_) => {
-                    self.clear_work_retry_state(&work);
-                    self.clear_diagnostic();
-                }
-                Err(error) if reconciliation_completion_error_is_fatal(&error) => {
-                    eprintln!(
-                        "unavailable PG staging finalization blocked by fatal error: {error}"
-                    );
-                    self.blocked.insert(reconciliation_retry_key(&work));
-                }
-                Err(error) => {
-                    self.record_diagnostic(error.to_string());
-                    self.defer(&work);
-                }
-            }
-        }
-    }
-
-    fn record_transfer_error(
-        &mut self,
-        work: UnavailablePgReconciliationWork,
-        error: crate::LivePgMetadataTransferError,
-    ) {
-        let error = reconciliation_transfer_error(error);
-        let fatal = error.is_fatal();
-        let diagnostic = error.diagnostic();
-        if fatal {
-            eprintln!(
-                "unavailable PG reconciliation blocked by fatal transfer error: {diagnostic}"
-            );
-            self.blocked.insert(reconciliation_retry_key(&work));
-        } else {
-            self.record_diagnostic(diagnostic);
-            self.defer(&work);
-        }
-    }
-
-    fn record_authority_batch_error(
-        &mut self,
-        work: impl IntoIterator<Item = UnavailablePgReconciliationWork>,
-        error: ControlPlaneError,
-        operation: &str,
-    ) {
-        let fatal = reconciliation_completion_error_is_fatal(&error);
-        let diagnostic = format!("unavailable PG {operation} deferred: {error}");
-        for work in work {
-            if fatal {
-                self.blocked.insert(reconciliation_retry_key(&work));
-            } else {
-                self.defer(&work);
-            }
-        }
-        if fatal {
-            eprintln!("unavailable PG {operation} blocked by fatal error: {error}");
-        } else {
-            self.record_diagnostic(diagnostic);
-        }
-    }
-
-    fn poll(
+    fn complete_ready(
         &mut self,
         authority: &mut impl ReconciliationAuthority,
         now_ms: u64,
-    ) -> Result<(), ControlPlaneError> {
-        self.poll_reconciliation(authority, now_ms);
-        let result = self.poll_staging_maintenance(authority);
-        self.record_queue_metrics();
-        result
+        remaining_attempts: &mut usize,
+    ) {
+        while *remaining_attempts > 0 {
+            let Some(work) = self.ready_to_complete.pop_front() else {
+                break;
+            };
+            *remaining_attempts -= 1;
+            match authority.complete_reconciliation(&work, now_ms) {
+                Ok(_) => {
+                    observability::record_unavailable_pg_reconciliation_completion();
+                    self.deferred.remove(&work.pg_id());
+                    self.completion_retries.remove(&work.pg_id());
+                    self.blocked.remove(&work.pg_id());
+                    self.clear_diagnostic();
+                }
+                Err(error) => {
+                    let diagnostic = error.to_string();
+                    match reconciliation_completion_error_disposition(&error) {
+                        ReconciliationCompletionErrorDisposition::Retry => {
+                            self.record_diagnostic(diagnostic);
+                            self.defer_completion(work.clone());
+                        }
+                        ReconciliationCompletionErrorDisposition::Quarantine => {
+                            observability::record_unavailable_pg_reconciliation_fatal();
+                            eprintln!(
+                                "unavailable PG reconciliation blocked by fatal error: {diagnostic}"
+                            );
+                            self.blocked.insert(work.pg_id(), work.transition_epoch());
+                        }
+                        ReconciliationCompletionErrorDisposition::FailStop => {
+                            observability::record_unavailable_pg_reconciliation_fatal();
+                            panic!("fatal unavailable PG reconciliation completion error: {error}");
+                        }
+                    }
+                }
+            }
+            self.in_flight.remove(&work.pg_id());
+            observability::set_unavailable_pg_reconciliation_in_flight(self.in_flight.len());
+        }
     }
 
-    fn poll_reconciliation(&mut self, authority: &mut impl ReconciliationAuthority, now_ms: u64) {
-        self.observe_transfer_workers();
+    fn poll(&mut self, authority: &mut impl ReconciliationAuthority, now_ms: u64) {
+        self.observe_transfer_worker();
+        let mut completion_attempts = MAX_COMPLETION_ATTEMPTS_PER_POLL;
+        let retry_slots = completion_attempts.saturating_sub(self.ready_to_complete.len());
+        self.promote_due_completion_retries(retry_slots);
+        self.complete_ready(authority, now_ms, &mut completion_attempts);
         if Instant::now() < self.authority_retry_not_before {
             return;
         }
-        // Authorization is epoch-neutral. Publish each byte-bounded preparation
-        // wave to durable destination staging before admitting more artifact
-        // memory, while retaining lightweight receipts for one plural install.
-        if !self.prepared_for_authorization.is_empty() {
-            self.authorize_prepared_batch(authority);
-        }
-        self.dispatch_pending_transfers();
-        if !self.in_flight.is_empty() || !self.pending_transfers.is_empty() {
-            return;
-        }
-        if !self.tombstoned_for_finalization.is_empty() {
-            self.finalize_tombstoned(authority);
-            return;
-        }
-        if !self.staged_for_install.is_empty() {
-            self.install_staged_batch(authority);
-            self.dispatch_pending_transfers();
-            return;
-        }
-        // Replay, ordinary activation, and discovery are independently
-        // retryable. Rotate between them so continuously failing work in two
-        // classes cannot prevent the third class from making progress.
-        for _ in 0..3 {
-            let turn = self.reconciliation_poll_turn;
-            self.reconciliation_poll_turn = turn.next();
-            match turn {
-                ReconciliationPollTurn::ActivationReplay => {
-                    if let Some(replay) = self.take_due_activation_replay() {
-                        self.complete_ready_batch(authority, replay.owners, now_ms, true);
-                        return;
+
+        let mut scan_attempts = 0;
+        while self.in_flight.len() < MAX_CONCURRENT_TRANSFERS
+            && scan_attempts < MAX_SCAN_ATTEMPTS_PER_POLL
+        {
+            scan_attempts += 1;
+            let cursor_before = self.cursor;
+            match authority.poll_reconciliation(&mut self.cursor, now_ms) {
+                Ok(Some(work)) => {
+                    if self.in_flight.contains_key(&work.pg_id())
+                        || self.candidate_is_deferred_or_blocked(&work)
+                    {
+                        continue;
                     }
+                    self.dispatch(work);
                 }
-                ReconciliationPollTurn::OrdinaryActivation => {
-                    let ready = self.take_ready_activation_batch();
-                    if !ready.is_empty() {
-                        self.complete_ready_batch(authority, ready, now_ms, false);
-                        return;
-                    }
-                }
-                ReconciliationPollTurn::Discovery => break,
-            }
-        }
-        match authority.poll_reconciliation_batch(&mut self.cursor, now_ms) {
-            Ok(batch) => {
-                let had_rejections = !batch.rejected.is_empty();
-                let mut rejected_pg_ids = Vec::with_capacity(batch.rejected.len());
-                for (pg_id, error) in batch.rejected {
-                    rejected_pg_ids.push(pg_id);
-                    self.record_diagnostic(format!(
-                        "PG {} begin candidate rejected: {error}",
-                        pg_id.get()
-                    ));
-                }
-                let work = self.select_reconciliation_work(
-                    batch.work,
-                    batch.cleanup_fallbacks,
-                    &rejected_pg_ids,
-                );
-                let had_work = !work.is_empty();
-                let snapshot = if self.staged_protocol && had_work {
-                    match authority.reconciliation_snapshot() {
-                        Ok(snapshot) => Some(snapshot),
-                        Err(error) => {
+                Ok(None) => break,
+                Err(error) => {
+                    let cursor_advanced = self.cursor != cursor_before;
+                    match reconciliation_authority_error_disposition(&error, cursor_advanced) {
+                        ReconciliationAuthorityErrorDisposition::ContinueScan => {
                             self.record_diagnostic(error.to_string());
+                            observability::record_unavailable_pg_reconciliation_deferred();
+                        }
+                        ReconciliationAuthorityErrorDisposition::Backoff => {
+                            self.record_diagnostic(error.to_string());
+                            observability::record_unavailable_pg_reconciliation_deferred();
                             self.authority_retry_not_before = Instant::now() + self.retry_backoff;
-                            return;
+                            break;
                         }
-                    }
-                } else {
-                    None
-                };
-                for work in work {
-                    if self.staged_protocol {
-                        let snapshot = snapshot
-                            .as_ref()
-                            .expect("staged reconciliation snapshot loaded for nonempty work");
-                        match work.stage() {
-                            UnavailablePgReconciliationStage::PayloadReadiness => {
-                                self.pending_transfers.push_back(TransferJob::new(
-                                    TransferOperation::ResumeInstalled(
-                                        work,
-                                        Box::new((*snapshot).clone()),
-                                    ),
-                                ));
-                            }
-                            UnavailablePgReconciliationStage::MetadataTransfer => {
-                                if snapshot
-                                    .committed_unavailable_pg_staging_request(&work)
-                                    .is_ok()
-                                {
-                                    self.pending_transfers.push_back(TransferJob::new(
-                                        TransferOperation::ResumeAuthorized(
-                                            work,
-                                            Box::new((*snapshot).clone()),
-                                        ),
-                                    ));
-                                } else {
-                                    self.pending_transfers.push_back(TransferJob::new(
-                                        TransferOperation::Prepare(work),
-                                    ));
-                                }
-                            }
-                            UnavailablePgReconciliationStage::StagingCleanup => {
-                                self.pending_transfers.push_back(TransferJob::new(
-                                    TransferOperation::ResumeCleanup(
-                                        work,
-                                        Box::new((*snapshot).clone()),
-                                    ),
-                                ));
-                            }
-                        }
-                    } else {
-                        match work.stage() {
-                            UnavailablePgReconciliationStage::PayloadReadiness => {
-                                self.ready_for_activation
-                                    .push(ActivationOwner::Legacy(work));
-                            }
-                            UnavailablePgReconciliationStage::MetadataTransfer => {
-                                self.pending_transfers
-                                    .push_back(TransferJob::new(TransferOperation::Legacy(work)));
-                            }
-                            UnavailablePgReconciliationStage::StagingCleanup => {
-                                panic!("legacy reconciliation cannot own staged cleanup")
-                            }
+                        ReconciliationAuthorityErrorDisposition::FailStop => {
+                            observability::record_unavailable_pg_reconciliation_fatal();
+                            panic!("fatal unavailable PG reconciliation authority error: {error}");
                         }
                     }
                 }
-                self.dispatch_pending_transfers();
-                if self.in_flight.is_empty() && self.pending_transfers.is_empty() {
-                    let ready = self.take_ready_activation_batch();
-                    self.complete_ready_batch(authority, ready, now_ms, false);
-                }
-                if had_rejections && !had_work {
-                    self.authority_retry_not_before = Instant::now() + self.retry_backoff;
-                }
-            }
-            Err(error) => {
-                self.record_diagnostic(error.to_string());
-                self.authority_retry_not_before = Instant::now() + self.retry_backoff;
             }
         }
-    }
-
-    fn poll_staging_maintenance(
-        &mut self,
-        authority: &mut impl ReconciliationAuthority,
-    ) -> Result<(), ControlPlaneError> {
-        if Instant::now() < self.maintenance_retry_not_before {
-            return Ok(());
-        }
-        let result = authority.maintain_outage_command_artifacts().and_then(|_| {
-            authority.maintain_staging_evidence(&mut self.staging_maintenance_cursor)
-        });
-        match result {
-            Ok(_) => {
-                self.last_maintenance_diagnostic = None;
-                Ok(())
-            }
-            Err(error) if staging_maintenance_error_is_retryable(&error) => {
-                let diagnostic = error.to_string();
-                if self.last_maintenance_diagnostic.as_deref() != Some(&diagnostic) {
-                    eprintln!("metadata-transfer staging maintenance deferred: {diagnostic}");
-                    self.last_maintenance_diagnostic = Some(diagnostic);
-                }
-                self.maintenance_retry_not_before = Instant::now() + self.retry_backoff;
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        self.complete_ready(authority, now_ms, &mut completion_attempts);
     }
 }
 
-fn staging_maintenance_error_is_retryable(error: &ControlPlaneError) -> bool {
-    error.is_retryable_staging_evidence_publication_error()
-        || matches!(error, ControlPlaneError::RpcUnconfirmed { .. })
+fn reconciliation_authority_error_disposition(
+    error: &ControlPlaneError,
+    cursor_advanced: bool,
+) -> ReconciliationAuthorityErrorDisposition {
+    if cursor_advanced
+        && matches!(
+            error,
+            ControlPlaneError::CommandDecode { .. }
+                | ControlPlaneError::NodeLeaseExpired { .. }
+                | ControlPlaneError::PgHasNoServingPrimary { .. }
+                | ControlPlaneError::PgPrimaryMissingActiveObservation { .. }
+                | ControlPlaneError::PgPrimaryObservationNotActive { .. }
+                | ControlPlaneError::PgPeeringPendingMetadataCommand { .. }
+        )
+    {
+        return ReconciliationAuthorityErrorDisposition::ContinueScan;
+    }
+    if error.is_retryable_control_plane_rpc_transport_error()
+        || error.is_retryable_authority_clock_wait_error()
         || error.is_retryable_openraft_leadership_error()
+        || matches!(
+            error,
+            ControlPlaneError::AuthorityNotServing
+                | ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority
+                | ControlPlaneError::ControlPlaneReadIndexNotApplied { .. }
+                | ControlPlaneError::RpcUnconfirmed { .. }
+        )
+    {
+        return ReconciliationAuthorityErrorDisposition::Backoff;
+    }
+    ReconciliationAuthorityErrorDisposition::FailStop
 }
 
-fn reconciliation_completion_error_is_fatal(error: &ControlPlaneError) -> bool {
-    matches!(
+fn reconciliation_completion_error_disposition(
+    error: &ControlPlaneError,
+) -> ReconciliationCompletionErrorDisposition {
+    if error.is_retryable_control_plane_rpc_transport_error()
+        || error.is_retryable_authority_clock_wait_error()
+        || error.is_retryable_openraft_leadership_error()
+        || matches!(
+            error,
+            ControlPlaneError::AuthorityNotServing
+                | ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority
+                | ControlPlaneError::ControlPlaneReadIndexNotApplied { .. }
+                | ControlPlaneError::RpcUnconfirmed { .. }
+                | ControlPlaneError::CommandDecode { .. }
+                | ControlPlaneError::NodeLeaseExpired { .. }
+                | ControlPlaneError::PgHasNoServingPrimary { .. }
+                | ControlPlaneError::PgPrimaryMissingActiveObservation { .. }
+                | ControlPlaneError::PgPrimaryObservationNotActive { .. }
+                | ControlPlaneError::PgPeeringPendingMetadataCommand { .. }
+        )
+    {
+        return ReconciliationCompletionErrorDisposition::Retry;
+    }
+    if matches!(
         error,
-        ControlPlaneError::Parse { .. } | ControlPlaneError::AuthorityClockCheckpoint { .. }
+        ControlPlaneError::Io { .. }
+            | ControlPlaneError::RpcRemote { .. }
+            | ControlPlaneError::Parse { .. }
+            | ControlPlaneError::AuthorityClockCheckpoint { .. }
     ) || matches!(
         error,
         ControlPlaneError::RpcProtocol { diagnostic }
@@ -2022,7 +575,10 @@ fn reconciliation_completion_error_is_fatal(error: &ControlPlaneError) -> bool {
                 kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::Fatal,
                 ..
             }
-    )
+    ) {
+        return ReconciliationCompletionErrorDisposition::FailStop;
+    }
+    ReconciliationCompletionErrorDisposition::Quarantine
 }
 
 #[cfg(test)]
@@ -2031,116 +587,114 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex};
 
     use super::*;
+    use crate::control_plane::NodeMembershipState;
     use crate::NodeId;
 
     #[derive(Default)]
     struct FakeAuthority {
         candidates: VecDeque<UnavailablePgReconciliationWork>,
-        poll_batch_size: usize,
+        poll_errors: VecDeque<(ControlPlaneError, bool)>,
         poll_count: usize,
-        maintenance_count: usize,
-        maintenance_results: VecDeque<Result<bool, ControlPlaneError>>,
         published: Vec<UnavailablePgReconciliationWork>,
-        published_batches: Vec<Vec<UnavailablePgReconciliationWork>>,
-        publish_results:
-            VecDeque<Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError>>,
-    }
-
-    #[derive(Default)]
-    struct TransferPoolGate {
-        state: Mutex<(usize, usize, bool)>,
-        changed: Condvar,
-    }
-
-    impl TransferPoolGate {
-        fn release(&self) {
-            let mut state = self.state.lock().unwrap();
-            state.2 = true;
-            self.changed.notify_all();
-        }
-    }
-
-    struct TransferPoolGateRelease(Arc<TransferPoolGate>);
-
-    impl Drop for TransferPoolGateRelease {
-        fn drop(&mut self) {
-            self.0.release();
-        }
+        publish_results: VecDeque<Result<bool, ControlPlaneError>>,
     }
 
     impl ReconciliationAuthority for FakeAuthority {
-        fn reconciliation_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-            Ok(ClusterControlSnapshot::empty())
-        }
-
-        fn poll_reconciliation_batch(
+        fn poll_reconciliation(
             &mut self,
-            _cursor: &mut UnavailablePgReconciliationCursor,
+            cursor: &mut UnavailablePgReconciliationCursor,
             _now_ms: u64,
-        ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
+        ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError> {
             self.poll_count += 1;
-            let batch_size = self.poll_batch_size.max(1);
-            Ok(UnavailablePgReconciliationPollBatch {
-                work: (0..batch_size)
-                    .filter_map(|_| self.candidates.pop_front())
-                    .collect(),
-                cleanup_fallbacks: Vec::new(),
-                rejected: Vec::new(),
-            })
+            if let Some((error, advance_cursor)) = self.poll_errors.pop_front() {
+                if advance_cursor {
+                    *cursor = UnavailablePgReconciliationCursor::for_test_after(PgId::new(1));
+                }
+                return Err(error);
+            }
+            Ok(self.candidates.pop_front())
         }
 
-        fn complete_reconciliation_batch(
+        fn complete_reconciliation(
             &mut self,
-            work: &[UnavailablePgReconciliationWork],
+            work: &UnavailablePgReconciliationWork,
             _now_ms: u64,
-        ) -> Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError> {
-            self.published_batches.push(work.to_vec());
-            self.published.extend_from_slice(work);
-            self.publish_results.pop_front().unwrap_or_else(|| {
-                Ok(UnavailablePgReconciliationCompletionAttempt::Classified(
-                    Box::new(UnavailablePgReconciliationCompletionBatch {
-                        completed: work.to_vec(),
-                        rejected: Vec::new(),
-                        rederive: Vec::new(),
-                        snapshot: ClusterControlSnapshot::empty(),
-                    }),
-                ))
-            })
-        }
-
-        fn authorize_staging_batch(
-            &mut self,
-            _requests: &[UnavailablePgStagingIntentAuthorizationRequest],
-        ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-            panic!("legacy reconciliation tests must not authorize staging")
-        }
-
-        fn install_staged_batch(
-            &mut self,
-            _requests: &[UnavailablePgTransitionInstallRequest],
-            _expected_destination_epoch: ClusterEpoch,
-        ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-            panic!("legacy reconciliation tests must not install staged transfers")
-        }
-
-        fn finalize_staging_generation(
-            &mut self,
-            _cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-        ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-            panic!("legacy reconciliation tests must not finalize staging")
-        }
-
-        fn maintain_staging_evidence(
-            &mut self,
-            _cursor: &mut MetadataTransferStagingMaintenanceCursor,
         ) -> Result<bool, ControlPlaneError> {
-            self.maintenance_count += 1;
-            self.maintenance_results.pop_front().unwrap_or(Ok(false))
+            self.published.push(work.clone());
+            self.publish_results.pop_front().unwrap_or(Ok(true))
+        }
+    }
+
+    enum AmbiguousAppendStage {
+        Begin,
+        Completion,
+    }
+
+    struct AmbiguousStandaloneAppendAuthority {
+        authority: SingleAuthorityControlPlane<FileControlPlaneStore>,
+        store: FileControlPlaneStore,
+        stage: AmbiguousAppendStage,
+        later_candidate: Option<UnavailablePgReconciliationWork>,
+        poll_count: usize,
+        completion_count: usize,
+    }
+
+    impl AmbiguousStandaloneAppendAuthority {
+        fn inject_ambiguous_append(&mut self) -> Result<(), ControlPlaneError> {
+            self.store.fail_next_journal_file_sync();
+            self.authority
+                .set_node_membership(NodeId::new(99), NodeMembershipState::Active)
+                .map(|_| ())
+        }
+    }
+
+    impl ReconciliationAuthority for AmbiguousStandaloneAppendAuthority {
+        fn poll_reconciliation(
+            &mut self,
+            cursor: &mut UnavailablePgReconciliationCursor,
+            _now_ms: u64,
+        ) -> Result<Option<UnavailablePgReconciliationWork>, ControlPlaneError> {
+            self.poll_count += 1;
+            if matches!(self.stage, AmbiguousAppendStage::Begin) && self.poll_count == 1 {
+                *cursor = UnavailablePgReconciliationCursor::for_test_after(PgId::new(1));
+                self.inject_ambiguous_append()?;
+                unreachable!("the injected ambiguous append must fail")
+            }
+            Ok(self.later_candidate.take())
         }
 
-        fn maintain_outage_command_artifacts(&mut self) -> Result<bool, ControlPlaneError> {
-            Ok(false)
+        fn complete_reconciliation(
+            &mut self,
+            _work: &UnavailablePgReconciliationWork,
+            _now_ms: u64,
+        ) -> Result<bool, ControlPlaneError> {
+            self.completion_count += 1;
+            if matches!(self.stage, AmbiguousAppendStage::Completion) {
+                self.inject_ambiguous_append()?;
+                unreachable!("the injected ambiguous append must fail")
+            }
+            Ok(true)
         }
+    }
+
+    fn ambiguous_standalone_authority(
+        stage: AmbiguousAppendStage,
+        later_candidate: UnavailablePgReconciliationWork,
+    ) -> (test_util::TempDir, AmbiguousStandaloneAppendAuthority) {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        (
+            tmp,
+            AmbiguousStandaloneAppendAuthority {
+                authority,
+                store,
+                stage,
+                later_candidate: Some(later_candidate),
+                poll_count: 0,
+                completion_count: 0,
+            },
+        )
     }
 
     fn work(
@@ -2156,19 +710,6 @@ mod tests {
             vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
             stage,
         )
-    }
-
-    fn completed(
-        work: Vec<UnavailablePgReconciliationWork>,
-    ) -> Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError> {
-        Ok(UnavailablePgReconciliationCompletionAttempt::Classified(
-            Box::new(UnavailablePgReconciliationCompletionBatch {
-                completed: work,
-                rejected: Vec::new(),
-                rederive: Vec::new(),
-                snapshot: ClusterControlSnapshot::empty(),
-            }),
-        ))
     }
 
     #[test]
@@ -2196,16 +737,15 @@ mod tests {
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100).unwrap();
+        worker.poll(&mut authority, 100);
         assert_eq!(
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             expected
         );
         for _ in 0..100 {
-            worker.poll(&mut authority, 101).unwrap();
+            worker.poll(&mut authority, 101);
         }
-        assert_eq!(authority.poll_count, 1);
-        assert_eq!(authority.maintenance_count, 101);
+        assert!(authority.poll_count >= 2);
         assert!(authority.published.is_empty());
 
         let (lock, ready) = &*transfer_gate;
@@ -2216,29 +756,92 @@ mod tests {
             .expect("released transfer worker did not finish its transfer body");
         let publication_deadline = Instant::now() + Duration::from_secs(1);
         while authority.published.is_empty() {
-            worker.poll(&mut authority, 102).unwrap();
+            worker.poll(&mut authority, 102);
             if !authority.published.is_empty() {
                 break;
             }
             if Instant::now() >= publication_deadline {
-                panic!(
-                    "completed transfer was not published before the deadline; retained state: {:?}",
-                    worker.retained_test_state()
-                );
+                panic!("completed transfer was not published before the deadline");
             }
             thread::yield_now();
         }
-        assert_eq!(authority.published, vec![expected]);
-        assert_eq!(authority.poll_count, 1);
+        assert_eq!(
+            authority.published,
+            vec![expected.with_stage(UnavailablePgReconciliationStage::PayloadReadiness)]
+        );
+        assert!(authority.poll_count >= 2);
+    }
+
+    #[test]
+    fn transfer_pool_runs_four_pgs_concurrently_and_refills_after_completion() {
+        let expected = (1..=5)
+            .map(|pg_id| {
+                work(
+                    pg_id,
+                    10 + u64::from(pg_id),
+                    UnavailablePgReconciliationStage::MetadataTransfer,
+                )
+            })
+            .collect::<Vec<_>>();
+        let transfer_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::sync_channel(MAX_CONCURRENT_TRANSFERS + 1);
+        let worker_gate = Arc::clone(&transfer_gate);
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            move |work| {
+                started_tx.send(work.pg_id()).unwrap();
+                let (lock, ready) = &*worker_gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+                Ok(())
+            },
+            Duration::ZERO,
+        );
+        let mut authority = FakeAuthority {
+            candidates: expected.clone().into(),
+            ..FakeAuthority::default()
+        };
+
+        worker.poll(&mut authority, 100);
+        let mut initially_started = Vec::new();
+        for _ in 0..MAX_CONCURRENT_TRANSFERS {
+            initially_started.push(
+                started_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("four transfers must start without serial waiting"),
+            );
+        }
+        assert!(started_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(worker.in_flight.len(), MAX_CONCURRENT_TRANSFERS);
+
+        let (lock, ready) = &*transfer_gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while authority.published.len() != expected.len() {
+            worker.poll(&mut authority, 101);
+            assert!(
+                Instant::now() < deadline,
+                "transfer pool did not refill and publish every PG"
+            );
+            thread::yield_now();
+        }
+        let fifth = started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the fifth transfer must start after a slot is released");
+        initially_started.push(fifth);
+        initially_started.sort_unstable();
+        let mut expected_pg_ids = expected.iter().map(|work| work.pg_id()).collect::<Vec<_>>();
+        expected_pg_ids.sort_unstable();
+        assert_eq!(initially_started, expected_pg_ids);
+        assert!(worker.in_flight.is_empty());
     }
 
     #[test]
     fn transfer_thread_panic_fails_stop_after_dequeue() {
         let expected = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
-        let prepare_before = observability::unavailable_pg_worker_stage_metrics_snapshot()
-            .into_iter()
-            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Prepare)
-            .unwrap();
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
             move |work| {
@@ -2252,7 +855,7 @@ mod tests {
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100).unwrap();
+        worker.poll(&mut authority, 100);
         assert_eq!(
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             expected
@@ -2261,7 +864,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker.observe_transfer_workers();
+                worker.observe_transfer_worker();
             }));
             if let Err(payload) = result {
                 let message = payload
@@ -2270,7 +873,7 @@ mod tests {
                     .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("non-string panic");
                 assert!(
-                    message.contains("transfer worker terminated unexpectedly"),
+                    message.contains("transfer worker panicked"),
                     "unexpected fail-stop panic: {message}"
                 );
                 break;
@@ -2282,23 +885,9 @@ mod tests {
             thread::yield_now();
         }
 
-        assert_eq!(authority.poll_count, 1);
-        assert_eq!(
-            worker.in_flight,
-            BTreeMap::from([(expected.pg_id(), expected)])
-        );
+        assert!(authority.poll_count >= 1);
+        assert_eq!(worker.in_flight.get(&expected.pg_id()), Some(&expected));
         assert!(authority.published.is_empty());
-        let prepare_after = observability::unavailable_pg_worker_stage_metrics_snapshot()
-            .into_iter()
-            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Prepare)
-            .unwrap();
-        assert_eq!(prepare_after.total, prepare_before.total + 1);
-        assert_eq!(prepare_after.fatal_total, prepare_before.fatal_total + 1);
-        assert_eq!(
-            prepare_after.succeeded_total,
-            prepare_before.succeeded_total
-        );
-        assert_eq!(prepare_after.deferred_total, prepare_before.deferred_total);
     }
 
     #[test]
@@ -2315,21 +904,18 @@ mod tests {
             Duration::ZERO,
         );
         let mut authority = FakeAuthority {
-            candidates: VecDeque::from([stale.clone(), successor.clone()]),
-            publish_results: VecDeque::from([
-                completed(vec![stale.clone()]),
-                completed(vec![successor.clone()]),
-            ]),
+            candidates: VecDeque::from([stale.clone()]),
+            publish_results: VecDeque::from([Ok(false), Ok(true)]),
             ..FakeAuthority::default()
         };
 
-        for now_ms in 100..104 {
-            worker.poll(&mut authority, now_ms).unwrap();
-        }
+        worker.poll(&mut authority, 100);
+        authority.candidates.push_back(successor.clone());
+        worker.poll(&mut authority, 101);
 
         assert_eq!(authority.published, vec![stale, successor]);
         assert_eq!(*transfer_count.lock().unwrap(), 0);
-        assert_eq!(authority.poll_count, 4);
+        assert!(authority.poll_count >= 2);
     }
 
     #[test]
@@ -2346,287 +932,309 @@ mod tests {
                 Err(ControlPlaneError::CommandDecode {
                     message: "destination lease changed before activation".to_owned(),
                 }),
-                completed(vec![successor.clone()]),
+                Ok(true),
             ]),
             ..FakeAuthority::default()
         };
 
         for now_ms in 100..104 {
-            worker.poll(&mut authority, now_ms).unwrap();
+            worker.poll(&mut authority, now_ms);
         }
 
         assert_eq!(authority.published, vec![deferred.clone(), successor]);
-        assert_eq!(authority.poll_count, 4);
-        assert!(worker
-            .deferred
-            .contains_key(&reconciliation_retry_key(&deferred)));
+        assert!(authority.poll_count >= 2);
+        assert_eq!(
+            worker.deferred.get(&deferred.pg_id()).map(|entry| entry.0),
+            Some(deferred.transition_epoch())
+        );
+        assert_eq!(
+            worker
+                .completion_retries
+                .get(&deferred.pg_id())
+                .map(|entry| &entry.0),
+            Some(&deferred)
+        );
         assert!(worker.in_flight.is_empty());
     }
 
     #[test]
-    fn unconfirmed_completion_retains_the_exact_batch_until_retry() {
-        let first = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let second = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let later = work(9, 12, UnavailablePgReconciliationStage::PayloadReadiness);
+    fn retryable_activation_lag_does_not_repeat_metadata_transfer() {
+        let transfer = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
+        let readiness = transfer
+            .clone()
+            .with_stage(UnavailablePgReconciliationStage::PayloadReadiness);
+        let transfer_count = Arc::new(Mutex::new(0));
+        let observed_transfer_count = Arc::clone(&transfer_count);
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| panic!("activation-stage work must not invoke metadata transfer"),
-            Duration::from_secs(60),
+            move |_| {
+                *observed_transfer_count.lock().unwrap() += 1;
+                Ok(())
+            },
+            Duration::ZERO,
         );
         let mut authority = FakeAuthority {
-            candidates: VecDeque::from([first.clone(), second.clone(), later.clone()]),
-            poll_batch_size: 2,
-            publish_results: VecDeque::from([Err(ControlPlaneError::RpcUnconfirmed {
-                message: "injected activation response loss".to_owned(),
-            })]),
+            candidates: VecDeque::from([transfer]),
+            publish_results: VecDeque::from([
+                Err(ControlPlaneError::CommandDecode {
+                    message: "destination heartbeat has not published readiness".to_owned(),
+                }),
+                Ok(true),
+            ]),
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100).unwrap();
-        worker.poll(&mut authority, 101).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while authority.published.len() < 2 {
+            worker.poll(&mut authority, 100);
+            assert!(
+                Instant::now() < deadline,
+                "activation retry did not retain the completed transfer owner"
+            );
+            thread::yield_now();
+        }
 
-        assert_eq!(
-            authority.published_batches,
-            vec![vec![first.clone(), second.clone()], vec![later]]
-        );
-        assert!(worker.ready_for_activation.is_empty());
-        assert_eq!(worker.activation_replays.len(), 1);
-        assert_eq!(worker.activation_replays[0].owners.len(), 2);
-        assert!(worker
-            .deferred
-            .contains_key(&reconciliation_retry_key(&first)));
-        assert!(worker
-            .deferred
-            .contains_key(&reconciliation_retry_key(&second)));
+        assert_eq!(*transfer_count.lock().unwrap(), 1);
+        assert_eq!(authority.published, vec![readiness.clone(), readiness]);
+        assert!(worker.completion_retries.is_empty());
+        assert!(worker.in_flight.is_empty());
     }
 
     #[test]
-    fn unconfirmed_completion_retains_only_the_submitted_prefix() {
-        let submitted = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let rejected = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let suffix = work(9, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+    fn retryable_poll_race_does_not_block_a_later_pg() {
+        let successor = work(8, 12, UnavailablePgReconciliationStage::PayloadReadiness);
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
             |_| panic!("activation-stage work must not invoke metadata transfer"),
             Duration::from_secs(60),
         );
         let mut authority = FakeAuthority {
-            candidates: VecDeque::from([submitted.clone(), rejected.clone(), suffix.clone()]),
-            poll_batch_size: 16,
-            publish_results: VecDeque::from([Ok(
-                UnavailablePgReconciliationCompletionAttempt::Unconfirmed(
-                    UnconfirmedUnavailablePgReconciliationCompletionBatch {
-                        already_completed: Vec::new(),
-                        submitted: vec![submitted.clone()],
-                        rejected: vec![(
-                            rejected.clone(),
-                            ControlPlaneError::CommandDecode {
-                                message: "destination lease changed before activation".to_owned(),
-                            },
-                        )],
-                        rederive: vec![suffix.clone()],
-                        error: ControlPlaneError::RpcUnconfirmed {
-                            message: "injected prefix response loss".to_owned(),
-                        },
-                    },
-                ),
+            candidates: VecDeque::from([successor.clone()]),
+            poll_errors: VecDeque::from([(
+                ControlPlaneError::CommandDecode {
+                    message: "candidate lease changed during begin validation".to_owned(),
+                },
+                true,
             )]),
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100).unwrap();
+        worker.poll(&mut authority, 100);
 
-        assert_eq!(worker.activation_replays.len(), 1);
-        assert_eq!(worker.activation_replays[0].owners[0].work(), &submitted);
-        assert_eq!(worker.ready_for_activation.len(), 2);
-        assert!(worker
-            .ready_for_activation
-            .iter()
-            .any(|owner| owner.work() == &rejected));
-        assert!(worker
-            .ready_for_activation
-            .iter()
-            .any(|owner| owner.work() == &suffix));
-    }
-
-    #[test]
-    fn transient_exact_replay_failure_preserves_the_replay_group() {
-        let first = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let second = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| panic!("activation-stage work must not invoke metadata transfer"),
-            Duration::ZERO,
-        );
-        let mut authority = FakeAuthority {
-            candidates: VecDeque::from([first.clone(), second.clone()]),
-            poll_batch_size: 16,
-            publish_results: VecDeque::from([
-                Ok(UnavailablePgReconciliationCompletionAttempt::Unconfirmed(
-                    UnconfirmedUnavailablePgReconciliationCompletionBatch {
-                        already_completed: Vec::new(),
-                        submitted: vec![first.clone(), second.clone()],
-                        rejected: Vec::new(),
-                        rederive: Vec::new(),
-                        error: ControlPlaneError::RpcUnconfirmed {
-                            message: "injected activation response loss".to_owned(),
-                        },
-                    },
-                )),
-                Err(ControlPlaneError::AuthorityClockLeadershipChanged {
-                    established_term: Some(7),
-                    current_term: 8,
-                }),
-            ]),
-            ..FakeAuthority::default()
-        };
-
-        worker.poll(&mut authority, 100).unwrap();
-        worker.poll(&mut authority, 101).unwrap();
-
+        assert_eq!(authority.poll_count, 3);
         assert_eq!(
-            authority.published_batches,
-            vec![
-                vec![first.clone(), second.clone()],
-                vec![first.clone(), second.clone()]
-            ]
+            authority.published,
+            vec![successor.with_stage(UnavailablePgReconciliationStage::PayloadReadiness)]
         );
-        assert!(worker.ready_for_activation.is_empty());
-        assert_eq!(worker.activation_replays.len(), 1);
-        assert_eq!(worker.activation_replays[0].owners.len(), 2);
-        assert_eq!(worker.activation_replays[0].owners[0].work(), &first);
-        assert_eq!(worker.activation_replays[0].owners[1].work(), &second);
+        assert!(worker.in_flight.is_empty());
     }
 
     #[test]
-    fn failing_replay_and_activation_rotate_through_discovery() {
-        let replay = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let ordinary = work(8, 12, UnavailablePgReconciliationStage::PayloadReadiness);
-        let discovered = work(9, 13, UnavailablePgReconciliationStage::PayloadReadiness);
+    fn authority_wide_post_scan_failures_back_off_after_cursor_advancement() {
+        let failures = [
+            ControlPlaneError::AuthorityNotServing,
+            ControlPlaneError::OpenRaftOperation {
+                kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+                message: "injected quorum loss after candidate selection".to_owned(),
+            },
+            ControlPlaneError::io(
+                "submit unavailable PG begin",
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "injected timeout"),
+            ),
+        ];
+        for error in failures {
+            let successor = work(8, 12, UnavailablePgReconciliationStage::PayloadReadiness);
+            let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+                |_| panic!("authority-wide failure must not dispatch transfer work"),
+                Duration::from_secs(60),
+            );
+            let mut authority = FakeAuthority {
+                candidates: VecDeque::from([successor]),
+                poll_errors: VecDeque::from([(error, true)]),
+                ..FakeAuthority::default()
+            };
+
+            worker.poll(&mut authority, 100);
+
+            assert_eq!(authority.poll_count, 1);
+            assert!(authority.published.is_empty());
+            assert!(worker.authority_retry_not_before > Instant::now());
+        }
+    }
+
+    #[test]
+    fn retryable_pre_scan_failure_backs_off_without_synchronous_retries() {
+        let successor = work(8, 12, UnavailablePgReconciliationStage::PayloadReadiness);
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
             |_| panic!("activation-stage work must not invoke metadata transfer"),
-            Duration::ZERO,
+            Duration::from_secs(60),
         );
-        worker.retain_activation_replay(vec![ActivationOwner::Legacy(replay.clone())]);
-        worker
-            .ready_for_activation
-            .push(ActivationOwner::Legacy(ordinary.clone()));
         let mut authority = FakeAuthority {
-            candidates: VecDeque::from([discovered.clone()]),
-            publish_results: VecDeque::from([
-                Err(ControlPlaneError::AuthorityClockLeadershipChanged {
+            candidates: VecDeque::from([successor]),
+            poll_errors: VecDeque::from([(
+                ControlPlaneError::AuthorityClockLeadershipChanged {
                     established_term: Some(7),
                     current_term: 8,
-                }),
-                Err(ControlPlaneError::AuthorityClockLeadershipChanged {
-                    established_term: Some(8),
-                    current_term: 9,
-                }),
-                Err(ControlPlaneError::AuthorityClockLeadershipChanged {
-                    established_term: Some(9),
-                    current_term: 10,
-                }),
-                Err(ControlPlaneError::AuthorityClockLeadershipChanged {
-                    established_term: Some(10),
-                    current_term: 11,
-                }),
-            ]),
+                },
+                false,
+            )]),
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100).unwrap();
-        worker.poll(&mut authority, 101).unwrap();
+        worker.poll(&mut authority, 100);
+
+        assert_eq!(authority.poll_count, 1);
+        assert!(authority.published.is_empty());
+        assert!(worker.authority_retry_not_before > Instant::now());
+    }
+
+    #[test]
+    fn authority_backoff_does_not_delay_an_already_completed_transfer() {
+        let completed = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            |_| panic!("the completed work is injected directly"),
+            Duration::from_secs(60),
+        );
+        worker
+            .in_flight
+            .insert(completed.pg_id(), completed.clone());
+        worker.ready_to_complete.push_back(completed.clone());
+        worker.authority_retry_not_before = Instant::now() + Duration::from_secs(60);
+        let mut authority = FakeAuthority::default();
+
+        worker.poll(&mut authority, 100);
+
+        assert_eq!(authority.published, vec![completed]);
         assert_eq!(authority.poll_count, 0);
-
-        worker.poll(&mut authority, 102).unwrap();
-        assert_eq!(authority.poll_count, 1, "discovery must receive its turn");
-
-        worker.poll(&mut authority, 103).unwrap();
-
-        assert_eq!(
-            authority.published_batches,
-            vec![
-                vec![replay.clone()],
-                vec![ordinary.clone()],
-                vec![ordinary, discovered],
-                vec![replay.clone()],
-            ]
-        );
-        assert_eq!(worker.activation_replays.len(), 1);
-        assert_eq!(worker.activation_replays[0].owners[0].work(), &replay);
-        assert_eq!(worker.ready_for_activation.len(), 2);
+        assert!(worker.in_flight.is_empty());
     }
 
     #[test]
-    fn durable_completion_by_another_batch_releases_stale_activation_ownership() {
-        let stale = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+    fn fatal_poll_failure_fails_stop_reconciliation() {
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| panic!("activation-stage work must not invoke metadata transfer"),
+            |_| panic!("fatal polling must not dispatch transfer work"),
             Duration::ZERO,
         );
-        worker
-            .ready_for_activation
-            .push(ActivationOwner::Legacy(stale.clone()));
         let mut authority = FakeAuthority {
-            publish_results: VecDeque::from([completed(vec![stale.clone()])]),
+            poll_errors: VecDeque::from([(
+                ControlPlaneError::durability_failure("injected begin durability failure"),
+                true,
+            )]),
             ..FakeAuthority::default()
         };
 
-        worker.poll(&mut authority, 100).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker.poll(&mut authority, 100);
+        }));
 
-        assert_eq!(authority.published_batches, vec![vec![stale.clone()]]);
-        assert!(!worker.foreground_owns_transition(&stale));
-        assert!(!worker
-            .deferred
-            .contains_key(&reconciliation_retry_key(&stale)));
+        let payload = result.expect_err("fatal polling failure must fail-stop the worker");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic");
+        assert!(message.contains("fatal unavailable PG reconciliation authority error"));
+        assert_eq!(authority.poll_count, 1);
     }
 
     #[test]
-    fn deferred_active_successor_selects_retained_cleanup_without_clearing_successor_backoff() {
-        let active = work(7, 12, UnavailablePgReconciliationStage::MetadataTransfer);
-        let cleanup = work(7, 11, UnavailablePgReconciliationStage::StagingCleanup);
+    fn ambiguous_standalone_begin_append_fail_stops_before_later_candidate() {
+        let later = work(8, 12, UnavailablePgReconciliationStage::MetadataTransfer);
+        let (_tmp, mut authority) =
+            ambiguous_standalone_authority(AmbiguousAppendStage::Begin, later.clone());
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| Ok(()),
-            Duration::from_secs(60),
+            |_| panic!("durability uncertainty must not dispatch transfer work"),
+            Duration::ZERO,
         );
-        worker.defer(&active);
 
-        let selected =
-            worker.select_reconciliation_work(vec![active.clone()], vec![cleanup.clone()], &[]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker.poll(&mut authority, 100);
+        }));
 
-        assert_eq!(selected, vec![cleanup.clone()]);
-        assert!(worker
-            .deferred
-            .contains_key(&reconciliation_retry_key(&active)));
-
-        worker.deferred.clear();
-        worker.blocked.insert(reconciliation_retry_key(&active));
-        let selected =
-            worker.select_reconciliation_work(vec![active.clone()], vec![cleanup.clone()], &[]);
-        assert_eq!(selected, vec![cleanup]);
-        assert!(worker.blocked.contains(&reconciliation_retry_key(&active)));
+        let payload = result.expect_err("ambiguous begin append must fail-stop the worker");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic");
+        assert!(message.contains("fatal unavailable PG reconciliation authority error"));
+        assert_eq!(authority.poll_count, 1);
+        assert_eq!(authority.later_candidate, Some(later));
+        assert!(worker.in_flight.is_empty());
     }
 
     #[test]
-    fn durable_cleanup_supersedes_local_transfer_quarantine_after_leadership_change() {
-        let transfer = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
-        let cleanup = work(7, 11, UnavailablePgReconciliationStage::StagingCleanup);
+    fn ambiguous_standalone_completion_append_fail_stops_before_later_candidate() {
+        let completed = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+        let later = work(8, 12, UnavailablePgReconciliationStage::MetadataTransfer);
+        let (_tmp, mut authority) =
+            ambiguous_standalone_authority(AmbiguousAppendStage::Completion, later.clone());
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| Ok(()),
-            Duration::from_secs(60),
+            |_| panic!("the completed work is injected directly"),
+            Duration::ZERO,
         );
-        worker.blocked.insert(reconciliation_retry_key(&transfer));
+        worker
+            .in_flight
+            .insert(completed.pg_id(), completed.clone());
+        worker.ready_to_complete.push_back(completed);
 
-        // Another leader completed this exact transition. Rediscovery must follow
-        // the durable cleanup phase rather than the stale local transfer failure.
-        let selected = worker.select_reconciliation_work(vec![cleanup.clone()], Vec::new(), &[]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worker.poll(&mut authority, 100);
+        }));
 
-        assert_eq!(selected, vec![cleanup.clone()]);
-        assert!(worker
-            .blocked
-            .contains(&reconciliation_retry_key(&transfer)));
-        assert!(!worker.blocked.contains(&reconciliation_retry_key(&cleanup)));
+        let payload = result.expect_err("ambiguous completion append must fail-stop the worker");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic");
+        assert!(message.contains("fatal unavailable PG reconciliation completion error"));
+        assert_eq!(authority.completion_count, 1);
+        assert_eq!(authority.poll_count, 0);
+        assert_eq!(authority.later_candidate, Some(later));
+        assert!(worker.completion_retries.is_empty());
     }
 
     #[test]
-    fn fatal_completion_failure_blocks_only_its_exact_transition() {
+    fn nontransient_io_and_remote_state_failures_fail_stop_polling() {
+        let failures = [
+            (
+                ControlPlaneError::io(
+                    "append standalone reconciliation begin",
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected denial"),
+                ),
+                true,
+            ),
+            (
+                ControlPlaneError::rpc_remote("injected local Raft state-machine read failure"),
+                false,
+            ),
+        ];
+        for (error, cursor_advanced) in failures {
+            let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+                |_| panic!("fatal polling must not dispatch transfer work"),
+                Duration::ZERO,
+            );
+            let mut authority = FakeAuthority {
+                poll_errors: VecDeque::from([(error, cursor_advanced)]),
+                ..FakeAuthority::default()
+            };
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker.poll(&mut authority, 100);
+            }));
+
+            let payload = result.expect_err("production fatal polling error must fail-stop");
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic");
+            assert!(message.contains("fatal unavailable PG reconciliation authority error"));
+            assert_eq!(authority.poll_count, 1);
+        }
+    }
+
+    #[test]
+    fn definitive_completion_failure_blocks_only_its_exact_transition() {
         let blocked = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
         let successor = work(8, 12, UnavailablePgReconciliationStage::PayloadReadiness);
         let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
@@ -2636,21 +1244,106 @@ mod tests {
         let mut authority = FakeAuthority {
             candidates: VecDeque::from([blocked.clone(), successor.clone(), blocked.clone()]),
             publish_results: VecDeque::from([
-                Err(ControlPlaneError::durability_failure(
-                    "injected reconciliation durability failure",
-                )),
-                completed(vec![successor.clone()]),
+                Err(ControlPlaneError::UnknownPg {
+                    pg_id: blocked.pg_id().get(),
+                }),
+                Ok(true),
             ]),
             ..FakeAuthority::default()
         };
 
         for now_ms in 100..105 {
-            worker.poll(&mut authority, now_ms).unwrap();
+            worker.poll(&mut authority, now_ms);
         }
 
         assert_eq!(authority.published, vec![blocked.clone(), successor]);
-        assert_eq!(authority.poll_count, 5);
-        assert!(worker.blocked.contains(&reconciliation_retry_key(&blocked)));
+        assert!(authority.poll_count >= 3);
+        assert_eq!(
+            worker.blocked.get(&blocked.pg_id()),
+            Some(&blocked.transition_epoch())
+        );
+        assert!(worker.in_flight.is_empty());
+    }
+
+    #[test]
+    fn nontransient_completion_authority_failures_fail_stop() {
+        let failures = [
+            ControlPlaneError::io(
+                "checkpoint reconciliation completion",
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected denial"),
+            ),
+            ControlPlaneError::rpc_remote("injected Raft state-machine read failure"),
+        ];
+        for error in failures {
+            let completion = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
+            let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+                |_| panic!("activation-stage work must not invoke metadata transfer"),
+                Duration::ZERO,
+            );
+            let mut authority = FakeAuthority {
+                candidates: VecDeque::from([completion]),
+                publish_results: VecDeque::from([Err(error)]),
+                ..FakeAuthority::default()
+            };
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker.poll(&mut authority, 100);
+            }));
+
+            let payload = result.expect_err("nontransient completion failure must fail-stop");
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic");
+            assert!(message.contains("fatal unavailable PG reconciliation completion error"));
+            assert!(worker.completion_retries.is_empty());
+        }
+    }
+
+    #[test]
+    fn completion_retries_are_bounded_and_rotate_past_low_pg_ids() {
+        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
+            |_| panic!("activation-stage work must not invoke metadata transfer"),
+            Duration::ZERO,
+        );
+        for pg_id in 1..=6 {
+            worker.defer_completion(work(
+                pg_id,
+                10 + u64::from(pg_id),
+                UnavailablePgReconciliationStage::PayloadReadiness,
+            ));
+        }
+        let retry = || {
+            Err(ControlPlaneError::CommandDecode {
+                message: "destination readiness has not converged".to_owned(),
+            })
+        };
+        let mut authority = FakeAuthority {
+            publish_results: std::iter::repeat_with(retry).take(8).collect(),
+            ..FakeAuthority::default()
+        };
+
+        worker.poll(&mut authority, 100);
+        assert_eq!(
+            authority
+                .published
+                .iter()
+                .map(|work| work.pg_id().get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+
+        worker.poll(&mut authority, 101);
+        assert_eq!(
+            authority
+                .published
+                .iter()
+                .map(|work| work.pg_id().get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6, 1, 2]
+        );
+        assert_eq!(worker.completion_retries.len(), 6);
         assert!(worker.in_flight.is_empty());
     }
 
@@ -2683,480 +1376,36 @@ mod tests {
         };
 
         for now_ms in 100..10_100 {
-            worker.poll(&mut authority, now_ms).unwrap();
-            if authority.poll_count == 5 && worker.in_flight.is_empty() {
+            worker.poll(&mut authority, now_ms);
+            if authority.poll_count >= 5 && worker.in_flight.is_empty() {
                 break;
             }
             thread::yield_now();
         }
 
-        assert_eq!(authority.poll_count, 5);
-        assert_eq!(authority.published, vec![successor]);
-        assert!(worker.blocked.contains(&reconciliation_retry_key(&fatal)));
-        assert!(worker
-            .deferred
-            .contains_key(&reconciliation_retry_key(&retryable)));
-    }
-
-    #[test]
-    fn failed_transfer_members_do_not_discard_successful_batch_peers() {
-        let fatal = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
-        let retryable = work(8, 11, UnavailablePgReconciliationStage::MetadataTransfer);
-        let successful = work(9, 11, UnavailablePgReconciliationStage::MetadataTransfer);
-        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |work| match work.pg_id().get() {
-                7 => Err(ReconciliationTransferError::Fatal(
-                    "injected authenticated transfer integrity failure".to_owned(),
-                )),
-                8 => Err(ReconciliationTransferError::Retryable(
-                    "injected transfer timeout".to_owned(),
-                )),
-                _ => Ok(()),
-            },
-            Duration::from_secs(60),
+        assert!(authority.poll_count >= 5);
+        assert_eq!(
+            authority.published,
+            vec![successor.with_stage(UnavailablePgReconciliationStage::PayloadReadiness)]
         );
-        let mut authority = FakeAuthority {
-            candidates: VecDeque::from([fatal.clone(), retryable.clone(), successful.clone()]),
-            poll_batch_size: 16,
-            ..FakeAuthority::default()
-        };
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while authority.published_batches.is_empty() {
-            worker.poll(&mut authority, 100).unwrap();
-            assert!(
-                Instant::now() < deadline,
-                "successful transfer peer did not reach batch activation"
-            );
-            thread::yield_now();
-        }
-
-        assert_eq!(authority.published_batches, vec![vec![successful]]);
-        assert!(worker.blocked.contains(&reconciliation_retry_key(&fatal)));
-        assert!(worker
-            .deferred
-            .contains_key(&reconciliation_retry_key(&retryable)));
-        assert!(worker.in_flight.is_empty());
-        assert!(worker.pending_transfers.is_empty());
-        assert!(worker.ready_for_activation.is_empty());
+        assert_eq!(
+            worker.blocked.get(&fatal.pg_id()),
+            Some(&fatal.transition_epoch())
+        );
+        assert_eq!(
+            worker.deferred.get(&retryable.pg_id()).map(|entry| entry.0),
+            Some(retryable.transition_epoch())
+        );
     }
 
     #[test]
-    fn fatal_openraft_completion_is_quarantined() {
-        assert!(reconciliation_completion_error_is_fatal(
-            &ControlPlaneError::OpenRaftOperation {
+    fn fatal_openraft_completion_fails_stop() {
+        assert_eq!(
+            reconciliation_completion_error_disposition(&ControlPlaneError::OpenRaftOperation {
                 kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::Fatal,
                 message: "injected fatal state-machine failure".to_owned(),
-            }
-        ));
-    }
-
-    #[test]
-    fn ready_page_is_activated_as_one_batch() {
-        let first = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let second = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| panic!("activation-stage work must not invoke metadata transfer"),
-            Duration::ZERO,
+            }),
+            ReconciliationCompletionErrorDisposition::FailStop
         );
-        let mut authority = FakeAuthority {
-            candidates: VecDeque::from([first.clone(), second.clone()]),
-            poll_batch_size: 16,
-            ..FakeAuthority::default()
-        };
-
-        worker.poll(&mut authority, 100).unwrap();
-
-        assert_eq!(authority.poll_count, 1);
-        assert_eq!(authority.published_batches, vec![vec![first, second]]);
-        assert!(worker.in_flight.is_empty());
-        assert!(worker.pending_transfers.is_empty());
-    }
-
-    #[test]
-    fn transferred_page_is_accumulated_before_one_activation_batch() {
-        let first = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
-        let second = work(8, 11, UnavailablePgReconciliationStage::MetadataTransfer);
-        let transfer_count = Arc::new(Mutex::new(0));
-        let observed_transfer_count = Arc::clone(&transfer_count);
-        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            move |_| {
-                *observed_transfer_count.lock().unwrap() += 1;
-                Ok(())
-            },
-            Duration::ZERO,
-        );
-        let mut authority = FakeAuthority {
-            candidates: VecDeque::from([first.clone(), second.clone()]),
-            poll_batch_size: 16,
-            ..FakeAuthority::default()
-        };
-        let metric = |stage| {
-            observability::unavailable_pg_worker_stage_metrics_snapshot()
-                .into_iter()
-                .find(|sample| sample.stage == stage)
-                .unwrap()
-        };
-        let prepare_before = metric(observability::UnavailablePgWorkerStage::Prepare);
-        let activation_before = metric(observability::UnavailablePgWorkerStage::Activation);
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while authority.published_batches.is_empty() {
-            worker.poll(&mut authority, 100).unwrap();
-            assert!(
-                Instant::now() < deadline,
-                "transferred page did not reach batch activation"
-            );
-            thread::yield_now();
-        }
-
-        assert_eq!(*transfer_count.lock().unwrap(), 2);
-        assert_eq!(authority.published_batches, vec![vec![first, second]]);
-        assert!(worker.in_flight.is_empty());
-        assert!(worker.pending_transfers.is_empty());
-        assert!(worker.ready_for_activation.is_empty());
-        let prepare_after = metric(observability::UnavailablePgWorkerStage::Prepare);
-        let activation_after = metric(observability::UnavailablePgWorkerStage::Activation);
-        assert_eq!(prepare_after.total, prepare_before.total + 2);
-        assert_eq!(
-            prepare_after.succeeded_total,
-            prepare_before.succeeded_total + 2
-        );
-        assert_eq!(activation_after.total, activation_before.total + 1);
-        assert_eq!(
-            activation_after.succeeded_total,
-            activation_before.succeeded_total + 1
-        );
-    }
-
-    #[test]
-    fn transfer_pool_is_bounded_and_activates_the_complete_page_as_one_batch() {
-        let expected = (0..5)
-            .map(|offset| {
-                work(
-                    7 + offset,
-                    11,
-                    UnavailablePgReconciliationStage::MetadataTransfer,
-                )
-            })
-            .collect::<Vec<_>>();
-        let transfer_gate = Arc::new(TransferPoolGate::default());
-        let observed_gate = Arc::clone(&transfer_gate);
-        let (started_tx, started_rx) = mpsc::sync_channel(expected.len());
-        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            move |work| {
-                let mut state = observed_gate.state.lock().unwrap();
-                state.0 += 1;
-                state.1 = state.1.max(state.0);
-                started_tx.send(work.pg_id()).unwrap();
-                while !state.2 {
-                    state = observed_gate.changed.wait(state).unwrap();
-                }
-                state.0 -= 1;
-                Ok(())
-            },
-            Duration::ZERO,
-        );
-        let _release = TransferPoolGateRelease(Arc::clone(&transfer_gate));
-        let mut authority = FakeAuthority {
-            candidates: expected.iter().cloned().collect(),
-            poll_batch_size: 16,
-            ..FakeAuthority::default()
-        };
-
-        worker.poll(&mut authority, 100).unwrap();
-        let mut started = Vec::new();
-        for _ in 0..TRANSFER_WORKER_COUNT {
-            started.push(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
-        }
-        started.sort_unstable();
-        assert_eq!(started.len(), TRANSFER_WORKER_COUNT);
-        assert_eq!(worker.in_flight.len(), TRANSFER_WORKER_COUNT);
-        assert_eq!(worker.pending_transfers.len(), 1);
-        let saturated_queue = observability::unavailable_pg_worker_queue_metrics_snapshot();
-        assert_eq!(
-            saturated_queue.in_flight_transfer_depth,
-            u64::try_from(TRANSFER_WORKER_COUNT).unwrap()
-        );
-        assert_eq!(saturated_queue.pending_transfer_depth, 1);
-        assert!(started_rx.try_recv().is_err());
-        {
-            let state = transfer_gate.state.lock().unwrap();
-            assert_eq!(
-                (state.0, state.1),
-                (TRANSFER_WORKER_COUNT, TRANSFER_WORKER_COUNT)
-            );
-        }
-        transfer_gate.release();
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while authority.published_batches.is_empty() {
-            worker.poll(&mut authority, 101).unwrap();
-            assert!(
-                Instant::now() < deadline,
-                "bounded transfer page did not reach batch activation"
-            );
-            thread::yield_now();
-        }
-
-        assert_eq!(
-            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            expected[4].pg_id()
-        );
-        assert_eq!(authority.published_batches, vec![expected]);
-        assert!(worker.in_flight.is_empty());
-        assert!(worker.pending_transfers.is_empty());
-        assert!(worker.ready_for_activation.is_empty());
-        let drained_queue = observability::unavailable_pg_worker_queue_metrics_snapshot();
-        assert_eq!(drained_queue.in_flight_transfer_depth, 0);
-        assert_eq!(drained_queue.pending_transfer_depth, 0);
-        let state = transfer_gate.state.lock().unwrap();
-        assert_eq!((state.0, state.1), (0, TRANSFER_WORKER_COUNT));
-    }
-
-    #[test]
-    fn mixed_ready_and_transferred_page_is_canonicalized_before_activation() {
-        let transferred = work(7, 11, UnavailablePgReconciliationStage::MetadataTransfer);
-        let already_ready = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let mut worker =
-            UnavailablePgReconciliationWorker::spawn_with_transfer(|_| Ok(()), Duration::ZERO);
-        let mut authority = FakeAuthority {
-            candidates: VecDeque::from([transferred.clone(), already_ready.clone()]),
-            poll_batch_size: 16,
-            ..FakeAuthority::default()
-        };
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while authority.published_batches.is_empty() {
-            worker.poll(&mut authority, 100).unwrap();
-            assert!(
-                Instant::now() < deadline,
-                "mixed-stage page did not reach batch activation"
-            );
-            thread::yield_now();
-        }
-
-        assert_eq!(
-            authority.published_batches,
-            vec![vec![transferred, already_ready]]
-        );
-        assert!(worker.in_flight.is_empty());
-        assert!(worker.pending_transfers.is_empty());
-        assert!(worker.ready_for_activation.is_empty());
-    }
-
-    #[test]
-    fn fatal_batch_submission_is_not_retried_as_singleton_mutations() {
-        let first = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let second = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| panic!("activation-stage work must not invoke metadata transfer"),
-            Duration::ZERO,
-        );
-        let mut authority = FakeAuthority {
-            candidates: VecDeque::from([first.clone(), second.clone()]),
-            poll_batch_size: 16,
-            publish_results: VecDeque::from([Err(ControlPlaneError::durability_failure(
-                "injected batch durability failure",
-            ))]),
-            ..FakeAuthority::default()
-        };
-
-        worker.poll(&mut authority, 100).unwrap();
-
-        assert_eq!(
-            authority.published_batches,
-            vec![vec![first.clone(), second.clone()]]
-        );
-        assert!(worker.blocked.contains(&reconciliation_retry_key(&first)));
-        assert!(worker.blocked.contains(&reconciliation_retry_key(&second)));
-    }
-
-    #[test]
-    fn rejected_ready_batch_is_classified_per_member() {
-        let stale = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let ready = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let activation_before = observability::unavailable_pg_worker_stage_metrics_snapshot()
-            .into_iter()
-            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Activation)
-            .unwrap();
-        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| panic!("activation-stage work must not invoke metadata transfer"),
-            Duration::from_secs(60),
-        );
-        let mut authority = FakeAuthority {
-            candidates: VecDeque::from([stale.clone(), ready.clone()]),
-            poll_batch_size: 16,
-            publish_results: VecDeque::from([Ok(
-                UnavailablePgReconciliationCompletionAttempt::Classified(Box::new(
-                    UnavailablePgReconciliationCompletionBatch {
-                        completed: vec![ready.clone()],
-                        rejected: vec![(
-                            stale.clone(),
-                            ControlPlaneError::CommandDecode {
-                                message: "stale destination lease".to_owned(),
-                            },
-                        )],
-                        rederive: Vec::new(),
-                        snapshot: ClusterControlSnapshot::empty(),
-                    },
-                )),
-            )]),
-            ..FakeAuthority::default()
-        };
-
-        worker.poll(&mut authority, 100).unwrap();
-
-        assert_eq!(
-            authority.published_batches,
-            vec![vec![stale.clone(), ready]]
-        );
-        assert!(worker
-            .deferred
-            .contains_key(&reconciliation_retry_key(&stale)));
-        let activation_after = observability::unavailable_pg_worker_stage_metrics_snapshot()
-            .into_iter()
-            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Activation)
-            .unwrap();
-        assert_eq!(activation_after.total, activation_before.total + 1);
-        assert_eq!(
-            activation_after.deferred_total,
-            activation_before.deferred_total + 1
-        );
-        assert_eq!(
-            activation_after.succeeded_total,
-            activation_before.succeeded_total
-        );
-        assert_eq!(activation_after.fatal_total, activation_before.fatal_total);
-    }
-
-    #[test]
-    fn activation_metrics_give_fatal_member_precedence_over_deferred_member() {
-        let stale = work(7, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let corrupt = work(8, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let ready = work(9, 11, UnavailablePgReconciliationStage::PayloadReadiness);
-        let activation_before = observability::unavailable_pg_worker_stage_metrics_snapshot()
-            .into_iter()
-            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Activation)
-            .unwrap();
-        let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-            |_| panic!("activation-stage work must not invoke metadata transfer"),
-            Duration::from_secs(60),
-        );
-        let mut authority = FakeAuthority {
-            candidates: VecDeque::from([stale.clone(), corrupt.clone(), ready.clone()]),
-            poll_batch_size: 16,
-            publish_results: VecDeque::from([Ok(
-                UnavailablePgReconciliationCompletionAttempt::Classified(Box::new(
-                    UnavailablePgReconciliationCompletionBatch {
-                        completed: vec![ready],
-                        rejected: vec![
-                            (
-                                stale.clone(),
-                                ControlPlaneError::CommandDecode {
-                                    message: "stale destination lease".to_owned(),
-                                },
-                            ),
-                            (
-                                corrupt.clone(),
-                                ControlPlaneError::durability_failure(
-                                    "injected activation durability failure",
-                                ),
-                            ),
-                        ],
-                        rederive: Vec::new(),
-                        snapshot: ClusterControlSnapshot::empty(),
-                    },
-                )),
-            )]),
-            ..FakeAuthority::default()
-        };
-
-        worker.poll(&mut authority, 100).unwrap();
-
-        assert!(worker
-            .deferred
-            .contains_key(&reconciliation_retry_key(&stale)));
-        assert!(worker.blocked.contains(&reconciliation_retry_key(&corrupt)));
-        let activation_after = observability::unavailable_pg_worker_stage_metrics_snapshot()
-            .into_iter()
-            .find(|sample| sample.stage == observability::UnavailablePgWorkerStage::Activation)
-            .unwrap();
-        assert_eq!(activation_after.total, activation_before.total + 1);
-        assert_eq!(
-            activation_after.fatal_total,
-            activation_before.fatal_total + 1
-        );
-        assert_eq!(
-            activation_after.succeeded_total,
-            activation_before.succeeded_total
-        );
-        assert_eq!(
-            activation_after.deferred_total,
-            activation_before.deferred_total
-        );
-    }
-
-    #[test]
-    fn retryable_staging_maintenance_failure_uses_bounded_backoff() {
-        for error in [
-            ControlPlaneError::AuthorityNotServing,
-            ControlPlaneError::StagingEvidencePublicationDeferred,
-            ControlPlaneError::StagingEvidencePublicationOutcomeUnconfirmed {
-                message: "injected response loss".to_owned(),
-            },
-        ] {
-            let mut worker = UnavailablePgReconciliationWorker::spawn_with_transfer(
-                |_| Ok(()),
-                Duration::from_secs(60),
-            );
-            let mut authority = FakeAuthority {
-                maintenance_results: VecDeque::from([Err(error)]),
-                ..FakeAuthority::default()
-            };
-
-            worker.poll(&mut authority, 100).unwrap();
-            assert_eq!(authority.maintenance_count, 1);
-            assert!(worker.last_maintenance_diagnostic.is_some());
-
-            worker.poll(&mut authority, 101).unwrap();
-            assert_eq!(authority.maintenance_count, 1);
-            assert!(worker.last_maintenance_diagnostic.is_some());
-        }
-    }
-
-    #[test]
-    fn fatal_staging_maintenance_failure_propagates_without_becoming_retryable() {
-        let mut worker =
-            UnavailablePgReconciliationWorker::spawn_with_transfer(|_| Ok(()), Duration::ZERO);
-        let mut authority = FakeAuthority {
-            maintenance_results: VecDeque::from([Err(
-                ControlPlaneError::SnapshotInvariantViolation {
-                    context: "injected staging maintenance",
-                    message: "corrupt checkpoint catalogue".to_owned(),
-                },
-            )]),
-            ..FakeAuthority::default()
-        };
-        let retry_not_before = worker.maintenance_retry_not_before;
-
-        let error = worker.poll(&mut authority, 100).unwrap_err();
-        assert!(matches!(
-            error,
-            ControlPlaneError::SnapshotInvariantViolation { .. }
-        ));
-        assert_eq!(authority.maintenance_count, 1);
-        assert!(worker.last_maintenance_diagnostic.is_none());
-        assert_eq!(worker.maintenance_retry_not_before, retry_not_before);
-
-        for fatal in [
-            ControlPlaneError::durability_failure("injected staging durability failure"),
-            ControlPlaneError::OpenRaftOperation {
-                kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::Fatal,
-                message: "injected staging Raft failure".to_owned(),
-            },
-        ] {
-            assert!(!staging_maintenance_error_is_retryable(&fatal));
-        }
     }
 }

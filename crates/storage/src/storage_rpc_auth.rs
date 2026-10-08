@@ -13,8 +13,6 @@ use crate::storage_rpc::{
     decode_storage_rpc_frame, encode_storage_rpc_frame,
     validate_storage_rpc_request_frame_payload_limit, StorageRpcFrame, StorageRpcFrameError,
     StorageRpcMessageKind, STORAGE_RPC_MAX_FRAME_LEN,
-    STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_FRAME_LEN,
-    STORAGE_RPC_STAGING_ARTIFACT_READ_MAX_RESPONSE_FRAME_LEN,
 };
 use crate::NodeId;
 use std::fmt;
@@ -44,21 +42,6 @@ const STORAGE_RPC_AUTH_TRANSPORT_VERSION: u16 = 1;
 const STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD: usize = 64 * 1024;
 pub const STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN: usize =
     STORAGE_RPC_AUTH_MAX_BINDING_LEN + STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD;
-pub const STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_ENVELOPE_LEN: usize =
-    STORAGE_RPC_AUTH_BINDING_FIXED_LEN
-        + STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_FRAME_LEN
-        + STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD;
-const STORAGE_RPC_STAGING_ARTIFACT_READ_MAX_RESPONSE_ENVELOPE_LEN: usize =
-    STORAGE_RPC_AUTH_BINDING_FIXED_LEN
-        + STORAGE_RPC_STAGING_ARTIFACT_READ_MAX_RESPONSE_FRAME_LEN
-        + STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD;
-const _: () = assert!(
-    STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_ENVELOPE_LEN <= STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN
-);
-const _: () = assert!(
-    STORAGE_RPC_STAGING_ARTIFACT_READ_MAX_RESPONSE_ENVELOPE_LEN
-        <= STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN
-);
 const STORAGE_RPC_AUTH_PRE_AUTH_BYTE_BUDGET: usize = STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +92,6 @@ impl StorageRpcAuthTransportFrameError {
 }
 
 pub const STORAGE_RPC_AUTH_REPLAY_WINDOW_MS: u64 = 5_000;
-pub const STORAGE_RPC_AUTH_RESPONSE_REPLAY_WINDOW_MS: u64 = 60_000;
 pub const STORAGE_RPC_AUTH_ALLOWED_FUTURE_SKEW_MS: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,12 +131,6 @@ impl StorageRpcTransportLimits {
                 "storage RPC I/O timeout must be non-zero",
             ));
         }
-        if io_timeout > std::time::Duration::from_millis(STORAGE_RPC_AUTH_RESPONSE_REPLAY_WINDOW_MS)
-        {
-            return Err(storage_rpc_auth_protocol_error(format!(
-                "storage RPC I/O timeout must not exceed the protocol response authentication window of {STORAGE_RPC_AUTH_RESPONSE_REPLAY_WINDOW_MS} ms"
-            )));
-        }
         Ok(Self {
             max_frame_bytes,
             max_connections,
@@ -173,19 +149,6 @@ impl StorageRpcTransportLimits {
     pub fn io_timeout(self) -> std::time::Duration {
         self.io_timeout
     }
-}
-
-pub(crate) fn storage_rpc_auth_response_envelope_limit(
-    kind: StorageRpcMessageKind,
-    configured_max_frame_bytes: usize,
-) -> usize {
-    let operation_limit = match kind {
-        StorageRpcMessageKind::MetadataTransferStagingArtifactRead => {
-            STORAGE_RPC_STAGING_ARTIFACT_READ_MAX_RESPONSE_ENVELOPE_LEN
-        }
-        _ => configured_max_frame_bytes,
-    };
-    operation_limit.min(configured_max_frame_bytes)
 }
 
 #[derive(Clone)]
@@ -304,7 +267,7 @@ impl StorageRpcClientSigner {
             expected_kind: request.kind,
             expected_request_transcript: &request.transcript,
             now_ms,
-            max_replay_window_ms: STORAGE_RPC_AUTH_RESPONSE_REPLAY_WINDOW_MS,
+            max_replay_window_ms: STORAGE_RPC_AUTH_REPLAY_WINDOW_MS,
             allowed_future_skew_ms: STORAGE_RPC_AUTH_ALLOWED_FUTURE_SKEW_MS,
             envelope_bytes: envelope,
         })
@@ -563,7 +526,7 @@ impl StorageRpcServerAuthConfig {
         frame: &StorageRpcFrame,
     ) -> Result<Vec<u8>, ControlPlaneError> {
         let expires_at_ms = now_ms
-            .checked_add(STORAGE_RPC_AUTH_RESPONSE_REPLAY_WINDOW_MS)
+            .checked_add(STORAGE_RPC_AUTH_REPLAY_WINDOW_MS)
             .ok_or_else(|| storage_rpc_auth_protocol_error("storage RPC auth expiry overflowed"))?;
         sign_storage_rpc_response(StorageRpcAuthResponseInput {
             request_credential: &request.credential,
@@ -1400,7 +1363,6 @@ impl StorageRpcAuthorizedRoles {
         Self(Self::FRONTEND | Self::STORAGE_NODE | Self::MAINTENANCE | Self::ADMIN);
     const FRONTEND_STORAGE_ADMIN: Self = Self(Self::FRONTEND | Self::STORAGE_NODE | Self::ADMIN);
     const MAINTENANCE_ONLY: Self = Self(Self::MAINTENANCE);
-    const ADMIN_ONLY: Self = Self(Self::ADMIN);
     const STORAGE_MAINTENANCE: Self = Self(Self::STORAGE_NODE | Self::MAINTENANCE);
 
     fn allows(self, role: StorageRpcCallerRole) -> bool {
@@ -1458,14 +1420,6 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::MetadataCommandRetainedLogHashes
         | StorageRpcMessageKind::MetadataCommandRetainedLogEntries => {
             StorageRpcAuthorizedRoles::FRONTEND_STORAGE_ADMIN
-        }
-
-        StorageRpcMessageKind::MetadataTransferStagingIntentCreate
-        | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish
-        | StorageRpcMessageKind::MetadataTransferStagingProofPublish
-        | StorageRpcMessageKind::MetadataTransferStagingTombstone
-        | StorageRpcMessageKind::MetadataTransferStagingArtifactRead => {
-            StorageRpcAuthorizedRoles::ADMIN_ONLY
         }
 
         StorageRpcMessageKind::ShardAckRecord | StorageRpcMessageKind::ShardAckValidate => {
@@ -1651,11 +1605,6 @@ fn admin_live_pg_metadata_transfer_operation(kind: StorageRpcMessageKind) -> boo
             | StorageRpcMessageKind::MetadataCommandRetainedLogEntries
             | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
             | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
-            | StorageRpcMessageKind::MetadataTransferStagingIntentCreate
-            | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish
-            | StorageRpcMessageKind::MetadataTransferStagingProofPublish
-            | StorageRpcMessageKind::MetadataTransferStagingTombstone
-            | StorageRpcMessageKind::MetadataTransferStagingArtifactRead
     )
 }
 
@@ -2162,74 +2111,24 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 22, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
             0, 202, 74, 215, 141, 132, 131, 9, 128, 97, 98, 99,
         ];
-        const V23_FRAME: &[u8] = &[
-            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
-            114, 112, 99, 45, 102, 114, 97, 109, 101, 23, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
-            0, 219, 185, 232, 25, 191, 51, 112, 119, 97, 98, 99,
-        ];
-        const V24_FRAME: &[u8] = &[
-            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
-            114, 112, 99, 45, 102, 114, 97, 109, 101, 24, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
-            0, 227, 38, 97, 110, 223, 29, 108, 239, 97, 98, 99,
-        ];
-        const V25_FRAME: &[u8] = &[
-            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
-            114, 112, 99, 45, 102, 114, 97, 109, 101, 25, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
-            0, 242, 213, 94, 250, 228, 173, 21, 24, 97, 98, 99,
-        ];
-        const V26_FRAME: &[u8] = &[
-            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
-            114, 112, 99, 45, 102, 114, 97, 109, 101, 26, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
-            0, 170, 83, 137, 30, 251, 91, 70, 53, 97, 98, 99,
-        ];
-        const V27_FRAME: &[u8] = &[
-            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
-            114, 112, 99, 45, 102, 114, 97, 109, 101, 27, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
-            0, 187, 160, 182, 138, 192, 235, 63, 194, 97, 98, 99,
-        ];
-        const V28_FRAME: &[u8] = &[
-            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
-            114, 112, 99, 45, 102, 114, 97, 109, 101, 28, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
-            0, 26, 95, 38, 215, 196, 183, 225, 111, 97, 98, 99,
-        ];
-        const V29_FRAME: &[u8] = &[
-            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
-            114, 112, 99, 45, 102, 114, 97, 109, 101, 29, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
-            0, 11, 172, 25, 67, 255, 7, 152, 152, 97, 98, 99,
-        ];
-        const V30_FRAME: &[u8] = &[
-            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
-            114, 112, 99, 45, 102, 114, 97, 109, 101, 30, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
-            0, 83, 42, 206, 167, 224, 241, 203, 181, 97, 98, 99,
-        ];
-        const V31_FRAME: &[u8] = &[
-            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
-            114, 112, 99, 45, 102, 114, 97, 109, 101, 31, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
-            0, 66, 217, 241, 51, 219, 65, 178, 66, 97, 98, 99,
-        ];
-        for historical_frame in [
-            V21_FRAME, V22_FRAME, V23_FRAME, V24_FRAME, V25_FRAME, V26_FRAME, V27_FRAME, V28_FRAME,
-            V29_FRAME, V30_FRAME,
-        ] {
-            let old_request = encode_binding_with_encoded_frame(
-                0x0102_0304_0506_0708,
-                TOPOLOGY_DIGEST,
-                NodeId::new(0x1122_3344),
-                None,
-                historical_frame,
-            )
-            .unwrap();
-            assert_eq!(
-                decode_binding(&old_request),
-                Err(StorageRpcAuthBindingError::Malformed)
-            );
-        }
+        let old_request = encode_binding_with_encoded_frame(
+            0x0102_0304_0506_0708,
+            TOPOLOGY_DIGEST,
+            NodeId::new(0x1122_3344),
+            None,
+            V21_FRAME,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_binding(&old_request),
+            Err(StorageRpcAuthBindingError::Malformed)
+        );
         let request = encode_binding_with_encoded_frame(
             0x0102_0304_0506_0708,
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
             None,
-            V31_FRAME,
+            V22_FRAME,
         )
         .unwrap();
         assert_eq!(
@@ -2238,8 +2137,8 @@ mod tests {
                 "4152475352504342000201020304050607080000004030313233343536373839",
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "6162636465663031323334353637383961626364656611223344000000003718",
-                "0000006172676d696e2d73746f726167652d7270632d6672616d651f00080706",
-                "050403020103000300000042d9f133db41b242616263"
+                "0000006172676d696e2d73746f726167652d7270632d6672616d651600080706",
+                "0504030201030003000000ca4ad78d84830980616263"
             )
         );
 
@@ -2253,7 +2152,7 @@ mod tests {
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
             Some(&transcript),
-            V31_FRAME,
+            V22_FRAME,
         )
         .unwrap();
         assert_eq!(
@@ -2263,8 +2162,8 @@ mod tests {
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "616263646566303132333435363738396162636465661122334401673e6f836a",
                 "950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037",
-                "180000006172676d696e2d73746f726167652d7270632d6672616d651f000807",
-                "06050403020103000300000042d9f133db41b242616263"
+                "180000006172676d696e2d73746f726167652d7270632d6672616d6516000807",
+                "060504030201030003000000ca4ad78d84830980616263"
             )
         );
 
@@ -2679,7 +2578,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 176, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 171, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]
@@ -2717,18 +2616,6 @@ mod tests {
             &admin,
             StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
         ));
-        for kind in [
-            StorageRpcMessageKind::MetadataTransferStagingIntentCreate,
-            StorageRpcMessageKind::MetadataTransferStagingArtifactPublish,
-            StorageRpcMessageKind::MetadataTransferStagingProofPublish,
-            StorageRpcMessageKind::MetadataTransferStagingTombstone,
-            StorageRpcMessageKind::MetadataTransferStagingArtifactRead,
-        ] {
-            assert!(principal_allows_operation(&admin, kind));
-            assert!(!principal_allows_operation(&frontend, kind));
-            assert!(!principal_allows_operation(&storage, kind));
-            assert!(!principal_allows_operation(&maintenance, kind));
-        }
         assert!(!principal_allows_operation(
             &admin,
             StorageRpcMessageKind::MetadataCommandPendingSlotInsert
@@ -2972,113 +2859,6 @@ mod tests {
             client_auth.verify_response(NodeId::new(7), 2_000, &different_request_proof, &signed),
             Err(StorageRpcAuthRejectionReason::WrongRequest)
         );
-    }
-
-    #[test]
-    fn storage_rpc_response_freshness_is_protocol_wide_across_heterogeneous_timeouts() {
-        let caller_credential = credential(ControlPlaneAuthPrincipal::Admin {
-            instance_id: "metadata-transfer-response-timeout".to_owned(),
-        });
-        let client_transport_limits = StorageRpcTransportLimits::new(
-            StorageRpcTransportLimits::DEFAULT.max_frame_bytes(),
-            StorageRpcTransportLimits::DEFAULT.max_connections(),
-            std::time::Duration::from_secs(5),
-        )
-        .unwrap();
-        let server_transport_limits = StorageRpcTransportLimits::new(
-            StorageRpcTransportLimits::DEFAULT.max_frame_bytes(),
-            StorageRpcTransportLimits::DEFAULT.max_connections(),
-            std::time::Duration::from_secs(15),
-        )
-        .unwrap();
-        let client_auth = StorageRpcClientAuthConfig::from(
-            LivePgMetadataTransferStorageRpcClientCapability::new_with_transport_limits(
-                caller_credential.clone(),
-                9,
-                TOPOLOGY_DIGEST,
-                client_transport_limits,
-            )
-            .unwrap(),
-        );
-        let server_auth = StorageRpcServerAuthConfig::new(
-            caller_credential.cluster_id(),
-            ControlPlaneScopedCredentialStore::new(vec![caller_credential.clone()]).unwrap(),
-            9,
-            TOPOLOGY_DIGEST,
-        )
-        .unwrap()
-        .with_transport_limits(server_transport_limits);
-        let request = frame(StorageRpcMessageKind::MetadataTransferStagingArtifactRead);
-        let (request_envelope, request_proof) = client_auth
-            .sign_request(NodeId::new(7), 1_000, &request)
-            .unwrap()
-            .into_parts();
-        let verified_request = server_auth
-            .verify_request(NodeId::new(7), 1_500, &request_envelope)
-            .unwrap();
-        let (_, response_signing_context) =
-            verified_request.into_frame_and_response_signing_context();
-        let response = StorageRpcFrame {
-            request_id: request.request_id,
-            kind: request.kind,
-            payload: crate::storage_rpc::encode_storage_rpc_success_response(
-                &crate::storage_rpc::encode_metadata_transfer_staging_artifact_read_response(
-                    &vec![
-                        0x5a;
-                        usize::try_from(
-                            crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES
-                        )
-                        .unwrap()
-                    ],
-                )
-                .unwrap(),
-            ),
-        };
-        let signed = server_auth
-            .sign_response(&response_signing_context, NodeId::new(7), 1_500, &response)
-            .unwrap();
-        assert_eq!(
-            crate::storage_rpc::storage_rpc_response_max_payload_len(
-                response.kind,
-                crate::storage_rpc::STORAGE_RPC_MAX_PAYLOAD_LEN,
-            ),
-            response.payload.len()
-        );
-        assert!(
-            signed.len()
-                <= storage_rpc_auth_response_envelope_limit(
-                    response.kind,
-                    client_transport_limits.max_frame_bytes(),
-                )
-        );
-
-        assert_eq!(
-            client_auth
-                .verify_response(NodeId::new(7), 7_000, &request_proof, &signed)
-                .unwrap()
-                .into_frame(),
-            response
-        );
-        assert!(matches!(
-            client_auth.verify_response(NodeId::new(7), 61_501, &request_proof, &signed),
-            Err(StorageRpcAuthRejectionReason::Envelope(_))
-        ));
-    }
-
-    #[test]
-    fn storage_rpc_transport_timeout_is_bounded_by_response_authentication() {
-        assert!(StorageRpcTransportLimits::new(
-            StorageRpcTransportLimits::DEFAULT.max_frame_bytes(),
-            StorageRpcTransportLimits::DEFAULT.max_connections(),
-            std::time::Duration::from_millis(STORAGE_RPC_AUTH_RESPONSE_REPLAY_WINDOW_MS),
-        )
-        .is_ok());
-        assert!(StorageRpcTransportLimits::new(
-            StorageRpcTransportLimits::DEFAULT.max_frame_bytes(),
-            StorageRpcTransportLimits::DEFAULT.max_connections(),
-            std::time::Duration::from_millis(STORAGE_RPC_AUTH_RESPONSE_REPLAY_WINDOW_MS + 1),
-        )
-        .is_err());
     }
 
     #[test]

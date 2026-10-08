@@ -18,12 +18,6 @@ use rustls::pki_types::ServerName;
 use rustls::sign::CertifiedKey;
 use thiserror::Error;
 
-mod outage_artifact;
-pub use outage_artifact::OutageCommandArtifactPage;
-use outage_artifact::OutageCommandArtifactRecord;
-pub(crate) use outage_artifact::OutageCommandArtifactRetirement;
-pub(crate) use outage_artifact::OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES;
-
 use crate::control_plane_auth::{
     control_plane_auth_payload_has_magic, ControlPlaneAuthDecision, ControlPlaneAuthEnvelope,
     ControlPlaneAuthEnvelopeDecodeError, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
@@ -32,61 +26,11 @@ use crate::control_plane_auth::{
     ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{
-    decode_control_plane_command, encode_control_plane_command,
-    unavailable_pg_batch_metric_descriptor, AppliedControlPlaneCommand, ControlPlaneCommand,
-    ControlPlaneCommandResponse, ControlPlaneCommandStateMachine, ControlPlaneLogId,
-    ExpiredNodeHeartbeatLease, FinalizeMetadataTransferStagingGenerationRequest,
-    MetadataTransferStagingCleanupDisposition, MetadataTransferStagingTombstoneBinding,
-    PromotedNodeHeartbeatLease, ReadyPgPeeringCompletion,
-    UnavailablePgOutageResolutionIntentRequest, UnavailablePgStagingIntentAuthorizationRequest,
-    UnavailablePgStagingPublicationBinding, UnavailablePgTransitionBeginRequest,
-    UnavailablePgTransitionCompletionRequest, UnavailablePgTransitionInstallRequest,
+    decode_control_plane_command, encode_control_plane_command, AppliedControlPlaneCommand,
+    ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneCommandStateMachine,
+    ControlPlaneLogId, ExpiredNodeHeartbeatLease, PromotedNodeHeartbeatLease,
+    ReadyPgPeeringCompletion,
 };
-
-pub(crate) struct AuthorityPublishedStagingAuthorizationSeal {
-    _private: (),
-}
-
-fn authority_published_staging_authorization_seal() -> AuthorityPublishedStagingAuthorizationSeal {
-    AuthorityPublishedStagingAuthorizationSeal { _private: () }
-}
-
-pub(crate) struct CompletedUnavailablePgStagingCleanupAuthorization {
-    cluster_epoch: ClusterEpoch,
-    destination_actors: Vec<MetadataTransferStagingNodeIdentity>,
-}
-
-impl CompletedUnavailablePgStagingCleanupAuthorization {
-    pub(crate) fn cluster_epoch(&self) -> ClusterEpoch {
-        self.cluster_epoch
-    }
-
-    pub(crate) fn destination_actor(
-        &self,
-        node_id: NodeId,
-    ) -> Option<&MetadataTransferStagingNodeIdentity> {
-        self.destination_actors
-            .binary_search_by_key(&node_id, MetadataTransferStagingNodeIdentity::node_id)
-            .ok()
-            .map(|index| &self.destination_actors[index])
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn committed_staging_authorization_from_presentation_for_test(
-    presentation: crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
-    destination_node_id: NodeId,
-    pg_id: PgId,
-) -> crate::control_plane_command::CommittedUnavailablePgStagingAuthorization {
-    assert!(presentation.authorizes_destination_for_pg(destination_node_id, pg_id));
-    crate::control_plane_command::CommittedUnavailablePgStagingAuthorization::from_authority_published(
-        presentation,
-        destination_node_id,
-        pg_id,
-        authority_published_staging_authorization_seal(),
-    )
-}
-
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::control_plane_lease::{
     bounded_renewal_deadline, successor_activation_fence_satisfied, validate_process_lease_clock,
@@ -99,11 +43,6 @@ use crate::durable_journal::{
     DurableJournalObserver,
 };
 use crate::internal_tls_protocol::InternalTlsProtocol;
-use crate::pg_store::{
-    decode_staging_evidence_apply_receipt, decode_staging_evidence_page_payload,
-    MetadataTransferStagingEvidenceApplyReceipt, MetadataTransferStagingEvidencePage,
-    MetadataTransferStagingNodeIdentity,
-};
 use crate::static_topology::UncertifiedInitialControlPlaneTopology;
 use crate::{
     ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
@@ -117,52 +56,23 @@ const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 pub const DEFAULT_UNAVAILABLE_PLACEMENT_GRACE_MS: u64 = 30_000;
 pub const UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE: usize = 16;
-pub(crate) const METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE: usize = 16;
-pub const MAX_UNAVAILABLE_PG_TRANSITION_BATCH: usize = 16;
-pub(crate) const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES: usize = 64;
-const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS: usize = 64;
-const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_BYTES: usize = 120 * 1_024;
-const METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_PREFIX: &str =
-    "metadata_transfer_staging_evidence_checkpoint=";
-const METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_ANCHOR_STATE_RECORD_PREFIX: &str =
-    "metadata_transfer_staging_evidence_checkpoint_anchor=";
-const METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_STATE_RECORD_PREFIX: &str =
-    "metadata_transfer_staging_actor_closure=";
-const METADATA_TRANSFER_STAGING_RETIRED_ACTOR_CLOSURE_STATE_RECORD_PREFIX: &str =
-    "metadata_transfer_staging_retired_actor_closure=";
-const METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_STATE_RECORD_PREFIX: &str =
-    "metadata_transfer_staging_finalized_floor=";
 pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 29;
+const CONTROL_PLANE_RPC_VERSION: u16 = 18;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
 const CONTROL_PLANE_RPC_TLS_ALPN: &[u8] = InternalTlsProtocol::ControlPlaneRpc.alpn();
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 pub const CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
-const OUTAGE_RESOLUTION_MAX_IN_FLIGHT_OPERATION_MS: u64 = 15_000;
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 49;
-const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS: usize = 64;
-const UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN: &[u8] =
-    b"argmin-unavailable-pg-transition-batch-receipt-v1";
-const METADATA_TRANSFER_STAGING_CLEANUP_DIGEST_DOMAIN: &[u8] =
-    b"argmin-metadata-transfer-staging-cleanup-v2";
-const METADATA_TRANSFER_STAGING_CHECKPOINT_SEGMENT_DIGEST_DOMAIN: &[u8] =
-    b"argmin-metadata-transfer-staging-checkpoint-segment-v1";
-const METADATA_TRANSFER_STAGING_CHECKPOINT_SOURCE_SEGMENTS_DIGEST_DOMAIN: &[u8] =
-    b"argmin-metadata-transfer-staging-checkpoint-source-segments-v1";
-const METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_CERTIFICATE_DIGEST_DOMAIN: &[u8] =
-    b"argmin-metadata-transfer-staging-actor-closure-certificate-v1";
-pub(crate) const MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COALESCED_ANCHORS: usize = 64;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 32;
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
 const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
@@ -931,531 +841,7 @@ pub struct ClusterControlSnapshot {
     unavailable_pg_placement_transitions: BTreeMap<PgId, UnavailablePgPlacementTransition>,
     retained_unavailable_pg_placement_transitions:
         BTreeMap<(PgId, ClusterEpoch), UnavailablePgPlacementTransition>,
-    outage_command_artifacts:
-        BTreeMap<(PgId, ClusterEpoch, ClusterEpoch, u64), Arc<OutageCommandArtifactRecord>>,
-    outage_command_artifact_retirements:
-        BTreeMap<(PgId, ClusterEpoch, ClusterEpoch, u64), OutageCommandArtifactRetirement>,
-    outage_resolution_intents: BTreeMap<PgId, UnavailablePgOutageResolutionIntent>,
-    metadata_transfer_staging_evidence_pages:
-        BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidencePageRecord>,
-    metadata_transfer_staging_evidence_checkpoint_segments:
-        BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidenceCheckpointSegment>,
-    metadata_transfer_staging_evidence_checkpoint_anchors:
-        BTreeMap<(NodeId, u64, u64), MetadataTransferStagingEvidenceCheckpointAnchor>,
-    metadata_transfer_staging_actor_closures:
-        BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureCertificate>,
-    metadata_transfer_staging_retired_actor_closures:
-        BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureCertificate>,
-    metadata_transfer_staging_finalized_floors:
-        BTreeMap<(PgId, u64), MetadataTransferStagingFinalizedFloor>,
-    metadata_transfer_staging_evidence: BTreeMap<MetadataTransferStagingEvidenceKey, Vec<u8>>,
     history: Vec<ClusterMapHistoryRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingEvidencePageRecord {
-    operation_payload: Vec<u8>,
-    page_digest: [u8; 32],
-    apply_receipt: Vec<u8>,
-}
-
-pub(crate) enum MetadataTransferStagingEvidencePageClassification {
-    NewAuthorized {
-        page_key: (NodeId, u64, u64),
-        decoded_entries: Vec<(MetadataTransferStagingEvidenceKey, Vec<u8>)>,
-        apply_receipt: Vec<u8>,
-    },
-    ExactReplay {
-        apply_receipt: Vec<u8>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingEvidenceCheckpointSegment {
-    actor: crate::pg_store::MetadataTransferStagingNodeIdentity,
-    first_generation: u64,
-    last_generation: u64,
-    previous_generation: u64,
-    previous_apply_receipt_digest: [u8; 32],
-    page_links: Vec<MetadataTransferStagingEvidenceCheckpointPageLink>,
-    tip_apply_receipt: Vec<u8>,
-    commitments: BTreeMap<MetadataTransferStagingEvidenceKey, [u8; 32]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingEvidenceCheckpointPageLink {
-    page_digest: [u8; 32],
-    previous_apply_receipt_digest: [u8; 32],
-    apply_receipt_digest: [u8; 32],
-    actor_closure_candidate: Option<crate::pg_store::MetadataTransferStagingActorClosureCandidate>,
-    entries: Vec<MetadataTransferStagingEvidenceCheckpointPageEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingEvidenceCheckpointPageEntry {
-    sequence: u64,
-    evidence_key: MetadataTransferStagingEvidenceKey,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingEvidenceCheckpointAnchor {
-    actor: crate::pg_store::MetadataTransferStagingNodeIdentity,
-    first_generation: u64,
-    last_generation: u64,
-    previous_generation: u64,
-    previous_apply_receipt_digest: [u8; 32],
-    tip_apply_receipt: Vec<u8>,
-    source_segment_digest: [u8; 32],
-    source_segment_count: u64,
-    source_segments_digest: [u8; 32],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingFinalizedCheckpointBinding {
-    actor_node_id: NodeId,
-    actor_node_incarnation: u64,
-    actor_endpoint: String,
-    first_generation: u64,
-    last_generation: u64,
-    page_generation: u64,
-    page_sequence: u64,
-    segment_digest: [u8; 32],
-    actor_closure_candidate: Option<crate::pg_store::MetadataTransferStagingActorClosureCandidate>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingActorClosureCertificate {
-    source_actor: MetadataTransferStagingNodeIdentity,
-    source_tip_generation: u64,
-    source_tip_page_digest: [u8; 32],
-    source_tip_apply_receipt_digest: [u8; 32],
-    destination_actor: MetadataTransferStagingNodeIdentity,
-    destination_genesis_page_digest: [u8; 32],
-    rebound_entry_count: u64,
-    rebound_max_sequence: u64,
-    rebound_evidence_digest: [u8; 32],
-}
-
-type MetadataTransferStagingActorClosureTip =
-    (MetadataTransferStagingNodeIdentity, u64, [u8; 32], [u8; 32]);
-
-struct MetadataTransferStagingActorClosureValidationIndex {
-    actor_tips: BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureTip>,
-    actor_genesis: BTreeMap<(NodeId, u64), (String, [u8; 32])>,
-    actor_entries: BTreeMap<(NodeId, u64), BTreeMap<u64, Vec<u8>>>,
-}
-
-fn metadata_transfer_staging_actor_closure_certificate_digest(
-    certificate: &MetadataTransferStagingActorClosureCertificate,
-) -> [u8; 32] {
-    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-    digest_bytes(
-        &mut hasher,
-        METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_CERTIFICATE_DIGEST_DOMAIN,
-    );
-    for actor in [&certificate.source_actor, &certificate.destination_actor] {
-        digest_u32(&mut hasher, actor.node_id().as_u32());
-        digest_u64(&mut hasher, actor.node_incarnation());
-        digest_bytes(&mut hasher, actor.endpoint().as_bytes());
-    }
-    digest_u64(&mut hasher, certificate.source_tip_generation);
-    digest_bytes(&mut hasher, &certificate.source_tip_page_digest);
-    digest_bytes(&mut hasher, &certificate.source_tip_apply_receipt_digest);
-    digest_bytes(&mut hasher, &certificate.destination_genesis_page_digest);
-    digest_u64(&mut hasher, certificate.rebound_entry_count);
-    digest_u64(&mut hasher, certificate.rebound_max_sequence);
-    digest_bytes(&mut hasher, &certificate.rebound_evidence_digest);
-    hasher
-        .finalize()
-        .bytes()
-        .try_into()
-        .expect("SHA-256 actor-closure certificate digest has fixed length")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingFinalizedFloor {
-    transition: UnavailablePgTransitionMutationBinding,
-    staging_generation: u64,
-    disposition: MetadataTransferStagingCleanupDisposition,
-    artifact_digest: [u8; 32],
-    artifact_length: u64,
-    artifact_format_version: u16,
-    publications: Vec<MetadataTransferStagingFinalizedPublicationBinding>,
-    tombstones: Vec<MetadataTransferStagingTombstoneBinding>,
-    tombstone_set_digest: [u8; 32],
-    checkpoint_bindings: BTreeMap<
-        MetadataTransferStagingEvidenceKey,
-        MetadataTransferStagingFinalizedCheckpointBinding,
-    >,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataTransferStagingFinalizedPublicationBinding {
-    node_id: NodeId,
-    node_incarnation: u64,
-    endpoint: String,
-    target_epoch: ClusterEpoch,
-    transfer: PgMetadataTransferProof,
-    evidence_digest: [u8; 32],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MetadataTransferStagingFinalizedEvidenceIndexEntry<'a> {
-    floor: &'a MetadataTransferStagingFinalizedFloor,
-    endpoint: &'a str,
-    evidence_digest: [u8; 32],
-    target_epoch: Option<ClusterEpoch>,
-    transfer: Option<PgMetadataTransferProof>,
-}
-
-type MetadataTransferStagingFinalizedEvidenceIndex<'a> = BTreeMap<
-    MetadataTransferStagingEvidenceKey,
-    MetadataTransferStagingFinalizedEvidenceIndexEntry<'a>,
->;
-
-type MetadataTransferStagingFinalizedCheckpointIndex<'a> = BTreeMap<
-    (NodeId, u64, u64, u64, [u8; 32]),
-    Vec<(
-        &'a MetadataTransferStagingEvidenceKey,
-        &'a MetadataTransferStagingFinalizedFloor,
-    )>,
->;
-
-#[derive(Debug, Clone, Copy)]
-struct MetadataTransferStagingCheckpointSourceSegmentBinding {
-    first_generation: u64,
-    last_generation: u64,
-    previous_generation: u64,
-    previous_apply_receipt_digest: [u8; 32],
-    source_segment_digest: [u8; 32],
-}
-
-fn metadata_transfer_staging_finalized_evidence_index(
-    floors: &BTreeMap<(PgId, u64), MetadataTransferStagingFinalizedFloor>,
-) -> Result<MetadataTransferStagingFinalizedEvidenceIndex<'_>, String> {
-    let mut index = BTreeMap::new();
-    for ((pg_id, staging_generation), floor) in floors {
-        if floor.publications.len()
-            > crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
-                .saturating_mul(floor.transition.destination_acting_set().len())
-        {
-            return Err(
-                "metadata-transfer staging finalized publication exceeds its bounded actor-target index"
-                    .to_owned(),
-            );
-        }
-        let mut publication_actor_targets = BTreeSet::new();
-        for publication in &floor.publications {
-            if !publication_actor_targets.insert((publication.target_epoch, publication.node_id)) {
-                return Err(
-                    "metadata-transfer staging finalized publication has a duplicate actor-target identity"
-                        .to_owned(),
-                );
-            }
-            let key = MetadataTransferStagingEvidenceKey {
-                pg_id: *pg_id,
-                staging_generation: *staging_generation,
-                actor_node_id: publication.node_id,
-                actor_node_incarnation: publication.node_incarnation,
-                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-                target_epoch: Some(publication.target_epoch),
-            };
-            if index
-                .insert(
-                    key,
-                    MetadataTransferStagingFinalizedEvidenceIndexEntry {
-                        floor,
-                        endpoint: &publication.endpoint,
-                        evidence_digest: publication.evidence_digest,
-                        target_epoch: Some(publication.target_epoch),
-                        transfer: Some(publication.transfer),
-                    },
-                )
-                .is_some()
-            {
-                return Err(
-                    "metadata-transfer staging finalized evidence has a duplicate identity"
-                        .to_owned(),
-                );
-            }
-        }
-        for tombstone in &floor.tombstones {
-            let key = MetadataTransferStagingEvidenceKey {
-                pg_id: *pg_id,
-                staging_generation: *staging_generation,
-                actor_node_id: tombstone.node_id,
-                actor_node_incarnation: tombstone.node_incarnation,
-                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
-                target_epoch: None,
-            };
-            if index
-                .insert(
-                    key,
-                    MetadataTransferStagingFinalizedEvidenceIndexEntry {
-                        floor,
-                        endpoint: &tombstone.endpoint,
-                        evidence_digest: tombstone.evidence_digest,
-                        target_epoch: None,
-                        transfer: None,
-                    },
-                )
-                .is_some()
-            {
-                return Err(
-                    "metadata-transfer staging finalized evidence has a duplicate identity"
-                        .to_owned(),
-                );
-            }
-        }
-        for (key, binding) in &floor.checkpoint_bindings {
-            if index.contains_key(key) {
-                continue;
-            }
-            let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
-                key.actor_node_id,
-                key.actor_node_incarnation,
-                binding.actor_endpoint.clone(),
-            )
-            .map_err(|error| error.to_string())?;
-            let bytes = metadata_transfer_staging_finalized_semantic_evidence_bytes(
-                floor,
-                &actor,
-                key.kind,
-                key.target_epoch,
-            )?;
-            let evidence = crate::pg_store::decode_staging_evidence(&bytes)
-                .map_err(|error| error.to_string())?;
-            if index
-                .insert(
-                    key.clone(),
-                    MetadataTransferStagingFinalizedEvidenceIndexEntry {
-                        floor,
-                        endpoint: &binding.actor_endpoint,
-                        evidence_digest: checksum::sha256::digest(&bytes),
-                        target_epoch: evidence.target_epoch(),
-                        transfer: evidence.transfer(),
-                    },
-                )
-                .is_some()
-            {
-                return Err(
-                    "metadata-transfer staging finalized replay evidence has a duplicate identity"
-                        .to_owned(),
-                );
-            }
-        }
-    }
-    Ok(index)
-}
-
-fn metadata_transfer_staging_finalized_semantic_evidence_bytes(
-    floor: &MetadataTransferStagingFinalizedFloor,
-    actor: &crate::pg_store::MetadataTransferStagingNodeIdentity,
-    kind: crate::pg_store::MetadataTransferStagingEvidenceKind,
-    target_epoch: Option<ClusterEpoch>,
-) -> Result<Vec<u8>, String> {
-    let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
-        &floor.transition,
-        floor.artifact_digest,
-        floor.artifact_length,
-        floor.artifact_format_version,
-    )
-    .map_err(|error| error.to_string())?;
-    let (source_actor, transfer, expected_digest) = match kind {
-        crate::pg_store::MetadataTransferStagingEvidenceKind::Publication => {
-            let target_epoch = target_epoch.ok_or_else(|| {
-                "metadata-transfer staging finalized publication replay has no target epoch"
-                    .to_owned()
-            })?;
-            let publication = floor
-                .publications
-                .iter()
-                .find(|publication| {
-                    publication.node_id == actor.node_id()
-                        && publication.target_epoch == target_epoch
-                })
-                .ok_or_else(|| {
-                    "metadata-transfer staging finalized publication replay has no semantic source"
-                        .to_owned()
-                })?;
-            let source_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
-                publication.node_id,
-                publication.node_incarnation,
-                publication.endpoint.clone(),
-            )
-            .map_err(|error| error.to_string())?;
-            (
-                source_actor,
-                Some(publication.transfer),
-                publication.evidence_digest,
-            )
-        }
-        crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone => {
-            if target_epoch.is_some() {
-                return Err(
-                    "metadata-transfer staging finalized tombstone replay has a target epoch"
-                        .to_owned(),
-                );
-            }
-            let tombstone = floor
-                .tombstones
-                .iter()
-                .find(|tombstone| tombstone.node_id == actor.node_id())
-                .ok_or_else(|| {
-                    "metadata-transfer staging finalized tombstone replay has no semantic source"
-                        .to_owned()
-                })?;
-            let source_actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
-                tombstone.node_id,
-                tombstone.node_incarnation,
-                tombstone.endpoint.clone(),
-            )
-            .map_err(|error| error.to_string())?;
-            (source_actor, None, tombstone.evidence_digest)
-        }
-    };
-    let source_bytes = crate::pg_store::canonical_metadata_transfer_staging_evidence(
-        &source_actor,
-        &intent,
-        kind,
-        target_epoch,
-        transfer,
-    )
-    .map_err(|error| error.to_string())?;
-    if checksum::sha256::digest(&source_bytes) != expected_digest {
-        return Err(
-            "metadata-transfer staging finalized semantic source is not canonical".to_owned(),
-        );
-    }
-    crate::pg_store::canonical_metadata_transfer_staging_evidence(
-        actor,
-        &intent,
-        kind,
-        target_epoch,
-        transfer,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn metadata_transfer_staging_finalized_checkpoint_index(
-    floors: &BTreeMap<(PgId, u64), MetadataTransferStagingFinalizedFloor>,
-) -> Result<MetadataTransferStagingFinalizedCheckpointIndex<'_>, String> {
-    let mut index = BTreeMap::new();
-    for ((pg_id, staging_generation), floor) in floors {
-        for (key, binding) in &floor.checkpoint_bindings {
-            if key.pg_id != *pg_id || key.staging_generation != *staging_generation {
-                return Err(
-                    "metadata-transfer staging finalized checkpoint binding has a foreign floor identity"
-                        .to_owned(),
-                );
-            }
-            index
-                .entry((
-                    binding.actor_node_id,
-                    binding.actor_node_incarnation,
-                    binding.first_generation,
-                    binding.last_generation,
-                    binding.segment_digest,
-                ))
-                .or_insert_with(Vec::new)
-                .push((key, floor));
-        }
-    }
-    Ok(index)
-}
-
-fn metadata_transfer_staging_checkpoint_source_segments(
-    finalized_checkpoints: &MetadataTransferStagingFinalizedCheckpointIndex<'_>,
-    actor_node_id: NodeId,
-    actor_node_incarnation: u64,
-    first_generation: u64,
-    last_generation: u64,
-) -> Result<Vec<(u64, u64, [u8; 32])>, String> {
-    let start = (
-        actor_node_id,
-        actor_node_incarnation,
-        first_generation,
-        0,
-        [0; 32],
-    );
-    let end = (
-        actor_node_id,
-        actor_node_incarnation,
-        last_generation,
-        u64::MAX,
-        [u8::MAX; 32],
-    );
-    let mut sources = Vec::new();
-    let mut next_generation = first_generation;
-    for ((_, _, source_first, source_last, source_digest), _) in
-        finalized_checkpoints.range(start..=end)
-    {
-        if *source_first != next_generation || *source_last < *source_first {
-            return Err(
-                "metadata-transfer staging checkpoint source ranges are not contiguous".to_owned(),
-            );
-        }
-        sources.push((*source_first, *source_last, *source_digest));
-        if *source_last == last_generation {
-            break;
-        }
-        next_generation = source_last.checked_add(1).ok_or_else(|| {
-            "metadata-transfer staging checkpoint source range overflows".to_owned()
-        })?;
-    }
-    if sources.is_empty()
-        || sources.first().map(|source| source.0) != Some(first_generation)
-        || sources.last().map(|source| source.1) != Some(last_generation)
-        || sources
-            .windows(2)
-            .any(|pair| pair[0].1.checked_add(1) != Some(pair[1].0))
-    {
-        return Err(
-            "metadata-transfer staging checkpoint source ranges do not cover the anchor".to_owned(),
-        );
-    }
-    Ok(sources)
-}
-
-#[derive(Clone)]
-struct MetadataTransferStagingActorChainTip {
-    actor: MetadataTransferStagingNodeIdentity,
-    generation: u64,
-    page_digest: [u8; 32],
-    apply_receipt_digest: [u8; 32],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct MetadataTransferStagingEvidenceKey {
-    pg_id: PgId,
-    staging_generation: u64,
-    actor_node_id: NodeId,
-    actor_node_incarnation: u64,
-    kind: crate::pg_store::MetadataTransferStagingEvidenceKind,
-    target_epoch: Option<ClusterEpoch>,
-}
-
-fn metadata_transfer_staging_evidence_key(
-    evidence: &crate::pg_store::MetadataTransferStagingEvidence,
-) -> MetadataTransferStagingEvidenceKey {
-    MetadataTransferStagingEvidenceKey {
-        pg_id: evidence.intent().pg_id(),
-        staging_generation: evidence.intent().staging_generation(),
-        actor_node_id: evidence.actor().node_id(),
-        actor_node_incarnation: evidence.actor().node_incarnation(),
-        kind: evidence.kind(),
-        target_epoch: evidence.target_epoch(),
-    }
-}
-
-fn metadata_transfer_staging_finalized_generation(
-    floors: &BTreeMap<(PgId, u64), MetadataTransferStagingFinalizedFloor>,
-    pg_id: PgId,
-) -> Option<u64> {
-    floors
-        .range((pg_id, 0)..=(pg_id, u64::MAX))
-        .next_back()
-        .map(|(key, _)| key.1)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1514,697 +900,11 @@ pub struct UnavailablePgPlacementTransition {
     destination_epoch: Option<ClusterEpoch>,
     destination_route: Option<HistoricalPgRouteRecord>,
     payload_readiness: Option<UnavailablePgPayloadReadiness>,
-    completion: Option<ReadyPgPeeringCompletion>,
-    begin_batch_receipt: UnavailablePgTransitionBatchReceipt,
-    staging_authorization: Option<UnavailablePgStagingIntentAuthorization>,
-    destination_install: Option<UnavailablePgDestinationInstall>,
-    completion_batch_receipt: Option<UnavailablePgTransitionBatchReceipt>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnavailablePgOutageResolutionIntent {
-    request: UnavailablePgOutageResolutionIntentRequest,
-    committed_epoch: ClusterEpoch,
-    batch_member_pg_ids: Vec<PgId>,
-    batch_members_digest: [u8; 32],
-}
-
-impl UnavailablePgOutageResolutionIntent {
-    #[must_use]
-    pub fn pg_id(&self) -> PgId {
-        self.request.pg_id
-    }
-
-    #[must_use]
-    pub fn fence_cutoff_ms(&self) -> u64 {
-        self.request.fence_cutoff_ms
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnavailablePgStagingIntentAuthorization {
-    staging_generation: u64,
-    artifact_target_epoch: ClusterEpoch,
-    artifact_digest: [u8; 32],
-    artifact_length: u64,
-    artifact_format_version: u16,
-    batch_receipt: UnavailablePgTransitionBatchReceipt,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UnavailablePgDestinationInstall {
-    transfer: PgMetadataTransferProof,
-    publications: Vec<UnavailablePgStagingPublicationBinding>,
-    batch_receipt: UnavailablePgTransitionBatchReceipt,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum UnavailablePgTransitionBatchStage {
-    Begin,
-    StagingAuthorization,
-    DestinationInstall,
-    Completion,
-}
-
-impl UnavailablePgTransitionBatchStage {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Begin => "begin",
-            Self::StagingAuthorization => "staging-authorization",
-            Self::DestinationInstall => "destination-install",
-            Self::Completion => "completion",
-        }
-    }
-
-    fn from_str(value: &str) -> Result<Self, String> {
-        match value {
-            "begin" => Ok(Self::Begin),
-            "staging-authorization" => Ok(Self::StagingAuthorization),
-            "destination-install" => Ok(Self::DestinationInstall),
-            "completion" => Ok(Self::Completion),
-            _ => Err(format!(
-                "unknown unavailable PG transition batch stage {value:?}"
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct UnavailablePgTransitionBatchReceiptIdentity {
-    stage: UnavailablePgTransitionBatchStage,
-    member_pg_ids: Vec<PgId>,
-    members_digest: [u8; 32],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct UnavailablePgTransitionBatchReceipt {
-    identity: UnavailablePgTransitionBatchReceiptIdentity,
-    source_epoch: ClusterEpoch,
-    target_epoch: ClusterEpoch,
-}
-
-#[derive(Debug)]
-enum ValidatedUnavailablePgTransitionBegin {
-    ExactReplay {
-        pg_id: PgId,
-    },
-    Apply {
-        requested: Box<UnavailablePgPlacementTransition>,
-        previous_primary_lease: Option<PreviousPrimaryLease>,
-        fenced_primary_lease_deadline_ms: u64,
-    },
-}
-
-impl ValidatedUnavailablePgTransitionBegin {
-    fn pg_id(&self) -> PgId {
-        match self {
-            Self::ExactReplay { pg_id } => *pg_id,
-            Self::Apply { requested, .. } => requested.pg_id,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum ValidatedUnavailablePgTransitionCompletion {
-    ExactReplay {
-        pg_id: PgId,
-    },
-    Apply {
-        readiness: Box<UnavailablePgPayloadReadiness>,
-        completion: ReadyPgPeeringCompletion,
-        batch_identity: UnavailablePgTransitionBatchReceiptIdentity,
-    },
-}
-
-#[derive(Debug)]
-enum ValidatedUnavailablePgStagingIntentAuthorization {
-    ExactReplay {
-        pg_id: PgId,
-    },
-    Apply {
-        pg_id: PgId,
-        authorization: UnavailablePgStagingIntentAuthorization,
-    },
-}
-
-#[derive(Debug)]
-enum ValidatedUnavailablePgDestinationInstall {
-    ExactReplay {
-        pg_id: PgId,
-    },
-    Apply {
-        pg_id: PgId,
-        transfer: PgMetadataTransferProof,
-        publications: Vec<UnavailablePgStagingPublicationBinding>,
-        batch_identity: UnavailablePgTransitionBatchReceiptIdentity,
-    },
-}
-
-impl ValidatedUnavailablePgDestinationInstall {
-    fn pg_id(&self) -> PgId {
-        match self {
-            Self::ExactReplay { pg_id } | Self::Apply { pg_id, .. } => *pg_id,
-        }
-    }
-}
-
-impl ValidatedUnavailablePgStagingIntentAuthorization {
-    fn pg_id(&self) -> PgId {
-        match self {
-            Self::ExactReplay { pg_id } | Self::Apply { pg_id, .. } => *pg_id,
-        }
-    }
-}
-
-impl ValidatedUnavailablePgTransitionCompletion {
-    fn pg_id(&self) -> PgId {
-        match self {
-            Self::ExactReplay { pg_id } => *pg_id,
-            Self::Apply { readiness, .. } => readiness.pg_id,
-        }
-    }
-}
-
-fn validate_canonical_unavailable_pg_batch(
-    kind: &str,
-    pg_ids: impl IntoIterator<Item = PgId>,
-) -> Result<(), ControlPlaneError> {
-    let mut previous = None;
-    let mut count = 0_usize;
-    for pg_id in pg_ids {
-        count = count.saturating_add(1);
-        if count > MAX_UNAVAILABLE_PG_TRANSITION_BATCH {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "unavailable placement {kind} batch exceeds the {} member limit",
-                    MAX_UNAVAILABLE_PG_TRANSITION_BATCH
-                ),
-            });
-        }
-        if previous.is_some_and(|previous_pg_id| previous_pg_id >= pg_id) {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "unavailable placement {kind} batch PG IDs are not strictly increasing"
-                ),
-            });
-        }
-        previous = Some(pg_id);
-    }
-    if count == 0 {
-        return Err(ControlPlaneError::CommandDecode {
-            message: format!("unavailable placement {kind} batch is empty"),
-        });
-    }
-    Ok(())
-}
-
-fn unavailable_pg_transition_begin_batch_identity(
-    requests: &[UnavailablePgTransitionBeginRequest],
-    expected_transition_epoch: ClusterEpoch,
-    begin_at_ms: u64,
-) -> UnavailablePgTransitionBatchReceiptIdentity {
-    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-    digest_bytes(
-        &mut hasher,
-        UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN,
-    );
-    digest_u8(&mut hasher, 1);
-    digest_u64(&mut hasher, expected_transition_epoch.get());
-    digest_u64(&mut hasher, begin_at_ms);
-    digest_len(&mut hasher, requests.len());
-    for request in requests {
-        digest_u32(&mut hasher, request.pg_id.get());
-        digest_option_u64(
-            &mut hasher,
-            request.predecessor_transition_epoch.map(ClusterEpoch::get),
-        );
-        digest_u64(&mut hasher, request.source_epoch.get());
-        digest_node_ids(&mut hasher, &request.source_acting_set);
-        digest_u32(&mut hasher, request.source_node_id.as_u32());
-        digest_bytes(
-            &mut hasher,
-            format_unavailable_pg_transition_begin_authorization(&request.begin_authorization)
-                .as_bytes(),
-        );
-        digest_unavailable_node_observation(&mut hasher, &request.unavailable_node);
-        digest_u64(&mut hasher, request.grace_cutoff_ms);
-        digest_u64(&mut hasher, request.topology_generation);
-        digest_bytes(&mut hasher, &request.topology_digest);
-        digest_node_ids(&mut hasher, &request.destination_acting_set);
-    }
-    UnavailablePgTransitionBatchReceiptIdentity {
-        stage: UnavailablePgTransitionBatchStage::Begin,
-        member_pg_ids: requests.iter().map(|request| request.pg_id).collect(),
-        members_digest: hasher
-            .finalize()
-            .bytes()
-            .try_into()
-            .expect("SHA-256 unavailable transition batch digest must contain 32 bytes"),
-    }
-}
-
-fn unavailable_pg_outage_resolution_intent_batch_digest(
-    requests: &[UnavailablePgOutageResolutionIntentRequest],
-    expected_cluster_epoch: ClusterEpoch,
-) -> [u8; 32] {
-    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-    digest_bytes(
-        &mut hasher,
-        b"argmin-unavailable-pg-outage-resolution-intent-batch-v1",
-    );
-    digest_u64(&mut hasher, expected_cluster_epoch.get());
-    digest_len(&mut hasher, requests.len());
-    for request in requests {
-        digest_u32(&mut hasher, request.pg_id.get());
-        digest_u64(&mut hasher, request.source_epoch.get());
-        digest_bytes(
-            &mut hasher,
-            format_historical_pg_route_record(&request.source_route).as_bytes(),
-        );
-        digest_unavailable_node_observation(&mut hasher, &request.unavailable_node);
-        digest_u64(&mut hasher, request.topology_generation);
-        digest_bytes(&mut hasher, &request.topology_digest);
-        digest_u64(&mut hasher, request.command_epoch.get());
-        digest_u64(&mut hasher, request.command_log_index);
-        digest_u32(&mut hasher, request.artifact_length);
-        digest_bytes(&mut hasher, &request.artifact_digest);
-        digest_u64(&mut hasher, request.lease_grant_not_after_ms);
-        digest_u64(&mut hasher, request.fence_cutoff_ms);
-    }
-    hasher
-        .finalize()
-        .bytes()
-        .try_into()
-        .expect("SHA-256 outage-resolution batch digest must contain 32 bytes")
-}
-
-fn unavailable_pg_transition_completion_batch_identity(
-    requests: &[UnavailablePgTransitionCompletionRequest],
-    ready_at_ms: u64,
-) -> UnavailablePgTransitionBatchReceiptIdentity {
-    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-    digest_bytes(
-        &mut hasher,
-        UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN,
-    );
-    digest_u8(&mut hasher, 3);
-    digest_u64(&mut hasher, ready_at_ms);
-    digest_len(&mut hasher, requests.len());
-    for request in requests {
-        digest_unavailable_pg_transition_binding(&mut hasher, &request.unavailable_transition);
-        digest_u32(&mut hasher, request.pg_id.get());
-        digest_u64(&mut hasher, request.transition_epoch.get());
-        digest_u64(&mut hasher, request.destination_epoch.get());
-        digest_u64(&mut hasher, request.topology_generation);
-        digest_bytes(&mut hasher, &request.topology_digest);
-        digest_len(&mut hasher, request.destinations.len());
-        for destination in &request.destinations {
-            digest_u32(&mut hasher, destination.node_id.as_u32());
-            digest_u64(&mut hasher, destination.node_incarnation);
-            digest_bytes(&mut hasher, destination.endpoint.as_bytes());
-            digest_u64(&mut hasher, destination.lease_deadline_ms);
-        }
-        digest_u32(&mut hasher, request.completion.pg_id.get());
-        digest_u32(&mut hasher, request.completion.primary.as_u32());
-        digest_u64(&mut hasher, request.completion.node_incarnation);
-        digest_pg_metadata_proof(&mut hasher, request.completion.active_metadata_proof);
-        digest_u64(
-            &mut hasher,
-            request.completion.active_metadata_proof_epoch.get(),
-        );
-    }
-    UnavailablePgTransitionBatchReceiptIdentity {
-        stage: UnavailablePgTransitionBatchStage::Completion,
-        member_pg_ids: requests.iter().map(|request| request.pg_id).collect(),
-        members_digest: hasher
-            .finalize()
-            .bytes()
-            .try_into()
-            .expect("SHA-256 unavailable transition batch digest must contain 32 bytes"),
-    }
-}
-
-fn unavailable_pg_staging_authorization_batch_identity(
-    requests: &[UnavailablePgStagingIntentAuthorizationRequest],
-) -> UnavailablePgTransitionBatchReceiptIdentity {
-    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-    digest_bytes(
-        &mut hasher,
-        UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN,
-    );
-    digest_u8(&mut hasher, 2);
-    digest_len(&mut hasher, requests.len());
-    for request in requests {
-        digest_unavailable_pg_transition_binding(&mut hasher, &request.unavailable_transition);
-        digest_u64(&mut hasher, request.staging_generation);
-        digest_u64(&mut hasher, request.artifact_target_epoch.get());
-        digest_bytes(&mut hasher, &request.artifact_digest);
-        digest_u64(&mut hasher, request.artifact_length);
-        digest_u16(&mut hasher, request.artifact_format_version);
-    }
-    UnavailablePgTransitionBatchReceiptIdentity {
-        stage: UnavailablePgTransitionBatchStage::StagingAuthorization,
-        member_pg_ids: requests
-            .iter()
-            .map(|request| request.unavailable_transition.pg_id())
-            .collect(),
-        members_digest: hasher
-            .finalize()
-            .bytes()
-            .try_into()
-            .expect("SHA-256 staging authorization batch digest must contain 32 bytes"),
-    }
-}
-
-pub(crate) fn unavailable_pg_staging_authorization_members_digest(
-    requests: &[UnavailablePgStagingIntentAuthorizationRequest],
-) -> [u8; 32] {
-    unavailable_pg_staging_authorization_batch_identity(requests).members_digest
-}
-
-fn unavailable_pg_destination_install_batch_identity(
-    requests: &[UnavailablePgTransitionInstallRequest],
-    expected_destination_epoch: ClusterEpoch,
-) -> UnavailablePgTransitionBatchReceiptIdentity {
-    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-    digest_bytes(
-        &mut hasher,
-        UNAVAILABLE_PG_TRANSITION_BATCH_RECEIPT_DIGEST_DOMAIN,
-    );
-    digest_u8(&mut hasher, 4);
-    digest_u64(&mut hasher, expected_destination_epoch.get());
-    digest_len(&mut hasher, requests.len());
-    for request in requests {
-        digest_unavailable_pg_transition_binding(&mut hasher, &request.unavailable_transition);
-        digest_u64(&mut hasher, request.transfer.source_epoch().get());
-        digest_pg_metadata_proof(&mut hasher, request.transfer.source_metadata_proof());
-        digest_pg_metadata_proof(&mut hasher, request.transfer.metadata_proof());
-        digest_u64(&mut hasher, request.expected_destination_epoch.get());
-        digest_len(&mut hasher, request.publications.len());
-        for publication in &request.publications {
-            digest_u32(&mut hasher, publication.node_id.as_u32());
-            digest_u64(&mut hasher, publication.node_incarnation);
-            digest_bytes(&mut hasher, publication.endpoint.as_bytes());
-            digest_bytes(&mut hasher, &publication.evidence_digest);
-        }
-    }
-    UnavailablePgTransitionBatchReceiptIdentity {
-        stage: UnavailablePgTransitionBatchStage::DestinationInstall,
-        member_pg_ids: requests
-            .iter()
-            .map(|request| request.unavailable_transition.pg_id())
-            .collect(),
-        members_digest: hasher
-            .finalize()
-            .bytes()
-            .try_into()
-            .expect("SHA-256 destination install batch digest must contain 32 bytes"),
-    }
-}
-
-fn unavailable_pg_staging_authorization_request_from_durable(
-    transition: &UnavailablePgPlacementTransition,
-) -> Option<UnavailablePgStagingIntentAuthorizationRequest> {
-    let authorization = transition.staging_authorization.as_ref()?;
-    Some(UnavailablePgStagingIntentAuthorizationRequest {
-        unavailable_transition: UnavailablePgTransitionMutationBinding::new(
-            transition.pg_id,
-            transition.transition_epoch,
-            transition.source_epoch,
-            transition.source_acting_set.clone(),
-            transition.destination_acting_set.clone(),
-        ),
-        staging_generation: authorization.staging_generation,
-        artifact_target_epoch: authorization.artifact_target_epoch,
-        artifact_digest: authorization.artifact_digest,
-        artifact_length: authorization.artifact_length,
-        artifact_format_version: authorization.artifact_format_version,
-    })
-}
-
-fn unavailable_pg_destination_install_request_from_durable(
-    transition: &UnavailablePgPlacementTransition,
-) -> Option<UnavailablePgTransitionInstallRequest> {
-    let install = transition.destination_install.as_ref()?;
-    Some(UnavailablePgTransitionInstallRequest {
-        unavailable_transition: UnavailablePgTransitionMutationBinding::new(
-            transition.pg_id,
-            transition.transition_epoch,
-            transition.source_epoch,
-            transition.source_acting_set.clone(),
-            transition.destination_acting_set.clone(),
-        ),
-        transfer: install.transfer,
-        expected_destination_epoch: transition.destination_epoch?,
-        publications: install.publications.clone(),
-    })
-}
-
-fn unavailable_pg_transition_begin_request_from_durable(
-    transition: &UnavailablePgPlacementTransition,
-) -> UnavailablePgTransitionBeginRequest {
-    UnavailablePgTransitionBeginRequest {
-        pg_id: transition.pg_id,
-        predecessor_transition_epoch: transition.predecessor_transition_epoch,
-        source_epoch: transition.source_epoch,
-        source_acting_set: transition.source_acting_set.clone(),
-        source_node_id: transition.source_node_id,
-        begin_authorization: transition.begin_authorization.clone(),
-        unavailable_node: transition.unavailable_node.clone(),
-        grace_cutoff_ms: transition.grace_cutoff_ms,
-        topology_generation: transition.topology_generation,
-        topology_digest: transition.topology_digest,
-        destination_acting_set: transition.destination_acting_set.clone(),
-    }
-}
-
-fn unavailable_pg_transition_completion_request_from_durable(
-    transition: &UnavailablePgPlacementTransition,
-) -> Result<(UnavailablePgTransitionCompletionRequest, u64), String> {
-    let readiness = transition.payload_readiness.as_ref().ok_or_else(|| {
-        format!(
-            "unavailable PG transition {} has a completion receipt without payload readiness",
-            transition.pg_id.get()
-        )
-    })?;
-    let completion = transition.completion.ok_or_else(|| {
-        format!(
-            "unavailable PG transition {} has a completion receipt without completion evidence",
-            transition.pg_id.get()
-        )
-    })?;
-    Ok((
-        UnavailablePgTransitionCompletionRequest {
-            unavailable_transition: UnavailablePgTransitionMutationBinding::new(
-                transition.pg_id,
-                transition.transition_epoch,
-                transition.source_epoch,
-                transition.source_acting_set.clone(),
-                transition.destination_acting_set.clone(),
-            ),
-            pg_id: transition.pg_id,
-            transition_epoch: transition.transition_epoch,
-            destination_epoch: readiness.destination_epoch,
-            topology_generation: transition.topology_generation,
-            topology_digest: transition.topology_digest,
-            destinations: readiness.destinations.clone(),
-            completion,
-        },
-        readiness.ready_at_ms,
-    ))
-}
-
-fn digest_node_ids(hasher: &mut ChecksumHasher, node_ids: &[NodeId]) {
-    digest_len(hasher, node_ids.len());
-    for node_id in node_ids {
-        digest_u32(hasher, node_id.as_u32());
-    }
-}
-
-fn digest_unavailable_node_observation(
-    hasher: &mut ChecksumHasher,
-    observation: &NodeUnavailableObservation,
-) {
-    digest_u32(hasher, observation.node_id.as_u32());
-    digest_u64(hasher, observation.node_incarnation);
-    digest_bytes(hasher, observation.endpoint.as_bytes());
-    digest_u64(hasher, observation.lease_deadline_ms);
-    digest_u64(hasher, observation.observed_at_ms);
-}
-
-fn digest_unavailable_pg_transition_binding(
-    hasher: &mut ChecksumHasher,
-    binding: &UnavailablePgTransitionMutationBinding,
-) {
-    digest_u32(hasher, binding.pg_id.get());
-    digest_u64(hasher, binding.transition_epoch.get());
-    digest_u64(hasher, binding.source_epoch.get());
-    digest_node_ids(hasher, &binding.source_acting_set);
-    digest_node_ids(hasher, &binding.destination_acting_set);
-}
-
-fn metadata_transfer_staging_cleanup_digest(
-    transition: &UnavailablePgTransitionMutationBinding,
-    staging_generation: u64,
-    disposition: MetadataTransferStagingCleanupDisposition,
-    artifact_digest: [u8; 32],
-    artifact_length: u64,
-    artifact_format_version: u16,
-    tombstones: &[MetadataTransferStagingTombstoneBinding],
-) -> [u8; 32] {
-    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-    digest_bytes(&mut hasher, METADATA_TRANSFER_STAGING_CLEANUP_DIGEST_DOMAIN);
-    digest_unavailable_pg_transition_binding(&mut hasher, transition);
-    digest_u64(&mut hasher, staging_generation);
-    match disposition {
-        MetadataTransferStagingCleanupDisposition::Completed => digest_u8(&mut hasher, 0),
-        MetadataTransferStagingCleanupDisposition::Superseded {
-            successor_transition_epoch,
-        } => {
-            digest_u8(&mut hasher, 1);
-            digest_u64(&mut hasher, successor_transition_epoch.get());
-        }
-    }
-    digest_bytes(&mut hasher, &artifact_digest);
-    digest_u64(&mut hasher, artifact_length);
-    digest_u16(&mut hasher, artifact_format_version);
-    digest_len(&mut hasher, tombstones.len());
-    for tombstone in tombstones {
-        digest_u32(&mut hasher, tombstone.node_id.as_u32());
-        digest_u64(&mut hasher, tombstone.node_incarnation);
-        digest_bytes(&mut hasher, tombstone.endpoint.as_bytes());
-        digest_bytes(&mut hasher, &tombstone.evidence_digest);
-    }
-    hasher
-        .finalize()
-        .bytes()
-        .try_into()
-        .expect("SHA-256 staging cleanup digest must contain 32 bytes")
-}
-
-fn metadata_transfer_staging_checkpoint_segment_digest(
-    segment: &MetadataTransferStagingEvidenceCheckpointSegment,
-) -> [u8; 32] {
-    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-    digest_bytes(
-        &mut hasher,
-        METADATA_TRANSFER_STAGING_CHECKPOINT_SEGMENT_DIGEST_DOMAIN,
-    );
-    digest_bytes(
-        &mut hasher,
-        format_metadata_transfer_staging_evidence_checkpoint_segment(segment).as_bytes(),
-    );
-    hasher
-        .finalize()
-        .bytes()
-        .try_into()
-        .expect("SHA-256 staging checkpoint segment digest must contain 32 bytes")
-}
-
-fn metadata_transfer_staging_checkpoint_source_segments_digest(
-    segments: &[(u64, u64, [u8; 32])],
-) -> [u8; 32] {
-    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-    digest_bytes(
-        &mut hasher,
-        METADATA_TRANSFER_STAGING_CHECKPOINT_SOURCE_SEGMENTS_DIGEST_DOMAIN,
-    );
-    digest_u64(
-        &mut hasher,
-        u64::try_from(segments.len()).expect("source segment count fits u64"),
-    );
-    for (first_generation, last_generation, segment_digest) in segments {
-        digest_u64(&mut hasher, *first_generation);
-        digest_u64(&mut hasher, *last_generation);
-        digest_bytes(&mut hasher, segment_digest);
-    }
-    hasher
-        .finalize()
-        .bytes()
-        .try_into()
-        .expect("SHA-256 staging checkpoint source-segment digest must contain 32 bytes")
-}
-
-fn validate_metadata_transfer_staging_checkpoint_coalescing_source_count(
-    source_count: usize,
-) -> Result<(), ControlPlaneError> {
-    if source_count < 2 {
-        return Err(ControlPlaneError::CommandDecode {
-            message: "metadata-transfer staging checkpoint anchor coalescing source does not match"
-                .to_owned(),
-        });
-    }
-    if source_count > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COALESCED_ANCHORS {
-        return Err(ControlPlaneError::CommandDecode {
-            message: format!(
-                "metadata-transfer staging checkpoint anchor coalescing exceeds the {} direct-anchor limit",
-                MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COALESCED_ANCHORS
-            ),
-        });
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UnavailablePgReconciliationCursor {
     after_pg_id: Option<PgId>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum MetadataTransferStagingMaintenancePhase {
-    #[default]
-    ClosureRetirement,
-    PageCheckpoint,
-    SegmentCollapse,
-    AnchorCoalescing,
-}
-
-impl MetadataTransferStagingMaintenancePhase {
-    fn next(self) -> Self {
-        match self {
-            Self::ClosureRetirement => Self::PageCheckpoint,
-            Self::PageCheckpoint => Self::SegmentCollapse,
-            Self::SegmentCollapse => Self::AnchorCoalescing,
-            Self::AnchorCoalescing => Self::ClosureRetirement,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct MetadataTransferStagingMaintenanceCursor {
-    next_phase: MetadataTransferStagingMaintenancePhase,
-    after_closure: Option<(NodeId, u64)>,
-    closure_high_water: Option<(NodeId, u64)>,
-    after_page: Option<(NodeId, u64, u64)>,
-    page_high_water: Option<(NodeId, u64, u64)>,
-    after_segment: Option<(NodeId, u64, u64)>,
-    segment_high_water: Option<(NodeId, u64, u64)>,
-    after_anchor: Option<(NodeId, u64, u64)>,
-    anchor_high_water: Option<(NodeId, u64, u64)>,
-}
-
-impl MetadataTransferStagingMaintenanceCursor {
-    pub(crate) fn start() -> Self {
-        Self::default()
-    }
-}
-
-fn metadata_transfer_staging_maintenance_sweep_high_water<K: Copy + Ord>(
-    after: &mut Option<K>,
-    high_water: &mut Option<K>,
-    current_last: Option<K>,
-) -> Option<K> {
-    if after
-        .zip(*high_water)
-        .is_some_and(|(after, high_water)| after >= high_water)
-    {
-        *after = None;
-        *high_water = None;
-    }
-    if high_water.is_none() {
-        *high_water = current_last;
-    }
-    *high_water
 }
 
 impl UnavailablePgReconciliationCursor {
@@ -2216,6 +916,13 @@ impl UnavailablePgReconciliationCursor {
     #[must_use]
     pub fn after_pg_id(self) -> Option<PgId> {
         self.after_pg_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_after(pg_id: PgId) -> Self {
+        Self {
+            after_pg_id: Some(pg_id),
+        }
     }
 }
 
@@ -2234,11 +941,10 @@ pub struct UnavailablePgTransitionMutationBinding {
     destination_acting_set: Vec<NodeId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnavailablePgReconciliationStage {
     MetadataTransfer,
     PayloadReadiness,
-    StagingCleanup,
 }
 
 impl UnavailablePgReconciliationWork {
@@ -2304,6 +1010,12 @@ impl UnavailablePgReconciliationWork {
     #[must_use]
     pub fn stage(&self) -> UnavailablePgReconciliationStage {
         self.stage
+    }
+
+    #[must_use]
+    pub(crate) fn with_stage(mut self, stage: UnavailablePgReconciliationStage) -> Self {
+        self.stage = stage;
+        self
     }
 
     #[must_use]
@@ -2376,77 +1088,6 @@ pub(crate) struct UnavailablePgReconciliationScan {
     pub(crate) next_cursor: UnavailablePgReconciliationCursor,
 }
 
-pub(crate) struct UnavailablePgReconciliationBatchScan {
-    pub(crate) candidates: Vec<UnavailablePgReconciliationCandidate>,
-    pub(crate) cleanup_fallbacks: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) next_cursor: UnavailablePgReconciliationCursor,
-}
-
-pub(crate) struct PreparedUnavailablePgBeginBatch {
-    pub(crate) command: Option<ControlPlaneCommand>,
-    pub(crate) included: Vec<(PgId, NodeId)>,
-    pub(crate) rejected: Vec<(PgId, ControlPlaneError)>,
-}
-
-pub(crate) struct PreparedUnavailablePgCompletionBatch {
-    pub(crate) command: Option<ControlPlaneCommand>,
-    pub(crate) already_completed: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) included: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
-}
-
-impl PreparedUnavailablePgCompletionBatch {
-    pub(crate) fn rederive_from(
-        &self,
-        requested: &[UnavailablePgReconciliationWork],
-    ) -> Vec<UnavailablePgReconciliationWork> {
-        let classified_pg_ids = self
-            .already_completed
-            .iter()
-            .chain(&self.included)
-            .map(UnavailablePgReconciliationWork::pg_id)
-            .chain(self.rejected.iter().map(|(work, _)| work.pg_id()))
-            .collect::<BTreeSet<_>>();
-        requested
-            .iter()
-            .filter(|work| !classified_pg_ids.contains(&work.pg_id()))
-            .cloned()
-            .collect()
-    }
-}
-
-pub(crate) struct PreparedUnavailablePgInstallBatch {
-    pub(crate) command: Option<ControlPlaneCommand>,
-    pub(crate) included: Vec<UnavailablePgTransitionInstallRequest>,
-    pub(crate) rejected: Vec<(UnavailablePgTransitionInstallRequest, ControlPlaneError)>,
-}
-
-pub(crate) struct UnavailablePgReconciliationPollBatch {
-    pub(crate) work: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) cleanup_fallbacks: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) rejected: Vec<(PgId, ControlPlaneError)>,
-}
-
-pub(crate) struct UnavailablePgReconciliationCompletionBatch {
-    pub(crate) completed: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
-    pub(crate) rederive: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) snapshot: ClusterControlSnapshot,
-}
-
-pub(crate) struct UnconfirmedUnavailablePgReconciliationCompletionBatch {
-    pub(crate) already_completed: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) submitted: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) rejected: Vec<(UnavailablePgReconciliationWork, ControlPlaneError)>,
-    pub(crate) rederive: Vec<UnavailablePgReconciliationWork>,
-    pub(crate) error: ControlPlaneError,
-}
-
-pub(crate) enum UnavailablePgReconciliationCompletionAttempt {
-    Classified(Box<UnavailablePgReconciliationCompletionBatch>),
-    Unconfirmed(UnconfirmedUnavailablePgReconciliationCompletionBatch),
-}
-
 impl UnavailablePgPlacementTransition {
     #[must_use]
     pub fn pg_id(&self) -> PgId {
@@ -2505,67 +1146,6 @@ impl UnavailablePgPlacementTransition {
 }
 
 impl ClusterControlSnapshot {
-    pub(crate) fn metadata_transfer_staging_retention_metrics(
-        &self,
-    ) -> observability::MetadataTransferStagingRetentionMetricSnapshot {
-        let bounded_len = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
-        observability::MetadataTransferStagingRetentionMetricSnapshot {
-            retained_page_depth: bounded_len(self.metadata_transfer_staging_evidence_pages.len()),
-            retained_segment_depth: bounded_len(
-                self.metadata_transfer_staging_evidence_checkpoint_segments
-                    .len(),
-            ),
-            retained_anchor_depth: bounded_len(
-                self.metadata_transfer_staging_evidence_checkpoint_anchors
-                    .len(),
-            ),
-            retained_evidence_depth: bounded_len(self.metadata_transfer_staging_evidence.len()),
-            finalized_floor_depth: bounded_len(
-                self.metadata_transfer_staging_finalized_floors.len(),
-            ),
-            active_closure_depth: bounded_len(self.metadata_transfer_staging_actor_closures.len()),
-            retired_closure_depth: bounded_len(
-                self.metadata_transfer_staging_retired_actor_closures.len(),
-            ),
-            prune_applied_total: 0,
-        }
-    }
-
-    #[must_use]
-    pub fn outage_resolution_intent(
-        &self,
-        pg_id: PgId,
-    ) -> Option<&UnavailablePgOutageResolutionIntent> {
-        self.outage_resolution_intents.get(&pg_id)
-    }
-
-    pub(crate) fn next_cluster_epoch(&self) -> Result<ClusterEpoch, ControlPlaneError> {
-        next_epoch(self.cluster_epoch)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn metadata_transfer_staging_is_finalized(
-        &self,
-        work: &UnavailablePgReconciliationWork,
-    ) -> bool {
-        self.metadata_transfer_staging_finalized_floors
-            .contains_key(&(work.pg_id(), work.transition_epoch().get()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn latest_retained_unavailable_pg_transition(
-        &self,
-        pg_id: PgId,
-    ) -> Option<&UnavailablePgPlacementTransition> {
-        self.retained_unavailable_pg_placement_transitions
-            .range((
-                std::ops::Bound::Included((pg_id, ClusterEpoch::INITIAL)),
-                std::ops::Bound::Included((pg_id, self.cluster_epoch)),
-            ))
-            .next_back()
-            .map(|(_, transition)| transition)
-    }
-
     pub(crate) fn empty() -> Self {
         Self {
             authority_incarnation: AuthorityIncarnation::INITIAL,
@@ -2578,16 +1158,6 @@ impl ClusterControlSnapshot {
             unavailable_node_observations: BTreeMap::new(),
             unavailable_pg_placement_transitions: BTreeMap::new(),
             retained_unavailable_pg_placement_transitions: BTreeMap::new(),
-            metadata_transfer_staging_evidence_pages: BTreeMap::new(),
-            outage_command_artifacts: BTreeMap::new(),
-            outage_command_artifact_retirements: BTreeMap::new(),
-            outage_resolution_intents: BTreeMap::new(),
-            metadata_transfer_staging_evidence_checkpoint_segments: BTreeMap::new(),
-            metadata_transfer_staging_evidence_checkpoint_anchors: BTreeMap::new(),
-            metadata_transfer_staging_actor_closures: BTreeMap::new(),
-            metadata_transfer_staging_retired_actor_closures: BTreeMap::new(),
-            metadata_transfer_staging_finalized_floors: BTreeMap::new(),
-            metadata_transfer_staging_evidence: BTreeMap::new(),
             history: Vec::new(),
         }
     }
@@ -2627,33 +1197,6 @@ impl ClusterControlSnapshot {
             grant_not_after_ms,
         ));
         snapshot
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_rebind_singleton_staging_artifact_target_epoch(
-        &mut self,
-        pg_id: PgId,
-        artifact_target_epoch: ClusterEpoch,
-    ) {
-        let transition = self
-            .unavailable_pg_placement_transitions
-            .get_mut(&pg_id)
-            .expect("test staging transition is active");
-        let authorization = transition
-            .staging_authorization
-            .as_mut()
-            .expect("test staging transition is authorized");
-        assert_eq!(authorization.batch_receipt.identity.member_pg_ids, [pg_id]);
-        authorization.artifact_target_epoch = artifact_target_epoch;
-        let request = unavailable_pg_staging_authorization_request_from_durable(transition)
-            .expect("test staging authorization remains durable");
-        transition
-            .staging_authorization
-            .as_mut()
-            .unwrap()
-            .batch_receipt
-            .identity
-            .members_digest = unavailable_pg_staging_authorization_members_digest(&[request]);
     }
 
     #[must_use]
@@ -2784,7 +1327,47 @@ impl ClusterControlSnapshot {
                 };
             };
             last_examined = Some(pg_id);
-            let candidate = self.unavailable_pg_reconciliation_candidate(pg_id, pg, now_ms);
+            let active_transition = self.unavailable_pg_placement_transitions.get(&pg_id);
+            let unavailable_node_id = pg
+                .acting_set
+                .iter()
+                .copied()
+                .filter(|node_id| {
+                    active_transition
+                        .is_none_or(|transition| transition.unavailable_node.node_id != *node_id)
+                })
+                .filter_map(|node_id| {
+                    let observation = self.unavailable_node_observations.get(&node_id)?;
+                    let topology = self.initial_topology.as_ref()?;
+                    let grace_cutoff_ms = observation.observed_at_ms.checked_add(
+                        topology
+                            .placement_policy()
+                            .unavailable_replacement_grace_ms(),
+                    )?;
+                    (now_ms >= grace_cutoff_ms).then_some(node_id)
+                })
+                .min();
+            let candidate = if let Some(unavailable_node_id) = unavailable_node_id {
+                Some(UnavailablePgReconciliationCandidate::Begin {
+                    pg_id,
+                    unavailable_node_id,
+                })
+            } else {
+                active_transition.map(|transition| {
+                    // Route installation alone does not prove import. Exact current-epoch
+                    // destination observations do, and avoid retransferring metadata after
+                    // a process restart that occurred between import and activation.
+                    let stage = if self.unavailable_pg_transition_import_is_observed(pg, transition)
+                    {
+                        UnavailablePgReconciliationStage::PayloadReadiness
+                    } else {
+                        UnavailablePgReconciliationStage::MetadataTransfer
+                    };
+                    UnavailablePgReconciliationCandidate::Resume(
+                        UnavailablePgReconciliationWork::from_transition(transition, stage),
+                    )
+                })
+            };
             if candidate.is_some() {
                 return UnavailablePgReconciliationScan {
                     candidate,
@@ -2802,132 +1385,33 @@ impl ClusterControlSnapshot {
         }
     }
 
-    pub(crate) fn scan_unavailable_pg_reconciliation_batch(
+    fn unavailable_pg_transition_import_is_observed(
         &self,
-        cursor: UnavailablePgReconciliationCursor,
-        now_ms: u64,
-    ) -> UnavailablePgReconciliationBatchScan {
-        let start = cursor
-            .after_pg_id
-            .map_or(std::ops::Bound::Unbounded, |pg_id| {
-                std::ops::Bound::Excluded(pg_id)
-            });
-        let mut records = self.pgs.range((start, std::ops::Bound::Unbounded));
-        let mut candidates = Vec::new();
-        let mut cleanup_fallbacks = Vec::new();
-        let mut last_examined = None;
-        for _ in 0..UNAVAILABLE_PG_RECONCILIATION_SCAN_PAGE_SIZE {
-            let Some((&pg_id, pg)) = records.next() else {
-                return UnavailablePgReconciliationBatchScan {
-                    candidates,
-                    cleanup_fallbacks,
-                    next_cursor: UnavailablePgReconciliationCursor::start(),
-                };
-            };
-            last_examined = Some(pg_id);
-            if let Some(candidate) = self.unavailable_pg_reconciliation_candidate(pg_id, pg, now_ms)
-            {
-                let primary_is_cleanup = matches!(
-                    &candidate,
-                    UnavailablePgReconciliationCandidate::Resume(work)
-                        if work.stage() == UnavailablePgReconciliationStage::StagingCleanup
-                );
-                candidates.push(candidate);
-                if !primary_is_cleanup {
-                    if let Some(cleanup) = self.unavailable_pg_reconciliation_cleanup_work(pg_id) {
-                        cleanup_fallbacks.push(cleanup);
-                    }
-                }
-            }
-        }
-        UnavailablePgReconciliationBatchScan {
-            candidates,
-            cleanup_fallbacks,
-            next_cursor: UnavailablePgReconciliationCursor {
-                after_pg_id: last_examined,
-            },
-        }
-    }
-
-    fn unavailable_pg_reconciliation_candidate(
-        &self,
-        pg_id: PgId,
         pg: &PgControlRecord,
-        now_ms: u64,
-    ) -> Option<UnavailablePgReconciliationCandidate> {
-        let active_transition = self.unavailable_pg_placement_transitions.get(&pg_id);
-        let unavailable_node_id = pg
-            .acting_set
-            .iter()
-            .copied()
-            .filter(|node_id| {
-                active_transition
-                    .is_none_or(|transition| transition.unavailable_node.node_id != *node_id)
-            })
-            .filter_map(|node_id| {
-                let observation = self.unavailable_node_observations.get(&node_id)?;
-                let topology = self.initial_topology.as_ref()?;
-                let grace_cutoff_ms = observation.observed_at_ms.checked_add(
-                    topology
-                        .placement_policy()
-                        .unavailable_replacement_grace_ms(),
-                )?;
-                (now_ms >= grace_cutoff_ms).then_some(node_id)
-            })
-            .min();
-        if let Some(unavailable_node_id) = unavailable_node_id {
-            return Some(UnavailablePgReconciliationCandidate::Begin {
-                pg_id,
-                unavailable_node_id,
-            });
-        }
-        if let Some(transition) = active_transition {
-            let stage = if transition.destination_epoch.is_some() {
-                UnavailablePgReconciliationStage::PayloadReadiness
-            } else {
-                UnavailablePgReconciliationStage::MetadataTransfer
-            };
-            return Some(UnavailablePgReconciliationCandidate::Resume(
-                UnavailablePgReconciliationWork::from_transition(transition, stage),
-            ));
-        }
-        self.unavailable_pg_reconciliation_cleanup_work(pg_id)
-            .map(UnavailablePgReconciliationCandidate::Resume)
-    }
-
-    fn unavailable_pg_reconciliation_cleanup_work(
-        &self,
-        pg_id: PgId,
-    ) -> Option<UnavailablePgReconciliationWork> {
-        self.retained_unavailable_pg_placement_transitions
-            .range((
-                std::ops::Bound::Included((pg_id, ClusterEpoch::INITIAL)),
-                std::ops::Bound::Included((pg_id, self.cluster_epoch)),
-            ))
-            .find(|((retained_pg_id, transition_epoch), transition)| {
-                *retained_pg_id == pg_id
-                    && transition.staging_authorization.is_some()
-                    && (transition.completion.is_some()
-                        || (transition.destination_epoch.is_none()
-                            && transition.destination_install.is_none()
-                            && self
-                                .retained_unavailable_pg_placement_transitions
-                                .values()
-                                .chain(self.unavailable_pg_placement_transitions.values())
-                                .any(|candidate| {
-                                    candidate.pg_id == pg_id
-                                        && candidate.predecessor_transition_epoch
-                                            == Some(transition.transition_epoch)
-                                })))
-                    && !self
-                        .metadata_transfer_staging_finalized_floors
-                        .contains_key(&(pg_id, transition_epoch.get()))
-            })
-            .map(|(_, transition)| {
-                UnavailablePgReconciliationWork::from_transition(
-                    transition,
-                    UnavailablePgReconciliationStage::StagingCleanup,
-                )
+        transition: &UnavailablePgPlacementTransition,
+    ) -> bool {
+        let Some(destination_epoch) = transition.destination_epoch else {
+            return false;
+        };
+        let Some(transfer) = pg.peering_metadata_transfer else {
+            return false;
+        };
+        pg.state == PgState::Peering
+            && pg.acting_set == transition.destination_acting_set
+            && matches!(
+                peering_metadata_transfer_destination_epoch(pg),
+                Ok(Some(epoch)) if epoch == destination_epoch
+            )
+            && transition.destination_acting_set.iter().all(|node_id| {
+                self.nodes
+                    .get(node_id)
+                    .and_then(|node| node.pg_observation(pg.pg_id))
+                    .is_some_and(|observation| {
+                        observation.observed_epoch == self.cluster_epoch
+                            && observation.state == PgState::Peering
+                            && observation.pending_metadata_command.is_none()
+                            && observation.metadata_proof == transfer.metadata_proof()
+                    })
             })
     }
 
@@ -3004,5943 +1488,34 @@ impl ClusterControlSnapshot {
             begin_at_ms,
         )?;
         let source_node_id = begin_authorization.source_node_id;
-        Ok(
-            ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
-                transitions: vec![UnavailablePgTransitionBeginRequest {
-                    pg_id,
-                    predecessor_transition_epoch: self
-                        .unavailable_pg_placement_transitions
-                        .get(&pg_id)
-                        .map(|transition| transition.transition_epoch)
-                        .or_else(|| {
-                            self.retained_unavailable_pg_placement_transitions
-                                .range((pg_id, ClusterEpoch::INITIAL)..=(pg_id, self.cluster_epoch))
-                                .next_back()
-                                .map(|(_, transition)| transition.transition_epoch)
-                        }),
-                    source_epoch: self.cluster_epoch,
-                    source_acting_set: pg.acting_set.clone(),
-                    source_node_id,
-                    begin_authorization,
-                    unavailable_node: observation.clone(),
-                    grace_cutoff_ms,
-                    topology_generation: topology.topology_generation(),
-                    topology_digest: *topology.topology_digest(),
-                    destination_acting_set,
-                }],
-                expected_transition_epoch: next_epoch(self.cluster_epoch)?,
-                begin_at_ms,
-            },
-        )
-    }
-
-    fn validate_unavailable_pg_transition_begin(
-        &self,
-        request: UnavailablePgTransitionBeginRequest,
-        expected_transition_epoch: ClusterEpoch,
-        begin_at_ms: u64,
-        batch_receipt: &UnavailablePgTransitionBatchReceipt,
-    ) -> Result<ValidatedUnavailablePgTransitionBegin, ControlPlaneError> {
-        let pg_id = request.pg_id;
-        let requested = UnavailablePgPlacementTransition {
+        Ok(ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
             pg_id,
-            transition_epoch: expected_transition_epoch,
-            predecessor_transition_epoch: request.predecessor_transition_epoch,
-            topology_generation: request.topology_generation,
-            topology_digest: request.topology_digest,
-            source_epoch: request.source_epoch,
-            source_acting_set: request.source_acting_set.clone(),
-            source_node_id: request.source_node_id,
-            begin_authorization: request.begin_authorization.clone(),
-            unavailable_node: request.unavailable_node.clone(),
-            grace_cutoff_ms: request.grace_cutoff_ms,
-            destination_acting_set: request.destination_acting_set.clone(),
-            destination_epoch: None,
-            destination_route: None,
-            payload_readiness: None,
-            completion: None,
-            begin_batch_receipt: batch_receipt.clone(),
-            staging_authorization: None,
-            destination_install: None,
-            completion_batch_receipt: None,
-        };
-        if let Some(existing) = self
-            .retained_unavailable_pg_placement_transitions
-            .get(&(pg_id, expected_transition_epoch))
-        {
-            let mut original_request = existing.clone();
-            original_request.destination_epoch = None;
-            original_request.destination_route = None;
-            original_request.payload_readiness = None;
-            original_request.completion = None;
-            original_request.staging_authorization = None;
-            original_request.destination_install = None;
-            original_request.completion_batch_receipt = None;
-            if original_request == requested {
-                return Ok(ValidatedUnavailablePgTransitionBegin::ExactReplay { pg_id });
-            }
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} retained transition epoch belongs to a different request",
-                    pg_id.get()
-                ),
-            });
-        }
-        if let Some(existing) = self.unavailable_pg_placement_transitions.get(&pg_id) {
-            let mut original_request = existing.clone();
-            original_request.destination_epoch = None;
-            original_request.destination_route = None;
-            original_request.payload_readiness = None;
-            original_request.completion = None;
-            original_request.staging_authorization = None;
-            original_request.destination_install = None;
-            original_request.completion_batch_receipt = None;
-            if original_request == requested {
-                return Ok(ValidatedUnavailablePgTransitionBegin::ExactReplay { pg_id });
-            }
-            if request.predecessor_transition_epoch != Some(existing.transition_epoch) {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} successor transition does not consume the active transition tip",
-                        pg_id.get()
-                    ),
-                });
-            }
-        } else {
-            let retained_tip = self
-                .retained_unavailable_pg_placement_transitions
-                .range((pg_id, ClusterEpoch::INITIAL)..=(pg_id, self.cluster_epoch))
-                .next_back()
-                .map(|(_, transition)| transition.transition_epoch);
-            if request.predecessor_transition_epoch != retained_tip {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} successor transition does not consume the retained lineage tip",
-                        pg_id.get()
-                    ),
-                });
-            }
-        }
-        self.validate_serving_timestamp(begin_at_ms)?;
-        if request.source_epoch != self.cluster_epoch {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} unavailable placement source epoch {} does not match current epoch {}",
-                    pg_id.get(),
-                    request.source_epoch,
-                    self.cluster_epoch
-                ),
-            });
-        }
-        if expected_transition_epoch != next_epoch(self.cluster_epoch)? {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} unavailable placement transition epoch is not the next cluster epoch",
-                    pg_id.get()
-                ),
-            });
-        }
-        let topology =
-            self.initial_topology
-                .as_ref()
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: "unavailable placement transition requires certified topology"
-                        .to_string(),
-                })?;
-        if topology.topology_generation() != request.topology_generation
-            || topology.topology_digest() != &request.topology_digest
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "unavailable placement transition topology changed".to_string(),
-            });
-        }
-        let observation = self
-            .unavailable_node_observations
-            .get(&request.unavailable_node.node_id)
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: format!(
-                    "node {} has no durable unavailable lease observation",
-                    request.unavailable_node.node_id.as_u32()
-                ),
-            })?;
-        if observation != &request.unavailable_node {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "node {} unavailable lease observation changed",
-                    request.unavailable_node.node_id.as_u32()
-                ),
-            });
-        }
-        let expected_grace_cutoff_ms = request
-            .unavailable_node
-            .observed_at_ms
-            .checked_add(
-                topology
-                    .placement_policy()
-                    .unavailable_replacement_grace_ms(),
-            )
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "unavailable placement grace cutoff overflows".to_string(),
-            })?;
-        if request.grace_cutoff_ms != expected_grace_cutoff_ms
-            || begin_at_ms < request.grace_cutoff_ms
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} unavailable placement grace has not elapsed",
-                    pg_id.get()
-                ),
-            });
-        }
-        let record = self
-            .pg(pg_id)
-            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-        if !matches!(record.state, PgState::Active | PgState::Peering)
-            || record.acting_set != request.source_acting_set
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!("PG {} unavailable placement source changed", pg_id.get()),
-            });
-        }
-        let expected_destination = deterministic_unavailable_pg_destination(
-            self,
-            pg_id,
-            &request.source_acting_set,
-            request.unavailable_node.node_id,
-            begin_at_ms,
-        )?;
-        if request.destination_acting_set != expected_destination {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} unavailable placement destination is not the deterministic eligible replacement",
-                    pg_id.get()
-                ),
-            });
-        }
-        let expected_begin_authorization = unavailable_pg_transition_begin_authorization(
-            self,
-            record,
-            &request.destination_acting_set,
-            &request.unavailable_node,
-            begin_at_ms,
-        )?;
-        if request.begin_authorization != expected_begin_authorization
-            || request.source_node_id != request.begin_authorization.source_node_id
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} unavailable placement begin authorization changed",
-                    pg_id.get()
-                ),
-            });
-        }
-        let previous_primary_lease = active_primary_lease(self, record)
-            .or_else(|| record.previous_primary_lease.clone())
-            .map(PreviousPrimaryLease::without_reactivation_preference);
-        let fenced_primary_lease_deadline_ms = previous_primary_lease
-            .as_ref()
-            .map_or(request.unavailable_node.lease_deadline_ms, |lease| {
-                lease.lease_deadline_ms
-            });
-        Ok(ValidatedUnavailablePgTransitionBegin::Apply {
-            requested: Box::new(requested),
-            previous_primary_lease,
-            fenced_primary_lease_deadline_ms,
-        })
-    }
-
-    pub(crate) fn begin_unavailable_pg_placement_transition_batch_command(
-        &self,
-        candidates: &[(PgId, NodeId)],
-        begin_at_ms: u64,
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "begin",
-            candidates.iter().map(|(pg_id, _)| *pg_id),
-        )?;
-        let mut transitions = Vec::with_capacity(candidates.len());
-        let mut expected_transition_epoch = None;
-        for (pg_id, unavailable_node_id) in candidates {
-            let ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
-                transitions: mut member,
-                expected_transition_epoch: member_epoch,
-                begin_at_ms: member_begin_at_ms,
-            } = self.begin_unavailable_pg_placement_transition_command(
-                *pg_id,
-                *unavailable_node_id,
-                begin_at_ms,
-            )?
-            else {
-                unreachable!("unavailable transition member builder returned wrong command");
-            };
-            if member.len() != 1 || member_begin_at_ms != begin_at_ms {
-                return Err(ControlPlaneError::invariant_failure(
-                    "unavailable transition member builder returned a non-singleton envelope",
-                ));
-            }
-            if expected_transition_epoch
-                .replace(member_epoch)
-                .is_some_and(|expected| expected != member_epoch)
-            {
-                return Err(ControlPlaneError::invariant_failure(
-                    "unavailable transition batch members derived different target epochs",
-                ));
-            }
-            transitions.push(member.remove(0));
-        }
-        Ok(
-            ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
-                transitions,
-                expected_transition_epoch: expected_transition_epoch
-                    .expect("canonical batch validation rejects an empty candidate vector"),
-                begin_at_ms,
-            },
-        )
-    }
-
-    pub(crate) fn prepare_unavailable_pg_placement_transition_batch(
-        &self,
-        candidates: &[(PgId, NodeId)],
-        begin_at_ms: u64,
-    ) -> Result<PreparedUnavailablePgBeginBatch, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "begin preparation",
-            candidates.iter().map(|(pg_id, _)| *pg_id),
-        )?;
-        let mut included = Vec::new();
-        let mut rejected = Vec::new();
-        for candidate in candidates {
-            let singleton = match self.begin_unavailable_pg_placement_transition_command(
-                candidate.0,
-                candidate.1,
-                begin_at_ms,
-            ) {
-                Ok(command) => command,
-                Err(error) => {
-                    rejected.push((candidate.0, error));
-                    continue;
-                }
-            };
-            if let Err(error) = self.apply_control_plane_command(singleton) {
-                rejected.push((candidate.0, error));
-                continue;
-            }
-
-            let mut tentative = included.clone();
-            tentative.push(*candidate);
-            let command = self
-                .begin_unavailable_pg_placement_transition_batch_command(&tentative, begin_at_ms)?;
-            let encoded_len =
-                crate::control_plane_raft::control_plane_command_replication_encoded_len(&command)?;
-            if encoded_len > crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
-                if included.is_empty() {
-                    rejected.push((
-                        candidate.0,
-                        ControlPlaneError::invariant_failure(format!(
-                            "single PG {} unavailable transition command encodes to {encoded_len} OpenRaft entry bytes, exceeding the replication-safe limit {}",
-                            candidate.0.get(),
-                            crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
-                        )),
-                    ));
-                    continue;
-                }
-                break;
-            }
-            included = tentative;
-        }
-
-        let command = if included.is_empty() {
-            None
-        } else {
-            let command = self
-                .begin_unavailable_pg_placement_transition_batch_command(&included, begin_at_ms)?;
-            self.apply_control_plane_command(command.clone())
-                .map_err(|error| {
-                    ControlPlaneError::invariant_failure(format!(
-                        "individually valid unavailable transition begin members form an invalid batch: {error}"
-                    ))
-                })?;
-            Some(command)
-        };
-        Ok(PreparedUnavailablePgBeginBatch {
-            command,
-            included,
-            rejected,
-        })
-    }
-
-    fn validate_unavailable_pg_transition_begin_batch(
-        &self,
-        requests: Vec<UnavailablePgTransitionBeginRequest>,
-        expected_transition_epoch: ClusterEpoch,
-        begin_at_ms: u64,
-    ) -> Result<Vec<ValidatedUnavailablePgTransitionBegin>, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "begin",
-            requests.iter().map(|request| request.pg_id),
-        )?;
-        let batch_receipt = UnavailablePgTransitionBatchReceipt {
-            identity: unavailable_pg_transition_begin_batch_identity(
-                &requests,
-                expected_transition_epoch,
-                begin_at_ms,
-            ),
-            source_epoch: requests[0].source_epoch,
-            target_epoch: expected_transition_epoch,
-        };
-        requests
-            .into_iter()
-            .map(|request| {
-                self.validate_unavailable_pg_transition_begin(
-                    request,
-                    expected_transition_epoch,
-                    begin_at_ms,
-                    &batch_receipt,
-                )
-            })
-            .collect()
-    }
-
-    fn apply_validated_unavailable_pg_transition_begins(
-        &self,
-        validated: Vec<ValidatedUnavailablePgTransitionBegin>,
-        expected_transition_epoch: ClusterEpoch,
-        begin_at_ms: u64,
-    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "begin",
-            validated
-                .iter()
-                .map(ValidatedUnavailablePgTransitionBegin::pg_id),
-        )?;
-        if validated.iter().all(|entry| {
-            matches!(
-                entry,
-                ValidatedUnavailablePgTransitionBegin::ExactReplay { .. }
-            )
-        }) {
-            return Ok(None);
-        }
-        if validated.iter().any(|entry| {
-            matches!(
-                entry,
-                ValidatedUnavailablePgTransitionBegin::ExactReplay { .. }
-            )
-        }) {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "unavailable placement begin batch mixes replayed and new members"
-                    .to_string(),
-            });
-        }
-        let mut next_snapshot = self.clone();
-        next_snapshot.record_committed_timestamp(begin_at_ms);
-        for entry in validated {
-            let ValidatedUnavailablePgTransitionBegin::Apply {
-                requested,
-                previous_primary_lease,
-                fenced_primary_lease_deadline_ms,
-            } = entry
-            else {
-                unreachable!("mixed replay was rejected before batch mutation");
-            };
-            let pg_id = requested.pg_id;
-            if let Some(previous) = next_snapshot
-                .unavailable_pg_placement_transitions
-                .remove(&pg_id)
-            {
-                next_snapshot
-                    .retained_unavailable_pg_placement_transitions
-                    .insert((pg_id, previous.transition_epoch), previous);
-            }
-            let source_acting_set = requested.source_acting_set.clone();
-            let source_node_id = requested.source_node_id;
-            let source_metadata_floor = requested.begin_authorization.source_metadata_floor;
-            let source_metadata_floor_epoch =
-                requested.begin_authorization.source_metadata_floor_epoch;
-            let source_metadata_floor_imported =
-                requested.begin_authorization.source_metadata_floor_imported;
-            next_snapshot
-                .unavailable_pg_placement_transitions
-                .insert(pg_id, *requested);
-            let record = next_snapshot
-                .pgs
-                .get_mut(&pg_id)
-                .expect("unavailable transition PG was validated");
-            record.acting_set =
-                unavailable_transition_source_route_acting_set(&source_acting_set, source_node_id);
-            record.state = PgState::Peering;
-            record.active_primary = None;
-            record.active_metadata_proof = None;
-            record.active_metadata_proof_epoch = None;
-            record.active_metadata_log_epoch = None;
-            record.active_metadata_transfer_imported = false;
-            record.previous_primary_lease = previous_primary_lease;
-            record.peering_metadata_proof_floor = Some(source_metadata_floor);
-            record.peering_metadata_proof_floor_epoch = source_metadata_floor_epoch;
-            record.peering_metadata_proof_floor_imported = source_metadata_floor_imported;
-            record.peering_metadata_transfer = None;
-            record.peering_metadata_transfer_source_route_epoch = None;
-            record.peering_metadata_transfer_source_node_id = None;
-            record.metadata_transfer_fenced = true;
-            record.metadata_transfer_fence_source_lease_deadline_ms =
-                Some(fenced_primary_lease_deadline_ms);
-            record.metadata_transfer_fence_source_imported = source_metadata_floor_imported;
-            record.metadata_transfer_fence_epoch = Some(expected_transition_epoch);
-        }
-        next_snapshot.bump_epoch()?;
-        Ok(Some(next_snapshot))
-    }
-
-    fn validate_unavailable_pg_staging_authorization_batch(
-        &self,
-        requests: Vec<UnavailablePgStagingIntentAuthorizationRequest>,
-    ) -> Result<Vec<ValidatedUnavailablePgStagingIntentAuthorization>, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "staging authorization",
-            requests
-                .iter()
-                .map(|request| request.unavailable_transition.pg_id()),
-        )?;
-        let batch_identity = unavailable_pg_staging_authorization_batch_identity(&requests);
-        requests
-            .into_iter()
-            .map(|request| {
-                let pg_id = request.unavailable_transition.pg_id();
-                let transition_epoch = request.unavailable_transition.transition_epoch();
-                if request.staging_generation
-                    != request.unavailable_transition.transition_epoch().get()
-                    || request.artifact_target_epoch <= transition_epoch
-                    || request.artifact_length == 0
-                    || request.artifact_length
-                        > crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES
-                    || request.artifact_format_version
-                        != crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging authorization has invalid generation, artifact length, or storage format",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                let active_transition = self
-                    .unavailable_pg_placement_transitions
-                    .get(&pg_id)
-                    .filter(|transition| transition.transition_epoch == transition_epoch);
-                let transition = self
-                    .retained_unavailable_pg_placement_transitions
-                    .get(&(pg_id, transition_epoch))
-                    .or(active_transition)
-                    .ok_or_else(|| ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} has no matching unavailable transition for staging authorization",
-                            pg_id.get()
-                        ),
-                    })?;
-                if !request.unavailable_transition.matches_transition(transition) {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging authorization does not match its unavailable transition",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                if let Some(existing) = &transition.staging_authorization {
-                    if existing.staging_generation == request.staging_generation
-                        && existing.artifact_target_epoch == request.artifact_target_epoch
-                        && existing.artifact_digest == request.artifact_digest
-                        && existing.artifact_length == request.artifact_length
-                        && existing.artifact_format_version == request.artifact_format_version
-                        && existing.batch_receipt.identity == batch_identity
-                    {
-                        return Ok(
-                            ValidatedUnavailablePgStagingIntentAuthorization::ExactReplay {
-                                pg_id,
-                            },
-                        );
-                    }
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging authorization conflicts with durable artifact identity",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                if active_transition.is_none() || transition.destination_epoch.is_some()
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging authorization is not before destination installation",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                let authorization = UnavailablePgStagingIntentAuthorization {
-                    staging_generation: request.staging_generation,
-                    artifact_target_epoch: request.artifact_target_epoch,
-                    artifact_digest: request.artifact_digest,
-                    artifact_length: request.artifact_length,
-                    artifact_format_version: request.artifact_format_version,
-                    batch_receipt: UnavailablePgTransitionBatchReceipt {
-                        identity: batch_identity.clone(),
-                        source_epoch: self.cluster_epoch,
-                        target_epoch: self.cluster_epoch,
-                    },
-                };
-                Ok(ValidatedUnavailablePgStagingIntentAuthorization::Apply {
-                    pg_id,
-                    authorization,
-                })
-            })
-            .collect()
-    }
-
-    pub(crate) fn committed_unavailable_pg_staging_authorization(
-        &self,
-        expected: &UnavailablePgStagingIntentAuthorizationRequest,
-        destination_node_id: NodeId,
-    ) -> Result<
-        crate::control_plane_command::CommittedUnavailablePgStagingAuthorization,
-        ControlPlaneError,
-    > {
-        let pg_id = expected.unavailable_transition.pg_id();
-        let transition_epoch = expected.unavailable_transition.transition_epoch();
-        let transition = self
-            .retained_unavailable_pg_placement_transitions
-            .get(&(pg_id, transition_epoch))
-            .or_else(|| {
-                self.unavailable_pg_placement_transitions
-                    .get(&pg_id)
-                    .filter(|transition| transition.transition_epoch == transition_epoch)
-            })
-            .ok_or_else(|| {
-                ControlPlaneError::invariant_failure(
-                    "committed staging authorization transition is absent",
-                )
-            })?;
-        let durable = unavailable_pg_staging_authorization_request_from_durable(transition)
-            .ok_or_else(|| {
-                ControlPlaneError::invariant_failure(
-                    "committed staging authorization is absent from its transition",
-                )
-            })?;
-        if &durable != expected {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} committed staging authorization does not match the prepared artifact",
-                    pg_id.get()
-                ),
-            });
-        }
-        let receipt = &transition
-            .staging_authorization
-            .as_ref()
-            .expect("durable staging request requires authorization")
-            .batch_receipt;
-        let mut authorizations = Vec::with_capacity(receipt.identity.member_pg_ids.len());
-        for member_pg_id in receipt.identity.member_pg_ids.iter().copied() {
-            let mut matching =
-                self.retained_unavailable_pg_placement_transitions
-                    .values()
-                    .chain(self.unavailable_pg_placement_transitions.values())
-                    .filter(|candidate| {
-                        candidate.pg_id == member_pg_id
-                            && candidate.staging_authorization.as_ref().is_some_and(
-                                |authorization| authorization.batch_receipt == *receipt,
-                            )
-                    });
-            let member = matching.next().ok_or_else(|| {
-                ControlPlaneError::invariant_failure(
-                    "committed staging authorization batch member is absent",
-                )
-            })?;
-            if matching.next().is_some() {
-                return Err(ControlPlaneError::invariant_failure(
-                    "committed staging authorization batch member is ambiguous",
-                ));
-            }
-            authorizations.push(
-                unavailable_pg_staging_authorization_request_from_durable(member).ok_or_else(
-                    || {
-                        ControlPlaneError::invariant_failure(
-                            "committed staging authorization batch member has no request",
-                        )
-                    },
-                )?,
-            );
-        }
-        if unavailable_pg_staging_authorization_batch_identity(&authorizations) != receipt.identity
-            || receipt.source_epoch != receipt.target_epoch
-        {
-            return Err(ControlPlaneError::invariant_failure(
-                "committed staging authorization batch receipt is invalid",
-            ));
-        }
-        let presentation = crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
-            authorizations,
-            receipt.source_epoch,
-            receipt.identity.members_digest,
-        )?;
-        if !presentation.authorizes_destination_for_pg(destination_node_id, pg_id) {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "node {} is not a destination of PG {} in the committed staging authorization batch",
-                    destination_node_id.as_u32(),
-                    pg_id.get()
-                ),
-            });
-        }
-        Ok(crate::control_plane_command::CommittedUnavailablePgStagingAuthorization::from_authority_published(
-            presentation,
-            destination_node_id,
-            pg_id,
-            authority_published_staging_authorization_seal(),
-        ))
-    }
-
-    fn exact_unavailable_pg_transition_for_reconciliation(
-        &self,
-        work: &UnavailablePgReconciliationWork,
-    ) -> Result<&UnavailablePgPlacementTransition, ControlPlaneError> {
-        let pg_id = work.pg_id();
-        let transition_epoch = work.transition_epoch();
-        let transition = self
-            .retained_unavailable_pg_placement_transitions
-            .get(&(pg_id, transition_epoch))
-            .or_else(|| {
-                self.unavailable_pg_placement_transitions
-                    .get(&pg_id)
-                    .filter(|transition| transition.transition_epoch == transition_epoch)
-            })
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} has no exact unavailable transition for staged transfer recovery",
-                    pg_id.get()
-                ),
-            })?;
-        if !work.mutation_binding().matches_transition(transition) {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} staged transfer recovery does not match its unavailable transition",
-                    pg_id.get()
-                ),
-            });
-        }
-        Ok(transition)
-    }
-
-    #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged ownership.
-    pub(crate) fn committed_unavailable_pg_staging_request(
-        &self,
-        work: &UnavailablePgReconciliationWork,
-    ) -> Result<UnavailablePgStagingIntentAuthorizationRequest, ControlPlaneError> {
-        self.committed_unavailable_pg_staging_request_binding(work)
-            .map(|(request, _, _)| request)
-    }
-
-    pub(crate) fn committed_unavailable_pg_staging_request_binding(
-        &self,
-        work: &UnavailablePgReconciliationWork,
-    ) -> Result<
-        (
-            UnavailablePgStagingIntentAuthorizationRequest,
-            ClusterEpoch,
-            ClusterEpoch,
-        ),
-        ControlPlaneError,
-    > {
-        let transition = self.exact_unavailable_pg_transition_for_reconciliation(work)?;
-        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
-            ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} staged transfer recovery has no durable staging authorization",
-                    work.pg_id().get()
-                ),
-            }
-        })?;
-        let request = unavailable_pg_staging_authorization_request_from_durable(transition)
-            .expect("staging authorization request exists with its durable authorization");
-        let target_epoch = authorization.artifact_target_epoch;
-        let source_epoch =
-            ClusterEpoch::new(target_epoch.get().checked_sub(1).ok_or_else(|| {
-                ControlPlaneError::invariant_failure(
-                    "staging artifact target epoch has no source runtime epoch",
-                )
-            })?)
-            .ok_or_else(|| {
-                ControlPlaneError::invariant_failure(
-                    "staging artifact target epoch has no source runtime epoch",
-                )
-            })?;
-        Ok((request, source_epoch, target_epoch))
-    }
-
-    pub(crate) fn committed_unavailable_pg_staged_transfer_if_present(
-        &self,
-        work: &UnavailablePgReconciliationWork,
-    ) -> Result<
-        Option<(
-            UnavailablePgStagingIntentAuthorizationRequest,
-            UnavailablePgTransitionInstallRequest,
-        )>,
-        ControlPlaneError,
-    > {
-        let transition = self.exact_unavailable_pg_transition_for_reconciliation(work)?;
-        let authorization = self.committed_unavailable_pg_staging_request(work)?;
-        Ok(
-            unavailable_pg_destination_install_request_from_durable(transition)
-                .map(|install| (authorization, install)),
-        )
-    }
-
-    #[allow(dead_code)] // Consumed when the reconciliation worker switches to staged ownership.
-    pub(crate) fn committed_unavailable_pg_staged_transfer(
-        &self,
-        work: &UnavailablePgReconciliationWork,
-    ) -> Result<
-        (
-            UnavailablePgStagingIntentAuthorizationRequest,
-            UnavailablePgTransitionInstallRequest,
-        ),
-        ControlPlaneError,
-    > {
-        self.committed_unavailable_pg_staged_transfer_if_present(work)?
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} staged transfer recovery has no durable destination install",
-                    work.pg_id().get()
-                ),
-            })
-    }
-
-    pub(crate) fn committed_unavailable_pg_staging_cleanup(
-        &self,
-        work: &UnavailablePgReconciliationWork,
-    ) -> Result<
-        (
-            UnavailablePgStagingIntentAuthorizationRequest,
-            MetadataTransferStagingCleanupDisposition,
-            Option<UnavailablePgTransitionInstallRequest>,
-        ),
-        ControlPlaneError,
-    > {
-        let transition = self.exact_unavailable_pg_transition_for_reconciliation(work)?;
-        let authorization = self.committed_unavailable_pg_staging_request(work)?;
-        if transition.completion.is_some() && transition.completion_batch_receipt.is_some() {
-            let install = unavailable_pg_destination_install_request_from_durable(transition)
-                .ok_or_else(|| {
-                    ControlPlaneError::invariant_failure(
-                        "completed staging cleanup transition has no destination install",
-                    )
-                })?;
-            return Ok((
-                authorization,
-                MetadataTransferStagingCleanupDisposition::Completed,
-                Some(install),
-            ));
-        }
-        if transition.destination_epoch.is_some() || transition.destination_install.is_some() {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} staging cancellation is not a superseded pre-install transition",
-                    work.pg_id().get()
-                ),
-            });
-        }
-        let mut successors = self
-            .retained_unavailable_pg_placement_transitions
-            .values()
-            .chain(self.unavailable_pg_placement_transitions.values())
-            .filter(|candidate| {
-                candidate.pg_id == transition.pg_id
-                    && candidate.predecessor_transition_epoch == Some(transition.transition_epoch)
-            });
-        let successor = successors
-            .next()
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} staging cancellation has no exact successor transition",
-                    work.pg_id().get()
-                ),
-            })?;
-        if successors.next().is_some() {
-            return Err(ControlPlaneError::invariant_failure(
-                "staging cancellation transition has multiple direct successors",
-            ));
-        }
-        Ok((
-            authorization,
-            MetadataTransferStagingCleanupDisposition::Superseded {
-                successor_transition_epoch: successor.transition_epoch,
-            },
-            None,
-        ))
-    }
-
-    pub(crate) fn validate_unavailable_pg_staging_cleanup(
-        &self,
-        binding: &UnavailablePgTransitionMutationBinding,
-        disposition: MetadataTransferStagingCleanupDisposition,
-        install: Option<&UnavailablePgTransitionInstallRequest>,
-        staging_generation: u64,
-    ) -> Result<CompletedUnavailablePgStagingCleanupAuthorization, ControlPlaneError> {
-        let pg_id = binding.pg_id();
-        let transition_epoch = binding.transition_epoch();
-        let transition = self
-            .retained_unavailable_pg_placement_transitions
-            .get(&(pg_id, transition_epoch))
-            .filter(|transition| binding.matches_transition(transition))
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} staging cleanup requires its exact retained transition",
-                    pg_id.get()
-                ),
-            })?;
-        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
-            ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} staging cleanup has no durable authorization",
-                    pg_id.get()
-                ),
-            }
-        })?;
-        if authorization.staging_generation != staging_generation {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} staging cleanup generation is not authorized",
-                    pg_id.get()
-                ),
-            });
-        }
-        match disposition {
-            MetadataTransferStagingCleanupDisposition::Completed => {
-                let install = install.ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} completed staging cleanup has no install",
-                        pg_id.get()
-                    ),
-                })?;
-                let destination_install =
-                    transition.destination_install.as_ref().ok_or_else(|| {
-                        ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} staging cleanup has no durable destination install",
-                                pg_id.get()
-                            ),
-                        }
-                    })?;
-                if transition.destination_epoch != Some(install.expected_destination_epoch)
-                    || install.unavailable_transition != *binding
-                    || destination_install.transfer != install.transfer
-                    || destination_install.publications != install.publications
-                    || transition.completion.is_none()
-                    || transition.completion_batch_receipt.is_none()
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging cleanup does not match its completed destination installation",
-                            pg_id.get()
-                        ),
-                    });
-                }
-            }
-            MetadataTransferStagingCleanupDisposition::Superseded {
-                successor_transition_epoch,
-            } => {
-                if install.is_some()
-                    || transition.destination_epoch.is_some()
-                    || transition.destination_install.is_some()
-                    || transition.completion.is_some()
-                    || transition.completion_batch_receipt.is_some()
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging cancellation is not a superseded pre-install transition",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                let successor_matches = self
-                    .retained_unavailable_pg_placement_transitions
-                    .get(&(pg_id, successor_transition_epoch))
-                    .or_else(|| {
-                        self.unavailable_pg_placement_transitions
-                            .get(&pg_id)
-                            .filter(|candidate| {
-                                candidate.transition_epoch == successor_transition_epoch
-                            })
-                    })
-                    .is_some_and(|successor| {
-                        successor.predecessor_transition_epoch == Some(transition_epoch)
-                    });
-                if !successor_matches {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging cancellation does not match its direct successor",
-                            pg_id.get()
-                        ),
-                    });
-                }
-            }
-        }
-        let mut destination_actors = binding
-            .destination_acting_set()
-            .iter()
-            .copied()
-            .map(|node_id| {
-                let node = self.node(node_id).ok_or_else(|| {
-                    ControlPlaneError::invariant_failure(format!(
-                        "PG {} staging cleanup destination {} is absent from authority state",
-                        pg_id.get(),
-                        node_id.as_u32()
-                    ))
-                })?;
-                MetadataTransferStagingNodeIdentity::new(
-                    node_id,
-                    node.node_incarnation(),
-                    node.endpoint().to_owned(),
-                )
-                .map_err(|error| {
-                    ControlPlaneError::invariant_failure(format!(
-                        "PG {} staging cleanup destination {} has an invalid authority identity: {error}",
-                        pg_id.get(),
-                        node_id.as_u32()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        destination_actors.sort_by_key(MetadataTransferStagingNodeIdentity::node_id);
-        Ok(CompletedUnavailablePgStagingCleanupAuthorization {
-            cluster_epoch: self.cluster_epoch,
-            destination_actors,
-        })
-    }
-
-    pub fn authorize_unavailable_pg_staging_intents_batch_command(
-        &self,
-        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "staging authorization",
-            authorizations
-                .iter()
-                .map(|request| request.unavailable_transition.pg_id()),
-        )?;
-        let command = ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents {
-            authorizations: authorizations.to_vec(),
-        };
-        self.validate_replication_safe_unavailable_pg_batch_command(
-            "staging authorization",
-            &command,
-        )?;
-        Ok(command)
-    }
-
-    fn apply_validated_unavailable_pg_staging_authorizations(
-        &self,
-        validated: Vec<ValidatedUnavailablePgStagingIntentAuthorization>,
-    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "staging authorization",
-            validated
-                .iter()
-                .map(ValidatedUnavailablePgStagingIntentAuthorization::pg_id),
-        )?;
-        if validated.iter().all(|entry| {
-            matches!(
-                entry,
-                ValidatedUnavailablePgStagingIntentAuthorization::ExactReplay { .. }
-            )
-        }) {
-            return Ok(None);
-        }
-        if validated.iter().any(|entry| {
-            matches!(
-                entry,
-                ValidatedUnavailablePgStagingIntentAuthorization::ExactReplay { .. }
-            )
-        }) {
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "unavailable placement staging authorization batch mixes replayed and new members"
-                        .to_owned(),
-            });
-        }
-        let mut next_snapshot = self.clone();
-        for entry in validated {
-            let ValidatedUnavailablePgStagingIntentAuthorization::Apply {
-                pg_id,
-                authorization,
-            } = entry
-            else {
-                unreachable!("mixed replay was rejected before staging authorization mutation");
-            };
-            next_snapshot
-                .unavailable_pg_placement_transitions
-                .get_mut(&pg_id)
-                .expect("staging authorization transition was validated")
-                .staging_authorization = Some(authorization);
-        }
-        Ok(Some(next_snapshot))
-    }
-
-    fn validate_unavailable_pg_destination_install_batch(
-        &self,
-        requests: Vec<UnavailablePgTransitionInstallRequest>,
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<Vec<ValidatedUnavailablePgDestinationInstall>, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "destination installation",
-            requests
-                .iter()
-                .map(|request| request.unavailable_transition.pg_id()),
-        )?;
-        let batch_identity = unavailable_pg_destination_install_batch_identity(
-            &requests,
-            expected_destination_epoch,
-        );
-        requests
-            .into_iter()
-            .map(|request| {
-                let pg_id = request.unavailable_transition.pg_id();
-                let transition_epoch = request.unavailable_transition.transition_epoch();
-                let active_transition = self
-                    .unavailable_pg_placement_transitions
-                    .get(&pg_id)
-                    .filter(|transition| transition.transition_epoch == transition_epoch);
-                let transition = self
-                    .retained_unavailable_pg_placement_transitions
-                    .get(&(pg_id, transition_epoch))
-                    .or(active_transition)
-                    .ok_or_else(|| ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} has no matching unavailable transition for destination installation",
-                            pg_id.get()
-                        ),
-                    })?;
-                if !request.unavailable_transition.matches_transition(transition) {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} destination installation does not match its unavailable transition",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                if let Some(existing) = &transition.destination_install {
-                    if transition.destination_epoch == Some(request.expected_destination_epoch)
-                        && existing.transfer == request.transfer
-                        && existing.publications == request.publications
-                        && existing.batch_receipt.identity == batch_identity
-                    {
-                        return Ok(ValidatedUnavailablePgDestinationInstall::ExactReplay {
-                            pg_id,
-                        });
-                    }
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} destination installation conflicts with durable install evidence",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                if active_transition.is_none()
-                    || transition.destination_epoch.is_some()
-                    || request.expected_destination_epoch != expected_destination_epoch
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} destination installation is not applicable to its active transition",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
-                    ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} destination installation has no staging authorization",
-                            pg_id.get()
-                        ),
-                    }
-                })?;
-                validate_acting_set(self, pg_id, &transition.destination_acting_set)?;
-                validate_acting_set_preserves_pending_recovery(
-                    self,
-                    pg_id,
-                    &transition.destination_acting_set,
-                )?;
-                let publication_nodes = request
-                    .publications
-                    .iter()
-                    .map(|publication| publication.node_id)
-                    .collect::<BTreeSet<_>>();
-                let destination_nodes = transition
-                    .destination_acting_set
-                    .iter()
-                    .copied()
-                    .collect::<BTreeSet<_>>();
-                if request.publications.len() != transition.destination_acting_set.len()
-                    || publication_nodes.len() != request.publications.len()
-                    || publication_nodes != destination_nodes
-                    || request
-                        .publications
-                        .windows(2)
-                        .any(|pair| pair[0].node_id >= pair[1].node_id)
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} destination installation does not carry one canonical publication per destination",
-                            pg_id.get()
-                        ),
-                    });
-                }
-                for publication in &request.publications {
-                    let node = self.nodes.get(&publication.node_id).ok_or(
-                        ControlPlaneError::UnknownNode {
-                            node_id: publication.node_id.as_u32(),
-                        },
-                    )?;
-                    if node.node_incarnation != publication.node_incarnation
-                        || node.endpoint != publication.endpoint
-                    {
-                        return Err(ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} destination {} publication identity is stale",
-                                pg_id.get(),
-                                publication.node_id.as_u32()
-                            ),
-                        });
-                    }
-                    let key = MetadataTransferStagingEvidenceKey {
-                        pg_id,
-                        staging_generation: authorization.staging_generation,
-                        actor_node_id: publication.node_id,
-                        actor_node_incarnation: publication.node_incarnation,
-                        kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-                        target_epoch: Some(request.expected_destination_epoch),
-                    };
-                    let evidence_bytes = self
-                        .metadata_transfer_staging_evidence
-                        .get(&key)
-                        .ok_or_else(|| ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} destination {} has no committed staging publication",
-                                pg_id.get(),
-                                publication.node_id.as_u32()
-                            ),
-                        })?;
-                    if checksum::sha256::digest(evidence_bytes) != publication.evidence_digest {
-                        return Err(ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} destination {} staging publication digest does not match retained evidence",
-                                pg_id.get(),
-                                publication.node_id.as_u32()
-                            ),
-                        });
-                    }
-                    let evidence = crate::pg_store::decode_staging_evidence(evidence_bytes)
-                        .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
-                            context: "retained metadata-transfer staging evidence is invalid",
-                            message: error.to_string(),
-                        })?;
-                    self.validate_metadata_transfer_staging_evidence_authority(&evidence, false)?;
-                    if evidence.actor().endpoint() != publication.endpoint {
-                        return Err(ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} destination {} staging publication endpoint does not match",
-                                pg_id.get(),
-                                publication.node_id.as_u32()
-                            ),
-                        });
-                    }
-                    if evidence.target_epoch() != Some(request.expected_destination_epoch)
-                        || evidence.transfer() != Some(request.transfer)
-                    {
-                        return Err(ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} destination {} staged artifact does not derive the requested transfer proof",
-                                pg_id.get(),
-                                publication.node_id.as_u32()
-                            ),
-                        });
-                    }
-                }
-                let record = self.pg(pg_id).ok_or(ControlPlaneError::UnknownPg {
-                    pg_id: pg_id.get(),
-                })?;
-                let required_floor = record.peering_metadata_proof_floor.ok_or(
-                    ControlPlaneError::PgMetadataMigrationRequiresTransfer {
-                        pg_id: pg_id.get(),
-                    },
-                )?;
-                validate_metadata_transfer_proof(MetadataTransferProofValidation {
-                    snapshot: self,
-                    pg_id,
-                    state: record.state,
-                    metadata_transfer_fenced: record.metadata_transfer_fenced,
-                    metadata_transfer_fence_source_imported:
-                        record.metadata_transfer_fence_source_imported,
-                    metadata_transfer_fence_epoch: record.metadata_transfer_fence_epoch,
-                    required_floor,
-                    required_floor_epoch: record.peering_metadata_proof_floor_epoch,
-                    transfer: request.transfer,
-                })?;
-                Ok(ValidatedUnavailablePgDestinationInstall::Apply {
-                    pg_id,
-                    transfer: request.transfer,
-                    publications: request.publications,
-                    batch_identity: batch_identity.clone(),
-                })
-            })
-            .collect()
-    }
-
-    fn apply_validated_unavailable_pg_destination_installs(
-        &self,
-        validated: Vec<ValidatedUnavailablePgDestinationInstall>,
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "destination installation",
-            validated
-                .iter()
-                .map(ValidatedUnavailablePgDestinationInstall::pg_id),
-        )?;
-        if validated.iter().all(|entry| {
-            matches!(
-                entry,
-                ValidatedUnavailablePgDestinationInstall::ExactReplay { .. }
-            )
-        }) {
-            return Ok(None);
-        }
-        if validated.iter().any(|entry| {
-            matches!(
-                entry,
-                ValidatedUnavailablePgDestinationInstall::ExactReplay { .. }
-            )
-        }) {
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "unavailable placement destination install batch mixes replayed and new members"
-                        .to_owned(),
-            });
-        }
-        let actual_destination_epoch = next_epoch(self.cluster_epoch)?;
-        if actual_destination_epoch != expected_destination_epoch {
-            return Err(
-                ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
-                    pg_id: validated[0].pg_id().get(),
-                    expected_destination_epoch,
-                    actual_destination_epoch,
-                },
-            );
-        }
-        let mut next_snapshot = self.clone();
-        for entry in validated {
-            let ValidatedUnavailablePgDestinationInstall::Apply {
-                pg_id,
-                transfer,
-                publications,
-                batch_identity,
-            } = entry
-            else {
-                unreachable!("mixed replay was rejected before destination installation");
-            };
-            let transition = next_snapshot
+            predecessor_transition_epoch: self
                 .unavailable_pg_placement_transitions
                 .get(&pg_id)
-                .expect("destination install transition was validated");
-            let destination_acting_set = transition.destination_acting_set.clone();
-            let source_node_id = transition.source_node_id;
-            let record = next_snapshot
-                .pgs
-                .get_mut(&pg_id)
-                .expect("destination install PG was validated");
-            let previous_primary_lease = active_primary_lease(self, record)
-                .or_else(|| record.previous_primary_lease.clone())
-                .map(PreviousPrimaryLease::without_reactivation_preference);
-            record.acting_set = destination_acting_set;
-            record.state = PgState::Peering;
-            record.active_primary = None;
-            record.active_metadata_proof = None;
-            record.active_metadata_proof_epoch = None;
-            record.active_metadata_log_epoch = None;
-            record.active_metadata_transfer_imported = false;
-            record.previous_primary_lease = previous_primary_lease;
-            record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
-            record.peering_metadata_proof_floor_epoch = Some(self.cluster_epoch);
-            record.peering_metadata_proof_floor_imported = true;
-            record.peering_metadata_transfer = Some(transfer);
-            record.peering_metadata_transfer_source_route_epoch = Some(self.cluster_epoch);
-            record.peering_metadata_transfer_source_node_id = Some(source_node_id);
-            record.metadata_transfer_fenced = false;
-            record.metadata_transfer_fence_source_lease_deadline_ms = None;
-            record.metadata_transfer_fence_source_imported = false;
-            record.metadata_transfer_fence_epoch = None;
-            let destination_route = HistoricalPgRouteRecord::from(&*record);
-            let transition = next_snapshot
-                .unavailable_pg_placement_transitions
-                .get_mut(&pg_id)
-                .expect("destination install transition was validated");
-            transition.destination_epoch = Some(expected_destination_epoch);
-            transition.destination_route = Some(destination_route);
-            transition.destination_install = Some(UnavailablePgDestinationInstall {
-                transfer,
-                publications,
-                batch_receipt: UnavailablePgTransitionBatchReceipt {
-                    identity: batch_identity,
-                    source_epoch: self.cluster_epoch,
-                    target_epoch: expected_destination_epoch,
-                },
-            });
-        }
-        next_snapshot.bump_epoch()?;
-        Ok(Some(next_snapshot))
-    }
-
-    pub(crate) fn prepare_unavailable_pg_placement_install_batch(
-        &self,
-        transitions: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<PreparedUnavailablePgInstallBatch, ControlPlaneError> {
-        self.prepare_unavailable_pg_placement_install_batch_with_replication_limit(
-            transitions,
-            expected_destination_epoch,
-            crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES,
-        )
-    }
-
-    pub(crate) fn unavailable_pg_install_awaits_publication(
-        &self,
-        request: &UnavailablePgTransitionInstallRequest,
-    ) -> bool {
-        let pg_id = request.unavailable_transition.pg_id();
-        let transition_epoch = request.unavailable_transition.transition_epoch();
-        let Some(transition) = self
-            .unavailable_pg_placement_transitions
-            .get(&pg_id)
-            .filter(|transition| transition.transition_epoch == transition_epoch)
-        else {
-            return false;
-        };
-        let Some(authorization) = transition.staging_authorization.as_ref() else {
-            return false;
-        };
-        request.publications.iter().any(|publication| {
-            let key = MetadataTransferStagingEvidenceKey {
-                pg_id,
-                staging_generation: authorization.staging_generation,
-                actor_node_id: publication.node_id,
-                actor_node_incarnation: publication.node_incarnation,
-                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-                target_epoch: Some(request.expected_destination_epoch),
-            };
-            !self.metadata_transfer_staging_evidence.contains_key(&key)
+                .map(|transition| transition.transition_epoch)
+                .or_else(|| {
+                    self.retained_unavailable_pg_placement_transitions
+                        .range((pg_id, ClusterEpoch::INITIAL)..=(pg_id, self.cluster_epoch))
+                        .next_back()
+                        .map(|(_, transition)| transition.transition_epoch)
+                }),
+            source_epoch: self.cluster_epoch,
+            source_acting_set: pg.acting_set.clone(),
+            source_node_id,
+            begin_authorization: Box::new(begin_authorization),
+            unavailable_node_id,
+            unavailable_node_incarnation: observation.node_incarnation,
+            unavailable_endpoint: observation.endpoint.clone(),
+            unavailable_lease_deadline_ms: observation.lease_deadline_ms,
+            unavailable_observed_at_ms: observation.observed_at_ms,
+            grace_cutoff_ms,
+            topology_generation: topology.topology_generation(),
+            topology_digest: *topology.topology_digest(),
+            destination_acting_set,
+            expected_transition_epoch: next_epoch(self.cluster_epoch)?,
+            begin_at_ms,
         })
-    }
-
-    fn prepare_unavailable_pg_placement_install_batch_with_replication_limit(
-        &self,
-        transitions: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-        max_encoded_entry_bytes: usize,
-    ) -> Result<PreparedUnavailablePgInstallBatch, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "destination installation preparation",
-            transitions
-                .iter()
-                .map(|request| request.unavailable_transition.pg_id()),
-        )?;
-        let mut included = Vec::new();
-        let mut rejected = Vec::new();
-        for candidate in transitions {
-            let singleton = match self
-                .install_unavailable_pg_placement_transitions_batch_command_unbounded(
-                    std::slice::from_ref(candidate),
-                    expected_destination_epoch,
-                ) {
-                Ok(command) => command,
-                Err(error) => {
-                    rejected.push((candidate.clone(), error));
-                    continue;
-                }
-            };
-            let singleton_len =
-                crate::control_plane_raft::control_plane_command_replication_encoded_len(
-                    &singleton,
-                )?;
-            if singleton_len > max_encoded_entry_bytes {
-                rejected.push((
-                    candidate.clone(),
-                    ControlPlaneError::invariant_failure(format!(
-                        "single PG {} unavailable transition installation encodes to {singleton_len} OpenRaft entry bytes, exceeding the replication-safe limit {max_encoded_entry_bytes}",
-                        candidate.unavailable_transition.pg_id().get()
-                    )),
-                ));
-                continue;
-            }
-
-            let mut tentative = included.clone();
-            tentative.push(candidate.clone());
-            let command = self
-                .install_unavailable_pg_placement_transitions_batch_command_unbounded(
-                    &tentative,
-                    expected_destination_epoch,
-                )?;
-            let encoded_len =
-                crate::control_plane_raft::control_plane_command_replication_encoded_len(&command)?;
-            if encoded_len > max_encoded_entry_bytes {
-                break;
-            }
-            included = tentative;
-        }
-
-        let command = if included.is_empty() {
-            None
-        } else {
-            Some(
-                self.install_unavailable_pg_placement_transitions_batch_command_unbounded(
-                    &included,
-                    expected_destination_epoch,
-                )?,
-            )
-        };
-        Ok(PreparedUnavailablePgInstallBatch {
-            command,
-            included,
-            rejected,
-        })
-    }
-
-    pub fn install_unavailable_pg_placement_transitions_batch_command(
-        &self,
-        transitions: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        let command = self.install_unavailable_pg_placement_transitions_batch_command_unbounded(
-            transitions,
-            expected_destination_epoch,
-        )?;
-        self.validate_replication_safe_unavailable_pg_batch_command(
-            "destination installation",
-            &command,
-        )?;
-        Ok(command)
-    }
-
-    fn install_unavailable_pg_placement_transitions_batch_command_unbounded(
-        &self,
-        transitions: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "destination installation",
-            transitions
-                .iter()
-                .map(|request| request.unavailable_transition.pg_id()),
-        )?;
-        let command = ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
-            transitions: transitions.to_vec(),
-            expected_destination_epoch,
-        };
-        self.apply_control_plane_command(command.clone())?;
-        Ok(command)
-    }
-
-    fn validate_replication_safe_unavailable_pg_batch_command(
-        &self,
-        kind: &str,
-        command: &ControlPlaneCommand,
-    ) -> Result<(), ControlPlaneError> {
-        self.apply_control_plane_command(command.clone())?;
-        let encoded_len =
-            crate::control_plane_raft::control_plane_command_replication_encoded_len(command)?;
-        if encoded_len > crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
-            return Err(ControlPlaneError::invariant_failure(format!(
-                "unavailable placement {kind} batch encodes to {encoded_len} OpenRaft entry bytes, exceeding the replication-safe limit {}",
-                crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_metadata_transfer_staging_evidence_authority(
-        &self,
-        evidence: &crate::pg_store::MetadataTransferStagingEvidence,
-        require_current_actor: bool,
-    ) -> Result<(), ControlPlaneError> {
-        let actor = evidence.actor();
-        if require_current_actor {
-            let node = self.nodes.get(&actor.node_id()).ok_or_else(|| {
-                ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "metadata-transfer staging evidence references unknown node {}",
-                        actor.node_id().as_u32()
-                    ),
-                }
-            })?;
-            if node.node_incarnation != actor.node_incarnation()
-                || node.endpoint != actor.endpoint()
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "metadata-transfer staging evidence actor {} does not match current node identity",
-                        actor.node_id().as_u32()
-                    ),
-                });
-            }
-        }
-
-        let intent = evidence.intent();
-        let transition = self
-            .retained_unavailable_pg_placement_transitions
-            .get(&(intent.pg_id(), intent.transition_epoch()))
-            .or_else(|| {
-                self.unavailable_pg_placement_transitions
-                    .get(&intent.pg_id())
-                    .filter(|transition| transition.transition_epoch == intent.transition_epoch())
-            })
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} has no matching transition for metadata-transfer staging evidence",
-                    intent.pg_id().get()
-                ),
-            })?;
-        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
-            ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} has no staging authorization for metadata-transfer evidence",
-                    intent.pg_id().get()
-                ),
-            }
-        })?;
-        if transition.source_epoch != intent.source_epoch()
-            || transition.source_acting_set != intent.source_acting_set()
-            || transition.destination_acting_set != intent.destination_acting_set()
-            || authorization.staging_generation != intent.staging_generation()
-            || authorization.artifact_digest != intent.artifact_digest()
-            || authorization.artifact_length != intent.artifact_length()
-            || authorization.artifact_format_version != intent.artifact_format_version()
-            || !transition.destination_acting_set.contains(&actor.node_id())
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging evidence does not match its authorization",
-                    intent.pg_id().get()
-                ),
-            });
-        }
-        match (
-            evidence.kind(),
-            evidence.target_epoch(),
-            evidence.transfer(),
-        ) {
-            (
-                crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-                Some(target_epoch),
-                Some(transfer),
-            ) if target_epoch > intent.transition_epoch()
-                && transfer.source_epoch() <= intent.source_epoch() =>
-            {
-                // The staging node validates the complete imported proof against
-                // the artifact before publication. The authority does not own
-                // that artifact, but it can and must reject impossible epoch
-                // relationships before admitting the evidence to Raft.
-            }
-            (crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone, None, None) => {}
-            _ => {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} metadata-transfer staging evidence has invalid publication semantics",
-                        intent.pg_id().get()
-                    ),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn metadata_transfer_staging_checkpoint_evidence_bytes(
-        &self,
-        key: &MetadataTransferStagingEvidenceKey,
-        actor: &crate::pg_store::MetadataTransferStagingNodeIdentity,
-        finalized_evidence: &MetadataTransferStagingFinalizedEvidenceIndex<'_>,
-        expected_digest: [u8; 32],
-    ) -> Result<Vec<u8>, String> {
-        if let Some(bytes) = self.metadata_transfer_staging_evidence.get(key) {
-            if checksum::sha256::digest(bytes) != expected_digest {
-                return Err(
-                    "metadata-transfer staging checkpoint commitment digest is invalid".to_owned(),
-                );
-            }
-            return Ok(bytes.clone());
-        }
-        let finalized = finalized_evidence.get(key).ok_or_else(|| {
-            "metadata-transfer staging checkpoint member lacks detailed or finalized evidence"
-                .to_owned()
-        })?;
-        let floor = finalized.floor;
-        let transition = self
-            .retained_unavailable_pg_placement_transitions
-            .get(&(key.pg_id, floor.transition.transition_epoch()))
-            .filter(|transition| floor.transition.matches_transition(transition))
-            .ok_or_else(|| {
-                "metadata-transfer staging checkpoint member has no exact finalized transition"
-                    .to_owned()
-            })?;
-        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
-            "metadata-transfer staging checkpoint member has no finalized authorization".to_owned()
-        })?;
-        if actor.node_id() != key.actor_node_id
-            || actor.node_incarnation() != key.actor_node_incarnation
-        {
-            return Err(
-                "metadata-transfer staging checkpoint member actor does not match its page"
-                    .to_owned(),
-            );
-        }
-        if finalized.endpoint != actor.endpoint()
-            || finalized.evidence_digest != expected_digest
-            || finalized.target_epoch != key.target_epoch
-            || (key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication)
-                != finalized.transfer.is_some()
-        {
-            return Err(
-                "metadata-transfer staging checkpoint member does not match its finalized certificate"
-                    .to_owned(),
-            );
-        }
-        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
-            &floor.transition,
-            authorization.artifact_digest,
-            authorization.artifact_length,
-            authorization.artifact_format_version,
-        )
-        .map_err(|error| error.to_string())?;
-        let bytes = crate::pg_store::canonical_metadata_transfer_staging_evidence(
-            actor,
-            &intent,
-            key.kind,
-            finalized.target_epoch,
-            finalized.transfer,
-        )
-        .map_err(|error| error.to_string())?;
-        if checksum::sha256::digest(&bytes) != expected_digest {
-            return Err(
-                "metadata-transfer staging checkpoint member is not canonically committed"
-                    .to_owned(),
-            );
-        }
-        Ok(bytes)
-    }
-
-    fn reconstruct_metadata_transfer_staging_checkpoint_source_segment(
-        &self,
-        actor: &crate::pg_store::MetadataTransferStagingNodeIdentity,
-        binding: MetadataTransferStagingCheckpointSourceSegmentBinding,
-        finalized_evidence: &MetadataTransferStagingFinalizedEvidenceIndex<'_>,
-        finalized_checkpoints: &MetadataTransferStagingFinalizedCheckpointIndex<'_>,
-    ) -> Result<MetadataTransferStagingEvidenceCheckpointSegment, String> {
-        let MetadataTransferStagingCheckpointSourceSegmentBinding {
-            first_generation,
-            last_generation,
-            previous_generation,
-            previous_apply_receipt_digest,
-            source_segment_digest,
-        } = binding;
-        let page_count = last_generation
-            .checked_sub(first_generation)
-            .and_then(|distance| distance.checked_add(1))
-            .ok_or_else(|| {
-                "metadata-transfer staging checkpoint anchor generation range overflows".to_owned()
-            })?;
-        if page_count
-            > u64::try_from(MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES)
-                .expect("checkpoint page limit fits u64")
-        {
-            return Err(
-                "metadata-transfer staging checkpoint anchor exceeds the page limit".to_owned(),
-            );
-        }
-
-        type FinalizedPageMember = (u64, MetadataTransferStagingEvidenceKey, [u8; 32], Vec<u8>);
-        let mut page_members = BTreeMap::<u64, Vec<FinalizedPageMember>>::new();
-        let mut page_candidates = BTreeMap::new();
-        let mut commitments = BTreeMap::new();
-        let finalized_members = finalized_checkpoints
-            .get(&(
-                actor.node_id(),
-                actor.node_incarnation(),
-                first_generation,
-                last_generation,
-                source_segment_digest,
-            ))
-            .ok_or_else(|| {
-                "metadata-transfer staging checkpoint anchor has no finalized members".to_owned()
-            })?;
-        for (key, floor) in finalized_members {
-            let binding = floor.checkpoint_bindings.get(*key).ok_or_else(|| {
-                "metadata-transfer staging checkpoint anchor member lost its binding".to_owned()
-            })?;
-            if binding.page_generation < first_generation
-                || binding.page_generation > last_generation
-                || binding.page_sequence == 0
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor has an invalid finalized member binding"
-                        .to_owned(),
-                );
-            }
-            let finalized = finalized_evidence.get(*key).ok_or_else(|| {
-                "metadata-transfer staging checkpoint anchor member is absent from its finalized certificate"
-                    .to_owned()
-            })?;
-            if !std::ptr::eq(finalized.floor, *floor) {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor member belongs to a different finalized floor"
-                        .to_owned(),
-                );
-            }
-            let evidence_digest = finalized.evidence_digest;
-            let evidence = self.metadata_transfer_staging_checkpoint_evidence_bytes(
-                key,
-                actor,
-                finalized_evidence,
-                evidence_digest,
-            )?;
-            if commitments
-                .insert((*key).clone(), evidence_digest)
-                .is_some()
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor has a duplicate finalized member"
-                        .to_owned(),
-                );
-            }
-            if let Some(existing) = page_candidates.get(&binding.page_generation) {
-                if existing != &binding.actor_closure_candidate {
-                    return Err(
-                        "metadata-transfer staging checkpoint anchor page has conflicting actor-closure candidates"
-                            .to_owned(),
-                    );
-                }
-            } else {
-                page_candidates.insert(
-                    binding.page_generation,
-                    binding.actor_closure_candidate.clone(),
-                );
-            }
-            page_members
-                .entry(binding.page_generation)
-                .or_default()
-                .push((
-                    binding.page_sequence,
-                    (*key).clone(),
-                    evidence_digest,
-                    evidence,
-                ));
-        }
-        if commitments.is_empty()
-            || commitments.len() > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS
-        {
-            return Err(
-                "metadata-transfer staging checkpoint anchor has an invalid commitment count"
-                    .to_owned(),
-            );
-        }
-
-        let mut preceding_generation = previous_generation;
-        let mut preceding_digest = previous_apply_receipt_digest;
-        let mut page_links = Vec::with_capacity(usize::try_from(page_count).map_err(|_| {
-            "metadata-transfer staging checkpoint anchor page count does not fit usize".to_owned()
-        })?);
-        let mut tip_apply_receipt = None;
-        for generation in first_generation..=last_generation {
-            let mut members = page_members.remove(&generation).ok_or_else(|| {
-                "metadata-transfer staging checkpoint anchor has an empty page".to_owned()
-            })?;
-            members.sort_by_key(|member| member.0);
-            if members.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor has duplicate page sequences"
-                        .to_owned(),
-                );
-            }
-            let entries = members
-                .iter()
-                .map(|(sequence, _, _, evidence)| (*sequence, evidence.clone()))
-                .collect::<Vec<_>>();
-            let actor_closure_candidate = page_candidates.remove(&generation).ok_or_else(|| {
-                "metadata-transfer staging checkpoint anchor page has no closure binding".to_owned()
-            })?;
-            let page_digest = crate::pg_store::
-                metadata_transfer_staging_checkpoint_page_digest_with_actor_closure(
-                    actor,
-                    actor_closure_candidate.as_ref(),
-                    preceding_generation,
-                    preceding_digest,
-                    generation,
-                    &entries,
-                )
-                .map_err(|error| error.to_string())?;
-            let receipt =
-                crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_checkpoint_link(
-                    actor.clone(),
-                    preceding_generation,
-                    preceding_digest,
-                    generation,
-                    page_digest,
-                );
-            let receipt_digest = checksum::sha256::digest(receipt.as_bytes());
-            page_links.push(MetadataTransferStagingEvidenceCheckpointPageLink {
-                page_digest,
-                previous_apply_receipt_digest: preceding_digest,
-                apply_receipt_digest: receipt_digest,
-                actor_closure_candidate,
-                entries: members
-                    .into_iter()
-                    .map(|(sequence, evidence_key, _, _)| {
-                        MetadataTransferStagingEvidenceCheckpointPageEntry {
-                            sequence,
-                            evidence_key,
-                        }
-                    })
-                    .collect(),
-            });
-            preceding_generation = generation;
-            preceding_digest = receipt_digest;
-            if generation == last_generation {
-                tip_apply_receipt = Some(receipt.as_bytes().to_vec());
-            }
-        }
-        if !page_members.is_empty() {
-            return Err(
-                "metadata-transfer staging checkpoint anchor has out-of-range page members"
-                    .to_owned(),
-            );
-        }
-        if !page_candidates.is_empty() {
-            return Err(
-                "metadata-transfer staging checkpoint anchor has out-of-range closure bindings"
-                    .to_owned(),
-            );
-        }
-        Ok(MetadataTransferStagingEvidenceCheckpointSegment {
-            actor: actor.clone(),
-            first_generation,
-            last_generation,
-            previous_generation,
-            previous_apply_receipt_digest,
-            page_links,
-            tip_apply_receipt: tip_apply_receipt.ok_or_else(|| {
-                "metadata-transfer staging checkpoint source segment has no tip receipt".to_owned()
-            })?,
-            commitments,
-        })
-    }
-
-    fn reconstruct_metadata_transfer_staging_checkpoint_anchor_sources(
-        &self,
-        anchor: &MetadataTransferStagingEvidenceCheckpointAnchor,
-        finalized_evidence: &MetadataTransferStagingFinalizedEvidenceIndex<'_>,
-        finalized_checkpoints: &MetadataTransferStagingFinalizedCheckpointIndex<'_>,
-    ) -> Result<Vec<(u64, u64, [u8; 32])>, String> {
-        let sources = metadata_transfer_staging_checkpoint_source_segments(
-            finalized_checkpoints,
-            anchor.actor.node_id(),
-            anchor.actor.node_incarnation(),
-            anchor.first_generation,
-            anchor.last_generation,
-        )?;
-        let mut preceding_generation = anchor.previous_generation;
-        let mut preceding_digest = anchor.previous_apply_receipt_digest;
-        let mut tip_apply_receipt = None;
-        for (first_generation, last_generation, source_digest) in &sources {
-            let segment = self.reconstruct_metadata_transfer_staging_checkpoint_source_segment(
-                &anchor.actor,
-                MetadataTransferStagingCheckpointSourceSegmentBinding {
-                    first_generation: *first_generation,
-                    last_generation: *last_generation,
-                    previous_generation: preceding_generation,
-                    previous_apply_receipt_digest: preceding_digest,
-                    source_segment_digest: *source_digest,
-                },
-                finalized_evidence,
-                finalized_checkpoints,
-            )?;
-            if metadata_transfer_staging_checkpoint_segment_digest(&segment) != *source_digest {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor source digest is not reconstructible"
-                        .to_owned(),
-                );
-            }
-            preceding_generation = *last_generation;
-            preceding_digest = checksum::sha256::digest(&segment.tip_apply_receipt);
-            tip_apply_receipt = Some(segment.tip_apply_receipt);
-        }
-        if sources.is_empty()
-            || sources.len()
-                != usize::try_from(anchor.source_segment_count).map_err(|_| {
-                    "metadata-transfer staging checkpoint source count does not fit usize"
-                        .to_owned()
-                })?
-            || sources.first().map(|source| source.0) != Some(anchor.first_generation)
-            || sources.last().map(|source| source.1) != Some(anchor.last_generation)
-            || metadata_transfer_staging_checkpoint_source_segments_digest(&sources)
-                != anchor.source_segments_digest
-            || tip_apply_receipt.as_deref() != Some(anchor.tip_apply_receipt.as_slice())
-        {
-            return Err(
-                "metadata-transfer staging checkpoint anchor cumulative source is invalid"
-                    .to_owned(),
-            );
-        }
-        Ok(sources)
-    }
-
-    fn validate_metadata_transfer_staging_finalized_checkpoint_binding(
-        &self,
-        key: &MetadataTransferStagingEvidenceKey,
-        evidence_digest: [u8; 32],
-        expected_endpoint: &str,
-        binding: &MetadataTransferStagingFinalizedCheckpointBinding,
-    ) -> Result<(), String> {
-        if binding.actor_node_id != key.actor_node_id
-            || binding.actor_node_incarnation != key.actor_node_incarnation
-            || binding.actor_endpoint != expected_endpoint
-            || binding.first_generation == 0
-            || binding.first_generation > binding.last_generation
-            || binding.page_generation < binding.first_generation
-            || binding.page_generation > binding.last_generation
-            || binding.page_sequence == 0
-        {
-            return Err(
-                "metadata-transfer staging finalized checkpoint binding has invalid identity"
-                    .to_owned(),
-            );
-        }
-        let segment_key = (
-            binding.actor_node_id,
-            binding.actor_node_incarnation,
-            binding.first_generation,
-        );
-        if let Some(segment) = self
-            .metadata_transfer_staging_evidence_checkpoint_segments
-            .get(&segment_key)
-        {
-            if segment.last_generation != binding.last_generation
-                || segment.actor.endpoint() != binding.actor_endpoint
-                || metadata_transfer_staging_checkpoint_segment_digest(segment)
-                    != binding.segment_digest
-                || segment.commitments.get(key) != Some(&evidence_digest)
-                || segment
-                    .page_links
-                    .get(
-                        usize::try_from(binding.page_generation - binding.first_generation)
-                            .map_err(|_| {
-                                "metadata-transfer staging finalized checkpoint page offset does not fit usize"
-                                    .to_owned()
-                            })?,
-                    )
-                    .is_none_or(|link| {
-                        link.actor_closure_candidate != binding.actor_closure_candidate
-                            || !link.entries.iter().any(|entry| {
-                                entry.sequence == binding.page_sequence
-                                    && entry.evidence_key == *key
-                            })
-                    })
-            {
-                return Err(
-                    "metadata-transfer staging finalized checkpoint binding does not match its segment"
-                        .to_owned(),
-                );
-            }
-            return Ok(());
-        }
-        let anchor = self
-            .metadata_transfer_staging_evidence_checkpoint_anchors
-            .range(
-                (binding.actor_node_id, binding.actor_node_incarnation, 0)
-                    ..=(
-                        binding.actor_node_id,
-                        binding.actor_node_incarnation,
-                        binding.first_generation,
-                    ),
-            )
-            .next_back()
-            .map(|(_, anchor)| anchor)
-            .ok_or_else(|| {
-                "metadata-transfer staging finalized checkpoint binding has no retained segment or anchor"
-                    .to_owned()
-            })?;
-        if anchor.first_generation > binding.first_generation
-            || anchor.last_generation < binding.last_generation
-            || anchor.actor.endpoint() != binding.actor_endpoint
-        {
-            return Err(
-                "metadata-transfer staging finalized checkpoint binding does not match its anchor"
-                    .to_owned(),
-            );
-        }
-        Ok(())
-    }
-
-    fn validate_metadata_transfer_staging_finalized_evidence_retention(
-        &self,
-        key: &MetadataTransferStagingEvidenceKey,
-        evidence_digest: [u8; 32],
-        expected_endpoint: &str,
-        binding: Option<&MetadataTransferStagingFinalizedCheckpointBinding>,
-    ) -> Result<(), String> {
-        if let Some(binding) = binding {
-            return self.validate_metadata_transfer_staging_finalized_checkpoint_binding(
-                key,
-                evidence_digest,
-                expected_endpoint,
-                binding,
-            );
-        }
-        let bytes = self
-            .metadata_transfer_staging_evidence
-            .get(key)
-            .ok_or_else(|| {
-                "metadata-transfer staging finalized evidence has neither detail nor checkpoint binding"
-                    .to_owned()
-            })?;
-        let evidence =
-            crate::pg_store::decode_staging_evidence(bytes).map_err(|error| error.to_string())?;
-        if checksum::sha256::digest(bytes) != evidence_digest
-            || evidence.actor().endpoint() != expected_endpoint
-        {
-            return Err(
-                "metadata-transfer staging finalized detailed evidence is not exact".to_owned(),
-            );
-        }
-        Ok(())
-    }
-
-    fn validate_metadata_transfer_staging_evidence_invariants(&self) -> Result<(), String> {
-        let mut page_members = BTreeMap::new();
-        let mut finalized_page_members = BTreeSet::new();
-        let mut checkpoint_members = BTreeMap::new();
-        let finalized_evidence = metadata_transfer_staging_finalized_evidence_index(
-            &self.metadata_transfer_staging_finalized_floors,
-        )?;
-        let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
-            &self.metadata_transfer_staging_finalized_floors,
-        )?;
-        let retired_closure_destinations = self
-            .metadata_transfer_staging_retired_actor_closures
-            .values()
-            .map(|closure| closure.destination_actor.clone())
-            .collect::<BTreeSet<_>>();
-        type ChainRange = (u64, u64, u64, [u8; 32], [u8; 32], bool);
-        let mut actor_chains: BTreeMap<(NodeId, u64, String), Vec<ChainRange>> = BTreeMap::new();
-        for (key, record) in &self.metadata_transfer_staging_evidence_pages {
-            let page = crate::pg_store::decode_staging_evidence_page_payload(
-                &record.operation_payload,
-                record.page_digest,
-            )
-            .map_err(|error| error.to_string())?;
-            if *key
-                != (
-                    page.actor().node_id(),
-                    page.actor().node_incarnation(),
-                    page.generation(),
-                )
-            {
-                return Err(
-                    "metadata-transfer staging page key does not match its actor and generation"
-                        .to_owned(),
-                );
-            }
-            let node = self.nodes.get(&page.actor().node_id()).ok_or_else(|| {
-                "metadata-transfer staging page references an unknown actor".to_owned()
-            })?;
-            if node.node_incarnation < page.actor().node_incarnation()
-                || (node.node_incarnation == page.actor().node_incarnation()
-                    && node.endpoint != page.actor().endpoint())
-            {
-                return Err(
-                    "metadata-transfer staging page actor is incompatible with current node identity"
-                        .to_owned(),
-                );
-            }
-            let receipt =
-                crate::pg_store::decode_staging_evidence_apply_receipt(&record.apply_receipt)
-                    .map_err(|error| error.to_string())?;
-            let expected =
-                crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&page);
-            if receipt.as_bytes() != expected.as_bytes() {
-                return Err(
-                    "metadata-transfer staging page has a mismatched apply receipt".to_owned(),
-                );
-            }
-            actor_chains
-                .entry((key.0, key.1, page.actor().endpoint().to_owned()))
-                .or_default()
-                .push((
-                    page.generation(),
-                    page.generation(),
-                    page.previous_generation(),
-                    page.previous_apply_receipt_digest(),
-                    checksum::sha256::digest(&record.apply_receipt),
-                    true,
-                ));
-            let actor_has_closure_candidate = page.actor_closure_candidate().is_some()
-                || self
-                    .metadata_transfer_staging_evidence_pages
-                    .get(&(page.actor().node_id(), page.actor().node_incarnation(), 1))
-                    .and_then(|record| {
-                        decode_staging_evidence_page_payload(
-                            &record.operation_payload,
-                            record.page_digest,
-                        )
-                        .ok()
-                    })
-                    .is_some_and(|genesis| genesis.actor_closure_candidate().is_some())
-                || retired_closure_destinations.contains(page.actor());
-            for entry in page.entries() {
-                let evidence = crate::pg_store::decode_staging_evidence(entry.evidence())
-                    .map_err(|error| error.to_string())?;
-                if evidence.actor() != page.actor() {
-                    return Err(
-                        "metadata-transfer staging page contains foreign actor evidence".to_owned(),
-                    );
-                }
-                let evidence_key = MetadataTransferStagingEvidenceKey {
-                    pg_id: evidence.intent().pg_id(),
-                    staging_generation: evidence.intent().staging_generation(),
-                    actor_node_id: evidence.actor().node_id(),
-                    actor_node_incarnation: evidence.actor().node_incarnation(),
-                    kind: evidence.kind(),
-                    target_epoch: evidence.target_epoch(),
-                };
-                let finalized_replay = metadata_transfer_staging_finalized_generation(
-                    &self.metadata_transfer_staging_finalized_floors,
-                    evidence_key.pg_id,
-                )
-                .is_some_and(|floor| evidence_key.staging_generation <= floor);
-                if finalized_replay {
-                    let floor = self
-                        .metadata_transfer_staging_finalized_floors
-                        .get(&(evidence_key.pg_id, evidence_key.staging_generation))
-                        .ok_or_else(|| {
-                            "metadata-transfer staging page replay has no exact finalized certificate"
-                                .to_owned()
-                        })?;
-                    if !actor_has_closure_candidate
-                        && floor.checkpoint_bindings.contains_key(&evidence_key)
-                    {
-                        return Err(
-                            "metadata-transfer staging page retains checkpointed evidence at or below its finalized floor without actor rollover"
-                                .to_owned(),
-                        );
-                    }
-                    let expected = metadata_transfer_staging_finalized_semantic_evidence_bytes(
-                        floor,
-                        evidence.actor(),
-                        evidence.kind(),
-                        evidence.target_epoch(),
-                    )?;
-                    if expected != entry.evidence() {
-                        return Err(
-                            "metadata-transfer staging page does not exactly replay finalized evidence"
-                                .to_owned(),
-                        );
-                    }
-                    if self.metadata_transfer_staging_evidence.get(&evidence_key)
-                        == Some(&entry.evidence().to_vec())
-                    {
-                        if page_members
-                            .insert(evidence_key, entry.evidence().to_vec())
-                            .is_some()
-                        {
-                            return Err(
-                                "metadata-transfer staging finalized evidence appears in more than one retained page"
-                                    .to_owned(),
-                            );
-                        }
-                    } else if !finalized_page_members.insert(evidence_key) {
-                        return Err(
-                            "metadata-transfer staging page does not exactly replay unique finalized evidence"
-                                .to_owned(),
-                        );
-                    }
-                } else if page_members
-                    .insert(evidence_key, entry.evidence().to_vec())
-                    .is_some()
-                {
-                    return Err(
-                        "metadata-transfer staging evidence appears in more than one retained page"
-                            .to_owned(),
-                    );
-                }
-            }
-        }
-        for (key, segment) in &self.metadata_transfer_staging_evidence_checkpoint_segments {
-            if *key
-                != (
-                    segment.actor.node_id(),
-                    segment.actor.node_incarnation(),
-                    segment.first_generation,
-                )
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint key does not match its actor and range"
-                        .to_owned(),
-                );
-            }
-            let node = self.nodes.get(&segment.actor.node_id()).ok_or_else(|| {
-                "metadata-transfer staging checkpoint references an unknown actor".to_owned()
-            })?;
-            if node.node_incarnation < segment.actor.node_incarnation()
-                || (node.node_incarnation == segment.actor.node_incarnation()
-                    && node.endpoint != segment.actor.endpoint())
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint actor is incompatible with current node identity"
-                        .to_owned(),
-                );
-            }
-            if segment.first_generation == 0
-                || segment.first_generation > segment.last_generation
-                || segment.commitments.is_empty()
-                || segment.commitments.len()
-                    > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS
-                || segment.page_links.is_empty()
-                || segment.page_links.len()
-                    > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES
-                || u64::try_from(segment.page_links.len()).ok()
-                    != segment
-                        .last_generation
-                        .checked_sub(segment.first_generation)
-                        .and_then(|distance| distance.checked_add(1))
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint has invalid range or bounds".to_owned(),
-                );
-            }
-            if metadata_transfer_staging_evidence_checkpoint_state_record_len(segment)
-                > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_BYTES
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint exceeds its encoded byte limit"
-                        .to_owned(),
-                );
-            }
-            let mut preceding_generation = segment.previous_generation;
-            let mut preceding_digest = segment.previous_apply_receipt_digest;
-            let mut segment_members = BTreeSet::new();
-            for (offset, link) in segment.page_links.iter().enumerate() {
-                if link.previous_apply_receipt_digest != preceding_digest
-                    || link.entries.is_empty()
-                    || link.entries.len() > crate::pg_store::MAX_STAGING_EVIDENCE_PAGE_ENTRIES
-                    || link
-                        .entries
-                        .windows(2)
-                        .any(|pair| pair[0].sequence >= pair[1].sequence)
-                {
-                    return Err(
-                        "metadata-transfer staging checkpoint page link is invalid".to_owned()
-                    );
-                }
-                let generation = segment
-                    .first_generation
-                    .checked_add(u64::try_from(offset).map_err(|_| {
-                        "metadata-transfer staging checkpoint page offset does not fit u64"
-                            .to_owned()
-                    })?)
-                    .ok_or_else(|| {
-                        "metadata-transfer staging checkpoint page generation overflow".to_owned()
-                    })?;
-                let mut page_entries = Vec::with_capacity(link.entries.len());
-                for entry in &link.entries {
-                    if !segment_members.insert(entry.evidence_key.clone())
-                        || entry.evidence_key.actor_node_id != segment.actor.node_id()
-                        || entry.evidence_key.actor_node_incarnation
-                            != segment.actor.node_incarnation()
-                    {
-                        return Err(
-                            "metadata-transfer staging checkpoint page membership is invalid"
-                                .to_owned(),
-                        );
-                    }
-                    let evidence_digest = *segment
-                        .commitments
-                        .get(&entry.evidence_key)
-                        .ok_or_else(|| {
-                            "metadata-transfer staging checkpoint page member has no commitment"
-                                .to_owned()
-                        })?;
-                    let evidence = self.metadata_transfer_staging_checkpoint_evidence_bytes(
-                        &entry.evidence_key,
-                        &segment.actor,
-                        &finalized_evidence,
-                        evidence_digest,
-                    )?;
-                    page_entries.push((entry.sequence, evidence));
-                    if checkpoint_members
-                        .insert(
-                            entry.evidence_key.clone(),
-                            (evidence_digest, segment.actor.clone()),
-                        )
-                        .is_some()
-                        || page_members.contains_key(&entry.evidence_key)
-                        || finalized_page_members.contains(&entry.evidence_key)
-                    {
-                        return Err(
-                            "metadata-transfer staging evidence appears in more than one retained chain range"
-                                .to_owned(),
-                        );
-                    }
-                }
-                let reconstructed_page_digest = crate::pg_store::
-                    metadata_transfer_staging_checkpoint_page_digest_with_actor_closure(
-                        &segment.actor,
-                        link.actor_closure_candidate.as_ref(),
-                        preceding_generation,
-                        preceding_digest,
-                        generation,
-                        &page_entries,
-                    )
-                    .map_err(|error| error.to_string())?;
-                if reconstructed_page_digest != link.page_digest {
-                    return Err(
-                        "metadata-transfer staging checkpoint page membership does not match its digest"
-                            .to_owned(),
-                    );
-                }
-                if link.actor_closure_candidate.is_some() {
-                    let closures = self
-                        .metadata_transfer_staging_actor_closures
-                        .values()
-                        .filter(|closure| {
-                            closure.destination_actor == segment.actor
-                                && closure.destination_genesis_page_digest == link.page_digest
-                        })
-                        .collect::<Vec<_>>();
-                    if generation != 1
-                        || segment.first_generation != 1
-                        || closures.is_empty()
-                        || closures.iter().any(|closure| {
-                            self.metadata_transfer_staging_retired_actor_closures.get(&(
-                                closure.source_actor.node_id(),
-                                closure.source_actor.node_incarnation(),
-                            )) != Some(*closure)
-                        })
-                    {
-                        return Err(
-                            "metadata-transfer staging checkpoint has an unretired actor-closure candidate"
-                                .to_owned(),
-                        );
-                    }
-                }
-                let expected_receipt = crate::pg_store::
-                    MetadataTransferStagingEvidenceApplyReceipt::for_checkpoint_link(
-                        segment.actor.clone(),
-                        preceding_generation,
-                        preceding_digest,
-                        generation,
-                        link.page_digest,
-                    );
-                if checksum::sha256::digest(expected_receipt.as_bytes())
-                    != link.apply_receipt_digest
-                {
-                    return Err(
-                        "metadata-transfer staging checkpoint page link has an invalid apply receipt digest"
-                            .to_owned(),
-                    );
-                }
-                preceding_generation = generation;
-                preceding_digest = link.apply_receipt_digest;
-            }
-            let tip_receipt =
-                crate::pg_store::decode_staging_evidence_apply_receipt(&segment.tip_apply_receipt)
-                    .map_err(|error| error.to_string())?;
-            let tip_link = segment.page_links.last().expect("nonempty links validated");
-            if tip_receipt.actor() != &segment.actor
-                || tip_receipt.generation() != segment.last_generation
-                || tip_receipt.accepted_generation() != segment.last_generation
-                || tip_receipt.page_digest() != tip_link.page_digest
-                || tip_receipt.previous_generation() != segment.last_generation.saturating_sub(1)
-                || tip_receipt.previous_apply_receipt_digest()
-                    != tip_link.previous_apply_receipt_digest
-                || checksum::sha256::digest(&segment.tip_apply_receipt)
-                    != tip_link.apply_receipt_digest
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint tip receipt is invalid".to_owned(),
-                );
-            }
-            if segment_members.len() != segment.commitments.len() {
-                return Err(
-                    "metadata-transfer staging checkpoint has unassigned commitments".to_owned(),
-                );
-            }
-            actor_chains
-                .entry((key.0, key.1, segment.actor.endpoint().to_owned()))
-                .or_default()
-                .push((
-                    segment.first_generation,
-                    segment.last_generation,
-                    segment.previous_generation,
-                    segment.previous_apply_receipt_digest,
-                    checksum::sha256::digest(&segment.tip_apply_receipt),
-                    false,
-                ));
-        }
-        for (key, anchor) in &self.metadata_transfer_staging_evidence_checkpoint_anchors {
-            if *key
-                != (
-                    anchor.actor.node_id(),
-                    anchor.actor.node_incarnation(),
-                    anchor.first_generation,
-                )
-                || anchor.first_generation == 0
-                || anchor.first_generation > anchor.last_generation
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor has invalid identity or range"
-                        .to_owned(),
-                );
-            }
-            let node = self.nodes.get(&anchor.actor.node_id()).ok_or_else(|| {
-                "metadata-transfer staging checkpoint anchor references an unknown actor".to_owned()
-            })?;
-            if node.node_incarnation < anchor.actor.node_incarnation()
-                || (node.node_incarnation == anchor.actor.node_incarnation()
-                    && node.endpoint != anchor.actor.endpoint())
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor actor is incompatible with current node identity"
-                    .to_owned(),
-                );
-            }
-            let sources = self.reconstruct_metadata_transfer_staging_checkpoint_anchor_sources(
-                anchor,
-                &finalized_evidence,
-                &finalized_checkpoints,
-            )?;
-            let leaf_anchor = anchor.source_segment_count == 1;
-            if anchor.source_segment_count == 0
-                || (leaf_anchor && anchor.source_segment_digest != sources[0].2)
-                || (!leaf_anchor && anchor.source_segment_digest != [0; 32])
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor provenance is invalid".to_owned(),
-                );
-            }
-            let tip_receipt =
-                crate::pg_store::decode_staging_evidence_apply_receipt(&anchor.tip_apply_receipt)
-                    .map_err(|error| error.to_string())?;
-            if tip_receipt.actor() != &anchor.actor
-                || tip_receipt.generation() != anchor.last_generation
-                || tip_receipt.accepted_generation() != anchor.last_generation
-                || tip_receipt.previous_generation() != anchor.last_generation.saturating_sub(1)
-            {
-                return Err(
-                    "metadata-transfer staging checkpoint anchor tip receipt is invalid".to_owned(),
-                );
-            }
-            actor_chains
-                .entry((key.0, key.1, anchor.actor.endpoint().to_owned()))
-                .or_default()
-                .push((
-                    anchor.first_generation,
-                    anchor.last_generation,
-                    anchor.previous_generation,
-                    anchor.previous_apply_receipt_digest,
-                    checksum::sha256::digest(&anchor.tip_apply_receipt),
-                    false,
-                ));
-        }
-        let reconstructed_actor_closures = self
-            .reconstruct_metadata_transfer_staging_actor_closures()
-            .map_err(|error| error.to_string())?;
-        if reconstructed_actor_closures.iter().any(|(key, closure)| {
-            self.metadata_transfer_staging_actor_closures.get(key) != Some(closure)
-        }) || self
-            .metadata_transfer_staging_actor_closures
-            .iter()
-            .any(|(key, closure)| {
-                !reconstructed_actor_closures.contains_key(key)
-                    && self
-                        .metadata_transfer_staging_retired_actor_closures
-                        .get(key)
-                        != Some(closure)
-            })
-            || self
-                .metadata_transfer_staging_retired_actor_closures
-                .iter()
-                .any(|(key, closure)| {
-                    self.metadata_transfer_staging_actor_closures.get(key) != Some(closure)
-                })
-        {
-            return Err(
-                "metadata-transfer staging actor closures do not match retained chain evidence"
-                    .to_owned(),
-            );
-        }
-        if !self
-            .metadata_transfer_staging_retired_actor_closures
-            .is_empty()
-        {
-            let closure_validation_index = self
-                .metadata_transfer_staging_actor_closure_validation_index(
-                    &finalized_evidence,
-                    &finalized_checkpoints,
-                )?;
-            for (key, certificate) in &self.metadata_transfer_staging_retired_actor_closures {
-                Self::validate_retired_metadata_transfer_staging_actor_closure(
-                    *key,
-                    certificate,
-                    &closure_validation_index,
-                )?;
-            }
-        }
-
-        for ((node_id, incarnation, endpoint), ranges) in &mut actor_chains {
-            ranges.sort_by_key(|range| range.0);
-            let mut expected_generation = 1_u64;
-            let mut previous_generation = 0_u64;
-            let mut previous_receipt_digest = [0; 32];
-            for (first, last, predecessor, predecessor_digest, tip_digest, _) in ranges.iter() {
-                if *first != expected_generation
-                    || *predecessor != previous_generation
-                    || *predecessor_digest != previous_receipt_digest
-                {
-                    return Err(
-                        "metadata-transfer staging actor chain has a gap or invalid predecessor"
-                            .to_owned(),
-                    );
-                }
-                expected_generation = last.checked_add(1).ok_or_else(|| {
-                    "metadata-transfer staging actor generation overflow".to_owned()
-                })?;
-                previous_generation = *last;
-                previous_receipt_digest = *tip_digest;
-            }
-            let has_replayable_tip = ranges.last().is_some_and(|range| range.5);
-            let has_closed_tip = ranges.last().is_some_and(|range| {
-                self.metadata_transfer_staging_actor_closures
-                    .get(&(*node_id, *incarnation))
-                    .is_some_and(|closure| {
-                        closure.source_actor.node_id() == *node_id
-                            && closure.source_actor.node_incarnation() == *incarnation
-                            && closure.source_actor.endpoint() == endpoint
-                            && closure.source_tip_generation == range.1
-                            && closure.source_tip_apply_receipt_digest == range.4
-                    })
-            });
-            if !has_replayable_tip && !has_closed_tip {
-                return Err(
-                    "metadata-transfer staging actor chain must retain a replayable or closed tip"
-                        .to_owned(),
-                );
-            }
-        }
-        for ((pg_id, staging_generation), floor) in &self.metadata_transfer_staging_finalized_floors
-        {
-            if *pg_id != floor.transition.pg_id()
-                || *staging_generation != floor.staging_generation
-                || floor.staging_generation != floor.transition.transition_epoch().get()
-                || (floor.disposition == MetadataTransferStagingCleanupDisposition::Completed
-                    && floor.publications.is_empty())
-                || floor.publications.windows(2).any(|pair| {
-                    (pair[0].target_epoch, pair[0].node_id)
-                        >= (pair[1].target_epoch, pair[1].node_id)
-                })
-                || floor.tombstones.is_empty()
-                || floor
-                    .tombstones
-                    .windows(2)
-                    .any(|pair| pair[0].node_id >= pair[1].node_id)
-                || floor.tombstone_set_digest
-                    != metadata_transfer_staging_cleanup_digest(
-                        &floor.transition,
-                        floor.staging_generation,
-                        floor.disposition,
-                        floor.artifact_digest,
-                        floor.artifact_length,
-                        floor.artifact_format_version,
-                        &floor.tombstones,
-                    )
-            {
-                return Err(
-                    "metadata-transfer staging finalized floor has invalid identity or digest"
-                        .to_owned(),
-                );
-            }
-            let transition = self
-                .retained_unavailable_pg_placement_transitions
-                .get(&(*pg_id, floor.transition.transition_epoch()))
-                .filter(|transition| floor.transition.matches_transition(transition))
-                .ok_or_else(|| {
-                    "metadata-transfer staging finalized floor has no exact retained transition"
-                        .to_owned()
-                })?;
-            match floor.disposition {
-                MetadataTransferStagingCleanupDisposition::Completed => {
-                    if transition.destination_epoch.is_none()
-                        || transition.completion.is_none()
-                        || transition.completion_batch_receipt.is_none()
-                    {
-                        return Err(
-                            "metadata-transfer staging finalized floor transition is not completed"
-                                .to_owned(),
-                        );
-                    }
-                }
-                MetadataTransferStagingCleanupDisposition::Superseded {
-                    successor_transition_epoch,
-                } => {
-                    let successor_matches = self
-                        .retained_unavailable_pg_placement_transitions
-                        .get(&(*pg_id, successor_transition_epoch))
-                        .or_else(|| {
-                            self.unavailable_pg_placement_transitions.get(pg_id).filter(
-                                |candidate| {
-                                    candidate.transition_epoch == successor_transition_epoch
-                                },
-                            )
-                        })
-                        .is_some_and(|successor| {
-                            successor.predecessor_transition_epoch
-                                == Some(transition.transition_epoch)
-                        });
-                    if transition.destination_epoch.is_some()
-                        || transition.destination_install.is_some()
-                        || transition.completion.is_some()
-                        || transition.completion_batch_receipt.is_some()
-                        || !successor_matches
-                    {
-                        return Err(
-                            "metadata-transfer staging finalized floor cancellation is not an exact pre-install successor"
-                                .to_owned(),
-                        );
-                    }
-                }
-            }
-            let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
-                "metadata-transfer staging finalized floor has no retained authorization".to_owned()
-            })?;
-            if authorization.staging_generation != floor.staging_generation
-                || authorization.artifact_digest != floor.artifact_digest
-                || authorization.artifact_length != floor.artifact_length
-                || authorization.artifact_format_version != floor.artifact_format_version
-                || transition.destination_acting_set.len() != floor.tombstones.len()
-                || transition
-                    .destination_acting_set
-                    .iter()
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    != floor
-                        .tombstones
-                        .iter()
-                        .map(|tombstone| tombstone.node_id)
-                        .collect()
-            {
-                return Err(
-                    "metadata-transfer staging finalized floor does not match its authorization"
-                        .to_owned(),
-                );
-            }
-            let install = transition.destination_install.as_ref();
-            if floor.disposition == MetadataTransferStagingCleanupDisposition::Completed
-                && install.is_none()
-            {
-                return Err(
-                    "metadata-transfer staging finalized floor has no destination install"
-                        .to_owned(),
-                );
-            }
-            let mut expected_checkpoint_keys = BTreeSet::new();
-            let mut publication_transfers = BTreeMap::new();
-            for publication in &floor.publications {
-                let node = self.nodes.get(&publication.node_id).ok_or_else(|| {
-                    "metadata-transfer staging finalized publication references an unknown actor"
-                        .to_owned()
-                })?;
-                if !transition
-                    .destination_acting_set
-                    .contains(&publication.node_id)
-                    || node.node_incarnation < publication.node_incarnation
-                    || (node.node_incarnation == publication.node_incarnation
-                        && node.endpoint != publication.endpoint)
-                    || publication.target_epoch <= transition.transition_epoch
-                    || publication.transfer.source_epoch() > transition.source_epoch
-                {
-                    return Err(
-                        "metadata-transfer staging finalized publication has invalid authority"
-                            .to_owned(),
-                    );
-                }
-                if let Some(existing) =
-                    publication_transfers.insert(publication.target_epoch, publication.transfer)
-                {
-                    if existing != publication.transfer {
-                        return Err(
-                            "metadata-transfer staging finalized publication target has conflicting proofs"
-                                .to_owned(),
-                        );
-                    }
-                }
-                let key = MetadataTransferStagingEvidenceKey {
-                    pg_id: *pg_id,
-                    staging_generation: floor.staging_generation,
-                    actor_node_id: publication.node_id,
-                    actor_node_incarnation: publication.node_incarnation,
-                    kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-                    target_epoch: Some(publication.target_epoch),
-                };
-                expected_checkpoint_keys.insert(key.clone());
-                self.validate_metadata_transfer_staging_finalized_evidence_retention(
-                    &key,
-                    publication.evidence_digest,
-                    &publication.endpoint,
-                    floor.checkpoint_bindings.get(&key),
-                )?;
-            }
-            if publication_transfers.len() > crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT {
-                return Err(format!(
-                    "metadata-transfer staging finalized publication exceeds the per-intent target limit {}",
-                    crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
-                ));
-            }
-            if let Some(install) = install {
-                let final_publications = floor
-                    .publications
-                    .iter()
-                    .filter(|publication| {
-                        publication.target_epoch == install.batch_receipt.target_epoch
-                    })
-                    .collect::<Vec<_>>();
-                if final_publications.len() != install.publications.len()
-                    || install.publications.iter().any(|installed| {
-                        !final_publications.iter().any(|publication| {
-                            publication.node_id == installed.node_id
-                                && publication.node_incarnation == installed.node_incarnation
-                                && publication.endpoint == installed.endpoint
-                                && publication.evidence_digest == installed.evidence_digest
-                                && publication.transfer == install.transfer
-                        })
-                    })
-                {
-                    return Err(
-                        "metadata-transfer staging finalized publication does not match its destination install"
-                            .to_owned(),
-                    );
-                }
-            }
-            for tombstone in &floor.tombstones {
-                let node = self.nodes.get(&tombstone.node_id).ok_or_else(|| {
-                    "metadata-transfer staging finalized floor references an unknown actor"
-                        .to_owned()
-                })?;
-                if node.node_incarnation < tombstone.node_incarnation
-                    || (node.node_incarnation == tombstone.node_incarnation
-                        && node.endpoint != tombstone.endpoint)
-                {
-                    return Err(
-                        "metadata-transfer staging finalized floor actor is incompatible with current node identity"
-                            .to_owned(),
-                    );
-                }
-                let key = MetadataTransferStagingEvidenceKey {
-                    pg_id: *pg_id,
-                    staging_generation: floor.staging_generation,
-                    actor_node_id: tombstone.node_id,
-                    actor_node_incarnation: tombstone.node_incarnation,
-                    kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
-                    target_epoch: None,
-                };
-                expected_checkpoint_keys.insert(key.clone());
-                self.validate_metadata_transfer_staging_finalized_evidence_retention(
-                    &key,
-                    tombstone.evidence_digest,
-                    &tombstone.endpoint,
-                    floor.checkpoint_bindings.get(&key),
-                )?;
-            }
-            if !expected_checkpoint_keys.iter().all(|key| {
-                floor.checkpoint_bindings.contains_key(key)
-                    || self.metadata_transfer_staging_evidence.contains_key(key)
-            }) {
-                return Err(
-                    "metadata-transfer staging finalized floor lacks retained evidence authority"
-                        .to_owned(),
-                );
-            }
-            for (key, binding) in &floor.checkpoint_bindings {
-                if key.pg_id != *pg_id || key.staging_generation != *staging_generation {
-                    return Err(
-                        "metadata-transfer staging finalized floor has a foreign checkpoint binding"
-                            .to_owned(),
-                    );
-                }
-                let finalized = finalized_evidence.get(key).filter(|entry| {
-                    std::ptr::eq(entry.floor, floor)
-                }).ok_or_else(|| {
-                    "metadata-transfer staging finalized checkpoint binding has no canonical evidence"
-                        .to_owned()
-                })?;
-                self.validate_metadata_transfer_staging_finalized_checkpoint_binding(
-                    key,
-                    finalized.evidence_digest,
-                    finalized.endpoint,
-                    binding,
-                )?;
-            }
-        }
-        for transition in self
-            .retained_unavailable_pg_placement_transitions
-            .values()
-            .chain(self.unavailable_pg_placement_transitions.values())
-        {
-            let Some(authorization) = transition.staging_authorization.as_ref() else {
-                continue;
-            };
-            if metadata_transfer_staging_finalized_generation(
-                &self.metadata_transfer_staging_finalized_floors,
-                transition.pg_id,
-            )
-            .is_some_and(|floor| authorization.staging_generation <= floor)
-                && !self
-                    .metadata_transfer_staging_finalized_floors
-                    .contains_key(&(transition.pg_id, authorization.staging_generation))
-            {
-                return Err(
-                    "metadata-transfer staging finalized floor skips an authorized generation"
-                        .to_owned(),
-                );
-            }
-        }
-        let mut publication_targets = BTreeMap::<_, BTreeSet<_>>::new();
-        for (key, bytes) in &self.metadata_transfer_staging_evidence {
-            if key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication {
-                let target_epoch = key.target_epoch.ok_or_else(|| {
-                    "metadata-transfer publication evidence is missing its target epoch".to_owned()
-                })?;
-                let targets = publication_targets
-                    .entry((key.pg_id, key.staging_generation))
-                    .or_default();
-                targets.insert(target_epoch);
-                if targets.len() > crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT {
-                    return Err(format!(
-                        "metadata-transfer staging evidence exceeds the per-intent publication-target limit {}",
-                        crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
-                    ));
-                }
-            }
-            let evidence = crate::pg_store::decode_staging_evidence(bytes)
-                .map_err(|error| error.to_string())?;
-            let decoded_key = MetadataTransferStagingEvidenceKey {
-                pg_id: evidence.intent().pg_id(),
-                staging_generation: evidence.intent().staging_generation(),
-                actor_node_id: evidence.actor().node_id(),
-                actor_node_incarnation: evidence.actor().node_incarnation(),
-                kind: evidence.kind(),
-                target_epoch: evidence.target_epoch(),
-            };
-            if *key != decoded_key || evidence.as_bytes() != bytes {
-                return Err(
-                    "metadata-transfer staging evidence key does not match its payload".to_owned(),
-                );
-            }
-            match (page_members.get(key), checkpoint_members.get(key)) {
-                (Some(expected), None) if expected == bytes => {}
-                (None, Some((expected_digest, expected_actor)))
-                    if *expected_digest == checksum::sha256::digest(bytes)
-                        && evidence.actor() == expected_actor => {}
-                _ => {
-                    return Err(
-                        "metadata-transfer staging detailed evidence does not match its retained chain commitment"
-                            .to_owned(),
-                    );
-                }
-            }
-            self.validate_metadata_transfer_staging_evidence_authority(&evidence, false)
-                .map_err(|error| error.to_string())?;
-        }
-        for (key, expected) in &page_members {
-            if self.metadata_transfer_staging_evidence.get(key) != Some(expected) {
-                return Err(
-                    "metadata-transfer staging page member lacks exact detailed evidence"
-                        .to_owned(),
-                );
-            }
-        }
-        for (key, (expected_digest, expected_actor)) in &checkpoint_members {
-            let covered = metadata_transfer_staging_finalized_generation(
-                &self.metadata_transfer_staging_finalized_floors,
-                key.pg_id,
-            )
-            .is_some_and(|floor| key.staging_generation <= floor);
-            match (covered, self.metadata_transfer_staging_evidence.get(key)) {
-                (true, None) => {}
-                (false, Some(bytes))
-                    if *expected_digest == checksum::sha256::digest(bytes)
-                        && crate::pg_store::decode_staging_evidence(bytes)
-                            .is_ok_and(|evidence| evidence.actor() == expected_actor) => {}
-                (true, Some(_)) => {
-                    return Err(
-                        "metadata-transfer staging finalized evidence remains detailed".to_owned(),
-                    );
-                }
-                (false, _) => {
-                    return Err(
-                        "metadata-transfer staging checkpoint member lacks exact detailed evidence"
-                            .to_owned(),
-                    );
-                }
-            }
-        }
-        if self.metadata_transfer_staging_evidence.len()
-            != page_members.len()
-                + checkpoint_members
-                    .keys()
-                    .filter(|key| {
-                        metadata_transfer_staging_finalized_generation(
-                            &self.metadata_transfer_staging_finalized_floors,
-                            key.pg_id,
-                        )
-                        .is_none_or(|floor| key.staging_generation > floor)
-                    })
-                    .count()
-        {
-            return Err(
-                "metadata-transfer staging detailed evidence does not exactly match retained uncovered chain membership"
-                    .to_owned(),
-            );
-        }
-        Ok(())
-    }
-
-    fn apply_outage_command_artifact_page(
-        &self,
-        page: OutageCommandArtifactPage,
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        page.validate()
-            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-        if !self.pgs.contains_key(&page.pg_id) {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "outage artifact references an unknown PG".into(),
-            });
-        }
-        let key = page.key();
-        if let Some(retirement) = self.outage_command_artifact_retirements.get(&key) {
-            if !retirement.matches_page(&page) {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "outage artifact page conflicts with its durable retirement".into(),
-                });
-            }
-            return Ok(applied_control_plane_command(
-                self,
-                self.clone(),
-                ControlPlaneCommandResponse::PublishOutageCommandArtifactPage,
-                false,
-            ));
-        }
-        if !self.outage_command_artifacts.contains_key(&key)
-            && page.source_epoch != self.cluster_epoch
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "new outage artifact does not bind the current cluster epoch".into(),
-            });
-        }
-        let mut next = self.clone();
-        let retirement_count = next.outage_command_artifact_retirements.len();
-        next.outage_command_artifact_retirements
-            .retain(|_, retirement| retirement.source_epoch >= self.cluster_epoch);
-        let retired_state_changed =
-            next.outage_command_artifact_retirements.len() != retirement_count;
-        let artifact_changed = if let Some(existing) = next.outage_command_artifacts.get(&key) {
-            let mut record = (**existing).clone();
-            let changed = record
-                .append(&page)
-                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-            if changed {
-                next.outage_command_artifacts.insert(key, Arc::new(record));
-            }
-            changed
-        } else {
-            let record = OutageCommandArtifactRecord::from_first_page(&page)
-                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-            next.outage_command_artifacts.insert(key, Arc::new(record));
-            true
-        };
-        let changed = artifact_changed || retired_state_changed;
-        if changed {
-            next.validate_current_state_invariants()
-                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-        }
-        Ok(applied_control_plane_command(
-            self,
-            next,
-            ControlPlaneCommandResponse::PublishOutageCommandArtifactPage,
-            changed,
-        ))
-    }
-
-    fn apply_outage_command_artifact_retirements(
-        &self,
-        retirements: Vec<OutageCommandArtifactRetirement>,
-        expected_cluster_epoch: ClusterEpoch,
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        if expected_cluster_epoch != self.cluster_epoch
-            || retirements.is_empty()
-            || retirements.len() > MAX_UNAVAILABLE_PG_TRANSITION_BATCH
-            || retirements
-                .windows(2)
-                .any(|pair| pair[0].key() >= pair[1].key())
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "outage artifact retirement epoch or member vector is invalid".into(),
-            });
-        }
-        for retirement in &retirements {
-            retirement
-                .validate()
-                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-            match self.outage_command_artifacts.get(&retirement.key()) {
-                Some(record) => {
-                    if !retirement.matches_record(record) {
-                        return Err(ControlPlaneError::CommandDecode {
-                            message: "outage artifact retirement manifest changed".into(),
-                        });
-                    }
-                    if self.outage_resolution_intents.values().any(|intent| {
-                        intent.request.pg_id == retirement.pg_id
-                            && intent.request.source_epoch == retirement.source_epoch
-                            && intent.request.command_epoch == retirement.command_id.cluster_epoch()
-                            && intent.request.command_log_index
-                                == retirement.command_id.log_index().get()
-                    }) {
-                        return Err(ControlPlaneError::CommandDecode {
-                            message:
-                                "outage artifact retirement is still owned by a durable intent"
-                                    .into(),
-                        });
-                    }
-                }
-                None if self
-                    .outage_command_artifact_retirements
-                    .get(&retirement.key())
-                    .is_some_and(|retained| retained == retirement)
-                    || retirement.source_epoch < self.cluster_epoch => {}
-                None => {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: "outage artifact retirement does not name a retained artifact"
-                            .into(),
-                    });
-                }
-            }
-        }
-        let mut next = self.clone();
-        let previous_retirement_count = next.outage_command_artifact_retirements.len();
-        next.outage_command_artifact_retirements
-            .retain(|_, retirement| retirement.source_epoch >= self.cluster_epoch);
-        let mut changed =
-            next.outage_command_artifact_retirements.len() != previous_retirement_count;
-        for retirement in retirements {
-            changed |= next
-                .outage_command_artifacts
-                .remove(&retirement.key())
-                .is_some();
-            if retirement.source_epoch == self.cluster_epoch {
-                changed |= next
-                    .outage_command_artifact_retirements
-                    .insert(retirement.key(), retirement.clone())
-                    .as_ref()
-                    != Some(&retirement);
-            }
-        }
-        if changed {
-            next.validate_current_state_invariants()
-                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-        }
-        Ok(applied_control_plane_command(
-            self,
-            next,
-            ControlPlaneCommandResponse::RetireOutageCommandArtifacts,
-            changed,
-        ))
-    }
-
-    pub(crate) fn next_outage_command_artifact_retirement_command(
-        &self,
-    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
-        let retirements = self
-            .outage_command_artifacts
-            .values()
-            .filter(|record| record.source_epoch < self.cluster_epoch)
-            .filter(|record| {
-                !self.outage_resolution_intents.values().any(|intent| {
-                    intent.request.pg_id == record.pg_id
-                        && intent.request.source_epoch == record.source_epoch
-                        && intent.request.command_epoch == record.command_id.cluster_epoch()
-                        && intent.request.command_log_index == record.command_id.log_index().get()
-                })
-            })
-            .take(MAX_UNAVAILABLE_PG_TRANSITION_BATCH)
-            .map(|record| OutageCommandArtifactRetirement::from_record(record))
-            .collect::<Vec<_>>();
-        if retirements.is_empty() {
-            return Ok(None);
-        }
-        let command = ControlPlaneCommand::RetireOutageCommandArtifacts {
-            retirements,
-            expected_cluster_epoch: self.cluster_epoch,
-        };
-        self.apply_control_plane_command(command.clone())?;
-        Ok(Some(command))
-    }
-
-    pub(crate) fn commit_unavailable_pg_outage_resolution_intents_batch_command(
-        &self,
-        candidates: &[(PgId, NodeId, ClusterEpoch, u64)],
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "outage-resolution intent",
-            candidates.iter().map(|(pg_id, _, _, _)| *pg_id),
-        )?;
-        let candidate_pg_ids = candidates
-            .iter()
-            .map(|(pg_id, _, _, _)| *pg_id)
-            .collect::<Vec<_>>();
-        if let Some(retained) = candidates
-            .iter()
-            .find_map(|(pg_id, _, _, _)| self.outage_resolution_intents.get(pg_id))
-        {
-            if retained.batch_member_pg_ids != candidate_pg_ids {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "outage-resolution candidates do not match retained batch ownership"
-                        .into(),
-                });
-            }
-            let mut intents = Vec::with_capacity(candidates.len());
-            for (pg_id, unavailable_node_id, command_epoch, command_log_index) in candidates {
-                let member = self.outage_resolution_intents.get(pg_id).ok_or_else(|| {
-                    ControlPlaneError::invariant_failure(
-                        "retained outage-resolution batch is missing a member",
-                    )
-                })?;
-                if member.committed_epoch != retained.committed_epoch
-                    || member.batch_member_pg_ids != retained.batch_member_pg_ids
-                    || member.batch_members_digest != retained.batch_members_digest
-                    || member.request.pg_id != *pg_id
-                    || member.request.unavailable_node.node_id != *unavailable_node_id
-                    || member.request.command_epoch != *command_epoch
-                    || member.request.command_log_index != *command_log_index
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message:
-                            "outage-resolution candidates conflict with retained batch ownership"
-                                .into(),
-                    });
-                }
-                intents.push(member.request.clone());
-            }
-            let batch_members_digest = unavailable_pg_outage_resolution_intent_batch_digest(
-                &intents,
-                retained.committed_epoch,
-            );
-            if batch_members_digest != retained.batch_members_digest {
-                return Err(ControlPlaneError::invariant_failure(
-                    "retained outage-resolution batch digest is invalid",
-                ));
-            }
-            return Ok(
-                ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
-                    intents,
-                    expected_cluster_epoch: retained.committed_epoch,
-                },
-            );
-        }
-        let topology =
-            self.initial_topology
-                .as_ref()
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: "outage-resolution intent requires certified topology".into(),
-                })?;
-        let horizon = self
-            .lease_grant_horizon
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "outage-resolution intent requires a committed lease horizon".into(),
-            })?;
-        let lease_grant_not_after_ms = horizon.grant_not_after_ms();
-        let fence_cutoff_ms = lease_grant_not_after_ms
-            .checked_add(CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS)
-            .and_then(|value| value.checked_add(OUTAGE_RESOLUTION_MAX_IN_FLIGHT_OPERATION_MS))
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "outage-resolution fence cutoff overflows".into(),
-            })?;
-        let mut intents = Vec::with_capacity(candidates.len());
-        for (pg_id, unavailable_node_id, command_epoch, command_log_index) in candidates {
-            let command_index =
-                crate::metadata_command::MetadataCommandLogIndex::new(*command_log_index)
-                    .ok_or_else(|| ControlPlaneError::CommandDecode {
-                        message: "outage-resolution command index is zero".into(),
-                    })?;
-            let command_id = crate::metadata_command::MetadataCommandId::new(
-                *command_epoch,
-                *pg_id,
-                command_index,
-            );
-            let pg = self
-                .pg(*pg_id)
-                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-            let unavailable_node = self
-                .unavailable_node_observations
-                .get(unavailable_node_id)
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "node {} has no durable unavailable observation",
-                        unavailable_node_id.as_u32()
-                    ),
-                })?
-                .clone();
-            let artifact = self
-                .outage_command_artifacts
-                .get(&(
-                    *pg_id,
-                    self.cluster_epoch,
-                    command_id.cluster_epoch(),
-                    command_id.log_index().get(),
-                ))
-                .filter(|artifact| artifact.is_complete())
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} has no complete outage command artifact for {:?}",
-                        pg_id.get(),
-                        command_id
-                    ),
-                })?;
-            intents.push(UnavailablePgOutageResolutionIntentRequest {
-                pg_id: *pg_id,
-                source_epoch: self.cluster_epoch,
-                source_route: HistoricalPgRouteRecord::from(pg),
-                unavailable_node,
-                topology_generation: topology.topology_generation(),
-                topology_digest: *topology.topology_digest(),
-                command_epoch: command_id.cluster_epoch(),
-                command_log_index: command_id.log_index().get(),
-                artifact_length: artifact.total_length,
-                artifact_digest: artifact.digest,
-                lease_grant_not_after_ms,
-                fence_cutoff_ms,
-            });
-        }
-        Ok(
-            ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
-                intents,
-                expected_cluster_epoch: self.cluster_epoch,
-            },
-        )
-    }
-
-    fn apply_unavailable_pg_outage_resolution_intents(
-        &self,
-        intents: Vec<UnavailablePgOutageResolutionIntentRequest>,
-        expected_cluster_epoch: ClusterEpoch,
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "outage-resolution intent",
-            intents.iter().map(|intent| intent.pg_id),
-        )?;
-        let batch_member_pg_ids = intents
-            .iter()
-            .map(|intent| intent.pg_id)
-            .collect::<Vec<_>>();
-        let batch_members_digest =
-            unavailable_pg_outage_resolution_intent_batch_digest(&intents, expected_cluster_epoch);
-        let replay = intents.iter().all(|request| {
-            self.outage_resolution_intents
-                .get(&request.pg_id)
-                .is_some_and(|intent| {
-                    intent.request == *request
-                        && intent.committed_epoch == expected_cluster_epoch
-                        && intent.batch_member_pg_ids == batch_member_pg_ids
-                        && intent.batch_members_digest == batch_members_digest
-                })
-        });
-        if replay {
-            return Ok(applied_control_plane_command(
-                self,
-                self.clone(),
-                ControlPlaneCommandResponse::CommitUnavailablePgOutageResolutionIntents,
-                false,
-            ));
-        }
-        if intents
-            .iter()
-            .any(|request| self.outage_resolution_intents.contains_key(&request.pg_id))
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "outage-resolution intent conflicts with retained batch ownership".into(),
-            });
-        }
-        if expected_cluster_epoch != self.cluster_epoch {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "outage-resolution intent source epoch changed".into(),
-            });
-        }
-        let topology =
-            self.initial_topology
-                .as_ref()
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: "outage-resolution intent requires certified topology".into(),
-                })?;
-        let horizon = self
-            .lease_grant_horizon
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "outage-resolution intent requires a committed lease horizon".into(),
-            })?;
-        let expected_cutoff = horizon
-            .grant_not_after_ms()
-            .checked_add(CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS)
-            .and_then(|value| value.checked_add(OUTAGE_RESOLUTION_MAX_IN_FLIGHT_OPERATION_MS))
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "outage-resolution fence cutoff overflows".into(),
-            })?;
-        for request in &intents {
-            let pg = self.pg(request.pg_id).ok_or(ControlPlaneError::UnknownPg {
-                pg_id: request.pg_id.get(),
-            })?;
-            let observation = self
-                .unavailable_node_observations
-                .get(&request.unavailable_node.node_id)
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "node {} has no durable unavailable observation",
-                        request.unavailable_node.node_id.as_u32()
-                    ),
-                })?;
-            let grace_cutoff = observation
-                .observed_at_ms
-                .checked_add(
-                    topology
-                        .placement_policy()
-                        .unavailable_replacement_grace_ms(),
-                )
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: "outage-resolution grace cutoff overflows".into(),
-                })?;
-            if request.source_epoch != self.cluster_epoch
-                || request.source_route != HistoricalPgRouteRecord::from(pg)
-                || request.source_route.pg_id != request.pg_id
-                || !request
-                    .source_route
-                    .acting_set
-                    .contains(&request.unavailable_node.node_id)
-                || observation != &request.unavailable_node
-                || topology.topology_generation() != request.topology_generation
-                || topology.topology_digest() != &request.topology_digest
-                || request.command_log_index == 0
-                || request.command_epoch > request.source_epoch
-                || request.lease_grant_not_after_ms != horizon.grant_not_after_ms()
-                || request.fence_cutoff_ms != expected_cutoff
-                || self
-                    .max_committed_timestamp_ms
-                    .is_none_or(|now| now < grace_cutoff)
-                || self
-                    .unavailable_pg_placement_transitions
-                    .contains_key(&request.pg_id)
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} outage-resolution intent no longer matches durable authority state",
-                        request.pg_id.get()
-                    ),
-                });
-            }
-            let artifact = self
-                .outage_command_artifacts
-                .get(&(
-                    request.pg_id,
-                    request.source_epoch,
-                    request.command_epoch,
-                    request.command_log_index,
-                ))
-                .filter(|artifact| artifact.is_complete());
-            if artifact.is_none_or(|artifact| {
-                artifact.total_length != request.artifact_length
-                    || artifact.digest != request.artifact_digest
-            }) {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} outage-resolution artifact is incomplete or changed",
-                        request.pg_id.get()
-                    ),
-                });
-            }
-        }
-        let mut next = self.clone();
-        for request in intents {
-            next.outage_resolution_intents.insert(
-                request.pg_id,
-                UnavailablePgOutageResolutionIntent {
-                    request,
-                    committed_epoch: expected_cluster_epoch,
-                    batch_member_pg_ids: batch_member_pg_ids.clone(),
-                    batch_members_digest,
-                },
-            );
-        }
-        next.validate_current_state_invariants()
-            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-        Ok(applied_control_plane_command(
-            self,
-            next,
-            ControlPlaneCommandResponse::CommitUnavailablePgOutageResolutionIntents,
-            true,
-        ))
-    }
-
-    pub(crate) fn classify_metadata_transfer_staging_evidence_page(
-        &self,
-        operation_payload: &[u8],
-        page_digest: [u8; 32],
-    ) -> Result<MetadataTransferStagingEvidencePageClassification, ControlPlaneError> {
-        let page =
-            crate::pg_store::decode_staging_evidence_page_payload(operation_payload, page_digest)
-                .map_err(|error| ControlPlaneError::CommandDecode {
-                message: format!("invalid metadata-transfer staging evidence page: {error}"),
-            })?;
-        let actor_key = (page.actor().node_id(), page.actor().node_incarnation());
-        let page_key = (actor_key.0, actor_key.1, page.generation());
-        if let Some(existing) = self.metadata_transfer_staging_evidence_pages.get(&page_key) {
-            let existing_page = crate::pg_store::decode_staging_evidence_page_payload(
-                &existing.operation_payload,
-                existing.page_digest,
-            )
-            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
-                context: "retained metadata-transfer staging evidence page is invalid",
-                message: error.to_string(),
-            })?;
-            if page.actor() == existing_page.actor()
-                && existing.operation_payload == operation_payload
-                && existing.page_digest == page_digest
-            {
-                return Ok(
-                    MetadataTransferStagingEvidencePageClassification::ExactReplay {
-                        apply_receipt: existing.apply_receipt.clone(),
-                    },
-                );
-            }
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "node {} staging evidence generation {} conflicts with its retained page",
-                    page.actor().node_id().as_u32(),
-                    page.generation()
-                ),
-            });
-        }
-        let latest = self
-            .metadata_transfer_staging_evidence_pages
-            .range((actor_key.0, actor_key.1, 0)..=(actor_key.0, actor_key.1, u64::MAX))
-            .next_back();
-        if let Some((_, existing)) = latest {
-            let existing_page = crate::pg_store::decode_staging_evidence_page_payload(
-                &existing.operation_payload,
-                existing.page_digest,
-            )
-            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
-                context: "retained metadata-transfer staging evidence page is invalid",
-                message: error.to_string(),
-            })?;
-            let expected_previous_digest = checksum::sha256::digest(&existing.apply_receipt);
-            if page.actor() != existing_page.actor()
-                || page.generation() != existing_page.generation().checked_add(1).unwrap_or(0)
-                || page.previous_generation() != existing_page.generation()
-                || page.previous_apply_receipt_digest() != expected_previous_digest
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "node {} staging evidence page does not extend the retained generation",
-                        page.actor().node_id().as_u32()
-                    ),
-                });
-            }
-        } else if page.previous_generation() != 0 || page.previous_apply_receipt_digest() != [0; 32]
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "node {} first staging evidence page is not the genesis generation",
-                    page.actor().node_id().as_u32()
-                ),
-            });
-        }
-
-        let mut publication_targets = BTreeMap::<_, BTreeSet<_>>::new();
-        for key in self
-            .metadata_transfer_staging_evidence
-            .keys()
-            .filter(|key| {
-                key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication
-            })
-        {
-            let target_epoch =
-                key.target_epoch
-                    .ok_or_else(|| ControlPlaneError::SnapshotInvariantViolation {
-                        context: "retained metadata-transfer staging publication is invalid",
-                        message: "publication evidence is missing its target epoch".to_owned(),
-                    })?;
-            publication_targets
-                .entry((key.pg_id, key.staging_generation))
-                .or_default()
-                .insert(target_epoch);
-        }
-        let mut decoded_entries = Vec::with_capacity(page.entries().len());
-        let mut page_evidence_keys = BTreeSet::new();
-        let actor_has_closure_candidate = page.actor_closure_candidate().is_some()
-            || self
-                .metadata_transfer_staging_evidence_pages
-                .get(&(page.actor().node_id(), page.actor().node_incarnation(), 1))
-                .and_then(|record| {
-                    decode_staging_evidence_page_payload(
-                        &record.operation_payload,
-                        record.page_digest,
-                    )
-                    .ok()
-                })
-                .is_some_and(|genesis| genesis.actor_closure_candidate().is_some());
-        for entry in page.entries() {
-            let evidence =
-                crate::pg_store::decode_staging_evidence(entry.evidence()).map_err(|error| {
-                    ControlPlaneError::CommandDecode {
-                        message: format!("invalid metadata-transfer staging evidence: {error}"),
-                    }
-                })?;
-            if evidence.actor() != page.actor() {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging page contains foreign actor evidence"
-                        .to_owned(),
-                });
-            }
-            self.validate_metadata_transfer_staging_evidence_authority(&evidence, true)?;
-            let key = MetadataTransferStagingEvidenceKey {
-                pg_id: evidence.intent().pg_id(),
-                staging_generation: evidence.intent().staging_generation(),
-                actor_node_id: evidence.actor().node_id(),
-                actor_node_incarnation: evidence.actor().node_incarnation(),
-                kind: evidence.kind(),
-                target_epoch: evidence.target_epoch(),
-            };
-            let finalized_replay = metadata_transfer_staging_finalized_generation(
-                &self.metadata_transfer_staging_finalized_floors,
-                key.pg_id,
-            )
-            .is_some_and(|floor| key.staging_generation <= floor);
-            if finalized_replay {
-                if !actor_has_closure_candidate {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging evidence generation {} is at or below finalized floor",
-                            key.pg_id.get(),
-                            key.staging_generation
-                        ),
-                    });
-                }
-                let floor = self
-                    .metadata_transfer_staging_finalized_floors
-                    .get(&(key.pg_id, key.staging_generation))
-                    .ok_or_else(|| ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging evidence generation {} has no exact finalized certificate",
-                            key.pg_id.get(),
-                            key.staging_generation
-                        ),
-                    })?;
-                let expected = metadata_transfer_staging_finalized_semantic_evidence_bytes(
-                    floor,
-                    evidence.actor(),
-                    evidence.kind(),
-                    evidence.target_epoch(),
-                )
-                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-                if expected != entry.evidence() {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging evidence generation {} does not exactly replay finalized semantics",
-                            key.pg_id.get(),
-                            key.staging_generation
-                        ),
-                    });
-                }
-            }
-            if key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication {
-                let target_epoch =
-                    key.target_epoch
-                        .ok_or_else(|| ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} staging publication evidence is missing its target epoch",
-                                key.pg_id.get()
-                            ),
-                        })?;
-                let targets = publication_targets
-                    .entry((key.pg_id, key.staging_generation))
-                    .or_default();
-                if !targets.contains(&target_epoch)
-                    && targets.len() >= crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} staging evidence exceeds the per-intent publication-target limit {}",
-                            key.pg_id.get(),
-                            crate::pg_store::MAX_STAGING_EPOCH_PROOFS_PER_INTENT
-                        ),
-                    });
-                }
-                targets.insert(target_epoch);
-            }
-            if self.metadata_transfer_staging_evidence.contains_key(&key)
-                || !page_evidence_keys.insert(key.clone())
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} staging evidence identity is duplicated or already retained",
-                        key.pg_id.get()
-                    ),
-                });
-            }
-            if !finalized_replay {
-                decoded_entries.push((key, evidence.as_bytes().to_vec()));
-            }
-        }
-
-        let apply_receipt =
-            crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&page)
-                .as_bytes()
-                .to_vec();
-        Ok(
-            MetadataTransferStagingEvidencePageClassification::NewAuthorized {
-                page_key,
-                decoded_entries,
-                apply_receipt,
-            },
-        )
-    }
-
-    fn apply_metadata_transfer_staging_evidence_page(
-        &self,
-        operation_payload: Vec<u8>,
-        page_digest: [u8; 32],
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        let (page_key, decoded_entries, apply_receipt) = match self
-            .classify_metadata_transfer_staging_evidence_page(&operation_payload, page_digest)?
-        {
-            MetadataTransferStagingEvidencePageClassification::NewAuthorized {
-                page_key,
-                decoded_entries,
-                apply_receipt,
-            } => (page_key, decoded_entries, apply_receipt),
-            MetadataTransferStagingEvidencePageClassification::ExactReplay { apply_receipt } => {
-                return Ok(AppliedControlPlaneCommand::new(
-                    self.clone(),
-                    ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage {
-                        apply_receipt,
-                    },
-                    false,
-                ));
-            }
-        };
-        let mut next_snapshot = self.clone();
-        for (key, evidence) in decoded_entries {
-            next_snapshot
-                .metadata_transfer_staging_evidence
-                .insert(key, evidence);
-        }
-        next_snapshot
-            .metadata_transfer_staging_evidence_pages
-            .insert(
-                page_key,
-                MetadataTransferStagingEvidencePageRecord {
-                    operation_payload,
-                    page_digest,
-                    apply_receipt: apply_receipt.clone(),
-                },
-            );
-        let mut reconstructed =
-            next_snapshot.reconstruct_metadata_transfer_staging_actor_closures()?;
-        for (key, retired) in &next_snapshot.metadata_transfer_staging_retired_actor_closures {
-            if reconstructed
-                .insert(*key, retired.clone())
-                .is_some_and(|active| active != *retired)
-            {
-                return Err(ControlPlaneError::SnapshotInvariantViolation {
-                    context: "metadata-transfer staging retired actor closure",
-                    message: "reconstructed certificate conflicts with a retired certificate"
-                        .to_owned(),
-                });
-            }
-        }
-        next_snapshot.metadata_transfer_staging_actor_closures = reconstructed;
-        Ok(AppliedControlPlaneCommand::new(
-            next_snapshot,
-            ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt },
-            true,
-        ))
-    }
-
-    fn reconstruct_metadata_transfer_staging_actor_closures(
-        &self,
-    ) -> Result<
-        BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureCertificate>,
-        ControlPlaneError,
-    > {
-        let mut actor_tips = BTreeMap::<(NodeId, u64), MetadataTransferStagingActorChainTip>::new();
-        let mut page_entries = BTreeMap::<(NodeId, u64), BTreeMap<u64, Vec<u8>>>::new();
-        let mut candidates = Vec::new();
-
-        for (key, record) in &self.metadata_transfer_staging_evidence_pages {
-            let page =
-                decode_staging_evidence_page_payload(&record.operation_payload, record.page_digest)
-                    .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
-                        context: "retained metadata-transfer staging evidence page is invalid",
-                        message: error.to_string(),
-                    })?;
-            let actor_key = (key.0, key.1);
-            let tip = MetadataTransferStagingActorChainTip {
-                actor: page.actor().clone(),
-                generation: page.generation(),
-                page_digest: page.page_digest(),
-                apply_receipt_digest: checksum::sha256::digest(&record.apply_receipt),
-            };
-            if actor_tips
-                .get(&actor_key)
-                .is_none_or(|existing| existing.generation < tip.generation)
-            {
-                actor_tips.insert(actor_key, tip);
-            }
-            let entries = page_entries.entry(actor_key).or_default();
-            for entry in page.entries() {
-                if entries
-                    .insert(entry.sequence(), entry.evidence().to_vec())
-                    .is_some()
-                {
-                    return Err(ControlPlaneError::SnapshotInvariantViolation {
-                        context: "retained metadata-transfer staging evidence page is invalid",
-                        message: "actor chain contains a duplicate evidence sequence".to_owned(),
-                    });
-                }
-            }
-            if page.generation() == 1 {
-                if let Some(candidate) = page.actor_closure_candidate() {
-                    candidates.push((page.actor().clone(), candidate.clone(), page.page_digest()));
-                }
-            }
-        }
-        for segment in self
-            .metadata_transfer_staging_evidence_checkpoint_segments
-            .values()
-        {
-            let link = segment
-                .page_links
-                .last()
-                .expect("snapshot validation requires a nonempty checkpoint segment");
-            let actor_key = (segment.actor.node_id(), segment.actor.node_incarnation());
-            let tip = MetadataTransferStagingActorChainTip {
-                actor: segment.actor.clone(),
-                generation: segment.last_generation,
-                page_digest: link.page_digest,
-                apply_receipt_digest: checksum::sha256::digest(&segment.tip_apply_receipt),
-            };
-            if actor_tips
-                .get(&actor_key)
-                .is_none_or(|existing| existing.generation < tip.generation)
-            {
-                actor_tips.insert(actor_key, tip);
-            }
-        }
-        for anchor in self
-            .metadata_transfer_staging_evidence_checkpoint_anchors
-            .values()
-        {
-            let receipt =
-                crate::pg_store::decode_staging_evidence_apply_receipt(&anchor.tip_apply_receipt)
-                    .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging checkpoint anchor is invalid",
-                    message: error.to_string(),
-                })?;
-            let actor_key = (anchor.actor.node_id(), anchor.actor.node_incarnation());
-            let tip = MetadataTransferStagingActorChainTip {
-                actor: anchor.actor.clone(),
-                generation: anchor.last_generation,
-                page_digest: receipt.page_digest(),
-                apply_receipt_digest: checksum::sha256::digest(&anchor.tip_apply_receipt),
-            };
-            if actor_tips
-                .get(&actor_key)
-                .is_none_or(|existing| existing.generation < tip.generation)
-            {
-                actor_tips.insert(actor_key, tip);
-            }
-        }
-
-        let mut evidence_by_actor = BTreeMap::<(NodeId, u64), Vec<Vec<u8>>>::new();
-        for (actor_key, entries) in &page_entries {
-            evidence_by_actor
-                .entry(*actor_key)
-                .or_default()
-                .extend(entries.values().cloned());
-        }
-        for bytes in self.metadata_transfer_staging_evidence.values() {
-            let evidence = crate::pg_store::decode_staging_evidence(bytes).map_err(|error| {
-                ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging evidence is invalid",
-                    message: error.to_string(),
-                }
-            })?;
-            evidence_by_actor
-                .entry((
-                    evidence.actor().node_id(),
-                    evidence.actor().node_incarnation(),
-                ))
-                .or_default()
-                .push(bytes.clone());
-        }
-        let finalized_evidence = metadata_transfer_staging_finalized_evidence_index(
-            &self.metadata_transfer_staging_finalized_floors,
-        )
-        .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
-            context: "metadata-transfer staging finalized evidence index",
-            message,
-        })?;
-        for (key, finalized) in finalized_evidence {
-            let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
-                key.actor_node_id,
-                key.actor_node_incarnation,
-                finalized.endpoint.to_owned(),
-            )
-            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
-                context: "metadata-transfer staging finalized evidence actor",
-                message: error.to_string(),
-            })?;
-            let bytes = metadata_transfer_staging_finalized_semantic_evidence_bytes(
-                finalized.floor,
-                &actor,
-                key.kind,
-                key.target_epoch,
-            )
-            .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
-                context: "metadata-transfer staging finalized evidence",
-                message,
-            })?;
-            if checksum::sha256::digest(&bytes) != finalized.evidence_digest {
-                return Err(ControlPlaneError::SnapshotInvariantViolation {
-                    context: "metadata-transfer staging finalized evidence",
-                    message: "canonical evidence digest does not match its certificate".to_owned(),
-                });
-            }
-            evidence_by_actor
-                .entry((key.actor_node_id, key.actor_node_incarnation))
-                .or_default()
-                .push(bytes);
-        }
-
-        candidates.sort_by_key(|(actor, _, _)| (actor.node_id(), actor.node_incarnation()));
-        let mut unclosed_actor_tips = actor_tips.clone();
-        for retired_key in self.metadata_transfer_staging_retired_actor_closures.keys() {
-            unclosed_actor_tips.remove(retired_key);
-        }
-        let mut closures =
-            BTreeMap::<(NodeId, u64), MetadataTransferStagingActorClosureCertificate>::new();
-        for (destination_actor, candidate, destination_genesis_page_digest) in candidates {
-            let node = self.nodes.get(&destination_actor.node_id()).ok_or(
-                ControlPlaneError::UnknownNode {
-                    node_id: destination_actor.node_id().as_u32(),
-                },
-            )?;
-            if node.node_incarnation < destination_actor.node_incarnation()
-                || (node.node_incarnation == destination_actor.node_incarnation()
-                    && node.endpoint != destination_actor.endpoint())
-                || candidate.first_actor().node_id() != destination_actor.node_id()
-                || candidate.through_actor().node_id() != destination_actor.node_id()
-                || candidate.through_actor().node_incarnation()
-                    >= destination_actor.node_incarnation()
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging actor closure is not fenced by the current node identity"
-                        .to_owned(),
-                });
-            }
-
-            let first_actor_key = (
-                destination_actor.node_id(),
-                candidate.first_actor().node_incarnation(),
-            );
-            if let Some(first_tip) = actor_tips.get(&first_actor_key) {
-                if !candidate.accepts_first_tip(
-                    &first_tip.actor,
-                    first_tip.generation,
-                    first_tip.page_digest,
-                    first_tip.apply_receipt_digest,
-                ) {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: "metadata-transfer staging actor closure does not match an authority-retained first-actor tip"
-                            .to_owned(),
-                    });
-                }
-            } else if candidate.first_accepted_generation() > 0 {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging actor closure lost its acknowledged first-actor tip"
-                        .to_owned(),
-                });
-            }
-            let through_actor_key = (
-                destination_actor.node_id(),
-                candidate.through_actor().node_incarnation(),
-            );
-            if actor_tips
-                .get(&through_actor_key)
-                .is_some_and(|tip| &tip.actor != candidate.through_actor())
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging actor closure through actor does not match retained chain identity"
-                        .to_owned(),
-                });
-            }
-
-            let rebound_entries = page_entries
-                .get(&(
-                    destination_actor.node_id(),
-                    destination_actor.node_incarnation(),
-                ))
-                .into_iter()
-                .flat_map(|entries| entries.range(..=candidate.rebound_max_sequence()))
-                .map(|(sequence, evidence)| (*sequence, evidence.as_slice()))
-                .collect::<Vec<_>>();
-            let observed_entry_count = u64::try_from(rebound_entries.len()).map_err(|_| {
-                ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging evidence page is invalid",
-                    message: "actor closure evidence count does not fit u64".to_owned(),
-                }
-            })?;
-            let observed_max_sequence = rebound_entries.last().map_or(0, |(sequence, _)| *sequence);
-            if observed_entry_count < candidate.rebound_entry_count()
-                && observed_max_sequence < candidate.rebound_max_sequence()
-            {
-                continue;
-            }
-            if observed_entry_count != candidate.rebound_entry_count() {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging actor closure evidence count exceeds or cannot complete its committed prefix"
-                        .to_owned(),
-                });
-            }
-            let (entry_count, max_sequence, evidence_digest) =
-                crate::pg_store::metadata_transfer_staging_rebound_evidence_digest(
-                    rebound_entries.iter().copied(),
-                )
-                .map_err(|error| ControlPlaneError::CommandDecode {
-                    message: format!("invalid staging actor closure evidence prefix: {error}"),
-                })?;
-            if entry_count != candidate.rebound_entry_count()
-                || max_sequence != candidate.rebound_max_sequence()
-                || evidence_digest != candidate.rebound_evidence_digest()
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging actor closure evidence digest does not match its rebound prefix"
-                        .to_owned(),
-                });
-            }
-            let rebound_evidence = rebound_entries
-                .iter()
-                .map(|(_, evidence)| *evidence)
-                .collect::<BTreeSet<_>>();
-
-            let source_keys = unclosed_actor_tips
-                .range(
-                    (
-                        destination_actor.node_id(),
-                        candidate.first_actor().node_incarnation(),
-                    )
-                        ..=(
-                            destination_actor.node_id(),
-                            candidate.through_actor().node_incarnation(),
-                        ),
-                )
-                .map(|(key, _)| *key)
-                .collect::<Vec<_>>();
-            for source_key in source_keys {
-                let source_tip = unclosed_actor_tips
-                    .remove(&source_key)
-                    .expect("collected unclosed actor tip remains present");
-                if evidence_by_actor.get(&source_key).is_some_and(|evidence| {
-                    evidence.iter().any(|evidence| {
-                        let decoded = crate::pg_store::decode_staging_evidence(evidence)
-                            .expect("indexed staging evidence was decoded above");
-                        !rebound_evidence
-                            .contains(decoded.rebound_for_actor(&destination_actor).as_slice())
-                    })
-                }) {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message:
-                            "metadata-transfer staging actor closure omits retained source evidence"
-                                .to_owned(),
-                    });
-                }
-                closures.insert(
-                    source_key,
-                    MetadataTransferStagingActorClosureCertificate {
-                        source_actor: source_tip.actor.clone(),
-                        source_tip_generation: source_tip.generation,
-                        source_tip_page_digest: source_tip.page_digest,
-                        source_tip_apply_receipt_digest: source_tip.apply_receipt_digest,
-                        destination_actor: destination_actor.clone(),
-                        destination_genesis_page_digest,
-                        rebound_entry_count: entry_count,
-                        rebound_max_sequence: max_sequence,
-                        rebound_evidence_digest: evidence_digest,
-                    },
-                );
-            }
-        }
-        Ok(closures)
-    }
-
-    fn metadata_transfer_staging_actor_closure_validation_index(
-        &self,
-        finalized_evidence: &MetadataTransferStagingFinalizedEvidenceIndex<'_>,
-        finalized_checkpoints: &MetadataTransferStagingFinalizedCheckpointIndex<'_>,
-    ) -> Result<MetadataTransferStagingActorClosureValidationIndex, String> {
-        let mut actor_tips =
-            BTreeMap::<(NodeId, u64), MetadataTransferStagingActorClosureTip>::new();
-        let mut actor_genesis = BTreeMap::<(NodeId, u64), (String, [u8; 32])>::new();
-        let mut actor_entries = BTreeMap::<(NodeId, u64), BTreeMap<u64, Vec<u8>>>::new();
-
-        fn retain_segment(
-            snapshot: &ClusterControlSnapshot,
-            segment: &MetadataTransferStagingEvidenceCheckpointSegment,
-            finalized_evidence: &MetadataTransferStagingFinalizedEvidenceIndex<'_>,
-            actor_tips: &mut BTreeMap<(NodeId, u64), MetadataTransferStagingActorClosureTip>,
-            actor_genesis: &mut BTreeMap<(NodeId, u64), (String, [u8; 32])>,
-            actor_entries: &mut BTreeMap<(NodeId, u64), BTreeMap<u64, Vec<u8>>>,
-        ) -> Result<(), String> {
-            let actor_key = (segment.actor.node_id(), segment.actor.node_incarnation());
-            let tip_link = segment
-                .page_links
-                .last()
-                .ok_or_else(|| "retired actor closure references an empty checkpoint".to_owned())?;
-            let tip = (
-                segment.actor.clone(),
-                segment.last_generation,
-                tip_link.page_digest,
-                checksum::sha256::digest(&segment.tip_apply_receipt),
-            );
-            if actor_tips
-                .get(&actor_key)
-                .is_none_or(|existing| existing.1 < tip.1)
-            {
-                actor_tips.insert(actor_key, tip);
-            }
-            if segment.first_generation == 1 {
-                let genesis = segment
-                    .page_links
-                    .first()
-                    .expect("nonempty checkpoint has a first link");
-                if actor_genesis
-                    .insert(
-                        actor_key,
-                        (segment.actor.endpoint().to_owned(), genesis.page_digest),
-                    )
-                    .is_some()
-                {
-                    return Err(
-                        "retired actor closure actor has duplicate genesis evidence".to_owned()
-                    );
-                }
-            }
-            let entries = actor_entries.entry(actor_key).or_default();
-            for link in &segment.page_links {
-                for entry in &link.entries {
-                    let digest =
-                        *segment
-                            .commitments
-                            .get(&entry.evidence_key)
-                            .ok_or_else(|| {
-                                "retired actor closure checkpoint member has no commitment"
-                                    .to_owned()
-                            })?;
-                    let evidence = snapshot.metadata_transfer_staging_checkpoint_evidence_bytes(
-                        &entry.evidence_key,
-                        &segment.actor,
-                        finalized_evidence,
-                        digest,
-                    )?;
-                    if entries.insert(entry.sequence, evidence).is_some() {
-                        return Err(
-                            "retired actor closure actor has duplicate evidence sequence"
-                                .to_owned(),
-                        );
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        for record in self.metadata_transfer_staging_evidence_pages.values() {
-            let page =
-                decode_staging_evidence_page_payload(&record.operation_payload, record.page_digest)
-                    .map_err(|error| error.to_string())?;
-            let actor_key = (page.actor().node_id(), page.actor().node_incarnation());
-            let tip = (
-                page.actor().clone(),
-                page.generation(),
-                page.page_digest(),
-                checksum::sha256::digest(&record.apply_receipt),
-            );
-            if actor_tips
-                .get(&actor_key)
-                .is_none_or(|existing| existing.1 < tip.1)
-            {
-                actor_tips.insert(actor_key, tip);
-            }
-            if page.generation() == 1
-                && actor_genesis
-                    .insert(
-                        actor_key,
-                        (page.actor().endpoint().to_owned(), page.page_digest()),
-                    )
-                    .is_some()
-            {
-                return Err("retired actor closure actor has duplicate genesis evidence".to_owned());
-            }
-            let entries = actor_entries.entry(actor_key).or_default();
-            for entry in page.entries() {
-                if entries
-                    .insert(entry.sequence(), entry.evidence().to_vec())
-                    .is_some()
-                {
-                    return Err(
-                        "retired actor closure actor has duplicate evidence sequence".to_owned(),
-                    );
-                }
-            }
-        }
-        for segment in self
-            .metadata_transfer_staging_evidence_checkpoint_segments
-            .values()
-        {
-            retain_segment(
-                self,
-                segment,
-                finalized_evidence,
-                &mut actor_tips,
-                &mut actor_genesis,
-                &mut actor_entries,
-            )?;
-        }
-        for anchor in self
-            .metadata_transfer_staging_evidence_checkpoint_anchors
-            .values()
-        {
-            let sources = self.reconstruct_metadata_transfer_staging_checkpoint_anchor_sources(
-                anchor,
-                finalized_evidence,
-                finalized_checkpoints,
-            )?;
-            let mut previous_generation = anchor.previous_generation;
-            let mut previous_apply_receipt_digest = anchor.previous_apply_receipt_digest;
-            for (first_generation, last_generation, source_segment_digest) in sources {
-                let segment = self
-                    .reconstruct_metadata_transfer_staging_checkpoint_source_segment(
-                        &anchor.actor,
-                        MetadataTransferStagingCheckpointSourceSegmentBinding {
-                            first_generation,
-                            last_generation,
-                            previous_generation,
-                            previous_apply_receipt_digest,
-                            source_segment_digest,
-                        },
-                        finalized_evidence,
-                        finalized_checkpoints,
-                    )?;
-                previous_generation = segment.last_generation;
-                previous_apply_receipt_digest =
-                    checksum::sha256::digest(&segment.tip_apply_receipt);
-                retain_segment(
-                    self,
-                    &segment,
-                    finalized_evidence,
-                    &mut actor_tips,
-                    &mut actor_genesis,
-                    &mut actor_entries,
-                )?;
-            }
-        }
-
-        Ok(MetadataTransferStagingActorClosureValidationIndex {
-            actor_tips,
-            actor_genesis,
-            actor_entries,
-        })
-    }
-
-    fn validate_retired_metadata_transfer_staging_actor_closure(
-        key: (NodeId, u64),
-        certificate: &MetadataTransferStagingActorClosureCertificate,
-        index: &MetadataTransferStagingActorClosureValidationIndex,
-    ) -> Result<(), String> {
-        if key
-            != (
-                certificate.source_actor.node_id(),
-                certificate.source_actor.node_incarnation(),
-            )
-            || certificate.source_actor.node_id() != certificate.destination_actor.node_id()
-            || certificate.source_actor.node_incarnation()
-                >= certificate.destination_actor.node_incarnation()
-        {
-            return Err("retired actor closure has an invalid actor identity".to_owned());
-        }
-        let source_tip = index
-            .actor_tips
-            .get(&key)
-            .ok_or_else(|| "retired actor closure has no retained source actor chain".to_owned())?;
-        if source_tip.0 != certificate.source_actor
-            || source_tip.1 != certificate.source_tip_generation
-            || source_tip.2 != certificate.source_tip_page_digest
-            || source_tip.3 != certificate.source_tip_apply_receipt_digest
-        {
-            return Err("retired actor closure does not match its source actor tip".to_owned());
-        }
-        let destination_key = (
-            certificate.destination_actor.node_id(),
-            certificate.destination_actor.node_incarnation(),
-        );
-        let destination_genesis = index.actor_genesis.get(&destination_key).ok_or_else(|| {
-            "retired actor closure has no retained destination genesis".to_owned()
-        })?;
-        if destination_genesis.0 != certificate.destination_actor.endpoint()
-            || destination_genesis.1 != certificate.destination_genesis_page_digest
-        {
-            return Err("retired actor closure does not match its destination genesis".to_owned());
-        }
-        let rebound_entries = index
-            .actor_entries
-            .get(&destination_key)
-            .into_iter()
-            .flat_map(|entries| entries.range(..=certificate.rebound_max_sequence))
-            .map(|(sequence, evidence)| (*sequence, evidence.as_slice()))
-            .collect::<Vec<_>>();
-        let (entry_count, max_sequence, evidence_digest) =
-            crate::pg_store::metadata_transfer_staging_rebound_evidence_digest(
-                rebound_entries.iter().copied(),
-            )
-            .map_err(|error| error.to_string())?;
-        if entry_count != certificate.rebound_entry_count
-            || max_sequence != certificate.rebound_max_sequence
-            || evidence_digest != certificate.rebound_evidence_digest
-        {
-            return Err(
-                "retired actor closure does not match its rebound evidence prefix".to_owned(),
-            );
-        }
-        Ok(())
-    }
-
-    fn checkpoint_metadata_transfer_staging_evidence_pages(
-        &self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        if first_generation == 0 || first_generation > last_generation {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint generation range is invalid"
-                    .to_owned(),
-            });
-        }
-        if let Some(genesis_record) = self.metadata_transfer_staging_evidence_pages.get(&(
-            actor_node_id,
-            actor_node_incarnation,
-            1,
-        )) {
-            let genesis = decode_staging_evidence_page_payload(
-                &genesis_record.operation_payload,
-                genesis_record.page_digest,
-            )
-            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
-                context: "retained metadata-transfer staging evidence genesis is invalid",
-                message: error.to_string(),
-            })?;
-            if genesis.actor_closure_candidate().is_some() {
-                let closures = self
-                    .metadata_transfer_staging_actor_closures
-                    .values()
-                    .filter(|closure| {
-                        closure.destination_actor == *genesis.actor()
-                            && closure.destination_genesis_page_digest == genesis.page_digest()
-                    })
-                    .collect::<Vec<_>>();
-                if closures.is_empty()
-                    || closures.iter().any(|closure| {
-                        self.metadata_transfer_staging_retired_actor_closures.get(&(
-                            closure.source_actor.node_id(),
-                            closure.source_actor.node_incarnation(),
-                        )) != Some(*closure)
-                    })
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: "metadata-transfer staging checkpoint cannot consume an actor-closure chain before certificate retirement"
-                            .to_owned(),
-                    });
-                }
-            }
-        }
-        let page_count = last_generation
-            .checked_sub(first_generation)
-            .and_then(|distance| distance.checked_add(1))
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint generation range overflows"
-                    .to_owned(),
-            })?;
-        if page_count
-            > u64::try_from(MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES)
-                .expect("checkpoint page limit fits u64")
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "metadata-transfer staging checkpoint exceeds the {} page limit",
-                    MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES
-                ),
-            });
-        }
-        let segment_key = (actor_node_id, actor_node_incarnation, first_generation);
-        if let Some((_, existing)) = self
-            .metadata_transfer_staging_evidence_checkpoint_anchors
-            .range(
-                (actor_node_id, actor_node_incarnation, 0)
-                    ..=(actor_node_id, actor_node_incarnation, first_generation),
-            )
-            .next_back()
-        {
-            if existing.last_generation >= first_generation {
-                let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
-                    &self.metadata_transfer_staging_finalized_floors,
-                )
-                .map_err(|message| {
-                    ControlPlaneError::SnapshotInvariantViolation {
-                        context: "metadata-transfer staging finalized checkpoint index",
-                        message,
-                    }
-                })?;
-                let sources = metadata_transfer_staging_checkpoint_source_segments(
-                    &finalized_checkpoints,
-                    actor_node_id,
-                    actor_node_incarnation,
-                    first_generation,
-                    last_generation,
-                )
-                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-                if existing.first_generation <= first_generation
-                    && existing.last_generation >= last_generation
-                    && sources.len() == 1
-                    && sources[0].0 == first_generation
-                    && sources[0].1 == last_generation
-                {
-                    return Ok(AppliedControlPlaneCommand::new(
-                        self.clone(),
-                        ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages,
-                        false,
-                    ));
-                }
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging checkpoint conflicts with retained anchor"
-                        .to_owned(),
-                });
-            }
-        }
-        if let Some(existing) = self
-            .metadata_transfer_staging_evidence_checkpoint_segments
-            .get(&segment_key)
-        {
-            if existing.last_generation == last_generation {
-                return Ok(AppliedControlPlaneCommand::new(
-                    self.clone(),
-                    ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages,
-                    false,
-                ));
-            }
-            return Err(ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint conflicts with retained segment"
-                    .to_owned(),
-            });
-        }
-        if self
-            .metadata_transfer_staging_evidence_checkpoint_segments
-            .values()
-            .any(|segment| {
-                segment.actor.node_id() == actor_node_id
-                    && segment.actor.node_incarnation() == actor_node_incarnation
-                    && first_generation <= segment.last_generation
-                    && segment.first_generation <= last_generation
-            })
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint overlaps a retained segment"
-                    .to_owned(),
-            });
-        }
-        if self
-            .metadata_transfer_staging_evidence_checkpoint_anchors
-            .values()
-            .any(|anchor| {
-                anchor.actor.node_id() == actor_node_id
-                    && anchor.actor.node_incarnation() == actor_node_incarnation
-                    && first_generation <= anchor.last_generation
-                    && anchor.first_generation <= last_generation
-            })
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint overlaps a retained anchor"
-                    .to_owned(),
-            });
-        }
-        let actor_key = (actor_node_id, actor_node_incarnation);
-        let latest_generation = self
-            .metadata_transfer_staging_evidence_pages
-            .range((actor_key.0, actor_key.1, 0)..=(actor_key.0, actor_key.1, u64::MAX))
-            .next_back()
-            .map(|(key, _)| key.2)
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint actor has no retained pages"
-                    .to_owned(),
-            })?;
-        let closes_latest = self
-            .metadata_transfer_staging_actor_closures
-            .get(&(actor_node_id, actor_node_incarnation))
-            .is_some_and(|closure| closure.source_tip_generation == latest_generation);
-        if last_generation > latest_generation
-            || (last_generation == latest_generation && !closes_latest)
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint cannot consume the actor page tip"
-                    .to_owned(),
-            });
-        }
-
-        let mut actor = None;
-        let mut previous_generation = 0;
-        let mut previous_apply_receipt_digest = [0; 32];
-        let mut expected_previous_generation = None;
-        let mut expected_previous_digest = None;
-        let mut page_links = Vec::new();
-        let mut tip_apply_receipt = Vec::new();
-        let mut commitments = BTreeMap::new();
-        for generation in first_generation..=last_generation {
-            let record = self
-                .metadata_transfer_staging_evidence_pages
-                .get(&(actor_node_id, actor_node_incarnation, generation))
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "metadata-transfer staging checkpoint is missing generation {generation}"
-                    ),
-                })?;
-            let page = crate::pg_store::decode_staging_evidence_page_payload(
-                &record.operation_payload,
-                record.page_digest,
-            )
-            .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
-                context: "retained metadata-transfer staging evidence page is invalid",
-                message: error.to_string(),
-            })?;
-            if page.actor().node_id() != actor_node_id
-                || page.actor().node_incarnation() != actor_node_incarnation
-                || page.generation() != generation
-            {
-                return Err(ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging evidence page is invalid",
-                    message: "page identity does not match its retained key".to_owned(),
-                });
-            }
-            if generation == first_generation {
-                actor = Some(page.actor().clone());
-                previous_generation = page.previous_generation();
-                previous_apply_receipt_digest = page.previous_apply_receipt_digest();
-            } else if Some(page.actor()) != actor.as_ref()
-                || page.previous_generation() != expected_previous_generation.unwrap()
-                || page.previous_apply_receipt_digest() != expected_previous_digest.unwrap()
-            {
-                return Err(ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging evidence page is invalid",
-                    message: "checkpoint source pages are not a contiguous exact chain".to_owned(),
-                });
-            }
-            let receipt =
-                crate::pg_store::decode_staging_evidence_apply_receipt(&record.apply_receipt)
-                    .map_err(|error| ControlPlaneError::SnapshotInvariantViolation {
-                        context: "retained metadata-transfer staging evidence receipt is invalid",
-                        message: error.to_string(),
-                    })?;
-            if !receipt.is_for_page(&page) {
-                return Err(ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging evidence receipt is invalid",
-                    message: "receipt does not identify its page".to_owned(),
-                });
-            }
-            let mut link_entries = Vec::with_capacity(page.entries().len());
-            for entry in page.entries() {
-                let evidence = crate::pg_store::decode_staging_evidence(entry.evidence()).map_err(
-                    |error| ControlPlaneError::SnapshotInvariantViolation {
-                        context: "retained metadata-transfer staging evidence is invalid",
-                        message: error.to_string(),
-                    },
-                )?;
-                let key = metadata_transfer_staging_evidence_key(&evidence);
-                link_entries.push(MetadataTransferStagingEvidenceCheckpointPageEntry {
-                    sequence: entry.sequence(),
-                    evidence_key: key.clone(),
-                });
-                if commitments
-                    .insert(key, checksum::sha256::digest(entry.evidence()))
-                    .is_some()
-                {
-                    return Err(ControlPlaneError::SnapshotInvariantViolation {
-                        context: "retained metadata-transfer staging evidence is invalid",
-                        message: "checkpoint source contains duplicate evidence identity"
-                            .to_owned(),
-                    });
-                }
-                if commitments.len() > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "metadata-transfer staging checkpoint exceeds the {} commitment limit",
-                            MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS
-                        ),
-                    });
-                }
-            }
-            page_links.push(MetadataTransferStagingEvidenceCheckpointPageLink {
-                page_digest: page.page_digest(),
-                previous_apply_receipt_digest: page.previous_apply_receipt_digest(),
-                apply_receipt_digest: checksum::sha256::digest(&record.apply_receipt),
-                actor_closure_candidate: page.actor_closure_candidate().cloned(),
-                entries: link_entries,
-            });
-            expected_previous_generation = Some(generation);
-            expected_previous_digest = Some(checksum::sha256::digest(&record.apply_receipt));
-            tip_apply_receipt.clone_from(&record.apply_receipt);
-        }
-        let segment = MetadataTransferStagingEvidenceCheckpointSegment {
-            actor: actor.expect("nonempty checkpoint range has an actor"),
-            first_generation,
-            last_generation,
-            previous_generation,
-            previous_apply_receipt_digest,
-            page_links,
-            tip_apply_receipt,
-            commitments,
-        };
-        if metadata_transfer_staging_evidence_checkpoint_state_record_len(&segment)
-            > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_BYTES
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "metadata-transfer staging checkpoint exceeds the {} byte limit",
-                    MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_BYTES
-                ),
-            });
-        }
-
-        let segment_digest = metadata_transfer_staging_checkpoint_segment_digest(&segment);
-        let mut finalized_replay_bindings = Vec::new();
-        for (key, evidence_digest) in &segment.commitments {
-            let Some(floor) = self
-                .metadata_transfer_staging_finalized_floors
-                .get(&(key.pg_id, key.staging_generation))
-            else {
-                if self.metadata_transfer_staging_evidence.contains_key(key) {
-                    continue;
-                }
-                return Err(ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging evidence page",
-                    message: "page member lacks detailed or exact finalized evidence".to_owned(),
-                });
-            };
-            let expected = metadata_transfer_staging_finalized_semantic_evidence_bytes(
-                floor,
-                &segment.actor,
-                key.kind,
-                key.target_epoch,
-            )
-            .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
-                context: "retained metadata-transfer staging finalized replay",
-                message,
-            })?;
-            if checksum::sha256::digest(&expected) != *evidence_digest {
-                return Err(ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging finalized replay",
-                    message: "page member does not match finalized semantics".to_owned(),
-                });
-            }
-            let (page_offset, page_sequence, actor_closure_candidate) = segment
-                .page_links
-                .iter()
-                .enumerate()
-                .find_map(|(offset, link)| {
-                    link.entries
-                        .iter()
-                        .find(|entry| entry.evidence_key == *key)
-                        .map(|entry| (offset, entry.sequence, link.actor_closure_candidate.clone()))
-                })
-                .ok_or_else(|| ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging finalized replay",
-                    message: "checkpoint commitment has no page membership".to_owned(),
-                })?;
-            let page_generation = first_generation
-                .checked_add(u64::try_from(page_offset).map_err(|_| {
-                    ControlPlaneError::invariant_failure(
-                        "metadata-transfer staging checkpoint page offset does not fit u64",
-                    )
-                })?)
-                .ok_or_else(|| {
-                    ControlPlaneError::invariant_failure(
-                        "metadata-transfer staging checkpoint page generation overflows",
-                    )
-                })?;
-            finalized_replay_bindings.push((
-                (key.pg_id, key.staging_generation),
-                key.clone(),
-                MetadataTransferStagingFinalizedCheckpointBinding {
-                    actor_node_id,
-                    actor_node_incarnation,
-                    actor_endpoint: segment.actor.endpoint().to_owned(),
-                    first_generation,
-                    last_generation,
-                    page_generation,
-                    page_sequence,
-                    segment_digest,
-                    actor_closure_candidate,
-                },
-            ));
-        }
-
-        let mut next_snapshot = self.clone();
-        for generation in first_generation..=last_generation {
-            next_snapshot
-                .metadata_transfer_staging_evidence_pages
-                .remove(&(actor_node_id, actor_node_incarnation, generation));
-        }
-        next_snapshot
-            .metadata_transfer_staging_evidence_checkpoint_segments
-            .insert(segment_key, segment);
-        for (floor_key, evidence_key, binding) in finalized_replay_bindings {
-            next_snapshot
-                .metadata_transfer_staging_evidence
-                .remove(&evidence_key);
-            let floor = next_snapshot
-                .metadata_transfer_staging_finalized_floors
-                .get_mut(&floor_key)
-                .expect("finalized replay floor validated before checkpoint mutation");
-            if floor
-                .checkpoint_bindings
-                .insert(evidence_key, binding)
-                .is_some()
-            {
-                return Err(ControlPlaneError::SnapshotInvariantViolation {
-                    context: "metadata-transfer staging finalized replay checkpoint",
-                    message: "replay binding already exists".to_owned(),
-                });
-            }
-        }
-        Ok(AppliedControlPlaneCommand::new(
-            next_snapshot,
-            ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages,
-            true,
-        ))
-    }
-
-    pub(crate) fn checkpoint_metadata_transfer_staging_evidence_pages_command(
-        &self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        let command = ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        };
-        self.apply_control_plane_command(command.clone())?;
-        Ok(command)
-    }
-
-    pub(crate) fn next_metadata_transfer_staging_maintenance_command(
-        &self,
-        cursor: &mut MetadataTransferStagingMaintenanceCursor,
-    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
-        let first_phase = cursor.next_phase;
-        let mut phase = first_phase;
-        loop {
-            let command = match phase {
-                MetadataTransferStagingMaintenancePhase::ClosureRetirement => {
-                    self.next_staging_closure_retirement_command(cursor)?
-                }
-                MetadataTransferStagingMaintenancePhase::PageCheckpoint => {
-                    self.next_staging_checkpoint_command(cursor)?
-                }
-                MetadataTransferStagingMaintenancePhase::SegmentCollapse => {
-                    self.next_staging_segment_collapse_command(cursor)?
-                }
-                MetadataTransferStagingMaintenancePhase::AnchorCoalescing => {
-                    self.next_staging_anchor_coalescing_command(cursor)?
-                }
-            };
-            if command.is_some() {
-                cursor.next_phase = phase.next();
-                return Ok(command);
-            }
-            phase = phase.next();
-            if phase == first_phase {
-                cursor.next_phase = first_phase.next();
-                return Ok(None);
-            }
-        }
-    }
-
-    fn next_staging_closure_retirement_command(
-        &self,
-        cursor: &mut MetadataTransferStagingMaintenanceCursor,
-    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
-        let Some(high_water) = metadata_transfer_staging_maintenance_sweep_high_water(
-            &mut cursor.after_closure,
-            &mut cursor.closure_high_water,
-            self.metadata_transfer_staging_actor_closures
-                .keys()
-                .next_back()
-                .copied(),
-        ) else {
-            return Ok(None);
-        };
-        let start = cursor
-            .after_closure
-            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-        let candidates = self
-            .metadata_transfer_staging_actor_closures
-            .range((start, std::ops::Bound::Included(high_water)))
-            .take(METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE)
-            .map(|(key, closure)| (*key, closure.clone()))
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            cursor.after_closure = None;
-            cursor.closure_high_water = None;
-            return Ok(None);
-        }
-        for ((node_id, incarnation), closure) in candidates {
-            let key = (node_id, incarnation);
-            match self
-                .metadata_transfer_staging_retired_actor_closures
-                .get(&key)
-            {
-                Some(retired) if retired == &closure => {
-                    cursor.after_closure = Some(key);
-                }
-                Some(_) => {
-                    return Err(ControlPlaneError::SnapshotInvariantViolation {
-                        context: "metadata-transfer staging maintenance closure retirement",
-                        message: "active and retired actor-closure certificates conflict"
-                            .to_owned(),
-                    });
-                }
-                None => {
-                    let command = self
-                        .retire_metadata_transfer_staging_actor_closure_command(
-                            node_id,
-                            incarnation,
-                        )
-                        .map(Some)?;
-                    cursor.after_closure = Some(key);
-                    return Ok(command);
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn next_staging_checkpoint_command(
-        &self,
-        cursor: &mut MetadataTransferStagingMaintenanceCursor,
-    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
-        let Some(high_water) = metadata_transfer_staging_maintenance_sweep_high_water(
-            &mut cursor.after_page,
-            &mut cursor.page_high_water,
-            self.metadata_transfer_staging_evidence_pages
-                .keys()
-                .next_back()
-                .copied(),
-        ) else {
-            return Ok(None);
-        };
-        let start = cursor
-            .after_page
-            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-        let mut candidates = cursor
-            .after_page
-            .filter(|key| {
-                self.metadata_transfer_staging_evidence_pages
-                    .contains_key(key)
-            })
-            .into_iter()
-            .collect::<Vec<_>>();
-        candidates.extend(
-            self.metadata_transfer_staging_evidence_pages
-                .range((start, std::ops::Bound::Included(high_water)))
-                .take(METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE - candidates.len())
-                .map(|(key, _)| *key),
-        );
-        if candidates.is_empty() {
-            cursor.after_page = None;
-            cursor.page_high_water = None;
-            return Ok(None);
-        }
-        for (node_id, incarnation, generation) in candidates {
-            let key = (node_id, incarnation, generation);
-            let has_later_page = generation.checked_add(1).is_some_and(|next_generation| {
-                self.metadata_transfer_staging_evidence_pages
-                    .range(
-                        (node_id, incarnation, next_generation)..=(node_id, incarnation, u64::MAX),
-                    )
-                    .next()
-                    .is_some()
-            });
-            let closes_tip = self
-                .metadata_transfer_staging_actor_closures
-                .get(&(node_id, incarnation))
-                .is_some_and(|closure| closure.source_tip_generation == generation);
-            if !has_later_page && !closes_tip {
-                cursor.after_page = Some(key);
-                continue;
-            }
-            match self.checkpoint_metadata_transfer_staging_evidence_pages_command(
-                node_id,
-                incarnation,
-                generation,
-                generation,
-            ) {
-                Ok(command) => {
-                    cursor.after_page = Some(key);
-                    return Ok(Some(command));
-                }
-                Err(ControlPlaneError::CommandDecode { .. }) => {
-                    cursor.after_page = Some(key);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(None)
-    }
-
-    fn next_staging_segment_collapse_command(
-        &self,
-        cursor: &mut MetadataTransferStagingMaintenanceCursor,
-    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
-        let Some(high_water) = metadata_transfer_staging_maintenance_sweep_high_water(
-            &mut cursor.after_segment,
-            &mut cursor.segment_high_water,
-            self.metadata_transfer_staging_evidence_checkpoint_segments
-                .keys()
-                .next_back()
-                .copied(),
-        ) else {
-            return Ok(None);
-        };
-        let start = cursor
-            .after_segment
-            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-        let mut candidates = cursor
-            .after_segment
-            .and_then(|key| {
-                self.metadata_transfer_staging_evidence_checkpoint_segments
-                    .get(&key)
-                    .map(|segment| (key, segment.last_generation))
-            })
-            .into_iter()
-            .collect::<Vec<_>>();
-        candidates.extend(
-            self.metadata_transfer_staging_evidence_checkpoint_segments
-                .range((start, std::ops::Bound::Included(high_water)))
-                .take(METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE - candidates.len())
-                .map(|(key, segment)| (*key, segment.last_generation)),
-        );
-        if candidates.is_empty() {
-            cursor.after_segment = None;
-            cursor.segment_high_water = None;
-            return Ok(None);
-        }
-        for ((node_id, incarnation, first_generation), last_generation) in candidates {
-            let key = (node_id, incarnation, first_generation);
-            match self.collapse_metadata_transfer_staging_evidence_checkpoint_segment_command(
-                node_id,
-                incarnation,
-                first_generation,
-                last_generation,
-            ) {
-                Ok(command) => {
-                    cursor.after_segment = Some(key);
-                    return Ok(Some(command));
-                }
-                Err(ControlPlaneError::CommandDecode { .. }) => {
-                    cursor.after_segment = Some(key);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(None)
-    }
-
-    fn next_staging_anchor_coalescing_command(
-        &self,
-        cursor: &mut MetadataTransferStagingMaintenanceCursor,
-    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
-        let Some(high_water) = metadata_transfer_staging_maintenance_sweep_high_water(
-            &mut cursor.after_anchor,
-            &mut cursor.anchor_high_water,
-            self.metadata_transfer_staging_evidence_checkpoint_anchors
-                .keys()
-                .next_back()
-                .copied(),
-        ) else {
-            return Ok(None);
-        };
-        let start = cursor
-            .after_anchor
-            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-        let mut candidates = cursor
-            .after_anchor
-            .and_then(|key| {
-                self.metadata_transfer_staging_evidence_checkpoint_anchors
-                    .get(&key)
-                    .map(|anchor| (key, anchor.last_generation))
-            })
-            .into_iter()
-            .collect::<Vec<_>>();
-        candidates.extend(
-            self.metadata_transfer_staging_evidence_checkpoint_anchors
-                .range((start, std::ops::Bound::Included(high_water)))
-                .take(METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE + 1 - candidates.len())
-                .map(|(key, anchor)| (*key, anchor.last_generation)),
-        );
-        if candidates.is_empty() {
-            cursor.after_anchor = None;
-            cursor.anchor_high_water = None;
-            return Ok(None);
-        }
-        for pair in candidates.windows(2) {
-            let ((left_node, left_incarnation, first_generation), left_last) = pair[0];
-            let ((right_node, right_incarnation, right_first), right_last) = pair[1];
-            let left_key = (left_node, left_incarnation, first_generation);
-            let right_key = (right_node, right_incarnation, right_first);
-            if left_node != right_node
-                || left_incarnation != right_incarnation
-                || left_last.checked_add(1) != Some(right_first)
-            {
-                cursor.after_anchor = Some(left_key);
-                continue;
-            }
-            match self.coalesce_metadata_transfer_staging_evidence_checkpoint_anchors_command(
-                left_node,
-                left_incarnation,
-                first_generation,
-                right_last,
-            ) {
-                Ok(command) => {
-                    // Coalescing replaces the left anchor in place. Revisit it so it can be
-                    // combined with its new successor on a later phase rotation.
-                    cursor.after_anchor = None;
-                    if right_key == high_water {
-                        cursor.anchor_high_water = None;
-                    }
-                    return Ok(Some(command));
-                }
-                Err(ControlPlaneError::CommandDecode { .. }) => {
-                    cursor.after_anchor = Some(left_key);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        if candidates.len() <= METADATA_TRANSFER_STAGING_MAINTENANCE_SCAN_PAGE_SIZE {
-            cursor.after_anchor = candidates.last().map(|(key, _)| *key);
-        }
-        Ok(None)
-    }
-
-    fn retire_metadata_transfer_staging_actor_closure(
-        &self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        certificate_digest: [u8; 32],
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        let key = (actor_node_id, actor_node_incarnation);
-        let certificate = self
-            .metadata_transfer_staging_actor_closures
-            .get(&key)
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging actor closure does not exist".to_owned(),
-            })?;
-        if certificate.source_actor.node_id() != actor_node_id
-            || certificate.source_actor.node_incarnation() != actor_node_incarnation
-            || metadata_transfer_staging_actor_closure_certificate_digest(certificate)
-                != certificate_digest
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging actor-closure retirement does not match the exact certificate"
-                    .to_owned(),
-            });
-        }
-        if let Some(retired) = self
-            .metadata_transfer_staging_retired_actor_closures
-            .get(&key)
-        {
-            if retired == certificate {
-                return Ok(AppliedControlPlaneCommand::new(
-                    self.clone(),
-                    ControlPlaneCommandResponse::RetireMetadataTransferStagingActorClosure,
-                    false,
-                ));
-            }
-            return Err(ControlPlaneError::SnapshotInvariantViolation {
-                context: "metadata-transfer staging retired actor closure",
-                message: "retired certificate conflicts with the active certificate".to_owned(),
-            });
-        }
-        let mut next_snapshot = self.clone();
-        next_snapshot
-            .metadata_transfer_staging_retired_actor_closures
-            .insert(key, certificate.clone());
-        Ok(AppliedControlPlaneCommand::new(
-            next_snapshot,
-            ControlPlaneCommandResponse::RetireMetadataTransferStagingActorClosure,
-            true,
-        ))
-    }
-
-    pub(crate) fn retire_metadata_transfer_staging_actor_closure_command(
-        &self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        let certificate = self
-            .metadata_transfer_staging_actor_closures
-            .get(&(actor_node_id, actor_node_incarnation))
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging actor closure does not exist".to_owned(),
-            })?;
-        let command = ControlPlaneCommand::RetireMetadataTransferStagingActorClosure {
-            actor_node_id,
-            actor_node_incarnation,
-            certificate_digest: metadata_transfer_staging_actor_closure_certificate_digest(
-                certificate,
-            ),
-        };
-        self.apply_control_plane_command(command.clone())?;
-        Ok(command)
-    }
-
-    fn collapse_metadata_transfer_staging_evidence_checkpoint_segment(
-        &self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-        source_segment_digest: [u8; 32],
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        if first_generation == 0 || first_generation > last_generation {
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "metadata-transfer staging checkpoint collapse generation range is invalid"
-                        .to_owned(),
-            });
-        }
-        let segment_key = (actor_node_id, actor_node_incarnation, first_generation);
-        if let Some((_, anchor)) = self
-            .metadata_transfer_staging_evidence_checkpoint_anchors
-            .range(
-                (actor_node_id, actor_node_incarnation, 0)
-                    ..=(actor_node_id, actor_node_incarnation, first_generation),
-            )
-            .next_back()
-        {
-            if anchor.last_generation >= first_generation {
-                let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
-                    &self.metadata_transfer_staging_finalized_floors,
-                )
-                .map_err(|message| {
-                    ControlPlaneError::SnapshotInvariantViolation {
-                        context: "metadata-transfer staging finalized checkpoint index",
-                        message,
-                    }
-                })?;
-                let sources = metadata_transfer_staging_checkpoint_source_segments(
-                    &finalized_checkpoints,
-                    actor_node_id,
-                    actor_node_incarnation,
-                    first_generation,
-                    last_generation,
-                )
-                .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-                if anchor.first_generation <= first_generation
-                    && anchor.last_generation >= last_generation
-                    && sources.as_slice()
-                        == [(first_generation, last_generation, source_segment_digest)]
-                {
-                    return Ok(AppliedControlPlaneCommand::new(
-                        self.clone(),
-                        ControlPlaneCommandResponse::CollapseMetadataTransferStagingEvidenceCheckpointSegment,
-                        false,
-                    ));
-                }
-                return Err(ControlPlaneError::CommandDecode {
-                    message:
-                        "metadata-transfer staging checkpoint collapse conflicts with retained anchor"
-                            .to_owned(),
-                });
-            }
-        }
-        let segment = self
-            .metadata_transfer_staging_evidence_checkpoint_segments
-            .get(&segment_key)
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint collapse source is not retained"
-                    .to_owned(),
-            })?;
-        if segment.last_generation != last_generation
-            || metadata_transfer_staging_checkpoint_segment_digest(segment) != source_segment_digest
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "metadata-transfer staging checkpoint collapse source does not match"
-                    .to_owned(),
-            });
-        }
-        let finalized_evidence = metadata_transfer_staging_finalized_evidence_index(
-            &self.metadata_transfer_staging_finalized_floors,
-        )
-        .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
-            context: "metadata-transfer staging finalized evidence index",
-            message,
-        })?;
-        for (key, evidence_digest) in &segment.commitments {
-            if self.metadata_transfer_staging_evidence.contains_key(key) {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging checkpoint collapse requires pruned detailed evidence"
-                        .to_owned(),
-                });
-            }
-            let floor = self
-                .metadata_transfer_staging_finalized_floors
-                .get(&(key.pg_id, key.staging_generation))
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging checkpoint collapse requires every commitment to be finalized"
-                        .to_owned(),
-                })?;
-            let binding = floor.checkpoint_bindings.get(key).ok_or_else(|| {
-                ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging checkpoint collapse finalization binding does not match its source"
-                        .to_owned(),
-                }
-            })?;
-            if binding.actor_node_id != actor_node_id
-                || binding.actor_node_incarnation != actor_node_incarnation
-                || binding.first_generation != first_generation
-                || binding.last_generation != last_generation
-                || binding.segment_digest != source_segment_digest
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging checkpoint collapse finalization binding does not match its source"
-                        .to_owned(),
-                });
-            }
-            let finalized = finalized_evidence.get(key);
-            if !finalized.is_some_and(|finalized| {
-                std::ptr::eq(finalized.floor, floor)
-                    && finalized.evidence_digest == *evidence_digest
-            }) {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging checkpoint collapse commitment is not certified by its finalized floor"
-                        .to_owned(),
-                });
-            }
-        }
-        let source_segments = [(first_generation, last_generation, source_segment_digest)];
-        let anchor = MetadataTransferStagingEvidenceCheckpointAnchor {
-            actor: segment.actor.clone(),
-            first_generation,
-            last_generation,
-            previous_generation: segment.previous_generation,
-            previous_apply_receipt_digest: segment.previous_apply_receipt_digest,
-            tip_apply_receipt: segment.tip_apply_receipt.clone(),
-            source_segment_digest,
-            source_segment_count: 1,
-            source_segments_digest: metadata_transfer_staging_checkpoint_source_segments_digest(
-                &source_segments,
-            ),
-        };
-        let mut next_snapshot = self.clone();
-        next_snapshot
-            .metadata_transfer_staging_evidence_checkpoint_segments
-            .remove(&segment_key);
-        next_snapshot
-            .metadata_transfer_staging_evidence_checkpoint_anchors
-            .insert(segment_key, anchor);
-        Ok(AppliedControlPlaneCommand::new(
-            next_snapshot,
-            ControlPlaneCommandResponse::CollapseMetadataTransferStagingEvidenceCheckpointSegment,
-            true,
-        ))
-    }
-
-    pub(crate) fn collapse_metadata_transfer_staging_evidence_checkpoint_segment_command(
-        &self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        let key = (actor_node_id, actor_node_incarnation, first_generation);
-        let source_segment_digest = if let Some(segment) = self
-            .metadata_transfer_staging_evidence_checkpoint_segments
-            .get(&key)
-        {
-            metadata_transfer_staging_checkpoint_segment_digest(segment)
-        } else {
-            let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
-                &self.metadata_transfer_staging_finalized_floors,
-            )
-            .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
-                context: "metadata-transfer staging finalized checkpoint index",
-                message,
-            })?;
-            let sources = metadata_transfer_staging_checkpoint_source_segments(
-                &finalized_checkpoints,
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-            )
-            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-            if sources.len() != 1 {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: "metadata-transfer staging checkpoint collapse source is not retained"
-                        .to_owned(),
-                });
-            }
-            sources[0].2
-        };
-        let command =
-            ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment {
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-                source_segment_digest,
-            };
-        self.apply_control_plane_command(command.clone())?;
-        Ok(command)
-    }
-
-    fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
-        &self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-        source_segment_count: u64,
-        source_segments_digest: [u8; 32],
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        if first_generation == 0 || first_generation > last_generation || source_segment_count < 2 {
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "metadata-transfer staging checkpoint anchor coalescing bounds are invalid"
-                        .to_owned(),
-            });
-        }
-
-        let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
-            &self.metadata_transfer_staging_finalized_floors,
-        )
-        .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
-            context: "metadata-transfer staging finalized checkpoint index",
-            message,
-        })?;
-        let source_segments = metadata_transfer_staging_checkpoint_source_segments(
-            &finalized_checkpoints,
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        )
-        .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-        if u64::try_from(source_segments.len()).expect("source segment count fits u64")
-            != source_segment_count
-            || metadata_transfer_staging_checkpoint_source_segments_digest(&source_segments)
-                != source_segments_digest
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "metadata-transfer staging checkpoint anchor coalescing source segments do not match"
-                        .to_owned(),
-            });
-        }
-
-        if let Some((_, covering)) = self
-            .metadata_transfer_staging_evidence_checkpoint_anchors
-            .range(
-                (actor_node_id, actor_node_incarnation, 0)
-                    ..=(actor_node_id, actor_node_incarnation, first_generation),
-            )
-            .next_back()
-        {
-            if covering.first_generation <= first_generation
-                && covering.last_generation >= last_generation
-            {
-                return Ok(AppliedControlPlaneCommand::new(
-                    self.clone(),
-                    ControlPlaneCommandResponse::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors,
-                    false,
-                ));
-            }
-        }
-
-        let mut source_keys = Vec::new();
-        let mut source_anchors = Vec::new();
-        let mut next_generation = first_generation;
-        let mut preceding_generation = None;
-        let mut preceding_digest = None;
-        while next_generation <= last_generation {
-            let key = (actor_node_id, actor_node_incarnation, next_generation);
-            let anchor = self
-                .metadata_transfer_staging_evidence_checkpoint_anchors
-                .get(&key)
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message:
-                        "metadata-transfer staging checkpoint anchor coalescing source is not retained"
-                            .to_owned(),
-                })?;
-            if anchor.actor.node_id() != actor_node_id
-                || anchor.actor.node_incarnation() != actor_node_incarnation
-                || anchor.last_generation > last_generation
-                || preceding_generation.is_some_and(|generation| {
-                    anchor.previous_generation != generation
-                        || anchor.previous_apply_receipt_digest
-                            != preceding_digest.expect("preceding digest accompanies generation")
-                })
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message:
-                        "metadata-transfer staging checkpoint anchors are not one contiguous chain"
-                            .to_owned(),
-                });
-            }
-            source_keys.push(key);
-            source_anchors.push(anchor);
-            preceding_generation = Some(anchor.last_generation);
-            preceding_digest = Some(checksum::sha256::digest(&anchor.tip_apply_receipt));
-            if anchor.last_generation == last_generation {
-                break;
-            }
-            next_generation = anchor.last_generation.checked_add(1).ok_or_else(|| {
-                ControlPlaneError::CommandDecode {
-                    message:
-                        "metadata-transfer staging checkpoint anchor coalescing range overflows"
-                            .to_owned(),
-                }
-            })?;
-        }
-        validate_metadata_transfer_staging_checkpoint_coalescing_source_count(
-            source_anchors.len(),
-        )?;
-        if source_anchors.last().map(|anchor| anchor.last_generation) != Some(last_generation) {
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "metadata-transfer staging checkpoint anchor coalescing source does not match"
-                        .to_owned(),
-            });
-        }
-
-        let first = source_anchors
-            .first()
-            .expect("coalescing requires at least two anchors");
-        let last = source_anchors
-            .last()
-            .expect("coalescing requires at least two anchors");
-        let anchor = MetadataTransferStagingEvidenceCheckpointAnchor {
-            actor: first.actor.clone(),
-            first_generation,
-            last_generation,
-            previous_generation: first.previous_generation,
-            previous_apply_receipt_digest: first.previous_apply_receipt_digest,
-            tip_apply_receipt: last.tip_apply_receipt.clone(),
-            source_segment_digest: [0; 32],
-            source_segment_count,
-            source_segments_digest,
-        };
-
-        let mut next_snapshot = self.clone();
-        for key in source_keys {
-            next_snapshot
-                .metadata_transfer_staging_evidence_checkpoint_anchors
-                .remove(&key);
-        }
-        next_snapshot
-            .metadata_transfer_staging_evidence_checkpoint_anchors
-            .insert(
-                (actor_node_id, actor_node_incarnation, first_generation),
-                anchor,
-            );
-        Ok(AppliedControlPlaneCommand::new(
-            next_snapshot,
-            ControlPlaneCommandResponse::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors,
-            true,
-        ))
-    }
-
-    pub(crate) fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors_command(
-        &self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        let finalized_checkpoints = metadata_transfer_staging_finalized_checkpoint_index(
-            &self.metadata_transfer_staging_finalized_floors,
-        )
-        .map_err(|message| ControlPlaneError::SnapshotInvariantViolation {
-            context: "metadata-transfer staging finalized checkpoint index",
-            message,
-        })?;
-        let source_segments = metadata_transfer_staging_checkpoint_source_segments(
-            &finalized_checkpoints,
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        )
-        .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-        let command =
-            ControlPlaneCommand::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors {
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-                source_segment_count: u64::try_from(source_segments.len())
-                    .expect("source segment count fits u64"),
-                source_segments_digest: metadata_transfer_staging_checkpoint_source_segments_digest(
-                    &source_segments,
-                ),
-            };
-        self.apply_control_plane_command(command.clone())?;
-        Ok(command)
-    }
-
-    fn finalize_metadata_transfer_staging_generation(
-        &self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        let pg_id = cleanup.unavailable_transition.pg_id();
-        if cleanup.staging_generation == 0
-            || cleanup.staging_generation != cleanup.unavailable_transition.transition_epoch().get()
-            || cleanup.tombstones.is_empty()
-            || cleanup
-                .tombstones
-                .windows(2)
-                .any(|pair| pair[0].node_id >= pair[1].node_id)
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging cleanup has invalid generation or destination ordering",
-                    pg_id.get()
-                ),
-            });
-        }
-        let transition = self
-            .retained_unavailable_pg_placement_transitions
-            .get(&(pg_id, cleanup.unavailable_transition.transition_epoch()))
-            .filter(|transition| cleanup.unavailable_transition.matches_transition(transition))
-            .ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging cleanup requires its exact completed transition",
-                    pg_id.get()
-                ),
-            })?;
-        match cleanup.disposition {
-            MetadataTransferStagingCleanupDisposition::Completed => {
-                if transition.destination_epoch.is_none()
-                    || transition.completion.is_none()
-                    || transition.completion_batch_receipt.is_none()
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} metadata-transfer staging cleanup requires its exact completed transition",
-                            pg_id.get()
-                        ),
-                    });
-                }
-            }
-            MetadataTransferStagingCleanupDisposition::Superseded {
-                successor_transition_epoch,
-            } => {
-                let successor_matches = self
-                    .retained_unavailable_pg_placement_transitions
-                    .get(&(pg_id, successor_transition_epoch))
-                    .or_else(|| {
-                        self.unavailable_pg_placement_transitions
-                            .get(&pg_id)
-                            .filter(|candidate| {
-                                candidate.transition_epoch == successor_transition_epoch
-                            })
-                    })
-                    .is_some_and(|successor| {
-                        successor.predecessor_transition_epoch == Some(transition.transition_epoch)
-                    });
-                if transition.completion.is_some() || !successor_matches {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "PG {} metadata-transfer staging cancellation requires its exact successor transition",
-                            pg_id.get()
-                        ),
-                    });
-                }
-            }
-        }
-        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
-            ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging cleanup has no retained authorization",
-                    pg_id.get()
-                ),
-            }
-        })?;
-        if authorization.staging_generation != cleanup.staging_generation
-            || transition.destination_acting_set.len() != cleanup.tombstones.len()
-            || transition
-                .destination_acting_set
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                != cleanup
-                    .tombstones
-                    .iter()
-                    .map(|tombstone| tombstone.node_id)
-                    .collect()
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging cleanup does not match its authorization obligations",
-                    pg_id.get()
-                ),
-            });
-        }
-        let transition_binding = cleanup.unavailable_transition;
-        let staging_generation = cleanup.staging_generation;
-        let tombstones = cleanup.tombstones;
-        let tombstone_set_digest = metadata_transfer_staging_cleanup_digest(
-            &transition_binding,
-            staging_generation,
-            cleanup.disposition,
-            authorization.artifact_digest,
-            authorization.artifact_length,
-            authorization.artifact_format_version,
-            &tombstones,
-        );
-        let certificate_key = (pg_id, staging_generation);
-        if let Some(existing) = self
-            .metadata_transfer_staging_finalized_floors
-            .get(&certificate_key)
-        {
-            if existing.transition == transition_binding
-                && existing.staging_generation == staging_generation
-                && existing.disposition == cleanup.disposition
-                && existing.artifact_digest == authorization.artifact_digest
-                && existing.artifact_length == authorization.artifact_length
-                && existing.artifact_format_version == authorization.artifact_format_version
-                && existing.tombstones == tombstones
-                && existing.tombstone_set_digest == tombstone_set_digest
-            {
-                return Ok(AppliedControlPlaneCommand::new(
-                    self.clone(),
-                    ControlPlaneCommandResponse::FinalizeMetadataTransferStagingGeneration,
-                    false,
-                ));
-            }
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging cleanup conflicts with finalized generation {}",
-                    pg_id.get(),
-                    existing.staging_generation
-                ),
-            });
-        }
-        let previous_floor = metadata_transfer_staging_finalized_generation(
-            &self.metadata_transfer_staging_finalized_floors,
-            pg_id,
-        )
-        .unwrap_or(0);
-        if previous_floor >= staging_generation {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging cleanup is older than finalized generation {}",
-                    pg_id.get(),
-                    previous_floor
-                ),
-            });
-        }
-        if self
-            .retained_unavailable_pg_placement_transitions
-            .values()
-            .chain(self.unavailable_pg_placement_transitions.values())
-            .filter(|candidate| candidate.pg_id == pg_id)
-            .filter_map(|candidate| candidate.staging_authorization.as_ref())
-            .any(|authorization| {
-                authorization.staging_generation > previous_floor
-                    && authorization.staging_generation < staging_generation
-            })
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging cleanup cannot skip an authorized generation",
-                    pg_id.get()
-                ),
-            });
-        }
-
-        for tombstone in &tombstones {
-            let key = MetadataTransferStagingEvidenceKey {
-                pg_id,
-                staging_generation,
-                actor_node_id: tombstone.node_id,
-                actor_node_incarnation: tombstone.node_incarnation,
-                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
-                target_epoch: None,
-            };
-            let bytes = self
-                .metadata_transfer_staging_evidence
-                .get(&key)
-                .ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} metadata-transfer staging cleanup lacks a tombstone for node {}",
-                        pg_id.get(),
-                        tombstone.node_id.as_u32()
-                    ),
-                })?;
-            let evidence = crate::pg_store::decode_staging_evidence(bytes).map_err(|error| {
-                ControlPlaneError::SnapshotInvariantViolation {
-                    context: "retained metadata-transfer staging evidence is invalid",
-                    message: error.to_string(),
-                }
-            })?;
-            if evidence.actor().endpoint() != tombstone.endpoint
-                || checksum::sha256::digest(bytes) != tombstone.evidence_digest
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} metadata-transfer staging cleanup tombstone for node {} is not exact",
-                        pg_id.get(),
-                        tombstone.node_id.as_u32()
-                    ),
-                });
-            }
-        }
-
-        let covered_keys = self
-            .metadata_transfer_staging_evidence
-            .keys()
-            .filter(|key| {
-                key.pg_id == pg_id
-                    && key.staging_generation > previous_floor
-                    && key.staging_generation <= staging_generation
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if covered_keys
-            .iter()
-            .any(|key| key.staging_generation != staging_generation)
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} metadata-transfer staging cleanup cannot skip an unfinished generation",
-                    pg_id.get()
-                ),
-            });
-        }
-        let mut checkpoint_bindings = BTreeMap::new();
-        for key in &covered_keys {
-            let Some((segment_key, segment)) = self
-                .metadata_transfer_staging_evidence_checkpoint_segments
-                .iter()
-                .find(|(_, segment)| segment.commitments.contains_key(key))
-            else {
-                continue;
-            };
-            let evidence_digest = checksum::sha256::digest(
-                self.metadata_transfer_staging_evidence
-                    .get(key)
-                    .expect("covered staging evidence key came from the detailed map"),
-            );
-            if segment.commitments.get(key) != Some(&evidence_digest) {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} metadata-transfer staging cleanup evidence does not match its checkpoint commitment",
-                        pg_id.get()
-                    ),
-                });
-            }
-            let (page_offset, page_sequence, actor_closure_candidate) = segment
-                .page_links
-                .iter()
-                .enumerate()
-                .find_map(|(offset, link)| {
-                    link.entries
-                        .iter()
-                        .find(|entry| entry.evidence_key == *key)
-                        .map(|entry| (offset, entry.sequence, link.actor_closure_candidate.clone()))
-                })
-                .ok_or_else(|| ControlPlaneError::SnapshotInvariantViolation {
-                    context: "metadata-transfer staging cleanup checkpoint membership",
-                    message: format!(
-                        "PG {} checkpoint commitment has no page membership",
-                        pg_id.get()
-                    ),
-                })?;
-            let page_generation = segment
-                .first_generation
-                .checked_add(u64::try_from(page_offset).map_err(|_| {
-                    ControlPlaneError::invariant_failure(
-                        "metadata-transfer staging checkpoint page offset does not fit u64",
-                    )
-                })?)
-                .ok_or_else(|| {
-                    ControlPlaneError::invariant_failure(
-                        "metadata-transfer staging checkpoint page generation overflows",
-                    )
-                })?;
-            checkpoint_bindings.insert(
-                key.clone(),
-                MetadataTransferStagingFinalizedCheckpointBinding {
-                    actor_node_id: segment_key.0,
-                    actor_node_incarnation: segment_key.1,
-                    actor_endpoint: segment.actor.endpoint().to_owned(),
-                    first_generation: segment_key.2,
-                    last_generation: segment.last_generation,
-                    page_generation,
-                    page_sequence,
-                    segment_digest: metadata_transfer_staging_checkpoint_segment_digest(segment),
-                    actor_closure_candidate,
-                },
-            );
-            if self
-                .metadata_transfer_staging_actor_closures
-                .values()
-                .any(|closure| {
-                    let depends_on_closure = (closure.source_actor.node_id() == key.actor_node_id
-                        && closure.source_actor.node_incarnation() == key.actor_node_incarnation)
-                        || (closure.destination_actor.node_id() == key.actor_node_id
-                            && closure.destination_actor.node_incarnation()
-                                == key.actor_node_incarnation);
-                    depends_on_closure
-                        && self.metadata_transfer_staging_retired_actor_closures.get(&(
-                            closure.source_actor.node_id(),
-                            closure.source_actor.node_incarnation(),
-                        )) != Some(closure)
-                })
-            {
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "PG {} metadata-transfer staging cleanup awaits actor-closure retirement",
-                        pg_id.get()
-                    ),
-                });
-            }
-        }
-
-        let mut publications = covered_keys
-            .iter()
-            .filter(|key| {
-                key.kind == crate::pg_store::MetadataTransferStagingEvidenceKind::Publication
-            })
-            .map(|key| {
-                let bytes = self
-                    .metadata_transfer_staging_evidence
-                    .get(key)
-                    .expect("covered staging evidence key came from the detailed map");
-                let evidence =
-                    crate::pg_store::decode_staging_evidence(bytes).map_err(|error| {
-                        ControlPlaneError::SnapshotInvariantViolation {
-                            context: "retained metadata-transfer staging evidence is invalid",
-                            message: error.to_string(),
-                        }
-                    })?;
-                let target_epoch =
-                    evidence
-                        .target_epoch()
-                        .ok_or_else(|| ControlPlaneError::CommandDecode {
-                            message: format!(
-                                "PG {} metadata-transfer staging publication lacks a target epoch",
-                                pg_id.get()
-                            ),
-                        })?;
-                let transfer =
-                    evidence
-                        .transfer()
-                        .ok_or_else(|| ControlPlaneError::CommandDecode {
-                            message: format!(
-                            "PG {} metadata-transfer staging publication lacks a transfer proof",
-                            pg_id.get()
-                        ),
-                        })?;
-                Ok(MetadataTransferStagingFinalizedPublicationBinding {
-                    node_id: evidence.actor().node_id(),
-                    node_incarnation: evidence.actor().node_incarnation(),
-                    endpoint: evidence.actor().endpoint().to_owned(),
-                    target_epoch,
-                    transfer,
-                    evidence_digest: checksum::sha256::digest(bytes),
-                })
-            })
-            .collect::<Result<Vec<_>, ControlPlaneError>>()?;
-        publications.sort_by_key(|publication| (publication.target_epoch, publication.node_id));
-        let checkpointed_keys = checkpoint_bindings.keys().cloned().collect::<Vec<_>>();
-        let certificate = MetadataTransferStagingFinalizedFloor {
-            transition: transition_binding,
-            staging_generation,
-            disposition: cleanup.disposition,
-            artifact_digest: authorization.artifact_digest,
-            artifact_length: authorization.artifact_length,
-            artifact_format_version: authorization.artifact_format_version,
-            publications,
-            tombstones,
-            tombstone_set_digest,
-            checkpoint_bindings,
-        };
-
-        let mut next_snapshot = self.clone();
-        for key in checkpointed_keys {
-            next_snapshot
-                .metadata_transfer_staging_evidence
-                .remove(&key);
-        }
-        next_snapshot
-            .metadata_transfer_staging_finalized_floors
-            .insert(certificate_key, certificate);
-        Ok(AppliedControlPlaneCommand::new(
-            next_snapshot,
-            ControlPlaneCommandResponse::FinalizeMetadataTransferStagingGeneration,
-            true,
-        ))
-    }
-
-    pub(crate) fn finalize_metadata_transfer_staging_generation_command(
-        &self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        let command = ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup };
-        self.apply_control_plane_command(command.clone())?;
-        Ok(command)
     }
 
     pub(crate) fn complete_unavailable_pg_placement_transition_command(
@@ -9020,390 +1595,18 @@ impl ClusterControlSnapshot {
                 ),
             })?;
         Ok(
-            ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
+                unavailable_transition: work.mutation_binding().clone(),
+                pg_id,
+                transition_epoch: transition.transition_epoch,
+                destination_epoch,
+                topology_generation: transition.topology_generation,
+                topology_digest: transition.topology_digest,
                 ready_at_ms,
-                transitions: vec![UnavailablePgTransitionCompletionRequest {
-                    unavailable_transition: work.mutation_binding().clone(),
-                    pg_id,
-                    transition_epoch: transition.transition_epoch,
-                    destination_epoch,
-                    topology_generation: transition.topology_generation,
-                    topology_digest: transition.topology_digest,
-                    destinations,
-                    completion,
-                }],
+                destinations,
+                completion,
             },
         )
-    }
-
-    pub(crate) fn complete_unavailable_pg_placement_transition_batch_command(
-        &self,
-        work: &[UnavailablePgReconciliationWork],
-        ready_at_ms: u64,
-    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "completion",
-            work.iter().map(UnavailablePgReconciliationWork::pg_id),
-        )?;
-        let mut transitions = Vec::with_capacity(work.len());
-        for member_work in work {
-            let ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
-                ready_at_ms: member_ready_at_ms,
-                transitions: mut member,
-            } = self
-                .complete_unavailable_pg_placement_transition_command(member_work, ready_at_ms)?
-            else {
-                unreachable!("unavailable completion member builder returned wrong command");
-            };
-            if member.len() != 1 || member_ready_at_ms != ready_at_ms {
-                return Err(ControlPlaneError::invariant_failure(
-                    "unavailable completion member builder returned a non-singleton envelope",
-                ));
-            }
-            transitions.push(member.remove(0));
-        }
-        Ok(
-            ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
-                ready_at_ms,
-                transitions,
-            },
-        )
-    }
-
-    pub(crate) fn prepare_unavailable_pg_placement_completion_batch(
-        &self,
-        work: &[UnavailablePgReconciliationWork],
-        ready_at_ms: u64,
-    ) -> Result<PreparedUnavailablePgCompletionBatch, ControlPlaneError> {
-        self.prepare_unavailable_pg_placement_completion_batch_with_replication_limit(
-            work,
-            ready_at_ms,
-            crate::control_plane_raft::CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES,
-        )
-    }
-
-    fn prepare_unavailable_pg_placement_completion_batch_with_replication_limit(
-        &self,
-        work: &[UnavailablePgReconciliationWork],
-        ready_at_ms: u64,
-        max_encoded_entry_bytes: usize,
-    ) -> Result<PreparedUnavailablePgCompletionBatch, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "completion preparation",
-            work.iter().map(UnavailablePgReconciliationWork::pg_id),
-        )?;
-        let mut already_completed = Vec::new();
-        let mut included = Vec::new();
-        let mut rejected = Vec::new();
-        for candidate in work {
-            if self.unavailable_pg_completion_is_durably_completed(candidate) {
-                already_completed.push(candidate.clone());
-                continue;
-            }
-            let singleton = match self
-                .complete_unavailable_pg_placement_transition_command(candidate, ready_at_ms)
-            {
-                Ok(command) => command,
-                Err(error) => {
-                    rejected.push((candidate.clone(), error));
-                    continue;
-                }
-            };
-            if let Err(error) = self.apply_control_plane_command(singleton) {
-                rejected.push((candidate.clone(), error));
-                continue;
-            }
-
-            let mut tentative = included.clone();
-            tentative.push(candidate.clone());
-            let command = self.complete_unavailable_pg_placement_transition_batch_command(
-                &tentative,
-                ready_at_ms,
-            )?;
-            let encoded_len =
-                crate::control_plane_raft::control_plane_command_replication_encoded_len(&command)?;
-            if encoded_len > max_encoded_entry_bytes {
-                if included.is_empty() {
-                    rejected.push((
-                        candidate.clone(),
-                        ControlPlaneError::invariant_failure(format!(
-                            "single PG {} unavailable transition completion encodes to {encoded_len} OpenRaft entry bytes, exceeding the replication-safe limit {}",
-                            candidate.pg_id().get(),
-                            max_encoded_entry_bytes
-                        )),
-                    ));
-                    continue;
-                }
-                break;
-            }
-            included = tentative;
-        }
-
-        let command = if included.is_empty() {
-            None
-        } else {
-            let command = self.complete_unavailable_pg_placement_transition_batch_command(
-                &included,
-                ready_at_ms,
-            )?;
-            self.apply_control_plane_command(command.clone())
-                .map_err(|error| {
-                    ControlPlaneError::invariant_failure(format!(
-                        "individually valid unavailable transition completion members form an invalid batch: {error}"
-                    ))
-                })?;
-            Some(command)
-        };
-        Ok(PreparedUnavailablePgCompletionBatch {
-            command,
-            already_completed,
-            included,
-            rejected,
-        })
-    }
-
-    fn unavailable_pg_completion_is_durably_completed(
-        &self,
-        work: &UnavailablePgReconciliationWork,
-    ) -> bool {
-        self.retained_unavailable_pg_placement_transitions
-            .get(&(work.pg_id(), work.transition_epoch()))
-            .is_some_and(|transition| {
-                work.mutation_binding().matches_transition(transition)
-                    && transition.completion.is_some()
-                    && transition
-                        .completion_batch_receipt
-                        .as_ref()
-                        .is_some_and(|receipt| {
-                            receipt.identity.stage == UnavailablePgTransitionBatchStage::Completion
-                                && receipt
-                                    .identity
-                                    .member_pg_ids
-                                    .binary_search(&work.pg_id())
-                                    .is_ok()
-                        })
-            })
-    }
-
-    fn validate_unavailable_pg_transition_completion(
-        &self,
-        request: UnavailablePgTransitionCompletionRequest,
-        ready_at_ms: u64,
-        batch_identity: &UnavailablePgTransitionBatchReceiptIdentity,
-    ) -> Result<ValidatedUnavailablePgTransitionCompletion, ControlPlaneError> {
-        let pg_id = request.pg_id;
-        if request.completion.pg_id != pg_id {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} completion carries nested PG subject {}",
-                    pg_id.get(),
-                    request.completion.pg_id.get()
-                ),
-            });
-        }
-        let readiness = UnavailablePgPayloadReadiness {
-            pg_id,
-            transition_epoch: request.transition_epoch,
-            destination_epoch: request.destination_epoch,
-            topology_generation: request.topology_generation,
-            topology_digest: request.topology_digest,
-            ready_at_ms,
-            destinations: request.destinations,
-        };
-        let Some(transition) = self.unavailable_pg_placement_transitions.get(&pg_id) else {
-            let exact_retained_transition = self
-                .retained_unavailable_pg_placement_transitions
-                .get(&(pg_id, request.unavailable_transition.transition_epoch()))
-                .is_some_and(|retained| {
-                    request.unavailable_transition.matches_transition(retained)
-                        && retained.payload_readiness.as_ref() == Some(&readiness)
-                        && retained.completion.as_ref() == Some(&request.completion)
-                        && retained
-                            .completion_batch_receipt
-                            .as_ref()
-                            .is_some_and(|receipt| receipt.identity == *batch_identity)
-                });
-            if exact_retained_transition {
-                return Ok(ValidatedUnavailablePgTransitionCompletion::ExactReplay { pg_id });
-            }
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} has no matching active unavailable placement transition",
-                    pg_id.get()
-                ),
-            });
-        };
-        if !request
-            .unavailable_transition
-            .matches_transition(transition)
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "PG {} completion does not match its active unavailable placement transition",
-                    pg_id.get()
-                ),
-            });
-        }
-        validate_unavailable_pg_payload_readiness(self, transition, &readiness)?;
-        Ok(ValidatedUnavailablePgTransitionCompletion::Apply {
-            readiness: Box::new(readiness),
-            completion: request.completion,
-            batch_identity: batch_identity.clone(),
-        })
-    }
-
-    fn validate_unavailable_pg_transition_completion_batch(
-        &self,
-        requests: Vec<UnavailablePgTransitionCompletionRequest>,
-        ready_at_ms: u64,
-    ) -> Result<Vec<ValidatedUnavailablePgTransitionCompletion>, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "completion",
-            requests.iter().map(|request| request.pg_id),
-        )?;
-        let batch_identity =
-            unavailable_pg_transition_completion_batch_identity(&requests, ready_at_ms);
-        requests
-            .into_iter()
-            .map(|request| {
-                self.validate_unavailable_pg_transition_completion(
-                    request,
-                    ready_at_ms,
-                    &batch_identity,
-                )
-            })
-            .collect()
-    }
-
-    fn apply_validated_unavailable_pg_transition_completions(
-        &self,
-        validated: Vec<ValidatedUnavailablePgTransitionCompletion>,
-        ready_at_ms: u64,
-    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
-        validate_canonical_unavailable_pg_batch(
-            "completion",
-            validated
-                .iter()
-                .map(ValidatedUnavailablePgTransitionCompletion::pg_id),
-        )?;
-        if validated.iter().all(|entry| {
-            matches!(
-                entry,
-                ValidatedUnavailablePgTransitionCompletion::ExactReplay { .. }
-            )
-        }) {
-            return Ok(None);
-        }
-        if validated.iter().any(|entry| {
-            matches!(
-                entry,
-                ValidatedUnavailablePgTransitionCompletion::ExactReplay { .. }
-            )
-        }) {
-            return Err(ControlPlaneError::CommandDecode {
-                message: "unavailable placement completion batch mixes replayed and new members"
-                    .to_string(),
-            });
-        }
-        self.validate_serving_timestamp(ready_at_ms)?;
-        let mut ready_snapshot = self.clone();
-        for entry in &validated {
-            let ValidatedUnavailablePgTransitionCompletion::Apply { readiness, .. } = entry else {
-                unreachable!("mixed replay was rejected before batch validation");
-            };
-            ready_snapshot
-                .unavailable_pg_placement_transitions
-                .get_mut(&readiness.pg_id)
-                .expect("payload-readiness transition was validated")
-                .payload_readiness = Some((**readiness).clone());
-        }
-        for entry in &validated {
-            let ValidatedUnavailablePgTransitionCompletion::Apply {
-                readiness,
-                completion,
-                ..
-            } = entry
-            else {
-                unreachable!("mixed replay was rejected before batch validation");
-            };
-            validate_pg_peering_completion(PgPeeringCompletionValidation {
-                snapshot: &ready_snapshot,
-                pg_id: readiness.pg_id,
-                primary: completion.primary,
-                node_incarnation: completion.node_incarnation,
-                completed_at_ms: ready_at_ms,
-                expected: Some(ExpectedPgPeeringCompletion {
-                    active_metadata_proof: completion.active_metadata_proof,
-                    active_metadata_proof_epoch: completion.active_metadata_proof_epoch,
-                }),
-            })?;
-        }
-        ready_snapshot.record_committed_timestamp(ready_at_ms);
-        let mut completed = Vec::with_capacity(validated.len());
-        for entry in validated {
-            let ValidatedUnavailablePgTransitionCompletion::Apply {
-                readiness,
-                completion,
-                batch_identity,
-            } = entry
-            else {
-                unreachable!("mixed replay was rejected before batch mutation");
-            };
-            let pg_id = readiness.pg_id;
-            let metadata_log_epoch = self
-                .nodes
-                .get(&completion.primary)
-                .and_then(|node| node.pg_observation(pg_id))
-                .map(NodePgObservationRecord::metadata_log_epoch)
-                .ok_or(ControlPlaneError::PgPrimaryMissingActiveObservation {
-                    pg_id: pg_id.get(),
-                    node_id: completion.primary.as_u32(),
-                    cluster_epoch: self.cluster_epoch,
-                })?;
-            let record = ready_snapshot
-                .pgs
-                .get_mut(&pg_id)
-                .expect("unavailable placement completion PG was validated");
-            record.state = PgState::Active;
-            record.active_primary = Some(completion.primary);
-            record.active_metadata_proof = Some(completion.active_metadata_proof);
-            record.active_metadata_log_epoch = Some(metadata_log_epoch);
-            record.active_metadata_transfer_imported = record.peering_metadata_transfer.is_some();
-            record.previous_primary_lease = None;
-            record.peering_metadata_proof_floor = None;
-            record.peering_metadata_proof_floor_epoch = None;
-            record.peering_metadata_proof_floor_imported = false;
-            record.peering_metadata_transfer = None;
-            record.peering_metadata_transfer_source_route_epoch = None;
-            record.peering_metadata_transfer_source_node_id = None;
-            record.metadata_transfer_fenced = false;
-            record.metadata_transfer_fence_source_lease_deadline_ms = None;
-            record.metadata_transfer_fence_source_imported = false;
-            record.metadata_transfer_fence_epoch = None;
-            let mut transition = ready_snapshot
-                .unavailable_pg_placement_transitions
-                .remove(&pg_id)
-                .expect("completed unavailable transition was validated");
-            transition.completion = Some(completion);
-            transition.completion_batch_receipt = Some(UnavailablePgTransitionBatchReceipt {
-                identity: batch_identity,
-                source_epoch: self.cluster_epoch,
-                target_epoch: next_epoch(self.cluster_epoch)?,
-            });
-            ready_snapshot
-                .retained_unavailable_pg_placement_transitions
-                .insert((pg_id, transition.transition_epoch), transition);
-            completed.push((pg_id, completion.active_metadata_proof_epoch));
-        }
-        ready_snapshot.bump_epoch()?;
-        for (pg_id, proof_epoch) in completed {
-            ready_snapshot
-                .pgs
-                .get_mut(&pg_id)
-                .expect("unavailable placement PG activated before epoch bump")
-                .active_metadata_proof_epoch = Some(proof_epoch);
-        }
-        Ok(Some(ready_snapshot))
     }
 
     pub fn cluster_map_history(&self) -> &[ClusterMapHistoryRecord] {
@@ -9803,17 +2006,13 @@ impl ClusterControlSnapshot {
             })?;
         route.pending_metadata_command_recovery =
             self.pending_metadata_command_recovery_for_pg(record)?;
-        self.runtime_map_from_pg_routes_with_history_and_extra_nodes(
+        self.runtime_map_from_pg_routes_with_history(
             vec![route],
             self.historical_pg_routes_for_runtime_map_pg(pg_id)?,
             self.historical_cluster_epochs(),
             RuntimeMapFreshnessProof::Reconstructed {
                 authority_incarnation: self.authority_incarnation,
             },
-            self.unavailable_pg_placement_transitions
-                .get(&pg_id)
-                .into_iter()
-                .flat_map(|transition| transition.destination_acting_set.iter().copied()),
             fallback_validity,
         )
     }
@@ -9852,7 +2051,6 @@ impl ClusterControlSnapshot {
             self.unavailable_pg_placement_transitions
                 .values()
                 .chain(self.retained_unavailable_pg_placement_transitions.values()),
-            self.outage_resolution_intents.values(),
         );
         let historical_pg_routes = self.historical_pg_routes_for_storage_node_refresh(
             node.retained_cluster_map_history_route_references(),
@@ -9973,70 +2171,7 @@ impl ClusterControlSnapshot {
             pg_routes,
             historical_pg_routes,
             historical_cluster_epochs,
-            staging_authorizations: self.committed_staging_authorization_presentations()?,
         })
-    }
-
-    fn committed_staging_authorization_presentations(
-        &self,
-    ) -> Result<
-        Vec<crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation>,
-        ControlPlaneError,
-    > {
-        let mut batches = BTreeMap::<
-            UnavailablePgTransitionBatchReceipt,
-            Vec<UnavailablePgStagingIntentAuthorizationRequest>,
-        >::new();
-        for transition in self
-            .retained_unavailable_pg_placement_transitions
-            .values()
-            .chain(self.unavailable_pg_placement_transitions.values())
-        {
-            let Some(authorization) = transition.staging_authorization.as_ref() else {
-                continue;
-            };
-            let request = unavailable_pg_staging_authorization_request_from_durable(transition)
-                .expect("staging authorization has a durable request");
-            batches
-                .entry(authorization.batch_receipt.clone())
-                .or_default()
-                .push(request);
-        }
-        let mut presentations = batches
-            .into_iter()
-            .map(|(receipt, mut authorizations)| {
-                authorizations.sort_by_key(|authorization| {
-                    authorization.unavailable_transition.pg_id()
-                });
-                if receipt.source_epoch != receipt.target_epoch
-                    || receipt.identity.stage
-                        != UnavailablePgTransitionBatchStage::StagingAuthorization
-                    || receipt.identity.member_pg_ids
-                        != authorizations
-                            .iter()
-                            .map(|authorization| authorization.unavailable_transition.pg_id())
-                            .collect::<Vec<_>>()
-                    || receipt.identity
-                        != unavailable_pg_staging_authorization_batch_identity(&authorizations)
-                {
-                    return Err(ControlPlaneError::invariant_failure(
-                        "committed staging authorization batch receipt is invalid",
-                    ));
-                }
-                crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation::from_authority_state(
-                    authorizations,
-                    receipt.source_epoch,
-                    receipt.identity.members_digest,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        presentations.sort_by_key(|authorization| {
-            (
-                authorization.committed_epoch(),
-                authorization.batch_members_digest(),
-            )
-        });
-        Ok(presentations)
     }
 
     fn historical_cluster_epochs(&self) -> Vec<ClusterEpoch> {
@@ -10665,174 +2800,6 @@ impl ClusterControlSnapshot {
             }
         }
         self.validate_lease_grant_horizon_invariant()?;
-        if self
-            .outage_command_artifacts
-            .len()
-            .checked_add(self.outage_command_artifact_retirements.len())
-            .ok_or("retained outage artifact count overflows")?
-            > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS
-        {
-            return Err("too many retained outage command artifacts and retirements".into());
-        }
-        let mut reserved_artifact_bytes = 0usize;
-        for (key, record) in &self.outage_command_artifacts {
-            if *key != record.key() || record.source_epoch > self.cluster_epoch {
-                return Err("outage command artifact key or source epoch is invalid".into());
-            }
-            if !self.pgs.contains_key(&record.pg_id) {
-                return Err("outage command artifact references unknown PG".into());
-            }
-            // Records are immutable after validated publication or snapshot decoding.
-            reserved_artifact_bytes = reserved_artifact_bytes
-                .checked_add(record.reserved_bytes())
-                .ok_or("outage command artifact reserved-byte count overflows")?;
-        }
-        if reserved_artifact_bytes > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES {
-            return Err("outage command artifact reservations exceed the byte budget".into());
-        }
-        for (key, retirement) in &self.outage_command_artifact_retirements {
-            retirement.validate()?;
-            if *key != retirement.key()
-                || retirement.source_epoch > self.cluster_epoch
-                || !self.pgs.contains_key(&retirement.pg_id)
-                || self.outage_command_artifacts.contains_key(key)
-            {
-                return Err("outage command artifact retirement is invalid".into());
-            }
-        }
-        let mut intent_batches = BTreeMap::<
-            (ClusterEpoch, Vec<PgId>, [u8; 32]),
-            BTreeMap<PgId, &UnavailablePgOutageResolutionIntent>,
-        >::new();
-        for (pg_id, intent) in &self.outage_resolution_intents {
-            let request = &intent.request;
-            if *pg_id != request.pg_id
-                || request.source_epoch != intent.committed_epoch
-                || intent.committed_epoch > self.cluster_epoch
-                || intent.batch_member_pg_ids.is_empty()
-                || intent.batch_member_pg_ids.len() > MAX_UNAVAILABLE_PG_TRANSITION_BATCH
-                || intent
-                    .batch_member_pg_ids
-                    .windows(2)
-                    .any(|pair| pair[0] >= pair[1])
-                || intent.batch_member_pg_ids.binary_search(pg_id).is_err()
-                || request.source_route.pg_id != *pg_id
-                || !request
-                    .source_route
-                    .acting_set
-                    .contains(&request.unavailable_node.node_id)
-                || request.unavailable_node.endpoint.is_empty()
-                || request.unavailable_node.lease_deadline_ms == 0
-                || request.unavailable_node.lease_deadline_ms
-                    > request.unavailable_node.observed_at_ms
-                || request.command_log_index == 0
-                || request.command_epoch > request.source_epoch
-                || request.fence_cutoff_ms
-                    != request
-                        .lease_grant_not_after_ms
-                        .checked_add(CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS)
-                        .and_then(|value| {
-                            value.checked_add(OUTAGE_RESOLUTION_MAX_IN_FLIGHT_OPERATION_MS)
-                        })
-                        .ok_or("outage-resolution fence cutoff overflows")?
-            {
-                return Err(format!(
-                    "outage-resolution intent for PG {} is structurally invalid",
-                    pg_id.get()
-                ));
-            }
-            let topology = self
-                .initial_topology
-                .as_ref()
-                .ok_or("outage-resolution intent requires certified topology")?;
-            if request.topology_generation != topology.topology_generation()
-                || request.topology_digest != *topology.topology_digest()
-            {
-                return Err(format!(
-                    "outage-resolution intent for PG {} has invalid topology authority",
-                    pg_id.get()
-                ));
-            }
-            validate_historical_pg_route_record(
-                &request.source_route,
-                request.source_epoch,
-                |node_id| self.nodes.contains_key(&node_id),
-            )?;
-            if historical_pg_route_record_at_epoch(
-                &self.history,
-                &self.pgs,
-                *pg_id,
-                request.source_epoch,
-            )
-            .as_ref()
-                != Some(&request.source_route)
-            {
-                return Err(format!(
-                    "outage-resolution intent for PG {} does not match retained route history",
-                    pg_id.get()
-                ));
-            }
-            let artifact = self.outage_command_artifacts.get(&(
-                *pg_id,
-                request.source_epoch,
-                request.command_epoch,
-                request.command_log_index,
-            ));
-            if artifact.is_none_or(|artifact| {
-                !artifact.is_complete()
-                    || artifact.total_length != request.artifact_length
-                    || artifact.digest != request.artifact_digest
-            }) {
-                return Err(format!(
-                    "outage-resolution intent for PG {} lacks its exact complete artifact",
-                    pg_id.get()
-                ));
-            }
-            if self.outage_command_artifact_retirements.contains_key(&(
-                *pg_id,
-                request.source_epoch,
-                request.command_epoch,
-                request.command_log_index,
-            )) {
-                return Err(format!(
-                    "outage-resolution intent for PG {} references a retired artifact",
-                    pg_id.get()
-                ));
-            }
-            let batch_key = (
-                intent.committed_epoch,
-                intent.batch_member_pg_ids.clone(),
-                intent.batch_members_digest,
-            );
-            if intent_batches
-                .entry(batch_key)
-                .or_default()
-                .insert(*pg_id, intent)
-                .is_some()
-            {
-                return Err("duplicate outage-resolution batch member".into());
-            }
-        }
-        for ((committed_epoch, member_pg_ids, members_digest), members) in intent_batches {
-            if members.len() != member_pg_ids.len()
-                || !members.keys().copied().eq(member_pg_ids.iter().copied())
-            {
-                return Err(
-                    "outage-resolution batch receipt does not retain its complete member vector"
-                        .into(),
-                );
-            }
-            let requests = member_pg_ids
-                .iter()
-                .map(|pg_id| members[pg_id].request.clone())
-                .collect::<Vec<_>>();
-            if unavailable_pg_outage_resolution_intent_batch_digest(&requests, committed_epoch)
-                != members_digest
-            {
-                return Err("outage-resolution batch receipt digest is invalid".into());
-            }
-        }
-        self.validate_metadata_transfer_staging_evidence_invariants()?;
         for (node_id, observation) in &self.unavailable_node_observations {
             if *node_id != observation.node_id {
                 return Err("unavailable node observation key does not match its subject".into());
@@ -10868,8 +2835,6 @@ impl ClusterControlSnapshot {
                 ));
             }
         }
-        let unavailable_pg_transition_successors =
-            validate_unavailable_pg_transition_lineages(self)?;
         for ((pg_id, transition_epoch), transition) in
             &self.retained_unavailable_pg_placement_transitions
         {
@@ -10878,11 +2843,7 @@ impl ClusterControlSnapshot {
                     "retained unavailable PG transition key does not match its subject".into(),
                 );
             }
-            validate_unavailable_pg_transition_invariant(
-                self,
-                transition,
-                &unavailable_pg_transition_successors,
-            )?;
+            validate_unavailable_pg_transition_invariant(self, transition)?;
         }
         for (pg_id, transition) in &self.unavailable_pg_placement_transitions {
             if *pg_id != transition.pg_id {
@@ -10896,17 +2857,7 @@ impl ClusterControlSnapshot {
                     pg_id.get()
                 ));
             }
-            if transition.completion.is_some() || transition.completion_batch_receipt.is_some() {
-                return Err(format!(
-                    "active unavailable PG transition {} retains completion evidence",
-                    pg_id.get()
-                ));
-            }
-            validate_unavailable_pg_transition_invariant(
-                self,
-                transition,
-                &unavailable_pg_transition_successors,
-            )?;
+            validate_unavailable_pg_transition_invariant(self, transition)?;
             let pg = self.pgs.get(pg_id).ok_or_else(|| {
                 format!(
                     "unavailable transition references unknown PG {}",
@@ -10933,7 +2884,7 @@ impl ClusterControlSnapshot {
                 }
             }
         }
-        validate_unavailable_pg_transition_batch_receipts(self)?;
+        validate_unavailable_pg_transition_lineages(self)?;
         for pg in self.pgs.values() {
             if pg.acting_set.is_empty() {
                 return Err(format!("PG {} has an empty acting set", pg.pg_id.get()));
@@ -11241,31 +3192,33 @@ impl ClusterControlSnapshot {
                         observation.pg_id.get()
                     ));
                 };
-                if !pg.acting_set.contains(&node.node_id) {
-                    let Some(pending) = observation.pending_metadata_command else {
-                        return Err(format!(
-                            "node {} observation references PG {} outside the acting set",
+                let current_actor = pg.acting_set.contains(&node.node_id);
+                if !current_actor && observation.pending_metadata_command.is_none() {
+                    return Err(format!(
+                        "node {} observation references PG {} outside the acting set",
+                        node.node_id.as_u32(),
+                        observation.pg_id.get()
+                    ));
+                }
+                if let Some(pending) = observation.pending_metadata_command {
+                    validate_pending_metadata_command_reporter(
+                        self,
+                        observation.pg_id,
+                        node.node_id,
+                        pending,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "node {} historical pending observation for PG {} is invalid: {error}",
                             node.node_id.as_u32(),
                             observation.pg_id.get()
-                        ));
-                    };
-                    let historical = self
-                        .reconstructed_pg_route_at_epoch(
-                            observation.pg_id,
-                            pending.cluster_epoch(),
                         )
-                        .map_err(|error| {
-                            format!(
-                                "node {} historical pending observation for PG {} has no valid route: {error}",
-                                node.node_id.as_u32(),
-                                observation.pg_id.get()
-                            )
-                        })?;
-                    if historical.state() != PgState::Active
-                        || historical.primary_node_id() != node.node_id
+                    })?;
+                    if (!current_actor || pending.cluster_epoch() != self.cluster_epoch)
+                        && (pg.state != PgState::Peering || observation.state != PgState::Peering)
                     {
                         return Err(format!(
-                            "node {} historical pending observation for PG {} was not reported by its active primary",
+                            "node {} historical pending observation for PG {} must retain a Peering fence",
                             node.node_id.as_u32(),
                             observation.pg_id.get()
                         ));
@@ -11275,16 +3228,6 @@ impl ClusterControlSnapshot {
                     && pg.active_primary == Some(node.node_id)
                     && observation.state == PgState::Active
                 {
-                    if observation
-                        .pending_metadata_command()
-                        .is_some_and(|pending| pending.cluster_epoch() != self.cluster_epoch)
-                    {
-                        return Err(format!(
-                            "active primary node {} observation for PG {} has a non-current pending metadata command",
-                            node.node_id.as_u32(),
-                            observation.pg_id.get()
-                        ));
-                    }
                     let Some(expected) = pg.active_metadata_proof else {
                         return Err(format!(
                             "active PG {} is missing metadata proof",
@@ -11426,7 +3369,6 @@ impl ClusterControlSnapshot {
             self.unavailable_pg_placement_transitions
                 .values()
                 .chain(self.retained_unavailable_pg_placement_transitions.values()),
-            self.outage_resolution_intents.values(),
         );
         prune_cluster_map_history(&mut self.history, &protection, self.cluster_epoch);
     }
@@ -11438,6 +3380,12 @@ impl ClusterControlSnapshot {
         let mut ready = Vec::new();
         for record in self.pgs.values() {
             if record.state != PgState::Peering {
+                continue;
+            }
+            if self
+                .pending_metadata_command_recovery_for_pg(record)?
+                .is_some()
+            {
                 continue;
             }
             if self.unavailable_replacement_grace_elapsed_for_pg(record, now_ms) {
@@ -12349,150 +4297,395 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     changed,
                 ))
             }
-            ControlPlaneCommand::BeginUnavailablePgPlacementTransitions {
-                transitions,
+            ControlPlaneCommand::BeginUnavailablePgPlacementTransition {
+                pg_id,
+                predecessor_transition_epoch,
+                source_epoch,
+                source_acting_set,
+                source_node_id,
+                begin_authorization,
+                unavailable_node_id,
+                unavailable_node_incarnation,
+                unavailable_endpoint,
+                unavailable_lease_deadline_ms,
+                unavailable_observed_at_ms,
+                grace_cutoff_ms,
+                topology_generation,
+                topology_digest,
+                destination_acting_set,
                 expected_transition_epoch,
                 begin_at_ms,
             } => {
-                let validated = self.validate_unavailable_pg_transition_begin_batch(
-                    transitions,
-                    expected_transition_epoch,
+                let supplied_observation = NodeUnavailableObservation {
+                    node_id: unavailable_node_id,
+                    node_incarnation: unavailable_node_incarnation,
+                    endpoint: unavailable_endpoint,
+                    lease_deadline_ms: unavailable_lease_deadline_ms,
+                    observed_at_ms: unavailable_observed_at_ms,
+                };
+                let requested = UnavailablePgPlacementTransition {
+                    pg_id,
+                    transition_epoch: expected_transition_epoch,
+                    predecessor_transition_epoch,
+                    topology_generation,
+                    topology_digest,
+                    source_epoch,
+                    source_acting_set: source_acting_set.clone(),
+                    source_node_id,
+                    begin_authorization: (*begin_authorization).clone(),
+                    unavailable_node: supplied_observation.clone(),
+                    grace_cutoff_ms,
+                    destination_acting_set: destination_acting_set.clone(),
+                    destination_epoch: None,
+                    destination_route: None,
+                    payload_readiness: None,
+                };
+                if let Some(existing) = self
+                    .retained_unavailable_pg_placement_transitions
+                    .get(&(pg_id, expected_transition_epoch))
+                {
+                    let mut original_request = existing.clone();
+                    original_request.destination_epoch = None;
+                    original_request.destination_route = None;
+                    original_request.payload_readiness = None;
+                    if original_request == requested {
+                        return Ok(applied_control_plane_command(
+                            self,
+                            self.clone(),
+                            ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransition,
+                            false,
+                        ));
+                    }
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} retained transition epoch belongs to a different request",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                if let Some(existing) = self.unavailable_pg_placement_transitions.get(&pg_id) {
+                    let mut original_request = existing.clone();
+                    original_request.destination_epoch = None;
+                    original_request.destination_route = None;
+                    original_request.payload_readiness = None;
+                    if original_request == requested {
+                        return Ok(applied_control_plane_command(
+                            self,
+                            self.clone(),
+                            ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransition,
+                            false,
+                        ));
+                    }
+                    if predecessor_transition_epoch != Some(existing.transition_epoch) {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} successor transition does not consume the active transition tip",
+                                pg_id.get()
+                            ),
+                        });
+                    }
+                } else {
+                    let retained_tip = self
+                        .retained_unavailable_pg_placement_transitions
+                        .range((pg_id, ClusterEpoch::INITIAL)..=(pg_id, self.cluster_epoch))
+                        .next_back()
+                        .map(|(_, transition)| transition.transition_epoch);
+                    if predecessor_transition_epoch != retained_tip {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "PG {} successor transition does not consume the retained lineage tip",
+                                pg_id.get()
+                            ),
+                        });
+                    }
+                }
+                self.validate_serving_timestamp(begin_at_ms)?;
+                if source_epoch != self.cluster_epoch {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} unavailable placement source epoch {} does not match current epoch {}",
+                            pg_id.get(),
+                            source_epoch,
+                            self.cluster_epoch
+                        ),
+                    });
+                }
+                if expected_transition_epoch != next_epoch(self.cluster_epoch)? {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} unavailable placement transition epoch is not the next cluster epoch",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                let topology = self.initial_topology.as_ref().ok_or_else(|| {
+                    ControlPlaneError::CommandDecode {
+                        message: "unavailable placement transition requires certified topology"
+                            .to_string(),
+                    }
+                })?;
+                if topology.topology_generation() != topology_generation
+                    || topology.topology_digest() != &topology_digest
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: "unavailable placement transition topology changed".to_string(),
+                    });
+                }
+                let observation = self
+                    .unavailable_node_observations
+                    .get(&unavailable_node_id)
+                    .ok_or_else(|| ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "node {} has no durable unavailable lease observation",
+                            unavailable_node_id.as_u32()
+                        ),
+                    })?;
+                if observation != &supplied_observation {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "node {} unavailable lease observation changed",
+                            unavailable_node_id.as_u32()
+                        ),
+                    });
+                }
+                let expected_grace_cutoff_ms = unavailable_observed_at_ms
+                    .checked_add(
+                        topology
+                            .placement_policy()
+                            .unavailable_replacement_grace_ms(),
+                    )
+                    .ok_or_else(|| ControlPlaneError::CommandDecode {
+                        message: "unavailable placement grace cutoff overflows".to_string(),
+                    })?;
+                if grace_cutoff_ms != expected_grace_cutoff_ms || begin_at_ms < grace_cutoff_ms {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} unavailable placement grace has not elapsed",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                let record = self
+                    .pg(pg_id)
+                    .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+                if !matches!(record.state, PgState::Active | PgState::Peering)
+                    || record.acting_set != source_acting_set
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!("PG {} unavailable placement source changed", pg_id.get()),
+                    });
+                }
+                let expected_destination = deterministic_unavailable_pg_destination(
+                    self,
+                    pg_id,
+                    &source_acting_set,
+                    unavailable_node_id,
                     begin_at_ms,
                 )?;
-                let next_snapshot = self.apply_validated_unavailable_pg_transition_begins(
-                    validated,
-                    expected_transition_epoch,
+                if destination_acting_set != expected_destination {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} unavailable placement destination is not the deterministic eligible replacement",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                let expected_begin_authorization = unavailable_pg_transition_begin_authorization(
+                    self,
+                    record,
+                    &destination_acting_set,
+                    &supplied_observation,
                     begin_at_ms,
                 )?;
-                let changed = next_snapshot.is_some();
+                if begin_authorization.as_ref() != &expected_begin_authorization
+                    || source_node_id != begin_authorization.source_node_id
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} unavailable placement begin authorization changed",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                let mut next_snapshot = self.clone();
+                next_snapshot.record_committed_timestamp(begin_at_ms);
+                if let Some(previous) = next_snapshot
+                    .unavailable_pg_placement_transitions
+                    .remove(&pg_id)
+                {
+                    next_snapshot
+                        .retained_unavailable_pg_placement_transitions
+                        .insert((pg_id, previous.transition_epoch), previous);
+                }
+                next_snapshot
+                    .unavailable_pg_placement_transitions
+                    .insert(pg_id, requested);
+                let previous_primary_lease = active_primary_lease(self, record)
+                    .or_else(|| record.previous_primary_lease.clone())
+                    .map(PreviousPrimaryLease::without_reactivation_preference);
+                let fenced_primary_lease_deadline_ms = previous_primary_lease
+                    .as_ref()
+                    .map(|lease| lease.lease_deadline_ms)
+                    .unwrap_or(supplied_observation.lease_deadline_ms);
+                let record = next_snapshot
+                    .pgs
+                    .get_mut(&pg_id)
+                    .expect("unavailable transition PG was validated");
+                record.acting_set = unavailable_transition_source_route_acting_set(
+                    &source_acting_set,
+                    source_node_id,
+                );
+                record.state = PgState::Peering;
+                record.active_primary = None;
+                record.active_metadata_proof = None;
+                record.active_metadata_proof_epoch = None;
+                record.active_metadata_log_epoch = None;
+                record.active_metadata_transfer_imported = false;
+                record.previous_primary_lease = previous_primary_lease;
+                record.peering_metadata_proof_floor =
+                    Some(begin_authorization.source_metadata_floor);
+                record.peering_metadata_proof_floor_epoch =
+                    begin_authorization.source_metadata_floor_epoch;
+                record.peering_metadata_proof_floor_imported =
+                    begin_authorization.source_metadata_floor_imported;
+                record.peering_metadata_transfer = None;
+                record.peering_metadata_transfer_source_route_epoch = None;
+                record.peering_metadata_transfer_source_node_id = None;
+                record.metadata_transfer_fenced = true;
+                record.metadata_transfer_fence_source_lease_deadline_ms =
+                    Some(fenced_primary_lease_deadline_ms);
+                record.metadata_transfer_fence_source_imported =
+                    begin_authorization.source_metadata_floor_imported;
+                record.metadata_transfer_fence_epoch = Some(expected_transition_epoch);
+                next_snapshot.bump_epoch()?;
                 Ok(applied_control_plane_command(
                     self,
-                    next_snapshot.unwrap_or_else(|| self.clone()),
-                    ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransitions,
-                    changed,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::BeginUnavailablePgPlacementTransition,
+                    true,
                 ))
             }
-            ControlPlaneCommand::AuthorizeUnavailablePgStagingIntents { authorizations } => {
-                let validated =
-                    self.validate_unavailable_pg_staging_authorization_batch(authorizations)?;
-                let next_snapshot =
-                    self.apply_validated_unavailable_pg_staging_authorizations(validated)?;
-                let changed = next_snapshot.is_some();
-                Ok(applied_control_plane_command(
-                    self,
-                    next_snapshot.unwrap_or_else(|| self.clone()),
-                    ControlPlaneCommandResponse::AuthorizeUnavailablePgStagingIntents,
-                    changed,
-                ))
-            }
-            ControlPlaneCommand::ApplyMetadataTransferStagingEvidencePage {
-                operation_payload,
-                page_digest,
-            } => self.apply_metadata_transfer_staging_evidence_page(operation_payload, page_digest),
-            ControlPlaneCommand::PublishOutageCommandArtifactPage { page } => {
-                self.apply_outage_command_artifact_page(page)
-            }
-            ControlPlaneCommand::RetireOutageCommandArtifacts {
-                retirements,
-                expected_cluster_epoch,
-            } => {
-                self.apply_outage_command_artifact_retirements(retirements, expected_cluster_epoch)
-            }
-            ControlPlaneCommand::CommitUnavailablePgOutageResolutionIntents {
-                intents,
-                expected_cluster_epoch,
-            } => {
-                self.apply_unavailable_pg_outage_resolution_intents(intents, expected_cluster_epoch)
-            }
-            ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-            } => self.checkpoint_metadata_transfer_staging_evidence_pages(
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-            ),
-            ControlPlaneCommand::CollapseMetadataTransferStagingEvidenceCheckpointSegment {
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-                source_segment_digest,
-            } => self.collapse_metadata_transfer_staging_evidence_checkpoint_segment(
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-                source_segment_digest,
-            ),
-            ControlPlaneCommand::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors {
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-                source_segment_count,
-                source_segments_digest,
-            } => self.coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-                source_segment_count,
-                source_segments_digest,
-            ),
-            ControlPlaneCommand::RetireMetadataTransferStagingActorClosure {
-                actor_node_id,
-                actor_node_incarnation,
-                certificate_digest,
-            } => self.retire_metadata_transfer_staging_actor_closure(
-                actor_node_id,
-                actor_node_incarnation,
-                certificate_digest,
-            ),
-            ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup } => {
-                self.finalize_metadata_transfer_staging_generation(cleanup)
-            }
-            ControlPlaneCommand::InstallUnavailablePgPlacementTransitions {
-                transitions,
-                expected_destination_epoch,
-            } => {
-                let validated = self.validate_unavailable_pg_destination_install_batch(
-                    transitions,
-                    expected_destination_epoch,
-                )?;
-                let next_snapshot = self.apply_validated_unavailable_pg_destination_installs(
-                    validated,
-                    expected_destination_epoch,
-                )?;
-                let changed = next_snapshot.is_some();
-                Ok(applied_control_plane_command(
-                    self,
-                    next_snapshot.unwrap_or_else(|| self.clone()),
-                    ControlPlaneCommandResponse::InstallUnavailablePgPlacementTransitions,
-                    changed,
-                ))
-            }
-            ControlPlaneCommand::CompleteUnavailablePgPlacementTransitions {
+            ControlPlaneCommand::CompleteUnavailablePgPlacementTransition {
+                unavailable_transition,
+                pg_id,
+                transition_epoch,
+                destination_epoch,
+                topology_generation,
+                topology_digest,
                 ready_at_ms,
-                transitions,
+                destinations,
+                completion,
             } => {
-                let validated = self.validate_unavailable_pg_transition_completion_batch(
-                    transitions,
+                self.validate_serving_timestamp(ready_at_ms)?;
+                let Some(transition) = self.unavailable_pg_placement_transitions.get(&pg_id) else {
+                    if self
+                        .retained_unavailable_pg_placement_transitions
+                        .get(&(pg_id, unavailable_transition.transition_epoch()))
+                        .is_some_and(|retained| unavailable_transition.matches_transition(retained))
+                        && self.pg(pg_id).is_some_and(|pg| {
+                            pg.state == PgState::Active
+                                && pg.acting_set == unavailable_transition.destination_acting_set
+                        })
+                    {
+                        return Ok(applied_control_plane_command(
+                            self,
+                            self.clone(),
+                            ControlPlaneCommandResponse::CompleteUnavailablePgPlacementTransition,
+                            false,
+                        ));
+                    }
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} has no matching active unavailable placement transition",
+                            pg_id.get()
+                        ),
+                    });
+                };
+                if !unavailable_transition.matches_transition(transition) {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} completion does not match its active unavailable placement transition",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                let readiness = UnavailablePgPayloadReadiness {
+                    pg_id,
+                    transition_epoch,
+                    destination_epoch,
+                    topology_generation,
+                    topology_digest,
                     ready_at_ms,
-                )?;
-                let ready_snapshot = self.apply_validated_unavailable_pg_transition_completions(
-                    validated,
-                    ready_at_ms,
-                )?;
-                let changed = ready_snapshot.is_some();
+                    destinations,
+                };
+                validate_unavailable_pg_payload_readiness(self, transition, &readiness)?;
+                let mut ready_snapshot = self.clone();
+                ready_snapshot
+                    .unavailable_pg_placement_transitions
+                    .get_mut(&pg_id)
+                    .expect("payload-readiness transition was validated")
+                    .payload_readiness = Some(readiness);
+                validate_pg_peering_completion(PgPeeringCompletionValidation {
+                    snapshot: &ready_snapshot,
+                    pg_id,
+                    primary: completion.primary,
+                    node_incarnation: completion.node_incarnation,
+                    completed_at_ms: ready_at_ms,
+                    expected: Some(ExpectedPgPeeringCompletion {
+                        active_metadata_proof: completion.active_metadata_proof,
+                        active_metadata_proof_epoch: completion.active_metadata_proof_epoch,
+                    }),
+                })?;
+                let metadata_log_epoch = self
+                    .nodes
+                    .get(&completion.primary)
+                    .and_then(|node| node.pg_observation(pg_id))
+                    .map(NodePgObservationRecord::metadata_log_epoch)
+                    .ok_or(ControlPlaneError::PgPrimaryMissingActiveObservation {
+                        pg_id: pg_id.get(),
+                        node_id: completion.primary.as_u32(),
+                        cluster_epoch: self.cluster_epoch,
+                    })?;
+                ready_snapshot.record_committed_timestamp(ready_at_ms);
+                let record = ready_snapshot
+                    .pgs
+                    .get_mut(&pg_id)
+                    .expect("unavailable placement completion PG was validated");
+                record.state = PgState::Active;
+                record.active_primary = Some(completion.primary);
+                record.active_metadata_proof = Some(completion.active_metadata_proof);
+                record.active_metadata_log_epoch = Some(metadata_log_epoch);
+                record.active_metadata_transfer_imported =
+                    record.peering_metadata_transfer.is_some();
+                record.previous_primary_lease = None;
+                record.peering_metadata_proof_floor = None;
+                record.peering_metadata_proof_floor_epoch = None;
+                record.peering_metadata_proof_floor_imported = false;
+                record.peering_metadata_transfer = None;
+                record.peering_metadata_transfer_source_route_epoch = None;
+                record.peering_metadata_transfer_source_node_id = None;
+                record.metadata_transfer_fenced = false;
+                record.metadata_transfer_fence_source_lease_deadline_ms = None;
+                record.metadata_transfer_fence_source_imported = false;
+                record.metadata_transfer_fence_epoch = None;
+                let transition = ready_snapshot
+                    .unavailable_pg_placement_transitions
+                    .remove(&pg_id)
+                    .expect("completed unavailable transition was validated");
+                ready_snapshot
+                    .retained_unavailable_pg_placement_transitions
+                    .insert((pg_id, transition.transition_epoch), transition);
+                ready_snapshot.bump_epoch()?;
+                ready_snapshot
+                    .pgs
+                    .get_mut(&pg_id)
+                    .expect("unavailable placement PG activated before epoch bump")
+                    .active_metadata_proof_epoch = Some(completion.active_metadata_proof_epoch);
                 Ok(applied_control_plane_command(
                     self,
-                    ready_snapshot.unwrap_or_else(|| self.clone()),
-                    ControlPlaneCommandResponse::CompleteUnavailablePgPlacementTransitions,
-                    changed,
+                    ready_snapshot,
+                    ControlPlaneCommandResponse::CompleteUnavailablePgPlacementTransition,
+                    true,
                 ))
             }
             ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => {
@@ -12639,8 +4832,24 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 acting_set,
                 transfer,
                 expected_destination_epoch,
+                unavailable_transition,
             } => {
-                validate_unavailable_transition_mutation_binding(self, pg_id, None)?;
+                validate_unavailable_transition_mutation_binding(
+                    self,
+                    pg_id,
+                    unavailable_transition.as_ref(),
+                )?;
+                if unavailable_transition
+                    .as_ref()
+                    .is_some_and(|binding| acting_set != binding.destination_acting_set)
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "PG {} metadata transfer does not match its unavailable placement destination",
+                            pg_id.get()
+                        ),
+                    });
+                }
                 validate_acting_set(self, pg_id, &acting_set)?;
                 validate_acting_set_preserves_pending_recovery(self, pg_id, &acting_set)?;
                 let record = self
@@ -12729,7 +4938,11 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     transfer,
                 })?;
                 let source_route_epoch = self.cluster_epoch;
-                let source_node_id =
+                let source_node_id = if let Some(transition) =
+                    self.unavailable_pg_placement_transitions.get(&pg_id)
+                {
+                    transition.source_node_id
+                } else {
                     match state {
                         PgState::Active => record.active_primary.ok_or(
                             ControlPlaneError::PgHasNoServingPrimary {
@@ -12747,7 +4960,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                                 pg_id: pg_id.get(),
                             });
                         }
-                    };
+                    }
+                };
 
                 let mut next_snapshot = self.clone();
                 let record = next_snapshot
@@ -12775,6 +4989,14 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 record.metadata_transfer_fence_source_lease_deadline_ms = None;
                 record.metadata_transfer_fence_source_imported = false;
                 record.metadata_transfer_fence_epoch = None;
+                let destination_route = HistoricalPgRouteRecord::from(&*record);
+                if let Some(transition) = next_snapshot
+                    .unavailable_pg_placement_transitions
+                    .get_mut(&pg_id)
+                {
+                    transition.destination_epoch = Some(expected_destination_epoch);
+                    transition.destination_route = Some(destination_route);
+                }
                 next_snapshot.bump_epoch()?;
                 Ok(applied_control_plane_command(
                     self,
@@ -13731,7 +5953,6 @@ fn validate_unavailable_pg_payload_readiness_at(
 fn validate_unavailable_pg_transition_invariant(
     snapshot: &ClusterControlSnapshot,
     transition: &UnavailablePgPlacementTransition,
-    transition_successors: &BTreeMap<(PgId, ClusterEpoch), ClusterEpoch>,
 ) -> Result<(), String> {
     let topology = snapshot.initial_topology.as_ref().ok_or_else(|| {
         format!(
@@ -13970,460 +6191,13 @@ fn validate_unavailable_pg_transition_invariant(
             }
         }
     }
-    validate_unavailable_pg_transition_batch_receipt(
-        transition,
-        &transition.begin_batch_receipt,
-        UnavailablePgTransitionBatchStage::Begin,
-    )?;
-    if let Some(authorization) = &transition.staging_authorization {
-        let staging_authorization_boundary = transition.destination_epoch.or_else(|| {
-            transition_successors
-                .get(&(transition.pg_id, transition.transition_epoch))
-                .copied()
-        });
-        if authorization.staging_generation != transition.transition_epoch.get()
-            || authorization.artifact_target_epoch <= transition.transition_epoch
-            || authorization.artifact_length == 0
-            || authorization.artifact_length
-                > crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES
-            || authorization.artifact_format_version
-                != crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION
-            || authorization.batch_receipt.source_epoch > snapshot.cluster_epoch
-            || staging_authorization_boundary
-                .is_some_and(|boundary| authorization.batch_receipt.source_epoch >= boundary)
-        {
-            return Err(format!(
-                "unavailable PG transition {} has invalid staging authorization",
-                transition.pg_id.get()
-            ));
-        }
-        validate_unavailable_pg_transition_batch_receipt(
-            transition,
-            &authorization.batch_receipt,
-            UnavailablePgTransitionBatchStage::StagingAuthorization,
-        )?;
-    }
-    if transition.destination_install.is_some() && transition.destination_epoch.is_none() {
-        return Err(format!(
-            "unavailable PG transition {} has destination install evidence without an installed route",
-            transition.pg_id.get()
-        ));
-    }
-    if let Some(install) = &transition.destination_install {
-        let destination_route = transition.destination_route.as_ref().ok_or_else(|| {
-            format!(
-                "unavailable PG transition {} has destination install evidence without a route",
-                transition.pg_id.get()
-            )
-        })?;
-        if destination_route.pg_id != transition.pg_id
-            || destination_route.state != PgState::Peering
-            || destination_route.acting_set != transition.destination_acting_set
-            || destination_route.active_primary.is_some()
-            || destination_route.peering_metadata_proof_floor
-                != Some(install.transfer.metadata_proof())
-            || destination_route.peering_metadata_proof_floor_epoch
-                != Some(install.batch_receipt.source_epoch)
-            || !destination_route.peering_metadata_proof_floor_imported
-            || destination_route.peering_metadata_transfer != Some(install.transfer)
-            || destination_route.peering_metadata_transfer_source_route_epoch
-                != Some(install.batch_receipt.source_epoch)
-            || destination_route.peering_metadata_transfer_source_node_id
-                != Some(transition.source_node_id)
-            || install.publications.len() != transition.destination_acting_set.len()
-            || install
-                .publications
-                .windows(2)
-                .any(|pair| pair[0].node_id >= pair[1].node_id)
-            || install
-                .publications
-                .iter()
-                .map(|publication| publication.node_id)
-                .collect::<BTreeSet<_>>()
-                != transition
-                    .destination_acting_set
-                    .iter()
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-        {
-            return Err(format!(
-                "unavailable PG transition {} has invalid destination install evidence",
-                transition.pg_id.get()
-            ));
-        }
-        let authorization = transition.staging_authorization.as_ref().ok_or_else(|| {
-            format!(
-                "unavailable PG transition {} has destination install evidence without staging authorization",
-                transition.pg_id.get()
-            )
-        })?;
-        for publication in &install.publications {
-            let key = MetadataTransferStagingEvidenceKey {
-                pg_id: transition.pg_id,
-                staging_generation: authorization.staging_generation,
-                actor_node_id: publication.node_id,
-                actor_node_incarnation: publication.node_incarnation,
-                kind: crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-                target_epoch: Some(install.batch_receipt.target_epoch),
-            };
-            if let Some(evidence) = snapshot.metadata_transfer_staging_evidence.get(&key) {
-                if checksum::sha256::digest(evidence) != publication.evidence_digest {
-                    return Err(format!(
-                        "unavailable PG transition {} destination install publication digest is invalid",
-                        transition.pg_id.get()
-                    ));
-                }
-                let decoded = crate::pg_store::decode_staging_evidence(evidence)
-                    .map_err(|error| error.to_string())?;
-                if decoded.actor().endpoint() != publication.endpoint
-                    || decoded.target_epoch() != Some(install.batch_receipt.target_epoch)
-                    || decoded.transfer() != Some(install.transfer)
-                {
-                    return Err(format!(
-                        "unavailable PG transition {} destination install publication semantics are invalid",
-                        transition.pg_id.get()
-                    ));
-                }
-            } else {
-                let finalized_floor = snapshot
-                    .metadata_transfer_staging_finalized_floors
-                    .get(&(transition.pg_id, authorization.staging_generation))
-                    .filter(|floor| floor.transition.matches_transition(transition));
-                let committed = finalized_floor
-                    .and_then(|floor| floor.checkpoint_bindings.get(&key))
-                    .is_some_and(|binding| {
-                        snapshot
-                            .validate_metadata_transfer_staging_finalized_checkpoint_binding(
-                                &key,
-                                publication.evidence_digest,
-                                &publication.endpoint,
-                                binding,
-                            )
-                            .is_ok()
-                    });
-                if !committed {
-                    return Err(format!(
-                        "unavailable PG transition {} destination install references missing publication evidence",
-                        transition.pg_id.get()
-                    ));
-                }
-            }
-        }
-        validate_unavailable_pg_transition_batch_receipt(
-            transition,
-            &install.batch_receipt,
-            UnavailablePgTransitionBatchStage::DestinationInstall,
-        )?;
-    }
-    if transition.completion.is_some() != transition.completion_batch_receipt.is_some() {
-        return Err(format!(
-            "unavailable PG transition {} has incomplete completion receipt evidence",
-            transition.pg_id.get()
-        ));
-    }
-    if let Some(receipt) = &transition.completion_batch_receipt {
-        validate_unavailable_pg_transition_batch_receipt(
-            transition,
-            receipt,
-            UnavailablePgTransitionBatchStage::Completion,
-        )?;
-        validate_unavailable_pg_transition_completion_evidence(snapshot, transition, receipt)?;
-    }
-    Ok(())
-}
-
-fn validate_unavailable_pg_transition_completion_evidence(
-    snapshot: &ClusterControlSnapshot,
-    transition: &UnavailablePgPlacementTransition,
-    receipt: &UnavailablePgTransitionBatchReceipt,
-) -> Result<(), String> {
-    let target_epoch = next_epoch(receipt.source_epoch).map_err(|error| error.to_string())?;
-    if receipt.target_epoch != target_epoch || receipt.target_epoch > snapshot.cluster_epoch {
-        return Err(format!(
-            "unavailable PG transition {} has invalid completion activation epochs",
-            transition.pg_id.get()
-        ));
-    }
-    let readiness = transition.payload_readiness.as_ref().ok_or_else(|| {
-        format!(
-            "unavailable PG transition {} has a completion receipt without payload readiness",
-            transition.pg_id.get()
-        )
-    })?;
-    let completion = transition.completion.as_ref().ok_or_else(|| {
-        format!(
-            "unavailable PG transition {} has a completion receipt without completion evidence",
-            transition.pg_id.get()
-        )
-    })?;
-    let destination_epoch = transition.destination_epoch.ok_or_else(|| {
-        format!(
-            "unavailable PG transition {} completed without a destination epoch",
-            transition.pg_id.get()
-        )
-    })?;
-    let destination_route = transition.destination_route.as_ref().ok_or_else(|| {
-        format!(
-            "unavailable PG transition {} completed without destination-route evidence",
-            transition.pg_id.get()
-        )
-    })?;
-    let destination_proof = destination_route
-        .peering_metadata_transfer
-        .ok_or_else(|| {
-            format!(
-                "unavailable PG transition {} completion has no imported metadata proof",
-                transition.pg_id.get()
-            )
-        })?
-        .metadata_proof();
-    let primary_readiness = readiness
-        .destinations
-        .iter()
-        .find(|destination| destination.node_id == completion.primary);
-    if receipt.source_epoch < destination_epoch
-        || completion.pg_id != transition.pg_id
-        || completion.active_metadata_proof_epoch != receipt.source_epoch
-        || completion.active_metadata_proof != destination_proof
-        || primary_readiness
-            .is_none_or(|destination| destination.node_incarnation != completion.node_incarnation)
-    {
-        return Err(format!(
-            "unavailable PG transition {} has invalid completion evidence",
-            transition.pg_id.get()
-        ));
-    }
-    let source_route = snapshot
-        .reconstructed_pg_route_at_epoch(transition.pg_id, receipt.source_epoch)
-        .map_err(|error| {
-            format!(
-                "unavailable PG transition {} completion source route is unavailable: {error}",
-                transition.pg_id.get()
-            )
-        })?;
-    if source_route.state() != PgState::Peering
-        || source_route.acting_set() != transition.destination_acting_set
-        || source_route.peering_metadata_transfer() != destination_route.peering_metadata_transfer
-    {
-        return Err(format!(
-            "unavailable PG transition {} completion source route does not match its destination",
-            transition.pg_id.get()
-        ));
-    }
-    let target_route = snapshot
-        .reconstructed_pg_route_at_epoch(transition.pg_id, receipt.target_epoch)
-        .map_err(|error| {
-            format!(
-                "unavailable PG transition {} completion target route is unavailable: {error}",
-                transition.pg_id.get()
-            )
-        })?;
-    if target_route.state() != PgState::Active
-        || target_route.acting_set() != transition.destination_acting_set
-        || target_route.primary_node_id() != completion.primary
-    {
-        return Err(format!(
-            "unavailable PG transition {} completion target route does not match its activation",
-            transition.pg_id.get()
-        ));
-    }
-    Ok(())
-}
-
-fn validate_unavailable_pg_transition_batch_receipt(
-    transition: &UnavailablePgPlacementTransition,
-    receipt: &UnavailablePgTransitionBatchReceipt,
-    expected_stage: UnavailablePgTransitionBatchStage,
-) -> Result<(), String> {
-    if receipt.identity.member_pg_ids.is_empty()
-        || receipt.identity.member_pg_ids.len() > MAX_UNAVAILABLE_PG_TRANSITION_BATCH
-        || receipt.identity.stage != expected_stage
-        || receipt
-            .identity
-            .member_pg_ids
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-        || receipt
-            .identity
-            .member_pg_ids
-            .binary_search(&transition.pg_id)
-            .is_err()
-        || match expected_stage {
-            UnavailablePgTransitionBatchStage::StagingAuthorization => {
-                receipt.source_epoch != receipt.target_epoch
-                    || receipt.source_epoch < transition.transition_epoch
-            }
-            UnavailablePgTransitionBatchStage::Begin
-            | UnavailablePgTransitionBatchStage::DestinationInstall
-            | UnavailablePgTransitionBatchStage::Completion => {
-                receipt.source_epoch >= receipt.target_epoch
-            }
-        }
-        || (expected_stage == UnavailablePgTransitionBatchStage::Begin
-            && (receipt.source_epoch != transition.source_epoch
-                || receipt.target_epoch != transition.transition_epoch))
-        || (expected_stage == UnavailablePgTransitionBatchStage::DestinationInstall
-            && (transition.destination_epoch != Some(receipt.target_epoch)
-                || next_epoch(receipt.source_epoch).ok() != Some(receipt.target_epoch)))
-    {
-        return Err(format!(
-            "unavailable PG transition {} has an invalid {} batch receipt",
-            transition.pg_id.get(),
-            expected_stage.as_str()
-        ));
-    }
-    Ok(())
-}
-
-fn validate_unavailable_pg_transition_batch_receipts(
-    snapshot: &ClusterControlSnapshot,
-) -> Result<(), String> {
-    let transitions = snapshot
-        .retained_unavailable_pg_placement_transitions
-        .values()
-        .chain(snapshot.unavailable_pg_placement_transitions.values())
-        .collect::<Vec<_>>();
-    let mut retained_members = BTreeMap::<
-        UnavailablePgTransitionBatchReceipt,
-        BTreeMap<PgId, Vec<&UnavailablePgPlacementTransition>>,
-    >::new();
-    for transition in &transitions {
-        for receipt in std::iter::once(&transition.begin_batch_receipt)
-            .chain(
-                transition
-                    .staging_authorization
-                    .as_ref()
-                    .map(|authorization| &authorization.batch_receipt),
-            )
-            .chain(
-                transition
-                    .destination_install
-                    .as_ref()
-                    .map(|install| &install.batch_receipt),
-            )
-            .chain(transition.completion_batch_receipt.as_ref())
-        {
-            retained_members
-                .entry(receipt.clone())
-                .or_default()
-                .entry(transition.pg_id)
-                .or_default()
-                .push(transition);
-        }
-    }
-    for (receipt, actual_members) in retained_members {
-        if actual_members.len() != receipt.identity.member_pg_ids.len()
-            || actual_members
-                .iter()
-                .any(|(_, transitions)| transitions.len() != 1)
-            || !actual_members
-                .keys()
-                .copied()
-                .eq(receipt.identity.member_pg_ids.iter().copied())
-        {
-            return Err(format!(
-                "unavailable PG {} batch receipt retained members do not match its canonical vector",
-                receipt.identity.stage.as_str()
-            ));
-        }
-        let member_transitions = receipt
-            .identity
-            .member_pg_ids
-            .iter()
-            .map(|pg_id| actual_members[pg_id][0])
-            .collect::<Vec<_>>();
-        let expected_identity = match receipt.identity.stage {
-            UnavailablePgTransitionBatchStage::Begin => {
-                let begin_at_ms = member_transitions[0].begin_authorization.begin_at_ms;
-                if member_transitions
-                    .iter()
-                    .any(|transition| transition.begin_authorization.begin_at_ms != begin_at_ms)
-                {
-                    return Err(
-                        "unavailable PG begin batch members have different commit times".into(),
-                    );
-                }
-                let requests = member_transitions
-                    .iter()
-                    .map(|transition| {
-                        unavailable_pg_transition_begin_request_from_durable(transition)
-                    })
-                    .collect::<Vec<_>>();
-                unavailable_pg_transition_begin_batch_identity(
-                    &requests,
-                    receipt.target_epoch,
-                    begin_at_ms,
-                )
-            }
-            UnavailablePgTransitionBatchStage::StagingAuthorization => {
-                let requests = member_transitions
-                    .iter()
-                    .map(|transition| {
-                        unavailable_pg_staging_authorization_request_from_durable(transition)
-                            .ok_or_else(|| {
-                                format!(
-                                    "unavailable PG transition {} has a staging receipt without authorization evidence",
-                                    transition.pg_id.get()
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                unavailable_pg_staging_authorization_batch_identity(&requests)
-            }
-            UnavailablePgTransitionBatchStage::DestinationInstall => {
-                let requests = member_transitions
-                    .iter()
-                    .map(|transition| {
-                        unavailable_pg_destination_install_request_from_durable(transition)
-                            .ok_or_else(|| {
-                                format!(
-                                    "unavailable PG transition {} has an install receipt without install evidence",
-                                    transition.pg_id.get()
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                unavailable_pg_destination_install_batch_identity(&requests, receipt.target_epoch)
-            }
-            UnavailablePgTransitionBatchStage::Completion => {
-                let requests_and_times = member_transitions
-                    .iter()
-                    .map(|transition| {
-                        unavailable_pg_transition_completion_request_from_durable(transition)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let ready_at_ms = requests_and_times[0].1;
-                if requests_and_times
-                    .iter()
-                    .any(|(_, member_ready_at_ms)| *member_ready_at_ms != ready_at_ms)
-                {
-                    return Err(
-                        "unavailable PG completion batch members have different commit times"
-                            .into(),
-                    );
-                }
-                let requests = requests_and_times
-                    .into_iter()
-                    .map(|(request, _)| request)
-                    .collect::<Vec<_>>();
-                unavailable_pg_transition_completion_batch_identity(&requests, ready_at_ms)
-            }
-        };
-        if receipt.identity != expected_identity {
-            return Err(format!(
-                "unavailable PG {} batch receipt digest does not match its durable member evidence",
-                receipt.identity.stage.as_str()
-            ));
-        }
-    }
     Ok(())
 }
 
 fn validate_unavailable_pg_transition_lineages(
     snapshot: &ClusterControlSnapshot,
-) -> Result<BTreeMap<(PgId, ClusterEpoch), ClusterEpoch>, String> {
+) -> Result<(), String> {
     let mut lineage_tips = BTreeMap::new();
-    let mut successors = BTreeMap::new();
     for transition in snapshot
         .retained_unavailable_pg_placement_transitions
         .values()
@@ -14435,9 +6209,6 @@ fn validate_unavailable_pg_transition_lineages(
                 transition.transition_epoch.get()
             ));
         }
-        if let Some(predecessor) = transition.predecessor_transition_epoch {
-            successors.insert((transition.pg_id, predecessor), transition.transition_epoch);
-        }
         lineage_tips.insert(transition.pg_id, transition.transition_epoch);
     }
     for transition in snapshot.unavailable_pg_placement_transitions.values() {
@@ -14448,11 +6219,8 @@ fn validate_unavailable_pg_transition_lineages(
                 transition.transition_epoch.get()
             ));
         }
-        if let Some(predecessor) = transition.predecessor_transition_epoch {
-            successors.insert((transition.pg_id, predecessor), transition.transition_epoch);
-        }
     }
-    Ok(successors)
+    Ok(())
 }
 
 fn unavailable_transition_source_route_acting_set(
@@ -14971,72 +6739,11 @@ pub struct ClusterRuntimeMapSnapshot {
     pg_routes: Vec<PgRouteSnapshot>,
     historical_pg_routes: Vec<PgRouteSnapshot>,
     historical_cluster_epochs: Vec<ClusterEpoch>,
-    staging_authorizations:
-        Vec<crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation>,
-}
-
-/// Authorization state copied only from an authority-issued runtime map. The
-/// private representation prevents decoded storage RPC bytes from being
-/// upgraded directly to a committed staging capability.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct AuthorityPublishedUnavailablePgStagingAuthorizations {
-    presentations: Vec<crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation>,
-}
-
-#[derive(Debug)]
-pub(crate) enum StagingAuthorizationVerificationError {
-    NotObserved,
-    Invalid(ControlPlaneError),
-}
-
-impl AuthorityPublishedUnavailablePgStagingAuthorizations {
-    pub(crate) fn verify(
-        &self,
-        node_id: NodeId,
-        pg_id: PgId,
-        observed_cluster_epoch: ClusterEpoch,
-        presented: &crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation,
-    ) -> Result<
-        crate::control_plane_command::CommittedUnavailablePgStagingAuthorization,
-        StagingAuthorizationVerificationError,
-    > {
-        let Some(authority_published) = self
-            .presentations
-            .iter()
-            .find(|candidate| *candidate == presented)
-        else {
-            if presented.committed_epoch() < observed_cluster_epoch {
-                return Err(StagingAuthorizationVerificationError::Invalid(
-                    ControlPlaneError::rpc_protocol(format!(
-                        "staging authorization committed at epoch {} is absent from newer runtime-map epoch {}",
-                        presented.committed_epoch().get(),
-                        observed_cluster_epoch.get()
-                    )),
-                ));
-            }
-            return Err(StagingAuthorizationVerificationError::NotObserved);
-        };
-        if !authority_published.authorizes_destination_for_pg(node_id, pg_id) {
-            return Err(StagingAuthorizationVerificationError::Invalid(
-                ControlPlaneError::rpc_protocol(format!(
-                    "node {} is not a destination of PG {} in the committed staging authorization batch",
-                    node_id.as_u32(),
-                    pg_id.get()
-                )),
-            ));
-        }
-        Ok(crate::control_plane_command::CommittedUnavailablePgStagingAuthorization::from_authority_published(
-            authority_published.clone(),
-            node_id,
-            pg_id,
-            authority_published_staging_authorization_seal(),
-        ))
-    }
 }
 
 const RUNTIME_MAP_CONTENT_DIGEST_LEN: usize = 32;
-const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v4";
-const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v4";
+const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v3";
+const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeMapContentDigest([u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
@@ -15181,14 +6888,6 @@ impl ClusterRuntimeMapSnapshot {
         &self.historical_pg_routes
     }
 
-    pub(crate) fn authority_published_staging_authorizations(
-        &self,
-    ) -> AuthorityPublishedUnavailablePgStagingAuthorizations {
-        AuthorityPublishedUnavailablePgStagingAuthorizations {
-            presentations: self.staging_authorizations.clone(),
-        }
-    }
-
     #[must_use]
     pub fn historical_cluster_epochs(&self) -> &[ClusterEpoch] {
         &self.historical_cluster_epochs
@@ -15247,7 +6946,6 @@ impl ClusterRuntimeMapSnapshot {
             pg_routes,
             historical_pg_routes: self.historical_pg_routes.clone(),
             historical_cluster_epochs: self.historical_cluster_epochs.clone(),
-            staging_authorizations: Vec::new(),
         })
     }
 
@@ -15340,7 +7038,6 @@ impl ClusterRuntimeMapSnapshot {
                 .cloned()
                 .collect(),
             historical_cluster_epochs: self.historical_cluster_epochs.clone(),
-            staging_authorizations: Vec::new(),
         })
     }
 
@@ -15395,7 +7092,6 @@ impl ClusterRuntimeMapSnapshot {
                 .cloned()
                 .collect(),
             historical_cluster_epochs: self.historical_cluster_epochs.clone(),
-            staging_authorizations: Vec::new(),
         })
     }
 }
@@ -15421,7 +7117,6 @@ fn runtime_map_content_digest(snapshot: &ClusterRuntimeMapSnapshot) -> RuntimeMa
     for epoch in snapshot.historical_cluster_epochs() {
         digest_u64(&mut hasher, epoch.get());
     }
-    digest_staging_authorization_presentations(&mut hasher, &snapshot.staging_authorizations);
     let checksum = hasher.finalize();
     RuntimeMapContentDigest::from_bytes(
         checksum
@@ -15450,10 +7145,6 @@ fn runtime_map_current_state_digest(
         );
     }
     digest_pg_routes(&mut hasher, pg_routes);
-    let staging_authorizations = snapshot
-        .committed_staging_authorization_presentations()
-        .expect("validated control-plane state has valid staging authorization receipts");
-    digest_staging_authorization_presentations(&mut hasher, &staging_authorizations);
     let checksum = hasher.finalize();
     RuntimeMapContentDigest::from_bytes(
         checksum
@@ -15461,23 +7152,6 @@ fn runtime_map_current_state_digest(
             .try_into()
             .expect("SHA-256 current runtime-map digest must contain 32 bytes"),
     )
-}
-
-fn digest_staging_authorization_presentations(
-    hasher: &mut ChecksumHasher,
-    authorizations: &[crate::control_plane_command::UnavailablePgStagingAuthorizationPresentation],
-) {
-    digest_len(hasher, authorizations.len());
-    for authorization in authorizations {
-        digest_u64(hasher, authorization.committed_epoch().get());
-        digest_bytes(hasher, &authorization.batch_members_digest());
-        digest_bytes(
-            hasher,
-            &authorization
-                .encode_command()
-                .expect("authority-published staging authorization is canonical"),
-        );
-    }
 }
 
 pub(crate) fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSnapshot]) {
@@ -15602,10 +7276,6 @@ fn digest_u64(hasher: &mut ChecksumHasher, value: u64) {
 }
 
 fn digest_u32(hasher: &mut ChecksumHasher, value: u32) {
-    hasher.update(&value.to_be_bytes());
-}
-
-fn digest_u16(hasher: &mut ChecksumHasher, value: u16) {
     hasher.update(&value.to_be_bytes());
 }
 
@@ -16162,8 +7832,9 @@ pub struct PgControlRecord {
     // command logs are epoch-local, so active primary progress in a later epoch
     // is not ordered by the bare log tuple alone.
     active_metadata_proof_epoch: Option<ClusterEpoch>,
-    // Replica log epoch of the active floor; a global map-epoch advance alone
-    // is not evidence that the PG's command log reset.
+    // PG-local metadata-log epoch for active_metadata_proof. Unlike the global
+    // route epoch, this advances only when the PG log changes epoch and prevents
+    // delayed heartbeats from replacing a newer active proof floor.
     active_metadata_log_epoch: Option<ClusterEpoch>,
     // True only when the active metadata proof was imported through an explicit
     // metadata transfer marker. This scopes destination-epoch local proof
@@ -16306,6 +7977,11 @@ impl PgControlRecord {
     #[must_use]
     pub fn active_metadata_proof_epoch(&self) -> Option<ClusterEpoch> {
         self.active_metadata_proof_epoch
+    }
+
+    #[must_use]
+    pub fn active_metadata_log_epoch(&self) -> Option<ClusterEpoch> {
+        self.active_metadata_log_epoch
     }
 
     #[must_use]
@@ -16824,23 +8500,6 @@ impl PgMetadataReadRoute {
 }
 
 impl PgMetadataProof {
-    pub(crate) fn from_encoded_parts(
-        applied_log_index: u64,
-        applied_log_hash_encoding_version: u8,
-        applied_log_hash: u64,
-        state_digest_encoding_version: u8,
-        state_digest: u64,
-    ) -> Result<Self, MetadataProofCarrierVersionError> {
-        Ok(Self::from_carriers(
-            applied_log_index,
-            MetadataCommandLogHash::from_encoded_parts(
-                applied_log_hash_encoding_version,
-                applied_log_hash,
-            )?,
-            CanonicalStateDigest::from_encoded_parts(state_digest_encoding_version, state_digest)?,
-        ))
-    }
-
     pub(crate) const fn applied_log_index(self) -> u64 {
         self.applied_log_index
     }
@@ -17393,11 +9052,6 @@ pub struct ControlPlaneRuntimeMapDiagnostics {
     raft_checkpoint_metrics: observability::ControlPlaneRaftCheckpointMetricSnapshot,
     raft_wal_metrics: observability::ControlPlaneRaftWalMetricSnapshot,
     raft_command_metrics: observability::ControlPlaneRaftCommandMetricSnapshot,
-    unavailable_pg_batch_metrics: Vec<observability::UnavailablePgBatchMetricSample>,
-    unavailable_pg_worker_stage_metrics: Vec<observability::UnavailablePgWorkerStageMetricSample>,
-    unavailable_pg_worker_queue_metrics: observability::UnavailablePgWorkerQueueMetricSnapshot,
-    metadata_transfer_staging_retention_metrics:
-        observability::MetadataTransferStagingRetentionMetricSnapshot,
     history_reference_samples: Vec<observability::ControlPlaneHistoryReferenceSample>,
     node_leases: Vec<ControlPlaneRuntimeMapNodeLeaseDiagnostic>,
 }
@@ -17502,32 +9156,6 @@ impl ControlPlaneRuntimeMapDiagnostics {
     #[must_use]
     pub fn raft_command_metrics(&self) -> observability::ControlPlaneRaftCommandMetricSnapshot {
         self.raft_command_metrics
-    }
-
-    #[must_use]
-    pub fn unavailable_pg_batch_metrics(&self) -> &[observability::UnavailablePgBatchMetricSample] {
-        &self.unavailable_pg_batch_metrics
-    }
-
-    #[must_use]
-    pub fn unavailable_pg_worker_stage_metrics(
-        &self,
-    ) -> &[observability::UnavailablePgWorkerStageMetricSample] {
-        &self.unavailable_pg_worker_stage_metrics
-    }
-
-    #[must_use]
-    pub fn unavailable_pg_worker_queue_metrics(
-        &self,
-    ) -> observability::UnavailablePgWorkerQueueMetricSnapshot {
-        self.unavailable_pg_worker_queue_metrics
-    }
-
-    #[must_use]
-    pub fn metadata_transfer_staging_retention_metrics(
-        &self,
-    ) -> observability::MetadataTransferStagingRetentionMetricSnapshot {
-        self.metadata_transfer_staging_retention_metrics
     }
 
     #[must_use]
@@ -17747,120 +9375,6 @@ pub trait ControlPlaneAdmin {
         ))
     }
 
-    fn authorize_unavailable_pg_staging_intents_batch(
-        &mut self,
-        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let _ = authorizations;
-        Err(ControlPlaneError::rpc_remote(
-            "unavailable PG staging authorization batches are not supported by this authority"
-                .to_owned(),
-        ))
-    }
-
-    fn install_unavailable_pg_placement_transitions_batch(
-        &mut self,
-        transitions: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let _ = (transitions, expected_destination_epoch);
-        Err(ControlPlaneError::rpc_remote(
-            "unavailable PG destination installation batches are not supported by this authority"
-                .to_owned(),
-        ))
-    }
-
-    fn apply_metadata_transfer_staging_evidence_page(
-        &mut self,
-        operation_payload: Vec<u8>,
-        page_digest: [u8; 32],
-    ) -> Result<Vec<u8>, ControlPlaneError> {
-        let _ = (operation_payload, page_digest);
-        Err(ControlPlaneError::rpc_remote(
-            "metadata-transfer staging evidence publication is not supported by this authority"
-                .to_owned(),
-        ))
-    }
-
-    fn checkpoint_metadata_transfer_staging_evidence_pages(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let _ = (
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        );
-        Err(ControlPlaneError::rpc_remote(
-            "metadata-transfer staging evidence checkpointing is not supported by this authority"
-                .to_owned(),
-        ))
-    }
-
-    fn collapse_metadata_transfer_staging_evidence_checkpoint_segment(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let _ = (
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        );
-        Err(ControlPlaneError::rpc_remote(
-            "metadata-transfer staging checkpoint collapse is not supported by this authority"
-                .to_owned(),
-        ))
-    }
-
-    fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let _ = (
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        );
-        Err(ControlPlaneError::rpc_remote(
-            "metadata-transfer staging checkpoint anchor coalescing is not supported by this authority"
-                .to_owned(),
-        ))
-    }
-
-    fn retire_metadata_transfer_staging_actor_closure(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let _ = (actor_node_id, actor_node_incarnation);
-        Err(ControlPlaneError::rpc_remote(
-            "metadata-transfer staging actor-closure retirement is not supported by this authority"
-                .to_owned(),
-        ))
-    }
-
-    fn finalize_metadata_transfer_staging_generation(
-        &mut self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let _ = cleanup;
-        Err(ControlPlaneError::rpc_remote(
-            "metadata-transfer staging cleanup is not supported by this authority".to_owned(),
-        ))
-    }
-
     fn fence_pg_for_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -17888,6 +9402,19 @@ pub trait ControlPlaneAdmin {
         transfer: PgMetadataTransferProof,
         expected_destination_epoch: ClusterEpoch,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
+
+    fn install_unavailable_pg_transition_metadata_transfer(
+        &mut self,
+        binding: UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let _ = (binding, transfer, expected_destination_epoch);
+        Err(ControlPlaneError::rpc_remote(
+            "unavailable PG transition metadata transfer is not supported by this authority"
+                .to_owned(),
+        ))
+    }
 
     fn transfer_raft_leadership_to(&mut self, node_id: u64) -> Result<(), ControlPlaneError> {
         let _ = node_id;
@@ -18104,7 +9631,6 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
                     .retained_unavailable_pg_placement_transitions
                     .values(),
             ),
-        snapshot.outage_resolution_intents.values(),
     );
     prune_cluster_map_history(&mut history_records, &protection, snapshot.cluster_epoch);
     for history in &history_records {
@@ -18174,38 +9700,6 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             format_unavailable_pg_placement_transition(transition)
         ));
     }
-    for record in snapshot.outage_command_artifacts.values() {
-        for (page_index, bytes) in record.pages.iter().enumerate() {
-            out.push_str(&format!(
-                "outage_command_artifact_page={},{},{},{},{},{},{},{}\n",
-                record.pg_id.get(),
-                record.source_epoch.get(),
-                record.command_id.cluster_epoch().get(),
-                record.command_id.log_index().get(),
-                record.total_length,
-                hex_encode(&record.digest),
-                page_index,
-                hex_encode(bytes)
-            ));
-        }
-    }
-    for retirement in snapshot.outage_command_artifact_retirements.values() {
-        out.push_str(&format!(
-            "outage_command_artifact_retirement={},{},{},{},{},{}\n",
-            retirement.pg_id.get(),
-            retirement.source_epoch.get(),
-            retirement.command_id.cluster_epoch().get(),
-            retirement.command_id.log_index().get(),
-            retirement.total_length,
-            hex_encode(&retirement.digest),
-        ));
-    }
-    for intent in snapshot.outage_resolution_intents.values() {
-        out.push_str(&format!(
-            "outage_resolution_intent={}\n",
-            format_unavailable_pg_outage_resolution_intent(intent)
-        ));
-    }
     for transition in snapshot
         .retained_unavailable_pg_placement_transitions
         .values()
@@ -18215,995 +9709,10 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             format_unavailable_pg_placement_transition(transition)
         ));
     }
-    for record in snapshot.metadata_transfer_staging_evidence_pages.values() {
-        out.push_str(&format!(
-            "metadata_transfer_staging_evidence_page={},{},{}\n",
-            hex_encode(&record.operation_payload),
-            hex_encode(&record.page_digest),
-            hex_encode(&record.apply_receipt)
-        ));
-    }
-    for segment in snapshot
-        .metadata_transfer_staging_evidence_checkpoint_segments
-        .values()
-    {
-        out.push_str(&format!(
-            "{METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_PREFIX}{}\n",
-            format_metadata_transfer_staging_evidence_checkpoint_segment(segment)
-        ));
-    }
-    for anchor in snapshot
-        .metadata_transfer_staging_evidence_checkpoint_anchors
-        .values()
-    {
-        out.push_str(&format!(
-            "{METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_ANCHOR_STATE_RECORD_PREFIX}{}\n",
-            format_metadata_transfer_staging_evidence_checkpoint_anchor(anchor)
-        ));
-    }
-    for closure in snapshot.metadata_transfer_staging_actor_closures.values() {
-        out.push_str(&format!(
-            "{METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_STATE_RECORD_PREFIX}{}\n",
-            format_metadata_transfer_staging_actor_closure(closure)
-        ));
-    }
-    for closure in snapshot
-        .metadata_transfer_staging_retired_actor_closures
-        .values()
-    {
-        out.push_str(&format!(
-            "{METADATA_TRANSFER_STAGING_RETIRED_ACTOR_CLOSURE_STATE_RECORD_PREFIX}{}\n",
-            format_metadata_transfer_staging_actor_closure(closure)
-        ));
-    }
-    for floor in snapshot.metadata_transfer_staging_finalized_floors.values() {
-        out.push_str(&format!(
-            "{METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_STATE_RECORD_PREFIX}{}\n",
-            format_metadata_transfer_staging_finalized_floor(floor)
-        ));
-    }
-    for evidence in snapshot.metadata_transfer_staging_evidence.values() {
-        out.push_str(&format!(
-            "metadata_transfer_staging_evidence={}\n",
-            hex_encode(evidence)
-        ));
-    }
     for record in snapshot.pgs.values() {
         out.push_str(&format!("pg={}\n", format_pg_record(record)));
     }
     out
-}
-
-fn metadata_transfer_staging_evidence_checkpoint_state_record_len(
-    segment: &MetadataTransferStagingEvidenceCheckpointSegment,
-) -> usize {
-    METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_STATE_RECORD_PREFIX.len()
-        + format_metadata_transfer_staging_evidence_checkpoint_segment(segment).len()
-        + 1
-}
-
-fn format_metadata_transfer_staging_finalized_floor(
-    floor: &MetadataTransferStagingFinalizedFloor,
-) -> String {
-    let publications = floor
-        .publications
-        .iter()
-        .map(|publication| {
-            let source = publication.transfer.source_metadata_proof();
-            let imported = publication.transfer.metadata_proof();
-            format!(
-                "{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
-                publication.node_id.as_u32(),
-                publication.node_incarnation,
-                hex_encode(publication.endpoint.as_bytes()),
-                publication.target_epoch.get(),
-                publication.transfer.source_epoch().get(),
-                source.applied_log_index,
-                source.applied_log_hash.encoding_version(),
-                source.applied_log_hash.value(),
-                source.state_digest.encoding_version(),
-                source.state_digest.value(),
-                imported.applied_log_index,
-                imported.applied_log_hash.encoding_version(),
-                imported.applied_log_hash.value(),
-                imported.state_digest.encoding_version(),
-                imported.state_digest.value(),
-                hex_encode(&publication.evidence_digest)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(";");
-    let tombstones = floor
-        .tombstones
-        .iter()
-        .map(|tombstone| {
-            format!(
-                "{}/{}/{}/{}",
-                tombstone.node_id.as_u32(),
-                tombstone.node_incarnation,
-                hex_encode(tombstone.endpoint.as_bytes()),
-                hex_encode(&tombstone.evidence_digest)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(";");
-    let checkpoint_bindings = floor
-        .checkpoint_bindings
-        .iter()
-        .map(|(key, binding)| {
-            format!(
-                "{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
-                key.pg_id.get(),
-                key.staging_generation,
-                key.actor_node_id.as_u32(),
-                key.actor_node_incarnation,
-                key.kind as u8,
-                key.target_epoch
-                    .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string()),
-                binding.actor_node_id.as_u32(),
-                binding.actor_node_incarnation,
-                hex_encode(binding.actor_endpoint.as_bytes()),
-                binding.first_generation,
-                binding.last_generation,
-                binding.page_generation,
-                binding.page_sequence,
-                hex_encode(&binding.segment_digest),
-                binding.actor_closure_candidate.as_ref().map_or_else(
-                    || "-".to_owned(),
-                    |candidate| {
-                        hex_encode(
-                            &crate::pg_store::encode_staging_evidence_actor_closure_candidate_bytes(
-                                candidate,
-                            )
-                            .expect("finalized closure candidate is validated before encoding"),
-                        )
-                    },
-                )
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(";");
-    [
-        floor.transition.pg_id().get().to_string(),
-        floor.transition.transition_epoch().get().to_string(),
-        floor.transition.source_epoch().get().to_string(),
-        format_node_list(floor.transition.source_acting_set()),
-        format_node_list(floor.transition.destination_acting_set()),
-        floor.staging_generation.to_string(),
-        match floor.disposition {
-            MetadataTransferStagingCleanupDisposition::Completed => "completed".to_owned(),
-            MetadataTransferStagingCleanupDisposition::Superseded {
-                successor_transition_epoch,
-            } => format!("superseded:{}", successor_transition_epoch.get()),
-        },
-        hex_encode(&floor.artifact_digest),
-        floor.artifact_length.to_string(),
-        floor.artifact_format_version.to_string(),
-        floor.publications.len().to_string(),
-        publications,
-        hex_encode(&floor.tombstone_set_digest),
-        floor.tombstones.len().to_string(),
-        tombstones,
-        floor.checkpoint_bindings.len().to_string(),
-        checkpoint_bindings,
-    ]
-    .join(",")
-}
-
-fn parse_metadata_transfer_staging_finalized_floor(
-    line: usize,
-    value: &str,
-) -> Result<MetadataTransferStagingFinalizedFloor, ControlPlaneError> {
-    let fields = value.split(',').collect::<Vec<_>>();
-    if fields.len() != 17 {
-        return Err(parse_error(
-            line,
-            "metadata-transfer staging finalized floor must have seventeen fields",
-        ));
-    }
-    let disposition = if fields[6] == "completed" {
-        MetadataTransferStagingCleanupDisposition::Completed
-    } else if let Some(epoch) = fields[6].strip_prefix("superseded:") {
-        MetadataTransferStagingCleanupDisposition::Superseded {
-            successor_transition_epoch: parse_required_cluster_epoch(
-                line,
-                epoch,
-                "staging finalized-floor successor transition epoch",
-            )?,
-        }
-    } else {
-        return Err(parse_error(
-            line,
-            "metadata-transfer staging finalized floor disposition is invalid",
-        ));
-    };
-    let publication_count = usize::try_from(parse_u64(
-        line,
-        fields[10],
-        "staging finalized-floor publication count",
-    )?)
-    .map_err(|_| {
-        parse_error(
-            line,
-            "staging finalized-floor publication count does not fit usize",
-        )
-    })?;
-    let publications = if fields[11].is_empty() {
-        Vec::new()
-    } else {
-        fields[11]
-            .split(';')
-            .map(|encoded| {
-                let parts = encoded.split('/').collect::<Vec<_>>();
-                if parts.len() != 16 {
-                    return Err(parse_error(
-                        line,
-                        "staging finalized-floor publication must have sixteen fields",
-                    ));
-                }
-                let source_metadata_proof = parse_optional_metadata_proof(
-                    line,
-                    &parts[5..10],
-                    "staging finalized-floor publication source proof",
-                )?
-                .ok_or_else(|| {
-                    parse_error(
-                        line,
-                        "staging finalized-floor publication source proof is required",
-                    )
-                })?;
-                let imported_metadata_proof = parse_optional_metadata_proof(
-                    line,
-                    &parts[10..15],
-                    "staging finalized-floor publication imported proof",
-                )?
-                .ok_or_else(|| {
-                    parse_error(
-                        line,
-                        "staging finalized-floor publication imported proof is required",
-                    )
-                })?;
-                Ok(MetadataTransferStagingFinalizedPublicationBinding {
-                    node_id: NodeId::new(parse_u32(
-                        line,
-                        parts[0],
-                        "staging finalized-floor publication node",
-                    )?),
-                    node_incarnation: parse_u64(
-                        line,
-                        parts[1],
-                        "staging finalized-floor publication incarnation",
-                    )?,
-                    endpoint: String::from_utf8(hex_decode(line, parts[2])?).map_err(|_| {
-                        parse_error(
-                            line,
-                            "staging finalized-floor publication endpoint is not UTF-8",
-                        )
-                    })?,
-                    target_epoch: parse_required_cluster_epoch(
-                        line,
-                        parts[3],
-                        "staging finalized-floor publication target epoch",
-                    )?,
-                    transfer: PgMetadataTransferProof::new_with_imported_metadata_proof(
-                        parse_required_cluster_epoch(
-                            line,
-                            parts[4],
-                            "staging finalized-floor publication source epoch",
-                        )?,
-                        source_metadata_proof,
-                        imported_metadata_proof,
-                    ),
-                    evidence_digest: hex_decode(line, parts[15])?.try_into().map_err(|_| {
-                        parse_error(
-                            line,
-                            "staging finalized-floor publication digest must contain 32 bytes",
-                        )
-                    })?,
-                })
-            })
-            .collect::<Result<Vec<_>, ControlPlaneError>>()?
-    };
-    if publications.len() != publication_count {
-        return Err(parse_error(
-            line,
-            "staging finalized-floor publication count does not match its entries",
-        ));
-    }
-    let tombstone_count = usize::try_from(parse_u64(
-        line,
-        fields[13],
-        "staging finalized-floor tombstone count",
-    )?)
-    .map_err(|_| {
-        parse_error(
-            line,
-            "staging finalized-floor tombstone count does not fit usize",
-        )
-    })?;
-    let tombstones = if fields[14].is_empty() {
-        Vec::new()
-    } else {
-        fields[14]
-            .split(';')
-            .map(|encoded| {
-                let parts = encoded.split('/').collect::<Vec<_>>();
-                if parts.len() != 4 {
-                    return Err(parse_error(
-                        line,
-                        "staging finalized-floor tombstone must have four fields",
-                    ));
-                }
-                Ok(MetadataTransferStagingTombstoneBinding {
-                    node_id: NodeId::new(parse_u32(
-                        line,
-                        parts[0],
-                        "staging finalized-floor tombstone node",
-                    )?),
-                    node_incarnation: parse_u64(
-                        line,
-                        parts[1],
-                        "staging finalized-floor tombstone incarnation",
-                    )?,
-                    endpoint: String::from_utf8(hex_decode(line, parts[2])?).map_err(|_| {
-                        parse_error(
-                            line,
-                            "staging finalized-floor tombstone endpoint is not UTF-8",
-                        )
-                    })?,
-                    evidence_digest: hex_decode(line, parts[3])?.try_into().map_err(|_| {
-                        parse_error(
-                            line,
-                            "staging finalized-floor tombstone digest must contain 32 bytes",
-                        )
-                    })?,
-                })
-            })
-            .collect::<Result<Vec<_>, ControlPlaneError>>()?
-    };
-    if tombstones.len() != tombstone_count {
-        return Err(parse_error(
-            line,
-            "staging finalized-floor tombstone count does not match its entries",
-        ));
-    }
-    let checkpoint_binding_count = usize::try_from(parse_u64(
-        line,
-        fields[15],
-        "staging finalized-floor checkpoint-binding count",
-    )?)
-    .map_err(|_| {
-        parse_error(
-            line,
-            "staging finalized-floor checkpoint-binding count does not fit usize",
-        )
-    })?;
-    let mut checkpoint_bindings = BTreeMap::new();
-    if !fields[16].is_empty() {
-        for encoded in fields[16].split(';') {
-            let parts = encoded.split('/').collect::<Vec<_>>();
-            if parts.len() != 15 {
-                return Err(parse_error(
-                    line,
-                    "staging finalized-floor checkpoint binding must have fifteen fields",
-                ));
-            }
-            let kind = match parse_u16(line, parts[4], "staging checkpoint evidence kind")? {
-                0 => crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-                1 => crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
-                _ => {
-                    return Err(parse_error(
-                        line,
-                        "invalid staging finalized-floor checkpoint evidence kind",
-                    ));
-                }
-            };
-            let target_epoch = if parts[5] == "-" {
-                None
-            } else {
-                Some(parse_required_cluster_epoch(
-                    line,
-                    parts[5],
-                    "staging finalized-floor checkpoint target epoch",
-                )?)
-            };
-            let key = MetadataTransferStagingEvidenceKey {
-                pg_id: PgId::new(parse_u32(
-                    line,
-                    parts[0],
-                    "staging finalized-floor checkpoint PG",
-                )?),
-                staging_generation: parse_u64(
-                    line,
-                    parts[1],
-                    "staging finalized-floor checkpoint generation",
-                )?,
-                actor_node_id: NodeId::new(parse_u32(
-                    line,
-                    parts[2],
-                    "staging finalized-floor checkpoint evidence actor",
-                )?),
-                actor_node_incarnation: parse_u64(
-                    line,
-                    parts[3],
-                    "staging finalized-floor checkpoint evidence incarnation",
-                )?,
-                kind,
-                target_epoch,
-            };
-            let binding = MetadataTransferStagingFinalizedCheckpointBinding {
-                actor_node_id: NodeId::new(parse_u32(
-                    line,
-                    parts[6],
-                    "staging finalized-floor checkpoint segment actor",
-                )?),
-                actor_node_incarnation: parse_u64(
-                    line,
-                    parts[7],
-                    "staging finalized-floor checkpoint segment incarnation",
-                )?,
-                actor_endpoint: String::from_utf8(hex_decode(line, parts[8])?).map_err(|_| {
-                    parse_error(
-                        line,
-                        "staging finalized-floor checkpoint segment endpoint is not UTF-8",
-                    )
-                })?,
-                first_generation: parse_u64(
-                    line,
-                    parts[9],
-                    "staging finalized-floor checkpoint first generation",
-                )?,
-                last_generation: parse_u64(
-                    line,
-                    parts[10],
-                    "staging finalized-floor checkpoint last generation",
-                )?,
-                page_generation: parse_u64(
-                    line,
-                    parts[11],
-                    "staging finalized-floor checkpoint page generation",
-                )?,
-                page_sequence: parse_u64(
-                    line,
-                    parts[12],
-                    "staging finalized-floor checkpoint page sequence",
-                )?,
-                segment_digest: hex_decode(line, parts[13])?.try_into().map_err(|_| {
-                    parse_error(
-                        line,
-                        "staging finalized-floor checkpoint segment digest must contain 32 bytes",
-                    )
-                })?,
-                actor_closure_candidate: if parts[14] == "-" {
-                    None
-                } else {
-                    Some(
-                        crate::pg_store::decode_staging_evidence_actor_closure_candidate_bytes(
-                            &hex_decode(line, parts[14])?,
-                        )
-                        .map_err(|error| parse_error(line, &error.to_string()))?,
-                    )
-                },
-            };
-            if checkpoint_bindings.insert(key, binding).is_some() {
-                return Err(parse_error(
-                    line,
-                    "duplicate staging finalized-floor checkpoint binding",
-                ));
-            }
-        }
-    }
-    if checkpoint_bindings.len() != checkpoint_binding_count {
-        return Err(parse_error(
-            line,
-            "staging finalized-floor checkpoint-binding count does not match its entries",
-        ));
-    }
-    Ok(MetadataTransferStagingFinalizedFloor {
-        transition: UnavailablePgTransitionMutationBinding::new(
-            PgId::new(parse_u32(line, fields[0], "staging finalized-floor PG")?),
-            parse_required_cluster_epoch(
-                line,
-                fields[1],
-                "staging finalized-floor transition epoch",
-            )?,
-            parse_required_cluster_epoch(line, fields[2], "staging finalized-floor source epoch")?,
-            parse_node_list(line, fields[3])?,
-            parse_node_list(line, fields[4])?,
-        ),
-        staging_generation: parse_u64(line, fields[5], "staging finalized-floor generation")?,
-        disposition,
-        artifact_digest: hex_decode(line, fields[7])?.try_into().map_err(|_| {
-            parse_error(
-                line,
-                "staging finalized-floor artifact digest must contain 32 bytes",
-            )
-        })?,
-        artifact_length: parse_u64(line, fields[8], "staging finalized-floor artifact length")?,
-        artifact_format_version: parse_u16(
-            line,
-            fields[9],
-            "staging finalized-floor artifact format version",
-        )?,
-        publications,
-        tombstone_set_digest: hex_decode(line, fields[12])?.try_into().map_err(|_| {
-            parse_error(
-                line,
-                "staging finalized-floor tombstone-set digest must contain 32 bytes",
-            )
-        })?,
-        tombstones,
-        checkpoint_bindings,
-    })
-}
-
-fn format_metadata_transfer_staging_actor_closure(
-    closure: &MetadataTransferStagingActorClosureCertificate,
-) -> String {
-    [
-        closure.source_actor.node_id().as_u32().to_string(),
-        closure.source_actor.node_incarnation().to_string(),
-        hex_encode(closure.source_actor.endpoint().as_bytes()),
-        closure.source_tip_generation.to_string(),
-        hex_encode(&closure.source_tip_page_digest),
-        hex_encode(&closure.source_tip_apply_receipt_digest),
-        closure.destination_actor.node_id().as_u32().to_string(),
-        closure.destination_actor.node_incarnation().to_string(),
-        hex_encode(closure.destination_actor.endpoint().as_bytes()),
-        hex_encode(&closure.destination_genesis_page_digest),
-        closure.rebound_entry_count.to_string(),
-        closure.rebound_max_sequence.to_string(),
-        hex_encode(&closure.rebound_evidence_digest),
-    ]
-    .join(",")
-}
-
-fn parse_metadata_transfer_staging_actor_closure(
-    line: usize,
-    value: &str,
-) -> Result<MetadataTransferStagingActorClosureCertificate, ControlPlaneError> {
-    let fields = value.split(',').collect::<Vec<_>>();
-    if fields.len() != 13 {
-        return Err(parse_error(
-            line,
-            "metadata-transfer staging actor closure must have thirteen fields",
-        ));
-    }
-    let actor = |node: usize,
-                 incarnation: usize,
-                 endpoint: usize,
-                 node_label: &'static str,
-                 incarnation_label: &'static str,
-                 endpoint_label: &'static str| {
-        let endpoint = String::from_utf8(hex_decode(line, fields[endpoint])?)
-            .map_err(|_| parse_error(line, endpoint_label))?;
-        MetadataTransferStagingNodeIdentity::new(
-            NodeId::new(parse_u32(line, fields[node], node_label)?),
-            parse_u64(line, fields[incarnation], incarnation_label)?,
-            endpoint,
-        )
-        .map_err(|error| parse_error(line, &error.to_string()))
-    };
-    let digest = |index: usize, label: &str| {
-        hex_decode(line, fields[index])?.try_into().map_err(|_| {
-            parse_error(
-                line,
-                &format!("metadata-transfer staging actor closure {label} must contain 32 bytes"),
-            )
-        })
-    };
-    Ok(MetadataTransferStagingActorClosureCertificate {
-        source_actor: actor(
-            0,
-            1,
-            2,
-            "source actor node",
-            "source actor incarnation",
-            "source actor endpoint is not UTF-8",
-        )?,
-        source_tip_generation: parse_u64(line, fields[3], "source tip generation")?,
-        source_tip_page_digest: digest(4, "source page digest")?,
-        source_tip_apply_receipt_digest: digest(5, "source receipt digest")?,
-        destination_actor: actor(
-            6,
-            7,
-            8,
-            "destination actor node",
-            "destination actor incarnation",
-            "destination actor endpoint is not UTF-8",
-        )?,
-        destination_genesis_page_digest: digest(9, "destination genesis digest")?,
-        rebound_entry_count: parse_u64(line, fields[10], "rebound entry count")?,
-        rebound_max_sequence: parse_u64(line, fields[11], "rebound maximum sequence")?,
-        rebound_evidence_digest: digest(12, "rebound evidence digest")?,
-    })
-}
-
-fn format_metadata_transfer_staging_evidence_checkpoint_anchor(
-    anchor: &MetadataTransferStagingEvidenceCheckpointAnchor,
-) -> String {
-    [
-        anchor.actor.node_id().as_u32().to_string(),
-        anchor.actor.node_incarnation().to_string(),
-        hex_encode(anchor.actor.endpoint().as_bytes()),
-        anchor.first_generation.to_string(),
-        anchor.last_generation.to_string(),
-        anchor.previous_generation.to_string(),
-        hex_encode(&anchor.previous_apply_receipt_digest),
-        hex_encode(&anchor.tip_apply_receipt),
-        hex_encode(&anchor.source_segment_digest),
-        anchor.source_segment_count.to_string(),
-        hex_encode(&anchor.source_segments_digest),
-    ]
-    .join(",")
-}
-
-fn parse_metadata_transfer_staging_evidence_checkpoint_anchor(
-    line: usize,
-    value: &str,
-) -> Result<MetadataTransferStagingEvidenceCheckpointAnchor, ControlPlaneError> {
-    let fields = value.split(',').collect::<Vec<_>>();
-    if fields.len() != 11 {
-        return Err(parse_error(
-            line,
-            "metadata-transfer staging checkpoint anchor must have eleven fields",
-        ));
-    }
-    let actor = MetadataTransferStagingNodeIdentity::new(
-        NodeId::new(parse_u32(
-            line,
-            fields[0],
-            "staging checkpoint anchor node",
-        )?),
-        parse_u64(line, fields[1], "staging checkpoint anchor incarnation")?,
-        String::from_utf8(hex_decode(line, fields[2])?)
-            .map_err(|_| parse_error(line, "staging checkpoint anchor endpoint is not UTF-8"))?,
-    )
-    .map_err(|error| parse_error(line, &error.to_string()))?;
-    Ok(MetadataTransferStagingEvidenceCheckpointAnchor {
-        actor,
-        first_generation: parse_u64(
-            line,
-            fields[3],
-            "staging checkpoint anchor first generation",
-        )?,
-        last_generation: parse_u64(line, fields[4], "staging checkpoint anchor last generation")?,
-        previous_generation: parse_u64(
-            line,
-            fields[5],
-            "staging checkpoint anchor previous generation",
-        )?,
-        previous_apply_receipt_digest: hex_decode(line, fields[6])?.try_into().map_err(|_| {
-            parse_error(
-                line,
-                "staging checkpoint anchor previous receipt digest must contain 32 bytes",
-            )
-        })?,
-        tip_apply_receipt: hex_decode(line, fields[7])?,
-        source_segment_digest: hex_decode(line, fields[8])?.try_into().map_err(|_| {
-            parse_error(
-                line,
-                "staging checkpoint anchor source segment digest must contain 32 bytes",
-            )
-        })?,
-        source_segment_count: parse_u64(
-            line,
-            fields[9],
-            "staging checkpoint anchor source segment count",
-        )?,
-        source_segments_digest: hex_decode(line, fields[10])?.try_into().map_err(|_| {
-            parse_error(
-                line,
-                "staging checkpoint anchor source segments digest must contain 32 bytes",
-            )
-        })?,
-    })
-}
-
-fn format_metadata_transfer_staging_evidence_checkpoint_segment(
-    segment: &MetadataTransferStagingEvidenceCheckpointSegment,
-) -> String {
-    let mut fields = vec![
-        segment.actor.node_id().as_u32().to_string(),
-        segment.actor.node_incarnation().to_string(),
-        hex_encode(segment.actor.endpoint().as_bytes()),
-        segment.first_generation.to_string(),
-        segment.last_generation.to_string(),
-        segment.previous_generation.to_string(),
-        hex_encode(&segment.previous_apply_receipt_digest),
-        hex_encode(&segment.tip_apply_receipt),
-        segment.page_links.len().to_string(),
-    ];
-    for link in &segment.page_links {
-        fields.extend([
-            hex_encode(&link.page_digest),
-            hex_encode(&link.previous_apply_receipt_digest),
-            hex_encode(&link.apply_receipt_digest),
-            link.actor_closure_candidate.as_ref().map_or_else(
-                || "-".to_owned(),
-                |candidate| {
-                    hex_encode(
-                        &crate::pg_store::encode_staging_evidence_actor_closure_candidate_bytes(
-                            candidate,
-                        )
-                        .expect("retained actor-closure candidate is validated before encoding"),
-                    )
-                },
-            ),
-            link.entries.len().to_string(),
-        ]);
-        for entry in &link.entries {
-            fields.extend([
-                entry.sequence.to_string(),
-                entry.evidence_key.pg_id.get().to_string(),
-                entry.evidence_key.staging_generation.to_string(),
-                entry.evidence_key.actor_node_id.as_u32().to_string(),
-                entry.evidence_key.actor_node_incarnation.to_string(),
-                (entry.evidence_key.kind as u8).to_string(),
-                entry
-                    .evidence_key
-                    .target_epoch
-                    .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string()),
-            ]);
-        }
-    }
-    fields.push(segment.commitments.len().to_string());
-    for (key, digest) in &segment.commitments {
-        fields.extend([
-            key.pg_id.get().to_string(),
-            key.staging_generation.to_string(),
-            key.actor_node_id.as_u32().to_string(),
-            key.actor_node_incarnation.to_string(),
-            (key.kind as u8).to_string(),
-            key.target_epoch
-                .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string()),
-            hex_encode(digest),
-        ]);
-    }
-    fields.join(",")
-}
-
-fn parse_metadata_transfer_staging_evidence_checkpoint_segment(
-    line: usize,
-    value: &str,
-) -> Result<MetadataTransferStagingEvidenceCheckpointSegment, ControlPlaneError> {
-    const HEADER_FIELDS: usize = 9;
-    const PAGE_LINK_FIELDS: usize = 5;
-    const PAGE_ENTRY_FIELDS: usize = 7;
-    const COMMITMENT_FIELDS: usize = 7;
-
-    let fields = value.split(',').collect::<Vec<_>>();
-    if fields.len() < HEADER_FIELDS {
-        return Err(parse_error(
-            line,
-            "metadata-transfer staging checkpoint has too few fields",
-        ));
-    }
-    let page_link_count = usize::try_from(parse_u64(
-        line,
-        fields[8],
-        "staging checkpoint page-link count",
-    )?)
-    .map_err(|_| {
-        parse_error(
-            line,
-            "staging checkpoint page-link count does not fit usize",
-        )
-    })?;
-    if page_link_count == 0
-        || page_link_count > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_PAGES
-    {
-        return Err(parse_error(
-            line,
-            "metadata-transfer staging checkpoint has an invalid page-link count",
-        ));
-    }
-    let endpoint_bytes = hex_decode(line, fields[2])?;
-    let endpoint = String::from_utf8(endpoint_bytes)
-        .map_err(|_| parse_error(line, "staging checkpoint endpoint is not UTF-8"))?;
-    let actor = crate::pg_store::MetadataTransferStagingNodeIdentity::new(
-        NodeId::new(parse_u32(line, fields[0], "staging checkpoint actor node")?),
-        parse_u64(line, fields[1], "staging checkpoint actor incarnation")?,
-        endpoint,
-    )
-    .map_err(|error| parse_error(line, &error.to_string()))?;
-    let first_generation = parse_u64(line, fields[3], "staging checkpoint first generation")?;
-    let last_generation = parse_u64(line, fields[4], "staging checkpoint last generation")?;
-    let previous_generation = parse_u64(line, fields[5], "staging checkpoint previous generation")?;
-    let previous_apply_receipt_digest = hex_decode(line, fields[6])?.try_into().map_err(|_| {
-        parse_error(
-            line,
-            "staging checkpoint previous receipt digest must contain 32 bytes",
-        )
-    })?;
-    let tip_apply_receipt = hex_decode(line, fields[7])?;
-    let parse_evidence_key = |offset: usize| {
-        let kind = match parse_u16(line, fields[offset + 4], "staging evidence kind")? {
-            0 => crate::pg_store::MetadataTransferStagingEvidenceKind::Publication,
-            1 => crate::pg_store::MetadataTransferStagingEvidenceKind::Tombstone,
-            _ => {
-                return Err(parse_error(
-                    line,
-                    "invalid staging checkpoint evidence kind",
-                ))
-            }
-        };
-        let target_epoch = if fields[offset + 5] == "-" {
-            None
-        } else {
-            Some(parse_required_cluster_epoch(
-                line,
-                fields[offset + 5],
-                "staging checkpoint target epoch",
-            )?)
-        };
-        Ok(MetadataTransferStagingEvidenceKey {
-            pg_id: PgId::new(parse_u32(line, fields[offset], "staging checkpoint PG")?),
-            staging_generation: parse_u64(
-                line,
-                fields[offset + 1],
-                "staging checkpoint generation",
-            )?,
-            actor_node_id: NodeId::new(parse_u32(
-                line,
-                fields[offset + 2],
-                "staging checkpoint evidence actor",
-            )?),
-            actor_node_incarnation: parse_u64(
-                line,
-                fields[offset + 3],
-                "staging checkpoint evidence incarnation",
-            )?,
-            kind,
-            target_epoch,
-        })
-    };
-    let mut page_links = Vec::with_capacity(page_link_count);
-    let mut cursor = HEADER_FIELDS;
-    for _ in 0..page_link_count {
-        let link_end = cursor.checked_add(PAGE_LINK_FIELDS).ok_or_else(|| {
-            parse_error(line, "staging checkpoint page-link field count overflow")
-        })?;
-        if link_end > fields.len() {
-            return Err(parse_error(
-                line,
-                "staging checkpoint page-link fields are truncated",
-            ));
-        }
-        let decode_digest = |value: &str, field| {
-            hex_decode(line, value)?.try_into().map_err(|_| {
-                parse_error(
-                    line,
-                    &format!("staging checkpoint {field} must contain 32 bytes"),
-                )
-            })
-        };
-        let entry_count = usize::try_from(parse_u64(
-            line,
-            fields[cursor + 4],
-            "staging checkpoint page-entry count",
-        )?)
-        .map_err(|_| {
-            parse_error(
-                line,
-                "staging checkpoint page-entry count does not fit usize",
-            )
-        })?;
-        if entry_count == 0 || entry_count > crate::pg_store::MAX_STAGING_EVIDENCE_PAGE_ENTRIES {
-            return Err(parse_error(
-                line,
-                "staging checkpoint page-entry count is invalid",
-            ));
-        }
-        let page_digest = decode_digest(fields[cursor], "page digest")?;
-        let previous_apply_receipt_digest =
-            decode_digest(fields[cursor + 1], "page predecessor receipt digest")?;
-        let apply_receipt_digest = decode_digest(fields[cursor + 2], "page apply receipt digest")?;
-        let actor_closure_candidate = if fields[cursor + 3] == "-" {
-            None
-        } else {
-            Some(
-                crate::pg_store::decode_staging_evidence_actor_closure_candidate_bytes(
-                    &hex_decode(line, fields[cursor + 3])?,
-                )
-                .map_err(|error| parse_error(line, &error.to_string()))?,
-            )
-        };
-        cursor = link_end;
-        let entries_end = cursor
-            .checked_add(entry_count.checked_mul(PAGE_ENTRY_FIELDS).ok_or_else(|| {
-                parse_error(line, "staging checkpoint page-entry field count overflow")
-            })?)
-            .ok_or_else(|| parse_error(line, "staging checkpoint field count overflow"))?;
-        if entries_end > fields.len() {
-            return Err(parse_error(
-                line,
-                "staging checkpoint page-entry fields are truncated",
-            ));
-        }
-        let mut entries = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            entries.push(MetadataTransferStagingEvidenceCheckpointPageEntry {
-                sequence: parse_u64(line, fields[cursor], "staging checkpoint page sequence")?,
-                evidence_key: parse_evidence_key(cursor + 1)?,
-            });
-            cursor += PAGE_ENTRY_FIELDS;
-        }
-        page_links.push(MetadataTransferStagingEvidenceCheckpointPageLink {
-            page_digest,
-            previous_apply_receipt_digest,
-            apply_receipt_digest,
-            actor_closure_candidate,
-            entries,
-        });
-    }
-    let commitment_count = fields
-        .get(cursor)
-        .ok_or_else(|| parse_error(line, "staging checkpoint commitment count is missing"))?;
-    let commitment_count = usize::try_from(parse_u64(
-        line,
-        commitment_count,
-        "staging checkpoint commitment count",
-    )?)
-    .map_err(|_| {
-        parse_error(
-            line,
-            "staging checkpoint commitment count does not fit usize",
-        )
-    })?;
-    if commitment_count == 0
-        || commitment_count > MAX_METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_COMMITMENTS
-    {
-        return Err(parse_error(
-            line,
-            "metadata-transfer staging checkpoint has an invalid commitment count",
-        ));
-    }
-    cursor += 1;
-    let expected_fields = cursor
-        .checked_add(
-            commitment_count
-                .checked_mul(COMMITMENT_FIELDS)
-                .ok_or_else(|| {
-                    parse_error(line, "staging checkpoint commitment field count overflow")
-                })?,
-        )
-        .ok_or_else(|| parse_error(line, "staging checkpoint field count overflow"))?;
-    if fields.len() != expected_fields {
-        return Err(parse_error(
-            line,
-            "metadata-transfer staging checkpoint field count does not match its commitments",
-        ));
-    }
-    let mut commitments = BTreeMap::new();
-    for index in 0..commitment_count {
-        let offset = cursor + index * COMMITMENT_FIELDS;
-        let key = parse_evidence_key(offset)?;
-        let digest = hex_decode(line, fields[offset + 6])?
-            .try_into()
-            .map_err(|_| {
-                parse_error(
-                    line,
-                    "staging checkpoint evidence digest must contain 32 bytes",
-                )
-            })?;
-        if commitments.insert(key, digest).is_some() {
-            return Err(parse_error(
-                line,
-                "duplicate staging checkpoint evidence commitment",
-            ));
-        }
-    }
-    Ok(MetadataTransferStagingEvidenceCheckpointSegment {
-        actor,
-        first_generation,
-        last_generation,
-        previous_generation,
-        previous_apply_receipt_digest,
-        page_links,
-        tip_apply_receipt,
-        commitments,
-    })
 }
 
 fn format_unavailable_node_observation(observation: &NodeUnavailableObservation) -> String {
@@ -19217,41 +9726,11 @@ fn format_unavailable_node_observation(observation: &NodeUnavailableObservation)
     )
 }
 
-fn format_unavailable_pg_outage_resolution_intent(
-    intent: &UnavailablePgOutageResolutionIntent,
-) -> String {
-    let request = &intent.request;
-    let members = intent
-        .batch_member_pg_ids
-        .iter()
-        .map(|pg_id| pg_id.get().to_string())
-        .collect::<Vec<_>>()
-        .join(":");
-    format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        request.pg_id.get(),
-        request.source_epoch.get(),
-        hex_encode(format_historical_pg_route_record(&request.source_route).as_bytes()),
-        hex_encode(format_unavailable_node_observation(&request.unavailable_node).as_bytes()),
-        request.topology_generation,
-        hex_encode(&request.topology_digest),
-        request.command_epoch.get(),
-        request.command_log_index,
-        request.artifact_length,
-        hex_encode(&request.artifact_digest),
-        request.lease_grant_not_after_ms,
-        request.fence_cutoff_ms,
-        intent.committed_epoch.get(),
-        members,
-        hex_encode(&intent.batch_members_digest)
-    )
-}
-
 fn format_unavailable_pg_placement_transition(
     transition: &UnavailablePgPlacementTransition,
 ) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         transition.pg_id.get(),
         transition.transition_epoch.get(),
         option_u64(
@@ -19280,113 +9759,7 @@ fn format_unavailable_pg_placement_transition(
             || "-".to_string(),
             |route| hex_encode(format_historical_pg_route_record(route).as_bytes())
         ),
-        format_unavailable_pg_payload_readiness(transition.payload_readiness.as_ref()),
-        transition.completion.as_ref().map_or_else(
-            || "-".to_string(),
-            |completion| hex_encode(format_ready_pg_peering_completion(completion).as_bytes())
-        ),
-        hex_encode(
-            format_unavailable_pg_transition_batch_receipt(&transition.begin_batch_receipt)
-                .as_bytes()
-        ),
-        transition.staging_authorization.as_ref().map_or_else(
-            || "-".to_string(),
-            |authorization| hex_encode(
-                format_unavailable_pg_staging_authorization(authorization).as_bytes()
-            )
-        ),
-        transition.destination_install.as_ref().map_or_else(
-            || "-".to_string(),
-            |install| hex_encode(format_unavailable_pg_destination_install(install).as_bytes())
-        ),
-        transition.completion_batch_receipt.as_ref().map_or_else(
-            || "-".to_string(),
-            |receipt| hex_encode(
-                format_unavailable_pg_transition_batch_receipt(receipt).as_bytes()
-            )
-        )
-    )
-}
-
-fn format_unavailable_pg_destination_install(install: &UnavailablePgDestinationInstall) -> String {
-    let source = install.transfer.source_metadata_proof();
-    let imported = install.transfer.metadata_proof();
-    let publications = install
-        .publications
-        .iter()
-        .map(|publication| {
-            format!(
-                "{}:{}:{}:{}",
-                publication.node_id.as_u32(),
-                publication.node_incarnation,
-                hex_encode(publication.endpoint.as_bytes()),
-                hex_encode(&publication.evidence_digest)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(";");
-    format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        install.transfer.source_epoch().get(),
-        source.applied_log_index,
-        source.applied_log_hash.encoding_version(),
-        source.applied_log_hash.value(),
-        source.state_digest.encoding_version(),
-        source.state_digest.value(),
-        imported.applied_log_index,
-        imported.applied_log_hash.encoding_version(),
-        imported.applied_log_hash.value(),
-        imported.state_digest.encoding_version(),
-        imported.state_digest.value(),
-        publications,
-        hex_encode(
-            format_unavailable_pg_transition_batch_receipt(&install.batch_receipt).as_bytes()
-        )
-    )
-}
-
-fn format_unavailable_pg_staging_authorization(
-    authorization: &UnavailablePgStagingIntentAuthorization,
-) -> String {
-    format!(
-        "{},{},{},{},{},{}",
-        authorization.staging_generation,
-        authorization.artifact_target_epoch.get(),
-        hex_encode(&authorization.artifact_digest),
-        authorization.artifact_length,
-        authorization.artifact_format_version,
-        hex_encode(
-            format_unavailable_pg_transition_batch_receipt(&authorization.batch_receipt).as_bytes()
-        )
-    )
-}
-
-fn format_ready_pg_peering_completion(completion: &ReadyPgPeeringCompletion) -> String {
-    let proof = completion.active_metadata_proof;
-    format!(
-        "{},{},{},{},{},{},{},{},{}",
-        completion.pg_id.get(),
-        completion.primary.as_u32(),
-        completion.node_incarnation,
-        proof.applied_log_index,
-        proof.applied_log_hash.encoding_version(),
-        proof.applied_log_hash.value(),
-        proof.state_digest.encoding_version(),
-        proof.state_digest.value(),
-        completion.active_metadata_proof_epoch.get(),
-    )
-}
-
-fn format_unavailable_pg_transition_batch_receipt(
-    receipt: &UnavailablePgTransitionBatchReceipt,
-) -> String {
-    format!(
-        "{},{},{},{},{}",
-        receipt.identity.stage.as_str(),
-        receipt.source_epoch.get(),
-        receipt.target_epoch.get(),
-        format_pg_list(&receipt.identity.member_pg_ids),
-        hex_encode(&receipt.identity.members_digest)
+        format_unavailable_pg_payload_readiness(transition.payload_readiness.as_ref())
     )
 }
 
@@ -19745,7 +10118,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         ),
     };
     format!(
-        concat!("{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}", ",{}"),
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
@@ -19819,7 +10192,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
 
 fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> String {
     format!(
-        concat!("{},{},{},{},{},{},{},{},{},{},{},{},{}", ",{}"),
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         node_id.as_u32(),
         record.pg_id.get(),
         pg_state_as_str(record.state),
@@ -19908,17 +10281,6 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut unavailable_node_observations = BTreeMap::new();
     let mut unavailable_pg_placement_transitions = BTreeMap::new();
     let mut retained_unavailable_pg_placement_transitions = BTreeMap::new();
-    let mut outage_command_artifacts = BTreeMap::new();
-    let mut outage_command_artifact_retirements = BTreeMap::new();
-    let mut outage_resolution_intents = BTreeMap::new();
-    let mut outage_command_artifact_reserved_bytes = 0usize;
-    let mut metadata_transfer_staging_evidence_pages = BTreeMap::new();
-    let mut metadata_transfer_staging_evidence_checkpoint_segments = BTreeMap::new();
-    let mut metadata_transfer_staging_evidence_checkpoint_anchors = BTreeMap::new();
-    let mut metadata_transfer_staging_actor_closures = BTreeMap::new();
-    let mut metadata_transfer_staging_retired_actor_closures = BTreeMap::new();
-    let mut metadata_transfer_staging_finalized_floors = BTreeMap::new();
-    let mut metadata_transfer_staging_evidence = BTreeMap::new();
     let mut pg_lines = BTreeMap::new();
     let mut node_pg_lines = BTreeMap::<(NodeId, PgId), usize>::new();
     let mut history = BTreeMap::<ClusterEpoch, ParsedHistoryRecord>::new();
@@ -20117,323 +10479,6 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                     "duplicate retained unavailable PG placement transition",
                 ));
             }
-        } else if let Some(value) = line.strip_prefix("outage_command_artifact_page=") {
-            let fields: Vec<_> = value.split(',').collect();
-            if fields.len() != 8 {
-                return Err(parse_error(
-                    line_number,
-                    "outage artifact page must have eight fields",
-                ));
-            }
-            if fields[7].len() > OUTAGE_COMMAND_ARTIFACT_PAGE_BYTES * 2 {
-                return Err(parse_error(
-                    line_number,
-                    "outage artifact page exceeds the byte bound",
-                ));
-            }
-            if fields[5].len() != 64 {
-                return Err(parse_error(
-                    line_number,
-                    "outage artifact digest must contain 32 bytes",
-                ));
-            }
-            let pg_id = PgId::new(parse_u32(line_number, fields[0], "outage artifact PG")?);
-            let source_epoch = ClusterEpoch::new(parse_u64(
-                line_number,
-                fields[1],
-                "outage artifact source epoch",
-            )?)
-            .ok_or_else(|| parse_error(line_number, "outage artifact source epoch is zero"))?;
-            let command_epoch = ClusterEpoch::new(parse_u64(
-                line_number,
-                fields[2],
-                "outage artifact command epoch",
-            )?)
-            .ok_or_else(|| parse_error(line_number, "outage artifact command epoch is zero"))?;
-            let log_index = crate::metadata_command::MetadataCommandLogIndex::new(parse_u64(
-                line_number,
-                fields[3],
-                "outage artifact command index",
-            )?)
-            .ok_or_else(|| parse_error(line_number, "outage artifact command index is zero"))?;
-            let digest = hex_decode(line_number, fields[5])?
-                .try_into()
-                .map_err(|_| {
-                    parse_error(line_number, "outage artifact digest must contain 32 bytes")
-                })?;
-            let page = OutageCommandArtifactPage {
-                pg_id,
-                source_epoch,
-                command_id: crate::metadata_command::MetadataCommandId::new(
-                    command_epoch,
-                    pg_id,
-                    log_index,
-                ),
-                total_length: parse_u32(line_number, fields[4], "outage artifact length")?,
-                digest,
-                page_index: parse_u16(line_number, fields[6], "outage artifact page index")?,
-                bytes: hex_decode(line_number, fields[7])?,
-            };
-            page.validate()
-                .map_err(|message| parse_error(line_number, &message))?;
-            let key = page.key();
-            if let Some(existing) = outage_command_artifacts.get_mut(&key) {
-                let record: &mut OutageCommandArtifactRecord = Arc::make_mut(existing);
-                if page.page_index as usize != record.pages.len() {
-                    return Err(parse_error(
-                        line_number,
-                        "outage artifact pages are not canonical and contiguous",
-                    ));
-                }
-                record
-                    .append(&page)
-                    .map_err(|message| parse_error(line_number, &message))?;
-            } else {
-                if outage_command_artifacts.len() >= MAX_RETAINED_OUTAGE_COMMAND_ARTIFACTS {
-                    return Err(parse_error(
-                        line_number,
-                        "too many retained outage artifacts",
-                    ));
-                }
-                let record = OutageCommandArtifactRecord::from_first_page(&page)
-                    .map_err(|message| parse_error(line_number, &message))?;
-                outage_command_artifact_reserved_bytes = outage_command_artifact_reserved_bytes
-                    .checked_add(record.reserved_bytes())
-                    .ok_or_else(|| {
-                        parse_error(line_number, "outage artifact reserved-byte count overflows")
-                    })?;
-                if outage_command_artifact_reserved_bytes
-                    > MAX_RETAINED_OUTAGE_COMMAND_ARTIFACT_BYTES
-                {
-                    return Err(parse_error(
-                        line_number,
-                        "outage artifact reservations exceed the byte budget",
-                    ));
-                }
-                outage_command_artifacts.insert(key, Arc::new(record));
-            }
-        } else if let Some(value) = line.strip_prefix("outage_command_artifact_retirement=") {
-            let fields = value.split(',').collect::<Vec<_>>();
-            if fields.len() != 6 {
-                return Err(parse_error(
-                    line_number,
-                    "outage artifact retirement must have six fields",
-                ));
-            }
-            let pg_id = PgId::new(parse_u32(
-                line_number,
-                fields[0],
-                "outage artifact retirement PG",
-            )?);
-            let source_epoch = ClusterEpoch::new(parse_u64(
-                line_number,
-                fields[1],
-                "outage artifact retirement source epoch",
-            )?)
-            .ok_or_else(|| parse_error(line_number, "outage artifact source epoch is zero"))?;
-            let command_epoch = ClusterEpoch::new(parse_u64(
-                line_number,
-                fields[2],
-                "outage artifact retirement command epoch",
-            )?)
-            .ok_or_else(|| parse_error(line_number, "outage artifact command epoch is zero"))?;
-            let command_index = crate::metadata_command::MetadataCommandLogIndex::new(parse_u64(
-                line_number,
-                fields[3],
-                "outage artifact retirement command index",
-            )?)
-            .ok_or_else(|| parse_error(line_number, "outage artifact command index is zero"))?;
-            let retirement = OutageCommandArtifactRetirement {
-                pg_id,
-                source_epoch,
-                command_id: crate::metadata_command::MetadataCommandId::new(
-                    command_epoch,
-                    pg_id,
-                    command_index,
-                ),
-                total_length: parse_u32(
-                    line_number,
-                    fields[4],
-                    "outage artifact retirement length",
-                )?,
-                digest: hex_decode(line_number, fields[5])?
-                    .try_into()
-                    .map_err(|_| {
-                        parse_error(line_number, "outage artifact digest must be 32 bytes")
-                    })?,
-            };
-            if outage_command_artifact_retirements
-                .insert(retirement.key(), retirement)
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate outage artifact retirement",
-                ));
-            }
-        } else if let Some(value) = line.strip_prefix("outage_resolution_intent=") {
-            let intent = parse_unavailable_pg_outage_resolution_intent(line_number, value)?;
-            if outage_resolution_intents
-                .insert(intent.pg_id(), intent)
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate outage-resolution intent",
-                ));
-            }
-        } else if let Some(value) = line.strip_prefix("metadata_transfer_staging_evidence_page=") {
-            let fields: Vec<_> = value.split(',').collect();
-            if fields.len() != 3 {
-                return Err(parse_error(
-                    line_number,
-                    "metadata-transfer staging evidence page must have three fields",
-                ));
-            }
-            let operation_payload = hex_decode(line_number, fields[0])?;
-            let page_digest = hex_decode(line_number, fields[1])?
-                .try_into()
-                .map_err(|_| {
-                    parse_error(
-                        line_number,
-                        "metadata-transfer staging page digest must contain 32 bytes",
-                    )
-                })?;
-            let apply_receipt = hex_decode(line_number, fields[2])?;
-            let page = crate::pg_store::decode_staging_evidence_page_payload(
-                &operation_payload,
-                page_digest,
-            )
-            .map_err(|error| parse_error(line_number, &error.to_string()))?;
-            let key = (
-                page.actor().node_id(),
-                page.actor().node_incarnation(),
-                page.generation(),
-            );
-            if metadata_transfer_staging_evidence_pages
-                .insert(
-                    key,
-                    MetadataTransferStagingEvidencePageRecord {
-                        operation_payload,
-                        page_digest,
-                        apply_receipt,
-                    },
-                )
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate metadata-transfer staging evidence page actor",
-                ));
-            }
-        } else if let Some(value) =
-            line.strip_prefix("metadata_transfer_staging_evidence_checkpoint=")
-        {
-            let segment =
-                parse_metadata_transfer_staging_evidence_checkpoint_segment(line_number, value)?;
-            let key = (
-                segment.actor.node_id(),
-                segment.actor.node_incarnation(),
-                segment.first_generation,
-            );
-            if metadata_transfer_staging_evidence_checkpoint_segments
-                .insert(key, segment)
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate metadata-transfer staging evidence checkpoint segment",
-                ));
-            }
-        } else if let Some(value) = line
-            .strip_prefix(METADATA_TRANSFER_STAGING_EVIDENCE_CHECKPOINT_ANCHOR_STATE_RECORD_PREFIX)
-        {
-            let anchor =
-                parse_metadata_transfer_staging_evidence_checkpoint_anchor(line_number, value)?;
-            let key = (
-                anchor.actor.node_id(),
-                anchor.actor.node_incarnation(),
-                anchor.first_generation,
-            );
-            if metadata_transfer_staging_evidence_checkpoint_anchors
-                .insert(key, anchor)
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate metadata-transfer staging evidence checkpoint anchor",
-                ));
-            }
-        } else if let Some(value) =
-            line.strip_prefix(METADATA_TRANSFER_STAGING_RETIRED_ACTOR_CLOSURE_STATE_RECORD_PREFIX)
-        {
-            let closure = parse_metadata_transfer_staging_actor_closure(line_number, value)?;
-            let key = (
-                closure.source_actor.node_id(),
-                closure.source_actor.node_incarnation(),
-            );
-            if metadata_transfer_staging_retired_actor_closures
-                .insert(key, closure)
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate metadata-transfer staging retired actor closure",
-                ));
-            }
-        } else if let Some(value) =
-            line.strip_prefix(METADATA_TRANSFER_STAGING_ACTOR_CLOSURE_STATE_RECORD_PREFIX)
-        {
-            let closure = parse_metadata_transfer_staging_actor_closure(line_number, value)?;
-            let key = (
-                closure.source_actor.node_id(),
-                closure.source_actor.node_incarnation(),
-            );
-            if metadata_transfer_staging_actor_closures
-                .insert(key, closure)
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate metadata-transfer staging actor closure",
-                ));
-            }
-        } else if let Some(value) =
-            line.strip_prefix(METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_STATE_RECORD_PREFIX)
-        {
-            let floor = parse_metadata_transfer_staging_finalized_floor(line_number, value)?;
-            let pg_id = floor.transition.pg_id();
-            let staging_generation = floor.staging_generation;
-            if metadata_transfer_staging_finalized_floors
-                .insert((pg_id, staging_generation), floor)
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate metadata-transfer staging finalized floor",
-                ));
-            }
-        } else if let Some(value) = line.strip_prefix("metadata_transfer_staging_evidence=") {
-            let bytes = hex_decode(line_number, value)?;
-            let evidence = crate::pg_store::decode_staging_evidence(&bytes)
-                .map_err(|error| parse_error(line_number, &error.to_string()))?;
-            let key = MetadataTransferStagingEvidenceKey {
-                pg_id: evidence.intent().pg_id(),
-                staging_generation: evidence.intent().staging_generation(),
-                actor_node_id: evidence.actor().node_id(),
-                actor_node_incarnation: evidence.actor().node_incarnation(),
-                kind: evidence.kind(),
-                target_epoch: evidence.target_epoch(),
-            };
-            if metadata_transfer_staging_evidence
-                .insert(key, bytes)
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate metadata-transfer staging evidence identity",
-                ));
-            }
         } else if let Some(value) = line.strip_prefix("pg=") {
             version.ok_or_else(|| parse_error(line_number, "version must precede PG records"))?;
             let record = parse_pg_record(line_number, value)?;
@@ -20460,7 +10505,6 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     }
     let cluster_epoch = cluster_epoch.ok_or_else(|| parse_error(0, "missing cluster epoch"))?;
     validate_current_pgs(&pgs, &pg_lines, &nodes, cluster_epoch)?;
-    validate_current_pg_observations(&nodes, &node_pg_lines, &pgs, cluster_epoch)?;
     validate_parsed_history(&history, cluster_epoch)?;
     let mut history: Vec<ClusterMapHistoryRecord> =
         history.into_values().map(|record| record.record).collect();
@@ -20470,7 +10514,6 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         unavailable_pg_placement_transitions
             .values()
             .chain(retained_unavailable_pg_placement_transitions.values()),
-        outage_resolution_intents.values(),
     );
     prune_cluster_map_history(&mut history, &protection, cluster_epoch);
     validate_metadata_transfer_route_references(
@@ -20503,20 +10546,11 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         unavailable_node_observations,
         unavailable_pg_placement_transitions,
         retained_unavailable_pg_placement_transitions,
-        outage_command_artifacts,
-        outage_command_artifact_retirements,
-        outage_resolution_intents,
-        metadata_transfer_staging_evidence_pages,
-        metadata_transfer_staging_evidence_checkpoint_segments,
-        metadata_transfer_staging_evidence_checkpoint_anchors,
-        metadata_transfer_staging_actor_closures,
-        metadata_transfer_staging_retired_actor_closures,
-        metadata_transfer_staging_finalized_floors,
-        metadata_transfer_staging_evidence,
         max_committed_timestamp_ms,
         lease_grant_horizon,
         history,
     };
+    validate_current_pg_observations(&snapshot, &node_pg_lines)?;
     if format_snapshot(&snapshot) != contents {
         return Err(parse_error(
             0,
@@ -20690,47 +10724,53 @@ fn validate_current_pgs(
 }
 
 fn validate_current_pg_observations(
-    nodes: &BTreeMap<NodeId, NodeControlRecord>,
+    snapshot: &ClusterControlSnapshot,
     node_pg_lines: &BTreeMap<(NodeId, PgId), usize>,
-    pgs: &BTreeMap<PgId, PgControlRecord>,
-    current_epoch: ClusterEpoch,
 ) -> Result<(), ControlPlaneError> {
-    for node in nodes.values() {
+    for node in snapshot.nodes.values() {
         for observation in node.pg_observations.values() {
             let line = node_pg_lines
                 .get(&(node.node_id, observation.pg_id))
                 .copied()
                 .unwrap_or(0);
-            if observation.observed_epoch != current_epoch {
+            if observation.observed_epoch != snapshot.cluster_epoch {
                 return Err(parse_error(
                     line,
                     "node PG observation epoch must match current cluster epoch",
                 ));
             }
-            let pg = pgs
+            let pg = snapshot
+                .pgs
                 .get(&observation.pg_id)
                 .ok_or_else(|| parse_error(line, "node PG observation references unknown PG"))?;
-            if !pg.acting_set.contains(&node.node_id)
-                && observation.pending_metadata_command().is_none()
-            {
+            let current_actor = pg.acting_set.contains(&node.node_id);
+            if !current_actor && observation.pending_metadata_command().is_none() {
                 return Err(parse_error(
                     line,
                     "node PG observation references PG outside node acting set",
                 ));
             }
+            if let Some(pending) = observation.pending_metadata_command() {
+                validate_pending_metadata_command_reporter(
+                    snapshot,
+                    observation.pg_id,
+                    node.node_id,
+                    pending,
+                )
+                .map_err(|error| parse_error(line, &error.to_string()))?;
+                if (!current_actor || pending.cluster_epoch() != snapshot.cluster_epoch)
+                    && (pg.state != PgState::Peering || observation.state != PgState::Peering)
+                {
+                    return Err(parse_error(
+                        line,
+                        "historical pending PG observation must retain a Peering fence",
+                    ));
+                }
+            }
             if pg.state == PgState::Active
                 && pg.active_primary == Some(node.node_id)
                 && observation.state == PgState::Active
             {
-                if observation
-                    .pending_metadata_command()
-                    .is_some_and(|pending| pending.cluster_epoch() != current_epoch)
-                {
-                    return Err(parse_error(
-                        line,
-                        "active node PG observation has a non-current pending metadata command",
-                    ));
-                }
                 let Some(expected) = pg.active_metadata_proof else {
                     return Err(parse_error(line, "active PG is missing metadata proof"));
                 };
@@ -21269,7 +11309,8 @@ fn parse_node_pg_record(
         parse_option_cluster_epoch(line, fields[10], "pending command cluster epoch")?;
     let pending_log_index = parse_option_u64(line, fields[11], "pending command log index")?;
     let pending_command_checksum = parse_option_u64(line, fields[12], "pending command checksum")?;
-    let metadata_log_epoch = parse_required_cluster_epoch(line, fields[13], "metadata log epoch")?;
+    let metadata_log_epoch = ClusterEpoch::new(parse_u64(line, fields[13], "metadata log epoch")?)
+        .ok_or_else(|| parse_error(line, "metadata log epoch must be nonzero"))?;
     let pending_metadata_command = match (
         pending_cluster_epoch,
         pending_log_index,
@@ -21367,99 +11408,15 @@ fn parse_unavailable_node_observation(
     })
 }
 
-fn parse_unavailable_pg_outage_resolution_intent(
-    line: usize,
-    value: &str,
-) -> Result<UnavailablePgOutageResolutionIntent, ControlPlaneError> {
-    let fields: Vec<_> = value.split(',').collect();
-    if fields.len() != 15 {
-        return Err(parse_error(
-            line,
-            "outage-resolution intent must have fifteen fields",
-        ));
-    }
-    let pg_id = PgId::new(parse_u32(line, fields[0], "outage-resolution PG")?);
-    let source_epoch = ClusterEpoch::new(parse_u64(
-        line,
-        fields[1],
-        "outage-resolution source epoch",
-    )?)
-    .ok_or_else(|| parse_error(line, "outage-resolution source epoch is zero"))?;
-    let source_route_encoded = String::from_utf8(hex_decode(line, fields[2])?)
-        .map_err(|_| parse_error(line, "outage-resolution source route is not UTF-8"))?;
-    let source_route = parse_historical_pg_route_record(line, &source_route_encoded)?;
-    let unavailable_encoded = String::from_utf8(hex_decode(line, fields[3])?)
-        .map_err(|_| parse_error(line, "outage-resolution observation is not UTF-8"))?;
-    let unavailable_node = parse_unavailable_node_observation(line, &unavailable_encoded)?;
-    let topology_digest = hex_decode(line, fields[5])?
-        .try_into()
-        .map_err(|_| parse_error(line, "outage-resolution topology digest must be 32 bytes"))?;
-    let command_epoch = ClusterEpoch::new(parse_u64(
-        line,
-        fields[6],
-        "outage-resolution command epoch",
-    )?)
-    .ok_or_else(|| parse_error(line, "outage-resolution command epoch is zero"))?;
-    let command_index = crate::metadata_command::MetadataCommandLogIndex::new(parse_u64(
-        line,
-        fields[7],
-        "outage-resolution command index",
-    )?)
-    .ok_or_else(|| parse_error(line, "outage-resolution command index is zero"))?;
-    let artifact_digest = hex_decode(line, fields[9])?
-        .try_into()
-        .map_err(|_| parse_error(line, "outage-resolution artifact digest must be 32 bytes"))?;
-    let committed_epoch = ClusterEpoch::new(parse_u64(
-        line,
-        fields[12],
-        "outage-resolution committed epoch",
-    )?)
-    .ok_or_else(|| parse_error(line, "outage-resolution committed epoch is zero"))?;
-    let batch_member_pg_ids = fields[13]
-        .split(':')
-        .map(|value| parse_u32(line, value, "outage-resolution batch member").map(PgId::new))
-        .collect::<Result<Vec<_>, _>>()?;
-    let batch_members_digest = hex_decode(line, fields[14])?
-        .try_into()
-        .map_err(|_| parse_error(line, "outage-resolution batch digest must be 32 bytes"))?;
-    Ok(UnavailablePgOutageResolutionIntent {
-        request: UnavailablePgOutageResolutionIntentRequest {
-            pg_id,
-            source_epoch,
-            source_route,
-            unavailable_node,
-            topology_generation: parse_u64(
-                line,
-                fields[4],
-                "outage-resolution topology generation",
-            )?,
-            topology_digest,
-            command_epoch,
-            command_log_index: command_index.get(),
-            artifact_length: parse_u32(line, fields[8], "outage-resolution artifact length")?,
-            artifact_digest,
-            lease_grant_not_after_ms: parse_u64(
-                line,
-                fields[10],
-                "outage-resolution lease horizon",
-            )?,
-            fence_cutoff_ms: parse_u64(line, fields[11], "outage-resolution fence cutoff")?,
-        },
-        committed_epoch,
-        batch_member_pg_ids,
-        batch_members_digest,
-    })
-}
-
 fn parse_unavailable_pg_placement_transition(
     line: usize,
     value: &str,
 ) -> Result<UnavailablePgPlacementTransition, ControlPlaneError> {
     let fields: Vec<_> = value.split(',').collect();
-    if fields.len() != 24 {
+    if fields.len() != 19 {
         return Err(parse_error(
             line,
-            "unavailable PG placement transition must have twenty-four fields",
+            "unavailable PG placement transition must have nineteen fields",
         ));
     }
     let topology_digest = hex_decode(line, fields[4])?
@@ -21512,200 +11469,6 @@ fn parse_unavailable_pg_placement_transition(
             Some(parse_historical_pg_route_record(line, &encoded)?)
         },
         payload_readiness: parse_unavailable_pg_payload_readiness(line, fields[18])?,
-        completion: parse_ready_pg_peering_completion(line, fields[19])?,
-        begin_batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[20])?,
-        staging_authorization: parse_unavailable_pg_staging_authorization(line, fields[21])?,
-        destination_install: parse_unavailable_pg_destination_install(line, fields[22])?,
-        completion_batch_receipt: if fields[23] == "-" {
-            None
-        } else {
-            Some(parse_unavailable_pg_transition_batch_receipt(
-                line, fields[23],
-            )?)
-        },
-    })
-}
-
-fn parse_unavailable_pg_destination_install(
-    line: usize,
-    value: &str,
-) -> Result<Option<UnavailablePgDestinationInstall>, ControlPlaneError> {
-    if value == "-" {
-        return Ok(None);
-    }
-    let encoded = String::from_utf8(hex_decode(line, value)?)
-        .map_err(|_| parse_error(line, "destination install evidence is not UTF-8"))?;
-    let fields = encoded.split(',').collect::<Vec<_>>();
-    if fields.len() != 13 {
-        return Err(parse_error(
-            line,
-            "destination install evidence must have thirteen fields",
-        ));
-    }
-    let source_metadata_proof = parse_optional_metadata_proof(
-        line,
-        &fields[1..6],
-        "destination install source metadata proof",
-    )?
-    .ok_or_else(|| parse_error(line, "destination install source proof is required"))?;
-    let imported_metadata_proof = parse_optional_metadata_proof(
-        line,
-        &fields[6..11],
-        "destination install imported metadata proof",
-    )?
-    .ok_or_else(|| parse_error(line, "destination install imported proof is required"))?;
-    let mut publications = Vec::new();
-    if !fields[11].is_empty() {
-        for publication in fields[11].split(';') {
-            let parts = publication.split(':').collect::<Vec<_>>();
-            if parts.len() != 4 {
-                return Err(parse_error(
-                    line,
-                    "destination install publication must have four fields",
-                ));
-            }
-            let endpoint = String::from_utf8(hex_decode(line, parts[2])?).map_err(|_| {
-                parse_error(
-                    line,
-                    "destination install publication endpoint is not UTF-8",
-                )
-            })?;
-            let evidence_digest = hex_decode(line, parts[3])?.try_into().map_err(|_| {
-                parse_error(
-                    line,
-                    "destination install publication digest must contain 32 bytes",
-                )
-            })?;
-            publications.push(UnavailablePgStagingPublicationBinding {
-                node_id: NodeId::new(parse_u32(
-                    line,
-                    parts[0],
-                    "destination install publication node",
-                )?),
-                node_incarnation: parse_u64(
-                    line,
-                    parts[1],
-                    "destination install publication incarnation",
-                )?,
-                endpoint,
-                evidence_digest,
-            });
-        }
-    }
-    Ok(Some(UnavailablePgDestinationInstall {
-        transfer: PgMetadataTransferProof::new_with_imported_metadata_proof(
-            parse_required_cluster_epoch(line, fields[0], "destination install source epoch")?,
-            source_metadata_proof,
-            imported_metadata_proof,
-        ),
-        publications,
-        batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[12])?,
-    }))
-}
-
-fn parse_unavailable_pg_staging_authorization(
-    line: usize,
-    value: &str,
-) -> Result<Option<UnavailablePgStagingIntentAuthorization>, ControlPlaneError> {
-    if value == "-" {
-        return Ok(None);
-    }
-    let encoded = String::from_utf8(hex_decode(line, value)?)
-        .map_err(|_| parse_error(line, "staging authorization is not UTF-8"))?;
-    let fields = encoded.split(',').collect::<Vec<_>>();
-    if fields.len() != 6 {
-        return Err(parse_error(
-            line,
-            "staging authorization must have six fields",
-        ));
-    }
-    let artifact_digest = hex_decode(line, fields[2])?
-        .try_into()
-        .map_err(|_| parse_error(line, "staging artifact digest must contain 32 bytes"))?;
-    Ok(Some(UnavailablePgStagingIntentAuthorization {
-        staging_generation: parse_u64(line, fields[0], "staging generation")?,
-        artifact_target_epoch: parse_required_cluster_epoch(
-            line,
-            fields[1],
-            "staging artifact target epoch",
-        )?,
-        artifact_digest,
-        artifact_length: parse_u64(line, fields[3], "staging artifact length")?,
-        artifact_format_version: parse_u16(line, fields[4], "staging artifact format version")?,
-        batch_receipt: parse_unavailable_pg_transition_batch_receipt(line, fields[5])?,
-    }))
-}
-
-fn parse_ready_pg_peering_completion(
-    line: usize,
-    value: &str,
-) -> Result<Option<ReadyPgPeeringCompletion>, ControlPlaneError> {
-    if value == "-" {
-        return Ok(None);
-    }
-    let encoded = String::from_utf8(hex_decode(line, value)?)
-        .map_err(|_| parse_error(line, "transition completion evidence is not UTF-8"))?;
-    let fields = encoded.split(',').collect::<Vec<_>>();
-    if fields.len() != 9 {
-        return Err(parse_error(
-            line,
-            "transition completion evidence must have nine fields",
-        ));
-    }
-    let active_metadata_proof =
-        parse_optional_metadata_proof(line, &fields[3..8], "transition completion metadata proof")?
-            .ok_or_else(|| parse_error(line, "transition completion metadata proof is required"))?;
-    Ok(Some(ReadyPgPeeringCompletion {
-        pg_id: PgId::new(parse_u32(line, fields[0], "transition completion PG id")?),
-        primary: NodeId::new(parse_u32(
-            line,
-            fields[1],
-            "transition completion primary node id",
-        )?),
-        node_incarnation: parse_u64(line, fields[2], "transition completion node incarnation")?,
-        active_metadata_proof,
-        active_metadata_proof_epoch: parse_required_cluster_epoch(
-            line,
-            fields[8],
-            "transition completion metadata proof epoch",
-        )?,
-    }))
-}
-
-fn parse_unavailable_pg_transition_batch_receipt(
-    line: usize,
-    value: &str,
-) -> Result<UnavailablePgTransitionBatchReceipt, ControlPlaneError> {
-    let encoded = String::from_utf8(hex_decode(line, value)?)
-        .map_err(|_| parse_error(line, "transition batch receipt is not UTF-8"))?;
-    let fields = encoded.split(',').collect::<Vec<_>>();
-    if fields.len() != 5 {
-        return Err(parse_error(
-            line,
-            "transition batch receipt must have five fields",
-        ));
-    }
-    let stage = UnavailablePgTransitionBatchStage::from_str(fields[0])
-        .map_err(|message| parse_error(line, &message))?;
-    let members_digest = hex_decode(line, fields[4])?
-        .try_into()
-        .map_err(|_| parse_error(line, "transition batch digest must contain 32 bytes"))?;
-    Ok(UnavailablePgTransitionBatchReceipt {
-        identity: UnavailablePgTransitionBatchReceiptIdentity {
-            stage,
-            member_pg_ids: parse_pg_list(line, fields[3])?,
-            members_digest,
-        },
-        source_epoch: parse_required_cluster_epoch(
-            line,
-            fields[1],
-            "transition batch source epoch",
-        )?,
-        target_epoch: parse_required_cluster_epoch(
-            line,
-            fields[2],
-            "transition batch target epoch",
-        )?,
     })
 }
 
@@ -21975,8 +11738,6 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
     )?;
     let active_metadata_proof_epoch =
         parse_option_cluster_epoch(line, fields[31], "active metadata proof epoch")?;
-    let active_metadata_log_epoch =
-        parse_option_cluster_epoch(line, fields[40], "active metadata log epoch")?;
     let peering_metadata_proof_floor_epoch =
         parse_option_cluster_epoch(line, fields[32], "peering metadata proof floor epoch")?;
     let peering_metadata_proof_floor_imported = parse_bool_u8(
@@ -22012,6 +11773,8 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         parse_bool_u8(line, fields[38], "previous primary reactivation preference")?;
     let metadata_transfer_fence_epoch =
         parse_option_cluster_epoch(line, fields[39], "metadata transfer fence epoch")?;
+    let active_metadata_log_epoch =
+        parse_option_cluster_epoch(line, fields[40], "active metadata log epoch")?;
     let previous_primary_lease = match (
         previous_primary_node_id,
         previous_primary_node_incarnation,
@@ -22680,6 +12443,14 @@ fn validate_pg_peering_completion(
         snapshot.cluster_epoch,
         completed_at_ms,
     )?;
+    if let Some(recovery) = snapshot.pending_metadata_command_recovery_for_pg(record)? {
+        return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+            pg_id: pg_id.get(),
+            node_id: recovery.reporting_node_id().as_u32(),
+            cluster_epoch: snapshot.cluster_epoch,
+            pending: recovery.pending(),
+        });
+    }
     if record.state == PgState::Active {
         if record.active_primary == Some(primary) {
             return Ok(ValidatedPgPeeringCompletion::AlreadyActive);
@@ -23420,7 +13191,6 @@ fn required_cluster_map_history_protection<'a, 'b>(
     pgs: impl IntoIterator<Item = &'a PgControlRecord>,
     nodes: impl IntoIterator<Item = &'b NodeControlRecord>,
     transitions: impl IntoIterator<Item = &'a UnavailablePgPlacementTransition>,
-    outage_intents: impl IntoIterator<Item = &'a UnavailablePgOutageResolutionIntent>,
 ) -> ClusterMapHistoryProtection {
     let mut exact_routes = BTreeSet::new();
     for pg in pgs {
@@ -23443,13 +13213,6 @@ fn required_cluster_map_history_protection<'a, 'b>(
         if let Some(destination_epoch) = transition.destination_epoch {
             exact_routes.insert((destination_epoch, transition.pg_id));
         }
-        if let Some(receipt) = &transition.completion_batch_receipt {
-            exact_routes.insert((receipt.source_epoch, transition.pg_id));
-            exact_routes.insert((receipt.target_epoch, transition.pg_id));
-        }
-    }
-    for intent in outage_intents {
-        exact_routes.insert((intent.request.source_epoch, intent.request.pg_id));
     }
     ClusterMapHistoryProtection { exact_routes }
 }
@@ -23686,13 +13449,6 @@ fn format_node_list(nodes: &[NodeId]) -> String {
         .join(":")
 }
 
-fn format_pg_list(pgs: &[PgId]) -> String {
-    pgs.iter()
-        .map(|pg_id| pg_id.get().to_string())
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 fn parse_node_list(line: usize, value: &str) -> Result<Vec<NodeId>, ControlPlaneError> {
     if value.is_empty() {
         return Ok(Vec::new());
@@ -23700,16 +13456,6 @@ fn parse_node_list(line: usize, value: &str) -> Result<Vec<NodeId>, ControlPlane
     value
         .split(':')
         .map(|value| parse_u32(line, value, "node id").map(NodeId::new))
-        .collect()
-}
-
-fn parse_pg_list(line: usize, value: &str) -> Result<Vec<PgId>, ControlPlaneError> {
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-    value
-        .split(':')
-        .map(|value| parse_u32(line, value, "PG id").map(PgId::new))
         .collect()
 }
 
@@ -23723,15 +13469,6 @@ fn parse_u8(line: usize, value: &str, field: &'static str) -> Result<u8, Control
     value
         .parse::<u8>()
         .map_err(|_| parse_error(line, &format!("invalid {field}")))
-}
-
-fn parse_u16(line: usize, value: &str, field: &'static str) -> Result<u16, ControlPlaneError> {
-    value
-        .parse::<u16>()
-        .map_err(|source| ControlPlaneError::Parse {
-            line,
-            message: format!("invalid {field}: {source}"),
-        })
 }
 
 fn parse_u64(line: usize, value: &str, field: &'static str) -> Result<u64, ControlPlaneError> {
@@ -23946,4 +13683,4 @@ pub fn ensure_control_plane_state_parent_directory(
 
 #[cfg(test)]
 #[path = "control_plane/tests.rs"]
-pub(crate) mod tests;
+mod tests;

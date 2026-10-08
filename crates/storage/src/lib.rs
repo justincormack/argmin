@@ -54,7 +54,6 @@ mod internal_tls_protocol;
 mod live_pg_transfer;
 mod maintenance;
 pub(crate) mod metadata_command;
-mod metadata_transfer_staging_outbox;
 mod node_runtime;
 pub(crate) mod peering;
 pub mod pg_topology;
@@ -179,9 +178,6 @@ pub use maintenance::{
     StoragePendingMetadataCommandRecoverySweeper, StorageReclaimSweeper,
     StorageShardBackfillSweeper, StorageShardRepairSweeper, StorageShardScavengerSweeper,
     StorageStreamSessionSweeper,
-};
-pub use metadata_transfer_staging_outbox::{
-    StorageNodeMetadataTransferStagingOutbox, StorageNodeMetadataTransferStagingOutboxStatus,
 };
 pub use unavailable_pg_reconciliation::UnavailablePgReconciliationWorker;
 
@@ -3964,7 +3960,6 @@ pub use storage_rpc_auth::{
     FrontendStorageRpcClientCapability, LivePgMetadataTransferStorageRpcClientCapability,
     MaintenanceStorageRpcClientCapability, StorageNodeStorageRpcClientCapability,
     StorageRpcServerAuthConfig, StorageRpcTransportLimits, STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN,
-    STORAGE_RPC_STAGING_ARTIFACT_PUBLICATION_MAX_ENVELOPE_LEN,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) use test_support::{

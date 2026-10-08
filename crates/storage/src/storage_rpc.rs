@@ -4,9 +4,6 @@
 use crate::{
     cluster::ShardLocation,
     control_plane::{CanonicalStateDigest, MetadataCommandLogHash},
-    control_plane_command::{
-        UnavailablePgStagingAuthorizationPresentation, MAX_UNAVAILABLE_PG_TRANSITION_COMMAND_BYTES,
-    },
     metadata_command::{
         decode_metadata_command_envelope, validate_metadata_command_envelope_bytes,
         BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
@@ -19,16 +16,12 @@ use crate::{
     },
     node_runtime::MetadataCommandDecodeAuthority,
     pg_store::{
-        decode_staging_intent, encode_staging_intent, MetadataCheckpointRow,
-        MetadataCheckpointTableBlock, MetadataCheckpointTableDigest, MetadataCheckpointValue,
-        MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
-        MetadataTransferStagingIntent, MetadataTransferStagingReceipt,
+        MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
+        MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
         PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
         PgClusterMapHistoryRouteReferences, ScavengerShardFile, ScavengerShardFileScan,
-        ScavengerShardRow, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES, MAX_STAGING_EVIDENCE_BYTES,
-        MAX_STAGING_INTENT_BYTES, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
-        METADATA_COMMAND_CHECKPOINT_MAGIC, METADATA_TRANSFER_STAGED_ARTIFACT_MAX_BYTES,
-        METADATA_TRANSFER_STAGED_ARTIFACT_READ_CHUNK_BYTES,
+        ScavengerShardRow, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+        METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, METADATA_COMMAND_CHECKPOINT_MAGIC,
     },
     types::{
         AbortMultipartUploadCleanup, AbortingMultipartUploadBucketWitness, BucketAclSummary,

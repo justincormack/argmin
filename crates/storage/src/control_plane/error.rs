@@ -323,12 +323,6 @@ pub enum ControlPlaneError {
     #[error("control-plane RPC applied-state confirmation failed: {message}")]
     RpcUnconfirmed { message: String },
 
-    #[error("metadata-transfer staging evidence publication was deferred")]
-    StagingEvidencePublicationDeferred,
-
-    #[error("metadata-transfer staging evidence publication outcome is unconfirmed: {message}")]
-    StagingEvidencePublicationOutcomeUnconfirmed { message: String },
-
     #[error("invalid {field} state {value:?}")]
     InvalidState { field: &'static str, value: String },
 
@@ -1050,16 +1044,6 @@ impl ControlPlaneError {
     }
 
     #[must_use]
-    pub(crate) fn is_retryable_staging_evidence_publication_error(&self) -> bool {
-        self.is_retryable_runtime_map_observation_error()
-            || matches!(
-                self,
-                Self::StagingEvidencePublicationDeferred
-                    | Self::StagingEvidencePublicationOutcomeUnconfirmed { .. }
-            )
-    }
-
-    #[must_use]
     pub fn is_retryable_heartbeat_startup_error(&self) -> bool {
         self.is_retryable_runtime_map_observation_error()
             || matches!(self, Self::RpcUnconfirmed { .. })
@@ -1089,7 +1073,7 @@ impl ControlPlaneError {
     }
 
     #[must_use]
-    pub(crate) fn is_unconfirmed_control_plane_mutation(&self) -> bool {
+    fn is_unconfirmed_control_plane_mutation(&self) -> bool {
         self.is_maybe_applied_control_plane_rpc_response_loss()
             || matches!(self, Self::RpcUnconfirmed { .. })
     }

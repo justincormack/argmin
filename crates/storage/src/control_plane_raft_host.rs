@@ -1,7 +1,6 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -18,22 +17,14 @@ use crate::control_plane::{
     ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRpcResponsePublication,
     ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapSource,
     ControlPlaneRuntimeMapStatus, FencedPgMetadataTransferSnapshot, LeaseHorizonAuthorityBinding,
-    NodeHeartbeat, OutageCommandArtifactPage, PgMetadataTransferProof,
-    PreparedUnavailablePgCompletionBatch, UnavailablePgReconciliationCandidate,
-    UnavailablePgReconciliationCompletionAttempt, UnavailablePgReconciliationCompletionBatch,
-    UnavailablePgReconciliationCursor, UnavailablePgReconciliationPollBatch,
-    UnavailablePgReconciliationStage, UnavailablePgReconciliationWork,
-    UnconfirmedUnavailablePgReconciliationCompletionBatch,
+    NodeHeartbeat, PgMetadataTransferProof, UnavailablePgReconciliationCandidate,
+    UnavailablePgReconciliationCursor, UnavailablePgReconciliationStage,
+    UnavailablePgReconciliationWork,
 };
-use crate::control_plane_command::{
-    ControlPlaneCommand, ControlPlaneCommandResponse,
-    FinalizeMetadataTransferStagingGenerationRequest,
-    UnavailablePgStagingIntentAuthorizationRequest, UnavailablePgTransitionInstallRequest,
-};
+use crate::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use crate::control_plane_raft::{
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
-    ControlPlaneRaftNodeId, LowPriorityControlPlaneRaftCommandResult,
-    SubmittedControlPlaneRaftCommand,
+    ControlPlaneRaftNodeId, SubmittedControlPlaneRaftCommand,
 };
 use crate::control_plane_raft_durability::ControlPlaneRaftAuthorityDurability;
 use crate::control_plane_server_bootstrap::{
@@ -449,8 +440,9 @@ impl ControlPlaneRaftAuthorityHost {
                 let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
                 self.submit_raft_command_derived(|current| {
                     let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
-                    let command = current.begin_unavailable_pg_placement_transition_batch_command(
-                        &[(pg_id, unavailable_node_id)],
+                    let command = current.begin_unavailable_pg_placement_transition_command(
+                        pg_id,
+                        unavailable_node_id,
                         command_now_ms,
                     )?;
                     #[cfg(test)]
@@ -475,357 +467,6 @@ impl ControlPlaneRaftAuthorityHost {
         }
     }
 
-    pub(crate) fn poll_unavailable_pg_reconciliation_batch(
-        &mut self,
-        cursor: &mut UnavailablePgReconciliationCursor,
-        supplied_now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationPollBatch, ControlPlaneError> {
-        let now_ms = self.authority_now_ms(supplied_now_ms)?;
-        let snapshot = self.current_snapshot()?;
-        let scan = snapshot.scan_unavailable_pg_reconciliation_batch(*cursor, now_ms);
-        *cursor = scan.next_cursor;
-        let begin_candidates = scan
-            .candidates
-            .iter()
-            .filter_map(|candidate| match candidate {
-                UnavailablePgReconciliationCandidate::Begin {
-                    pg_id,
-                    unavailable_node_id,
-                } => Some((*pg_id, *unavailable_node_id)),
-                UnavailablePgReconciliationCandidate::Resume(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let mut begun = Vec::new();
-        let mut rejected = Vec::new();
-        if !begin_candidates.is_empty() {
-            #[cfg(test)]
-            self.run_after_unavailable_reconciliation_time_sampled_hook(now_ms);
-        }
-        #[cfg(test)]
-        let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
-        if !begin_candidates.is_empty() {
-            let mut prepared_slot = None;
-            let submit_result = self.submit_raft_command_derived(|current| {
-                let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
-                let prepared = current.prepare_unavailable_pg_placement_transition_batch(
-                    &begin_candidates,
-                    command_now_ms,
-                )?;
-                let command = prepared.command.clone();
-                prepared_slot = Some(prepared);
-                #[cfg(test)]
-                if command.is_some() {
-                    if let Some(after_derived) = after_derived {
-                        after_derived();
-                    }
-                }
-                command.ok_or_else(|| ControlPlaneError::CommandDecode {
-                    message: "unavailable transition begin page has no valid member".to_owned(),
-                })
-            });
-            let (prepared, submit_result) = resolve_derived_preparation(
-                prepared_slot,
-                submit_result,
-                "unavailable transition begin derivation returned without preparation state",
-            )?;
-            let included_pg_ids = prepared
-                .included
-                .iter()
-                .map(|(pg_id, _)| *pg_id)
-                .collect::<BTreeSet<_>>();
-            let submitted = prepared.command.is_some();
-            if submitted {
-                submit_result?;
-                begun.extend(included_pg_ids.iter().copied());
-            }
-            rejected.extend(prepared.rejected);
-        }
-        let current = self.current_snapshot()?;
-        let cleanup_fallbacks = scan.cleanup_fallbacks;
-        let mut work = scan
-            .candidates
-            .into_iter()
-            .filter_map(|candidate| match candidate {
-                UnavailablePgReconciliationCandidate::Resume(work) => Some(work),
-                UnavailablePgReconciliationCandidate::Begin { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        for pg_id in begun {
-            let transition = current
-                .unavailable_pg_placement_transition(pg_id)
-                .ok_or_else(|| {
-                    ControlPlaneError::invariant_failure(
-                        "committed unavailable PG transition is absent from current state",
-                    )
-                })?;
-            work.push(UnavailablePgReconciliationWork::from_transition(
-                transition,
-                UnavailablePgReconciliationStage::MetadataTransfer,
-            ));
-        }
-        work.sort_by_key(UnavailablePgReconciliationWork::pg_id);
-        Ok(UnavailablePgReconciliationPollBatch {
-            work,
-            cleanup_fallbacks,
-            rejected,
-        })
-    }
-
-    pub fn authorize_unavailable_pg_staging_intents_batch(
-        &mut self,
-        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let authorizations = authorizations.to_vec();
-        let response = self.submit_raft_command_derived(move |current| {
-            current.authorize_unavailable_pg_staging_intents_batch_command(&authorizations)
-        })?;
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::AuthorizeUnavailablePgStagingIntents
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "staging authorization batch returned the wrong response",
-            ));
-        }
-        self.current_snapshot()
-    }
-
-    pub fn commit_unavailable_pg_outage_resolution_intents_batch(
-        &mut self,
-        candidates: &[(PgId, NodeId, ClusterEpoch, u64)],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let candidates = candidates.to_vec();
-        let response = self.submit_raft_command_derived(move |current| {
-            current.commit_unavailable_pg_outage_resolution_intents_batch_command(&candidates)
-        })?;
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::CommitUnavailablePgOutageResolutionIntents
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "outage-resolution intent batch returned the wrong response",
-            ));
-        }
-        self.current_snapshot()
-    }
-
-    #[allow(dead_code)] // Production outage reconciliation wiring is the next protocol slice.
-    pub(crate) fn publish_unavailable_pg_outage_command_artifact(
-        &mut self,
-        command: &crate::metadata_command::MetadataCommandEnvelope,
-        source_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let pages = OutageCommandArtifactPage::for_command(command, source_epoch)
-            .map_err(|message| ControlPlaneError::CommandDecode { message })?;
-        for page in pages {
-            let response =
-                self.submit_raft_command(ControlPlaneCommand::PublishOutageCommandArtifactPage {
-                    page,
-                })?;
-            if !matches!(
-                response,
-                ControlPlaneCommandResponse::PublishOutageCommandArtifactPage
-            ) {
-                return Err(ControlPlaneError::invariant_failure(
-                    "outage command artifact publication returned the wrong response",
-                ));
-            }
-        }
-        self.current_snapshot()
-    }
-
-    pub fn install_unavailable_pg_placement_transitions_batch(
-        &mut self,
-        transitions: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let transitions = transitions.to_vec();
-        let response = self.submit_raft_command_derived(move |current| {
-            current.install_unavailable_pg_placement_transitions_batch_command(
-                &transitions,
-                expected_destination_epoch,
-            )
-        })?;
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::InstallUnavailablePgPlacementTransitions
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "destination installation batch returned the wrong response",
-            ));
-        }
-        self.current_snapshot()
-    }
-
-    pub fn checkpoint_metadata_transfer_staging_evidence_pages(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let response = self.submit_low_priority_raft_command(
-            ControlPlaneCommand::CheckpointMetadataTransferStagingEvidencePages {
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-            },
-        )?;
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "staging evidence checkpoint returned the wrong response",
-            ));
-        }
-        self.current_snapshot()
-    }
-
-    pub fn collapse_metadata_transfer_staging_evidence_checkpoint_segment(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .current_snapshot()?
-            .collapse_metadata_transfer_staging_evidence_checkpoint_segment_command(
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-            )?;
-        let response = self.submit_low_priority_raft_command(command)?;
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::CollapseMetadataTransferStagingEvidenceCheckpointSegment
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "staging evidence checkpoint collapse returned the wrong response",
-            ));
-        }
-        self.current_snapshot()
-    }
-
-    pub fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .current_snapshot()?
-            .coalesce_metadata_transfer_staging_evidence_checkpoint_anchors_command(
-                actor_node_id,
-                actor_node_incarnation,
-                first_generation,
-                last_generation,
-            )?;
-        let response = self.submit_low_priority_raft_command(command)?;
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "staging evidence checkpoint anchor coalescing returned the wrong response",
-            ));
-        }
-        self.current_snapshot()
-    }
-
-    pub fn retire_metadata_transfer_staging_actor_closure(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let command = self
-            .current_snapshot()?
-            .retire_metadata_transfer_staging_actor_closure_command(
-                actor_node_id,
-                actor_node_incarnation,
-            )?;
-        let response = self.submit_low_priority_raft_command(command)?;
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::RetireMetadataTransferStagingActorClosure
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "staging actor-closure retirement returned the wrong response",
-            ));
-        }
-        self.current_snapshot()
-    }
-
-    pub(crate) fn maintain_metadata_transfer_staging_evidence_once(
-        &mut self,
-        cursor: &mut crate::control_plane::MetadataTransferStagingMaintenanceCursor,
-    ) -> Result<bool, ControlPlaneError> {
-        let mut next_cursor = *cursor;
-        let Some(command) = self
-            .current_snapshot()?
-            .next_metadata_transfer_staging_maintenance_command(&mut next_cursor)?
-        else {
-            *cursor = next_cursor;
-            return Ok(false);
-        };
-        let response = self.submit_low_priority_raft_command(command)?;
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::CheckpointMetadataTransferStagingEvidencePages
-                | ControlPlaneCommandResponse::CollapseMetadataTransferStagingEvidenceCheckpointSegment
-                | ControlPlaneCommandResponse::CoalesceMetadataTransferStagingEvidenceCheckpointAnchors
-                | ControlPlaneCommandResponse::RetireMetadataTransferStagingActorClosure
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "staging evidence maintenance returned the wrong response",
-            ));
-        }
-        *cursor = next_cursor;
-        Ok(true)
-    }
-
-    pub(crate) fn maintain_outage_command_artifacts_once(
-        &mut self,
-    ) -> Result<bool, ControlPlaneError> {
-        let Some(response) = self.submit_low_priority_raft_command_derived(|current| {
-            current.next_outage_command_artifact_retirement_command()
-        })?
-        else {
-            return Ok(false);
-        };
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::RetireOutageCommandArtifacts
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "outage artifact maintenance returned the wrong response",
-            ));
-        }
-        Ok(true)
-    }
-
-    pub fn finalize_metadata_transfer_staging_generation(
-        &mut self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let response = self.submit_low_priority_raft_command(
-            ControlPlaneCommand::FinalizeMetadataTransferStagingGeneration { cleanup },
-        )?;
-        if !matches!(
-            response,
-            ControlPlaneCommandResponse::FinalizeMetadataTransferStagingGeneration
-        ) {
-            return Err(ControlPlaneError::invariant_failure(
-                "staging cleanup returned the wrong response",
-            ));
-        }
-        self.current_snapshot()
-    }
-
     pub fn complete_unavailable_pg_reconciliation(
         &mut self,
         work: &UnavailablePgReconciliationWork,
@@ -845,10 +486,8 @@ impl ControlPlaneRaftAuthorityHost {
         let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
         self.submit_raft_command_derived(|current| {
             let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
-            let command = current.complete_unavailable_pg_placement_transition_batch_command(
-                std::slice::from_ref(work),
-                command_now_ms,
-            )?;
+            let command = current
+                .complete_unavailable_pg_placement_transition_command(work, command_now_ms)?;
             #[cfg(test)]
             if let Some(after_derived) = after_derived {
                 after_derived();
@@ -856,56 +495,6 @@ impl ControlPlaneRaftAuthorityHost {
             Ok(command)
         })?;
         Ok(true)
-    }
-
-    pub(crate) fn complete_unavailable_pg_reconciliation_batch(
-        &mut self,
-        work: &[UnavailablePgReconciliationWork],
-        supplied_now_ms: u64,
-    ) -> Result<UnavailablePgReconciliationCompletionAttempt, ControlPlaneError> {
-        let now_ms = self.authority_now_ms(supplied_now_ms)?;
-        #[cfg(test)]
-        self.run_after_unavailable_reconciliation_time_sampled_hook(now_ms);
-        #[cfg(test)]
-        let after_derived = self.take_unavailable_reconciliation_command_derived_hook();
-        let mut prepared_slot = None;
-        let submit_result = self.submit_raft_command_derived(|current| {
-            let command_now_ms = authority_time_not_before_snapshot(current, now_ms);
-            let prepared =
-                current.prepare_unavailable_pg_placement_completion_batch(work, command_now_ms)?;
-            let command = prepared.command.clone();
-            prepared_slot = Some(prepared);
-            #[cfg(test)]
-            if command.is_some() {
-                if let Some(after_derived) = after_derived {
-                    after_derived();
-                }
-            }
-            command.ok_or_else(|| ControlPlaneError::CommandDecode {
-                message: "unavailable transition completion batch has no valid member".to_owned(),
-            })
-        });
-        let (prepared, submit_result) = resolve_derived_preparation(
-            prepared_slot,
-            submit_result,
-            "unavailable transition completion derivation returned without preparation state",
-        )?;
-        let prepared =
-            match resolve_unavailable_pg_completion_submission(prepared, work, submit_result)? {
-                UnavailablePgCompletionSubmission::Applied(prepared) => prepared,
-                UnavailablePgCompletionSubmission::Unconfirmed(attempt) => return Ok(attempt),
-            };
-        let rederive = prepared.rederive_from(work);
-        let mut completed = prepared.already_completed;
-        completed.extend(prepared.included);
-        Ok(UnavailablePgReconciliationCompletionAttempt::Classified(
-            Box::new(UnavailablePgReconciliationCompletionBatch {
-                completed,
-                rejected: prepared.rejected,
-                rederive,
-                snapshot: self.current_snapshot()?,
-            }),
-        ))
     }
 
     fn block_on<F: Future>(&self, future: F) -> F::Output {
@@ -1017,37 +606,6 @@ impl ControlPlaneRaftAuthorityHost {
         self.submit_raft_command_with_checkpoint_policy(command, true)
     }
 
-    fn submit_low_priority_raft_command(
-        &mut self,
-        command: ControlPlaneCommand,
-    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        let submitted = self.block_on(
-            self.authority
-                .submit_low_priority_control_plane_command(command),
-        )?;
-        self.finish_submitted_raft_command(submitted, true)
-    }
-
-    fn submit_low_priority_raft_command_derived<F>(
-        &mut self,
-        derive_command: F,
-    ) -> Result<Option<ControlPlaneCommandResponse>, ControlPlaneError>
-    where
-        F: FnOnce(
-            &ClusterControlSnapshot,
-        ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError>,
-    {
-        self.ensure_not_durably_poisoned()?;
-        let submitted = self.block_on(
-            self.authority
-                .submit_low_priority_control_plane_command_derived(derive_command),
-        )?;
-        submitted
-            .map(|submitted| self.finish_submitted_raft_command(submitted, true))
-            .transpose()
-    }
-
     fn submit_raft_command_derived<F>(
         &mut self,
         derive_command: F,
@@ -1110,12 +668,6 @@ impl ControlPlaneRaftAuthorityHost {
     fn current_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
         self.block_on(self.authority.current_control_plane_snapshot())
-    }
-
-    pub(crate) fn unavailable_pg_reconciliation_snapshot(
-        &self,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.current_snapshot()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1557,121 +1109,6 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
         self.current_snapshot()
     }
 
-    fn authorize_unavailable_pg_staging_intents_batch(
-        &mut self,
-        authorizations: &[UnavailablePgStagingIntentAuthorizationRequest],
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        ControlPlaneRaftAuthorityHost::authorize_unavailable_pg_staging_intents_batch(
-            self,
-            authorizations,
-        )
-    }
-
-    fn install_unavailable_pg_placement_transitions_batch(
-        &mut self,
-        transitions: &[UnavailablePgTransitionInstallRequest],
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        ControlPlaneRaftAuthorityHost::install_unavailable_pg_placement_transitions_batch(
-            self,
-            transitions,
-            expected_destination_epoch,
-        )
-    }
-
-    fn apply_metadata_transfer_staging_evidence_page(
-        &mut self,
-        operation_payload: Vec<u8>,
-        page_digest: [u8; 32],
-    ) -> Result<Vec<u8>, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        let response = match self.block_on(
-            self.authority
-                .submit_low_priority_metadata_transfer_staging_evidence_page(
-                    operation_payload,
-                    page_digest,
-                ),
-        )? {
-            LowPriorityControlPlaneRaftCommandResult::PreflightResolved(response) => response,
-            LowPriorityControlPlaneRaftCommandResult::Submitted(submitted) => {
-                self.finish_submitted_raft_command(submitted, true)?
-            }
-        };
-        let ControlPlaneCommandResponse::ApplyMetadataTransferStagingEvidencePage { apply_receipt } =
-            response
-        else {
-            unreachable!("staging evidence command returned the wrong response");
-        };
-        Ok(apply_receipt)
-    }
-
-    fn checkpoint_metadata_transfer_staging_evidence_pages(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        ControlPlaneRaftAuthorityHost::checkpoint_metadata_transfer_staging_evidence_pages(
-            self,
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        )
-    }
-
-    fn collapse_metadata_transfer_staging_evidence_checkpoint_segment(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        ControlPlaneRaftAuthorityHost::collapse_metadata_transfer_staging_evidence_checkpoint_segment(
-            self,
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        )
-    }
-
-    fn coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-        first_generation: u64,
-        last_generation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        ControlPlaneRaftAuthorityHost::coalesce_metadata_transfer_staging_evidence_checkpoint_anchors(
-            self,
-            actor_node_id,
-            actor_node_incarnation,
-            first_generation,
-            last_generation,
-        )
-    }
-
-    fn retire_metadata_transfer_staging_actor_closure(
-        &mut self,
-        actor_node_id: NodeId,
-        actor_node_incarnation: u64,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        ControlPlaneRaftAuthorityHost::retire_metadata_transfer_staging_actor_closure(
-            self,
-            actor_node_id,
-            actor_node_incarnation,
-        )
-    }
-
-    fn finalize_metadata_transfer_staging_generation(
-        &mut self,
-        cleanup: FinalizeMetadataTransferStagingGenerationRequest,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        ControlPlaneRaftAuthorityHost::finalize_metadata_transfer_staging_generation(self, cleanup)
-    }
-
     fn fence_pg_for_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -1740,6 +1177,23 @@ impl ControlPlaneAdmin for ControlPlaneRaftAuthorityHost {
             acting_set,
             transfer,
             expected_destination_epoch,
+            unavailable_transition: None,
+        })?;
+        self.current_snapshot()
+    }
+
+    fn install_unavailable_pg_transition_metadata_transfer(
+        &mut self,
+        binding: crate::control_plane::UnavailablePgTransitionMutationBinding,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.submit_raft_command(ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
+            pg_id: binding.pg_id(),
+            acting_set: binding.destination_acting_set().to_vec(),
+            transfer,
+            expected_destination_epoch,
+            unavailable_transition: Some(binding),
         })?;
         self.current_snapshot()
     }
@@ -1804,67 +1258,6 @@ fn authority_time_not_before_snapshot(
         .map_or(sampled_now_ms, |committed| committed.max(sampled_now_ms))
 }
 
-fn resolve_derived_preparation<T, R>(
-    prepared: Option<T>,
-    submit_result: Result<R, ControlPlaneError>,
-    missing_preparation_diagnostic: &'static str,
-) -> Result<(T, Result<R, ControlPlaneError>), ControlPlaneError> {
-    match prepared {
-        Some(prepared) => Ok((prepared, submit_result)),
-        None => match submit_result {
-            Err(error) => Err(error),
-            Ok(_) => Err(ControlPlaneError::invariant_failure(
-                missing_preparation_diagnostic,
-            )),
-        },
-    }
-}
-
-fn unconfirmed_unavailable_pg_completion_attempt(
-    prepared: PreparedUnavailablePgCompletionBatch,
-    requested: &[UnavailablePgReconciliationWork],
-    error: ControlPlaneError,
-) -> UnavailablePgReconciliationCompletionAttempt {
-    debug_assert!(prepared.command.is_some());
-    let rederive = prepared.rederive_from(requested);
-    UnavailablePgReconciliationCompletionAttempt::Unconfirmed(
-        UnconfirmedUnavailablePgReconciliationCompletionBatch {
-            already_completed: prepared.already_completed,
-            submitted: prepared.included,
-            rejected: prepared.rejected,
-            rederive,
-            error,
-        },
-    )
-}
-
-enum UnavailablePgCompletionSubmission {
-    Applied(PreparedUnavailablePgCompletionBatch),
-    Unconfirmed(UnavailablePgReconciliationCompletionAttempt),
-}
-
-fn resolve_unavailable_pg_completion_submission<R>(
-    prepared: PreparedUnavailablePgCompletionBatch,
-    requested: &[UnavailablePgReconciliationWork],
-    submit_result: Result<R, ControlPlaneError>,
-) -> Result<UnavailablePgCompletionSubmission, ControlPlaneError> {
-    if prepared.command.is_none() {
-        return Ok(UnavailablePgCompletionSubmission::Applied(prepared));
-    }
-    match submit_result {
-        Ok(_) => Ok(UnavailablePgCompletionSubmission::Applied(prepared)),
-        Err(error)
-            if error.is_unconfirmed_control_plane_mutation()
-                || error.is_retryable_openraft_leadership_error() =>
-        {
-            Ok(UnavailablePgCompletionSubmission::Unconfirmed(
-                unconfirmed_unavailable_pg_completion_attempt(prepared, requested, error),
-            ))
-        }
-        Err(error) => Err(error),
-    }
-}
-
 fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Output {
     if Handle::try_current().is_ok() {
         tokio::task::block_in_place(|| runtime.block_on(future))
@@ -1881,85 +1274,6 @@ mod tests {
     use std::thread;
 
     struct ReconciliationCommandRelease(Option<mpsc::SyncSender<()>>);
-
-    #[test]
-    fn pre_derivation_reconciliation_submission_error_is_preserved() {
-        let error = resolve_derived_preparation::<(), ()>(
-            None,
-            Err(ControlPlaneError::AuthorityClockLeadershipChanged {
-                established_term: Some(7),
-                current_term: 8,
-            }),
-            "missing preparation",
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ControlPlaneError::AuthorityClockLeadershipChanged {
-                established_term: Some(7),
-                current_term: 8,
-            }
-        ));
-    }
-
-    #[test]
-    fn ambiguous_openraft_completion_preserves_the_exact_prepared_partition() {
-        let work = |pg_id| {
-            UnavailablePgReconciliationWork::new(
-                PgId::new(pg_id),
-                ClusterEpoch::new(11).unwrap(),
-                ClusterEpoch::new(10).unwrap(),
-                vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
-                vec![NodeId::new(4), NodeId::new(2), NodeId::new(3)],
-                UnavailablePgReconciliationStage::PayloadReadiness,
-            )
-        };
-        let completed = work(6);
-        let submitted = work(7);
-        let rejected = work(8);
-        let suffix = work(9);
-        let requested = vec![
-            completed.clone(),
-            submitted.clone(),
-            rejected.clone(),
-            suffix.clone(),
-        ];
-        let submission = resolve_unavailable_pg_completion_submission(
-            PreparedUnavailablePgCompletionBatch {
-                command: Some(ControlPlaneCommand::MarkNodeAvailability {
-                    node_id: NodeId::new(1),
-                    availability: crate::control_plane::NodeAvailabilityState::Healthy,
-                }),
-                already_completed: vec![completed.clone()],
-                included: vec![submitted.clone()],
-                rejected: vec![(
-                    rejected.clone(),
-                    ControlPlaneError::CommandDecode {
-                        message: "injected definitive rejection".to_owned(),
-                    },
-                )],
-            },
-            &requested,
-            Err::<(), _>(ControlPlaneError::OpenRaftOperation {
-                kind: crate::control_plane::ControlPlaneRaftOperationErrorKind::ForwardToLeader,
-                message: "injected changed-tip leadership rejection".to_owned(),
-            }),
-        )
-        .unwrap();
-
-        let UnavailablePgCompletionSubmission::Unconfirmed(attempt) = submission else {
-            panic!("ambiguous OpenRaft submission was not retained as unconfirmed");
-        };
-        let UnavailablePgReconciliationCompletionAttempt::Unconfirmed(attempt) = attempt else {
-            panic!("unconfirmed submission was not preserved");
-        };
-        assert_eq!(attempt.already_completed, vec![completed]);
-        assert_eq!(attempt.submitted, vec![submitted]);
-        assert_eq!(attempt.rejected[0].0, rejected);
-        assert_eq!(attempt.rederive, vec![suffix]);
-        assert!(attempt.error.is_retryable_openraft_leadership_error());
-    }
 
     impl ReconciliationCommandRelease {
         fn release(&mut self) {
@@ -2005,94 +1319,6 @@ mod tests {
              committed={committed_timestamp_ms} previous={previous_timestamp_ms}"
         );
         committed_timestamp_ms
-    }
-
-    fn stage_and_install_unavailable_transition_for_test(
-        host: &mut ControlPlaneRaftAuthorityHost,
-        work: &UnavailablePgReconciliationWork,
-        artifact_byte: u8,
-        receipts: &mut std::collections::BTreeMap<
-            NodeId,
-            crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt,
-        >,
-    ) {
-        let artifact_target_epoch = ClusterEpoch::new(
-            host.current_snapshot_for_test()
-                .unwrap()
-                .cluster_epoch()
-                .get()
-                + 1,
-        )
-        .unwrap();
-        let authorization = UnavailablePgStagingIntentAuthorizationRequest {
-            unavailable_transition: work.mutation_binding().clone(),
-            staging_generation: work.transition_epoch().get(),
-            artifact_target_epoch,
-            artifact_digest: [artifact_byte; 32],
-            artifact_length: 4_096 + u64::from(artifact_byte),
-            artifact_format_version:
-                crate::pg_store::METADATA_TRANSFER_STAGED_ARTIFACT_FORMAT_VERSION,
-        };
-        host.authorize_unavailable_pg_staging_intents_batch(std::slice::from_ref(&authorization))
-            .unwrap();
-        let snapshot = host.current_snapshot_for_test().unwrap();
-        let destination_epoch = ClusterEpoch::new(snapshot.cluster_epoch().get() + 1).unwrap();
-        let transfer = PgMetadataTransferProof::new(
-            work.source_epoch(),
-            crate::control_plane::PgMetadataProof::empty(),
-        );
-        let intent = crate::pg_store::MetadataTransferStagingIntent::for_unavailable_transition(
-            work.mutation_binding(),
-            authorization.artifact_digest,
-            authorization.artifact_length,
-            authorization.artifact_format_version,
-        )
-        .unwrap();
-        let mut publications = Vec::new();
-        for node_id in work.destination_acting_set().iter().copied() {
-            let node = snapshot.node(node_id).unwrap();
-            let page =
-                crate::pg_store::metadata_transfer_staging_publication_evidence_page_for_test(
-                    crate::pg_store::MetadataTransferStagingNodeIdentity::new(
-                        node_id,
-                        node.node_incarnation(),
-                        node.endpoint().to_owned(),
-                    )
-                    .unwrap(),
-                    &intent,
-                    transfer,
-                    receipts.get(&node_id),
-                );
-            let evidence_digest = checksum::sha256::digest(page.entries()[0].evidence());
-            host.apply_metadata_transfer_staging_evidence_page(
-                page.operation_payload().to_vec(),
-                page.page_digest(),
-            )
-            .unwrap();
-            receipts.insert(
-                node_id,
-                crate::pg_store::MetadataTransferStagingEvidenceApplyReceipt::for_page(&page),
-            );
-            publications.push(
-                crate::control_plane_command::UnavailablePgStagingPublicationBinding {
-                    node_id,
-                    node_incarnation: node.node_incarnation(),
-                    endpoint: node.endpoint().to_owned(),
-                    evidence_digest,
-                },
-            );
-        }
-        publications.sort_by_key(|publication| publication.node_id);
-        host.install_unavailable_pg_placement_transitions_batch(
-            &[UnavailablePgTransitionInstallRequest {
-                unavailable_transition: work.mutation_binding().clone(),
-                transfer,
-                expected_destination_epoch: destination_epoch,
-                publications,
-            }],
-            destination_epoch,
-        )
-        .unwrap();
     }
 
     fn run_reconciliation_across_durable_heartbeat_races<T: Send>(
@@ -2227,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_raft_host_poll_batches_grace_expired_unavailable_pg_transitions() {
+    fn durable_raft_host_poll_commits_grace_expired_unavailable_pg_transition() {
         let tmp = test_util::tempdir();
         let artifact_path = tmp.path().join("authority.state");
         let runtime = runtime();
@@ -2476,51 +1702,16 @@ mod tests {
         let work = run_reconciliation_across_durable_heartbeat_races(
             &mut host,
             |host| {
-                host.poll_unavailable_pg_reconciliation_batch(
+                host.poll_unavailable_pg_reconciliation(
                     &mut cursor,
                     crate::clock::current_time_millis(),
                 )
                 .unwrap()
+                .expect("grace-expired unavailable actor should atomically produce Raft work")
             },
-            |host, now_ms| {
-                heartbeat(
-                    host,
-                    3,
-                    10_000,
-                    Some(PgState::Peering),
-                    now_ms,
-                    &[pg_id, admin_pg_id],
-                )
-            },
-            |host, now_ms| {
-                heartbeat(
-                    host,
-                    3,
-                    10_000,
-                    Some(PgState::Peering),
-                    now_ms,
-                    &[pg_id, admin_pg_id],
-                )
-            },
+            |host, now_ms| heartbeat(host, 3, 10_000, Some(PgState::Peering), now_ms, &[pg_id]),
+            |host, now_ms| heartbeat(host, 3, 10_000, Some(PgState::Peering), now_ms, &[pg_id]),
         );
-        assert!(work.rejected.is_empty());
-        assert_eq!(work.work.len(), 2);
-        assert_eq!(
-            work.work
-                .iter()
-                .map(UnavailablePgReconciliationWork::pg_id)
-                .collect::<Vec<_>>(),
-            vec![pg_id, admin_pg_id]
-        );
-        assert_eq!(
-            work.work[0].transition_epoch(),
-            work.work[1].transition_epoch()
-        );
-        let work = work
-            .work
-            .into_iter()
-            .find(|work| work.pg_id() == pg_id)
-            .expect("batch must contain the data PG transition");
         assert_eq!(
             host.current_snapshot_for_test()
                 .unwrap()
@@ -2561,13 +1752,17 @@ mod tests {
                 ),
         ));
 
-        let mut staging_receipts = std::collections::BTreeMap::new();
-        stage_and_install_unavailable_transition_for_test(
-            &mut host,
-            &work,
-            0x61,
-            &mut staging_receipts,
+        let transfer = PgMetadataTransferProof::new(
+            snapshot.cluster_epoch(),
+            crate::control_plane::PgMetadataProof::empty(),
         );
+        let destination_epoch = ClusterEpoch::new(snapshot.cluster_epoch().get() + 1).unwrap();
+        host.install_unavailable_pg_transition_metadata_transfer(
+            work.mutation_binding().clone(),
+            transfer,
+            destination_epoch,
+        )
+        .unwrap();
         for &node_id in work.destination_acting_set() {
             heartbeat(
                 &mut host,
@@ -2669,12 +1864,15 @@ mod tests {
                     crate::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 10,
                 ),
         ));
-        stage_and_install_unavailable_transition_for_test(
-            &mut host,
-            &direct_work,
-            0x62,
-            &mut staging_receipts,
-        );
+        host.install_unavailable_pg_transition_metadata_transfer(
+            direct_work.mutation_binding().clone(),
+            PgMetadataTransferProof::new(
+                direct_begin_snapshot.cluster_epoch(),
+                crate::control_plane::PgMetadataProof::empty(),
+            ),
+            ClusterEpoch::new(direct_begin_snapshot.cluster_epoch().get() + 1).unwrap(),
+        )
+        .unwrap();
         for &node_id in direct_work.destination_acting_set() {
             heartbeat(
                 &mut host,

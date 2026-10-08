@@ -16,6 +16,11 @@ Signals: Security, Validated, Attack-path
 Fixed in [`299aab30`](https://github.com/justincormack/argmin/commit/299aab30)
 (`Bound staging evidence before Raft submission`).
 
+The staging-evidence RPC and replicated evidence protocol described below were
+subsequently removed when unavailable-PG reconciliation returned to singleton
+commands. This record is retained as historical evidence; the affected
+production path no longer exists.
+
 The authenticated staging-evidence path now performs state-aware preflight
 inside the existing serialized low-priority evidence-update boundary. One
 shared classifier decodes the complete page and returns exactly one of:

@@ -193,6 +193,14 @@ static BACKGROUND_WORK_ADMISSION_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ELAPSED_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UNAVAILABLE_PG_RECONCILIATION_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static UNAVAILABLE_PG_RECONCILIATION_DISPATCHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UNAVAILABLE_PG_RECONCILIATION_TRANSFER_SUCCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UNAVAILABLE_PG_RECONCILIATION_COMPLETION_SUCCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UNAVAILABLE_PG_RECONCILIATION_DEFERRED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UNAVAILABLE_PG_RECONCILIATION_FATAL_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UNAVAILABLE_PG_RECONCILIATION_TRANSFER_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static UNAVAILABLE_PG_RECONCILIATION_TRANSFER_US_MAX: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_DIMENSIONS: OnceLock<Mutex<Vec<MetadataCommandDimensionCounter>>> =
     OnceLock::new();
 static METADATA_COMMAND_PENDING_SLOT_ACTION_DIMENSIONS: OnceLock<
@@ -340,32 +348,6 @@ static CONTROL_PLANE_RAFT_COMMAND_QUEUE_WAIT_US_TOTAL: AtomicU64 = AtomicU64::ne
 static CONTROL_PLANE_RAFT_COMMAND_QUEUE_WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_COMMAND_OPERATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_COMMAND_OPERATION_US_MAX: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_BATCH_METRICS: OnceLock<
-    [UnavailablePgBatchMetricCounters; UnavailablePgBatchStage::ALL.len()],
-> = OnceLock::new();
-static UNAVAILABLE_PG_WORKER_STAGE_METRICS: OnceLock<
-    [UnavailablePgWorkerStageMetricCounters; UnavailablePgWorkerStage::ALL.len()],
-> = OnceLock::new();
-static UNAVAILABLE_PG_PENDING_TRANSFER_DEPTH: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_IN_FLIGHT_TRANSFER_DEPTH: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_PREPARED_ARTIFACT_DEPTH: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_PREPARED_ARTIFACT_BYTES: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_STAGED_INSTALL_DEPTH: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_STAGED_INSTALL_BYTES: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_READY_ACTIVATION_DEPTH: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_PENDING_FINALIZATION_DEPTH: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_DEFERRED_DEPTH: AtomicU64 = AtomicU64::new(0);
-static UNAVAILABLE_PG_BLOCKED_DEPTH: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_ENTRY_DEPTH: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_ARTIFACT_BYTES: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_RETAINED_PAGE_DEPTH: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_RETAINED_SEGMENT_DEPTH: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_RETAINED_ANCHOR_DEPTH: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_RETAINED_EVIDENCE_DEPTH: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_DEPTH: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_ACTIVE_CLOSURE_DEPTH: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_RETIRED_CLOSURE_DEPTH: AtomicU64 = AtomicU64::new(0);
-static METADATA_TRANSFER_STAGING_RETENTION_PRUNE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_HISTORY_REFERENCE_SAMPLES: OnceLock<
     Mutex<BTreeMap<u32, ControlPlaneHistoryReferenceSample>>,
 > = OnceLock::new();
@@ -397,13 +379,12 @@ pub enum ControlPlaneRpcMetricKind {
     ReestablishAuthorityClock,
     RuntimeMapDiagnostics,
     ServingPgRuntimeMapSnapshot,
-    ApplyMetadataTransferStagingEvidencePage,
     #[default]
     Unknown,
 }
 
 impl ControlPlaneRpcMetricKind {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 17] = [
         Self::RuntimeMapSnapshot,
         Self::RefreshNodeHeartbeat,
         Self::SetPgActingSet,
@@ -420,7 +401,6 @@ impl ControlPlaneRpcMetricKind {
         Self::ReestablishAuthorityClock,
         Self::RuntimeMapDiagnostics,
         Self::ServingPgRuntimeMapSnapshot,
-        Self::ApplyMetadataTransferStagingEvidencePage,
         Self::Unknown,
     ];
 
@@ -449,9 +429,6 @@ impl ControlPlaneRpcMetricKind {
             Self::ReestablishAuthorityClock => "reestablish_authority_clock",
             Self::RuntimeMapDiagnostics => "runtime_map_diagnostics",
             Self::ServingPgRuntimeMapSnapshot => "serving_pg_runtime_map_snapshot",
-            Self::ApplyMetadataTransferStagingEvidencePage => {
-                "apply_metadata_transfer_staging_evidence_page"
-            }
             Self::Unknown => "unknown",
         }
     }
@@ -998,442 +975,33 @@ pub fn control_plane_raft_command_metrics_snapshot() -> ControlPlaneRaftCommandM
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(usize)]
-pub enum UnavailablePgBatchStage {
-    #[default]
-    Begin,
-    Authorization,
-    Install,
-    Activation,
+pub fn set_unavailable_pg_reconciliation_in_flight(depth: usize) {
+    UNAVAILABLE_PG_RECONCILIATION_IN_FLIGHT.store(depth as u64, Ordering::Relaxed);
 }
 
-impl UnavailablePgBatchStage {
-    pub const ALL: [Self; 4] = [
-        Self::Begin,
-        Self::Authorization,
-        Self::Install,
-        Self::Activation,
-    ];
+pub fn record_unavailable_pg_reconciliation_dispatch() {
+    UNAVAILABLE_PG_RECONCILIATION_DISPATCHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
 
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Begin => "begin",
-            Self::Authorization => "authorization",
-            Self::Install => "install",
-            Self::Activation => "activation",
-        }
-    }
-
-    fn index(self) -> usize {
-        self as usize
+pub fn record_unavailable_pg_reconciliation_transfer(elapsed: Duration, succeeded: bool) {
+    let elapsed_us = saturating_u128_to_u64(elapsed.as_micros());
+    UNAVAILABLE_PG_RECONCILIATION_TRANSFER_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&UNAVAILABLE_PG_RECONCILIATION_TRANSFER_US_MAX, elapsed_us);
+    if succeeded {
+        UNAVAILABLE_PG_RECONCILIATION_TRANSFER_SUCCEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-struct UnavailablePgBatchMetricCounters {
-    submitted_total: AtomicU64,
-    applied_total: AtomicU64,
-    replayed_total: AtomicU64,
-    rejected_total: AtomicU64,
-    members_total: AtomicU64,
-    members_max: AtomicU64,
-    encoded_bytes_total: AtomicU64,
-    encoded_bytes_max: AtomicU64,
-    encoded_fill_ppm_total: AtomicU64,
-    encoded_fill_ppm_max: AtomicU64,
-    epoch_advance_total: AtomicU64,
-    recovered_pg_total: AtomicU64,
+pub fn record_unavailable_pg_reconciliation_completion() {
+    UNAVAILABLE_PG_RECONCILIATION_COMPLETION_SUCCEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-impl UnavailablePgBatchMetricCounters {
-    fn new() -> Self {
-        Self {
-            submitted_total: AtomicU64::new(0),
-            applied_total: AtomicU64::new(0),
-            replayed_total: AtomicU64::new(0),
-            rejected_total: AtomicU64::new(0),
-            members_total: AtomicU64::new(0),
-            members_max: AtomicU64::new(0),
-            encoded_bytes_total: AtomicU64::new(0),
-            encoded_bytes_max: AtomicU64::new(0),
-            encoded_fill_ppm_total: AtomicU64::new(0),
-            encoded_fill_ppm_max: AtomicU64::new(0),
-            epoch_advance_total: AtomicU64::new(0),
-            recovered_pg_total: AtomicU64::new(0),
-        }
-    }
+pub fn record_unavailable_pg_reconciliation_deferred() {
+    UNAVAILABLE_PG_RECONCILIATION_DEFERRED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
-fn unavailable_pg_batch_metrics(
-) -> &'static [UnavailablePgBatchMetricCounters; UnavailablePgBatchStage::ALL.len()] {
-    UNAVAILABLE_PG_BATCH_METRICS
-        .get_or_init(|| std::array::from_fn(|_| UnavailablePgBatchMetricCounters::new()))
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct UnavailablePgBatchMetricSample {
-    pub stage: UnavailablePgBatchStage,
-    pub submitted_total: u64,
-    pub applied_total: u64,
-    pub replayed_total: u64,
-    pub rejected_total: u64,
-    pub members_total: u64,
-    pub members_max: u64,
-    pub encoded_bytes_total: u64,
-    pub encoded_bytes_max: u64,
-    pub encoded_fill_ppm_total: u64,
-    pub encoded_fill_ppm_max: u64,
-    pub epoch_advance_total: u64,
-    pub recovered_pg_total: u64,
-}
-
-pub fn record_unavailable_pg_batch_submission(
-    stage: UnavailablePgBatchStage,
-    members: usize,
-    encoded_bytes: usize,
-    encoded_limit: usize,
-) {
-    let counters = &unavailable_pg_batch_metrics()[stage.index()];
-    let members = u64::try_from(members).unwrap_or(u64::MAX);
-    let encoded_bytes = u64::try_from(encoded_bytes).unwrap_or(u64::MAX);
-    let encoded_fill_ppm = if encoded_limit == 0 {
-        0
-    } else {
-        u64::try_from(
-            (u128::from(encoded_bytes) * 1_000_000)
-                / u128::try_from(encoded_limit).unwrap_or(u128::MAX),
-        )
-        .unwrap_or(u64::MAX)
-    };
-    counters.submitted_total.fetch_add(1, Ordering::Relaxed);
-    counters.members_total.fetch_add(members, Ordering::Relaxed);
-    fetch_max_atomic(&counters.members_max, members);
-    counters
-        .encoded_bytes_total
-        .fetch_add(encoded_bytes, Ordering::Relaxed);
-    fetch_max_atomic(&counters.encoded_bytes_max, encoded_bytes);
-    counters
-        .encoded_fill_ppm_total
-        .fetch_add(encoded_fill_ppm, Ordering::Relaxed);
-    fetch_max_atomic(&counters.encoded_fill_ppm_max, encoded_fill_ppm);
-}
-
-pub fn record_unavailable_pg_batch_committed(
-    stage: UnavailablePgBatchStage,
-    changed: bool,
-    epoch_advance: u64,
-    members: usize,
-) {
-    let counters = &unavailable_pg_batch_metrics()[stage.index()];
-    if changed {
-        counters.applied_total.fetch_add(1, Ordering::Relaxed);
-        counters
-            .epoch_advance_total
-            .fetch_add(epoch_advance, Ordering::Relaxed);
-        if stage == UnavailablePgBatchStage::Activation {
-            counters.recovered_pg_total.fetch_add(
-                u64::try_from(members).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
-        }
-    } else {
-        counters.replayed_total.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-pub fn record_unavailable_pg_batch_rejected(stage: UnavailablePgBatchStage) {
-    unavailable_pg_batch_metrics()[stage.index()]
-        .rejected_total
-        .fetch_add(1, Ordering::Relaxed);
-}
-
-#[must_use]
-pub fn unavailable_pg_batch_metrics_snapshot() -> Vec<UnavailablePgBatchMetricSample> {
-    UnavailablePgBatchStage::ALL
-        .into_iter()
-        .map(|stage| {
-            let counters = &unavailable_pg_batch_metrics()[stage.index()];
-            UnavailablePgBatchMetricSample {
-                stage,
-                submitted_total: counters.submitted_total.load(Ordering::Relaxed),
-                applied_total: counters.applied_total.load(Ordering::Relaxed),
-                replayed_total: counters.replayed_total.load(Ordering::Relaxed),
-                rejected_total: counters.rejected_total.load(Ordering::Relaxed),
-                members_total: counters.members_total.load(Ordering::Relaxed),
-                members_max: counters.members_max.load(Ordering::Relaxed),
-                encoded_bytes_total: counters.encoded_bytes_total.load(Ordering::Relaxed),
-                encoded_bytes_max: counters.encoded_bytes_max.load(Ordering::Relaxed),
-                encoded_fill_ppm_total: counters.encoded_fill_ppm_total.load(Ordering::Relaxed),
-                encoded_fill_ppm_max: counters.encoded_fill_ppm_max.load(Ordering::Relaxed),
-                epoch_advance_total: counters.epoch_advance_total.load(Ordering::Relaxed),
-                recovered_pg_total: counters.recovered_pg_total.load(Ordering::Relaxed),
-            }
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(usize)]
-pub enum UnavailablePgWorkerStage {
-    #[default]
-    Prepare,
-    Authorization,
-    Stage,
-    Install,
-    Import,
-    Activation,
-    Tombstone,
-    Finalization,
-}
-
-impl UnavailablePgWorkerStage {
-    pub const ALL: [Self; 8] = [
-        Self::Prepare,
-        Self::Authorization,
-        Self::Stage,
-        Self::Install,
-        Self::Import,
-        Self::Activation,
-        Self::Tombstone,
-        Self::Finalization,
-    ];
-
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Prepare => "prepare",
-            Self::Authorization => "authorization",
-            Self::Stage => "stage",
-            Self::Install => "install",
-            Self::Import => "import",
-            Self::Activation => "activation",
-            Self::Tombstone => "tombstone",
-            Self::Finalization => "finalization",
-        }
-    }
-
-    fn index(self) -> usize {
-        self as usize
-    }
-}
-
-struct UnavailablePgWorkerStageMetricCounters {
-    total: AtomicU64,
-    succeeded_total: AtomicU64,
-    deferred_total: AtomicU64,
-    fatal_total: AtomicU64,
-    elapsed_us_total: AtomicU64,
-    elapsed_us_max: AtomicU64,
-}
-
-impl UnavailablePgWorkerStageMetricCounters {
-    fn new() -> Self {
-        Self {
-            total: AtomicU64::new(0),
-            succeeded_total: AtomicU64::new(0),
-            deferred_total: AtomicU64::new(0),
-            fatal_total: AtomicU64::new(0),
-            elapsed_us_total: AtomicU64::new(0),
-            elapsed_us_max: AtomicU64::new(0),
-        }
-    }
-}
-
-fn unavailable_pg_worker_stage_metrics(
-) -> &'static [UnavailablePgWorkerStageMetricCounters; UnavailablePgWorkerStage::ALL.len()] {
-    UNAVAILABLE_PG_WORKER_STAGE_METRICS
-        .get_or_init(|| std::array::from_fn(|_| UnavailablePgWorkerStageMetricCounters::new()))
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct UnavailablePgWorkerStageMetricSample {
-    pub stage: UnavailablePgWorkerStage,
-    pub total: u64,
-    pub succeeded_total: u64,
-    pub deferred_total: u64,
-    pub fatal_total: u64,
-    pub elapsed_us_total: u64,
-    pub elapsed_us_max: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnavailablePgWorkerStageOutcome {
-    Succeeded,
-    Deferred,
-    Fatal,
-}
-
-pub fn record_unavailable_pg_worker_stage(
-    stage: UnavailablePgWorkerStage,
-    outcome: UnavailablePgWorkerStageOutcome,
-    elapsed: Duration,
-) {
-    let counters = &unavailable_pg_worker_stage_metrics()[stage.index()];
-    let elapsed_us = elapsed_us(elapsed);
-    counters.total.fetch_add(1, Ordering::Relaxed);
-    match outcome {
-        UnavailablePgWorkerStageOutcome::Succeeded => {
-            counters.succeeded_total.fetch_add(1, Ordering::Relaxed);
-        }
-        UnavailablePgWorkerStageOutcome::Deferred => {
-            counters.deferred_total.fetch_add(1, Ordering::Relaxed);
-        }
-        UnavailablePgWorkerStageOutcome::Fatal => {
-            counters.fatal_total.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    counters
-        .elapsed_us_total
-        .fetch_add(elapsed_us, Ordering::Relaxed);
-    fetch_max_atomic(&counters.elapsed_us_max, elapsed_us);
-}
-
-#[must_use]
-pub fn unavailable_pg_worker_stage_metrics_snapshot() -> Vec<UnavailablePgWorkerStageMetricSample> {
-    UnavailablePgWorkerStage::ALL
-        .into_iter()
-        .map(|stage| {
-            let counters = &unavailable_pg_worker_stage_metrics()[stage.index()];
-            UnavailablePgWorkerStageMetricSample {
-                stage,
-                total: counters.total.load(Ordering::Relaxed),
-                succeeded_total: counters.succeeded_total.load(Ordering::Relaxed),
-                deferred_total: counters.deferred_total.load(Ordering::Relaxed),
-                fatal_total: counters.fatal_total.load(Ordering::Relaxed),
-                elapsed_us_total: counters.elapsed_us_total.load(Ordering::Relaxed),
-                elapsed_us_max: counters.elapsed_us_max.load(Ordering::Relaxed),
-            }
-        })
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct UnavailablePgWorkerQueueMetricSnapshot {
-    pub pending_transfer_depth: u64,
-    pub in_flight_transfer_depth: u64,
-    pub prepared_artifact_depth: u64,
-    pub prepared_artifact_bytes: u64,
-    pub staged_install_depth: u64,
-    pub staged_install_bytes: u64,
-    pub ready_activation_depth: u64,
-    pub pending_finalization_depth: u64,
-    pub deferred_depth: u64,
-    pub blocked_depth: u64,
-}
-
-pub fn record_unavailable_pg_worker_queue(snapshot: UnavailablePgWorkerQueueMetricSnapshot) {
-    UNAVAILABLE_PG_PENDING_TRANSFER_DEPTH.store(snapshot.pending_transfer_depth, Ordering::Relaxed);
-    UNAVAILABLE_PG_IN_FLIGHT_TRANSFER_DEPTH
-        .store(snapshot.in_flight_transfer_depth, Ordering::Relaxed);
-    UNAVAILABLE_PG_PREPARED_ARTIFACT_DEPTH
-        .store(snapshot.prepared_artifact_depth, Ordering::Relaxed);
-    UNAVAILABLE_PG_PREPARED_ARTIFACT_BYTES
-        .store(snapshot.prepared_artifact_bytes, Ordering::Relaxed);
-    UNAVAILABLE_PG_STAGED_INSTALL_DEPTH.store(snapshot.staged_install_depth, Ordering::Relaxed);
-    UNAVAILABLE_PG_STAGED_INSTALL_BYTES.store(snapshot.staged_install_bytes, Ordering::Relaxed);
-    UNAVAILABLE_PG_READY_ACTIVATION_DEPTH.store(snapshot.ready_activation_depth, Ordering::Relaxed);
-    UNAVAILABLE_PG_PENDING_FINALIZATION_DEPTH
-        .store(snapshot.pending_finalization_depth, Ordering::Relaxed);
-    UNAVAILABLE_PG_DEFERRED_DEPTH.store(snapshot.deferred_depth, Ordering::Relaxed);
-    UNAVAILABLE_PG_BLOCKED_DEPTH.store(snapshot.blocked_depth, Ordering::Relaxed);
-}
-
-#[must_use]
-pub fn unavailable_pg_worker_queue_metrics_snapshot() -> UnavailablePgWorkerQueueMetricSnapshot {
-    UnavailablePgWorkerQueueMetricSnapshot {
-        pending_transfer_depth: UNAVAILABLE_PG_PENDING_TRANSFER_DEPTH.load(Ordering::Relaxed),
-        in_flight_transfer_depth: UNAVAILABLE_PG_IN_FLIGHT_TRANSFER_DEPTH.load(Ordering::Relaxed),
-        prepared_artifact_depth: UNAVAILABLE_PG_PREPARED_ARTIFACT_DEPTH.load(Ordering::Relaxed),
-        prepared_artifact_bytes: UNAVAILABLE_PG_PREPARED_ARTIFACT_BYTES.load(Ordering::Relaxed),
-        staged_install_depth: UNAVAILABLE_PG_STAGED_INSTALL_DEPTH.load(Ordering::Relaxed),
-        staged_install_bytes: UNAVAILABLE_PG_STAGED_INSTALL_BYTES.load(Ordering::Relaxed),
-        ready_activation_depth: UNAVAILABLE_PG_READY_ACTIVATION_DEPTH.load(Ordering::Relaxed),
-        pending_finalization_depth: UNAVAILABLE_PG_PENDING_FINALIZATION_DEPTH
-            .load(Ordering::Relaxed),
-        deferred_depth: UNAVAILABLE_PG_DEFERRED_DEPTH.load(Ordering::Relaxed),
-        blocked_depth: UNAVAILABLE_PG_BLOCKED_DEPTH.load(Ordering::Relaxed),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MetadataTransferStagingCapacityMetricSnapshot {
-    pub entry_depth: u64,
-    pub artifact_bytes: u64,
-}
-
-pub fn record_metadata_transfer_staging_capacity(entry_depth: usize, artifact_bytes: u64) {
-    METADATA_TRANSFER_STAGING_ENTRY_DEPTH.store(
-        u64::try_from(entry_depth).unwrap_or(u64::MAX),
-        Ordering::Relaxed,
-    );
-    METADATA_TRANSFER_STAGING_ARTIFACT_BYTES.store(artifact_bytes, Ordering::Relaxed);
-}
-
-#[must_use]
-pub fn metadata_transfer_staging_capacity_metrics_snapshot(
-) -> MetadataTransferStagingCapacityMetricSnapshot {
-    MetadataTransferStagingCapacityMetricSnapshot {
-        entry_depth: METADATA_TRANSFER_STAGING_ENTRY_DEPTH.load(Ordering::Relaxed),
-        artifact_bytes: METADATA_TRANSFER_STAGING_ARTIFACT_BYTES.load(Ordering::Relaxed),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MetadataTransferStagingRetentionMetricSnapshot {
-    pub retained_page_depth: u64,
-    pub retained_segment_depth: u64,
-    pub retained_anchor_depth: u64,
-    pub retained_evidence_depth: u64,
-    pub finalized_floor_depth: u64,
-    pub active_closure_depth: u64,
-    pub retired_closure_depth: u64,
-    pub prune_applied_total: u64,
-}
-
-pub fn record_metadata_transfer_staging_retention(
-    snapshot: MetadataTransferStagingRetentionMetricSnapshot,
-    pruned: bool,
-) {
-    METADATA_TRANSFER_STAGING_RETAINED_PAGE_DEPTH
-        .store(snapshot.retained_page_depth, Ordering::Relaxed);
-    METADATA_TRANSFER_STAGING_RETAINED_SEGMENT_DEPTH
-        .store(snapshot.retained_segment_depth, Ordering::Relaxed);
-    METADATA_TRANSFER_STAGING_RETAINED_ANCHOR_DEPTH
-        .store(snapshot.retained_anchor_depth, Ordering::Relaxed);
-    METADATA_TRANSFER_STAGING_RETAINED_EVIDENCE_DEPTH
-        .store(snapshot.retained_evidence_depth, Ordering::Relaxed);
-    METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_DEPTH
-        .store(snapshot.finalized_floor_depth, Ordering::Relaxed);
-    METADATA_TRANSFER_STAGING_ACTIVE_CLOSURE_DEPTH
-        .store(snapshot.active_closure_depth, Ordering::Relaxed);
-    METADATA_TRANSFER_STAGING_RETIRED_CLOSURE_DEPTH
-        .store(snapshot.retired_closure_depth, Ordering::Relaxed);
-    if pruned {
-        METADATA_TRANSFER_STAGING_RETENTION_PRUNE_TOTAL.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-#[must_use]
-pub fn metadata_transfer_staging_retention_metrics_snapshot(
-) -> MetadataTransferStagingRetentionMetricSnapshot {
-    MetadataTransferStagingRetentionMetricSnapshot {
-        retained_page_depth: METADATA_TRANSFER_STAGING_RETAINED_PAGE_DEPTH.load(Ordering::Relaxed),
-        retained_segment_depth: METADATA_TRANSFER_STAGING_RETAINED_SEGMENT_DEPTH
-            .load(Ordering::Relaxed),
-        retained_anchor_depth: METADATA_TRANSFER_STAGING_RETAINED_ANCHOR_DEPTH
-            .load(Ordering::Relaxed),
-        retained_evidence_depth: METADATA_TRANSFER_STAGING_RETAINED_EVIDENCE_DEPTH
-            .load(Ordering::Relaxed),
-        finalized_floor_depth: METADATA_TRANSFER_STAGING_FINALIZED_FLOOR_DEPTH
-            .load(Ordering::Relaxed),
-        active_closure_depth: METADATA_TRANSFER_STAGING_ACTIVE_CLOSURE_DEPTH
-            .load(Ordering::Relaxed),
-        retired_closure_depth: METADATA_TRANSFER_STAGING_RETIRED_CLOSURE_DEPTH
-            .load(Ordering::Relaxed),
-        prune_applied_total: METADATA_TRANSFER_STAGING_RETENTION_PRUNE_TOTAL
-            .load(Ordering::Relaxed),
-    }
+pub fn record_unavailable_pg_reconciliation_fatal() {
+    UNAVAILABLE_PG_RECONCILIATION_FATAL_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 impl ControlPlaneRpcMetricCounters {
@@ -3294,6 +2862,14 @@ pub struct MetricsSnapshot {
     pub background_work_active_total: u64,
     pub background_work_finished_total: u64,
     pub background_work_elapsed_us_total: u64,
+    pub unavailable_pg_reconciliation_in_flight: u64,
+    pub unavailable_pg_reconciliation_dispatched_total: u64,
+    pub unavailable_pg_reconciliation_transfer_succeeded_total: u64,
+    pub unavailable_pg_reconciliation_completion_succeeded_total: u64,
+    pub unavailable_pg_reconciliation_deferred_total: u64,
+    pub unavailable_pg_reconciliation_fatal_total: u64,
+    pub unavailable_pg_reconciliation_transfer_us_total: u64,
+    pub unavailable_pg_reconciliation_transfer_us_max: u64,
     pub stream_upload_active_sessions: u64,
     pub stream_upload_session_created_total: u64,
     pub stream_upload_session_aborted_total: u64,
@@ -3659,6 +3235,38 @@ impl MetricsSnapshot {
             (
                 "background_work_elapsed_us_total",
                 self.background_work_elapsed_us_total,
+            ),
+            (
+                "unavailable_pg_reconciliation_in_flight",
+                self.unavailable_pg_reconciliation_in_flight,
+            ),
+            (
+                "unavailable_pg_reconciliation_dispatched_total",
+                self.unavailable_pg_reconciliation_dispatched_total,
+            ),
+            (
+                "unavailable_pg_reconciliation_transfer_succeeded_total",
+                self.unavailable_pg_reconciliation_transfer_succeeded_total,
+            ),
+            (
+                "unavailable_pg_reconciliation_completion_succeeded_total",
+                self.unavailable_pg_reconciliation_completion_succeeded_total,
+            ),
+            (
+                "unavailable_pg_reconciliation_deferred_total",
+                self.unavailable_pg_reconciliation_deferred_total,
+            ),
+            (
+                "unavailable_pg_reconciliation_fatal_total",
+                self.unavailable_pg_reconciliation_fatal_total,
+            ),
+            (
+                "unavailable_pg_reconciliation_transfer_us_total",
+                self.unavailable_pg_reconciliation_transfer_us_total,
+            ),
+            (
+                "unavailable_pg_reconciliation_transfer_us_max",
+                self.unavailable_pg_reconciliation_transfer_us_max,
             ),
             (
                 "stream_upload_active_sessions",
@@ -4043,6 +3651,22 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         background_work_active_total: BACKGROUND_WORK_ACTIVE_TOTAL.load(Ordering::Relaxed),
         background_work_finished_total: BACKGROUND_WORK_FINISHED_TOTAL.load(Ordering::Relaxed),
         background_work_elapsed_us_total: BACKGROUND_WORK_ELAPSED_US_TOTAL.load(Ordering::Relaxed),
+        unavailable_pg_reconciliation_in_flight: UNAVAILABLE_PG_RECONCILIATION_IN_FLIGHT
+            .load(Ordering::Relaxed),
+        unavailable_pg_reconciliation_dispatched_total:
+            UNAVAILABLE_PG_RECONCILIATION_DISPATCHED_TOTAL.load(Ordering::Relaxed),
+        unavailable_pg_reconciliation_transfer_succeeded_total:
+            UNAVAILABLE_PG_RECONCILIATION_TRANSFER_SUCCEEDED_TOTAL.load(Ordering::Relaxed),
+        unavailable_pg_reconciliation_completion_succeeded_total:
+            UNAVAILABLE_PG_RECONCILIATION_COMPLETION_SUCCEEDED_TOTAL.load(Ordering::Relaxed),
+        unavailable_pg_reconciliation_deferred_total: UNAVAILABLE_PG_RECONCILIATION_DEFERRED_TOTAL
+            .load(Ordering::Relaxed),
+        unavailable_pg_reconciliation_fatal_total: UNAVAILABLE_PG_RECONCILIATION_FATAL_TOTAL
+            .load(Ordering::Relaxed),
+        unavailable_pg_reconciliation_transfer_us_total:
+            UNAVAILABLE_PG_RECONCILIATION_TRANSFER_US_TOTAL.load(Ordering::Relaxed),
+        unavailable_pg_reconciliation_transfer_us_max:
+            UNAVAILABLE_PG_RECONCILIATION_TRANSFER_US_MAX.load(Ordering::Relaxed),
         stream_upload_active_sessions: STREAM_UPLOAD_ACTIVE_SESSIONS.load(Ordering::Relaxed),
         stream_upload_session_created_total: STREAM_UPLOAD_SESSION_CREATED_TOTAL
             .load(Ordering::Relaxed),
@@ -5633,75 +5257,6 @@ macro_rules! trace_scope {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unavailable_pg_metrics_preserve_batch_and_stage_dimensions() {
-        let batch_before = unavailable_pg_batch_metrics_snapshot();
-        let stage = UnavailablePgBatchStage::Install;
-        let before = batch_before[stage.index()];
-        record_unavailable_pg_batch_submission(stage, 7, 65_536, 131_072);
-        record_unavailable_pg_batch_committed(stage, true, 1, 7);
-        record_unavailable_pg_batch_committed(stage, false, 0, 7);
-        record_unavailable_pg_batch_rejected(stage);
-        let after = unavailable_pg_batch_metrics_snapshot()[stage.index()];
-        assert_eq!(after.submitted_total, before.submitted_total + 1);
-        assert_eq!(after.applied_total, before.applied_total + 1);
-        assert_eq!(after.replayed_total, before.replayed_total + 1);
-        assert_eq!(after.rejected_total, before.rejected_total + 1);
-        assert_eq!(after.members_total, before.members_total + 7);
-        assert!(after.members_max >= 7);
-        assert_eq!(
-            after.encoded_bytes_total,
-            before.encoded_bytes_total + 65_536
-        );
-        assert!(after.encoded_bytes_max >= 65_536);
-        assert_eq!(
-            after.encoded_fill_ppm_total,
-            before.encoded_fill_ppm_total + 500_000
-        );
-        assert!(after.encoded_fill_ppm_max >= 500_000);
-        assert_eq!(after.epoch_advance_total, before.epoch_advance_total + 1);
-
-        let worker_stage = UnavailablePgWorkerStage::Activation;
-        let before = unavailable_pg_worker_stage_metrics_snapshot()[worker_stage.index()];
-        record_unavailable_pg_worker_stage(
-            worker_stage,
-            UnavailablePgWorkerStageOutcome::Deferred,
-            Duration::from_micros(41),
-        );
-        let after = unavailable_pg_worker_stage_metrics_snapshot()[worker_stage.index()];
-        assert_eq!(after.total, before.total + 1);
-        assert_eq!(after.deferred_total, before.deferred_total + 1);
-        assert_eq!(after.elapsed_us_total, before.elapsed_us_total + 41);
-        assert!(after.elapsed_us_max >= 41);
-
-        let retention_before = metadata_transfer_staging_retention_metrics_snapshot();
-        record_metadata_transfer_staging_retention(
-            MetadataTransferStagingRetentionMetricSnapshot {
-                retained_page_depth: 11,
-                retained_segment_depth: 12,
-                retained_anchor_depth: 13,
-                retained_evidence_depth: 14,
-                finalized_floor_depth: 15,
-                active_closure_depth: 16,
-                retired_closure_depth: 17,
-                prune_applied_total: 0,
-            },
-            true,
-        );
-        let retention_after = metadata_transfer_staging_retention_metrics_snapshot();
-        assert_eq!(retention_after.retained_page_depth, 11);
-        assert_eq!(retention_after.retained_segment_depth, 12);
-        assert_eq!(retention_after.retained_anchor_depth, 13);
-        assert_eq!(retention_after.retained_evidence_depth, 14);
-        assert_eq!(retention_after.finalized_floor_depth, 15);
-        assert_eq!(retention_after.active_closure_depth, 16);
-        assert_eq!(retention_after.retired_closure_depth, 17);
-        assert_eq!(
-            retention_after.prune_applied_total,
-            retention_before.prune_applied_total + 1
-        );
-    }
     use std::sync::Mutex;
 
     static METRICS_TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -7271,6 +6826,48 @@ mod tests {
         assert!(records
             .iter()
             .any(|record| record.detail == format!("index={}", FLIGHT_RECORDER_CAPACITY + 7)));
+    }
+
+    #[test]
+    fn unavailable_pg_reconciliation_metrics_record_singleton_progress() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let before = metrics_snapshot();
+
+        set_unavailable_pg_reconciliation_in_flight(3);
+        record_unavailable_pg_reconciliation_dispatch();
+        record_unavailable_pg_reconciliation_transfer(Duration::from_micros(17), true);
+        record_unavailable_pg_reconciliation_completion();
+        record_unavailable_pg_reconciliation_deferred();
+        record_unavailable_pg_reconciliation_fatal();
+
+        let after = metrics_snapshot();
+        assert_eq!(after.unavailable_pg_reconciliation_in_flight, 3);
+        assert_eq!(
+            after.unavailable_pg_reconciliation_dispatched_total,
+            before.unavailable_pg_reconciliation_dispatched_total + 1
+        );
+        assert_eq!(
+            after.unavailable_pg_reconciliation_transfer_succeeded_total,
+            before.unavailable_pg_reconciliation_transfer_succeeded_total + 1
+        );
+        assert_eq!(
+            after.unavailable_pg_reconciliation_completion_succeeded_total,
+            before.unavailable_pg_reconciliation_completion_succeeded_total + 1
+        );
+        assert_eq!(
+            after.unavailable_pg_reconciliation_deferred_total,
+            before.unavailable_pg_reconciliation_deferred_total + 1
+        );
+        assert_eq!(
+            after.unavailable_pg_reconciliation_fatal_total,
+            before.unavailable_pg_reconciliation_fatal_total + 1
+        );
+        assert_eq!(
+            after.unavailable_pg_reconciliation_transfer_us_total,
+            before.unavailable_pg_reconciliation_transfer_us_total + 17
+        );
+        assert!(after.unavailable_pg_reconciliation_transfer_us_max >= 17);
+        set_unavailable_pg_reconciliation_in_flight(0);
     }
 
     #[test]

@@ -518,7 +518,6 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ShardHistoricalRead
         | StorageRpcMessageKind::ShardReadRange
         | StorageRpcMessageKind::ReadHandlesAcquire
-        | StorageRpcMessageKind::MetadataTransferStagingArtifactRead
         | StorageRpcMessageKind::BucketDeleteReplicaHead
         | StorageRpcMessageKind::BucketHeadRaw
         | StorageRpcMessageKind::BucketHeadInfo
@@ -653,10 +652,6 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
         | StorageRpcMessageKind::MetadataCommandPgLockAcquire
         | StorageRpcMessageKind::MetadataCommandPgLockRelease
-        | StorageRpcMessageKind::MetadataTransferStagingIntentCreate
-        | StorageRpcMessageKind::MetadataTransferStagingArtifactPublish
-        | StorageRpcMessageKind::MetadataTransferStagingProofPublish
-        | StorageRpcMessageKind::MetadataTransferStagingTombstone
         | StorageRpcMessageKind::ReadHandlesRelease
         | StorageRpcMessageKind::ObjectPayloadLeaseControl
         | StorageRpcMessageKind::ClaimHeartbeat
