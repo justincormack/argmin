@@ -28,9 +28,10 @@ not replace private modules with broadly public crate APIs.
 
 Today these components still share `storage` with cluster routing, replication,
 control-plane/Raft code, and maintenance orchestration. Node code depends on
-shared types and command/proof definitions. The metadata-transfer staging
-outbox also connects a SQLite-backed store to a control-plane client. Moving
-the module tree without resolving these dependencies would create cycles.
+shared types and command/proof definitions. Live PG metadata transfer spans
+node-owned checkpoint/log export and import, transient artifact/proof
+validation, and durable control-plane transfer-route publication. Moving the
+module tree without separating those responsibilities would create cycles.
 
 ## Target Dependency Shape
 
@@ -62,14 +63,14 @@ database records merely to make compilation succeed.
 | Area | Target owner | Boundary |
 | --- | --- | --- |
 | PgStore, SQLite driver, SQL, schema/catalogue, row decoding, transactions, digest caches, database errors | `storage-node` | Private implementation; no connection, transaction, row, SQL callback, or driver-error escape. |
-| Metadata-transfer staging database, local artifact files, evidence persistence, receipt persistence, and restart validation | `storage-node` | Bounded semantic operations and opaque handles, not access to the staging store. |
+| Metadata-transfer source export and destination checkpoint/log import in per-PG SQLite | `storage-node` | Bounded semantic export/import operations. Transfer artifacts are transient proof-bound carriers, not a node-owned persistent staging store. |
 | Shard files, local read fences, local reservations, node identity/locks, local layout, synchronization, and local recovery | `storage-node` | Capabilities retain the exact local owner and lifetime; release and cleanup run against that owner. |
 | Storage-node RPC framing, authentication binding, operation codecs, server dispatch, and local/remote client adapters | `storage-node` | Keep byte codecs private; expose scoped client/server construction and typed operations. Local and remote adapters implement the same contracts. |
 | Installed node-route publication, node-local route admission, and server-local capability minting | `storage-node` | Own `StorageNodeRouteAdmissionGate` independently of cluster admission. Validate caller-supplied route evidence against installed node state and bind each server-local capability to this gate. |
 | Replicated metadata-command logical model and canonical command encoding; shared proof/carrier definitions | `storage-contracts` | One owner for encoding and validation. Opaque encoded carriers may cross to persistence/transport; raw row models do not. Command application remains node-owned; publication/recovery coordination remains distributed. |
 | Shared node identities, operation contracts, and semantic results | `storage-contracts` | Extract only definitions actually needed by both sides. Retain logical types in their existing domain crates where appropriate. |
-| Cluster route publication/admission, acting sets, replication/fanout, command convergence, placement, repair/backfill/reclaim orchestration, and live transfer orchestration | `storage` | Own `StorageClusterRouteAdmission` for distributed work. Use node operations; cannot mint node-local admission authority, open stores, or perform physical mutations around the existing state machines. |
-| Control-plane authority, Raft, leases, cluster certification, and operator workflows | `storage` | Remain in this crate for now; no general control-plane client or authority dependency from the node engine. |
+| Cluster route publication/admission, acting sets, replication/fanout, command convergence, placement, repair/backfill/reclaim orchestration, live transfer orchestration, and transient transfer artifact/proof validation | `storage` | Own `StorageClusterRouteAdmission` for distributed work. Use node operations; cannot mint node-local admission authority, open stores, or perform physical mutations around the existing state machines. |
+| Control-plane authority, Raft, leases, cluster certification, durable transfer-route/proof publication, and operator workflows | `storage` | Remain in this crate for now; no general control-plane client or authority dependency from the node engine. |
 | Existing S3-facing logical storage API and bootstrap facade | `storage` | Preserve caller semantics and bounded failures; no new PG/EC/database exposure to coordinator or HTTP code. |
 
 Cluster admission and node admission are separate security boundaries, not two
@@ -87,22 +88,27 @@ admission belongs to distributed orchestration. Node-local admission remains
 required for execution. Moving physical code must not create a
 public unclaimed repair/delete shortcut.
 
-The same distinction applies to staging evidence: node-owned persistence can
-produce an opaque bounded page; `storage` coordinates its authenticated
-publication and records the validated receipt through a node operation. Where
-node startup needs control-plane services, inject a narrow contract implemented
-by the composition layer rather than adding a reverse crate dependency.
+The same distinction applies to live PG metadata transfer: node-owned
+persistence can export or import a bounded opaque carrier, while `storage`
+validates the artifact and proofs, durably publishes the transfer route through
+the control plane, and coordinates exact destination convergence. The carrier
+is transient; restart re-exports it from the retained source authority and
+checks it against the durable transfer proof. Where node startup needs
+control-plane services, inject a narrow contract implemented by the composition
+layer rather than adding a reverse crate dependency.
 
 ## Phase 0 — Close the Extraction Inventory
 
 - [ ] Inventory production and test dependencies of `node_runtime`, including
-  engine/client/server facades, PgStore, staging, local filesystem utilities,
-  RPC/authentication helpers, and all `crate::` references into distributed code.
+  engine/client/server facades, PgStore, metadata-transfer export/import, local
+  filesystem utilities, RPC/authentication helpers, and all `crate::`
+  references into distributed code.
 - [ ] Assign every moved type, codec, error, capability constructor, and test
   facility to exactly one owner. Expand the ownership table into a concrete
   module/API move list before editing Cargo manifests.
 - [ ] Identify the minimal contracts set. Separate logical values from durable
-  rows and distinguish evidence carriers from capabilities that authorize work.
+  rows and distinguish transient artifact/proof carriers from capabilities that
+  authorize work.
 - [ ] Resolve command/proof dependencies without relocating control-plane
   snapshots, Raft internals, or physical rows wholesale into contracts.
 - [ ] Define who may mint each capability and how the receiver validates it.
@@ -111,8 +117,10 @@ by the composition layer rather than adding a reverse crate dependency.
   Inventory cluster and node admission gates separately, including installed
   node-route publication and every server-local capability constructor.
 - [ ] Inventory node-to-control-plane calls and decide the narrow injected
-  interface or composition-layer operation for each, including staging outbox,
-  heartbeat/refresh, bootstrap, and recovery paths.
+  interface or composition-layer operation for each, including
+  heartbeat/refresh, bootstrap, and recovery paths. Keep live-transfer
+  route/proof publication in `storage`; expose node-owned source export and
+  destination import only through scoped semantic operations.
 - [ ] Map every affected format to its new owner in the
   [format ledger](../guides/storage-format-ledger.md), including nested command,
   proof, checkpoint, digest, RPC, and filesystem formats.
@@ -144,12 +152,14 @@ representation authority, or new caller-visible physical state.
 
 ## Phase 2 — Extract the Node Implementation
 
-- [ ] Move the engine, PgStore, shard implementation, staging persistence,
-  storage-node server, and local/remote adapters into `storage-node` in bounded,
-  coherent slices. Preserve private descendant-only boundaries inside it.
+- [ ] Move the engine, PgStore, shard implementation, metadata-transfer
+  checkpoint/log export and import, storage-node server, and local/remote
+  adapters into `storage-node` in bounded, coherent slices. Preserve private
+  descendant-only boundaries inside it.
 - [ ] Move `rusqlite` and SQLite feature configuration out of `storage` and into
-  the node crate. All SQL, including test corruption setup and staging SQL,
-  belongs there; distributed code must not acquire a SQLite dev-dependency.
+  the node crate. All SQL, including test corruption setup and
+  metadata-transfer import/adoption SQL, belongs there; distributed code must
+  not acquire a SQLite dev-dependency.
 - [ ] Move local state/layout/recovery helpers to their assigned owner and keep
   shared filesystem/transport utilities at the lowest non-cyclic owner required
   by the inventory. Do not copy helpers to avoid choosing ownership.

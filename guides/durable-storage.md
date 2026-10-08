@@ -274,23 +274,23 @@ durability. Reclaim, repair, and backfill use durable metadata plus
 deletion-exclusion leases so a file cannot be removed while a permitted reader
 or writer still depends on it.
 
-### Metadata-transfer staging store
+### Live PG metadata transfer
 
-The staging store lives under the storage-node data directory and is a
-separate durable subsystem:
+Live PG metadata transfer does not own a separate persistent staging store.
+The exported `PgMetadataTransferArtifact` is transient process state assembled
+from the authoritative source PG's retained command log or checkpoint in
+`metadata.db`.
 
-| Artifact | Classification | Current durability and recovery contract |
-| --- | --- | --- |
-| `metadata-transfer-staging.established` | Authoritative establishment marker | Published only after the staging root is initialized and synced. Prevents a missing or partial root from being silently recreated as a new store. |
-| `metadata-transfer-staging/manifest` | Authoritative store identity/format | Integrity-bound manifest naming the store format and identity. Written through temp-file sync, rename, and directory sync. |
-| `metadata-transfer-staging/initialized` | Authoritative initialization marker | Distinguishes a fully initialized catalogue from interrupted construction. |
-| `metadata-transfer-staging/catalogue.db` and companions | Authoritative staging metadata | SQLite WAL with `synchronous=FULL`. Tracks intents, evidence, receipts, publication, tombstones, closure, and capacity. |
-| `metadata-transfer-staging/artifacts/<intent-derived-name>` | Durable staging payload | Bounded, digested metadata-transfer artifacts. File durability precedes catalogue publication; tombstoning and physical removal preserve exact replay evidence and restart convergence. |
-| `metadata-transfer-staging/quarantine/` entries | Recoverable diagnostic residue | Bounded and owner-controlled. Quarantine is not publication authority and cannot be interpreted as a valid artifact. |
-
-The catalogue and artifact are not independently replaceable backup units.
-Recovery validates their exact relationship and fails closed on missing,
-crossed, corrupt, or unexplained established state.
+Before destination import, the control plane durably installs a transfer route
+binding the exact source proof and expected destination proof. Each destination
+then installs the checkpoint and/or replays the transferred commands through
+its own `metadata.db` transactions. Transfer completion is reported only after
+the destination acting set agrees on the exact imported proof. If the process
+fails between route installation and import completion, recovery re-exports
+from the retained source authority and rejects an artifact that does not match
+the installed transfer proof. The source and destination PG databases plus the
+control-plane state are therefore the durable recovery set; there is no
+independently restorable transfer-artifact file or catalogue.
 
 ### Single-authority control plane
 
@@ -355,7 +355,7 @@ the inventory. It is deliberately a source map, not a second format ledger:
 | Storage-node incarnation and persisted runtime configuration | [`storage_node_server/session.rs`](../crates/storage/src/storage_node_server/session.rs) and [`storage_node_server/config.rs`](../crates/storage/src/storage_node_server/config.rs) |
 | Static storage-directory identity and transition markers | [`static_cluster_state.rs`](../crates/argmin-s3/src/static_cluster_state.rs) |
 | Standalone route identity and transition markers | [`standalone.rs`](../crates/storage/src/standalone.rs) |
-| Metadata-transfer staging catalogue and artifacts | [`pg_store/metadata_transfer_staging.rs`](../crates/storage/src/pg_store/metadata_transfer_staging.rs) |
+| Live PG metadata-transfer ordering, proof validation, route persistence, and durable import | [`live_pg_transfer.rs`](../crates/storage/src/live_pg_transfer.rs), [`peering.rs`](../crates/storage/src/peering.rs), [`control_plane.rs`](../crates/storage/src/control_plane.rs), [`cluster/metadata_operations.rs`](../crates/storage/src/cluster/metadata_operations.rs), and [`pg_store/command_log.rs`](../crates/storage/src/pg_store/command_log.rs) |
 | Single-authority state set | [`control_plane/single_authority.rs`](../crates/storage/src/control_plane/single_authority.rs) and [`durable_journal.rs`](../crates/storage/src/durable_journal.rs) |
 | Raft restart state, WAL, sentinel, and clock checkpoint | [`control_plane_raft.rs`](../crates/storage/src/control_plane_raft.rs) and [`durable_journal.rs`](../crates/storage/src/durable_journal.rs) |
 | Outer static control-plane identity and process locks | [`static_cluster_state.rs`](../crates/argmin-s3/src/static_cluster_state.rs) and [`main.rs`](../crates/argmin-s3/src/main.rs) |
@@ -374,7 +374,7 @@ map, the inventory, format evidence, and the relevant recovery tests together.
 | Raft log mutation | OpenRaft durability completion only after the corresponding WAL durability operation |
 | checkpoint replacement | complete temporary file sync, atomic rename, and parent-directory sync, with its journal/WAL offset relationship preserved |
 | storage-node runtime-config replacement | complete staging-file `sync_all`, atomic rename, and storage-node data-directory sync before the installed route state becomes visible |
-| staged transfer publication | durable artifact plus durable catalogue transition, in the owner-defined order, before returning publication evidence |
+| live PG metadata transfer | durable control-plane transfer proof plus destination-PG SQLite commits across the destination acting set, with the exact imported proof verified before reporting completion; the exported artifact is transient and restart re-exports it from retained source authority |
 | authority-clock recovery | replacement clock checkpoint and directory entry durable before restored serving authority is acknowledged |
 
 ## Known gaps and required follow-up
