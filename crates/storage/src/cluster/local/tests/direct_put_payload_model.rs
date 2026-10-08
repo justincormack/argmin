@@ -12,6 +12,9 @@ use std::cell::RefCell;
 #[path = "direct_put_cancellation_model.rs"]
 mod cancellation_model;
 
+#[path = "direct_put_cleanup_progress.rs"]
+mod cleanup_progress;
+
 const DATA: [&[u8]; 2] = [b"owner A staged body", b"owner B different staged body"];
 const REQUIRED: [&str; 6] = [
     "ordinary drop releases only its own staging",
@@ -392,7 +395,17 @@ impl Fixture {
         payload: crate::DirectPutPayloadWrite<'_>,
     ) -> Result<MetadataCommandEnvelope, String> {
         let prepared = self.prepared(owner);
-        let command = self.install_matching_pending(owner, &payload, &prepared)?;
+        self.leave_pending_with_prepared_after_inspection_failure(owner, route, payload, &prepared)
+    }
+
+    fn leave_pending_with_prepared_after_inspection_failure(
+        &self,
+        owner: usize,
+        route: &crate::ActivePutObjectRoute<'_>,
+        payload: crate::DirectPutPayloadWrite<'_>,
+        prepared: &crate::PreparedDirectPutObjectCommit,
+    ) -> Result<MetadataCommandEnvelope, String> {
+        let command = self.install_matching_pending(owner, &payload, prepared)?;
         let expected_command = command.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let observed_calls = Arc::clone(&calls);
@@ -416,7 +429,7 @@ impl Fixture {
                     .into())
                 },
             ));
-        let result = route.commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()));
+        let result = route.commit_direct_object(payload, prepared, |_| Ok::<(), ()>(()));
         drop(hook);
         let error = result
             .err()

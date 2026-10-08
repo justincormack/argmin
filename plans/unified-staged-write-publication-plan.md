@@ -45,6 +45,50 @@ their metadata commands with each other.
 
 ## Design
 
+### Shared cleanup investigation before further implementation
+
+The [durable cleanup findings](durable-generation-cleanup-ownership.md) must be resolved through
+this plan rather than a direct-PUT-only physical write lifecycle. The unfinished metadata-owner
+and node-ticket prototypes have been removed. Only issue documentation and permanent regression
+tests remain; the known-failing tests are explicitly ignored pending a separately reviewed fix.
+No prototype format changes or production cleanup behavior are part of that evidence slice.
+
+Keep two separate obligations explicit:
+
+- A crash after writing shards but before recording their manifest is an existing consequence
+  of nontransactional shard and metadata publication. Orphan scanning is needed; this work does
+  not claim to eliminate that window or require one metadata command per physical write.
+- Cleanup must not certify that an owner is finished while an old prepared or already-dispatched
+  write can recreate payload after deletion. A recorded stream manifest does not by itself prove
+  physical write quiescence. Any scanner also needs a safe rule for racing late writes, without
+  deleting pending or committed payload.
+
+The permanent owner-local cases in `cluster/local/tests/late_stream_cleanup.rs` exercise both
+stream targets with the original route admission still live. They prepare a segment, finish
+session abort, then deliver the delayed physical write without frontend compensation. A second
+case first writes and publishes the segment, verifies its exact files and acknowledgement rows,
+aborts and verifies deletion, then delivers a delayed duplicate. This second schedule separates
+the fencing obligation from the unrecorded-manifest crash window. These are local production
+phase interleavings, not yet transport-gap or node-restart evidence.
+
+The focused run reproduced all four counterexamples: both targets accept the late write and
+leave all three 2+1 shard files present, with no durable acknowledgement rows and no session.
+The published-append cases first proved that both files and rows existed and that abort deleted
+them. The existing `failed_stream_append_after_session_abort_removes_all_staged_payload` and
+`failed_stream_append_placed_cleanup_failure_leaves_only_files` tests pass; they exercise the
+surviving caller's compensation, which does not establish safety after that caller disappears.
+The four stream safety regressions remain failing completion gates, now explicitly ignored with
+reasons pointing to the issue document. They are not a green verification result. No production
+cleanup behavior is changed by the retained investigation tests.
+
+Before resuming implementation, select one storage-owned write/cleanup exclusion contract for
+all three paths. Durable provenance may remain a reservation, stream session, or multipart
+owner; those differences must not produce independent physical fencing protocols. Reconcile the
+multipart cutoff/lease design below with the findings from the discarded experiment, including
+scanner ownership, node failure, restart, retained routes, and pending-command references. Retain the small-PUT
+cost constraint below: a change to its metadata protocol needs an explicit measured decision,
+not an incidental consequence of a direct-only fix.
+
 ### Opaque staged payloads
 
 Introduce storage-owned, non-cloneable staged payload capabilities:
@@ -58,7 +102,9 @@ write reservation, cleanup authority, and, for parts, upload ID and part number.
 
 Request-owned capabilities delete unowned shards and release reservations on failure. Durable
 session capabilities preserve the existing abort, heartbeat, sweeper, recovery, and retained
-cleanup behavior. Callers cannot extract shard identities or convert between ownership modes.
+cleanup behavior, subject to the common late-write exclusion gate above; existing session
+bookkeeping alone is not evidence that this gate is satisfied. Callers cannot extract shard
+identities or convert between ownership modes.
 
 The capability is only the live frontend representation. Terminal publication must not depend
 on that in-memory type surviving. For `StagedMultipartPartPayload` only, before the first
@@ -493,6 +539,8 @@ plan before implementing a boundary change.
 ## Implementation Slices
 
 1. **Baseline and inventory**
+   - complete the shared cleanup investigation above before extending a staging-specific fix;
+     retain the same late-write safety regressions for direct PUT and both stream targets
    - record command/RPC counts and latency for 5 MiB, exact 8 MiB, and representative larger
      UploadPart sizes
    - measure complete multipart uploads with repeated 8 MiB parts, not only isolated part latency
@@ -514,7 +562,8 @@ plan before implementing a boundary change.
    - add the object-PG cleanup-root state machine, expiry adopter, worker, route-history references,
      reservation-release convergence, and atomic terminal/claim transitions
    - advance the metadata-command encoding and exact-current rejection fixtures
-   - move the existing streamed path unchanged behind `CommitMultipartPart`
+   - move the existing streamed publication semantics behind `CommitMultipartPart`, using the
+     shared physical cleanup contract selected by the investigation above
    - add request-owned single-segment part staging only after the terminal path is shared
 4. **HTTP lazy promotion and cleanup**
    - delay UploadPart session creation until the body crosses one segment

@@ -1155,6 +1155,115 @@ boundary checker passed. After review, the full
 `cargo nextest run --locked --no-fail-fast` passed all 9,121 tests (1 slow,
 none skipped) in 230.947 s.
 
+### Discovery Experiment — Cleanup Without A Model-Supplied Retry
+
+The permanent regressions in
+[direct_put_cleanup_progress.rs](../crates/storage/src/cluster/local/tests/direct_put_cleanup_progress.rs)
+remove Increment 7's final test-scheduled reservation release. They use the same
+real admitted payload handles and retained authorized-recovery boundary, then run
+the production static pending-command scan, abandoned-stream scan, shard audit,
+and durable-reclaim scan. Recovery selects its own pending command. No background
+threads, sleeps, manual release retry, or production mutation are used.
+
+Both command owners and both cancellation forms (drop/discard) are exercised.
+Three maintenance passes before cancellation must preserve both live requests.
+After the production recovery scan finishes the pending owner, three additional
+healthy maintenance passes must release the cancelled request's reservation.
+The fixture checks complete reclaim scanning with no queued work left unprocessed,
+no stream sessions, and no retained recovery flight. The paired recovery-before-
+cancellation control verifies that ordinary cleanup succeeds once the slot is free.
+
+**New unresolved finding:** cancellation before authorized recovery loses the
+reservation-cleanup obligation. `DirectPutPayloadWrite::cleanup_on_owner()` deletes
+the caller's shards, attempts reservation release, and discards its error. The
+unrelated pending command's retained recovery flight prevents that release from
+proceeding; no release command or retry obligation is installed. Authorized
+recovery subsequently releases the pending owner's reservation, not the cancelled
+caller's. The inspected maintenance paths do not scan abandoned direct-PUT
+reservations: stream cleanup requires a stream-session record, and shard/reclaim
+scans have no reservation-only cleanup work.
+
+The focused discovery run produced **one failing test and one passing control**:
+`production_maintenance_releases_cancelled_direct_put_reservation_after_recovery`
+fails for all four owner/cancellation combinations. The first replica still has
+`Some(GenerationId(2))` when owner 0 commits, or `Some(GenerationId(1))` when owner
+1 commits, instead of no cancelled reservation. The regression now has an explicit
+`#[ignore]` reason while the fix is deferred; running it explicitly must still fail.
+It is not marked `should_panic`. This establishes a
+retained durable reservation, not object-data loss. Repeated occurrences can
+accumulate unused metadata; further effects are not established by this test.
+
+```bash
+cargo nextest run --locked -p storage -E 'test(production_maintenance_)' --run-ignored all --no-fail-fast --failure-output immediate
+```
+
+This is a deterministic production-path discovery regression, not a larger
+exhaustive model. Three healthy passes are bounded evidence, not an unbounded
+liveness proof; the source audit explains why additional identical passes have no
+cleanup obligation to discover. The retained-flight handoff is still scheduled
+explicitly rather than induced by transport/budget failure. Worker scheduling,
+process restart, and cleanup I/O failures remain outside this experiment.
+
+The next implementation decision is how storage retains and recovers the cleanup
+obligation after the caller disappears, including restart behavior, without
+collecting a still-live reservation or command-owned payload. Do not restore the
+model's manual retry as the fix or assume age alone proves abandonment. Any new
+durable representation must follow the versioning evidence/advancement rules.
+
+#### Fix Design Gate — Retain Ownership Before The Caller Disappears
+
+The unfinished durable fix was subsequently removed to separate issue evidence
+from implementation. The unresolved findings, delayed-write reproductions, and
+shared-design requirements are tracked in
+[durable-generation-cleanup-ownership.md](durable-generation-cleanup-ownership.md).
+Production retains its existing formats and cleanup behavior. The discovery test
+and delayed-write regressions are explicitly ignored, with the healthy control
+still enabled. A fix must converge with the unified staged-write publication plan.
+
+Source inspection for the fix found that `ReserveObjectGenerationCommand` and
+`object_generation_reservations` retain only the subject, reservation ID,
+generation, and creation timestamp. They do not retain a live-owner proof or a
+durable cancellation obligation. Adding an in-memory retry queue would repair
+the observed in-process schedule but would not repair restart cleanup. Writing
+an intent only after release fails also leaves a crash window before that intent
+is durable. An age-only reservation scan cannot distinguish a slow live PUT from
+an abandoned one.
+
+The proposed durable direction is to reuse the existing bucket-write authority:
+production direct PUT already holds it before reserving a generation. Bind the
+generation reservation to that owner durably at creation, and make storage-owned
+cleanup prove that caller ownership has ended and that no recoverable command
+still owns the reservation before releasing it through the command stream.
+This is a design candidate, not an implemented guarantee. Review the exact
+heartbeat/fencing, command-ownership transfer, and route-change rules before
+choosing the representation. The shared generation-reservation path also serves
+stream-session creation, so its pre-session failure window must be included.
+
+Required implementation evidence:
+
+- Keep the discovery regression's drop/discard and both-owner cases, without a
+  test-supplied release retry.
+- Preserve live ownership during maintenance, including a renewed owner; a
+  missing/unavailable ownership observation is not permission to reclaim.
+- Preserve a pending command's reservation and payload across cancellation,
+  publication ambiguity, recovery, and ownership transfer.
+- Restart after cancellation and before cleanup, and after a partial cleanup
+  attempt; cleanup must converge without recreating the original caller.
+- Cover cancellation before payload staging and stream-session creation, not
+  only drops of an already constructed direct-PUT handle.
+- Carry the cleanup authority through route changes and metadata transfer, or
+  prove the retained owner can still complete cleanup without stale mutation.
+- Keep cleanup bounded, retryable, and diagnosable when storage is unavailable;
+  a failed scan or release must not silently discard its obligation.
+- Inventory and advance every affected schema, command, checkpoint/digest, and
+  RPC format according to the selected representation, retaining parent-version
+  evidence. Do not change formats merely to support a process-local retry.
+
+Verification: the 18 focused existing explorer/publication-model tests and the
+healthy cleanup control passed. Storage all-targets/all-features Clippy with
+warnings denied, formatting, and the storage boundary checker passed. The discovery
+test above remains failing; no full-suite run or production fix is claimed.
+
 ### Remaining Increments
 
 The broad checklist below stays open: these increments establish a
@@ -1168,6 +1277,8 @@ The cancellation model additionally covers disjoint caller cleanup around an
 explicit retained handoff and healthy authorized takeover, with deferred
 reservation-release retries. Active-leader interleavings, cleanup I/O failures,
 partial-overlap cancellation and actual background cleanup progress remain open.
+The discovery experiment above now records a concrete reservation-cleanup failure
+to resolve before claiming that progress.
 Retain the transport composition as explicit follow-up evidence.
 In particular, do not model a dropped response as undoing a committed apply.
 Add request-budget expiry, in-flight cancellation and active-owner recovery

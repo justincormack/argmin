@@ -1595,6 +1595,7 @@ mod bucket_delete;
 mod command_fanout;
 mod command_recovery;
 mod direct_put;
+mod late_stream_cleanup;
 mod metadata_replay;
 mod multipart;
 mod multipart_completion;
