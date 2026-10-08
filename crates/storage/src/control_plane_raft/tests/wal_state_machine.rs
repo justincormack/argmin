@@ -665,6 +665,7 @@ fn control_plane_raft_wal_file_replays_records() {
         .replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
             base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
             replay_offset: 0,
+            tail_policy: ControlPlaneRaftWalTailPolicy::Repair,
         })
         .expect("WAL file replay should succeed");
     let expected = ControlPlaneRaftLogStoreRestartArtifact::default()
@@ -2428,6 +2429,7 @@ fn control_plane_raft_wal_file_missing_is_empty_replay() {
         .replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
             base: &base,
             replay_offset: 0,
+            tail_policy: ControlPlaneRaftWalTailPolicy::Repair,
         })
         .expect("missing WAL should replay as empty");
     assert_eq!(replayed, base);
@@ -2449,6 +2451,7 @@ fn control_plane_raft_wal_file_rejects_identity_mismatch() {
         reader.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
             base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
             replay_offset: 0,
+            tail_policy: ControlPlaneRaftWalTailPolicy::Repair,
         }),
         "control-plane OpenRaft WAL frame belongs to cluster",
     );
@@ -2478,6 +2481,7 @@ fn control_plane_raft_wal_file_rejects_corrupt_middle_frame() {
         wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
             base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
             replay_offset: 0,
+            tail_policy: ControlPlaneRaftWalTailPolicy::Repair,
         }),
         "control-plane OpenRaft WAL frame checksum mismatch",
     );
@@ -2514,6 +2518,7 @@ fn control_plane_raft_wal_file_rejects_corrupt_first_and_middle_frame_lengths() 
             wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
                 base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
                 replay_offset: 0,
+                tail_policy: ControlPlaneRaftWalTailPolicy::Repair,
             }),
             "control-plane OpenRaft WAL frame length check mismatch",
         );
@@ -2585,6 +2590,7 @@ fn control_plane_raft_wal_status_offsets_do_not_decode_frames() {
             wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
                 base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
                 replay_offset: 0,
+                tail_policy: ControlPlaneRaftWalTailPolicy::Repair,
             }),
             "control-plane OpenRaft WAL frame checksum mismatch",
         );
@@ -2614,6 +2620,7 @@ fn control_plane_raft_wal_file_truncates_torn_final_frame() {
         .replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
             base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
             replay_offset: 0,
+            tail_policy: ControlPlaneRaftWalTailPolicy::Repair,
         })
         .expect("WAL replay should discard torn final frame");
     let expected = ControlPlaneRaftLogStoreRestartArtifact::default()
@@ -2621,6 +2628,52 @@ fn control_plane_raft_wal_file_truncates_torn_final_frame() {
         .expect("retained WAL prefix should replay");
     assert_eq!(replayed, expected);
     assert_eq!(fs::metadata(&path).unwrap().len(), clean_len as u64);
+}
+
+#[test]
+fn control_plane_raft_live_recovery_inspection_preserves_torn_final_frame() {
+    let tmp = test_util::tempdir();
+    let artifact_path = tmp.path().join("raft.state");
+    let wal_path = durable_artifact_wal_path(&artifact_path);
+    let artifact = ControlPlaneRaftRestartArtifact {
+        cluster_name: "test-cluster".to_owned(),
+        local_node_id: 1,
+        wal_replay_offset: 0,
+        log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+        state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+    };
+    artifact
+        .store_durable_artifact(&artifact_path)
+        .expect("base restart artifact should persist");
+
+    let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+    let retained_vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+    wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(retained_vote))
+        .expect("retained WAL append should succeed");
+    wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
+        ControlPlaneRaftLeaderId,
+    >::new_committed(4, 1)))
+    .expect("final WAL append should succeed");
+
+    let complete_bytes = fs::read(&wal_path).unwrap();
+    let file = OpenOptions::new().write(true).open(&wal_path).unwrap();
+    file.set_len((complete_bytes.len() - 1) as u64).unwrap();
+    drop(file);
+    let torn_bytes = fs::read(&wal_path).unwrap();
+
+    let inspected = inspect_control_plane_raft_recovery_state_for_test(&artifact_path)
+        .expect("live inspection should replay the clean WAL prefix");
+    let inspected_vote = inspected
+        .persisted_vote()
+        .expect("clean WAL prefix should contain the retained vote");
+    assert_eq!(inspected_vote.term(), retained_vote.leader_id.term);
+    assert_eq!(inspected_vote.node_id(), retained_vote.leader_id.node_id);
+    assert_eq!(inspected_vote.committed(), retained_vote.committed);
+    assert_eq!(
+        fs::read(&wal_path).unwrap(),
+        torn_bytes,
+        "live inspection must not repair a WAL append that may still be in progress"
+    );
 }
 
 #[test]

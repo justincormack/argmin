@@ -2745,6 +2745,7 @@ fn restore_raft_durable_artifact(
                         cluster_name: cluster_name.to_owned(),
                         local_node_id: node_id,
                     }),
+                    ControlPlaneRaftWalTailPolicy::Repair,
                     validate_artifact,
                 )
             } else {
@@ -7366,6 +7367,14 @@ impl ControlPlaneRaftWalOffsets {
 struct ControlPlaneRaftWalReplayConfig<'a> {
     base: &'a ControlPlaneRaftLogStoreRestartArtifact,
     replay_offset: u64,
+    tail_policy: ControlPlaneRaftWalTailPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneRaftWalTailPolicy {
+    Repair,
+    #[cfg(any(test, feature = "test-hooks"))]
+    Preserve,
 }
 
 #[derive(Debug, Clone)]
@@ -8127,6 +8136,7 @@ impl ControlPlaneRaftLogStore {
         let replayed = wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
             base: &artifact,
             replay_offset: 0,
+            tail_policy: ControlPlaneRaftWalTailPolicy::Repair,
         })?;
         Self::from_restart_artifact_inner(replayed, Some(Arc::new(wal))).map_err(|source| {
             ControlPlaneError::io(
@@ -8780,7 +8790,9 @@ impl ControlPlaneRaftWalFile {
             .map_err(|source| {
                 ControlPlaneError::io("replay control-plane OpenRaft WAL records", source)
             })?;
-        if records.truncated_tail {
+        if records.truncated_tail
+            && matches!(config.tail_policy, ControlPlaneRaftWalTailPolicy::Repair)
+        {
             self.truncate_to_clean_len(records.clean_len)?;
         }
         Ok(artifact)
@@ -9172,17 +9184,28 @@ impl ControlPlaneRaftRestartArtifact {
         Ok((log_store, state_machine))
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     fn restore_with_wal_file(
         self,
         wal: ControlPlaneRaftWalFile,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
-        self.restore_with_wal_file_validated(wal, |_| Ok(()))
+        self.restore_with_wal_file_validated(wal, ControlPlaneRaftWalTailPolicy::Repair, |_| Ok(()))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn inspect_with_wal_file(
+        self,
+        wal: ControlPlaneRaftWalFile,
+    ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
+        self.restore_with_wal_file_validated(wal, ControlPlaneRaftWalTailPolicy::Preserve, |_| {
+            Ok(())
+        })
     }
 
     fn restore_with_wal_file_validated(
         self,
         wal: ControlPlaneRaftWalFile,
+        tail_policy: ControlPlaneRaftWalTailPolicy,
         validate_replayed_artifact: impl FnOnce(
             &ControlPlaneRaftRestartArtifact,
         ) -> Result<(), ControlPlaneError>,
@@ -9194,6 +9217,7 @@ impl ControlPlaneRaftRestartArtifact {
             wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
                 base: &self.log_store,
                 replay_offset: self.wal_replay_offset,
+                tail_policy,
             })?;
         Self::validate_log_store_state_machine_pair(&log_store_artifact, &self.state_machine)
             .map_err(|source| {

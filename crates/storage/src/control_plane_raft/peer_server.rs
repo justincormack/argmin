@@ -537,7 +537,10 @@ fn inspect_control_plane_raft_durable_state_for_test(
             cluster_name: artifact.cluster_name.clone(),
             local_node_id: artifact.local_node_id,
         });
-        artifact.restore_with_wal_file(wal)?
+        // This can inspect a running process. A partial final frame may be an
+        // append in progress rather than crash residue, so inspection must
+        // replay only the clean prefix without repairing the live WAL.
+        artifact.inspect_with_wal_file(wal)?
     } else {
         artifact.restore().map_err(|source| {
             ControlPlaneError::io("inspect control-plane OpenRaft checkpoint state", source)
