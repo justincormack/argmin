@@ -45,6 +45,8 @@ struct TracePlacedSegment {
     written: crate::DirectPutWrittenSegment,
 }
 
+const TRACE_RAW_SHARD_VERSION_BASE: u64 = 1_000_000;
+
 fn local_cluster_trace_strategy() -> impl Strategy<Value = Vec<LocalClusterTraceOp>> {
     prop::collection::vec(
         prop_oneof![
@@ -180,11 +182,23 @@ fn trace_generation(seed: u8) -> crate::GenerationId {
 }
 
 fn trace_segment_generation(step: usize, seed: u8) -> crate::GenerationId {
-    crate::GenerationId::new(10_000 + step as u64 * 257 + u64::from(seed)).unwrap()
+    let generation = 10_000 + step as u64 * 257 + u64::from(seed);
+    assert!(
+        generation < TRACE_RAW_SHARD_VERSION_BASE,
+        "trace metadata segment generation overlaps raw shard namespace"
+    );
+    crate::GenerationId::new(generation).unwrap()
 }
 
 fn trace_shard_key(step: usize, seed: u8) -> ShardKey {
-    ShardKey::new(&[seed.wrapping_add(1); 16], 10_000 + step as u64, 0)
+    // Keep raw shard I/O identities disjoint from the metadata-backed
+    // segments created by the other trace operations. Those segments use
+    // trace_segment_generation(), whose values remain below this namespace.
+    ShardKey::new(
+        &[seed.wrapping_add(1); 16],
+        TRACE_RAW_SHARD_VERSION_BASE + step as u64,
+        0,
+    )
 }
 
 fn trace_bucket_for_pg(
@@ -1354,6 +1368,20 @@ fn local_cluster_trace_stale_direct_put_cleanup_uses_retained_route() {
             37,
         )],
     )
+    .unwrap();
+}
+
+#[test]
+fn local_cluster_trace_rejected_raw_write_does_not_alias_backfill_segment() {
+    run_local_cluster_trace(&[
+        LocalClusterTraceOp::DurableBackfillClaimAfterRouteChange(6),
+        LocalClusterTraceOp::AdvanceEpoch,
+        LocalClusterTraceOp::AdvanceEpoch,
+        LocalClusterTraceOp::AdvanceEpoch,
+        LocalClusterTraceOp::QueueStale(95),
+        LocalClusterTraceOp::SetPgState(PgState::Degraded),
+        LocalClusterTraceOp::WriteCurrent(64),
+    ])
     .unwrap();
 }
 

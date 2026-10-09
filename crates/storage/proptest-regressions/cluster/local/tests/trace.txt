@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f39b5e3e0e822af6d3227d58c2d5ec9cf9bf5bf321ad6fbf542566e32cef6a99 # shrinks to ops = [DurableBackfillClaimAfterRouteChange(6), AdvanceEpoch, AdvanceEpoch, AdvanceEpoch, QueueStale(95), SetPgState(Degraded), WriteCurrent(64)]
