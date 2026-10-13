@@ -294,6 +294,20 @@ fn access_control_policy(owner_id: &str, grants: Vec<Grant>) -> AccessControlPol
         .build()
 }
 
+async fn put_public_access_block_retrying_contention(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    configuration: aws_sdk_s3::types::PublicAccessBlockConfiguration,
+) {
+    client
+        .put_public_access_block()
+        .bucket(bucket)
+        .public_access_block_configuration(configuration)
+        .send_retrying_operation_aborted("configure bucket Public Access Block")
+        .await
+        .unwrap();
+}
+
 #[test]
 fn test_block_public_put_bucket_acls() {
     s3_tests::run(async {
@@ -301,7 +315,7 @@ fn test_block_public_put_bucket_acls() {
         let bucket = unique_bucket();
         s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-            .send()
+            .send_retrying_operation_aborted("create bucket for BlockPublicAcls test")
             .await
             .unwrap();
 
@@ -309,13 +323,7 @@ fn test_block_public_put_bucket_acls() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .block_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
 
         // Attempt PutBucketAcl with public-read -> should be denied
         let url = format!("{}/{}?acl", CTX.endpoint(), bucket);
@@ -365,13 +373,7 @@ fn test_block_public_put_bucket_acl_authenticated_users_xml_grant() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .block_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
 
         let result = client
             .put_bucket_acl()
@@ -483,13 +485,7 @@ fn test_ignore_public_acls() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .ignore_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
         wait_for_ignore_public_acls(&bucket, true).await;
 
         // Re-apply public-read ACL (matching Ceph test: ACL still set, but ignored)
@@ -589,13 +585,7 @@ fn test_ignore_public_acls_get_bucket_acl_returns_effective_acl() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .ignore_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
         wait_for_ignore_public_acls(&bucket, true).await;
 
         let effective = client
@@ -648,13 +638,7 @@ fn test_ignore_public_acls_get_object_acl_returns_effective_acl() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .ignore_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
         wait_for_ignore_public_acls(&bucket, true).await;
 
         let effective = client
@@ -707,13 +691,7 @@ fn test_ignore_public_acls_disables_authenticated_read_object_acl() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .ignore_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
         wait_for_ignore_public_acls(&bucket, true).await;
 
         alt_get_object_access_denied_eventually(&bucket, "key1").await;
@@ -769,13 +747,7 @@ fn test_ignore_public_acls_disables_authenticated_read_bucket_acl() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .ignore_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
         wait_for_ignore_public_acls(&bucket, true).await;
 
         alt_list_bucket_access_denied_eventually(&bucket).await;
@@ -829,13 +801,7 @@ fn test_ignore_public_acls_disables_authenticated_read_put_object_acl() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .ignore_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
         wait_for_ignore_public_acls(&bucket, true).await;
 
         alt_get_object_access_denied_eventually(&bucket, "key1").await;
@@ -862,13 +828,7 @@ fn test_get_public_access_block_requires_owner() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .block_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
 
         // Anonymous GET of public access block should fail with 403
         let url = format!("{}/{}?publicAccessBlock", CTX.endpoint(), bucket);
@@ -906,7 +866,7 @@ fn test_block_public_object_canned_acls() {
         let bucket = unique_bucket();
         s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-            .send()
+            .send_retrying_operation_aborted("create bucket for blocked object ACL test")
             .await
             .unwrap();
 
@@ -916,13 +876,7 @@ fn test_block_public_object_canned_acls() {
             .block_public_policy(false)
             .restrict_public_buckets(false)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
 
         for (key, acl) in [
             ("foo1", "public-read"),
@@ -972,7 +926,7 @@ fn test_block_public_copy_object_canned_acl() {
         let bucket = unique_bucket();
         s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerPreferred)
-            .send()
+            .send_retrying_operation_aborted("create bucket for blocked copy ACL test")
             .await
             .unwrap();
 
@@ -988,13 +942,7 @@ fn test_block_public_copy_object_canned_acl() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .block_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
 
         let result = client
             .copy_object()
@@ -1030,13 +978,7 @@ fn test_block_public_object_authenticated_users_grant_header() {
             .block_public_policy(false)
             .restrict_public_buckets(false)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
 
         let url = format!("{}/{bucket}/grant-header", CTX.endpoint());
         let response = send_signed_put_response(
@@ -1073,13 +1015,7 @@ fn test_block_public_put_object_acl_authenticated_users_xml_grant() {
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .block_public_acls(true)
             .build();
-        client
-            .put_public_access_block()
-            .bucket(&bucket)
-            .public_access_block_configuration(pab)
-            .send()
-            .await
-            .unwrap();
+        put_public_access_block_retrying_contention(client, &bucket, pab).await;
 
         let result = client
             .put_object_acl()

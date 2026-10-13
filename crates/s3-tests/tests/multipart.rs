@@ -365,7 +365,7 @@ fn single_part_completion(etag: &str, part_number: i32) -> CompletedMultipartUpl
     clippy::result_large_err,
     reason = "Preserve the AWS SDK result type in this test adapter."
 )]
-async fn send_single_part_completion(
+async fn send_single_part_completion_once(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
@@ -383,6 +383,28 @@ async fn send_single_part_completion(
         .await
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
+async fn send_single_part_completion(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    etag: &str,
+) -> CompleteMultipartResult {
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(single_part_completion(etag, part_number))
+        .send_retrying_operation_aborted("multipart completion after terminal-state race")
+        .await
+}
+
 fn spawn_barrier_single_part_completion(
     client: aws_sdk_s3::Client,
     bucket: String,
@@ -394,7 +416,8 @@ fn spawn_barrier_single_part_completion(
 ) -> tokio::task::JoinHandle<CompleteMultipartResult> {
     tokio::spawn(async move {
         barrier.wait().await;
-        send_single_part_completion(&client, &bucket, key, &upload_id, part_number, &etag).await
+        send_single_part_completion_once(&client, &bucket, key, &upload_id, part_number, &etag)
+            .await
     })
 }
 

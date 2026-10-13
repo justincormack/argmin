@@ -11,9 +11,10 @@ use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, create_bucket_with_sse_c_enabled, delete_all_and_bucket, err_status,
-    raw_object_with,
+    raw_object_with, retrying_copy_object_contention_response,
     shape::{assert_shape, error_response_headers, expected_error, shape},
-    sse_c_header_values, test_sse_c_key, unique_bucket, SendRetryingOperationAborted, CTX,
+    sse_c_header_values, test_sse_c_key, unique_bucket, RawResponse, SendRetryingOperationAborted,
+    CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2607,9 +2608,18 @@ fn test_sse_c_upload_part_copy_round_trip() {
                 dst_key_md5_b64.as_str(),
             ),
         ];
-        let (status, body_text) = signed_put(&url, &[], &headers);
-        assert_eq!(status, 200, "body: {body_text}");
-        let etag = xml_tag(&body_text, "ETag")
+        let response = retrying_copy_object_contention_response(|| {
+            let (status, body) = signed_put(&url, &[], &headers);
+            RawResponse {
+                status,
+                headers: Vec::new(),
+                body,
+                body_read_error: None,
+            }
+        })
+        .await;
+        assert_eq!(response.status, 200, "body: {}", response.body);
+        let etag = xml_tag(&response.body, "ETag")
             .expect("copy part response etag")
             .replace("&quot;", "\"")
             .to_string();
