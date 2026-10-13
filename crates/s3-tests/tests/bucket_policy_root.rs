@@ -9,7 +9,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     AbacStatus, BucketAbacStatus, PublicAccessBlockConfiguration, Tag, Tagging,
 };
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{unique_bucket, SendRetryingOperationAborted, CTX};
 use serde_json::json;
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
@@ -106,14 +106,14 @@ async fn enable_bucket_abac_with_security_tag(
         .put_bucket_tagging()
         .bucket(bucket)
         .tagging(simple_bucket_tagging("security", value))
-        .send()
+        .send_retrying_operation_aborted("put root-policy ABAC bucket tags")
         .await
         .unwrap();
     client
         .put_bucket_abac()
         .bucket(bucket)
         .abac_status(enabled_abac_status())
-        .send()
+        .send_retrying_operation_aborted("enable root-policy bucket ABAC")
         .await
         .unwrap();
 }
@@ -331,7 +331,7 @@ fn test_owner_root_get_bucket_policy_bypasses_explicit_deny() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy.clone())
-            .send()
+            .send_retrying_operation_aborted("install root GetBucketPolicy deny policy")
             .await
             .unwrap();
 
@@ -368,7 +368,7 @@ fn test_owner_root_put_bucket_policy_bypasses_explicit_deny() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(deny_policy(&bucket, "s3:PutBucketPolicy"))
-            .send()
+            .send_retrying_operation_aborted("install root PutBucketPolicy deny policy")
             .await
             .unwrap();
 
@@ -429,7 +429,7 @@ fn test_owner_root_delete_bucket_policy_bypasses_explicit_deny() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(deny_policy(&bucket, "s3:DeleteBucketPolicy"))
-            .send()
+            .send_retrying_operation_aborted("install root DeleteBucketPolicy deny policy")
             .await
             .unwrap();
 
@@ -467,7 +467,7 @@ fn test_owner_root_get_bucket_policy_status_has_no_carveout() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(deny_policy(&bucket, "s3:GetBucketPolicyStatus"))
-            .send()
+            .send_retrying_operation_aborted("install root policy-status deny policy")
             .await
             .unwrap();
 
@@ -586,14 +586,14 @@ fn test_owner_root_confirm_remove_self_bucket_access_accepts_non_locking_policy(
             .unwrap();
 
         let policy = non_public_root_get_policy(&bucket);
-        let put = root_client
+        root_client
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy.clone())
             .confirm_remove_self_bucket_access(true)
-            .send()
-            .await;
-        put.unwrap();
+            .send_retrying_operation_aborted("install non-locking confirmed root policy")
+            .await
+            .unwrap();
 
         let fetched = eventually_ok(
             "owner-root GetBucketPolicy after ConfirmRemoveSelfBucketAccess non-locking policy",
@@ -627,7 +627,7 @@ fn test_same_account_non_root_get_bucket_policy_bucket_tag_condition_when_abac_e
             .put_bucket_policy()
             .bucket(&public_bucket)
             .policy(public_policy.clone())
-            .send()
+            .send_retrying_operation_aborted("install public-tag GetBucketPolicy policy")
             .await
             .unwrap();
 
@@ -646,7 +646,7 @@ fn test_same_account_non_root_get_bucket_policy_bucket_tag_condition_when_abac_e
             .put_bucket_policy()
             .bucket(&private_bucket)
             .policy(private_policy)
-            .send()
+            .send_retrying_operation_aborted("install private-tag GetBucketPolicy policy")
             .await
             .unwrap();
 
@@ -692,7 +692,7 @@ fn test_same_account_non_root_put_bucket_policy_bucket_tag_condition_when_abac_e
                 "s3:PutBucketPolicy",
                 "public",
             ))
-            .send()
+            .send_retrying_operation_aborted("install public-tag PutBucketPolicy policy")
             .await
             .unwrap();
 
@@ -710,7 +710,7 @@ fn test_same_account_non_root_put_bucket_policy_bucket_tag_condition_when_abac_e
                 "s3:PutBucketPolicy",
                 "public",
             ))
-            .send()
+            .send_retrying_operation_aborted("install private-tag PutBucketPolicy policy")
             .await
             .unwrap();
 
@@ -780,7 +780,7 @@ fn test_same_account_non_root_delete_bucket_policy_bucket_tag_condition_when_aba
                 "s3:DeleteBucketPolicy",
                 "public",
             ))
-            .send()
+            .send_retrying_operation_aborted("install public-tag DeleteBucketPolicy policy")
             .await
             .unwrap();
 
@@ -798,7 +798,7 @@ fn test_same_account_non_root_delete_bucket_policy_bucket_tag_condition_when_aba
                 "s3:DeleteBucketPolicy",
                 "public",
             ))
-            .send()
+            .send_retrying_operation_aborted("install private-tag DeleteBucketPolicy policy")
             .await
             .unwrap();
 
