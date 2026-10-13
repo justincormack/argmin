@@ -283,6 +283,42 @@ fn send_signed_post(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) 
     (status, body_text)
 }
 
+async fn send_signed_post_retrying_operation_contention(
+    url_str: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> (u16, String) {
+    let response = s3_tests::retrying_operation_contention_response(|| {
+        let (status, body) = send_signed_post(url_str, body, extra_headers);
+        s3_tests::RawResponse {
+            status,
+            headers: Vec::new(),
+            body,
+            body_read_error: None,
+        }
+    })
+    .await;
+    (response.status, response.body)
+}
+
+async fn send_signed_complete_multipart_post_retrying_operation_contention(
+    url_str: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> (u16, String) {
+    let response = s3_tests::retrying_complete_multipart_contention_response(|| {
+        let (status, body) = send_signed_post(url_str, body, extra_headers);
+        s3_tests::RawResponse {
+            status,
+            headers: Vec::new(),
+            body,
+            body_read_error: None,
+        }
+    })
+    .await;
+    (response.status, response.body)
+}
+
 fn encode_base64(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -752,7 +788,12 @@ fn test_complete_multipart_without_checksum_headers_defaults_crc64nvme() {
         );
         let expected = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, body);
         let (status, response_body) =
-            send_signed_post(&complete_url, complete_body.as_bytes(), &[]);
+            send_signed_complete_multipart_post_retrying_operation_contention(
+                &complete_url,
+                complete_body.as_bytes(),
+                &[],
+            )
+            .await;
         assert_eq!(status, 200, "complete response body: {response_body}");
         assert!(
             response_body.contains(&format!(
@@ -1816,7 +1857,8 @@ fn test_delete_objects_content_md5_required() {
 
         let url = format!("{}/{}?delete", CTX.endpoint(), bucket);
         let body = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
-        let (status, body_text) = send_signed_post(&url, body.as_bytes(), &[]);
+        let (status, body_text) =
+            send_signed_post_retrying_operation_contention(&url, body.as_bytes(), &[]).await;
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "InvalidRequest");
 
@@ -2505,11 +2547,13 @@ fn test_complete_multipart_legacy_object_checksum_without_create_algorithm_is_ig
                 "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
             );
             let checksum = checksum_base64(local_algo, part_body);
-            let (status, body_text) = send_signed_post(
-                &url,
-                body.as_bytes(),
-                &[(checksum_header_name(&aws_algo), checksum.as_str())],
-            );
+            let (status, body_text) =
+                send_signed_complete_multipart_post_retrying_operation_contention(
+                    &url,
+                    body.as_bytes(),
+                    &[(checksum_header_name(&aws_algo), checksum.as_str())],
+                )
+                .await;
             assert_eq!(status, 200, "body: {body_text}");
 
             let head = client
@@ -2589,11 +2633,13 @@ fn test_complete_multipart_new_object_checksum_without_create_algorithm_rejected
                 "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
             );
             let checksum = checksum_base64(local_algo, part_body);
-            let (status, body_text) = send_signed_post(
-                &url,
-                body.as_bytes(),
-                &[(checksum_header_name(&aws_algo), checksum.as_str())],
-            );
+            let (status, body_text) =
+                send_signed_complete_multipart_post_retrying_operation_contention(
+                    &url,
+                    body.as_bytes(),
+                    &[(checksum_header_name(&aws_algo), checksum.as_str())],
+                )
+                .await;
             assert!(
                 matches!(status, 200 | 400),
                 "CompleteMultipartUpload InvalidRequest used status {status}, expected 400 or embedded-error status 200: {body_text}"
@@ -2653,14 +2699,16 @@ fn test_complete_multipart_unconfigured_crc64nvme_checksum_is_stored() {
             "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
         );
         let expected = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, part_body);
-        let (status, body_text) = send_signed_post(
-            &url,
-            body.as_bytes(),
-            &[(
-                checksum_header_name(&ChecksumAlgorithm::Crc64Nvme),
-                expected.as_str(),
-            )],
-        );
+        let (status, body_text) =
+            send_signed_complete_multipart_post_retrying_operation_contention(
+                &url,
+                body.as_bytes(),
+                &[(
+                    checksum_header_name(&ChecksumAlgorithm::Crc64Nvme),
+                    expected.as_str(),
+                )],
+            )
+            .await;
         assert_eq!(status, 200, "body: {body_text}");
         assert!(
             body_text.contains(&format!(
@@ -2744,14 +2792,16 @@ fn test_complete_multipart_unconfigured_crc64nvme_mismatch_is_computed() {
         let wrong_checksum = encode_base64(&[0u8; 8]);
         let expected = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, part_body);
         assert_ne!(wrong_checksum, expected);
-        let (status, body_text) = send_signed_post(
-            &url,
-            body.as_bytes(),
-            &[(
-                checksum_header_name(&ChecksumAlgorithm::Crc64Nvme),
-                wrong_checksum.as_str(),
-            )],
-        );
+        let (status, body_text) =
+            send_signed_complete_multipart_post_retrying_operation_contention(
+                &url,
+                body.as_bytes(),
+                &[(
+                    checksum_header_name(&ChecksumAlgorithm::Crc64Nvme),
+                    wrong_checksum.as_str(),
+                )],
+            )
+            .await;
         assert_eq!(status, 200, "body: {body_text}");
         assert!(
             body_text.contains(&format!(
@@ -2817,7 +2867,13 @@ fn test_complete_multipart_new_part_checksum_without_stored_checksum_is_invalid_
         let body = format!(
             "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag><ChecksumSHA512>{sha512}</ChecksumSHA512></Part></CompleteMultipartUpload>"
         );
-        let (status, body_text) = send_signed_post(&url, body.as_bytes(), &[]);
+        let (status, body_text) =
+            send_signed_complete_multipart_post_retrying_operation_contention(
+                &url,
+                body.as_bytes(),
+                &[],
+            )
+            .await;
         assert!(
             status == 200 || status == 400,
             "unexpected status {status}, body: {body_text}"
@@ -3037,11 +3093,13 @@ fn test_multipart_new_composite_checksum_algorithms_round_trip() {
                     "<CompleteMultipartUpload>{}</CompleteMultipartUpload>",
                     raw_completed_parts.join("")
                 );
-                let (status, body_text) = send_signed_post(
-                    &multipart_complete_url(&bucket, &key, upload_id),
-                    body.as_bytes(),
-                    &[],
-                );
+                let (status, body_text) =
+                    send_signed_complete_multipart_post_retrying_operation_contention(
+                        &multipart_complete_url(&bucket, &key, upload_id),
+                        body.as_bytes(),
+                        &[],
+                    )
+                    .await;
                 assert_eq!(
                     status, 200,
                     "CompleteMultipartUpload failed for {name}: {body_text}"
@@ -3066,7 +3124,9 @@ fn test_multipart_new_composite_checksum_algorithms_round_trip() {
                             .set_parts(Some(completed_parts))
                             .build(),
                     )
-                    .send()
+                    .send_retrying_operation_aborted(&format!(
+                        "complete new checksum multipart upload for {name}"
+                    ))
                     .await
                     .unwrap_or_else(|err| {
                         panic!("CompleteMultipartUpload failed for {name}: {err:?}")

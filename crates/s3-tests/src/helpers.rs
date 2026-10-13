@@ -325,15 +325,44 @@ pub fn is_retryable_operation_contention_response(status: u16, body: &str) -> bo
     )
 }
 
-pub async fn retrying_operation_contention_response<F>(mut op: F) -> RawResponse
+fn complete_multipart_embedded_error_code(body: &str) -> Option<&str> {
+    let mut body = body.trim_start();
+    if body.starts_with("<?xml") {
+        let declaration_end = body.find("?>")?;
+        body = body[declaration_end + 2..].trim_start();
+    }
+
+    let error_body = body.strip_prefix("<Error>")?;
+    let error_end = error_body.rfind("</Error>")?;
+    if !error_body[error_end + "</Error>".len()..].trim().is_empty() {
+        return None;
+    }
+
+    let error_body = error_body[..error_end].trim_start();
+    let code_body = error_body.strip_prefix("<Code>")?;
+    let code_end = code_body.find("</Code>")?;
+    Some(&code_body[..code_end])
+}
+
+pub fn is_retryable_complete_multipart_contention_response(status: u16, body: &str) -> bool {
+    is_retryable_operation_contention_response(status, body)
+        || (status == 200
+            && matches!(
+                complete_multipart_embedded_error_code(body),
+                Some("OperationAborted" | "SlowDown")
+            ))
+}
+
+async fn retrying_raw_response<F, C>(mut op: F, is_retryable: C) -> RawResponse
 where
     F: FnMut() -> RawResponse,
+    C: Fn(u16, &str) -> bool,
 {
     let deadline = std::time::Instant::now() + configured_test_timeout();
 
     loop {
         let response = op();
-        if !is_retryable_operation_contention_response(response.status, &response.body) {
+        if !is_retryable(response.status, &response.body) {
             return response;
         }
         let Some(delay) = operation_contention_retry_delay(deadline, std::time::Instant::now())
@@ -345,6 +374,20 @@ where
             return response;
         }
     }
+}
+
+pub async fn retrying_operation_contention_response<F>(op: F) -> RawResponse
+where
+    F: FnMut() -> RawResponse,
+{
+    retrying_raw_response(op, is_retryable_operation_contention_response).await
+}
+
+pub async fn retrying_complete_multipart_contention_response<F>(op: F) -> RawResponse
+where
+    F: FnMut() -> RawResponse,
+{
+    retrying_raw_response(op, is_retryable_complete_multipart_contention_response).await
 }
 
 pub async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
@@ -3979,6 +4022,34 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn complete_multipart_contention_retry_accepts_only_top_level_embedded_errors() {
+        assert!(is_retryable_complete_multipart_contention_response(
+            200,
+            "<Error><Code>OperationAborted</Code></Error>"
+        ));
+        assert!(is_retryable_complete_multipart_contention_response(
+            200,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>SlowDown</Code></Error>"
+        ));
+        assert!(!is_retryable_complete_multipart_contention_response(
+            200,
+            "<CompleteMultipartUploadResult><Code>SlowDown</Code></CompleteMultipartUploadResult>"
+        ));
+        assert!(!is_retryable_complete_multipart_contention_response(
+            200,
+            "<Error><Message>outer</Message><Detail><Code>SlowDown</Code></Detail></Error>"
+        ));
+        assert!(!is_retryable_complete_multipart_contention_response(
+            200,
+            "<Error><Code>InternalError</Code></Error>"
+        ));
+        assert!(!is_retryable_operation_contention_response(
+            200,
+            "<Error><Code>SlowDown</Code></Error>"
+        ));
+    }
+
     #[tokio::test]
     async fn raw_operation_contention_retry_retries_both_contention_responses() {
         let mut calls = 0;
@@ -4000,6 +4071,30 @@ mod tests {
 
         assert_eq!(calls, 3);
         assert_eq!(response.status, 204);
+    }
+
+    #[tokio::test]
+    async fn complete_multipart_contention_retry_retries_embedded_errors() {
+        let mut calls = 0;
+        let response = retrying_complete_multipart_contention_response(|| {
+            calls += 1;
+            let body = match calls {
+                1 => "<Error><Code>OperationAborted</Code></Error>",
+                2 => "<Error><Code>SlowDown</Code></Error>",
+                _ => "<CompleteMultipartUploadResult/>",
+            };
+            RawResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: body.to_string(),
+                body_read_error: None,
+            }
+        })
+        .await;
+
+        assert_eq!(calls, 3);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "<CompleteMultipartUploadResult/>");
     }
 
     #[test]
