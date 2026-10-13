@@ -325,6 +325,28 @@ pub fn is_retryable_operation_contention_response(status: u16, body: &str) -> bo
     )
 }
 
+pub async fn retrying_operation_contention_response<F>(mut op: F) -> RawResponse
+where
+    F: FnMut() -> RawResponse,
+{
+    let deadline = std::time::Instant::now() + configured_test_timeout();
+
+    loop {
+        let response = op();
+        if !is_retryable_operation_contention_response(response.status, &response.body) {
+            return response;
+        }
+        let Some(delay) = operation_contention_retry_delay(deadline, std::time::Instant::now())
+        else {
+            return response;
+        };
+        tokio::time::sleep(delay).await;
+        if std::time::Instant::now() >= deadline {
+            return response;
+        }
+    }
+}
+
 pub async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
 where
     E: ProvideErrorMetadata + std::fmt::Debug,
@@ -3955,6 +3977,29 @@ mod tests {
             503,
             "<Error><Code>InternalError</Code><Detail><Code>SlowDown</Code></Detail></Error>"
         ));
+    }
+
+    #[tokio::test]
+    async fn raw_operation_contention_retry_retries_both_contention_responses() {
+        let mut calls = 0;
+        let response = retrying_operation_contention_response(|| {
+            calls += 1;
+            let (status, body) = match calls {
+                1 => (409, "<Error><Code>OperationAborted</Code></Error>"),
+                2 => (503, "<Error><Code>SlowDown</Code></Error>"),
+                _ => (204, ""),
+            };
+            RawResponse {
+                status,
+                headers: Vec::new(),
+                body: body.to_string(),
+                body_read_error: None,
+            }
+        })
+        .await;
+
+        assert_eq!(calls, 3);
+        assert_eq!(response.status, 204);
     }
 
     #[test]

@@ -287,11 +287,7 @@ fn simple_bucket_tagging(key: &str, value: &str) -> Tagging {
     bucket_tagging(&[(key, value)])
 }
 
-async fn enable_bucket_abac_with_tags(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    tags: &[(&str, &str)],
-) {
+async fn put_bucket_tags(client: &aws_sdk_s3::Client, bucket: &str, tags: &[(&str, &str)]) {
     client
         .put_bucket_tagging()
         .bucket(bucket)
@@ -299,6 +295,14 @@ async fn enable_bucket_abac_with_tags(
         .send_retrying_operation_aborted("put ABAC bucket tags")
         .await
         .unwrap();
+}
+
+async fn enable_bucket_abac_with_tags(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    tags: &[(&str, &str)],
+) {
+    put_bucket_tags(client, bucket, tags).await;
     client
         .put_bucket_abac()
         .bucket(bucket)
@@ -480,6 +484,13 @@ fn tag_resource(bucket: &str, tags: &[(&str, &str)]) -> s3_tests::RawResponse {
         s3_tests::SigningService::S3Control,
         raw_primary_credentials(),
     )
+}
+
+async fn tag_resource_retrying_operation_contention(
+    bucket: &str,
+    tags: &[(&str, &str)],
+) -> s3_tests::RawResponse {
+    s3_tests::retrying_operation_contention_response(|| tag_resource(bucket, tags)).await
 }
 
 fn simple_lifecycle_configuration(prefix: &str, days: i32) -> BucketLifecycleConfiguration {
@@ -682,13 +693,7 @@ fn test_bucket_policy_get_bucket_tagging_bucket_tag_condition() {
         let alt_client = CTX.alt_client();
 
         let bucket = create_bucket_allowing_sse_c(client).await;
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "public"))
-            .send()
-            .await
-            .unwrap();
+        put_bucket_tags(client, &bucket, &[("security", "public")]).await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -719,13 +724,7 @@ fn test_bucket_policy_get_bucket_tagging_bucket_tag_condition() {
         )
         .await;
 
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "private"))
-            .send()
-            .await
-            .unwrap();
+        put_bucket_tags(client, &bucket, &[("security", "private")]).await;
 
         eventually_access_denied(
             "GetBucketTagging denied for private bucket tag while bucket ABAC is disabled",
@@ -754,13 +753,7 @@ fn test_bucket_policy_get_object_bucket_tag_condition() {
             .send()
             .await
             .unwrap();
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "public"))
-            .send()
-            .await
-            .unwrap();
+        put_bucket_tags(client, &bucket, &[("security", "public")]).await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -791,13 +784,7 @@ fn test_bucket_policy_get_object_bucket_tag_condition() {
         )
         .await;
 
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "private"))
-            .send()
-            .await
-            .unwrap();
+        put_bucket_tags(client, &bucket, &[("security", "private")]).await;
 
         eventually_access_denied(
             "GetObject denied for private bucket tag while bucket ABAC is disabled",
@@ -817,13 +804,7 @@ fn test_bucket_policy_put_object_bucket_tag_condition() {
         let alt_client = CTX.alt_client();
 
         let bucket = create_bucket_allowing_sse_c(client).await;
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "public"))
-            .send()
-            .await
-            .unwrap();
+        put_bucket_tags(client, &bucket, &[("security", "public")]).await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -861,13 +842,7 @@ fn test_bucket_policy_put_object_bucket_tag_condition() {
         )
         .await;
 
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "private"))
-            .send()
-            .await
-            .unwrap();
+        put_bucket_tags(client, &bucket, &[("security", "private")]).await;
 
         eventually_access_denied(
             "PutObject denied for private bucket tag while bucket ABAC is disabled",
@@ -907,13 +882,7 @@ fn test_bucket_policy_get_object_bucket_tag_deny_condition_when_abac_disabled() 
             .send()
             .await
             .unwrap();
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "private"))
-            .send()
-            .await
-            .unwrap();
+        put_bucket_tags(client, &bucket, &[("security", "private")]).await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -964,20 +933,7 @@ fn test_bucket_policy_get_bucket_tagging_bucket_tag_condition_when_abac_enabled(
         let alt_client = CTX.alt_client();
 
         let bucket = create_bucket_allowing_sse_c(client).await;
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "public"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_bucket_abac()
-            .bucket(&bucket)
-            .abac_status(enabled_abac_status())
-            .send()
-            .await
-            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &bucket, "public").await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -1011,7 +967,8 @@ fn test_bucket_policy_get_bucket_tagging_bucket_tag_condition_when_abac_enabled(
         assert_eq!(response.tag_set()[0].key(), "security");
         assert_eq!(response.tag_set()[0].value(), "public");
 
-        let tag = tag_resource(&bucket, &[("security", "private")]);
+        let tag =
+            tag_resource_retrying_operation_contention(&bucket, &[("security", "private")]).await;
         assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
         let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
             client.get_bucket_tagging().bucket(&bucket).send()
@@ -1039,20 +996,7 @@ fn test_bucket_policy_get_bucket_tagging_resource_tag_condition_when_abac_enable
         let alt_client = CTX.alt_client();
 
         let bucket = create_bucket_allowing_sse_c(client).await;
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "allow"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_bucket_abac()
-            .bucket(&bucket)
-            .abac_status(enabled_abac_status())
-            .send()
-            .await
-            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &bucket, "allow").await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -1086,7 +1030,8 @@ fn test_bucket_policy_get_bucket_tagging_resource_tag_condition_when_abac_enable
         assert_eq!(response.tag_set()[0].key(), "security");
         assert_eq!(response.tag_set()[0].value(), "allow");
 
-        let tag = tag_resource(&bucket, &[("security", "deny")]);
+        let tag =
+            tag_resource_retrying_operation_contention(&bucket, &[("security", "deny")]).await;
         assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
 
         eventually_access_denied(
@@ -1219,20 +1164,7 @@ fn test_bucket_policy_list_bucket_bucket_tag_condition_when_abac_enabled() {
         let alt_client = CTX.alt_client();
 
         let bucket = create_bucket_allowing_sse_c(client).await;
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "public"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_bucket_abac()
-            .bucket(&bucket)
-            .abac_status(enabled_abac_status())
-            .send()
-            .await
-            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &bucket, "public").await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -1263,7 +1195,8 @@ fn test_bucket_policy_list_bucket_bucket_tag_condition_when_abac_enabled() {
         )
         .await;
 
-        let tag = tag_resource(&bucket, &[("security", "private")]);
+        let tag =
+            tag_resource_retrying_operation_contention(&bucket, &[("security", "private")]).await;
         assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
         let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
             client.get_bucket_tagging().bucket(&bucket).send()
@@ -1286,28 +1219,14 @@ fn test_bucket_policy_get_object_bucket_tag_condition_when_abac_enabled() {
 
         let bucket = create_bucket_allowing_sse_c(client).await;
         let key = "bucket-tag-get-enabled";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"bucket-tag-body"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "public"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_bucket_abac()
-            .bucket(&bucket)
-            .abac_status(enabled_abac_status())
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"bucket-tag-body".to_vec(),
+        )
+        .await;
+        enable_bucket_abac_with_security_tag(client, &bucket, "public").await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -1328,7 +1247,7 @@ fn test_bucket_policy_get_object_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket-tag GetObject policy")
             .await
             .unwrap();
 
@@ -1339,7 +1258,8 @@ fn test_bucket_policy_get_object_bucket_tag_condition_when_abac_enabled() {
         .await;
         assert_eq!(response.content_length(), Some(15));
 
-        let tag = tag_resource(&bucket, &[("security", "private")]);
+        let tag =
+            tag_resource_retrying_operation_contention(&bucket, &[("security", "private")]).await;
         assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
         let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
             client.get_bucket_tagging().bucket(&bucket).send()
@@ -1362,28 +1282,14 @@ fn test_bucket_policy_get_object_bucket_tag_revocation_when_abac_enabled() {
 
         let bucket = create_bucket_allowing_sse_c(client).await;
         let key = "bucket-tag-get-revocation";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from_static(b"bucket-tag-body"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "public"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_bucket_abac()
-            .bucket(&bucket)
-            .abac_status(enabled_abac_status())
-            .send()
-            .await
-            .unwrap();
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"bucket-tag-body".to_vec(),
+        )
+        .await;
+        enable_bucket_abac_with_security_tag(client, &bucket, "public").await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -1404,7 +1310,7 @@ fn test_bucket_policy_get_object_bucket_tag_revocation_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket-tag revocation policy")
             .await
             .unwrap();
 
@@ -1417,7 +1323,8 @@ fn test_bucket_policy_get_object_bucket_tag_revocation_when_abac_enabled() {
             assert_eq!(response.content_length(), Some(15));
         }
 
-        let tag = tag_resource(&bucket, &[("security", "private")]);
+        let tag =
+            tag_resource_retrying_operation_contention(&bucket, &[("security", "private")]).await;
         assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
         let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
             client.get_bucket_tagging().bucket(&bucket).send()
@@ -1441,20 +1348,7 @@ fn test_bucket_policy_put_object_bucket_tag_condition_when_abac_enabled() {
         let alt_client = CTX.alt_client();
 
         let bucket = create_bucket_allowing_sse_c(client).await;
-        client
-            .put_bucket_tagging()
-            .bucket(&bucket)
-            .tagging(simple_bucket_tagging("security", "public"))
-            .send()
-            .await
-            .unwrap();
-        client
-            .put_bucket_abac()
-            .bucket(&bucket)
-            .abac_status(enabled_abac_status())
-            .send()
-            .await
-            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &bucket, "public").await;
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -1492,7 +1386,8 @@ fn test_bucket_policy_put_object_bucket_tag_condition_when_abac_enabled() {
         )
         .await;
 
-        let tag = tag_resource(&bucket, &[("security", "private")]);
+        let tag =
+            tag_resource_retrying_operation_contention(&bucket, &[("security", "private")]).await;
         assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
         let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
             client.get_bucket_tagging().bucket(&bucket).send()
