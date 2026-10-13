@@ -486,12 +486,41 @@ fn send_signed_put(url_str: &str, body: &[u8], include_content_md5: bool) -> (u1
     (status, body)
 }
 
+async fn send_signed_put_retrying_operation_contention(
+    url_str: &str,
+    body: &[u8],
+    include_content_md5: bool,
+) -> (u16, String) {
+    let response = s3_tests::retrying_operation_contention_response(|| {
+        let (status, body) = send_signed_put(url_str, body, include_content_md5);
+        s3_tests::RawResponse {
+            status,
+            headers: Vec::new(),
+            body,
+            body_read_error: None,
+        }
+    })
+    .await;
+    (response.status, response.body)
+}
+
+async fn send_signed_lifecycle_put_retrying_operation_contention(
+    url: &str,
+    body: &[u8],
+) -> s3_tests::RawResponse {
+    s3_tests::retrying_operation_contention_response(|| {
+        send_signed_request("PUT", url, body, [content_md5_header(body)])
+    })
+    .await
+}
+
 async fn assert_invalid_lifecycle_put_rejected(body: &str, expected_code: &str) {
     let bucket = unique_bucket();
     create_bucket_in_test_region(&bucket).await;
 
     let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-    let (status, response_body) = send_signed_put(&url, body.as_bytes(), true);
+    let (status, response_body) =
+        send_signed_put_retrying_operation_contention(&url, body.as_bytes(), true).await;
 
     cleanup_bucket(&bucket).await;
 
@@ -511,7 +540,8 @@ async fn assert_invalid_lifecycle_put_rejected_with_message(
     create_bucket_in_test_region(&bucket).await;
 
     let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-    let (status, response_body) = send_signed_put(&url, body.as_bytes(), true);
+    let (status, response_body) =
+        send_signed_put_retrying_operation_contention(&url, body.as_bytes(), true).await;
 
     cleanup_bucket(&bucket).await;
 
@@ -532,7 +562,8 @@ async fn assert_invalid_lifecycle_put_rejected_with_host_id_shape(
     create_bucket_in_test_region(&bucket).await;
 
     let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-    let (status, response_body) = send_signed_put(&url, body.as_bytes(), true);
+    let (status, response_body) =
+        send_signed_put_retrying_operation_contention(&url, body.as_bytes(), true).await;
 
     cleanup_bucket(&bucket).await;
 
@@ -554,7 +585,7 @@ async fn assert_raw_lifecycle_put_round_trips(body: &[u8]) {
     let expected = s3_types::render_lifecycle_configuration_xml(&parsed);
 
     let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-    let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+    let put = send_signed_lifecycle_put_retrying_operation_contention(&url, body).await;
     assert_eq!(
         put.status, 200,
         "unexpected lifecycle PUT body: {}",
@@ -577,12 +608,7 @@ async fn assert_valid_lifecycle_put_accepted(body: &str) {
     create_bucket_in_test_region(&bucket).await;
 
     let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-    let put = send_signed_request(
-        "PUT",
-        &url,
-        body.as_bytes(),
-        [content_md5_header(body.as_bytes())],
-    );
+    let put = send_signed_lifecycle_put_retrying_operation_contention(&url, body.as_bytes()).await;
     assert_eq!(
         put.status, 200,
         "expected lifecycle PUT to succeed, got response {put:?}"
@@ -647,7 +673,8 @@ fn test_put_bucket_lifecycle_accepts_midnight_utc_timestamp_without_millis() {
             </LifecycleConfiguration>"
             .to_string();
         let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-        let (status, response_body) = send_signed_put(&url, body.as_bytes(), true);
+        let (status, response_body) =
+            send_signed_put_retrying_operation_contention(&url, body.as_bytes(), true).await;
 
         let get_result = CTX
             .client()
@@ -683,7 +710,8 @@ fn test_put_bucket_lifecycle_requires_content_md5() {
             </LifecycleConfiguration>"
             .to_string();
         let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-        let (status, response_body) = send_signed_put(&url, body.as_bytes(), false);
+        let (status, response_body) =
+            send_signed_put_retrying_operation_contention(&url, body.as_bytes(), false).await;
 
         cleanup_bucket(&bucket).await;
 
@@ -1532,7 +1560,7 @@ fn test_bucket_lifecycle_raw_get_returns_canonical_xml() {
         let expected = s3_types::render_lifecycle_configuration_xml(&parsed);
 
         let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-        let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        let put = send_signed_lifecycle_put_retrying_operation_contention(&url, body).await;
         assert_eq!(
             put.status, 200,
             "unexpected lifecycle PUT body: {}",
@@ -1573,7 +1601,7 @@ fn test_bucket_lifecycle_raw_get_empty_filter_returns_canonical_xml() {
         let expected = s3_types::render_lifecycle_configuration_xml(&parsed);
 
         let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-        let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        let put = send_signed_lifecycle_put_retrying_operation_contention(&url, body).await;
         assert_eq!(
             put.status, 200,
             "unexpected lifecycle PUT body: {}",
@@ -1719,12 +1747,9 @@ fn test_put_bucket_lifecycle_tag_grammar_and_unicode_lengths_match_aws() {
         create_bucket_in_test_region(&bucket).await;
         let baseline = "<LifecycleConfiguration><Rule><ID>preserved</ID><Filter><Tag><Key>baseline</Key><Value>unchanged</Value></Tag></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>";
         let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-        let baseline_put = send_signed_request(
-            "PUT",
-            &url,
-            baseline.as_bytes(),
-            [content_md5_header(baseline.as_bytes())],
-        );
+        let baseline_put =
+            send_signed_lifecycle_put_retrying_operation_contention(&url, baseline.as_bytes())
+                .await;
         assert_eq!(
             baseline_put.status, 200,
             "unexpected lifecycle baseline response: {baseline_put:?}"
@@ -1754,12 +1779,9 @@ fn test_put_bucket_lifecycle_tag_grammar_and_unicode_lengths_match_aws() {
             let body = format!(
                 "<LifecycleConfiguration><Rule><ID>{label}</ID><Filter><Tag><Key>{key}</Key><Value>{value}</Value></Tag></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"
             );
-            let response = send_signed_request(
-                "PUT",
-                &url,
-                body.as_bytes(),
-                [content_md5_header(body.as_bytes())],
-            );
+            let response =
+                send_signed_lifecycle_put_retrying_operation_contention(&url, body.as_bytes())
+                    .await;
             assert_eq!(
                 response.status, 400,
                 "expected {label} lifecycle PUT to fail: {response:?}"
@@ -1798,12 +1820,8 @@ fn test_put_bucket_lifecycle_accepts_51_filter_tags() {
         create_bucket_in_test_region(&bucket).await;
 
         let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
-        let put = send_signed_request(
-            "PUT",
-            &url,
-            body.as_bytes(),
-            [content_md5_header(body.as_bytes())],
-        );
+        let put =
+            send_signed_lifecycle_put_retrying_operation_contention(&url, body.as_bytes()).await;
         assert_eq!(
             put.status, 200,
             "unexpected lifecycle PUT body: {}",
@@ -2708,13 +2726,11 @@ fn test_lifecycle_write_ack_shapes() {
              <Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>\
              <Expiration><Days>7</Days></Expiration></Rule>\
              </LifecycleConfiguration>";
-        let md5 = content_md5_header(config.as_bytes());
-        let put = send_signed_request(
-            "PUT",
+        let put = send_signed_lifecycle_put_retrying_operation_contention(
             &format!("{}/{}?lifecycle=", CTX.endpoint(), bucket),
             config.as_bytes(),
-            [(md5.0.as_str(), md5.1.as_str())],
-        );
+        )
+        .await;
         assert_shape_one_of(
             "PutBucketLifecycleConfiguration ack",
             &put,

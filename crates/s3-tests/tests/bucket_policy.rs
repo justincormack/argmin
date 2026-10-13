@@ -997,7 +997,7 @@ fn test_bucket_policy_put_get_delete() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy.clone())
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1106,7 +1106,7 @@ fn test_get_bucket_policy_status_public_bucket_policy() {
                 "s3:ListBucket",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         match put_result {
             Ok(_) => {}
@@ -1154,7 +1154,7 @@ fn test_get_bucket_policy_status_nonpublic_bucket_policy() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1188,7 +1188,7 @@ fn test_get_bucket_policy_status_public_ipv4_full_range_bucket_policy() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1222,7 +1222,7 @@ fn test_get_bucket_policy_status_public_ipv4_cidr_broader_than_slash_8_bucket_po
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1245,7 +1245,7 @@ fn test_get_bucket_policy_status_nonpublic_ipv4_slash_8_bucket_policy() {
                 "IpAddress",
                 "11.0.0.0/8",
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1274,7 +1274,7 @@ fn test_get_bucket_policy_status_qualified_source_ip_operator_classification() {
                     operator,
                     "10.0.0.0/8",
                 ))
-                .send()
+                .send_retrying_operation_aborted("put bucket policy during policy test")
                 .await
                 .unwrap();
 
@@ -1313,7 +1313,7 @@ fn test_get_bucket_policy_status_public_ipv6_ula_bucket_policy() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1346,7 +1346,7 @@ fn test_bucket_policy_source_ip_for_any_value_ip_address_allows_matching_ipv4_cl
                 "ForAnyValue:IpAddress",
                 "0.0.0.0/0",
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1381,7 +1381,7 @@ fn test_bucket_policy_source_ip_ip_address_denies_nonmatching_ipv4_subnet() {
                 "IpAddress",
                 "192.0.2.0/24",
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1419,7 +1419,7 @@ fn test_bucket_policy_source_ip_ip_address_allows_matching_ipv4_client() {
                 "IpAddress",
                 "0.0.0.0/0",
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1450,7 +1450,7 @@ fn test_bucket_policy_source_ip_ip_address_denies_nonmatching_ipv4_client() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(source_ip_get_object_policy(&bucket, "IpAddress", "::/0"))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1488,7 +1488,7 @@ fn test_bucket_policy_source_ip_not_ip_address_denies_matching_ipv4_client() {
                 "NotIpAddress",
                 "::/0",
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1526,7 +1526,7 @@ fn test_bucket_policy_source_ip_not_ip_address_allows_nonmatching_ipv4_client() 
                 "NotIpAddress",
                 "0.0.0.0/0",
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1557,7 +1557,7 @@ fn test_get_bucket_policy_status_nonpublic_fixed_principal_policy() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1585,7 +1585,7 @@ fn test_get_bucket_policy_status_cross_account_allow() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -1622,7 +1622,7 @@ fn test_get_bucket_policy_status_cross_account_deny_overrides_allow() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(allow_policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -1659,7 +1659,7 @@ fn test_get_bucket_policy_status_cross_account_deny_overrides_allow() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -1695,7 +1695,7 @@ fn test_put_bucket_policy_not_principal_rejected() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -1736,7 +1736,7 @@ fn test_put_bucket_policy_allows_raw_over_limit_when_normalized_under_limit() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(pretty_policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1787,7 +1787,7 @@ fn test_put_bucket_policy_rejects_oversized_normalized_policy() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(normalized_policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         let err = result.unwrap_err();
@@ -1820,7 +1820,7 @@ fn test_bucket_policy_get_returns_normalized_json() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1864,7 +1864,7 @@ fn test_bucket_policy_list_objects_v1() {
                 "s3:ListBucket",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1901,7 +1901,7 @@ fn test_bucket_policy_get_bucket_cors_cross_account_allow() {
                 "s3:GetBucketCORS",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -1939,7 +1939,7 @@ fn test_bucket_policy_put_bucket_cors_cross_account_allow() {
                 "s3:PutBucketCORS",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2013,7 +2013,7 @@ fn test_bucket_policy_get_bucket_tagging_cross_account_allow() {
                 "s3:GetBucketTagging",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2046,7 +2046,7 @@ fn test_bucket_policy_put_bucket_tagging_cross_account_allow() {
                 "s3:PutBucketTagging",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2115,7 +2115,7 @@ fn test_bucket_policy_get_bucket_lifecycle_cross_account_allow() {
                 "s3:GetLifecycleConfiguration",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2160,7 +2160,7 @@ fn test_bucket_policy_put_bucket_lifecycle_cross_account_allow() {
                 "s3:PutLifecycleConfiguration",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2245,7 +2245,7 @@ fn test_bucket_policy_get_bucket_public_access_block_cross_account_allow() {
                 "s3:GetBucketPublicAccessBlock",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2284,7 +2284,7 @@ fn test_bucket_policy_put_bucket_public_access_block_cross_account_allow() {
                 "s3:PutBucketPublicAccessBlock",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2366,7 +2366,7 @@ fn test_bucket_policy_get_bucket_object_lock_configuration_cross_account_allow()
                 "s3:GetBucketObjectLockConfiguration",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2406,7 +2406,7 @@ fn test_bucket_policy_put_bucket_object_lock_configuration_cross_account_allow()
                 "s3:PutBucketObjectLockConfiguration",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2463,7 +2463,7 @@ fn test_bucket_policy_get_bucket_ownership_controls_cross_account_allow() {
                 "s3:GetBucketOwnershipControls",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2508,7 +2508,7 @@ fn test_bucket_policy_put_bucket_ownership_controls_cross_account_allow() {
                 "s3:PutBucketOwnershipControls",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2598,7 +2598,7 @@ fn test_bucket_policy_get_bucket_encryption_cross_account_allow() {
                 "s3:GetEncryptionConfiguration",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2652,7 +2652,7 @@ fn test_bucket_policy_put_bucket_encryption_cross_account_allow() {
                 "s3:PutEncryptionConfiguration",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2737,7 +2737,7 @@ fn test_bucket_policy_list_objects_v2() {
                 "s3:ListBucket",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -2781,7 +2781,7 @@ fn test_bucket_policy_list_deny_overrides_bucket_acl() {
                 "s3:ListBucket",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -2811,7 +2811,7 @@ fn test_bucket_policy_list_requires_bucket_resource() {
                 "s3:ListBucket",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -2856,7 +2856,7 @@ fn test_bucket_policy_put_obj_grant_full_control() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -2868,7 +2868,7 @@ fn test_bucket_policy_put_obj_grant_full_control() {
                 "s3:PutObject",
                 bucket_wildcard_resource(&control_bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -3026,7 +3026,7 @@ fn test_bucket_policy_copy_object_grant_full_control() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -3124,7 +3124,7 @@ fn test_bucket_policy_copy_object_grant_write() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -3221,7 +3221,7 @@ fn test_bucket_policy_copy_object_replace_tags_require_put_object_tagging() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(initial_policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -3271,7 +3271,7 @@ fn test_bucket_policy_copy_object_replace_tags_require_put_object_tagging() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(updated_policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -3358,7 +3358,7 @@ fn test_bucket_policy_copy_object_acl_condition_applies() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -3439,7 +3439,7 @@ fn test_bucket_policy_copy_object_grant_read_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -3535,7 +3535,7 @@ fn test_bucket_policy_copy_object_grant_read_acp_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -3631,7 +3631,7 @@ fn test_bucket_policy_copy_object_grant_write_acp_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -3744,7 +3744,7 @@ fn test_bucket_policy_put_object_existing_tag_condition_is_rejected() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -3819,7 +3819,7 @@ fn test_bucket_policy_copy_object_source_existing_tag_condition() {
             .put_bucket_policy()
             .bucket(&src_bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -3905,7 +3905,7 @@ fn test_bucket_policy_put_object_existing_tag_condition_is_rejected_for_mixed_co
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -3986,7 +3986,7 @@ fn test_bucket_policy_get_object_acl_existing_tag_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -4101,7 +4101,7 @@ fn test_bucket_policy_put_object_acl_existing_tag_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -4207,7 +4207,7 @@ fn test_bucket_policy_put_object_acl_cross_account_allow() {
                 "s3:PutObjectAcl",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -4296,7 +4296,7 @@ fn test_bucket_policy_put_object_canned_acl_uses_put_object_permission() {
                 "s3:PutObject",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -4369,7 +4369,7 @@ fn test_bucket_policy_put_object_deny_on_public_acl() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -4454,7 +4454,7 @@ fn test_bucket_policy_put_object_acl_null_condition_treats_absent_header_as_null
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -4548,7 +4548,7 @@ fn test_bucket_policy_put_object_acl_string_not_equals_treats_absent_header_as_n
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -4675,7 +4675,7 @@ fn test_bucket_policy_put_object_acl_null_treats_absent_header_as_null() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -4773,7 +4773,7 @@ fn test_bucket_policy_put_object_acl_string_not_equals_treats_absent_acl_header_
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -4882,7 +4882,7 @@ fn test_bucket_policy_put_obj_grant_read_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -4894,7 +4894,7 @@ fn test_bucket_policy_put_obj_grant_read_condition() {
                 "s3:PutObject",
                 bucket_wildcard_resource(&control_bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -5024,7 +5024,7 @@ fn test_bucket_policy_grant_read_condition_uses_raw_header_spacing() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -5112,7 +5112,7 @@ fn test_bucket_policy_put_obj_grant_read_acp_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -5124,7 +5124,7 @@ fn test_bucket_policy_put_obj_grant_read_acp_condition() {
                 "s3:PutObject",
                 bucket_wildcard_resource(&control_bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -5256,7 +5256,7 @@ fn test_bucket_policy_put_obj_grant_write_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -5268,7 +5268,7 @@ fn test_bucket_policy_put_obj_grant_write_condition() {
                 "s3:PutObject",
                 bucket_wildcard_resource(&control_bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -5398,7 +5398,7 @@ fn test_bucket_policy_put_obj_grant_write_acp_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -5410,7 +5410,7 @@ fn test_bucket_policy_put_obj_grant_write_acp_condition() {
                 "s3:PutObject",
                 bucket_wildcard_resource(&control_bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -5523,7 +5523,7 @@ fn test_bucket_policy_put_object_public_allow_is_blocked_by_restrict_public_buck
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(public_policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
         {
             Ok(_) => {}
@@ -5600,7 +5600,7 @@ fn test_bucket_policy_put_object_public_allow_is_blocked_by_restrict_public_buck
                 "s3:PutObject",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -5681,7 +5681,7 @@ fn test_bucket_policy_put_object_acl_deny_on_public_acl() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -5786,7 +5786,7 @@ fn test_bucket_policy_put_object_version_acl_cross_account_allow() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -5909,7 +5909,7 @@ fn test_bucket_policy_version_id_condition_get_object_version() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -6002,7 +6002,7 @@ fn test_bucket_policy_version_id_condition_get_object_version_attributes() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -6097,7 +6097,7 @@ fn test_bucket_policy_version_id_condition_object_version_acl() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -6234,7 +6234,7 @@ fn test_bucket_policy_version_id_condition_object_version_tagging() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -6388,7 +6388,7 @@ fn test_bucket_policy_version_id_condition_delete_object_version() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -6523,7 +6523,7 @@ fn test_bucket_policy_get_object_version_acl_existing_tag_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -6656,7 +6656,7 @@ fn test_bucket_policy_put_object_version_acl_existing_tag_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -6791,7 +6791,7 @@ fn test_bucket_policy_delete_object_version_tagging_existing_tag_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -6911,7 +6911,7 @@ fn test_bucket_policy_put_object_version_acl_null_treats_absent_acl_header_as_mi
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7025,7 +7025,7 @@ fn test_bucket_policy_put_object_version_acl_string_not_equals_treats_absent_acl
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7155,7 +7155,7 @@ fn test_bucket_policy_put_object_version_acl_grant_read_condition_applies() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7250,7 +7250,7 @@ fn test_bucket_policy_put_obj_requires_sse_c_algorithm_header() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7323,7 +7323,7 @@ fn test_bucket_policy_put_obj_requires_sse_s3_header() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7389,7 +7389,7 @@ fn test_bucket_policy_put_obj_sse_c_algorithm_string_not_equals() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7447,7 +7447,7 @@ fn test_bucket_policy_put_obj_sse_s3_string_not_equals() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7510,7 +7510,7 @@ fn test_bucket_policy_copy_object_recognizes_destination_sse_c_header() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7583,7 +7583,7 @@ fn test_bucket_policy_copy_object_recognizes_destination_sse_s3_header() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7651,7 +7651,7 @@ fn test_bucket_policy_complete_multipart_does_not_reuse_destination_sse_c_header
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7776,7 +7776,7 @@ fn test_bucket_policy_upload_part_copy_does_not_reuse_destination_sse_c_header()
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7856,7 +7856,7 @@ fn test_bucket_policy_multipart_copy_inherits_destination_sse_s3() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -7967,7 +7967,7 @@ fn test_bucket_policy_upload_part_copy_reuses_destination_sse_s3_from_multipart_
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8064,7 +8064,7 @@ fn test_bucket_policy_complete_multipart_reuses_destination_sse_s3_from_multipar
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8176,7 +8176,7 @@ fn test_bucket_policy_put_obj_request_object_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -8238,7 +8238,7 @@ fn test_bucket_policy_request_object_tag_condition_uses_decoded_tag_value() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8318,7 +8318,7 @@ fn test_bucket_policy_request_object_tag_binary_equals_matches_base64_value() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8401,7 +8401,7 @@ fn test_bucket_policy_request_object_tag_binary_equals_deny_uses_base64_request_
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8461,7 +8461,7 @@ fn test_bucket_policy_request_object_tag_binary_equals_does_not_wildcard_match()
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8535,7 +8535,7 @@ fn test_bucket_policy_list_bucket_prefix_string_equals_does_not_wildcard_match()
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8602,7 +8602,7 @@ fn test_bucket_policy_list_bucket_prefix_string_not_equals_does_not_wildcard_mat
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8668,7 +8668,7 @@ fn test_bucket_policy_list_bucket_prefix_string_like_question_mark_matches_one_c
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8873,7 +8873,7 @@ fn test_bucket_policy_variables_anonymous_principal_values_defaults_and_special_
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -8955,7 +8955,7 @@ fn test_bucket_policy_variables_authenticated_identity_defaults_do_not_apply() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9130,7 +9130,7 @@ fn test_bucket_policy_variables_omit_unresolved_string_operands() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9193,7 +9193,7 @@ fn test_bucket_policy_variables_multivalued_context_defaults_do_not_apply() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9258,7 +9258,7 @@ fn test_bucket_policy_variables_require_2012_policy_version() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9283,7 +9283,7 @@ fn test_bucket_policy_variables_require_2012_policy_version() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9346,7 +9346,7 @@ fn test_bucket_policy_variables_do_not_expand_for_numeric_operators() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9546,7 +9546,7 @@ fn test_bucket_policy_current_time_date_condition_operators() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9650,7 +9650,7 @@ fn test_bucket_policy_epoch_time_numeric_conditions() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9742,7 +9742,7 @@ fn test_bucket_policy_secure_transport_bool_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9816,7 +9816,7 @@ fn test_bucket_policy_requested_region_string_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -9880,7 +9880,7 @@ fn test_bucket_policy_referer_string_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -10094,7 +10094,7 @@ fn test_bucket_policy_auth_request_context_condition_keys() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -10444,7 +10444,7 @@ fn test_bucket_policy_condition_key_names_are_case_insensitive() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -10593,7 +10593,7 @@ fn test_bucket_policy_existing_object_tag_prefix_key_is_case_insensitive() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -10701,7 +10701,7 @@ fn test_bucket_policy_request_object_tag_prefix_key_is_case_insensitive() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -10828,7 +10828,7 @@ fn test_bucket_policy_request_object_tag_case_equivalent_values_preserve_set_ope
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -10971,7 +10971,7 @@ fn test_bucket_policy_request_object_tag_case_equivalent_values_preserve_binary_
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11107,7 +11107,7 @@ fn test_bucket_policy_request_object_tag_binary_equals_if_exists_matches_missing
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11183,7 +11183,7 @@ fn test_bucket_policy_request_object_tag_keys_for_all_values_binary_equals() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11254,7 +11254,7 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value_binary_equals() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11325,7 +11325,7 @@ fn test_bucket_policy_request_object_tag_keys_for_all_values_string_not_equals()
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11396,7 +11396,7 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value_string_not_equals() 
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11456,7 +11456,7 @@ fn test_bucket_policy_put_object_no_tag_keys_for_all_values_string_not_equals() 
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11517,7 +11517,7 @@ fn test_bucket_policy_put_object_no_tag_keys_for_any_value_string_not_equals() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11588,7 +11588,7 @@ fn test_bucket_policy_put_object_tagging_request_object_tag() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11697,7 +11697,7 @@ fn test_bucket_policy_put_object_version_tagging_request_object_tag() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11795,7 +11795,7 @@ fn test_bucket_policy_string_equals_ignore_case_request_object_tag() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11859,7 +11859,7 @@ fn test_bucket_policy_string_equals_ignore_case_request_object_tag_non_ascii() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11917,7 +11917,7 @@ fn test_bucket_policy_string_not_equals_ignore_case_request_object_tag() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -11989,7 +11989,7 @@ fn test_bucket_policy_string_not_equals_ignore_case_request_object_tag_non_ascii
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -12053,7 +12053,7 @@ fn test_bucket_policy_string_equals_ignore_case_if_exists_request_object_tag() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -12124,7 +12124,7 @@ fn test_bucket_policy_string_not_equals_ignore_case_if_exists_request_object_tag
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -12195,7 +12195,7 @@ fn test_bucket_policy_put_object_acl_request_object_tag_condition_is_rejected() 
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12240,7 +12240,7 @@ fn test_bucket_policy_put_object_acl_and_tagging_request_object_tag_condition_is
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12298,7 +12298,7 @@ fn test_bucket_policy_delete_object_tagging_existing_tag_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -12397,7 +12397,7 @@ fn test_bucket_policy_copy_source_condition_is_rejected_for_mixed_get_and_put() 
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12442,7 +12442,7 @@ fn test_bucket_policy_metadata_directive_condition_is_rejected_for_mixed_get_and
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12487,7 +12487,7 @@ fn test_bucket_policy_sse_s3_condition_is_rejected_for_mixed_get_and_put() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12532,7 +12532,7 @@ fn test_bucket_policy_sse_c_condition_is_rejected_for_mixed_get_and_put() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12577,7 +12577,7 @@ fn test_bucket_policy_canned_acl_condition_is_rejected_for_mixed_get_and_put() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12622,7 +12622,7 @@ fn test_bucket_policy_grant_read_condition_is_rejected_for_mixed_get_and_put() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12667,7 +12667,7 @@ fn test_bucket_policy_copy_source_condition_is_rejected_for_mixed_get_version_an
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12712,7 +12712,7 @@ fn test_bucket_policy_canned_acl_condition_is_rejected_for_mixed_get_version_and
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12757,7 +12757,7 @@ fn test_bucket_policy_sse_s3_condition_is_rejected_for_mixed_get_version_and_put
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12802,7 +12802,7 @@ fn test_bucket_policy_metadata_directive_condition_is_rejected_for_mixed_get_ver
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12847,7 +12847,7 @@ fn test_bucket_policy_sse_c_condition_is_rejected_for_mixed_get_version_and_put(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12892,7 +12892,7 @@ fn test_bucket_policy_grant_read_acp_condition_is_rejected_for_mixed_get_and_put
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12937,7 +12937,7 @@ fn test_bucket_policy_grant_full_control_condition_is_rejected_for_mixed_get_and
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -12982,7 +12982,7 @@ fn test_bucket_policy_grant_read_acp_condition_is_rejected_for_mixed_get_version
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -13027,7 +13027,7 @@ fn test_bucket_policy_grant_full_control_condition_is_rejected_for_mixed_get_ver
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -13054,7 +13054,7 @@ fn test_bucket_policy_put_object_inline_tags_require_put_object_tagging() {
                 "s3:PutObject",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13095,7 +13095,7 @@ fn test_bucket_policy_put_object_inline_tags_require_put_object_tagging() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13147,7 +13147,7 @@ fn test_bucket_policy_multipart_upload_requires_object_resource() {
                 "s3:PutObject",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&bucket_only), 400);
         assert_s3_err_code(&bucket_only, "MalformedPolicy");
@@ -13161,7 +13161,7 @@ fn test_bucket_policy_multipart_upload_requires_object_resource() {
                 "s3:PutObject",
                 format!("arn:aws:s3:::{bucket}/{key}"),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13213,7 +13213,7 @@ fn test_multipart_upload_on_bucket_with_policy() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13279,7 +13279,7 @@ fn test_bucket_policy_multipart_upload_request_object_tag() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -13342,7 +13342,7 @@ fn test_bucket_policy_multipart_upload_inline_tags_require_put_object_tagging() 
                 "s3:PutObject",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13382,7 +13382,7 @@ fn test_bucket_policy_multipart_upload_inline_tags_require_put_object_tagging() 
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13442,7 +13442,7 @@ fn test_bucket_policy_canned_acl_condition_is_rejected_for_put_object_tagging() 
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -13478,7 +13478,7 @@ fn test_bucket_policy_canned_acl_condition_is_rejected_for_mixed_put_object_and_
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -13514,7 +13514,7 @@ fn test_bucket_policy_sse_condition_is_rejected_for_put_object_tagging() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -13550,7 +13550,7 @@ fn test_bucket_policy_sse_condition_is_rejected_for_mixed_put_object_and_tagging
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -13591,7 +13591,7 @@ fn test_bucket_policy_boe_put_object_acl_condition_applies() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13669,7 +13669,7 @@ fn test_bucket_policy_boe_multipart_upload_acl_condition_applies() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13775,7 +13775,7 @@ fn test_bucket_policy_boe_delete_object_requires_delete_object_policy() {
                 "s3:DeleteObject",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13857,7 +13857,7 @@ fn test_bucket_policy_boe_delete_object_version_requires_delete_object_version_p
                 "s3:DeleteObjectVersion",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13909,7 +13909,7 @@ fn test_bucket_policy_multipart_upload_acl_condition_applies() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -13977,7 +13977,7 @@ fn test_bucket_policy_multipart_upload_grant_full_control_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14050,7 +14050,7 @@ fn test_bucket_policy_multipart_upload_grant_read_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14123,7 +14123,7 @@ fn test_bucket_policy_multipart_upload_grant_read_acp_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14196,7 +14196,7 @@ fn test_bucket_policy_multipart_upload_grant_write() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14269,7 +14269,7 @@ fn test_bucket_policy_multipart_upload_grant_write_acp_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14329,7 +14329,7 @@ fn test_bucket_policy_abort_multipart_upload_initiator_only_requires_put_object(
                 "s3:PutObject",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14379,7 +14379,7 @@ fn test_bucket_policy_list_parts_initiator_only_requires_put_object() {
                 "s3:PutObject",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14450,7 +14450,7 @@ fn test_bucket_policy_upload_part_and_complete_allow_same_account_non_initiator_
                 &bucket,
                 &same_account_principal,
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14557,7 +14557,7 @@ fn test_bucket_policy_boe_upload_part_and_complete_allow_same_account_non_initia
                 &bucket,
                 &same_account_principal,
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14658,7 +14658,7 @@ fn test_bucket_policy_management_paths_deny_same_account_non_initiator_with_put_
                 &bucket,
                 &same_account_principal,
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14751,7 +14751,7 @@ fn test_bucket_policy_management_paths_deny_same_account_non_initiator_missing_u
                 &bucket,
                 &same_account_principal,
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -14923,7 +14923,7 @@ fn test_bucket_policy_boe_management_paths_deny_same_account_non_initiator_with_
                 &bucket,
                 &same_account_principal,
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -15015,7 +15015,7 @@ fn test_bucket_policy_completed_abort_denies_same_account_non_initiator_with_put
                 &bucket,
                 &same_account_principal,
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -15115,7 +15115,7 @@ fn test_bucket_policy_boe_abort_multipart_upload_initiator_only_requires_put_obj
                 "s3:PutObject",
                 bucket_wildcard_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -16206,7 +16206,7 @@ fn test_bucket_policy_another_bucket() {
                 "s3:ListBucket",
                 bucket_resource(&bucket1),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -16218,7 +16218,7 @@ fn test_bucket_policy_another_bucket() {
                 "s3:ListBucket",
                 bucket_resource(&bucket2),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -16267,7 +16267,7 @@ fn test_bucket_policy_condition_operator_if_exists() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -16328,7 +16328,7 @@ fn test_bucket_policy_string_not_like_if_exists_copy_source_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
         client
@@ -16351,7 +16351,7 @@ fn test_bucket_policy_string_not_like_if_exists_copy_source_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -16421,7 +16421,7 @@ fn test_bucket_policy_put_object_if_none_match_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -16504,7 +16504,7 @@ fn test_bucket_policy_put_object_if_match_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -16606,7 +16606,7 @@ fn test_bucket_policy_copy_object_if_match_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -16753,7 +16753,7 @@ fn test_bucket_policy_object_creation_operation_bool_does_not_wildcard_match() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -16832,7 +16832,7 @@ fn test_bucket_policy_copy_object_if_none_match_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -16960,7 +16960,7 @@ fn test_bucket_policy_complete_multipart_upload_if_none_match_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17065,7 +17065,7 @@ fn test_bucket_policy_complete_multipart_upload_if_match_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17165,7 +17165,7 @@ fn test_bucket_policy_list_bucket_prefix_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17241,7 +17241,7 @@ fn test_bucket_policy_list_bucket_delimiter_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17332,7 +17332,7 @@ fn test_bucket_policy_list_prefix_and_delimiter_conditions_use_decoded_query_val
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17412,7 +17412,7 @@ fn test_bucket_policy_list_bucket_max_keys_numeric_equals_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17470,7 +17470,7 @@ async fn put_max_keys_condition_policy(bucket: &str, operator: &str, policy_valu
             })
             .to_string(),
         )
-        .send()
+        .send_retrying_operation_aborted("put bucket policy during policy test")
         .await
         .unwrap();
 }
@@ -17613,7 +17613,7 @@ fn test_bucket_policy_list_bucket_max_keys_string_equals_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17681,7 +17681,7 @@ fn test_bucket_policy_list_bucket_max_keys_omitted_is_absent_for_numeric_conditi
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17769,7 +17769,7 @@ fn test_bucket_policy_list_bucket_max_keys_numeric_equals_nonnumeric_value_does_
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17856,7 +17856,7 @@ fn test_bucket_policy_list_bucket_max_keys_numeric_equals_wildcard_value_does_no
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -17928,7 +17928,7 @@ fn test_bucket_policy_list_bucket_versions_prefix_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18007,7 +18007,7 @@ fn test_bucket_policy_list_bucket_versions_delimiter_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18119,7 +18119,7 @@ fn test_bucket_policy_list_bucket_versions_max_keys_numeric_equals_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18183,7 +18183,7 @@ fn test_bucket_policy_list_multipart_uploads_prefix_condition_is_rejected() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_s3_err_code(&result, "MalformedPolicy");
 
@@ -18225,7 +18225,7 @@ fn test_bucket_policy_get_bucket_location_location_constraint_condition_is_rejec
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await;
         assert_s3_err_code(&result, "MalformedPolicy");
 
@@ -18260,7 +18260,7 @@ fn test_bucket_policy_put_bucket_ownership_controls_object_ownership_condition()
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18331,7 +18331,7 @@ fn test_bucket_policy_get_bucket_acl_requires_dedicated_action() {
                 "s3:GetBucketAcl",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18372,7 +18372,7 @@ fn test_bucket_policy_put_bucket_acl_requires_dedicated_action() {
                 "s3:PutBucketAcl",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18428,7 +18428,7 @@ fn test_bucket_policy_put_bucket_acl_null_treats_absent_acl_header_as_null() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18515,7 +18515,7 @@ fn test_bucket_policy_put_bucket_acl_string_not_equals_treats_absent_acl_header_
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18615,7 +18615,7 @@ fn test_bucket_policy_put_bucket_acl_grant_full_control_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18709,7 +18709,7 @@ fn test_bucket_policy_put_bucket_acl_grant_read_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18829,7 +18829,7 @@ fn test_bucket_policy_put_bucket_acl_grant_read_wrong_header_body_mismatch_is_un
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18882,7 +18882,7 @@ fn test_bucket_policy_put_bucket_acl_grant_read_acp_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -18974,7 +18974,7 @@ fn test_bucket_policy_put_bucket_acl_grant_write_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -19066,7 +19066,7 @@ fn test_bucket_policy_put_bucket_acl_grant_write_acp_condition() {
             .put_bucket_policy()
             .bucket(&bucket)
             .policy(policy)
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -19151,7 +19151,7 @@ fn test_bucket_policy_head_bucket_list_bucket_policy_is_not_sufficient() {
                 "s3:ListBucket",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -19189,7 +19189,7 @@ fn test_bucket_policy_get_bucket_location_requires_dedicated_action() {
                 "s3:ListBucket",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -19207,7 +19207,7 @@ fn test_bucket_policy_get_bucket_location_requires_dedicated_action() {
                 "s3:GetBucketLocation",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -19253,7 +19253,7 @@ fn test_bucket_policy_get_bucket_versioning_requires_dedicated_action() {
                 "s3:GetBucketVersioning",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -19300,7 +19300,7 @@ fn test_bucket_policy_put_bucket_versioning_requires_dedicated_action() {
                 "s3:PutBucketVersioning",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -19371,7 +19371,7 @@ fn test_bucket_policy_list_object_versions_requires_dedicated_action() {
                 "s3:ListBucketVersions",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 
@@ -19427,7 +19427,7 @@ fn test_bucket_policy_list_multipart_uploads_requires_dedicated_action() {
                 "s3:ListBucketMultipartUploads",
                 bucket_resource(&bucket),
             ))
-            .send()
+            .send_retrying_operation_aborted("put bucket policy during policy test")
             .await
             .unwrap();
 

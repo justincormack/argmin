@@ -64,7 +64,7 @@ async fn setup_object_lock_bucket() -> String {
     let bucket = unique_bucket();
     s3_tests::create_bucket_request(client, &bucket)
         .object_lock_enabled_for_bucket(true)
-        .send()
+        .send_retrying_operation_aborted("create object-lock bucket")
         .await
         .unwrap();
     bucket
@@ -98,7 +98,7 @@ async fn enable_bucket_abac_with_security_tag(bucket: &str, value: &str) {
         .put_bucket_tagging()
         .bucket(bucket)
         .tagging(object_tagging("security", value))
-        .send()
+        .send_retrying_operation_aborted("put object-lock bucket tags")
         .await
         .unwrap();
     CTX.client()
@@ -109,7 +109,7 @@ async fn enable_bucket_abac_with_security_tag(bucket: &str, value: &str) {
                 .status(BucketAbacStatus::Enabled)
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("enable object-lock bucket ABAC")
         .await
         .unwrap();
 }
@@ -119,7 +119,7 @@ async fn put_bucket_policy_json(bucket: &str, policy: serde_json::Value) {
         .put_bucket_policy()
         .bucket(bucket)
         .policy(policy.to_string())
-        .send()
+        .send_retrying_operation_aborted("put object-lock bucket policy")
         .await
         .unwrap();
 }
@@ -1374,7 +1374,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_get_ret
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put object-lock bucket policy")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -1617,7 +1617,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_put_ret
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put object-lock bucket policy")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -1662,7 +1662,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_bypass_
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put object-lock bucket policy")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -1707,7 +1707,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_put_leg
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put object-lock bucket policy")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -1744,7 +1744,7 @@ fn test_object_lock_bucket_policy_request_object_tag_condition_is_rejected_for_p
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put object-lock bucket policy")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -1781,7 +1781,7 @@ fn test_object_lock_bucket_policy_request_object_tag_condition_is_rejected_for_p
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put object-lock bucket policy")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
@@ -3460,7 +3460,7 @@ fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_get_leg
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put object-lock bucket policy")
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "MalformedPolicy");
