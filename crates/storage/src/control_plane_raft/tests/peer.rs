@@ -4439,6 +4439,16 @@ fn raft_replication_batch_fits_peer_transport_limit() {
         config.max_payload_entries,
         CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES
     );
+    assert_eq!(
+        config.broadcast_submitted_on_append,
+        Some(false),
+        "replication scheduling must preserve the existing batching policy"
+    );
+    assert_eq!(
+        config.reset_backoff_on_transfer_leader,
+        Some(true),
+        "leadership transfer must reset stale replication backoff"
+    );
     assert!(
         config.max_payload_entries
             <= ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES as u64

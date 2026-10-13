@@ -773,6 +773,20 @@ to v6, and WAL frames to v2. Exact v3/v5/v1 evidence is retained and rejected;
 the unchanged transport record, TLS ALPN, WAL file header, and restart sentinel
 keep their independent versions.
 
+The 2026-10-12 review upgraded the exact pin to 0.10.0-alpha.37. Alpha.36 fixes
+heartbeat-output draining and resets a leadership-transfer target's active
+replication backoff. Alpha.37 backs off replication streams that make no
+progress, backs off snapshot transfer after repeated network failures, and
+orders same-instant linearizable-read acknowledgements by heartbeat round.
+The release also adds opt-in eager replication scheduling, optional unbounded
+metric waits, a replication-backoff reset trigger, and less restrictive async
+runtime traits. Argmin retains the default non-eager scheduling policy and the
+default leadership-transfer backoff reset. Review of the exact alpha.35 to
+alpha.37 source delta found no change to the OpenRaft vote, log-id, membership,
+stored-membership, entry, or snapshot metadata values encoded by Argmin. The
+peer RPC v4, restart artifact v6, and WAL frame v2 therefore remain current;
+their byte-exact aggregate tests are the format acceptance boundary.
+
 ### 4.3 Complete Operational Metrics And Resource Bounds
 
 - add bounded runtime counters for storage RPC connection, session, admission,

@@ -1717,7 +1717,10 @@ async fn wait_for_local_leader(
     message: &'static str,
 ) {
     raft.wait(Some(IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT))
-        .state(ServerState::Leader, message)
+        .metrics(
+            |metrics| metrics.state == ServerState::Leader && metrics.vote.is_committed(),
+            message,
+        )
         .await
         .unwrap();
     raft.as_leader()

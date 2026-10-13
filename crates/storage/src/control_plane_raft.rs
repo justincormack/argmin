@@ -2430,6 +2430,11 @@ fn raft_config(
             // implicit purge; the explicit trigger().purge_log() path ignores
             // this retention value and is coordinated with artifact writes.
             max_in_snapshot_log_to_keep: u64::MAX,
+            // Preserve the existing append batching policy. Alpha.37 offers
+            // earlier replication scheduling as an explicit throughput tradeoff.
+            broadcast_submitted_on_append: Some(false),
+            // Leadership transfer must not inherit a stale target backoff.
+            reset_backoff_on_transfer_leader: Some(true),
             enable_tick: timers_enabled,
             enable_heartbeat: timers_enabled,
             enable_elect: timers_enabled,
