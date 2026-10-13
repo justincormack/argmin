@@ -636,19 +636,42 @@ where
     F: FnMut() -> RawResponse,
     C: Fn(u16, &str) -> bool,
 {
-    let deadline = std::time::Instant::now() + configured_test_timeout();
+    retrying_raw_response_for(
+        &mut op,
+        &is_retryable,
+        configured_test_timeout(),
+        std::time::Instant::now,
+    )
+    .await
+}
+
+async fn retrying_raw_response_for<F, C, N>(
+    op: &mut F,
+    is_retryable: &C,
+    retry_window: Duration,
+    mut now: N,
+) -> RawResponse
+where
+    F: FnMut() -> RawResponse,
+    C: Fn(u16, &str) -> bool,
+    N: FnMut() -> std::time::Instant,
+{
+    let mut response = op();
+    if !is_retryable(response.status, &response.body) {
+        return response;
+    }
+    let deadline = now() + retry_window;
 
     loop {
-        let response = op();
-        if !is_retryable(response.status, &response.body) {
-            return response;
-        }
-        let Some(delay) = operation_contention_retry_delay(deadline, std::time::Instant::now())
-        else {
+        let Some(delay) = operation_contention_retry_delay(deadline, now()) else {
             return response;
         };
         tokio::time::sleep(delay).await;
-        if std::time::Instant::now() >= deadline {
+        if now() >= deadline {
+            return response;
+        }
+        response = op();
+        if !is_retryable(response.status, &response.body) {
             return response;
         }
     }
@@ -699,9 +722,11 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
 {
-    retrying_operation_contention_result(
+    retrying_operation_contention_result_for(
         &mut op,
         OperationContentionRetryScope::OperationAbortedOrSlowDown,
+        configured_test_timeout(),
+        std::time::Instant::now,
     )
     .await
 }
@@ -718,9 +743,11 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
 {
-    retrying_operation_contention_result(
+    retrying_operation_contention_result_for(
         &mut op,
         OperationContentionRetryScope::OperationAbortedOnly,
+        configured_test_timeout(),
+        std::time::Instant::now,
     )
     .await
 }
@@ -729,36 +756,64 @@ where
     clippy::result_large_err,
     reason = "Preserve the AWS SDK result type in this test adapter."
 )]
-async fn retrying_operation_contention_result<T, E, F, Fut>(
+async fn retrying_operation_contention_result_for<T, E, F, Fut, N>(
     op: &mut F,
     scope: OperationContentionRetryScope,
+    retry_window: Duration,
+    mut now: N,
 ) -> Result<T, aws_sdk_s3::error::SdkError<E>>
 where
     E: ProvideErrorMetadata + std::fmt::Debug,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+    N: FnMut() -> std::time::Instant,
 {
-    let deadline = std::time::Instant::now() + configured_test_timeout();
-    let mut retry_error = None;
+    match op().await {
+        Err(err) if scope.includes_sdk_error(&err, false) => {
+            retrying_operation_contention_result_after_error(
+                op,
+                scope,
+                now() + retry_window,
+                err,
+                &mut now,
+            )
+            .await
+        }
+        result => result,
+    }
+}
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
+async fn retrying_operation_contention_result_after_error<T, E, F, Fut, N>(
+    op: &mut F,
+    scope: OperationContentionRetryScope,
+    deadline: std::time::Instant,
+    mut retry_error: aws_sdk_s3::error::SdkError<E>,
+    now: &mut N,
+) -> Result<T, aws_sdk_s3::error::SdkError<E>>
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+    N: FnMut() -> std::time::Instant,
+{
     loop {
-        if let Some(err) = retry_error.take() {
-            let Some(delay) = operation_contention_retry_delay(deadline, std::time::Instant::now())
-            else {
-                return Err(err);
-            };
-            tokio::time::sleep(delay).await;
-            if std::time::Instant::now() >= deadline {
-                return Err(err);
-            }
+        let Some(delay) = operation_contention_retry_delay(deadline, now()) else {
+            return Err(retry_error);
+        };
+        tokio::time::sleep(delay).await;
+        if now() >= deadline {
+            return Err(retry_error);
         }
 
         match op().await {
-            Ok(output) => return Ok(output),
             Err(err) if scope.includes_sdk_error(&err, false) => {
-                retry_error = Some(err);
+                retry_error = err;
             }
-            Err(err) => return Err(err),
+            result => return result,
         }
     }
 }
@@ -852,14 +907,49 @@ async fn send_with_operation_contention_retry<B>(
 where
     B: SendRetryingOperationAborted,
 {
-    let deadline = std::time::Instant::now() + configured_test_timeout();
-    send_with_operation_contention_retry_until(builder, scope, deadline).await
+    send_with_operation_contention_retry_for(
+        builder,
+        scope,
+        configured_test_timeout(),
+        std::time::Instant::now,
+    )
+    .await
 }
 
 #[allow(
     clippy::result_large_err,
     reason = "Preserve the AWS SDK result type in this test adapter."
 )]
+async fn send_with_operation_contention_retry_for<B, N>(
+    builder: B,
+    scope: OperationContentionRetryScope,
+    retry_window: Duration,
+    mut now: N,
+) -> Result<B::Output, aws_sdk_s3::error::SdkError<B::Error>>
+where
+    B: SendRetryingOperationAborted,
+    N: FnMut() -> std::time::Instant,
+{
+    match builder.clone().send_once().await {
+        Err(err) if scope.includes_sdk_error(&err, B::RETRY_UNMODELED_CONFLICT) => {
+            send_with_operation_contention_retry_after_error(
+                builder,
+                scope,
+                now() + retry_window,
+                err,
+                &mut now,
+            )
+            .await
+        }
+        result => result,
+    }
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
+#[cfg(test)]
 async fn send_with_operation_contention_retry_until<B>(
     builder: B,
     scope: OperationContentionRetryScope,
@@ -868,23 +958,45 @@ async fn send_with_operation_contention_retry_until<B>(
 where
     B: SendRetryingOperationAborted,
 {
-    let mut retry_error = None;
+    let mut now = std::time::Instant::now;
+    match builder.clone().send_once().await {
+        Err(err) if scope.includes_sdk_error(&err, B::RETRY_UNMODELED_CONFLICT) => {
+            send_with_operation_contention_retry_after_error(
+                builder, scope, deadline, err, &mut now,
+            )
+            .await
+        }
+        result => result,
+    }
+}
 
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
+async fn send_with_operation_contention_retry_after_error<B, N>(
+    builder: B,
+    scope: OperationContentionRetryScope,
+    deadline: std::time::Instant,
+    mut retry_error: aws_sdk_s3::error::SdkError<B::Error>,
+    now: &mut N,
+) -> Result<B::Output, aws_sdk_s3::error::SdkError<B::Error>>
+where
+    B: SendRetryingOperationAborted,
+    N: FnMut() -> std::time::Instant,
+{
     loop {
-        if let Some(err) = retry_error.take() {
-            let Some(delay) = operation_contention_retry_delay(deadline, std::time::Instant::now())
-            else {
-                return Err(err);
-            };
-            tokio::time::sleep(delay).await;
-            if std::time::Instant::now() >= deadline {
-                return Err(err);
-            }
+        let Some(delay) = operation_contention_retry_delay(deadline, now()) else {
+            return Err(retry_error);
+        };
+        tokio::time::sleep(delay).await;
+        if now() >= deadline {
+            return Err(retry_error);
         }
 
         match builder.clone().send_once().await {
             Err(err) if scope.includes_sdk_error(&err, B::RETRY_UNMODELED_CONFLICT) => {
-                retry_error = Some(err);
+                retry_error = err;
             }
             result => return result,
         }
@@ -1556,12 +1668,12 @@ async fn delete_objects_retrying_operation_contention_result(
     delete: Delete,
     scope: OperationContentionRetryScope,
 ) -> Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>> {
-    let deadline = std::time::Instant::now() + configured_test_timeout();
-    delete_objects_retrying_operation_contention_result_until(
+    delete_objects_retrying_operation_contention_result_for(
         delete,
         scope,
-        deadline,
+        configured_test_timeout(),
         |request_delete| delete_objects_with_md5(client, bucket, request_delete).send(),
+        std::time::Instant::now,
     )
     .await
 }
@@ -1570,17 +1682,77 @@ async fn delete_objects_retrying_operation_contention_result(
     clippy::result_large_err,
     reason = "Preserve the AWS SDK result type in this test adapter."
 )]
-async fn delete_objects_retrying_operation_contention_result_until<F, Fut>(
+async fn delete_objects_retrying_operation_contention_result_for<F, Fut, N>(
     delete: Delete,
     scope: OperationContentionRetryScope,
-    deadline: std::time::Instant,
-    mut send: F,
+    retry_window: Duration,
+    send: F,
+    now: N,
 ) -> Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>>
 where
     F: FnMut(Delete) -> Fut,
     Fut: Future<
         Output = Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>>,
     >,
+    N: FnMut() -> std::time::Instant,
+{
+    delete_objects_retrying_operation_contention_result_with_clock(
+        delete,
+        scope,
+        None,
+        retry_window,
+        send,
+        now,
+    )
+    .await
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
+#[cfg(test)]
+async fn delete_objects_retrying_operation_contention_result_until<F, Fut>(
+    delete: Delete,
+    scope: OperationContentionRetryScope,
+    deadline: std::time::Instant,
+    send: F,
+) -> Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>>
+where
+    F: FnMut(Delete) -> Fut,
+    Fut: Future<
+        Output = Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>>,
+    >,
+{
+    delete_objects_retrying_operation_contention_result_with_clock(
+        delete,
+        scope,
+        Some(deadline),
+        Duration::ZERO,
+        send,
+        std::time::Instant::now,
+    )
+    .await
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type in this test adapter."
+)]
+async fn delete_objects_retrying_operation_contention_result_with_clock<F, Fut, N>(
+    delete: Delete,
+    scope: OperationContentionRetryScope,
+    mut deadline: Option<std::time::Instant>,
+    retry_window: Duration,
+    mut send: F,
+    mut now: N,
+) -> Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>>
+where
+    F: FnMut(Delete) -> Fut,
+    Fut: Future<
+        Output = Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>>,
+    >,
+    N: FnMut() -> std::time::Instant,
 {
     let quiet = delete.quiet();
     let all_objects = delete.objects().to_vec();
@@ -1598,13 +1770,12 @@ where
         let resp = match send(request_delete).await {
             Ok(resp) => resp,
             Err(err) if scope.includes_sdk_error(&err, false) => {
-                let Some(delay) =
-                    operation_contention_retry_delay(deadline, std::time::Instant::now())
-                else {
+                let retry_deadline = *deadline.get_or_insert_with(|| now() + retry_window);
+                let Some(delay) = operation_contention_retry_delay(retry_deadline, now()) else {
                     return Err(err);
                 };
                 tokio::time::sleep(delay).await;
-                if std::time::Instant::now() >= deadline {
+                if now() >= retry_deadline {
                     return Err(err);
                 }
                 continue;
@@ -1629,14 +1800,14 @@ where
             return Ok(build_delete_objects_output(deleted, errors));
         }
 
-        let Some(delay) = operation_contention_retry_delay(deadline, std::time::Instant::now())
-        else {
+        let retry_deadline = *deadline.get_or_insert_with(|| now() + retry_window);
+        let Some(delay) = operation_contention_retry_delay(retry_deadline, now()) else {
             errors.extend(retry_errors);
             return Ok(build_delete_objects_output(deleted, errors));
         };
         pending = retry;
         tokio::time::sleep(delay).await;
-        if std::time::Instant::now() >= deadline {
+        if now() >= retry_deadline {
             errors.extend(retry_errors);
             return Ok(build_delete_objects_output(deleted, errors));
         }
@@ -4231,10 +4402,49 @@ mod tests {
             .build()
     }
 
+    fn fake_delete_objects_sdk_error(
+        code: &str,
+    ) -> aws_sdk_s3::error::SdkError<DeleteObjectsError> {
+        let metadata = aws_smithy_types::error::ErrorMetadata::builder()
+            .code(code)
+            .message("fake error")
+            .build();
+        let response = hyper::http::Response::builder()
+            .status(503)
+            .body(aws_smithy_types::body::SdkBody::empty())
+            .expect("build fake DeleteObjects response")
+            .try_into()
+            .expect("convert fake DeleteObjects response");
+        aws_sdk_s3::error::SdkError::service_error(DeleteObjectsError::generic(metadata), response)
+    }
+
+    #[derive(Clone)]
+    struct TestClock {
+        now: Arc<Mutex<std::time::Instant>>,
+    }
+
+    impl TestClock {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(Mutex::new(std::time::Instant::now())),
+            }
+        }
+
+        fn now(&self) -> std::time::Instant {
+            *self.now.lock().unwrap()
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.now.lock().unwrap();
+            *now += duration;
+        }
+    }
+
     #[derive(Clone)]
     struct FakeRetryBuilder {
         calls: Arc<AtomicUsize>,
         first_error_code: Option<&'static str>,
+        first_clock_advance: Option<(TestClock, Duration)>,
     }
 
     impl SendRetryingOperationAborted for FakeRetryBuilder {
@@ -4247,6 +4457,9 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if call == 0 {
+                    if let Some((clock, duration)) = self.first_clock_advance {
+                        clock.advance(duration);
+                    }
                     let mut metadata = aws_smithy_types::error::ErrorMetadata::builder();
                     if let Some(code) = self.first_error_code {
                         metadata = metadata.code(code);
@@ -4281,6 +4494,57 @@ mod tests {
         let contention = OperationContentionRetryScope::OperationAbortedOrSlowDown;
         assert!(contention.includes(Some("OperationAborted")));
         assert!(contention.includes(Some("SlowDown")));
+    }
+
+    #[tokio::test]
+    async fn closure_contention_window_starts_after_first_retryable_response() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let operation_calls = Arc::clone(&calls);
+        let clock = TestClock::new();
+        let operation_clock = clock.clone();
+        let mut operation = move || {
+            let call = operation_calls.fetch_add(1, Ordering::SeqCst);
+            let operation_clock = operation_clock.clone();
+            async move {
+                if call == 0 {
+                    operation_clock.advance(Duration::from_secs(2));
+                    Err(sdk_error_code_fixture(Some("SlowDown"), "retry"))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+
+        let result = retrying_operation_contention_result_for(
+            &mut operation,
+            OperationContentionRetryScope::OperationAbortedOrSlowDown,
+            Duration::from_secs(1),
+            move || clock.now(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn builder_contention_window_starts_after_first_retryable_response() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let clock = TestClock::new();
+        let result = send_with_operation_contention_retry_for(
+            FakeRetryBuilder {
+                calls: Arc::clone(&calls),
+                first_error_code: Some("SlowDown"),
+                first_clock_advance: Some((clock.clone(), Duration::from_secs(2))),
+            },
+            OperationContentionRetryScope::OperationAbortedOrSlowDown,
+            Duration::from_secs(1),
+            move || clock.now(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -4491,6 +4755,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_contention_window_starts_after_first_retryable_response() {
+        let clock = TestClock::new();
+        let operation_clock = clock.clone();
+        let mut calls = 0;
+        let mut operation = || {
+            calls += 1;
+            if calls == 1 {
+                operation_clock.advance(Duration::from_secs(2));
+                raw_complete_error(503, "SlowDown")
+            } else {
+                raw_complete_error(204, "")
+            }
+        };
+
+        let response = retrying_raw_response_for(
+            &mut operation,
+            &is_retryable_operation_contention_response,
+            Duration::from_secs(1),
+            move || clock.now(),
+        )
+        .await;
+
+        assert_eq!(calls, 2);
+        assert_eq!(response.status, 204);
+    }
+
+    #[tokio::test]
     async fn complete_multipart_contention_retry_retries_embedded_errors() {
         let mut calls = 0;
         let response = retrying_complete_multipart_contention_response(|| {
@@ -4647,12 +4938,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_objects_whole_request_window_starts_after_first_contention_response() {
+        let clock = TestClock::new();
+        let send_clock = clock.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let send_calls = Arc::clone(&calls);
+
+        let output = delete_objects_retrying_operation_contention_result_for(
+            fake_delete_objects_request(&["target"]),
+            OperationContentionRetryScope::OperationAbortedOrSlowDown,
+            Duration::from_secs(1),
+            move |_delete| {
+                let call = send_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    send_clock.advance(Duration::from_secs(2));
+                    std::future::ready(Err(fake_delete_objects_sdk_error("SlowDown")))
+                } else {
+                    std::future::ready(Ok(fake_delete_objects_output(
+                        vec![fake_deleted_object("target")],
+                        Vec::new(),
+                    )))
+                }
+            },
+            move || clock.now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(output.deleted()[0].key(), Some("target"));
+    }
+
+    #[tokio::test]
+    async fn delete_objects_entry_window_starts_after_first_contention_response() {
+        let clock = TestClock::new();
+        let send_clock = clock.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let send_calls = Arc::clone(&calls);
+
+        let output = delete_objects_retrying_operation_contention_result_for(
+            fake_delete_objects_request(&["target"]),
+            OperationContentionRetryScope::OperationAbortedOnly,
+            Duration::from_secs(1),
+            move |_delete| {
+                let call = send_calls.fetch_add(1, Ordering::SeqCst);
+                let output = if call == 0 {
+                    send_clock.advance(Duration::from_secs(2));
+                    fake_delete_objects_output(
+                        Vec::new(),
+                        vec![fake_delete_error("target", "OperationAborted")],
+                    )
+                } else {
+                    fake_delete_objects_output(vec![fake_deleted_object("target")], Vec::new())
+                };
+                std::future::ready(Ok(output))
+            },
+            move || clock.now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(output.deleted()[0].key(), Some("target"));
+    }
+
+    #[tokio::test]
     async fn exact_operation_aborted_retry_returns_slow_down_without_retrying() {
         let calls = Arc::new(AtomicUsize::new(0));
         let result = send_with_operation_contention_retry_until(
             FakeRetryBuilder {
                 calls: Arc::clone(&calls),
                 first_error_code: Some("SlowDown"),
+                first_clock_advance: None,
             },
             OperationContentionRetryScope::OperationAbortedOnly,
             std::time::Instant::now() + Duration::from_secs(1),
@@ -4673,6 +5030,7 @@ mod tests {
             FakeRetryBuilder {
                 calls: Arc::clone(&calls),
                 first_error_code: None,
+                first_clock_advance: None,
             },
             OperationContentionRetryScope::OperationAbortedOnly,
             std::time::Instant::now() + Duration::from_secs(1),
@@ -4712,6 +5070,7 @@ mod tests {
             FakeRetryBuilder {
                 calls: Arc::clone(&calls),
                 first_error_code: Some("OperationAborted"),
+                first_clock_advance: None,
             },
             OperationContentionRetryScope::OperationAbortedOnly,
             std::time::Instant::now(),

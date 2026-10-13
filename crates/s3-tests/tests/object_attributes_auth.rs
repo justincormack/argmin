@@ -10,7 +10,7 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, ObjectAttributes,
     ObjectOwnership, Tag, Tagging, VersioningConfiguration,
 };
-use s3_tests::{cleanup_versioned_bucket, unique_bucket, CTX};
+use s3_tests::{cleanup_versioned_bucket, retrying_operation_aborted, unique_bucket, CTX};
 use serde_json::json;
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
@@ -127,13 +127,15 @@ fn object_tagging(key: &str, value: &str) -> Tagging {
 }
 
 async fn put_bucket_policy_json(bucket: &str, policy: serde_json::Value) {
-    CTX.client()
-        .put_bucket_policy()
-        .bucket(bucket)
-        .policy(policy.to_string())
-        .send()
-        .await
-        .unwrap();
+    let policy = policy.to_string();
+    retrying_operation_aborted("install object-attributes bucket policy", || {
+        CTX.client()
+            .put_bucket_policy()
+            .bucket(bucket)
+            .policy(policy.clone())
+            .send()
+    })
+    .await;
 }
 
 async fn multipart_upload_parts(
