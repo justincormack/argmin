@@ -27,7 +27,8 @@ use s3_tests::{
         },
         Client,
     },
-    enable_bucket_sse_c, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+    enable_bucket_sse_c, sse_c_header_values, test_sse_c_key, unique_bucket,
+    SendRetryingOperationAborted, CTX,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1767,7 +1768,7 @@ async fn install_bucket_policy(client: &Client, bucket: &str, policy_json: &str)
         .put_bucket_policy()
         .bucket(bucket)
         .policy(policy_json)
-        .send()
+        .send_retrying_operation_aborted("install bucket policy for condition scenario")
         .await
         .expect("install bucket policy");
 }
