@@ -176,6 +176,40 @@ async fn eventually_list_contains(
     panic!("{description} did not converge to include {expected_buckets:?}");
 }
 
+async fn eventually_list_excludes(
+    client: &aws_sdk_s3::Client,
+    absent_buckets: &[&str],
+    description: &str,
+) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = client
+            .list_buckets()
+            .send_retrying_operation_aborted("list buckets for admin root deletion check")
+            .await;
+        match result {
+            Ok(output) => {
+                let names: Vec<&str> = output
+                    .buckets()
+                    .iter()
+                    .filter_map(|bucket| bucket.name())
+                    .collect();
+                if absent_buckets.iter().all(|absent| !names.contains(absent)) {
+                    return;
+                }
+            }
+            Err(err) if attempt + 1 < MAX_ATTEMPTS => {
+                let _ = err;
+            }
+            Err(err) => panic!("{description} failed unexpectedly: {err:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    panic!("{description} did not converge to exclude {absent_buckets:?}");
+}
+
 async fn create_standard_bucket(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
     s3_tests::create_bucket(client, &bucket).await.unwrap();
@@ -499,13 +533,33 @@ fn test_same_account_root_and_non_root_delete_bucket() {
         let root_bucket = create_standard_bucket(root_client).await;
         let non_root_bucket = create_standard_bucket(non_root_client).await;
 
-        eventually_ok("non-root DeleteBucket on root-created bucket", || {
-            non_root_client.delete_bucket().bucket(&root_bucket).send()
-        })
+        eventually_list_contains(
+            non_root_client,
+            &[&root_bucket],
+            "non-root visibility of root-created bucket before DeleteBucket",
+        )
         .await;
-        eventually_ok("root DeleteBucket on non-root-created bucket", || {
-            root_client.delete_bucket().bucket(&non_root_bucket).send()
-        })
+        eventually_list_contains(
+            root_client,
+            &[&non_root_bucket],
+            "root visibility of non-root-created bucket before DeleteBucket",
+        )
+        .await;
+
+        s3_tests::delete_bucket_retrying_operation_aborted(non_root_client, &root_bucket).await;
+        eventually_list_excludes(
+            root_client,
+            &[&root_bucket],
+            "root visibility after non-root DeleteBucket",
+        )
+        .await;
+
+        s3_tests::delete_bucket_retrying_operation_aborted(root_client, &non_root_bucket).await;
+        eventually_list_excludes(
+            non_root_client,
+            &[&non_root_bucket],
+            "non-root visibility after root DeleteBucket",
+        )
         .await;
     });
 }
