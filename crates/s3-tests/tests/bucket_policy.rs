@@ -16829,7 +16829,7 @@ fn test_bucket_policy_object_creation_operation_bool_variants_allow_put_object()
                 .put_bucket_policy()
                 .bucket(&bucket)
                 .policy(policy)
-                .send()
+                .send_retrying_operation_aborted("put object-creation bool-variant bucket policy")
                 .await
                 .unwrap();
 
