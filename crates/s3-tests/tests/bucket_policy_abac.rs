@@ -714,7 +714,7 @@ fn test_bucket_policy_get_bucket_tagging_bucket_tag_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -774,7 +774,7 @@ fn test_bucket_policy_get_object_bucket_tag_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -825,7 +825,7 @@ fn test_bucket_policy_put_object_bucket_tag_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -911,7 +911,7 @@ fn test_bucket_policy_get_object_bucket_tag_deny_condition_when_abac_disabled() 
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -954,7 +954,7 @@ fn test_bucket_policy_get_bucket_tagging_bucket_tag_condition_when_abac_enabled(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -1017,7 +1017,7 @@ fn test_bucket_policy_get_bucket_tagging_resource_tag_condition_when_abac_enable
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -1109,7 +1109,7 @@ async fn assert_bucket_abac_tag_prefix_key_suffix_case_behavior(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -1185,7 +1185,7 @@ fn test_bucket_policy_list_bucket_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -1369,7 +1369,7 @@ fn test_bucket_policy_put_object_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -1447,7 +1447,7 @@ fn test_bucket_policy_create_bucket_bucket_tag_condition_is_rejected() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await;
 
         cleanup(&bucket, &[]).await;
@@ -1485,7 +1485,7 @@ fn test_bucket_policy_delete_bucket_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await;
 
         let private_bucket = create_bucket_allowing_public_policy(client).await;
@@ -1510,7 +1510,7 @@ fn test_bucket_policy_delete_bucket_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await;
 
         public_policy.unwrap();
@@ -2571,7 +2571,7 @@ fn test_bucket_policy_head_object_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -2605,7 +2605,7 @@ fn test_bucket_policy_head_object_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -2685,7 +2685,7 @@ fn test_bucket_policy_get_object_attributes_bucket_tag_condition_when_abac_enabl
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -2727,7 +2727,7 @@ fn test_bucket_policy_get_object_attributes_bucket_tag_condition_when_abac_enabl
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -2793,7 +2793,7 @@ fn test_bucket_policy_create_multipart_upload_bucket_tag_condition_when_abac_ena
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -2819,7 +2819,7 @@ fn test_bucket_policy_create_multipart_upload_bucket_tag_condition_when_abac_ena
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -2890,7 +2890,7 @@ fn test_bucket_policy_upload_part_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -2966,7 +2966,7 @@ fn test_bucket_policy_complete_multipart_upload_bucket_tag_condition_when_abac_e
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3071,7 +3071,7 @@ fn test_bucket_policy_copy_object_source_bucket_tag_condition_when_abac_enabled(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3105,7 +3105,7 @@ fn test_bucket_policy_copy_object_source_bucket_tag_condition_when_abac_enabled(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3190,7 +3190,7 @@ fn test_bucket_policy_upload_part_copy_source_bucket_tag_condition_when_abac_ena
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3224,7 +3224,7 @@ fn test_bucket_policy_upload_part_copy_source_bucket_tag_condition_when_abac_ena
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3328,7 +3328,7 @@ fn test_bucket_policy_copy_object_destination_bucket_tag_condition_when_abac_ena
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3354,7 +3354,7 @@ fn test_bucket_policy_copy_object_destination_bucket_tag_condition_when_abac_ena
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3433,7 +3433,7 @@ fn test_bucket_policy_upload_part_copy_destination_bucket_tag_condition_when_aba
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3519,7 +3519,7 @@ fn test_bucket_policy_get_object_tagging_bucket_tag_condition_when_abac_enabled(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3561,7 +3561,7 @@ fn test_bucket_policy_get_object_tagging_bucket_tag_condition_when_abac_enabled(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3635,7 +3635,7 @@ fn test_bucket_policy_put_object_tagging_bucket_tag_condition_when_abac_enabled(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3669,7 +3669,7 @@ fn test_bucket_policy_put_object_tagging_bucket_tag_condition_when_abac_enabled(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3753,7 +3753,7 @@ fn test_bucket_policy_get_object_acl_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3787,7 +3787,7 @@ fn test_bucket_policy_get_object_acl_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3862,7 +3862,7 @@ fn test_bucket_policy_put_object_acl_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3897,7 +3897,7 @@ fn test_bucket_policy_put_object_acl_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -3993,7 +3993,7 @@ fn test_bucket_policy_delete_object_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4027,7 +4027,7 @@ fn test_bucket_policy_delete_object_bucket_tag_condition_when_abac_enabled() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4100,7 +4100,7 @@ fn test_bucket_policy_get_object_version_acl_bucket_tag_condition_when_abac_enab
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4127,7 +4127,7 @@ fn test_bucket_policy_get_object_version_acl_bucket_tag_condition_when_abac_enab
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4200,7 +4200,7 @@ fn test_bucket_policy_put_object_version_acl_bucket_tag_condition_when_abac_enab
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4228,7 +4228,7 @@ fn test_bucket_policy_put_object_version_acl_bucket_tag_condition_when_abac_enab
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4315,7 +4315,7 @@ fn test_bucket_policy_get_object_version_tagging_bucket_tag_condition_when_abac_
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4351,7 +4351,7 @@ fn test_bucket_policy_get_object_version_tagging_bucket_tag_condition_when_abac_
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4420,7 +4420,7 @@ fn test_bucket_policy_put_object_version_tagging_bucket_tag_condition_when_abac_
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4447,7 +4447,7 @@ fn test_bucket_policy_put_object_version_tagging_bucket_tag_condition_when_abac_
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4527,7 +4527,7 @@ fn test_bucket_policy_delete_object_version_bucket_tag_condition_when_abac_enabl
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4554,7 +4554,7 @@ fn test_bucket_policy_delete_object_version_bucket_tag_condition_when_abac_enabl
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4628,7 +4628,7 @@ fn test_bucket_policy_delete_object_tagging_bucket_tag_condition_when_abac_enabl
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4663,7 +4663,7 @@ fn test_bucket_policy_delete_object_tagging_bucket_tag_condition_when_abac_enabl
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4745,7 +4745,7 @@ fn test_bucket_policy_delete_object_version_tagging_bucket_tag_condition_when_ab
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4781,7 +4781,7 @@ fn test_bucket_policy_delete_object_version_tagging_bucket_tag_condition_when_ab
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4867,7 +4867,7 @@ fn test_bucket_policy_head_bucket_bucket_tag_conditions_with_list_and_location_w
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4906,7 +4906,7 @@ fn test_bucket_policy_head_bucket_bucket_tag_conditions_with_list_and_location_w
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 
@@ -4956,7 +4956,7 @@ fn test_bucket_policy_head_bucket_bucket_tag_condition_with_location_only_when_a
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put ABAC bucket policy")
             .await
             .unwrap();
 

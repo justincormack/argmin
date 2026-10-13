@@ -426,7 +426,7 @@ fn test_bucket_policy_request_object_tag_keys_on_put_object_inline_tags() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -500,7 +500,7 @@ fn test_bucket_policy_request_object_tag_keys_for_all_values() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -601,7 +601,7 @@ fn test_bucket_policy_request_object_tag_keys_for_all_values_empty_tag_set_allow
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -670,7 +670,7 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -746,7 +746,7 @@ fn test_bucket_policy_request_object_tag_keys_for_all_values_string_equals_ignor
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -821,7 +821,7 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value_string_equals_ignore
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -896,7 +896,7 @@ fn test_bucket_policy_request_object_tag_keys_for_all_values_string_not_equals_i
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -971,7 +971,7 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value_string_not_equals_ig
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1046,7 +1046,7 @@ fn test_bucket_policy_request_object_tag_keys_for_all_values_string_like() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1121,7 +1121,7 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value_string_like() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1196,7 +1196,7 @@ fn test_bucket_policy_request_object_tag_keys_for_all_values_string_not_like() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1271,7 +1271,7 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value_string_not_like() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1336,7 +1336,7 @@ fn test_bucket_policy_tag_resource_tag_keys_for_all_values() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1400,7 +1400,7 @@ fn test_bucket_policy_tag_resource_tag_keys_for_any_value() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1464,7 +1464,7 @@ fn test_bucket_policy_tag_resource_request_tag_condition() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1514,7 +1514,7 @@ fn test_bucket_policy_untag_resource_is_not_authorized_by_tag_resource() {
                 tag("security", "allow"),
                 tag("team", "storage"),
             ]))
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket tags")
             .await
             .unwrap();
         client
@@ -1532,7 +1532,7 @@ fn test_bucket_policy_untag_resource_is_not_authorized_by_tag_resource() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1576,7 +1576,7 @@ fn test_bucket_policy_untag_resource_tag_keys_for_all_values_partial_removal() {
                 tag("security", "allow"),
                 tag("team", "storage"),
             ]))
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket tags")
             .await
             .unwrap();
         client
@@ -1602,7 +1602,7 @@ fn test_bucket_policy_untag_resource_tag_keys_for_all_values_partial_removal() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1637,7 +1637,7 @@ fn test_bucket_policy_untag_resource_tag_keys_for_all_values_full_removal() {
             .put_bucket_tagging()
             .bucket(&bucket)
             .tagging(tagging(vec![tag("security", "allow")]))
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket tags")
             .await
             .unwrap();
         client
@@ -1663,7 +1663,7 @@ fn test_bucket_policy_untag_resource_tag_keys_for_all_values_full_removal() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1704,7 +1704,7 @@ fn test_bucket_policy_rejects_request_object_tag_condition_on_tag_resource() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .expect_err("TagResource policy with s3:RequestObjectTag should be rejected");
         assert_eq!(err.raw_response().map(|r| r.status().as_u16()), Some(400));
@@ -1743,7 +1743,7 @@ fn test_bucket_policy_rejects_request_object_tag_keys_condition_on_tag_resource(
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .expect_err("TagResource policy with s3:RequestObjectTagKeys should be rejected");
         assert_eq!(err.raw_response().map(|r| r.status().as_u16()), Some(400));
@@ -1782,7 +1782,7 @@ fn test_bucket_policy_rejects_request_object_tag_condition_on_untag_resource() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .expect_err("UntagResource policy with s3:RequestObjectTag should be rejected");
         assert_eq!(err.raw_response().map(|r| r.status().as_u16()), Some(400));
@@ -1809,7 +1809,7 @@ fn test_bucket_policy_request_tag_condition_on_untag_resource_is_accepted_but_do
                 tag("security", "allow"),
                 tag("team", "storage"),
             ]))
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket tags")
             .await
             .unwrap();
         client
@@ -1840,7 +1840,7 @@ fn test_bucket_policy_request_tag_condition_on_untag_resource_is_accepted_but_do
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1865,7 +1865,7 @@ fn test_bucket_policy_request_tag_condition_on_untag_resource_matches_empty_valu
             .put_bucket_tagging()
             .bucket(&bucket)
             .tagging(tagging(vec![tag("security", "allow")]))
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket tags")
             .await
             .unwrap();
         client
@@ -1896,7 +1896,7 @@ fn test_bucket_policy_request_tag_condition_on_untag_resource_matches_empty_valu
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -1941,7 +1941,7 @@ fn test_bucket_policy_rejects_request_object_tag_keys_condition_on_untag_resourc
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .expect_err("UntagResource policy with s3:RequestObjectTagKeys should be rejected");
         assert_eq!(err.raw_response().map(|r| r.status().as_u16()), Some(400));
@@ -1998,7 +1998,7 @@ fn test_bucket_policy_request_object_tag_keys_string_equals_is_accepted_but_does
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -2055,7 +2055,7 @@ fn test_bucket_policy_request_object_tag_keys_string_equals_is_accepted_but_does
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -2113,7 +2113,7 @@ fn test_bucket_policy_tag_keys_string_equals_is_accepted_but_does_not_match() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -2162,7 +2162,7 @@ fn test_bucket_policy_tag_keys_string_equals_is_accepted_but_does_not_match() {
                 })
                 .to_string(),
             )
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket policy")
             .await
             .unwrap();
 
@@ -2611,7 +2611,7 @@ fn test_tag_resource_unauthorized_request_does_not_validate_merged_hidden_tags()
             .put_bucket_tagging()
             .bucket(&bucket)
             .tagging(tagging(existing_tags))
-            .send()
+            .send_retrying_operation_aborted("put multivalue bucket tags")
             .await
             .unwrap();
 
