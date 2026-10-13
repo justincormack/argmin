@@ -62,6 +62,17 @@ async fn enable_versioning(bucket: &str) {
         .unwrap();
 }
 
+async fn put_lifecycle_configuration(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    configuration: BucketLifecycleConfiguration,
+) {
+    retrying_operation_aborted("put lifecycle configuration", || {
+        put_bucket_lifecycle_with_md5(client, bucket, configuration.clone()).send()
+    })
+    .await;
+}
+
 async fn cleanup_versioned_lifecycle_bucket(bucket: &str) {
     let client = CTX.client();
     let _ = client
@@ -1083,10 +1094,7 @@ fn test_delete_bucket_lifecycle_is_idempotent() {
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         client
             .delete_bucket_lifecycle()
@@ -1166,10 +1174,7 @@ fn test_bucket_lifecycle_crud_round_trip() {
             .build()
             .unwrap();
 
-        let put_result = put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await;
-        put_result.unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         let get = client
             .get_bucket_lifecycle_configuration()
@@ -1261,10 +1266,7 @@ fn test_bucket_lifecycle_round_trip_preserves_disabled_rule() {
             .build()
             .unwrap();
 
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         let get = client
             .get_bucket_lifecycle_configuration()
@@ -1322,10 +1324,7 @@ fn test_bucket_lifecycle_get_assigns_ids_when_missing() {
             .build()
             .unwrap();
 
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         let get = client
             .get_bucket_lifecycle_configuration()
@@ -1381,10 +1380,7 @@ fn test_bucket_lifecycle_round_trip_expiration_date_rule() {
             .build()
             .unwrap();
 
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         let get = client
             .get_bucket_lifecycle_configuration()
@@ -1429,10 +1425,7 @@ fn test_bucket_lifecycle_round_trip_empty_filter_rule() {
             .build()
             .unwrap();
 
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         let get = client
             .get_bucket_lifecycle_configuration()
@@ -1488,10 +1481,7 @@ fn test_bucket_lifecycle_round_trip_tag_filter_rule() {
             .build()
             .unwrap();
 
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         let get = client
             .get_bucket_lifecycle_configuration()
@@ -1866,10 +1856,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_prefix_filter() 
             )
             .build()
             .unwrap();
-        let put_lifecycle = put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await;
-        put_lifecycle.unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         put_object_until_expiration_header(&bucket, "logs/match", b"match", None, "expire-current")
             .await;
@@ -1927,10 +1914,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_tag_filter() {
             )
             .build()
             .unwrap();
-        let put_lifecycle = put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await;
-        put_lifecycle.unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         put_object_until_expiration_header(
             &bucket,
@@ -2000,10 +1984,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_and_filter() {
             )
             .build()
             .unwrap();
-        let put_lifecycle = put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await;
-        put_lifecycle.unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         put_object_until_expiration_header(
             &bucket,
@@ -2079,10 +2060,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_date_rule() {
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         put_object_until_expiration_header(
             &bucket,
@@ -2146,10 +2124,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_object_size_grea
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         put_object_until_expiration_header(
             &bucket,
@@ -2206,10 +2181,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_object_size_less
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         put_object_until_expiration_header(
             &bucket,
@@ -2263,10 +2235,7 @@ fn test_get_and_head_object_only_report_expiration_for_current_live_version() {
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         let first = put_object_until_expiration_header(
             &bucket,
@@ -2361,10 +2330,7 @@ fn test_create_multipart_upload_and_list_parts_skip_abort_headers_for_nonmatchin
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         let create = client
             .create_multipart_upload()
@@ -2423,10 +2389,7 @@ fn test_create_multipart_upload_and_list_parts_report_abort_headers() {
             )
             .build()
             .unwrap();
-        let put_lifecycle = put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await;
-        put_lifecycle.unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         let create = create_multipart_upload_until_abort_header(
             &bucket,
@@ -2480,10 +2443,7 @@ fn test_list_parts_abort_headers_follow_current_lifecycle_rule() {
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, initial_config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, initial_config).await;
 
         let create =
             create_multipart_upload_until_abort_header(&bucket, key, "abort-after-seven-days")
@@ -2507,10 +2467,7 @@ fn test_list_parts_abort_headers_follow_current_lifecycle_rule() {
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, replacement_config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, replacement_config).await;
 
         let replacement_canary = create_multipart_upload_until_specific_abort_rule(
             &bucket,
@@ -2578,10 +2535,7 @@ fn test_complete_multipart_upload_reports_expiration_header() {
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, config)
-            .send()
-            .await
-            .unwrap();
+        put_lifecycle_configuration(client, &bucket, config).await;
 
         // CompleteMultipartUpload cannot be re-sent for the same upload, so
         // while the just-put lifecycle rule propagates (AWS is eventually
@@ -2673,10 +2627,7 @@ fn test_get_bucket_lifecycle_response_shape() {
             )
             .build()
             .unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, lifecycle)
-            .send()
-            .await
-            .expect("put bucket lifecycle");
+        put_lifecycle_configuration(client, &bucket, lifecycle).await;
 
         let response = raw_bucket("GET", &bucket, Some("lifecycle="));
         const LIFECYCLE_BODY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

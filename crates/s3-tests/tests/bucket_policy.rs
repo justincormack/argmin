@@ -18,7 +18,8 @@ use s3_tests::{
     create_public_bucket, disable_bucket_public_access_block, err_status, object_url,
     post_object_raw_to_test_endpoint_with_headers, presign_url_with_credentials,
     put_bucket_lifecycle_with_md5, raw_alt_object_request, raw_anonymous, raw_bucket,
-    raw_fetch_url, send_signed_request, send_signed_request_with_credentials,
+    raw_fetch_url, retrying_operation_aborted, send_signed_request,
+    send_signed_request_with_credentials,
     shape::{
         assert_shape, error_response_headers, escape_literal, expected_error, id_headers, shape,
     },
@@ -2001,7 +2002,7 @@ fn test_bucket_policy_get_bucket_tagging_cross_account_allow() {
             .put_bucket_tagging()
             .bucket(&bucket)
             .tagging(simple_bucket_tagging("env", "test"))
-            .send()
+            .send_retrying_operation_aborted("put bucket tags during policy test")
             .await
             .unwrap();
         client
@@ -2102,10 +2103,15 @@ fn test_bucket_policy_get_bucket_lifecycle_cross_account_allow() {
 
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        put_bucket_lifecycle_with_md5(client, &bucket, simple_lifecycle_configuration("logs/", 30))
+        retrying_operation_aborted("put lifecycle configuration during policy test", || {
+            put_bucket_lifecycle_with_md5(
+                client,
+                &bucket,
+                simple_lifecycle_configuration("logs/", 30),
+            )
             .send()
-            .await
-            .unwrap();
+        })
+        .await;
         client
             .put_bucket_policy()
             .bucket(&bucket)

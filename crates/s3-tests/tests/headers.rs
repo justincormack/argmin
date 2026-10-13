@@ -64,10 +64,7 @@ fn raw_signed_request(method: &str, path: &str, body: &[u8]) -> (u16, String) {
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    s3_tests::create_bucket_request(client, &bucket)
-        .send()
-        .await
-        .unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 

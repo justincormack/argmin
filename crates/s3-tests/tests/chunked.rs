@@ -13,7 +13,7 @@ use ring::{digest, hmac};
 use s3_tests::{
     assert_s3_err_code, build_client_with_ca, build_test_agent,
     shape::{expected_error, xml_tag_text},
-    unique_bucket, TestServer, CTX,
+    unique_bucket, RawResponse, TestServer, CTX,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -661,48 +661,76 @@ struct UploadPartTarget<'a> {
     part_number: i32,
 }
 
-fn send_chunked_upload_part(
+async fn send_chunked_upload_part(
     target: UploadPartTarget<'_>,
     content_sha256: &str,
     decoded_content_length: usize,
     extra_signed_headers: &[(&str, &str)],
-    build_wire: impl FnOnce(&SignResult) -> Vec<u8>,
-) -> s3_tests::Response {
-    let path = format!("/{}/{}", target.bucket, target.key);
-    let encoded_upload_id: String =
-        url::form_urlencoded::byte_serialize(target.upload_id.as_bytes()).collect();
-    let query = format!(
-        "partNumber={}&uploadId={encoded_upload_id}",
-        target.part_number
-    );
-    let request_uri = format!("{path}?{query}");
-    let sign = sign_streaming_request_custom_with_query(
-        "PUT",
-        &request_uri,
-        content_sha256,
-        decoded_content_length,
-        extra_signed_headers,
-        false,
-        false,
-    );
-    let wire = build_wire(&sign);
+    build_wire: impl Fn(&SignResult) -> Vec<u8>,
+) -> RawResponse {
+    s3_tests::retrying_operation_contention_response(|| {
+        let path = format!("/{}/{}", target.bucket, target.key);
+        let encoded_upload_id: String =
+            url::form_urlencoded::byte_serialize(target.upload_id.as_bytes()).collect();
+        let query = format!(
+            "partNumber={}&uploadId={encoded_upload_id}",
+            target.part_number
+        );
+        let request_uri = format!("{path}?{query}");
+        let sign = sign_streaming_request_custom_with_query(
+            "PUT",
+            &request_uri,
+            content_sha256,
+            decoded_content_length,
+            extra_signed_headers,
+            false,
+            false,
+        );
+        let wire = build_wire(&sign);
 
-    let url = format!("{}{}?{}", CTX.endpoint(), path, query);
-    let mut request = agent()
-        .put(&url)
-        .header("Authorization", &sign.authorization)
-        .header("x-amz-date", &sign.amz_date)
-        .header("x-amz-content-sha256", content_sha256)
-        .header("content-encoding", "aws-chunked")
-        .header(
-            "x-amz-decoded-content-length",
-            decoded_content_length.to_string(),
-        )
-        .header("content-length", wire.len().to_string());
-    for (name, value) in extra_signed_headers {
-        request = request.header(*name, *value);
-    }
-    request.send(&wire).expect("transport error")
+        let url = format!("{}{}?{}", CTX.endpoint(), path, query);
+        let mut request = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header(
+                "x-amz-decoded-content-length",
+                decoded_content_length.to_string(),
+            )
+            .header("content-length", wire.len().to_string());
+        for (name, value) in extra_signed_headers {
+            request = request.header(*name, *value);
+        }
+        let mut response = request.send(&wire).expect("transport error");
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
+        let mut body_read_error = response.body_read_error().map(ToOwned::to_owned);
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|error| {
+                body_read_error.get_or_insert_with(|| error.to_string());
+                String::new()
+            });
+        RawResponse {
+            status,
+            headers,
+            body,
+            body_read_error,
+        }
+    })
+    .await
 }
 
 async fn assert_upload_has_no_parts(bucket: &str, key: &str, upload_id: &str, context: &str) {
@@ -3343,19 +3371,15 @@ fn test_large_single_signed_chunked_upload_part_completes() {
             data.len(),
             &[],
             |sign| build_signed_chunked_body(sign, &data),
-        );
+        )
+        .await;
         assert_eq!(
-            response.status().as_u16(),
-            200,
-            "large signed chunk UploadPart failed: {:?}",
-            response.body_read_error()
+            response.status, 200,
+            "large signed chunk UploadPart failed: {}; body read error: {:?}",
+            response.body, response.body_read_error
         );
-        let etag = response
-            .headers()
-            .get("etag")
+        let etag = s3_tests::raw_response_header(&response, "etag")
             .expect("UploadPart response missing ETag")
-            .to_str()
-            .expect("UploadPart ETag is not valid ASCII")
             .to_string();
 
         client
@@ -3408,7 +3432,7 @@ fn test_chunked_upload_part_decoder_failures_do_not_stage_parts() {
         let upload_id = create.upload_id().unwrap().to_string();
 
         let bad_signature_data = vec![b'B'; LARGE_SIGNED_CHUNK_BYTES];
-        let mut response = send_chunked_upload_part(
+        let response = send_chunked_upload_part(
             UploadPartTarget {
                 bucket: &bucket,
                 key,
@@ -3419,9 +3443,10 @@ fn test_chunked_upload_part_decoder_failures_do_not_stage_parts() {
             bad_signature_data.len(),
             &[],
             |_| build_signed_chunked_body_with_bad_data_signature(&bad_signature_data),
-        );
-        let status = response.status().as_u16();
-        let body = response.body_mut().read_to_string().unwrap_or_default();
+        )
+        .await;
+        let status = response.status;
+        let body = response.body;
         assert_eq!(status, 403, "bad data signature returned {status}: {body}");
         assert_signature_mismatch_body(&body);
         assert_upload_has_no_parts(&bucket, key, &upload_id, "bad data signature").await;
@@ -3431,7 +3456,7 @@ fn test_chunked_upload_part_decoder_failures_do_not_stage_parts() {
         let crc = checksum::crc32::checksum(&mismatch_data);
         let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
         let trailer = format!("x-amz-checksum-crc32:{crc_b64}");
-        let mut response = send_chunked_upload_part(
+        let response = send_chunked_upload_part(
             UploadPartTarget {
                 bucket: &bucket,
                 key,
@@ -3442,9 +3467,10 @@ fn test_chunked_upload_part_decoder_failures_do_not_stage_parts() {
             claimed_length,
             &[("x-amz-trailer", "x-amz-checksum-crc32")],
             |_| build_unsigned_chunked_body_with_trailer(&mismatch_data, &trailer),
-        );
-        let status = response.status().as_u16();
-        let body = response.body_mut().read_to_string().unwrap_or_default();
+        )
+        .await;
+        let status = response.status;
+        let body = response.body;
         assert_eq!(
             status, 400,
             "decoded length mismatch returned {status}: {body}"
@@ -3455,7 +3481,7 @@ fn test_chunked_upload_part_decoder_failures_do_not_stage_parts() {
         let small_chunk = b"small";
         let final_chunk = b"another chunk";
         let decoded_length = first_chunk.len() + small_chunk.len() + final_chunk.len();
-        let mut response = send_chunked_upload_part(
+        let response = send_chunked_upload_part(
             UploadPartTarget {
                 bucket: &bucket,
                 key,
@@ -3471,9 +3497,10 @@ fn test_chunked_upload_part_decoder_failures_do_not_stage_parts() {
                     &[first_chunk.as_slice(), small_chunk, final_chunk],
                 )
             },
-        );
-        let status = response.status().as_u16();
-        let body = response.body_mut().read_to_string().unwrap_or_default();
+        )
+        .await;
+        let status = response.status;
+        let body = response.body;
         assert_eq!(
             status, 403,
             "small non-final chunk returned {status}: {body}"
@@ -3510,37 +3537,22 @@ fn test_signed_chunked_upload_part_bad_terminal_signature_not_staged() {
         let upload_id = create.upload_id().unwrap().to_string();
 
         let data = b"part payload accepted before terminal signature fails";
-        let path = format!("/{bucket}/{key}");
-        let encoded_upload_id: String =
-            url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
-        let query = format!("partNumber=1&uploadId={encoded_upload_id}");
-        let request_uri = format!("{path}?{query}");
         let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
-
-        let sign = sign_streaming_request_custom_with_query(
-            "PUT",
-            &request_uri,
+        let response = send_chunked_upload_part(
+            UploadPartTarget {
+                bucket: &bucket,
+                key,
+                upload_id: &upload_id,
+                part_number: 1,
+            },
             content_sha256,
             data.len(),
             &[],
-            false,
-            false,
-        );
-        let wire = build_signed_chunked_body_with_bad_terminal_signature(&sign, data);
-
-        let url = format!("{}{}?{}", CTX.endpoint(), path, query);
-        let mut resp = agent()
-            .put(&url)
-            .header("Authorization", &sign.authorization)
-            .header("x-amz-date", &sign.amz_date)
-            .header("x-amz-content-sha256", content_sha256)
-            .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", data.len().to_string())
-            .header("content-length", wire.len().to_string())
-            .send(&wire[..])
-            .expect("transport error");
-        let status = resp.status().as_u16();
-        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+            |sign| build_signed_chunked_body_with_bad_terminal_signature(sign, data),
+        )
+        .await;
+        let status = response.status;
+        let body_str = response.body;
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
         assert_signature_mismatch_body(&body_str);
 
