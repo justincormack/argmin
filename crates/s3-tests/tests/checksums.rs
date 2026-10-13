@@ -11,7 +11,8 @@ use checksum::ChecksumAlgorithm as LocalChecksumAlgorithm;
 use ring::hmac;
 use s3_tests::{
     assert_complete_multipart_sdk_error, assert_s3_err_code, cleanup_versioned_bucket, err_status,
-    raw_object_with, retrying_operation_aborted, send_signed_request,
+    raw_object_with, retrying_operation_aborted, retrying_operation_aborted_result,
+    send_signed_request,
     shape::{assert_shape, error_response_headers, expected_error, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
@@ -319,6 +320,46 @@ async fn send_signed_complete_multipart_post_retrying_operation_contention(
     (response.status, response.body)
 }
 
+async fn send_signed_request_retrying_operation_contention<F>(operation: F) -> s3_tests::RawResponse
+where
+    F: FnMut() -> s3_tests::RawResponse,
+{
+    s3_tests::retrying_operation_contention_response(operation).await
+}
+
+async fn upload_part_retrying_operation_contention<F>(
+    mut operation: F,
+) -> aws_sdk_s3::operation::upload_part::UploadPartOutput
+where
+    F: FnMut() -> aws_sdk_s3::operation::upload_part::builders::UploadPartFluentBuilder,
+{
+    retrying_operation_aborted("upload checksum multipart part", || {
+        let request = operation();
+        async move { request.send().await }
+    })
+    .await
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserve the AWS SDK result type for checksum error assertions."
+)]
+async fn upload_part_result_retrying_operation_contention<F>(
+    mut operation: F,
+) -> Result<
+    aws_sdk_s3::operation::upload_part::UploadPartOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::upload_part::UploadPartError>,
+>
+where
+    F: FnMut() -> aws_sdk_s3::operation::upload_part::builders::UploadPartFluentBuilder,
+{
+    retrying_operation_aborted_result(|| {
+        let request = operation();
+        async move { request.send().await }
+    })
+    .await
+}
+
 fn encode_base64(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -335,12 +376,15 @@ async fn raw_put_object_with_checksum_headers(
     headers: &[(&str, String)],
 ) -> s3_tests::RawResponse {
     let url = s3_tests::object_url(CTX.endpoint(), bucket, key, None);
-    send_signed_request(
-        "PUT",
-        &url,
-        body,
-        headers.iter().map(|(k, v)| (*k, v.as_str())),
-    )
+    send_signed_request_retrying_operation_contention(|| {
+        send_signed_request(
+            "PUT",
+            &url,
+            body,
+            headers.iter().map(|(k, v)| (*k, v.as_str())),
+        )
+    })
+    .await
 }
 
 fn raw_upload_part_url(bucket: &str, key: &str, upload_id: &str, part_number: u32) -> String {
@@ -579,16 +623,16 @@ async fn complete_single_part_upload_without_checksum(
     body: Vec<u8>,
 ) {
     let client = CTX.client();
-    let part = client
-        .upload_part()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(upload_id)
-        .part_number(1)
-        .body(ByteStream::from(body))
-        .send()
-        .await
-        .unwrap();
+    let part = upload_part_retrying_operation_contention(|| {
+        client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from(body.clone()))
+    })
+    .await;
     client
         .complete_multipart_upload()
         .bucket(bucket)
@@ -604,7 +648,7 @@ async fn complete_single_part_upload_without_checksum(
                 )
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("complete checksum multipart upload")
         .await
         .unwrap();
 }
@@ -764,8 +808,10 @@ fn test_complete_multipart_without_checksum_headers_defaults_crc64nvme() {
         let body = b"multipart default crc64nvme oracle";
 
         let create_url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
-        let create =
-            send_signed_request("POST", &create_url, &[], std::iter::empty::<(&str, &str)>());
+        let create = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request("POST", &create_url, &[], std::iter::empty::<(&str, &str)>())
+        })
+        .await;
         assert_eq!(create.status, 200, "create response: {create:?}");
         assert_eq!(
             response_header(&create.headers, "x-amz-checksum-algorithm"),
@@ -778,7 +824,10 @@ fn test_complete_multipart_without_checksum_headers_defaults_crc64nvme() {
         let upload_id = xml_text(&create.body, "UploadId").expect("UploadId in response");
 
         let part_url = raw_upload_part_url(&bucket, key, upload_id, 1);
-        let part = send_signed_request("PUT", &part_url, body, std::iter::empty::<(&str, &str)>());
+        let part = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request("PUT", &part_url, body, std::iter::empty::<(&str, &str)>())
+        })
+        .await;
         assert_eq!(part.status, 200, "upload part response: {part:?}");
         let etag = response_header(&part.headers, "etag").expect("UploadPart ETag");
 
@@ -1405,8 +1454,10 @@ fn test_create_multipart_checksum_algorithm_lowercase() {
         let bucket = setup_bucket().await;
         let key = "create-multipart-lowercase-checksum-algorithm";
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
-        let response =
-            send_signed_request("POST", &url, &[], [("x-amz-checksum-algorithm", "crc32")]);
+        let response = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request("POST", &url, &[], [("x-amz-checksum-algorithm", "crc32")])
+        })
+        .await;
         if response.status == 200 {
             let upload_id = xml_text(&response.body, "UploadId").expect("UploadId in response");
             CTX.client()
@@ -1414,7 +1465,7 @@ fn test_create_multipart_checksum_algorithm_lowercase() {
                 .bucket(&bucket)
                 .key(key)
                 .upload_id(upload_id)
-                .send()
+                .send_retrying_operation_aborted("abort checksum multipart upload")
                 .await
                 .unwrap();
         }
@@ -1437,8 +1488,10 @@ fn test_create_multipart_invalid_checksum_algorithm() {
         let bucket = setup_bucket().await;
         let key = "create-multipart-invalid-checksum-algorithm";
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
-        let response =
-            send_signed_request("POST", &url, &[], [("x-amz-checksum-algorithm", "BOGUS")]);
+        let response = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request("POST", &url, &[], [("x-amz-checksum-algorithm", "BOGUS")])
+        })
+        .await;
         if response.status == 200 {
             let upload_id = xml_text(&response.body, "UploadId").expect("UploadId in response");
             CTX.client()
@@ -1446,7 +1499,7 @@ fn test_create_multipart_invalid_checksum_algorithm() {
                 .bucket(&bucket)
                 .key(key)
                 .upload_id(upload_id)
-                .send()
+                .send_retrying_operation_aborted("abort checksum multipart upload")
                 .await
                 .unwrap();
         }
@@ -1470,15 +1523,18 @@ fn test_create_multipart_invalid_checksum_type_error_shape() {
         let bucket = setup_bucket().await;
         let key = "create-multipart-invalid-checksum-type-shape";
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
-        let response = send_signed_request(
-            "POST",
-            &url,
-            &[],
-            [
-                ("x-amz-checksum-algorithm", "CRC32"),
-                ("x-amz-checksum-type", "INVALID"),
-            ],
-        );
+        let response = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request(
+                "POST",
+                &url,
+                &[],
+                [
+                    ("x-amz-checksum-algorithm", "CRC32"),
+                    ("x-amz-checksum-type", "INVALID"),
+                ],
+            )
+        })
+        .await;
         assert_shape(
             "CreateMultipartUpload invalid checksum type",
             &response,
@@ -1499,8 +1555,10 @@ fn test_create_multipart_checksum_type_without_algorithm_error_shape() {
         let bucket = setup_bucket().await;
         let key = "create-multipart-type-without-algorithm-shape";
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
-        let response =
-            send_signed_request("POST", &url, &[], [("x-amz-checksum-type", "COMPOSITE")]);
+        let response = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request("POST", &url, &[], [("x-amz-checksum-type", "COMPOSITE")])
+        })
+        .await;
         assert_shape(
             "CreateMultipartUpload checksum type without algorithm",
             &response,
@@ -1521,15 +1579,18 @@ fn test_create_multipart_crc64nvme_composite_error_shape() {
         let bucket = setup_bucket().await;
         let key = "create-multipart-crc64nvme-composite-shape";
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
-        let response = send_signed_request(
-            "POST",
-            &url,
-            &[],
-            [
-                ("x-amz-checksum-algorithm", "CRC64NVME"),
-                ("x-amz-checksum-type", "COMPOSITE"),
-            ],
-        );
+        let response = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request(
+                "POST",
+                &url,
+                &[],
+                [
+                    ("x-amz-checksum-algorithm", "CRC64NVME"),
+                    ("x-amz-checksum-type", "COMPOSITE"),
+                ],
+            )
+        })
+        .await;
         assert_shape(
             "CreateMultipartUpload CRC64NVME COMPOSITE",
             &response,
@@ -1551,15 +1612,18 @@ fn test_create_multipart_sha256_full_object_error_shape() {
         let bucket = setup_bucket().await;
         let key = "create-multipart-sha256-full-object-shape";
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
-        let response = send_signed_request(
-            "POST",
-            &url,
-            &[],
-            [
-                ("x-amz-checksum-algorithm", "SHA256"),
-                ("x-amz-checksum-type", "FULL_OBJECT"),
-            ],
-        );
+        let response = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request(
+                "POST",
+                &url,
+                &[],
+                [
+                    ("x-amz-checksum-algorithm", "SHA256"),
+                    ("x-amz-checksum-type", "FULL_OBJECT"),
+                ],
+            )
+        })
+        .await;
         assert_shape(
             "CreateMultipartUpload SHA256 FULL_OBJECT",
             &response,
@@ -1581,12 +1645,15 @@ fn test_create_multipart_concrete_checksum_header_without_algorithm_is_ignored()
         let bucket = setup_bucket().await;
         let key = "create-multipart-concrete-checksum-without-algorithm";
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
-        let response = send_signed_request(
-            "POST",
-            &url,
-            &[],
-            [("x-amz-checksum-sha256", "not-even-base64")],
-        );
+        let response = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request(
+                "POST",
+                &url,
+                &[],
+                [("x-amz-checksum-sha256", "not-even-base64")],
+            )
+        })
+        .await;
         assert_eq!(response.status, 200, "response: {response:?}");
         assert_eq!(
             response_header(&response.headers, "x-amz-checksum-algorithm"),
@@ -1620,15 +1687,18 @@ fn test_create_multipart_concrete_checksum_header_does_not_override_algorithm() 
         let bucket = setup_bucket().await;
         let key = "create-multipart-concrete-checksum-with-algorithm";
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
-        let response = send_signed_request(
-            "POST",
-            &url,
-            &[],
-            [
-                ("x-amz-checksum-algorithm", "CRC32"),
-                ("x-amz-checksum-sha256", "not-even-base64"),
-            ],
-        );
+        let response = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request(
+                "POST",
+                &url,
+                &[],
+                [
+                    ("x-amz-checksum-algorithm", "CRC32"),
+                    ("x-amz-checksum-sha256", "not-even-base64"),
+                ],
+            )
+        })
+        .await;
         assert_eq!(response.status, 200, "response: {response:?}");
         assert_eq!(
             response_header(&response.headers, "x-amz-checksum-algorithm"),
@@ -1644,7 +1714,7 @@ fn test_create_multipart_concrete_checksum_header_does_not_override_algorithm() 
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort checksum multipart upload")
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
@@ -1658,28 +1728,33 @@ fn test_copy_object_replace_checksum_algorithm_lowercase() {
         let bucket = setup_bucket().await;
         let source_key = "copy-source-lowercase-checksum-algorithm";
         let destination_key = "copy-destination-lowercase-checksum-algorithm";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(source_key)
-            .body(ByteStream::from_static(
-                b"copy checksum algorithm lowercase oracle",
-            ))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put checksum copy source", || async {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(source_key)
+                .body(ByteStream::from_static(
+                    b"copy checksum algorithm lowercase oracle",
+                ))
+                .send()
+                .await
+        })
+        .await;
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, destination_key, None);
         let copy_source = format!("/{bucket}/{source_key}");
-        let response = send_signed_request(
-            "PUT",
-            &url,
-            &[],
-            [
-                ("x-amz-copy-source", copy_source.as_str()),
-                ("x-amz-metadata-directive", "REPLACE"),
-                ("x-amz-checksum-algorithm", "crc32"),
-            ],
-        );
+        let response = s3_tests::retrying_copy_object_contention_response(|| {
+            send_signed_request(
+                "PUT",
+                &url,
+                &[],
+                [
+                    ("x-amz-copy-source", copy_source.as_str()),
+                    ("x-amz-metadata-directive", "REPLACE"),
+                    ("x-amz-checksum-algorithm", "crc32"),
+                ],
+            )
+        })
+        .await;
         assert_eq!(response.status, 200, "response: {response:?}");
         assert_eq!(xml_text(&response.body, "ChecksumCRC32"), Some("mYg1AA=="));
         assert_eq!(
@@ -1697,28 +1772,33 @@ fn test_copy_object_replace_invalid_checksum_algorithm() {
         let bucket = setup_bucket().await;
         let source_key = "copy-source-invalid-checksum-algorithm";
         let destination_key = "copy-destination-invalid-checksum-algorithm";
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(source_key)
-            .body(ByteStream::from_static(
-                b"copy checksum algorithm invalid oracle",
-            ))
-            .send()
-            .await
-            .unwrap();
+        retrying_operation_aborted("put invalid-checksum copy source", || async {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(source_key)
+                .body(ByteStream::from_static(
+                    b"copy checksum algorithm invalid oracle",
+                ))
+                .send()
+                .await
+        })
+        .await;
         let url = s3_tests::object_url(CTX.endpoint(), &bucket, destination_key, None);
         let copy_source = format!("/{bucket}/{source_key}");
-        let response = send_signed_request(
-            "PUT",
-            &url,
-            &[],
-            [
-                ("x-amz-copy-source", copy_source.as_str()),
-                ("x-amz-metadata-directive", "REPLACE"),
-                ("x-amz-checksum-algorithm", "BOGUS"),
-            ],
-        );
+        let response = s3_tests::retrying_copy_object_contention_response(|| {
+            send_signed_request(
+                "PUT",
+                &url,
+                &[],
+                [
+                    ("x-amz-copy-source", copy_source.as_str()),
+                    ("x-amz-metadata-directive", "REPLACE"),
+                    ("x-amz-checksum-algorithm", "BOGUS"),
+                ],
+            )
+        })
+        .await;
         assert_eq!(response.status, 400, "response: {response:?}");
         assert_error_code(&response.body, "InvalidRequest");
         assert!(
@@ -1930,22 +2010,22 @@ fn test_upload_part_content_md5() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create checksum multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(body.clone()))
-            .content_md5(MD5_1K_A)
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(body.clone()))
+                .content_md5(MD5_1K_A)
+        })
+        .await;
         let part_etag = part.e_tag().unwrap().to_string();
 
         let completed = CompletedMultipartUpload::builder()
@@ -1962,7 +2042,7 @@ fn test_upload_part_content_md5() {
             .key(key)
             .upload_id(&upload_id)
             .multipart_upload(completed)
-            .send()
+            .send_retrying_operation_aborted("complete checksum multipart upload")
             .await
             .unwrap();
 
@@ -1970,34 +2050,36 @@ fn test_upload_part_content_md5() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key("multipart-md5-bad")
-            .send()
+            .send_retrying_operation_aborted("create invalid-checksum multipart upload")
             .await
             .unwrap();
         let bad_upload_id = create.upload_id().unwrap().to_string();
 
-        let result = client
-            .upload_part()
-            .bucket(&bucket)
-            .key("multipart-md5-bad")
-            .upload_id(&bad_upload_id)
-            .part_number(1)
-            .body(ByteStream::from(body.clone()))
-            .content_md5("AAAAAAAAAAAAAAAAAAAAAA==")
-            .send()
-            .await;
+        let result = upload_part_result_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key("multipart-md5-bad")
+                .upload_id(&bad_upload_id)
+                .part_number(1)
+                .body(ByteStream::from(body.clone()))
+                .content_md5("AAAAAAAAAAAAAAAAAAAAAA==")
+        })
+        .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "BadDigest");
 
-        let result = client
-            .upload_part()
-            .bucket(&bucket)
-            .key("multipart-md5-bad")
-            .upload_id(&bad_upload_id)
-            .part_number(1)
-            .body(ByteStream::from(body))
-            .content_md5("bad")
-            .send()
-            .await;
+        let result = upload_part_result_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key("multipart-md5-bad")
+                .upload_id(&bad_upload_id)
+                .part_number(1)
+                .body(ByteStream::from(body.clone()))
+                .content_md5("bad")
+        })
+        .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidDigest");
 
@@ -2006,7 +2088,7 @@ fn test_upload_part_content_md5() {
             .bucket(&bucket)
             .key("multipart-md5-bad")
             .upload_id(&bad_upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort invalid-checksum multipart upload")
             .await;
 
         cleanup(&bucket, &[key]).await;
@@ -2420,7 +2502,7 @@ async fn run_multipart_checksum_test(tc: &MultipartChecksumTestCase) {
                 .set_parts(Some(completed_parts))
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("complete checksum multipart upload")
         .await
         .unwrap();
 
@@ -2525,21 +2607,21 @@ fn test_complete_multipart_legacy_object_checksum_without_create_algorithm_is_ig
                 .create_multipart_upload()
                 .bucket(&bucket)
                 .key(&key)
-                .send()
+                .send_retrying_operation_aborted("create legacy-checksum multipart upload")
                 .await
                 .unwrap();
             let upload_id = create.upload_id().unwrap().to_string();
 
-            let part = client
-                .upload_part()
-                .bucket(&bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .part_number(1)
-                .body(ByteStream::from(part_body.to_vec()))
-                .send()
-                .await
-                .unwrap();
+            let part = upload_part_retrying_operation_contention(|| {
+                client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(part_body.to_vec()))
+            })
+            .await;
             let etag = part.e_tag().unwrap();
 
             let url = multipart_complete_url(&bucket, &key, &upload_id);
@@ -2611,21 +2693,21 @@ fn test_complete_multipart_new_object_checksum_without_create_algorithm_rejected
                 .create_multipart_upload()
                 .bucket(&bucket)
                 .key(&key)
-                .send()
+                .send_retrying_operation_aborted("create new-checksum multipart upload")
                 .await
                 .unwrap();
             let upload_id = create.upload_id().unwrap().to_string();
 
-            let part = client
-                .upload_part()
-                .bucket(&bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .part_number(1)
-                .body(ByteStream::from(part_body.to_vec()))
-                .send()
-                .await
-                .unwrap();
+            let part = upload_part_retrying_operation_contention(|| {
+                client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(part_body.to_vec()))
+            })
+            .await;
             let etag = part.e_tag().unwrap();
 
             let url = multipart_complete_url(&bucket, &key, &upload_id);
@@ -2658,7 +2740,7 @@ fn test_complete_multipart_new_object_checksum_without_create_algorithm_rejected
                 .bucket(&bucket)
                 .key(&key)
                 .upload_id(&upload_id)
-                .send()
+                .send_retrying_operation_aborted("abort new-checksum multipart upload")
                 .await;
         }
         cleanup(&bucket, &[]).await;
@@ -2677,21 +2759,21 @@ fn test_complete_multipart_unconfigured_crc64nvme_checksum_is_stored() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create CRC64NVME multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_body.to_vec()))
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(part_body.to_vec()))
+        })
+        .await;
         let etag = part.e_tag().unwrap();
 
         let url = multipart_complete_url(&bucket, key, &upload_id);
@@ -2768,21 +2850,21 @@ fn test_complete_multipart_unconfigured_crc64nvme_mismatch_is_computed() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create CRC64NVME mismatch multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_body.to_vec()))
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(part_body.to_vec()))
+        })
+        .await;
         let etag = part.e_tag().unwrap();
 
         let url = multipart_complete_url(&bucket, key, &upload_id);
@@ -2845,21 +2927,21 @@ fn test_complete_multipart_new_part_checksum_without_stored_checksum_is_invalid_
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create invalid-part checksum multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_body.to_vec()))
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(part_body.to_vec()))
+        })
+        .await;
         let etag = part.e_tag().unwrap();
         let sha512 = checksum_base64(LocalChecksumAlgorithm::Sha512, part_body);
 
@@ -2885,7 +2967,7 @@ fn test_complete_multipart_new_part_checksum_without_stored_checksum_is_invalid_
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort invalid-part checksum multipart upload")
             .await;
         cleanup(&bucket, &[]).await;
     });
@@ -2903,24 +2985,24 @@ fn test_upload_part_new_checksum_without_create_algorithm_is_accepted() {
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create unconfigured-checksum multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
         let sha512 = checksum_base64(LocalChecksumAlgorithm::Sha512, part_body);
 
-        let resp = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_body.to_vec()))
-            .checksum_algorithm(ChecksumAlgorithm::Sha512)
-            .checksum_sha512(&sha512)
-            .send()
-            .await
-            .unwrap();
+        let resp = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(part_body.to_vec()))
+                .checksum_algorithm(ChecksumAlgorithm::Sha512)
+                .checksum_sha512(&sha512)
+        })
+        .await;
         assert_eq!(resp.checksum_sha512(), Some(sha512.as_str()));
 
         let _ = client
@@ -2928,7 +3010,7 @@ fn test_upload_part_new_checksum_without_create_algorithm_is_accepted() {
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort unconfigured-checksum multipart upload")
             .await;
         cleanup(&bucket, &[]).await;
     });
@@ -2946,24 +3028,24 @@ fn test_complete_multipart_new_part_checksum_without_create_algorithm_is_accepte
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send()
+            .send_retrying_operation_aborted("create configured-checksum multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
         let sha512 = checksum_base64(LocalChecksumAlgorithm::Sha512, part_body);
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_body.to_vec()))
-            .checksum_algorithm(ChecksumAlgorithm::Sha512)
-            .checksum_sha512(&sha512)
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(part_body.to_vec()))
+                .checksum_algorithm(ChecksumAlgorithm::Sha512)
+                .checksum_sha512(&sha512)
+        })
+        .await;
         assert_eq!(part.checksum_sha512(), Some(sha512.as_str()));
 
         let result = client
@@ -2981,7 +3063,7 @@ fn test_complete_multipart_new_part_checksum_without_create_algorithm_is_accepte
                     ))
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete configured-checksum multipart upload")
             .await;
         assert_complete_multipart_sdk_error(&result, 400, "InvalidPart");
 
@@ -2990,7 +3072,7 @@ fn test_complete_multipart_new_part_checksum_without_create_algorithm_is_accepte
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort configured-checksum multipart upload")
             .await;
         cleanup(&bucket, &[]).await;
     });
@@ -3191,23 +3273,23 @@ fn test_complete_multipart_configured_new_object_checksum_header_mismatch_reject
             .key(key)
             .checksum_algorithm(ChecksumAlgorithm::Sha512)
             .checksum_type(ChecksumType::Composite)
-            .send()
+            .send_retrying_operation_aborted("create checksum-mismatch multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_body.to_vec()))
-            .checksum_algorithm(ChecksumAlgorithm::Sha512)
-            .checksum_sha512(&part_checksum)
-            .send()
-            .await
-            .unwrap();
+        let part = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(part_body.to_vec()))
+                .checksum_algorithm(ChecksumAlgorithm::Sha512)
+                .checksum_sha512(&part_checksum)
+        })
+        .await;
         let wrong_object_checksum = encode_base64(&[0u8; 64]);
 
         let result = client
@@ -3226,7 +3308,7 @@ fn test_complete_multipart_configured_new_object_checksum_header_mismatch_reject
                     ))
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete checksum-mismatch multipart upload")
             .await;
         assert_complete_multipart_sdk_error(&result, 400, "BadDigest");
 
@@ -3235,7 +3317,7 @@ fn test_complete_multipart_configured_new_object_checksum_header_mismatch_reject
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort checksum-mismatch multipart upload")
             .await;
         cleanup(&bucket, &[]).await;
     });
@@ -3340,7 +3422,7 @@ fn test_upload_part_uses_multipart_checksum_algorithm_without_part_checksum_head
             .bucket(&bucket)
             .key(key)
             .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
-            .send()
+            .send_retrying_operation_aborted("create implicit-checksum multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
@@ -3353,8 +3435,10 @@ fn test_upload_part_uses_multipart_checksum_algorithm_without_part_checksum_head
             bucket,
             key
         );
-        let upload_part =
-            send_signed_request("PUT", &url, part_body, std::iter::empty::<(&str, &str)>());
+        let upload_part = send_signed_request_retrying_operation_contention(|| {
+            send_signed_request("PUT", &url, part_body, std::iter::empty::<(&str, &str)>())
+        })
+        .await;
         assert_eq!(
             upload_part.status, 200,
             "upload part failed: {}",
@@ -3372,7 +3456,7 @@ fn test_upload_part_uses_multipart_checksum_algorithm_without_part_checksum_head
             .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
-            .send()
+            .send_retrying_operation_aborted("abort implicit-checksum multipart upload")
             .await
             .unwrap();
 
@@ -3405,7 +3489,7 @@ fn test_upload_part_copy_uses_multipart_checksum_algorithm() {
             .key(dst_key)
             .checksum_algorithm(ChecksumAlgorithm::Crc32)
             .checksum_type(ChecksumType::FullObject)
-            .send()
+            .send_retrying_operation_aborted("create checksum copy multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -3417,7 +3501,7 @@ fn test_upload_part_copy_uses_multipart_checksum_algorithm() {
             .upload_id(upload_id)
             .part_number(1)
             .copy_source(format!("{bucket}/{src_key}"))
-            .send()
+            .send_retrying_operation_aborted("upload checksum copy multipart part")
             .await
             .unwrap();
         let copied_part = copy.copy_part_result().expect("expected CopyPartResult");
@@ -3442,7 +3526,7 @@ fn test_upload_part_copy_uses_multipart_checksum_algorithm() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete checksum copy multipart upload")
             .await
             .unwrap();
         assert_eq!(complete.checksum_crc32(), Some(expected_checksum.as_str()));
@@ -3482,23 +3566,23 @@ fn test_multipart_checksum_sha256() {
             .bucket(&bucket)
             .key(key)
             .checksum_algorithm(ChecksumAlgorithm::Sha256)
-            .send()
+            .send_retrying_operation_aborted("create SHA256 multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
-        let resp = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from(body_1k()))
-            .checksum_algorithm(ChecksumAlgorithm::Sha256)
-            .checksum_sha256(SHA256_1K_A)
-            .send()
-            .await
-            .unwrap();
+        let resp = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .body(ByteStream::from(body_1k()))
+                .checksum_algorithm(ChecksumAlgorithm::Sha256)
+                .checksum_sha256(SHA256_1K_A)
+        })
+        .await;
 
         // CompleteMultipartUpload with a malformed checksum should fail before digest comparison.
         let malformed_result = client
@@ -3518,7 +3602,7 @@ fn test_multipart_checksum_sha256() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete malformed-checksum multipart upload")
             .await;
         assert_complete_multipart_sdk_error(&malformed_result, 400, "InvalidRequest");
 
@@ -3541,7 +3625,7 @@ fn test_multipart_checksum_sha256() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete wrong-checksum multipart upload")
             .await;
         assert_complete_multipart_sdk_error(&result, 400, "BadDigest");
         assert_checksum_completion_preserved_upload(&bucket, key, upload_id, resp.e_tag().unwrap())
@@ -3564,7 +3648,7 @@ fn test_multipart_checksum_sha256() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete corrected-checksum multipart upload")
             .await
             .unwrap();
         assert_eq!(corrected.checksum_sha256(), Some(composite));
@@ -3576,23 +3660,23 @@ fn test_multipart_checksum_sha256() {
             .bucket(&bucket)
             .key(key2)
             .checksum_algorithm(ChecksumAlgorithm::Sha256)
-            .send()
+            .send_retrying_operation_aborted("create missing-part-checksum multipart upload")
             .await
             .unwrap();
         let upload_id2 = create2.upload_id().unwrap();
 
-        let resp2 = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key2)
-            .upload_id(upload_id2)
-            .part_number(1)
-            .body(ByteStream::from(body_1k()))
-            .checksum_algorithm(ChecksumAlgorithm::Sha256)
-            .checksum_sha256(SHA256_1K_A)
-            .send()
-            .await
-            .unwrap();
+        let resp2 = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key2)
+                .upload_id(upload_id2)
+                .part_number(1)
+                .body(ByteStream::from(body_1k()))
+                .checksum_algorithm(ChecksumAlgorithm::Sha256)
+                .checksum_sha256(SHA256_1K_A)
+        })
+        .await;
 
         // CompleteMultipartUpload without per-part checksum should fail.
         let result2 = client
@@ -3611,7 +3695,7 @@ fn test_multipart_checksum_sha256() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete missing-part-checksum multipart upload")
             .await;
         assert_complete_multipart_sdk_error(&result2, 400, "InvalidRequest");
         assert_checksum_completion_preserved_upload(
@@ -3639,7 +3723,7 @@ fn test_multipart_checksum_sha256() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete corrected-part-checksum multipart upload")
             .await
             .unwrap();
         assert_eq!(corrected2.checksum_sha256(), Some(composite));
@@ -3651,23 +3735,23 @@ fn test_multipart_checksum_sha256() {
             .bucket(&bucket)
             .key(key3)
             .checksum_algorithm(ChecksumAlgorithm::Sha256)
-            .send()
+            .send_retrying_operation_aborted("create successful SHA256 multipart upload")
             .await
             .unwrap();
         let upload_id3 = create3.upload_id().unwrap();
 
-        let resp3 = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key3)
-            .upload_id(upload_id3)
-            .part_number(1)
-            .body(ByteStream::from(body_1k()))
-            .checksum_algorithm(ChecksumAlgorithm::Sha256)
-            .checksum_sha256(SHA256_1K_A)
-            .send()
-            .await
-            .unwrap();
+        let resp3 = upload_part_retrying_operation_contention(|| {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key3)
+                .upload_id(upload_id3)
+                .part_number(1)
+                .body(ByteStream::from(body_1k()))
+                .checksum_algorithm(ChecksumAlgorithm::Sha256)
+                .checksum_sha256(SHA256_1K_A)
+        })
+        .await;
 
         let complete_resp = client
             .complete_multipart_upload()
@@ -3686,7 +3770,7 @@ fn test_multipart_checksum_sha256() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete successful SHA256 multipart upload")
             .await
             .unwrap();
         assert_eq!(complete_resp.checksum_sha256(), Some(composite));
@@ -3803,7 +3887,7 @@ fn test_get_object_part_with_checksum() {
             .bucket(&bucket)
             .key(key)
             .checksum_algorithm(ChecksumAlgorithm::Crc32)
-            .send()
+            .send_retrying_operation_aborted("create part-checksum multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
@@ -3820,18 +3904,18 @@ fn test_get_object_part_with_checksum() {
         for (i, data) in parts_data.iter().enumerate() {
             let part_number = (i + 1) as i32;
             let crc = checksum_crc32(data);
-            let resp = client
-                .upload_part()
-                .bucket(&bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .part_number(part_number)
-                .body(ByteStream::from(data.clone()))
-                .checksum_algorithm(ChecksumAlgorithm::Crc32)
-                .checksum_crc32(&crc)
-                .send()
-                .await
-                .unwrap();
+            let resp = upload_part_retrying_operation_contention(|| {
+                client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(data.clone()))
+                    .checksum_algorithm(ChecksumAlgorithm::Crc32)
+                    .checksum_crc32(&crc)
+            })
+            .await;
             let returned_crc = resp.checksum_crc32().unwrap().to_string();
             assert_eq!(returned_crc, crc);
             expected_checksums.push(crc.clone());
@@ -3855,7 +3939,7 @@ fn test_get_object_part_with_checksum() {
                     .set_parts(Some(completed_parts))
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete part-checksum multipart upload")
             .await
             .unwrap();
 

@@ -2181,6 +2181,7 @@ dependencies = [
  "hyper-util",
  "md-5 0.10.6",
  "observability",
+ "quick-xml",
  "ring",
  "rustls",
  "rustls-native-certs",
@@ -2194,6 +2195,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "url",
+ "xmlparser",
 ]
 
 [[package]]

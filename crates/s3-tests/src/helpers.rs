@@ -35,8 +35,13 @@ use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use base64::Engine;
 use md5_legacy::Digest;
+use quick_xml::escape::unescape;
+use quick_xml::events::{BytesDecl, BytesStart, Event};
+use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use ring::hmac;
 use s3_types::is_legacy_create_bucket_region;
+use xmlparser::{Tokenizer, XmlCharExt};
 
 use crate::{configured_test_timeout, CTX};
 
@@ -325,30 +330,303 @@ pub fn is_retryable_operation_contention_response(status: u16, body: &str) -> bo
     )
 }
 
-fn complete_multipart_embedded_error_code(body: &str) -> Option<&str> {
-    let mut body = body.trim_start();
-    if body.starts_with("<?xml") {
-        let declaration_end = body.find("?>")?;
-        body = body[declaration_end + 2..].trim_start();
-    }
-
-    let error_body = body.strip_prefix("<Error>")?;
-    let error_end = error_body.rfind("</Error>")?;
-    if !error_body[error_end + "</Error>".len()..].trim().is_empty() {
+fn top_level_embedded_error_code(body: &str) -> Option<String> {
+    if Tokenizer::from(body).any(|token| token.is_err()) {
         return None;
     }
 
-    let error_body = error_body[..error_end].trim_start();
-    let code_body = error_body.strip_prefix("<Code>")?;
-    let code_end = code_body.find("</Code>")?;
-    Some(&code_body[..code_end])
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().enable_all_checks(true);
+    let mut depth = 0_usize;
+    let mut saw_root = false;
+    let mut root_closed = false;
+    let mut saw_declaration = false;
+    let mut declaration_allowed = true;
+    let mut xml_version = XmlVersion::Implicit1_0;
+    let mut code = None;
+    let mut code_text = String::new();
+    let mut in_code = false;
+
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(element) => {
+                declaration_allowed = false;
+                if !xml_element_attributes_are_well_formed(&element, xml_version) {
+                    return None;
+                }
+                if depth == 0 {
+                    if saw_root || root_closed || element.name().as_ref() != b"Error" {
+                        return None;
+                    }
+                    saw_root = true;
+                } else if root_closed {
+                    return None;
+                } else if depth == 1 && element.name().as_ref() == b"Code" {
+                    if code.is_some() || in_code {
+                        return None;
+                    }
+                    code_text.clear();
+                    in_code = true;
+                } else if in_code {
+                    return None;
+                }
+                depth = depth.checked_add(1)?;
+            }
+            Event::Empty(element) => {
+                declaration_allowed = false;
+                if !xml_element_attributes_are_well_formed(&element, xml_version) {
+                    return None;
+                }
+                if depth == 0 {
+                    if saw_root || root_closed || element.name().as_ref() != b"Error" {
+                        return None;
+                    }
+                    saw_root = true;
+                    root_closed = true;
+                } else {
+                    if root_closed || in_code {
+                        return None;
+                    }
+                    if depth == 1
+                        && element.name().as_ref() == b"Code"
+                        && code.replace(String::new()).is_some()
+                    {
+                        return None;
+                    }
+                }
+            }
+            Event::End(element) => {
+                declaration_allowed = false;
+                if depth == 0 {
+                    return None;
+                }
+                if in_code && depth == 2 && element.name().as_ref() == b"Code" {
+                    code = Some(std::mem::take(&mut code_text));
+                    in_code = false;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    root_closed = true;
+                }
+            }
+            Event::Text(text) => {
+                declaration_allowed = false;
+                let text = std::str::from_utf8(text.as_ref()).ok()?;
+                if !xml_literal_text_is_well_formed(text, xml_version) {
+                    return None;
+                }
+                let text = unescape(text).ok()?;
+                if !xml_decoded_text_is_well_formed(&text, xml_version) {
+                    return None;
+                }
+                if in_code {
+                    code_text.push_str(&text);
+                } else if depth == 0 && !text.trim().is_empty() {
+                    return None;
+                }
+            }
+            Event::GeneralRef(reference) => {
+                declaration_allowed = false;
+                let reference = std::str::from_utf8(reference.as_ref()).ok()?;
+                let escaped = format!("&{reference};");
+                let text = unescape(&escaped).ok()?;
+                if !xml_decoded_text_is_well_formed(&text, xml_version) {
+                    return None;
+                }
+                if in_code {
+                    code_text.push_str(&text);
+                } else if depth == 0 && !text.trim().is_empty() {
+                    return None;
+                }
+            }
+            Event::CData(text) => {
+                declaration_allowed = false;
+                let text = std::str::from_utf8(text.as_ref()).ok()?;
+                if !xml_literal_text_is_well_formed(text, xml_version) {
+                    return None;
+                }
+                if in_code {
+                    code_text.push_str(text);
+                } else if depth == 0 && !text.bytes().all(|byte| byte.is_ascii_whitespace()) {
+                    return None;
+                }
+            }
+            Event::Decl(declaration)
+                if declaration_allowed && depth == 0 && !saw_root && !saw_declaration =>
+            {
+                xml_version = xml_declaration_version(&declaration)?;
+                saw_declaration = true;
+                declaration_allowed = false;
+            }
+            Event::Decl(_) | Event::DocType(_) => return None,
+            Event::Comment(comment) => {
+                declaration_allowed = false;
+                let comment = std::str::from_utf8(comment.as_ref()).ok()?;
+                if !xml_literal_text_is_well_formed(comment, xml_version) {
+                    return None;
+                }
+            }
+            Event::PI(instruction) => {
+                declaration_allowed = false;
+                let target = std::str::from_utf8(instruction.target()).ok()?;
+                let content = std::str::from_utf8(instruction.content()).ok()?;
+                if !xml_name_is_well_formed(target)
+                    || target.eq_ignore_ascii_case("xml")
+                    || !xml_literal_text_is_well_formed(content, xml_version)
+                {
+                    return None;
+                }
+            }
+            Event::Eof if saw_root && root_closed && depth == 0 => return code,
+            Event::Eof => return None,
+        }
+    }
+}
+
+fn xml_declaration_version(declaration: &BytesDecl<'_>) -> Option<XmlVersion> {
+    let mut input = declaration.as_ref().strip_prefix(b"xml")?;
+    if !consume_xml_space(&mut input) {
+        return None;
+    }
+
+    let version = take_xml_declaration_attribute(&mut input, b"version")?;
+    let version = match version {
+        b"1.0" => XmlVersion::Explicit1_0,
+        b"1.1" => XmlVersion::Explicit1_1,
+        _ => return None,
+    };
+
+    if input.is_empty() {
+        return Some(version);
+    }
+    if !consume_xml_space(&mut input) || input.is_empty() {
+        return input.is_empty().then_some(version);
+    }
+
+    if input.starts_with(b"encoding") {
+        let encoding = take_xml_declaration_attribute(&mut input, b"encoding")?;
+        if !xml_encoding_name_is_well_formed(encoding) {
+            return None;
+        }
+        if input.is_empty() {
+            return Some(version);
+        }
+        if !consume_xml_space(&mut input) || input.is_empty() {
+            return input.is_empty().then_some(version);
+        }
+    }
+
+    if input.starts_with(b"standalone") {
+        let standalone = take_xml_declaration_attribute(&mut input, b"standalone")?;
+        if !matches!(standalone, b"yes" | b"no") {
+            return None;
+        }
+        if input.is_empty() {
+            return Some(version);
+        }
+        if !consume_xml_space(&mut input) {
+            return None;
+        }
+    }
+
+    input.is_empty().then_some(version)
+}
+
+fn take_xml_declaration_attribute<'a>(input: &mut &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    *input = input.strip_prefix(name)?;
+    consume_xml_space(input);
+    *input = input.strip_prefix(b"=")?;
+    consume_xml_space(input);
+
+    let quote = *input.first()?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    let end = input[1..].iter().position(|byte| *byte == quote)?;
+    let value = &input[1..1 + end];
+    *input = &input[end + 2..];
+    Some(value)
+}
+
+fn consume_xml_space(input: &mut &[u8]) -> bool {
+    let count = input
+        .iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .count();
+    *input = &input[count..];
+    count != 0
+}
+
+fn xml_encoding_name_is_well_formed(encoding: &[u8]) -> bool {
+    encoding.first().is_some_and(u8::is_ascii_alphabetic)
+        && encoding[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn xml_name_is_well_formed(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|char| char.is_xml_name_start())
+        && characters.all(|char| char.is_xml_name())
+}
+
+fn xml_element_attributes_are_well_formed(element: &BytesStart<'_>, version: XmlVersion) -> bool {
+    let mut attributes = element.attributes();
+    attributes.with_checks(true).all(|attribute| {
+        attribute.is_ok_and(|attribute| {
+            std::str::from_utf8(attribute.value.as_ref()).is_ok_and(|value| {
+                xml_literal_text_is_well_formed(value, version)
+                    && attribute
+                        .normalized_value(version)
+                        .is_ok_and(|value| xml_decoded_text_is_well_formed(&value, version))
+            })
+        })
+    })
+}
+
+fn xml_decoded_text_is_well_formed(text: &str, version: XmlVersion) -> bool {
+    text.chars().all(|character| {
+        let code_point = u32::from(character);
+        match version {
+            XmlVersion::Implicit1_0 | XmlVersion::Explicit1_0 => matches!(
+                code_point,
+                0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+            ),
+            XmlVersion::Explicit1_1 => matches!(
+                code_point,
+                0x1..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+            ),
+        }
+    })
+}
+
+fn xml_literal_text_is_well_formed(text: &str, version: XmlVersion) -> bool {
+    xml_decoded_text_is_well_formed(text, version)
+        && (version != XmlVersion::Explicit1_1
+            || text.chars().all(|character| {
+                !matches!(
+                    u32::from(character),
+                    0x1..=0x8 | 0xB..=0xC | 0xE..=0x1F | 0x7F..=0x84 | 0x86..=0x9F
+                )
+            }))
 }
 
 pub fn is_retryable_complete_multipart_contention_response(status: u16, body: &str) -> bool {
     is_retryable_operation_contention_response(status, body)
         || (status == 200
             && matches!(
-                complete_multipart_embedded_error_code(body),
+                top_level_embedded_error_code(body).as_deref(),
+                Some("OperationAborted" | "SlowDown")
+            ))
+}
+
+pub fn is_retryable_copy_object_contention_response(status: u16, body: &str) -> bool {
+    is_retryable_operation_contention_response(status, body)
+        || (status == 200
+            && matches!(
+                top_level_embedded_error_code(body).as_deref(),
                 Some("OperationAborted" | "SlowDown")
             ))
 }
@@ -388,6 +666,13 @@ where
     F: FnMut() -> RawResponse,
 {
     retrying_raw_response(op, is_retryable_complete_multipart_contention_response).await
+}
+
+pub async fn retrying_copy_object_contention_response<F>(op: F) -> RawResponse
+where
+    F: FnMut() -> RawResponse,
+{
+    retrying_raw_response(op, is_retryable_copy_object_contention_response).await
 }
 
 pub async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
@@ -4030,7 +4315,15 @@ mod tests {
         ));
         assert!(is_retryable_complete_multipart_contention_response(
             200,
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>SlowDown</Code></Error>"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Error><Code>SlowDown</Code><?worker retry?></Error>"
+        ));
+        assert!(is_retryable_complete_multipart_contention_response(
+            200,
+            "<Error detail=\"valid &amp; normalized\"><Code>SlowDown</Code><!-- valid comment --><Message>retry</Message></Error>"
+        ));
+        assert!(is_retryable_complete_multipart_contention_response(
+            200,
+            "<?xml version=\"1.1\"?><Error detail=\"&#x1;&#x7f;\"><Code>SlowDown</Code><Message>&#x1;&#x7f;</Message></Error>"
         ));
         assert!(!is_retryable_complete_multipart_contention_response(
             200,
@@ -4044,9 +4337,133 @@ mod tests {
             200,
             "<Error><Code>InternalError</Code></Error>"
         ));
+        assert!(!is_retryable_complete_multipart_contention_response(
+            200,
+            "<Error><Code>SlowDown</Code><Message>broken</Error>"
+        ));
+        for malformed in [
+            "<Error bad=\"&bogus;\"><Code>SlowDown</Code></Error>",
+            "<Error bad=\"&#x1;\"><Code>SlowDown</Code></Error>",
+            "<Error><Code>SlowDown</Code><!-- broken -- comment --></Error>",
+            "<Error><Code>SlowDown</Code><Message>&#x1;</Message></Error>",
+            "<Error><Code>SlowDown</Code><1/></Error>",
+            "<?xml version=\"1.0\" encoding=\"\"?><Error><Code>SlowDown</Code></Error>",
+            "<?xml version=\"1.0\" standalone=\"maybe\"?><Error><Code>SlowDown</Code></Error>",
+            "<?xml version=\"1.0\" standalone=\"yes\" encoding=\"UTF-8\"?><Error><Code>SlowDown</Code></Error>",
+            "<!--leading--><?xml version=\"1.0\"?><Error><Code>SlowDown</Code></Error>",
+            "<?XML bad?><Error><Code>SlowDown</Code></Error>",
+        ] {
+            assert!(
+                !is_retryable_complete_multipart_contention_response(200, malformed),
+                "malformed XML was retryable: {malformed}"
+            );
+        }
+        let restricted = '\u{7f}';
+        for malformed in [
+            format!(
+                "<?xml version=\"1.1\"?><Error><Code>SlowDown</Code><Message>{restricted}</Message></Error>"
+            ),
+            format!(
+                "<?xml version=\"1.1\"?><Error><Code>SlowDown</Code><Message><![CDATA[{restricted}]]></Message></Error>"
+            ),
+            format!(
+                "<?xml version=\"1.1\"?><Error detail=\"{restricted}\"><Code>SlowDown</Code></Error>"
+            ),
+            format!(
+                "<?xml version=\"1.1\"?><Error><Code>SlowDown</Code><!--{restricted}--></Error>"
+            ),
+            format!(
+                "<?xml version=\"1.1\"?><Error><Code>SlowDown</Code><?worker {restricted}?></Error>"
+            ),
+        ] {
+            assert!(
+                !is_retryable_complete_multipart_contention_response(200, &malformed),
+                "XML 1.1 literal RestrictedChar was retryable: {malformed:?}"
+            );
+        }
         assert!(!is_retryable_operation_contention_response(
             200,
             "<Error><Code>SlowDown</Code></Error>"
+        ));
+    }
+
+    #[test]
+    fn copy_object_contention_retry_accepts_only_top_level_embedded_errors() {
+        assert!(is_retryable_copy_object_contention_response(
+            200,
+            "<Error><Code>OperationAborted</Code></Error>"
+        ));
+        assert!(is_retryable_copy_object_contention_response(
+            200,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Error><Code>SlowDown</Code><?worker retry?></Error>"
+        ));
+        assert!(is_retryable_copy_object_contention_response(
+            200,
+            "<Error detail=\"valid &amp; normalized\"><Code>SlowDown</Code><!-- valid comment --><Message>retry</Message></Error>"
+        ));
+        assert!(is_retryable_copy_object_contention_response(
+            200,
+            "<?xml version=\"1.1\"?><Error detail=\"&#x1;&#x7f;\"><Code>SlowDown</Code><Message>&#x1;&#x7f;</Message></Error>"
+        ));
+        assert!(!is_retryable_copy_object_contention_response(
+            200,
+            "<CopyObjectResult><Code>SlowDown</Code></CopyObjectResult>"
+        ));
+        assert!(!is_retryable_copy_object_contention_response(
+            200,
+            "<Error><Message>outer</Message><Detail><Code>SlowDown</Code></Detail></Error>"
+        ));
+        assert!(!is_retryable_copy_object_contention_response(
+            200,
+            "<Error><Code>InternalError</Code></Error>"
+        ));
+        assert!(!is_retryable_copy_object_contention_response(
+            200,
+            "<Error><Code>SlowDown</Code><Message>broken</Error>"
+        ));
+        for malformed in [
+            "<Error bad=\"&bogus;\"><Code>SlowDown</Code></Error>",
+            "<Error bad=\"&#x1;\"><Code>SlowDown</Code></Error>",
+            "<Error><Code>SlowDown</Code><!-- broken -- comment --></Error>",
+            "<Error><Code>SlowDown</Code><Message>&#x1;</Message></Error>",
+            "<Error><Code>SlowDown</Code><1/></Error>",
+            "<?xml version=\"1.0\" encoding=\"\"?><Error><Code>SlowDown</Code></Error>",
+            "<?xml version=\"1.0\" standalone=\"maybe\"?><Error><Code>SlowDown</Code></Error>",
+            "<?xml version=\"1.0\" standalone=\"yes\" encoding=\"UTF-8\"?><Error><Code>SlowDown</Code></Error>",
+            "<!--leading--><?xml version=\"1.0\"?><Error><Code>SlowDown</Code></Error>",
+            "<?XML bad?><Error><Code>SlowDown</Code></Error>",
+        ] {
+            assert!(
+                !is_retryable_copy_object_contention_response(200, malformed),
+                "malformed XML was retryable: {malformed}"
+            );
+        }
+        let restricted = '\u{7f}';
+        for malformed in [
+            format!(
+                "<?xml version=\"1.1\"?><Error><Code>SlowDown</Code><Message>{restricted}</Message></Error>"
+            ),
+            format!(
+                "<?xml version=\"1.1\"?><Error><Code>SlowDown</Code><Message><![CDATA[{restricted}]]></Message></Error>"
+            ),
+            format!(
+                "<?xml version=\"1.1\"?><Error detail=\"{restricted}\"><Code>SlowDown</Code></Error>"
+            ),
+            format!(
+                "<?xml version=\"1.1\"?><Error><Code>SlowDown</Code><!--{restricted}--></Error>"
+            ),
+            format!(
+                "<?xml version=\"1.1\"?><Error><Code>SlowDown</Code><?worker {restricted}?></Error>"
+            ),
+        ] {
+            assert!(
+                !is_retryable_copy_object_contention_response(200, &malformed),
+                "XML 1.1 literal RestrictedChar was retryable: {malformed:?}"
+            );
+        }
+        assert!(is_retryable_copy_object_contention_response(
+            409,
+            "<Error><Code>OperationAborted</Code></Error>"
         ));
     }
 
@@ -4095,6 +4512,30 @@ mod tests {
         assert_eq!(calls, 3);
         assert_eq!(response.status, 200);
         assert_eq!(response.body, "<CompleteMultipartUploadResult/>");
+    }
+
+    #[tokio::test]
+    async fn copy_object_contention_retry_retries_embedded_errors() {
+        let mut calls = 0;
+        let response = retrying_copy_object_contention_response(|| {
+            calls += 1;
+            let body = match calls {
+                1 => "<Error><Code>OperationAborted</Code></Error>",
+                2 => "<Error><Code>SlowDown</Code></Error>",
+                _ => "<CopyObjectResult/>",
+            };
+            RawResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: body.to_string(),
+                body_read_error: None,
+            }
+        })
+        .await;
+
+        assert_eq!(calls, 3);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "<CopyObjectResult/>");
     }
 
     #[test]
