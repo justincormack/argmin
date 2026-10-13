@@ -5737,17 +5737,7 @@ fn test_bucket_policy_put_object_version_acl_cross_account_allow() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         set_object_writer_ownership(&bucket).await;
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         let put = client
             .put_object()
             .bucket(&bucket)
@@ -5875,17 +5865,7 @@ fn test_bucket_policy_version_id_condition_get_object_version() {
 
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
 
         let allowed_version_id = client
             .put_object()
@@ -5978,17 +5958,7 @@ fn test_bucket_policy_version_id_condition_get_object_version_attributes() {
 
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
 
         let allowed_version_id = client
             .put_object()
@@ -6081,17 +6051,7 @@ fn test_bucket_policy_version_id_condition_object_version_acl() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         set_object_writer_ownership(&bucket).await;
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
 
         let allowed_version_id = client
             .put_object()
@@ -6226,17 +6186,7 @@ fn test_bucket_policy_version_id_condition_object_version_tagging() {
 
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
 
         let allowed_version_id = client
             .put_object()
@@ -6394,17 +6344,7 @@ fn test_bucket_policy_version_id_condition_delete_object_version() {
 
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
 
         let allowed_version_id = client
             .put_object()
@@ -6510,17 +6450,7 @@ fn test_bucket_policy_get_object_version_acl_existing_tag_condition() {
 
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         let put = client
             .put_object()
             .bucket(&bucket)
@@ -6642,17 +6572,7 @@ fn test_bucket_policy_put_object_version_acl_existing_tag_condition() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         set_object_writer_ownership(&bucket).await;
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         let put = client
             .put_object()
             .bucket(&bucket)
@@ -6808,17 +6728,7 @@ fn test_bucket_policy_delete_object_version_tagging_existing_tag_condition() {
 
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
 
         let public_version_id = client
             .put_object()
@@ -6958,17 +6868,7 @@ fn test_bucket_policy_put_object_version_acl_null_treats_absent_acl_header_as_mi
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         set_object_writer_ownership(&bucket).await;
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         let put = client
             .put_object()
             .bucket(&bucket)
@@ -7082,17 +6982,7 @@ fn test_bucket_policy_put_object_version_acl_string_not_equals_treats_absent_acl
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         set_object_writer_ownership(&bucket).await;
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         let put = client
             .put_object()
             .bucket(&bucket)
@@ -7228,17 +7118,7 @@ fn test_bucket_policy_put_object_version_acl_grant_read_condition_applies() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         set_object_writer_ownership(&bucket).await;
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         let put = client
             .put_object()
             .bucket(&bucket)
@@ -11784,17 +11664,7 @@ fn test_bucket_policy_put_object_version_tagging_request_object_tag() {
         let key = "request-tag-put-object-version-tagging";
 
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         let version_id = client
             .put_object()
             .bucket(&bucket)
@@ -13940,17 +13810,7 @@ fn test_bucket_policy_boe_delete_object_version_requires_delete_object_version_p
             .send()
             .await
             .unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
 
         let denied_version_id = client
             .put_object()
@@ -18036,17 +17896,7 @@ fn test_bucket_policy_list_bucket_versions_prefix_condition() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = create_bucket_allowing_public_policy(client).await;
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         for key in ["allowed/versioned", "blocked/versioned"] {
             client
                 .put_object()
@@ -18125,17 +17975,7 @@ fn test_bucket_policy_list_bucket_versions_delimiter_condition() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = create_bucket_allowing_public_policy(client).await;
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         for key in ["allowed/versioned", "allowed/again", "z-versioned"] {
             client
                 .put_object()
@@ -18247,17 +18087,7 @@ fn test_bucket_policy_list_bucket_versions_max_keys_numeric_equals_condition() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = create_bucket_allowing_public_policy(client).await;
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         for key in ["one", "two", "three"] {
             client
                 .put_object()
@@ -19506,17 +19336,7 @@ fn test_bucket_policy_list_object_versions_requires_dedicated_action() {
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
         client
             .put_object()
             .bucket(&bucket)
