@@ -4627,6 +4627,10 @@ mod tests {
             503,
             "<Error><Code>SlowDown</Code></Error>"
         ));
+        assert!(is_retryable_operation_contention_response(
+            503,
+            "<ErrorResponse><Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error></ErrorResponse>"
+        ));
         assert!(!is_retryable_operation_contention_response(
             503,
             "<Error><Code>OperationAborted</Code></Error>"

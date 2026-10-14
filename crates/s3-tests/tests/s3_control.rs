@@ -5,6 +5,7 @@ use s3_tests::shape::{assert_shape, error_response_headers, shape, xml_tag_text,
 use s3_tests::{
     build_configured_test_agent, build_test_agent, create_account_regional_bucket_with_credentials,
     delete_bucket_retrying_operation_aborted, presign_url_for_service_with_aws_signer_credentials,
+    retrying_operation_contention_response,
     send_checked_signed_payload_request_for_service_with_credentials,
     send_signed_request_for_service_with_credentials, unique_account_regional_bucket,
     unique_bucket, PresignedRequest, RawResponse, SignedRequestCredentials, SigningPayload,
@@ -284,16 +285,19 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
 
         let header_fixed_body = tag_resource_body("header-fixed");
         let header_fixed_hash = auth::canonical::sha256_hex(header_fixed_body.as_bytes());
-        let response = send_checked_signed_payload_request_for_service_with_credentials(
-            "POST",
-            &url,
-            header_fixed_body.as_bytes(),
-            SigningPayload::Precomputed(header_fixed_hash.as_str()),
-            base_headers,
-            SigningService::S3Control,
-            "s3",
-            credentials,
-        );
+        let response = retrying_operation_contention_response(|| {
+            send_checked_signed_payload_request_for_service_with_credentials(
+                "POST",
+                &url,
+                header_fixed_body.as_bytes(),
+                SigningPayload::Precomputed(header_fixed_hash.as_str()),
+                base_headers,
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            )
+        })
+        .await;
         assert_s3_control_tag_success(
             "S3 Control header auth with correct payload hash",
             &response,
@@ -301,16 +305,19 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
         wait_for_payload_tag_value(&bucket, "header-fixed").await;
 
         let header_missing_body = tag_resource_body("header-missing");
-        let response = send_checked_signed_payload_request_for_service_with_credentials(
-            "POST",
-            &url,
-            header_missing_body.as_bytes(),
-            SigningPayload::BodyWithoutHeader(header_missing_body.as_bytes()),
-            base_headers,
-            SigningService::S3Control,
-            "s3",
-            credentials,
-        );
+        let response = retrying_operation_contention_response(|| {
+            send_checked_signed_payload_request_for_service_with_credentials(
+                "POST",
+                &url,
+                header_missing_body.as_bytes(),
+                SigningPayload::BodyWithoutHeader(header_missing_body.as_bytes()),
+                base_headers,
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            )
+        })
+        .await;
         assert_s3_control_error(
             "S3 Control header auth without payload hash header",
             &response,
@@ -322,16 +329,19 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
         wait_for_payload_tag_value(&bucket, "header-fixed").await;
 
         let header_missing_wrong_service_body = tag_resource_body("header-missing-wrong-service");
-        let response = send_checked_signed_payload_request_for_service_with_credentials(
-            "POST",
-            &url,
-            header_missing_wrong_service_body.as_bytes(),
-            SigningPayload::BodyWithoutHeader(header_missing_wrong_service_body.as_bytes()),
-            base_headers,
-            SigningService::S3Control,
-            "sts",
-            credentials,
-        );
+        let response = retrying_operation_contention_response(|| {
+            send_checked_signed_payload_request_for_service_with_credentials(
+                "POST",
+                &url,
+                header_missing_wrong_service_body.as_bytes(),
+                SigningPayload::BodyWithoutHeader(header_missing_wrong_service_body.as_bytes()),
+                base_headers,
+                SigningService::S3Control,
+                "sts",
+                credentials,
+            )
+        })
+        .await;
         assert_s3_control_error(
             "S3 Control header auth without payload hash header and with wrong service",
             &response,
@@ -348,16 +358,19 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
             ..credentials
         };
         let header_missing_bad_hmac_body = tag_resource_body("header-missing-bad-hmac");
-        let response = send_checked_signed_payload_request_for_service_with_credentials(
-            "POST",
-            &url,
-            header_missing_bad_hmac_body.as_bytes(),
-            SigningPayload::BodyWithoutHeader(header_missing_bad_hmac_body.as_bytes()),
-            base_headers,
-            SigningService::S3Control,
-            "s3",
-            bad_credentials,
-        );
+        let response = retrying_operation_contention_response(|| {
+            send_checked_signed_payload_request_for_service_with_credentials(
+                "POST",
+                &url,
+                header_missing_bad_hmac_body.as_bytes(),
+                SigningPayload::BodyWithoutHeader(header_missing_bad_hmac_body.as_bytes()),
+                base_headers,
+                SigningService::S3Control,
+                "s3",
+                bad_credentials,
+            )
+        })
+        .await;
         assert_s3_control_error(
             "S3 Control header auth without payload hash header and with bad HMAC",
             &response,
@@ -369,16 +382,19 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
         wait_for_payload_tag_value(&bucket, "header-fixed").await;
 
         let header_unsigned_body = tag_resource_body("header-unsigned");
-        let response = send_checked_signed_payload_request_for_service_with_credentials(
-            "POST",
-            &url,
-            header_unsigned_body.as_bytes(),
-            SigningPayload::Unsigned,
-            base_headers,
-            SigningService::S3Control,
-            "s3",
-            credentials,
-        );
+        let response = retrying_operation_contention_response(|| {
+            send_checked_signed_payload_request_for_service_with_credentials(
+                "POST",
+                &url,
+                header_unsigned_body.as_bytes(),
+                SigningPayload::Unsigned,
+                base_headers,
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            )
+        })
+        .await;
         assert_s3_control_tag_success("S3 Control header auth with UNSIGNED-PAYLOAD", &response);
         wait_for_payload_tag_value(&bucket, "header-unsigned").await;
 
@@ -386,16 +402,19 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
         let header_mismatch_altered_body = tag_resource_body("header-mismatch-altered");
         let header_mismatch_hash =
             auth::canonical::sha256_hex(header_mismatch_signed_body.as_bytes());
-        let response = send_checked_signed_payload_request_for_service_with_credentials(
-            "POST",
-            &url,
-            header_mismatch_altered_body.as_bytes(),
-            SigningPayload::Precomputed(header_mismatch_hash.as_str()),
-            base_headers,
-            SigningService::S3Control,
-            "s3",
-            credentials,
-        );
+        let response = retrying_operation_contention_response(|| {
+            send_checked_signed_payload_request_for_service_with_credentials(
+                "POST",
+                &url,
+                header_mismatch_altered_body.as_bytes(),
+                SigningPayload::Precomputed(header_mismatch_hash.as_str()),
+                base_headers,
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            )
+        })
+        .await;
         assert_s3_control_error(
             "S3 Control header auth with mismatched payload hash",
             &response,
@@ -425,8 +444,10 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
             "s3",
             credentials,
         );
-        let response =
-            send_presigned_s3_control(&presigned_correct, presigned_fixed_body.as_bytes());
+        let response = retrying_operation_contention_response(|| {
+            send_presigned_s3_control(&presigned_correct, presigned_fixed_body.as_bytes())
+        })
+        .await;
         assert_s3_control_tag_success("presigned S3 Control with correct payload hash", &response);
         wait_for_payload_tag_value(&bucket, "presigned-fixed").await;
 
@@ -440,8 +461,10 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
             "s3",
             credentials,
         );
-        let response =
-            send_presigned_s3_control(&presigned_without_header, presigned_missing_body.as_bytes());
+        let response = retrying_operation_contention_response(|| {
+            send_presigned_s3_control(&presigned_without_header, presigned_missing_body.as_bytes())
+        })
+        .await;
         assert_s3_control_tag_success(
             "presigned S3 Control without payload hash header",
             &response,
@@ -462,8 +485,10 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
             "s3",
             credentials,
         );
-        let response =
-            send_presigned_s3_control(&presigned_unsigned, presigned_unsigned_body.as_bytes());
+        let response = retrying_operation_contention_response(|| {
+            send_presigned_s3_control(&presigned_unsigned, presigned_unsigned_body.as_bytes())
+        })
+        .await;
         assert_s3_control_tag_success("presigned S3 Control with UNSIGNED-PAYLOAD", &response);
         wait_for_payload_tag_value(&bucket, "presigned-unsigned").await;
 
@@ -484,10 +509,13 @@ fn test_s3_control_sigv4_payload_modes_match_aws() {
             "s3",
             credentials,
         );
-        let response = send_presigned_s3_control(
-            &presigned_mismatch,
-            presigned_mismatch_altered_body.as_bytes(),
-        );
+        let response = retrying_operation_contention_response(|| {
+            send_presigned_s3_control(
+                &presigned_mismatch,
+                presigned_mismatch_altered_body.as_bytes(),
+            )
+        })
+        .await;
         assert_s3_control_error(
             "presigned S3 Control with mismatched payload hash",
             &response,

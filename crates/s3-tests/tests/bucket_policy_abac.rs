@@ -1736,33 +1736,25 @@ fn test_bucket_policy_list_bucket_versions_bucket_tag_condition_when_abac_enable
             create_bucket_pair_allowing_bucket_tag_action("s3:ListBucketVersions").await;
 
         for bucket in [&public_bucket, &private_bucket] {
-            client
-                .put_bucket_versioning()
-                .bucket(bucket)
-                .versioning_configuration(
-                    VersioningConfiguration::builder()
-                        .status(BucketVersioningStatus::Enabled)
-                        .build(),
-                )
-                .send()
-                .await
-                .unwrap();
-            client
-                .put_object()
-                .bucket(bucket)
-                .key("key")
-                .body(ByteStream::from_static(b"one"))
-                .send()
-                .await
-                .unwrap();
-            client
-                .put_object()
-                .bucket(bucket)
-                .key("key")
-                .body(ByteStream::from_static(b"two"))
-                .send()
-                .await
-                .unwrap();
+            s3_tests::enable_bucket_versioning(client, bucket).await;
+            s3_tests::retrying_operation_aborted("put first ABAC list-versions object", || {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key("key")
+                    .body(ByteStream::from_static(b"one"))
+                    .send()
+            })
+            .await;
+            s3_tests::retrying_operation_aborted("put second ABAC list-versions object", || {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key("key")
+                    .body(ByteStream::from_static(b"two"))
+                    .send()
+            })
+            .await;
         }
 
         let versions = eventually_ok(
