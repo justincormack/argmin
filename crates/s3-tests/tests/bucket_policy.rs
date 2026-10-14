@@ -2360,7 +2360,7 @@ fn test_bucket_policy_get_bucket_object_lock_configuration_cross_account_allow()
             .put_object_lock_configuration()
             .bucket(&bucket)
             .object_lock_configuration(config.clone())
-            .send()
+            .send_retrying_operation_aborted("put object-lock configuration during policy test")
             .await
             .unwrap();
         client

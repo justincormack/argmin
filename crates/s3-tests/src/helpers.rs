@@ -663,7 +663,7 @@ where
     let deadline = now() + retry_window;
 
     loop {
-        let Some(delay) = operation_contention_retry_delay(deadline, now()) else {
+        let Some(delay) = raw_response_contention_retry_delay(deadline, now(), &response) else {
             return response;
         };
         tokio::time::sleep(delay).await;
@@ -801,7 +801,7 @@ where
     N: FnMut() -> std::time::Instant,
 {
     loop {
-        let Some(delay) = operation_contention_retry_delay(deadline, now()) else {
+        let Some(delay) = sdk_error_contention_retry_delay(deadline, now(), &retry_error) else {
             return Err(retry_error);
         };
         tokio::time::sleep(delay).await;
@@ -818,6 +818,23 @@ where
     }
 }
 
+async fn wait_for_get_body_collection_retry<N, S, Fut>(
+    deadline: std::time::Instant,
+    mut now: N,
+    mut sleep: S,
+) -> bool
+where
+    N: FnMut() -> std::time::Instant,
+    S: FnMut(Duration) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let Some(delay) = operation_contention_retry_delay(deadline, now(), None) else {
+        return false;
+    };
+    sleep(delay).await;
+    now() < deadline
+}
+
 pub async fn get_object_body_retrying_operation_aborted(
     client: &Client,
     bucket: &str,
@@ -825,7 +842,6 @@ pub async fn get_object_body_retrying_operation_aborted(
     version_id: Option<&str>,
     context: &str,
 ) -> Vec<u8> {
-    const RETRY_DELAY: Duration = Duration::from_millis(100);
     let deadline = std::time::Instant::now() + configured_test_timeout();
 
     loop {
@@ -837,17 +853,29 @@ pub async fn get_object_body_retrying_operation_aborted(
         match request.send().await {
             Ok(response) => match response.body.collect().await {
                 Ok(body) => return body.into_bytes().to_vec(),
-                Err(_error) if std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(RETRY_DELAY).await;
+                Err(error) => {
+                    if !wait_for_get_body_collection_retry(
+                        deadline,
+                        std::time::Instant::now,
+                        tokio::time::sleep,
+                    )
+                    .await
+                    {
+                        panic!("{context}: {error:?}");
+                    }
                     continue;
                 }
-                Err(error) => panic!("{context}: {error:?}"),
             },
-            Err(error)
-                if is_retryable_operation_contention(&error)
-                    && std::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(RETRY_DELAY).await;
+            Err(error) if is_retryable_operation_contention(&error) => {
+                let Some(delay) =
+                    sdk_error_contention_retry_delay(deadline, std::time::Instant::now(), &error)
+                else {
+                    panic!("{context}: {error:?}");
+                };
+                tokio::time::sleep(delay).await;
+                if std::time::Instant::now() >= deadline {
+                    panic!("{context}: {error:?}");
+                }
             }
             Err(error) => panic!("{context}: {error:?}"),
         }
@@ -889,11 +917,52 @@ pub trait SendRetryingOperationAborted: Clone {
 fn operation_contention_retry_delay(
     deadline: std::time::Instant,
     now: std::time::Instant,
+    retry_after: Option<&str>,
 ) -> Option<Duration> {
     const RETRY_DELAY: Duration = Duration::from_millis(100);
 
     let remaining = deadline.checked_duration_since(now)?;
-    (!remaining.is_zero()).then_some(RETRY_DELAY.min(remaining))
+    if remaining.is_zero() {
+        return None;
+    }
+    let requested = retry_after
+        .and_then(parse_retry_after_seconds)
+        .unwrap_or(RETRY_DELAY)
+        .max(RETRY_DELAY);
+    Some(requested.min(remaining))
+}
+
+fn parse_retry_after_seconds(value: &str) -> Option<Duration> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u64>().ok().map(Duration::from_secs)
+}
+
+fn sdk_error_retry_after<E>(error: &aws_sdk_s3::error::SdkError<E>) -> Option<&str> {
+    error
+        .raw_response()
+        .and_then(|response| response.headers().get("retry-after"))
+}
+
+fn raw_response_retry_after(response: &RawResponse) -> Option<&str> {
+    raw_response_header(response, "retry-after")
+}
+
+fn sdk_error_contention_retry_delay<E>(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+    error: &aws_sdk_s3::error::SdkError<E>,
+) -> Option<Duration> {
+    operation_contention_retry_delay(deadline, now, sdk_error_retry_after(error))
+}
+
+fn raw_response_contention_retry_delay(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+    response: &RawResponse,
+) -> Option<Duration> {
+    operation_contention_retry_delay(deadline, now, raw_response_retry_after(response))
 }
 
 #[allow(
@@ -986,7 +1055,7 @@ where
     N: FnMut() -> std::time::Instant,
 {
     loop {
-        let Some(delay) = operation_contention_retry_delay(deadline, now()) else {
+        let Some(delay) = sdk_error_contention_retry_delay(deadline, now(), &retry_error) else {
             return Err(retry_error);
         };
         tokio::time::sleep(delay).await;
@@ -1771,7 +1840,8 @@ where
             Ok(resp) => resp,
             Err(err) if scope.includes_sdk_error(&err, false) => {
                 let retry_deadline = *deadline.get_or_insert_with(|| now() + retry_window);
-                let Some(delay) = operation_contention_retry_delay(retry_deadline, now()) else {
+                let Some(delay) = sdk_error_contention_retry_delay(retry_deadline, now(), &err)
+                else {
                     return Err(err);
                 };
                 tokio::time::sleep(delay).await;
@@ -1801,7 +1871,7 @@ where
         }
 
         let retry_deadline = *deadline.get_or_insert_with(|| now() + retry_window);
-        let Some(delay) = operation_contention_retry_delay(retry_deadline, now()) else {
+        let Some(delay) = operation_contention_retry_delay(retry_deadline, now(), None) else {
             errors.extend(retry_errors);
             return Ok(build_delete_objects_output(deleted, errors));
         };
@@ -4833,17 +4903,106 @@ mod tests {
     fn operation_contention_retry_delay_is_capped_and_rejects_expired_deadline() {
         let now = std::time::Instant::now();
         assert_eq!(
-            operation_contention_retry_delay(now + Duration::from_millis(250), now),
+            operation_contention_retry_delay(now + Duration::from_millis(250), now, None),
             Some(Duration::from_millis(100))
         );
         assert_eq!(
-            operation_contention_retry_delay(now + Duration::from_millis(25), now),
+            operation_contention_retry_delay(now + Duration::from_millis(25), now, None),
             Some(Duration::from_millis(25))
         );
-        assert_eq!(operation_contention_retry_delay(now, now), None);
+        assert_eq!(operation_contention_retry_delay(now, now, None), None);
         assert_eq!(
-            operation_contention_retry_delay(now, now + Duration::from_millis(1)),
+            operation_contention_retry_delay(now, now + Duration::from_millis(1), None),
             None
+        );
+    }
+
+    #[test]
+    fn operation_contention_retry_delay_honors_strict_retry_after_seconds() {
+        let now = std::time::Instant::now();
+        let deadline = now + Duration::from_secs(5);
+
+        assert_eq!(
+            operation_contention_retry_delay(deadline, now, Some("1")),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            operation_contention_retry_delay(deadline, now, Some("30")),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            operation_contention_retry_delay(deadline, now, Some("0")),
+            Some(Duration::from_millis(100))
+        );
+        for invalid in ["", " 1", "+1", "1.0", "Wed, 14 Oct 2026 08:43:36 GMT"] {
+            assert_eq!(
+                operation_contention_retry_delay(deadline, now, Some(invalid)),
+                Some(Duration::from_millis(100)),
+                "accepted non-delta-seconds Retry-After value {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn contention_retry_delay_reads_sdk_and_raw_retry_after_headers() {
+        let now = std::time::Instant::now();
+        let deadline = now + Duration::from_secs(5);
+        let response = hyper::http::Response::builder()
+            .status(503)
+            .header("retry-after", "2")
+            .body(aws_smithy_types::body::SdkBody::empty())
+            .expect("build retry response")
+            .try_into()
+            .expect("convert retry response");
+        let error = aws_sdk_s3::error::SdkError::service_error(
+            aws_sdk_s3::operation::get_object::GetObjectError::generic(
+                aws_smithy_types::error::ErrorMetadata::builder()
+                    .code("SlowDown")
+                    .build(),
+            ),
+            response,
+        );
+        assert_eq!(
+            sdk_error_contention_retry_delay(deadline, now, &error),
+            Some(Duration::from_secs(2))
+        );
+
+        let response = RawResponse {
+            status: 503,
+            headers: vec![("Retry-After".to_string(), "3".to_string())],
+            body: "<Error><Code>SlowDown</Code></Error>".to_string(),
+            body_read_error: None,
+        };
+        assert_eq!(
+            raw_response_contention_retry_delay(deadline, now, &response),
+            Some(Duration::from_secs(3))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_body_collection_failure_crossing_deadline_does_not_retry() {
+        let clock = TestClock::new();
+        let deadline = clock.now() + Duration::from_millis(75);
+        let now_clock = clock.clone();
+        let sleep_clock = clock.clone();
+        let observed_delays = Arc::new(Mutex::new(Vec::new()));
+        let sleep_delays = Arc::clone(&observed_delays);
+
+        let should_retry = wait_for_get_body_collection_retry(
+            deadline,
+            move || now_clock.now(),
+            move |delay| {
+                sleep_delays.lock().unwrap().push(delay);
+                sleep_clock.advance(delay);
+                std::future::ready(())
+            },
+        )
+        .await;
+
+        assert!(!should_retry);
+        assert_eq!(
+            observed_delays.lock().unwrap().as_slice(),
+            &[Duration::from_millis(75)]
         );
     }
 

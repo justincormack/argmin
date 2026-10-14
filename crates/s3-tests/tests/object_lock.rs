@@ -326,7 +326,7 @@ async fn put_object_lock_configuration(
         .put_object_lock_configuration()
         .bucket(bucket)
         .object_lock_configuration(config)
-        .send()
+        .send_retrying_operation_aborted("put object-lock configuration")
         .await
         .unwrap()
 }
@@ -940,7 +940,7 @@ fn test_object_lock_put_obj_lock_enable_after_create() {
             .put_object_lock_configuration()
             .bucket(&bucket)
             .object_lock_configuration(config)
-            .send()
+            .send_retrying_operation_aborted("put object-lock configuration")
             .await
             .unwrap();
 

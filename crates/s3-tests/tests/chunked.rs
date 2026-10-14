@@ -661,6 +661,34 @@ struct UploadPartTarget<'a> {
     part_number: i32,
 }
 
+fn capture_raw_response(mut response: s3_tests::Response) -> RawResponse {
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let mut body_read_error = response.body_read_error().map(ToOwned::to_owned);
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .unwrap_or_else(|error| {
+            body_read_error.get_or_insert_with(|| error.to_string());
+            String::new()
+        });
+    RawResponse {
+        status,
+        headers,
+        body,
+        body_read_error,
+    }
+}
+
 async fn send_chunked_upload_part(
     target: UploadPartTarget<'_>,
     content_sha256: &str,
@@ -703,32 +731,7 @@ async fn send_chunked_upload_part(
         for (name, value) in extra_signed_headers {
             request = request.header(*name, *value);
         }
-        let mut response = request.send(&wire).expect("transport error");
-        let status = response.status().as_u16();
-        let headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.as_str().to_string(), value.to_string()))
-            })
-            .collect();
-        let mut body_read_error = response.body_read_error().map(ToOwned::to_owned);
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .unwrap_or_else(|error| {
-                body_read_error.get_or_insert_with(|| error.to_string());
-                String::new()
-            });
-        RawResponse {
-            status,
-            headers,
-            body,
-            body_read_error,
-        }
+        capture_raw_response(request.send(&wire).expect("transport error"))
     })
     .await
 }
@@ -3288,34 +3291,40 @@ fn test_streaming_upload_part_with_inline_checksum() {
         let data = b"streaming upload part with checksum";
         let expected_crc = base64::engine::general_purpose::STANDARD
             .encode(checksum::crc32::checksum(data).to_be_bytes());
-        let path = format!("/{}/{}", bucket, key);
-        let encoded_upload_id: String =
-            url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
-        let query = format!("partNumber=1&uploadId={encoded_upload_id}");
-        let request_uri = format!("{path}?{query}");
+        let response = s3_tests::retrying_operation_contention_response(|| {
+            let path = format!("/{}/{}", bucket, key);
+            let encoded_upload_id: String =
+                url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
+            let query = format!("partNumber=1&uploadId={encoded_upload_id}");
+            let request_uri = format!("{path}?{query}");
+            let sign = sign_streaming_request_custom_with_query(
+                "PUT",
+                &request_uri,
+                "UNSIGNED-PAYLOAD",
+                data.len(),
+                &[("x-amz-checksum-crc32", &expected_crc)],
+                true, // not aws-chunked
+                true, // not aws-chunked
+            );
 
-        let sign = sign_streaming_request_custom_with_query(
-            "PUT",
-            &request_uri,
-            "UNSIGNED-PAYLOAD",
-            data.len(),
-            &[("x-amz-checksum-crc32", &expected_crc)],
-            true, // not aws-chunked
-            true, // not aws-chunked
+            let url = format!("{}{}?{}", CTX.endpoint(), path, query);
+            capture_raw_response(
+                agent()
+                    .put(&url)
+                    .header("Authorization", &sign.authorization)
+                    .header("x-amz-date", &sign.amz_date)
+                    .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                    .header("x-amz-checksum-crc32", &expected_crc)
+                    .send(&data[..])
+                    .expect("transport error"),
+            )
+        })
+        .await;
+        assert_eq!(
+            response.status, 200,
+            "expected 200, got {}: {}",
+            response.status, response.body
         );
-
-        let url = format!("{}{}?{}", CTX.endpoint(), path, query);
-        let mut resp = agent()
-            .put(&url)
-            .header("Authorization", &sign.authorization)
-            .header("x-amz-date", &sign.amz_date)
-            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
-            .header("x-amz-checksum-crc32", &expected_crc)
-            .send(&data[..])
-            .expect("transport error");
-        let status = resp.status().as_u16();
-        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
-        assert_eq!(status, 200, "expected 200, got {}: {}", status, body_str);
 
         let listed = client
             .list_parts()

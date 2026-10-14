@@ -2413,7 +2413,9 @@ fn test_bucket_policy_get_bucket_object_lock_configuration_bucket_tag_condition_
             .put_object_lock_configuration()
             .bucket(&public_bucket)
             .object_lock_configuration(public_config.clone())
-            .send()
+            .send_retrying_operation_aborted(
+                "put public object-lock configuration during ABAC test",
+            )
             .await
             .unwrap();
         enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
@@ -2430,7 +2432,9 @@ fn test_bucket_policy_get_bucket_object_lock_configuration_bucket_tag_condition_
             .put_object_lock_configuration()
             .bucket(&private_bucket)
             .object_lock_configuration(private_config.clone())
-            .send()
+            .send_retrying_operation_aborted(
+                "put private object-lock configuration during ABAC test",
+            )
             .await
             .unwrap();
         enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
