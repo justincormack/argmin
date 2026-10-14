@@ -1078,7 +1078,7 @@ fn test_delete_bucket_lifecycle_is_idempotent() {
         client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete absent lifecycle configuration")
             .await
             .unwrap();
 
@@ -1099,13 +1099,13 @@ fn test_delete_bucket_lifecycle_is_idempotent() {
         client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete lifecycle configuration")
             .await
             .unwrap();
         client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("repeat lifecycle configuration deletion")
             .await
             .unwrap();
 
@@ -1176,12 +1176,13 @@ fn test_bucket_lifecycle_crud_round_trip() {
 
         put_lifecycle_configuration(client, &bucket, config).await;
 
-        let get = client
-            .get_bucket_lifecycle_configuration()
-            .bucket(&bucket)
-            .send()
-            .await;
-        let get = get.unwrap();
+        let get = retrying_operation_aborted("read lifecycle configuration for CRUD test", || {
+            client
+                .get_bucket_lifecycle_configuration()
+                .bucket(&bucket)
+                .send()
+        })
+        .await;
 
         assert_eq!(get.rules().len(), 4);
         let expire_current = &get.rules()[0];
@@ -1223,7 +1224,7 @@ fn test_bucket_lifecycle_crud_round_trip() {
         client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete lifecycle configuration for CRUD test")
             .await
             .unwrap();
 
@@ -1880,7 +1881,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_prefix_filter() 
         let _ = client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete prefix lifecycle configuration")
             .await;
         delete_all_and_bucket(
             client,
@@ -1945,7 +1946,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_tag_filter() {
         let _ = client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete tag lifecycle configuration")
             .await;
         delete_all_and_bucket(
             client,
@@ -2024,7 +2025,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_and_filter() {
         let _ = client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete combined-filter lifecycle configuration")
             .await;
         delete_all_and_bucket(
             client,
@@ -2090,7 +2091,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_date_rule() {
         let _ = client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete date lifecycle configuration")
             .await;
         delete_all_and_bucket(
             client,
@@ -2152,7 +2153,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_object_size_grea
         let _ = client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete minimum-size lifecycle configuration")
             .await;
         delete_all_and_bucket(client, &bucket, &["large".to_string(), "small".to_string()]).await;
     });
@@ -2209,7 +2210,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_object_size_less
         let _ = client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete maximum-size lifecycle configuration")
             .await;
         delete_all_and_bucket(client, &bucket, &["small".to_string(), "large".to_string()]).await;
     });
@@ -2592,7 +2593,7 @@ fn test_complete_multipart_upload_reports_expiration_header() {
         let _ = client
             .delete_bucket_lifecycle()
             .bucket(&bucket)
-            .send()
+            .send_retrying_operation_aborted("delete multipart lifecycle configuration")
             .await;
         delete_all_and_bucket(client, &bucket, &["logs/complete".to_string()]).await;
     });
@@ -2697,9 +2698,13 @@ fn test_lifecycle_write_ack_shapes() {
                 shape().status(200).headers(id_headers()).body_empty(),
             ],
         );
+        let delete = s3_tests::retrying_operation_contention_response(|| {
+            raw_bucket("DELETE", &bucket, Some("lifecycle="))
+        })
+        .await;
         assert_shape_one_of(
             "DeleteBucketLifecycle ack",
-            &raw_bucket("DELETE", &bucket, Some("lifecycle=")),
+            &delete,
             &[shape().status(204).headers(id_headers()).body_empty()],
         );
 

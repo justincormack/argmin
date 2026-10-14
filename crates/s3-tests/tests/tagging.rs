@@ -3979,7 +3979,7 @@ fn test_get_bucket_tagging_response_shape() {
             .put_bucket_tagging()
             .bucket(&bucket)
             .tagging(tagging)
-            .send()
+            .send_retrying_operation_aborted("put response-shape bucket tagging")
             .await
             .expect("put bucket tagging");
 
