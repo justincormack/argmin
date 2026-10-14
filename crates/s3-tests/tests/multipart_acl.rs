@@ -127,16 +127,22 @@ async fn complete_single_part_multipart_upload_with_client_and_acl(
         .unwrap();
     let upload_id = create.upload_id().unwrap().to_string();
 
-    let part = client
-        .upload_part()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(&upload_id)
-        .part_number(1)
-        .body(ByteStream::from(body.to_vec()))
-        .send()
-        .await
-        .unwrap();
+    let part = s3_tests::retrying_operation_aborted("upload multipart ACL test part", || {
+        let body = body.to_vec();
+        let upload_id = upload_id.clone();
+        async move {
+            client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .body(ByteStream::from(body))
+                .send()
+                .await
+        }
+    })
+    .await;
 
     client
         .complete_multipart_upload()
@@ -153,7 +159,7 @@ async fn complete_single_part_multipart_upload_with_client_and_acl(
                 )
                 .build(),
         )
-        .send()
+        .send_retrying_operation_aborted("complete multipart ACL test upload")
         .await
         .unwrap();
 
@@ -197,16 +203,20 @@ fn test_create_multipart_upload_grant_write_header_persists_write_grant() {
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .unwrap();
+        let part = s3_tests::retrying_operation_aborted(
+            "upload multipart ACL grant-write test part",
+            || {
+                let request = client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(body.clone()));
+                async move { request.send().await }
+            },
+        )
+        .await;
 
         client
             .complete_multipart_upload()
@@ -223,7 +233,7 @@ fn test_create_multipart_upload_grant_write_header_persists_write_grant() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete multipart ACL grant-write test upload")
             .await
             .unwrap();
 

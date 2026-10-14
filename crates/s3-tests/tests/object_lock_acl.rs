@@ -349,21 +349,23 @@ fn test_object_lock_acl_multipart_headers_persist() {
             .object_lock_mode(ObjectLockMode::Governance)
             .object_lock_retain_until_date(retain_until)
             .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
-            .send()
+            .send_retrying_operation_aborted("create ACL object-lock multipart upload")
             .await
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(1)
-            .body(ByteStream::from_static(b"abc"))
-            .send()
-            .await
-            .unwrap();
+        let part = retrying_operation_aborted("upload ACL object-lock multipart part", || async {
+            client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .body(ByteStream::from_static(b"abc"))
+                .send()
+                .await
+        })
+        .await;
         let version_id = client
             .complete_multipart_upload()
             .bucket(&bucket)
@@ -379,7 +381,7 @@ fn test_object_lock_acl_multipart_headers_persist() {
                     )
                     .build(),
             )
-            .send()
+            .send_retrying_operation_aborted("complete ACL object-lock multipart upload")
             .await
             .unwrap()
             .version_id()
