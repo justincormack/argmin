@@ -1879,7 +1879,7 @@ impl SharedStorageNode {
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
         let shard_path = PgStore::shard_path_for_shards_dir(&paths.shards_dir, key);
-        fs::read(&shard_path).map_err(|e| {
+        let payload = fs::read(&shard_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 return StoreError::NotFound;
             }
@@ -1887,7 +1887,12 @@ impl SharedStorageNode {
                 context: "read shard file",
                 source: e,
             }
-        })
+        })?;
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            shard_bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
+        Ok(payload)
     }
 
     /// Read a shard file directly into a caller-provided buffer without taking
@@ -1928,7 +1933,13 @@ impl SharedStorageNode {
 
         let mut extra = [0u8; 1];
         match file.read(&mut extra) {
-            Ok(0) => Ok(()),
+            Ok(0) => {
+                observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                    shard_bytes: u64::try_from(dst.len()).unwrap_or(u64::MAX),
+                    ..observability::PayloadReadMetricDelta::default()
+                });
+                Ok(())
+            }
             Ok(_) => Err(StoreError::Io {
                 context: "read shard file length mismatch",
                 source: std::io::Error::from(std::io::ErrorKind::InvalidData),

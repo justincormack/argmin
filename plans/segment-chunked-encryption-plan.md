@@ -1,6 +1,6 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: Proposed
+Status: In progress (Phase 0)
 
 ## Context
 
@@ -664,7 +664,8 @@ acknowledgement evidence is validated before installation and encoded as a self-
 ### Phase 0: Measure and freeze the current model
 
 - Add counters for logical range bytes, stored bytes read, shard bytes read, bytes reconstructed,
-  bytes decrypted, AEAD records opened, CRC bytes processed, allocations, and repair fallback.
+  bytes decrypted, AEAD records opened, CRC bytes processed, buffer checkouts and actual buffer
+  allocations, and repair fallback.
 - Benchmark the current encrypted and unencrypted range/full-read paths.
 - Inventory every existing plaintext/encrypted branch and specify the sealed common profile
   interface, including per-profile release guarantees and finalization errors.
@@ -675,6 +676,37 @@ acknowledgement evidence is validated before installation and encoded as a self-
 - Record the exact Cobblestone revision and review implementation/dependency choices.
 
 Exit: the expected benefit and current format are measurable and immutable evidence exists.
+
+Implementation update (2026-10-17):
+
+- The first measurement slice exports cumulative `payload_read_*` counters through the existing
+  metrics snapshot and local metrics endpoint. Logical bytes are counted when a read chunk is
+  exposed; stored bytes after a complete segment read; physical shard bytes at successful file
+  reads; reconstructed bytes at the EC output boundary; AEAD open attempts before authentication;
+  decrypted bytes only after a successful open; and CRC bytes at each actual checksum pass.
+- Pool checkouts, new backing-buffer allocations, and allocated capacity are separate counters.
+  This avoids calling every checkout an allocation and makes reuse measurable.
+- Repair fallback counts each healthy systematic read that enters the full-shard recovery path.
+  Physical shard and CRC counters deliberately include fallback rereads and repeated validation,
+  so they expose work amplification rather than merely restating the logical response size.
+- The current-path inventory confirms that local systematic reads validate each shard CRC and
+  compose the segment CRC without rescanning the assembled segment. Unix/TLS full-shard reads
+  through the production read-handle path use the range RPC with the complete shard range: the
+  storage node validates the whole-shard CRC once, then the authenticated transport carries the
+  selected bytes. Historical inspection computes the acknowledgement at the storage node and
+  validates it again at the receiver. The test-only full-shard RPC also validates during
+  handler processing, response encoding, and response decoding. The counters intentionally expose
+  each pass actually taken.
+- The current reader still obtains and decrypts one complete stored segment before returning any
+  selected bytes. `ObjectEncryption::None` bypasses the decrypt step; SSE-C and SSE-S3 each open
+  one whole-segment AEAD record. The common sealed profile interface and benchmark matrix remain
+  Phase 0 work.
+- The format-evidence audit found existing exact fixtures for `ObjectEncryption` state, the
+  metadata-command corpus (including encrypted stream-session state), and the SSE-S3 segment
+  cipher. This slice adds the missing deterministic SSE-C whole-segment cipher vector and a
+  crossed-DEK authentication failure, plus an exact encrypted storage-RPC v22 payload fixture.
+  Changing the current profile now requires an explicit fixture and outer-version decision rather
+  than silently rewriting the baseline.
 
 ### Phase 1: Exact encryption subjects
 

@@ -233,7 +233,11 @@ pub(crate) fn encode_shard_read_response(
     payload: &[u8],
     expected_ack: WriteAck,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    validate_shard_payload_matches_ack(payload, expected_ack)?;
+    validate_shard_payload_matches_ack(
+        payload,
+        expected_ack,
+        PayloadReadCrcAccounting::Record,
+    )?;
     let mut out = Vec::new();
     put_bytes(&mut out, payload);
     Ok(out)
@@ -246,13 +250,21 @@ pub(crate) fn decode_shard_read_response(
     let mut decoder = StorageRpcDecoder::new(bytes);
     let payload = decoder.read_bytes()?.to_vec();
     decoder.finish()?;
-    validate_shard_payload_matches_ack(&payload, expected_ack)?;
+    validate_shard_payload_matches_ack(
+        &payload,
+        expected_ack,
+        PayloadReadCrcAccounting::Record,
+    )?;
     Ok(payload)
 }
 
 pub(crate) fn encode_historical_shard_read_response(
     payload: &[u8],
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+        crc_bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+        ..observability::PayloadReadMetricDelta::default()
+    });
     let ack = WriteAck {
         stored_size: payload.len() as u64,
         crc64: checksum::crc64::checksum(payload),
@@ -274,7 +286,7 @@ pub(crate) fn decode_historical_shard_read_response(
     };
     let payload = decoder.read_bytes()?.to_vec();
     decoder.finish()?;
-    validate_shard_payload_matches_ack(&payload, ack)?;
+    validate_shard_payload_matches_ack(&payload, ack, PayloadReadCrcAccounting::Record)?;
     Ok((payload, ack))
 }
 
@@ -2639,18 +2651,32 @@ fn validate_shard_write_payload(
             stored_size: expected_size,
             crc64: expected_crc64,
         },
+        PayloadReadCrcAccounting::Ignore,
     )
+}
+
+#[derive(Clone, Copy)]
+enum PayloadReadCrcAccounting {
+    Record,
+    Ignore,
 }
 
 fn validate_shard_payload_matches_ack(
     payload: &[u8],
     expected_ack: WriteAck,
+    accounting: PayloadReadCrcAccounting,
 ) -> Result<(), StorageRpcPayloadError> {
     let actual_size = payload.len() as u64;
     if actual_size != expected_ack.stored_size {
         return Err(StorageRpcPayloadError::ShardWriteSizeMismatch {
             expected: expected_ack.stored_size,
             actual: actual_size,
+        });
+    }
+    if matches!(accounting, PayloadReadCrcAccounting::Record) {
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            crc_bytes: actual_size,
+            ..observability::PayloadReadMetricDelta::default()
         });
     }
     if checksum::crc64::checksum(payload) != expected_ack.crc64 {

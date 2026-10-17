@@ -2482,6 +2482,10 @@ impl StorageCluster {
                 temporarily_unavailable,
             } => temporarily_unavailable,
         };
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            repair_fallbacks: 1,
+            ..observability::PayloadReadMetricDelta::default()
+        });
 
         self.try_read_placed_segment_recovery_into(
             req,
@@ -2526,8 +2530,12 @@ impl StorageCluster {
                 PlacedSegmentDirectReadOutcome::Complete => return Ok(true),
                 PlacedSegmentDirectReadOutcome::Recover {
                     temporarily_unavailable,
-                } => temporarily_unavailable,
-            };
+            } => temporarily_unavailable,
+        };
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            repair_fallbacks: 1,
+            ..observability::PayloadReadMetricDelta::default()
+        });
         let mut all_shards = vec![None; total_shards];
         let mut present_count = 0usize;
         let mut temporarily_unavailable = temporarily_unavailable;
@@ -2778,6 +2786,12 @@ impl StorageCluster {
                     context: "reconstruct placed segment shards from historical route",
                     reason: error.to_string(),
                 })?;
+            observability::record_payload_read_metrics(
+                observability::PayloadReadMetricDelta {
+                    reconstructed_bytes: u64::try_from(recovered.len()).unwrap_or(u64::MAX),
+                    ..observability::PayloadReadMetricDelta::default()
+                },
+            );
         }
 
         dst.clear();
@@ -2818,6 +2832,10 @@ impl StorageCluster {
             dst.extend_from_slice(recovered_shard);
         }
         dst.truncate(stored_size);
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            crc_bytes: u64::try_from(dst.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
         Ok(checksum::crc64::checksum(dst))
     }
 
@@ -3032,6 +3050,13 @@ impl StorageCluster {
                     reason: error.to_string(),
                 })?;
 
+            observability::record_payload_read_metrics(
+                observability::PayloadReadMetricDelta {
+                    reconstructed_bytes: u64::try_from(recovered_buf.len()).unwrap_or(u64::MAX),
+                    ..observability::PayloadReadMetricDelta::default()
+                },
+            );
+
             for (slot, &missing_idx) in missing_needed.iter().enumerate() {
                 let start = slot * shard_size;
                 recovered_ranges[missing_idx] = Some((start, start + shard_size));
@@ -3070,6 +3095,10 @@ impl StorageCluster {
             }
         }
         dst.truncate(req.stored_size);
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            crc_bytes: u64::try_from(dst.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
         let actual_crc64 = checksum::crc64::checksum(dst);
         if actual_crc64 != req.segment_crc64 {
             return Err(StoreError::IntegrityError {

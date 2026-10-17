@@ -100,15 +100,25 @@ impl PayloadBufferPool {
         let maybe_idx = cached
             .iter()
             .rposition(|buf| buf.capacity() >= min_capacity);
-        let mut buf = maybe_idx.map_or_else(
+        let (mut buf, allocated) = maybe_idx.map_or_else(
             || {
                 #[cfg(test)]
                 self.allocations.fetch_add(1, Ordering::Relaxed);
-                Vec::with_capacity(min_capacity)
+                (Vec::with_capacity(min_capacity), true)
             },
-            |idx| cached.swap_remove(idx),
+            |idx| (cached.swap_remove(idx), false),
         );
         drop(cached);
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            buffer_checkouts: 1,
+            buffer_allocations: u64::from(allocated),
+            buffer_allocated_bytes: if allocated {
+                u64::try_from(buf.capacity()).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
+            ..observability::PayloadReadMetricDelta::default()
+        });
         buf.clear();
         PooledPayloadBuffer {
             pool: Arc::clone(self),

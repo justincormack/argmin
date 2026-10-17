@@ -6389,6 +6389,10 @@ impl StorageNodeConnectionHandler {
         let response = match payload {
             Ok(payload) => {
                 let actual_size = payload.len() as u64;
+                observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                    crc_bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                    ..observability::PayloadReadMetricDelta::default()
+                });
                 let actual_crc = checksum::crc64::checksum(&payload);
                 if actual_size != request.expected_ack.stored_size
                     || actual_crc != request.expected_ack.crc64
@@ -6438,6 +6442,10 @@ impl StorageNodeConnectionHandler {
         let response = match route.read() {
             Ok(payload) => {
                 let actual_size = payload.len() as u64;
+                observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                    crc_bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+                    ..observability::PayloadReadMetricDelta::default()
+                });
                 let actual_crc = checksum::crc64::checksum(&payload);
                 if actual_size != request.expected_ack.stored_size
                     || actual_crc != request.expected_ack.crc64

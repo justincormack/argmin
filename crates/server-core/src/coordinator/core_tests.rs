@@ -21209,6 +21209,7 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
         1
     );
 
+    let metrics_before = observability::metrics_snapshot();
     let first = coord
         .get_object(&GetObjectRequest {
             sse_customer: None,
@@ -21229,6 +21230,15 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
             .storage_node()
             .test_default_payload_ec_scratch_allocation_count(),
         1
+    );
+    let metrics_after_first = observability::metrics_snapshot();
+    assert_eq!(
+        metrics_after_first.payload_read_repair_fallback_total,
+        metrics_before.payload_read_repair_fallback_total + 1
+    );
+    assert!(
+        metrics_after_first.payload_read_reconstructed_bytes_total
+            > metrics_before.payload_read_reconstructed_bytes_total
     );
 
     let second = coord

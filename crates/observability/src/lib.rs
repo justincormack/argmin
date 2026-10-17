@@ -250,6 +250,17 @@ static STREAM_UPLOAD_SEGMENT_APPEND_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0
 static STREAM_UPLOAD_SEGMENT_APPEND_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_FINALIZE_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_FINALIZE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_LOGICAL_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_STORED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_SHARD_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_RECONSTRUCTED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_DECRYPTED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_AEAD_RECORDS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_CRC_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_BUFFER_CHECKOUTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_BUFFER_ALLOCATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_BUFFER_ALLOCATED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static PAYLOAD_READ_REPAIR_FALLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLIGHT_RECORDER: OnceLock<Mutex<FlightRecorder>> = OnceLock::new();
 static PANIC_FLIGHT_RECORDER_HOOK: Once = Once::new();
 static FLIGHT_RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -2881,6 +2892,17 @@ pub struct MetricsSnapshot {
     pub stream_upload_segment_append_error_total: u64,
     pub stream_upload_finalize_started_total: u64,
     pub stream_upload_finalize_error_total: u64,
+    pub payload_read_logical_bytes_total: u64,
+    pub payload_read_stored_bytes_total: u64,
+    pub payload_read_shard_bytes_total: u64,
+    pub payload_read_reconstructed_bytes_total: u64,
+    pub payload_read_decrypted_bytes_total: u64,
+    pub payload_read_aead_records_total: u64,
+    pub payload_read_crc_bytes_total: u64,
+    pub payload_read_buffer_checkouts_total: u64,
+    pub payload_read_buffer_allocations_total: u64,
+    pub payload_read_buffer_allocated_bytes_total: u64,
+    pub payload_read_repair_fallback_total: u64,
 }
 
 impl MetricsSnapshot {
@@ -3312,6 +3334,50 @@ impl MetricsSnapshot {
                 "stream_upload_finalize_error_total",
                 self.stream_upload_finalize_error_total,
             ),
+            (
+                "payload_read_logical_bytes_total",
+                self.payload_read_logical_bytes_total,
+            ),
+            (
+                "payload_read_stored_bytes_total",
+                self.payload_read_stored_bytes_total,
+            ),
+            (
+                "payload_read_shard_bytes_total",
+                self.payload_read_shard_bytes_total,
+            ),
+            (
+                "payload_read_reconstructed_bytes_total",
+                self.payload_read_reconstructed_bytes_total,
+            ),
+            (
+                "payload_read_decrypted_bytes_total",
+                self.payload_read_decrypted_bytes_total,
+            ),
+            (
+                "payload_read_aead_records_total",
+                self.payload_read_aead_records_total,
+            ),
+            (
+                "payload_read_crc_bytes_total",
+                self.payload_read_crc_bytes_total,
+            ),
+            (
+                "payload_read_buffer_checkouts_total",
+                self.payload_read_buffer_checkouts_total,
+            ),
+            (
+                "payload_read_buffer_allocations_total",
+                self.payload_read_buffer_allocations_total,
+            ),
+            (
+                "payload_read_buffer_allocated_bytes_total",
+                self.payload_read_buffer_allocated_bytes_total,
+            ),
+            (
+                "payload_read_repair_fallback_total",
+                self.payload_read_repair_fallback_total,
+            ),
         ]
         .into_iter()
     }
@@ -3687,6 +3753,71 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             .load(Ordering::Relaxed),
         stream_upload_finalize_error_total: STREAM_UPLOAD_FINALIZE_ERROR_TOTAL
             .load(Ordering::Relaxed),
+        payload_read_logical_bytes_total: PAYLOAD_READ_LOGICAL_BYTES_TOTAL.load(Ordering::Relaxed),
+        payload_read_stored_bytes_total: PAYLOAD_READ_STORED_BYTES_TOTAL.load(Ordering::Relaxed),
+        payload_read_shard_bytes_total: PAYLOAD_READ_SHARD_BYTES_TOTAL.load(Ordering::Relaxed),
+        payload_read_reconstructed_bytes_total: PAYLOAD_READ_RECONSTRUCTED_BYTES_TOTAL
+            .load(Ordering::Relaxed),
+        payload_read_decrypted_bytes_total: PAYLOAD_READ_DECRYPTED_BYTES_TOTAL
+            .load(Ordering::Relaxed),
+        payload_read_aead_records_total: PAYLOAD_READ_AEAD_RECORDS_TOTAL.load(Ordering::Relaxed),
+        payload_read_crc_bytes_total: PAYLOAD_READ_CRC_BYTES_TOTAL.load(Ordering::Relaxed),
+        payload_read_buffer_checkouts_total: PAYLOAD_READ_BUFFER_CHECKOUTS_TOTAL
+            .load(Ordering::Relaxed),
+        payload_read_buffer_allocations_total: PAYLOAD_READ_BUFFER_ALLOCATIONS_TOTAL
+            .load(Ordering::Relaxed),
+        payload_read_buffer_allocated_bytes_total: PAYLOAD_READ_BUFFER_ALLOCATED_BYTES_TOTAL
+            .load(Ordering::Relaxed),
+        payload_read_repair_fallback_total: PAYLOAD_READ_REPAIR_FALLBACK_TOTAL
+            .load(Ordering::Relaxed),
+    }
+}
+
+/// Additive measurements for physical and logical work performed by payload
+/// reads. Callers report work where it happens so fallback rereads and
+/// reconstruction remain visible rather than being inferred from object size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PayloadReadMetricDelta {
+    pub logical_bytes: u64,
+    pub stored_bytes: u64,
+    pub shard_bytes: u64,
+    pub reconstructed_bytes: u64,
+    pub decrypted_bytes: u64,
+    pub aead_records: u64,
+    pub crc_bytes: u64,
+    pub buffer_checkouts: u64,
+    pub buffer_allocations: u64,
+    pub buffer_allocated_bytes: u64,
+    pub repair_fallbacks: u64,
+}
+
+pub fn record_payload_read_metrics(delta: PayloadReadMetricDelta) {
+    add_metric(&PAYLOAD_READ_LOGICAL_BYTES_TOTAL, delta.logical_bytes);
+    add_metric(&PAYLOAD_READ_STORED_BYTES_TOTAL, delta.stored_bytes);
+    add_metric(&PAYLOAD_READ_SHARD_BYTES_TOTAL, delta.shard_bytes);
+    add_metric(
+        &PAYLOAD_READ_RECONSTRUCTED_BYTES_TOTAL,
+        delta.reconstructed_bytes,
+    );
+    add_metric(&PAYLOAD_READ_DECRYPTED_BYTES_TOTAL, delta.decrypted_bytes);
+    add_metric(&PAYLOAD_READ_AEAD_RECORDS_TOTAL, delta.aead_records);
+    add_metric(&PAYLOAD_READ_CRC_BYTES_TOTAL, delta.crc_bytes);
+    add_metric(&PAYLOAD_READ_BUFFER_CHECKOUTS_TOTAL, delta.buffer_checkouts);
+    add_metric(
+        &PAYLOAD_READ_BUFFER_ALLOCATIONS_TOTAL,
+        delta.buffer_allocations,
+    );
+    add_metric(
+        &PAYLOAD_READ_BUFFER_ALLOCATED_BYTES_TOTAL,
+        delta.buffer_allocated_bytes,
+    );
+    add_metric(&PAYLOAD_READ_REPAIR_FALLBACK_TOTAL, delta.repair_fallbacks);
+}
+
+#[inline]
+fn add_metric(counter: &AtomicU64, delta: u64) {
+    if delta != 0 {
+        counter.fetch_add(delta, Ordering::Relaxed);
     }
 }
 
@@ -5313,6 +5444,7 @@ mod tests {
             metadata_command_checkpoint_record_compaction_failed_total: 44,
             stream_upload_finalize_error_total: 55,
             stream_upload_finalize_started_total: 66,
+            payload_read_reconstructed_bytes_total: 77,
             ..MetricsSnapshot::default()
         };
         let entries: Vec<_> = snapshot.iter_named().collect();
@@ -5341,6 +5473,74 @@ mod tests {
         assert_eq!(
             map.get("stream_upload_finalize_started_total").copied(),
             Some(66)
+        );
+        assert_eq!(
+            map.get("payload_read_reconstructed_bytes_total").copied(),
+            Some(77)
+        );
+    }
+
+    #[test]
+    fn payload_read_metrics_record_each_kind_of_work() {
+        let before = metrics_snapshot();
+        record_payload_read_metrics(PayloadReadMetricDelta {
+            logical_bytes: 1,
+            stored_bytes: 2,
+            shard_bytes: 3,
+            reconstructed_bytes: 4,
+            decrypted_bytes: 5,
+            aead_records: 6,
+            crc_bytes: 7,
+            buffer_checkouts: 8,
+            buffer_allocations: 9,
+            buffer_allocated_bytes: 10,
+            repair_fallbacks: 11,
+        });
+        let after = metrics_snapshot();
+
+        assert_eq!(
+            after.payload_read_logical_bytes_total,
+            before.payload_read_logical_bytes_total + 1
+        );
+        assert_eq!(
+            after.payload_read_stored_bytes_total,
+            before.payload_read_stored_bytes_total + 2
+        );
+        assert_eq!(
+            after.payload_read_shard_bytes_total,
+            before.payload_read_shard_bytes_total + 3
+        );
+        assert_eq!(
+            after.payload_read_reconstructed_bytes_total,
+            before.payload_read_reconstructed_bytes_total + 4
+        );
+        assert_eq!(
+            after.payload_read_decrypted_bytes_total,
+            before.payload_read_decrypted_bytes_total + 5
+        );
+        assert_eq!(
+            after.payload_read_aead_records_total,
+            before.payload_read_aead_records_total + 6
+        );
+        assert_eq!(
+            after.payload_read_crc_bytes_total,
+            before.payload_read_crc_bytes_total + 7
+        );
+        assert_eq!(
+            after.payload_read_buffer_checkouts_total,
+            before.payload_read_buffer_checkouts_total + 8
+        );
+        assert_eq!(
+            after.payload_read_buffer_allocations_total,
+            before.payload_read_buffer_allocations_total + 9
+        );
+        assert_eq!(
+            after.payload_read_buffer_allocated_bytes_total,
+            before.payload_read_buffer_allocated_bytes_total + 10
+        );
+        assert_eq!(
+            after.payload_read_repair_fallback_total,
+            before.payload_read_repair_fallback_total + 11
         );
     }
 

@@ -336,6 +336,53 @@ mod tests {
     }
 
     #[test]
+    fn current_storage_rpc_v22_encryption_state_encoding_is_frozen() {
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 22);
+        let bucket = BucketName::try_from("encrypted-rpc").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let encryption = ObjectEncryption::SseS3(
+            crate::SseS3ObjectState::new(
+                0x0102_0304,
+                [0x11; crate::SSE_S3_WRAP_NONCE_LEN],
+                [0x22; crate::SSE_S3_WRAPPED_DEK_LEN],
+                [0x33; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_encrypted_checksum_metadata(
+                [0x44; crate::SSE_S3_CHECKSUM_NONCE_LEN],
+                vec![0x55, 0x66, 0x77],
+            )
+            .unwrap(),
+        );
+        let request = StorageRpcStreamUploadMatchRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(9).unwrap(),
+                pg_id: PgId::new(11),
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            request: CreateStreamUploadReq {
+                session_id: SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap(),
+                bucket,
+                key,
+                target: StreamUploadTarget::PutObject,
+                encryption,
+            },
+            expected_command: None,
+        };
+
+        let encoded = encode_stream_upload_match_request(&request).unwrap();
+        assert_eq!(
+            hex_bytes(&encoded),
+            "0700000009000000000000000b0000000d000000656e637279707465642d727063030000006b65792000000030313233343536373839616263646566303132333435363738396162636465660d000000656e637279707465642d727063030000006b6579000201580000000101020304111111111111111111111111222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222333333333333444444444444444444444444000355667700"
+        );
+        assert_eq!(
+            decode_stream_upload_match_request(&encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
     fn storage_rpc_v18_stream_upload_no_such_upload_payload_is_stable() {
         const V18_STREAM_UPLOAD_NO_SUCH_UPLOAD_PAYLOAD: &[u8] = b"\
             \x07\x20\x00\x00\x00\
@@ -2402,6 +2449,69 @@ mod tests {
             ),
             Err(StorageRpcPayloadError::ShardWriteChecksumMismatch)
         ));
+    }
+
+    #[test]
+    fn shard_read_crc_metric_counts_only_checksum_passes() {
+        let payload = b"payload bytes";
+        let mut active_response = Vec::new();
+        put_bytes(&mut active_response, payload);
+        let before = observability::metrics_snapshot();
+        assert!(matches!(
+            decode_shard_read_response(
+                &active_response,
+                WriteAck {
+                    stored_size: payload.len() as u64 + 1,
+                    crc64: checksum::crc64::checksum(payload),
+                },
+            ),
+            Err(StorageRpcPayloadError::ShardWriteSizeMismatch { .. })
+        ));
+
+        let mut historical_response = Vec::new();
+        put_u64(&mut historical_response, payload.len() as u64 + 1);
+        put_u64(
+            &mut historical_response,
+            checksum::crc64::checksum(payload),
+        );
+        put_bytes(&mut historical_response, payload);
+        assert!(matches!(
+            decode_historical_shard_read_response(&historical_response),
+            Err(StorageRpcPayloadError::ShardWriteSizeMismatch { .. })
+        ));
+        let after_size_failures = observability::metrics_snapshot();
+        assert_eq!(
+            after_size_failures.payload_read_crc_bytes_total,
+            before.payload_read_crc_bytes_total
+        );
+
+        assert!(matches!(
+            decode_shard_read_response(
+                &active_response,
+                WriteAck {
+                    stored_size: payload.len() as u64,
+                    crc64: checksum::crc64::checksum(payload) ^ 1,
+                },
+            ),
+            Err(StorageRpcPayloadError::ShardWriteChecksumMismatch)
+        ));
+        let after_checksum_failure = observability::metrics_snapshot();
+        assert_eq!(
+            after_checksum_failure.payload_read_crc_bytes_total,
+            before.payload_read_crc_bytes_total + payload.len() as u64
+        );
+
+        validate_shard_write_payload(
+            payload.len() as u64,
+            checksum::crc64::checksum(payload),
+            payload,
+        )
+        .unwrap();
+        let after_write_validation = observability::metrics_snapshot();
+        assert_eq!(
+            after_write_validation.payload_read_crc_bytes_total,
+            after_checksum_failure.payload_read_crc_bytes_total
+        );
     }
 
     #[test]

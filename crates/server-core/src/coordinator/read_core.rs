@@ -257,6 +257,12 @@ impl SegmentListReader {
                     } else {
                         *offset = end;
                     }
+                    observability::record_payload_read_metrics(
+                        observability::PayloadReadMetricDelta {
+                            logical_bytes: u64::try_from(out.len()).unwrap_or(u64::MAX),
+                            ..observability::PayloadReadMetricDelta::default()
+                        },
+                    );
                     return Ok(Some(out));
                 }
                 self.loaded_segment = None;
@@ -367,6 +373,10 @@ impl SegmentListReader {
                 SegmentListVerification::FullPayloadCrc { .. }
             ) {
                 self.verified_size += data.len();
+                observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                    crc_bytes: u64::try_from(data.len()).unwrap_or(u64::MAX),
+                    ..observability::PayloadReadMetricDelta::default()
+                });
                 self.verified_crc64.update(data.as_ref());
             }
             self.next_segment_index += 1;

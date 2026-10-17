@@ -420,11 +420,16 @@ fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
         data,
     );
 
+    let metrics_before = observability::metrics_snapshot();
     let chunk = reader.next_chunk(len).unwrap().unwrap();
     assert_eq!(chunk.as_ref(), [1u8, 2, 3, 4]);
     assert_eq!(chunk.as_ref().as_ptr(), ptr);
     assert!(reader.test_loaded_segment_is_none());
     assert!(reader.next_chunk(len).unwrap().is_none());
+    assert_eq!(
+        observability::metrics_snapshot().payload_read_logical_bytes_total,
+        metrics_before.payload_read_logical_bytes_total + u64::try_from(len).unwrap()
+    );
 }
 
 #[test]
@@ -459,6 +464,7 @@ fn get_object_reuses_payload_buffer_for_repeated_segment_reads() {
 
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
 
+    let metrics_before = observability::metrics_snapshot();
     let first = coord
         .get_object(&GetObjectRequest {
             sse_customer: None,
@@ -474,6 +480,15 @@ fn get_object_reuses_payload_buffer_for_repeated_segment_reads() {
         .unwrap();
     assert_eq!(first.body.read_all().unwrap(), data);
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
+    let metrics_after_first = observability::metrics_snapshot();
+    assert_eq!(
+        metrics_after_first.payload_read_buffer_checkouts_total,
+        metrics_before.payload_read_buffer_checkouts_total + 1
+    );
+    assert_eq!(
+        metrics_after_first.payload_read_buffer_allocations_total,
+        metrics_before.payload_read_buffer_allocations_total + 1
+    );
 
     let second = coord
         .get_object(&GetObjectRequest {
@@ -490,6 +505,15 @@ fn get_object_reuses_payload_buffer_for_repeated_segment_reads() {
         .unwrap();
     assert_eq!(second.body.read_all().unwrap(), data);
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
+    let metrics_after_second = observability::metrics_snapshot();
+    assert_eq!(
+        metrics_after_second.payload_read_buffer_checkouts_total,
+        metrics_after_first.payload_read_buffer_checkouts_total + 1
+    );
+    assert_eq!(
+        metrics_after_second.payload_read_buffer_allocations_total,
+        metrics_after_first.payload_read_buffer_allocations_total
+    );
 }
 
 #[test]

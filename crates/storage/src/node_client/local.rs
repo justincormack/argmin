@@ -541,6 +541,10 @@ impl RetainedPlacedShardRoute for LocalRetainedPlacedShardRoute {
         let payload = self
             .storage_node
             .read_shard_file(self.location.data_pg_id().get(), &self.key)?;
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            crc_bytes: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
         let ack = WriteAck {
             stored_size: payload.len() as u64,
             crc64: checksum::crc64::checksum(&payload),
@@ -554,6 +558,10 @@ impl RetainedPlacedShardRoute for LocalRetainedPlacedShardRoute {
     ) -> Result<WriteAck, StoreError> {
         self.storage_node
             .read_shard_file_into(self.location.data_pg_id().get(), &self.key, dst)?;
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            crc_bytes: u64::try_from(dst.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
         Ok(WriteAck {
             stored_size: dst.len() as u64,
             crc64: checksum::crc64::checksum(dst),
@@ -755,6 +763,10 @@ impl ShardReadHandleLease for LocalStorageNodeReadHandleLease {
         }
         self.storage_node
             .read_shard_file_into(location.data_pg_id().get(), key, dst)?;
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            crc_bytes: u64::try_from(dst.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
         let actual_crc = checksum::crc64::checksum(dst);
         if actual_crc != expected_ack.crc64 {
             return Err(StoreError::IntegrityError {

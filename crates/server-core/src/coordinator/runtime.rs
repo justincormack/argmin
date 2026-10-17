@@ -1077,6 +1077,10 @@ impl ReadRuntime {
                 }
             };
         read_result.map_err(super::map_object_read_failure)?;
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            stored_bytes: u64::try_from(buf.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
         self.decrypt_segment_if_needed_in_place(
             segment,
             part_number,
@@ -1093,7 +1097,8 @@ impl ReadRuntime {
         sse_customer_request: Option<&SseCustomerRequest>,
         stored_bytes: &mut Vec<u8>,
     ) -> Result<(), ServerError> {
-        match &segment.encryption {
+        let encrypted = !matches!(segment.encryption, ObjectEncryption::None);
+        let result = match &segment.encryption {
             ObjectEncryption::None => Ok(()),
             ObjectEncryption::SseCustomer(state) => {
                 let request = sse_customer_request.ok_or(ServerError::InvalidRequest {
@@ -1139,7 +1144,15 @@ impl ReadRuntime {
                     segment.size() as usize,
                 )
             }
+        };
+        result?;
+        if encrypted {
+            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+                decrypted_bytes: u64::try_from(stored_bytes.len()).unwrap_or(u64::MAX),
+                ..observability::PayloadReadMetricDelta::default()
+            });
         }
+        Ok(())
     }
 }
 
