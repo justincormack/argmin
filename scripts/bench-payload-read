@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+OBJECT_MIB="${OBJECT_MIB:-16}"
+RANGE_BYTES="${RANGE_BYTES:-4096}"
+WARMUP_ITERS="${WARMUP_ITERS:-4}"
+FULL_ITERS="${FULL_ITERS:-16}"
+RANGE_ITERS="${RANGE_ITERS:-64}"
+SAMPLES="${SAMPLES:-5}"
+
+FEATURE_ARGS=()
+PROVIDER="ring"
+if [[ "${1:-}" == "--openssl" ]]; then
+  FEATURE_ARGS=(--no-default-features --features openssl)
+  PROVIDER="openssl"
+  shift
+fi
+if [[ "$#" -ne 0 ]]; then
+  echo "usage: $0 [--openssl]" >&2
+  exit 2
+fi
+
+SOURCE_STATUS="$(git status --porcelain --untracked-files=normal)"
+if [[ -z "$SOURCE_STATUS" ]]; then
+  echo "source_worktree=clean"
+  echo "reference_run=true"
+else
+  if [[ "${ALLOW_DIRTY_BENCHMARK:-0}" != "1" ]]; then
+    echo "error: reference payload-read benchmarks require a clean worktree" >&2
+    echo "commit or stash the changes, or set ALLOW_DIRTY_BENCHMARK=1 for an exploratory non-reference run" >&2
+    exit 2
+  fi
+  echo "source_worktree=dirty"
+  echo "reference_run=false"
+fi
+echo "source_revision=$(git rev-parse HEAD)"
+echo "rustc=$(rustc --version)"
+echo "kernel=$(uname -srmo)"
+echo "cpu_arch=$(uname -m)"
+if [[ -r /proc/cpuinfo ]]; then
+  CPU_MODEL="$(awk -F: '/^(model name|Hardware|Processor)[[:space:]]*:/ { value=$2; sub(/^[[:space:]]+/, "", value); print value; exit }' /proc/cpuinfo)"
+else
+  CPU_MODEL=""
+fi
+if [[ -z "$CPU_MODEL" ]] && command -v sysctl >/dev/null 2>&1; then
+  CPU_MODEL="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+fi
+echo "cpu_model=${CPU_MODEL:-unknown}"
+echo "crypto_provider=$PROVIDER"
+echo "object_mib=$OBJECT_MIB range_bytes=$RANGE_BYTES warmup_iters=$WARMUP_ITERS"
+echo "full_iters=$FULL_ITERS range_iters=$RANGE_ITERS samples=$SAMPLES"
+
+cargo run --offline -p s3-tests --bin payload_read_bench --release "${FEATURE_ARGS[@]}" -- \
+  --object-mib "$OBJECT_MIB" \
+  --range-bytes "$RANGE_BYTES" \
+  --warmup-iters "$WARMUP_ITERS" \
+  --full-iters "$FULL_ITERS" \
+  --range-iters "$RANGE_ITERS" \
+  --samples "$SAMPLES"

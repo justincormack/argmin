@@ -48,6 +48,54 @@ For comparable results:
 The scripts use release builds and `cargo --offline`. Fetch dependencies before
 running them on a newly provisioned machine.
 
+## End-to-end payload reads
+
+Run the current payload-read baseline with:
+
+```bash
+./scripts/bench-payload-read
+```
+
+Use `./scripts/bench-payload-read --openssl` for the compile-time OpenSSL
+provider. Unlike the focused component benchmarks below, this starts the local
+release S3 server and an AWS SDK client and exercises HTTP, SigV4,
+authorization, object metadata, 4+2 EC shard reads, physical CRC validation,
+SSE-S3 decryption, response streaming, and SDK body collection. It is intended
+to compare payload-codec changes on the same machine, not to represent a
+networked deployment's absolute throughput.
+
+The following environment variables adjust the workload:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `OBJECT_MIB` | `16` | Size of the object; must exceed the 8 MiB segment size |
+| `RANGE_BYTES` | `4096` | Size of the range selected from inside a full segment |
+| `WARMUP_ITERS` | `4` | Untimed requests before each operation |
+| `FULL_ITERS` | `16` | Full GET requests in each sample |
+| `RANGE_ITERS` | `64` | Range GET requests in each sample |
+| `SAMPLES` | `5` | Number of full and range samples |
+
+The benchmark verifies with `HeadObject` that its object uses the AWS-visible
+SSE-S3 AES256 encryption mode. It deliberately does not infer the internal
+payload codec from that response: a future chunked codec will expose the same
+S3 encryption mode. It also does not create a plaintext S3 object: an absent or
+deleted bucket encryption configuration has AWS's automatic SSE-S3 default, so
+there is no production plaintext S3 writer. Each sample reports elapsed
+throughput and deltas for the `payload_read_*` work counters. These distinguish
+response bytes from stored and shard bytes, EC reconstruction, decrypted bytes,
+AEAD records, CRC work, buffer-pool activity, and repair fallback. It retains
+the SDK's collected `Bytes` directly so the timed full-read path does not add a
+second whole-response allocation and copy.
+
+Reference runs require a clean worktree, making the printed source revision a
+complete identifier for the measured source. The runner refuses a dirty tree
+by default. `ALLOW_DIRTY_BENCHMARK=1` permits exploratory development runs, but
+marks them `reference_run=false`; their results must not be recorded as a
+reference baseline. The output records the CPU architecture and model, selected
+CRC64, SHA-256, and EC runtime backends, and compile-time crypto provider.
+Record the Phase 0 baseline here only after the benchmark harness itself has
+been committed and rerun from a clean tree.
+
 ## Checksums and erasure coding
 
 Run:

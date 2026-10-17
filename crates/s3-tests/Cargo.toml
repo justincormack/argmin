@@ -37,6 +37,12 @@ name = "uat_pg_backfill_smoke"
 path = "src/bin/uat_pg_backfill_smoke.rs"
 required-features = ["uat-pg-topology"]
 
+[[bin]]
+name = "payload_read_bench"
+path = "src/bin/payload_read_bench.rs"
+test = false
+bench = false
+
 [dependencies]
 # Server (for local TestServer)
 server_http = { package = "server-http", path = "../server-http", default-features = false }

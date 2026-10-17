@@ -1,6 +1,6 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phase 0)
+Status: In progress (Phase 0 clean reference benchmark pending)
 
 ## Context
 
@@ -159,10 +159,15 @@ and would obscure rather than describe the persisted security property. A secret
 would be a distinct keyed-integrity format and needs its own key lifecycle and threat-model review.
 
 For the initial Cobblestone work, keep the current plaintext format behind an explicit
-`PlaintextWholeSegmentCrc`-style profile adapter. Full and range reads retain their current physical
-validation guarantees; the adapter may consequently buffer or read more than the encrypted
-profile. That performance difference is intentional, measurable, and documented rather than
-hidden in shared orchestration.
+`PlaintextWholeSegmentCrc`-style **reader** adapter while its durable representation remains
+accepted. There is no AWS-facing plaintext writer today: an absent bucket encryption configuration
+means AWS's automatic SSE-S3 default, and deleting the configuration restores that default rather
+than disabling encryption. Do not add a non-AWS request mode or manufacture an impossible S3
+object merely to make a symmetric benchmark matrix. Full and range reads retain their current
+physical validation guarantees; the adapter may consequently buffer or read more than the
+encrypted profile. That performance difference is intentional and documented rather than hidden
+in shared orchestration. If the plaintext representation remains supported, measure its reader in
+a storage-owned retained-format microbenchmark rather than claiming end-to-end S3 writer coverage.
 
 If unencrypted range workloads later justify equivalent granularity, design a separate,
 explicitly versioned plaintext chunk-integrity profile, for example 16 KiB plaintext records with
@@ -755,7 +760,9 @@ acknowledgement evidence is validated before installation and encoded as a self-
 - Add counters for logical range bytes, stored bytes read, shard bytes read, bytes reconstructed,
   bytes decrypted, AEAD records opened, CRC bytes processed, buffer checkouts and actual buffer
   allocations, and repair fallback.
-- Benchmark the current encrypted and unencrypted range/full-read paths.
+- Benchmark the current reachable encrypted range/full-read path end to end. If the dormant
+  plaintext reader remains supported, benchmark it separately through a storage-owned
+  retained-format harness; do not expose a plaintext S3 writer.
 - Inventory every existing plaintext/encrypted branch and specify the sealed common profile
   interface, including per-profile release guarantees and finalization errors.
 - Freeze current encryption-state, segment, command, and RPC fixtures.
@@ -788,8 +795,9 @@ Implementation update (2026-10-17):
   each pass actually taken.
 - The current reader still obtains and decrypts one complete stored segment before returning any
   selected bytes. `ObjectEncryption::None` bypasses the decrypt step; SSE-C and SSE-S3 each open
-  one whole-segment AEAD record. The common sealed profile interface and benchmark matrix remain
-  Phase 0 work.
+  one whole-segment AEAD record. The common sealed profile interface, durable-profile dimensions,
+  release guarantees, and benchmark matrix are specified above. Implementing that interface is
+  later phase work; Phase 0 retains only the clean reference benchmark as an open exit item.
 - The format-evidence audit found existing exact fixtures for `ObjectEncryption` state, the
   metadata-command corpus (including encrypted stream-session state), and the SSE-S3 segment
   cipher. This slice adds the missing deterministic SSE-C whole-segment cipher vector and a
@@ -813,7 +821,22 @@ Implementation update (2026-10-17):
   than a new production dependency. The separate Wycheproof corpus is pinned to commit
   `b61843a9a5115bb758134b6a1f5d5e502d445342` and the exact AES-256-GCM vector-file digest recorded
   above; both providers must pass that corpus and interoperability tests.
-- The reproducible encrypted/plaintext full/range benchmark matrix remains the Phase 0 exit item.
+- The production S3 writer audit found that plaintext is unreachable by design. An absent or
+  deleted bucket-encryption configuration resolves to the AWS automatic SSE-S3 default, and the
+  coordinator consequently always selects managed AES256 unless the request selects SSE-C. The
+  reproducible end-to-end benchmark therefore covers the reachable legacy segment-AEAD profile
+  and records that fact explicitly; a fabricated plaintext S3 fixture would test no production
+  behavior. A retained-format plaintext-reader benchmark is required only if that dormant reader
+  remains in the supported-profile registry.
+- `scripts/bench-payload-read` runs the release server and AWS SDK client against the real HTTP,
+  authorization, storage, EC, checksum, and decryption path. It fixes object/range sizes and
+  warm-up/sample counts, records revision/toolchain/kernel/CPU/provider inputs and the selected
+  CRC64, SHA-256, and EC runtime backends, verifies the effective SSE-S3 mode with `HeadObject`, and
+  reports timing together with every `payload_read_*` work counter. It does not claim an internal
+  codec identity from that AWS-visible mode and does not copy the SDK's collected response solely
+  for measurement. Reference runs fail closed on a dirty worktree. The earlier dirty-tree
+  measurements are exploratory only; an authoritative baseline must be recorded after this
+  harness is committed and rerun from a clean source revision.
 
 ### Phase 1: Exact encryption subjects
 
