@@ -59,6 +59,36 @@ writer format, record the exact reviewed revision or stable profile and decide h
 changes affect Argmin's persisted profile. An Argmin format identifier must never silently mean
 "whatever the current C2SP main branch says."
 
+### Reviewed specification and implementation choice
+
+The Phase 0 design baseline is the C2SP `chunked-encryption.md` file at commit
+[`d757bb90e5966d92d17353a3964ca1af776b63e0`](https://github.com/C2SP/C2SP/blob/d757bb90e5966d92d17353a3964ca1af776b63e0/chunked-encryption.md),
+dated 2026-08-24. As checked on 2026-10-17, C2SP still labels the document a development
+specification and has no chunked-encryption release tag. The pinned commit is therefore review
+evidence, not approval to make the profile Argmin's sole writer. Before enabling that writer,
+compare the pinned text and vectors with the then-current stable specification or, if it remains
+untagged, repeat and record the upstream review. The durable Argmin profile identifier always
+means the pinned construction; an upstream change requires a new explicit compatibility decision
+and may require a new Argmin profile identifier.
+
+The independently versioned Wycheproof baseline is commit
+[`b61843a9a5115bb758134b6a1f5d5e502d445342`](https://github.com/C2SP/wycheproof/blob/b61843a9a5115bb758134b6a1f5d5e502d445342/testvectors_v1/c2sp_chunked_encryption_aes_256_gcm_test.json).
+The SHA-256 digest of
+`testvectors_v1/c2sp_chunked_encryption_aes_256_gcm_test.json` at that commit is
+`0f8e35568d59649fb55fb0e5602dc678dc8910d6822beef4945aee0b5994ef05`. Import the fixture
+verbatim with this provenance and assert its digest rather than following C2SP's mutable
+Wycheproof `main` link. A later vector revision is additive evidence and does not rewrite the
+imported corpus.
+
+Do not add a production Cobblestone dependency in the initial implementation. The reviewed C2SP
+page lists Go and Python implementations but no Rust implementation. Implement the small
+provider-neutral construction inside `argmin-crypto`, using its existing AES-256-GCM and SHA-512
+provider abstractions and adding only the narrowly scoped HKDF-Expand-SHA-512 primitive the
+profile requires. Both Ring and OpenSSL builds must consume the same pinned Wycheproof corpus and
+pass bidirectional persistent-format interoperability tests. Reconsider a dependency only if a
+mature, audited Rust implementation appears and passes the repository's dependency and
+provider-interoperability review.
+
 ## Goals
 
 - Reduce healthy encrypted range reads to the header and authenticated chunks intersecting the
@@ -158,6 +188,64 @@ their readers for deliberate read-old/write-new operation or reject existing uns
 state before serving. Build and test the full and modern-only registries independently, including
 AWS-compatible rejection behavior for disabled request options. Do not make completion of this
 plan depend on that future product configuration.
+
+### Phase 0 implementation inventory and target seam
+
+The current code has no independent payload-codec choice. `ActiveWriteEncryption` combines the
+AWS-visible key mode with whole-segment framing: `None` copies into a new `Vec`, while SSE-C and
+SSE-S3 call their whole-segment AES-GCM helpers. On reads, `SegmentPayloadRecord` carries only
+`ObjectEncryption`; the reader loads a complete stored segment, chooses plaintext or whole-segment
+AEAD from that value, and only then slices the requested logical range. `max_stored_segment_size`
+likewise assumes the only encrypted representation is `plaintext length + one 16-byte tag`.
+
+The write-path inventory is:
+
+| Effective path | Current codec selection and identity timing | Required Phase 1/2 seam |
+| --- | --- | --- |
+| Buffered direct `PutObject` | Encrypts segment zero before reserving the object generation. | Reserve the immutable payload generation first, mint the opaque standard-object subject, then construct the segment encoder. |
+| Promoted buffered and streamed `PutObject`/POST Object | Session creation already durably reserves the eventual object generation under the session ID; append placement and finalization reload that reservation, but encryption does not consume it. Every append independently calls `encrypt_segment`. | Reuse the existing storage-owned reservation as the owner-minted encryption subject and expose it only through a subject-bound session encoder; do not duplicate it in `StreamUploadRecord`. |
+| `CopyObject` destination | Reads source chunks and feeds them to the same destination stream append/encryption path. | Use the same destination session subject and encoder as streamed PUT; source encryption state never supplies destination identity. |
+| `UploadPart` | The session target binds upload ID and part number, but no immutable generation for the new part is fixed before its first encrypted segment. | Allocate and persist the part payload generation at session creation and bind every segment to upload, part number, part generation, and segment index. |
+| `UploadPartCopy` destination | Uses the same multipart stream append path after reading source chunks. | Use exactly the same part-session subject and encoder as ordinary `UploadPart`. |
+| Full and ranged object/copy-source reads | Infer the representation from `ObjectEncryption`, read and verify a complete segment, decrypt one AEAD record, then slice. | Dispatch on an explicit durable profile and let its subject-bound reader define stored spans, authentication, release, finalization, and physical-health evidence. |
+
+`next_segment_vid` is a physical stream-segment allocator and is not a substitute for the logical
+object or part generation required by the encryption context. Streamed PUT already has a separate
+durable object-generation reservation keyed by its session ID; the encryption subject must reuse
+that exact reservation through a storage-owned capability. Do not bind ciphertext to session IDs,
+temporary shard identities, or placement, and do not copy the reservation into a second mutable
+record.
+
+The common seam is an exhaustive internal profile registry, not a public trait implementable by
+callers. It must provide these opaque, subject-bound states:
+
+- a prepared segment encoder created only from a supported durable profile, matching key state,
+  and an owner-minted standard-object or multipart-part subject;
+- an incremental encoder that owns framing/digest state and yields bounded stored chunks, followed
+  by one consuming finalization result containing exact stored size and integrity evidence;
+- a prepared segment reader created from the durable profile, matching key state, persisted
+  subject, and requested logical range;
+- a reader-owned stored-span plan and incremental verifier that is the only route by which
+  plaintext chunks can be released; and
+- one consuming read finalization result that separates logical authentication success, physical
+  shard health/repair evidence, and a post-response late failure.
+
+Profile dispatch must exhaustively admit only the durable cross-product specified below. HTTP,
+copy, multipart, EC, repair, and storage orchestration may carry these opaque states and results,
+but may not call raw encryption/decryption helpers or publish a caller-built plaintext/stored
+`Vec` around them. Stored-size and range geometry are profile operations rather than global
+constants.
+
+The initial release guarantees are deliberately different behind the common contract:
+
+| Profile | Earliest plaintext release | Successful finalization requirement | Late failure behavior |
+| --- | --- | --- | --- |
+| `PlaintextWholeSegmentCrcV1` | Per segment, after that complete segment's required physical CRC validation. | Exact logical/stored length and whole-segment CRC evidence agree for every requested segment. | Emit no bytes from the failing segment. If the response is uncommitted, return the mapped error; otherwise abort the transport, even when no body bytes were emitted. |
+| `SegmentAes256GcmV1` | Per segment, after that complete segment AEAD record authenticates. | AEAD, exact length, and required physical-health processing complete for every requested segment. | Emit no bytes from the failing segment. If the response is uncommitted, return the mapped error; otherwise abort the transport, even when no body bytes were emitted. |
+| `Cobblestone256SegmentV1` | Per 16 KiB chunk, only after that chunk authenticates. | Canonical terminal-chunk/length rules, every selected/full-read chunk, and final physical-health processing complete. | If headers or prior authenticated chunks were emitted, send no bytes from the failing chunk and abort the transport; otherwise return the mapped pre-response error. |
+
+The concrete Rust types may differ, but Phase 2 is not complete if callers can bypass these
+ownership and release boundaries or reconstruct a subject from primitive fields.
 
 ## Current Cryptographic Binding
 
@@ -353,8 +441,9 @@ binding merely because one current write path allocates it late.
 Required ordering changes:
 
 - Direct PutObject reserves its internal object generation before encrypting its segment.
-- Streamed PutObject allocates and persists the eventual object payload generation when its stream
-  session is created, not only during finalization.
+- Streamed PutObject already reserves the eventual object payload generation durably during
+  session creation. Reuse that exact reservation to mint the encryption subject before the first
+  append; do not allocate or persist a duplicate generation in the stream-session record.
 - Multipart upload creation already reserves the eventual object generation; UploadPart also
   needs an immutable part generation before its first segment is encrypted.
 - Request-owned UploadPart staging introduced by the unified staged-write plan receives the same
@@ -707,11 +796,30 @@ Implementation update (2026-10-17):
   crossed-DEK authentication failure, plus an exact encrypted storage-RPC v22 payload fixture.
   Changing the current profile now requires an explicit fixture and outer-version decision rather
   than silently rewriting the baseline.
+- The write/read inventory now identifies the current branch points and the identity-ordering gaps
+  for direct PUT, streamed PUT/POST, CopyObject, UploadPart, UploadPartCopy, full reads, and range
+  reads. In particular, direct PUT encrypts before generation reservation; streamed PUT durably
+  reserves its object generation at session creation but does not thread that reservation into
+  encryption; and UploadPart does not yet fix its replacement-part generation before encryption.
+- The target seam is an exhaustive internal durable-profile registry producing opaque,
+  subject-bound incremental encoders and readers. It owns stored-size/range geometry, plaintext
+  release, and consuming finalization; AWS-visible key mode remains a separate dimension. The
+  initial plaintext, legacy segment-AEAD, and Cobblestone release/error guarantees are recorded
+  above.
+- The reviewed upstream baseline is C2SP commit
+  `d757bb90e5966d92d17353a3964ca1af776b63e0`. Because the specification remains untagged and in
+  development, writer enablement requires a fresh upstream review. The implementation choice is a
+  provider-neutral `argmin-crypto` implementation over existing Ring/OpenSSL primitives rather
+  than a new production dependency. The separate Wycheproof corpus is pinned to commit
+  `b61843a9a5115bb758134b6a1f5d5e502d445342` and the exact AES-256-GCM vector-file digest recorded
+  above; both providers must pass that corpus and interoperability tests.
+- The reproducible encrypted/plaintext full/range benchmark matrix remains the Phase 0 exit item.
 
 ### Phase 1: Exact encryption subjects
 
 - Introduce private canonical context codecs and opaque subject constructors.
-- Move immutable generation allocation before encryption on every write path.
+- Ensure every write path exposes its existing or newly allocated immutable generation to the
+  owner-minted encryption subject before encryption.
 - Persist bucket incarnation, encryption-instance identity, and required payload provenance.
 - Bind DEK wrapping and encrypted checksum metadata to the base object subject.
 - Add exhaustive crossed-field and noncanonical-encoding tests.
