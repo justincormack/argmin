@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use storage::{
-    BucketName, CreateStreamUploadReq, ObjectKey, PreparedDirectPutObjectCommit, SessionId,
-    StreamPutFinalizeSnapshot, StreamUploadTarget,
+    AuthorizedStreamPutFinalization, BucketName, CreateStreamUploadReq, ObjectKey,
+    PreparedDirectPutObjectCommit, SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
 };
 
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle};
@@ -15,13 +15,12 @@ use super::{
 };
 use crate::error::ServerError;
 use crate::etag::format_etag;
-use crate::sse::SseCustomerRequest;
 use crate::system_metadata::SystemMetadata;
 
 trait StreamPutFinalizationRoute {
     fn finalize(
         &self,
-        session_id: &SessionId,
+        authorization: &AuthorizedStreamPutFinalization<'_, '_>,
         total_size: u64,
         action: &mut dyn FnMut(
             StreamPutFinalizeSnapshot,
@@ -43,7 +42,7 @@ trait StreamPutFinalizationRoute {
 impl StreamPutFinalizationRoute for storage::ActivePutObjectRoute<'_> {
     fn finalize(
         &self,
-        session_id: &SessionId,
+        authorization: &AuthorizedStreamPutFinalization<'_, '_>,
         total_size: u64,
         action: &mut dyn FnMut(
             StreamPutFinalizeSnapshot,
@@ -55,7 +54,7 @@ impl StreamPutFinalizationRoute for storage::ActivePutObjectRoute<'_> {
         Result<storage::FinalizeStreamPutOutcome<SystemMetadata>, ServerError>,
         storage::StreamUploadFailure,
     > {
-        self.finalize_stream(session_id, total_size, action)
+        self.finalize_stream(authorization, total_size, action)
     }
 
     fn enqueue_object_payload_reclaim(&self, generation_id: storage::GenerationId) {
@@ -480,15 +479,18 @@ impl Coordinator {
                 super::StreamSegmentAppendPayload::new(&chunk_storage, chunk_crc64),
             )?;
         }
+        let finalization = route
+            .authorize_stream_finalization(session_id)
+            .map_err(Self::map_stream_upload_failure)?;
         self.finalize_stream_put_with_authorized_write_tags_on_admitted_route(
             route,
+            &finalization,
             &AuthorizedFinalizeStreamPutRequest {
                 session_id,
                 crc64: object_crc64,
                 total_size: req.data.len() as u64,
                 metadata_blob: req.metadata,
                 system_metadata: req.system_metadata,
-                write_encryption: write_encryption.as_ref(),
                 cond: req.cond,
             },
             authorized,
@@ -660,15 +662,9 @@ impl Coordinator {
         &self,
         req: &AuthorizedFinalizeStreamPutRequest<'_>,
         authorized: &AuthorizedPutObjectWrite,
-        sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<PutObjectResult, ServerError> {
         let admission = self.admit_storage_route_for_request()?;
-        self.finalize_authorized_stream_put_with_storage_admission(
-            &admission,
-            req,
-            authorized,
-            sse_customer,
-        )
+        self.finalize_authorized_stream_put_with_storage_admission(&admission, req, authorized)
     }
 
     pub fn finalize_authorized_stream_put_with_storage_admission(
@@ -676,30 +672,23 @@ impl Coordinator {
         admission: &storage::StorageClusterRouteAdmission,
         req: &AuthorizedFinalizeStreamPutRequest<'_>,
         authorized: &AuthorizedPutObjectWrite,
-        sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<PutObjectResult, ServerError> {
         self.require_storage_route_admission(admission)?;
         let route = admission
             .active_put_object_route(authorized.bucket_typed(), authorized.key_typed())
             .map_err(super::map_store_failure)?;
-        let session = route
-            .load_stream_session(req.session_id)
+        let finalization = route
+            .authorize_stream_finalization(req.session_id)
             .map_err(Self::map_stream_upload_failure)?;
-        let write_encryption = self.resume_write_encryption(
-            &session.encryption,
-            sse_customer,
-            crate::sse::SseCustomerSegmentScope::object(),
-            false,
-        )?;
         self.finalize_stream_put_with_authorized_write_tags_on_admitted_route(
             &route,
+            &finalization,
             &AuthorizedFinalizeStreamPutRequest {
                 session_id: req.session_id,
                 crc64: req.crc64,
                 total_size: req.total_size,
                 metadata_blob: req.metadata_blob,
                 system_metadata: req.system_metadata,
-                write_encryption: write_encryption.as_ref(),
                 cond: req.cond,
             },
             authorized,
@@ -718,18 +707,32 @@ impl Coordinator {
         let route = admission
             .active_put_object_route(authorized.bucket_typed(), authorized.key_typed())
             .map_err(super::map_store_failure)?;
+        let finalization = route
+            .authorize_stream_finalization(req.session_id)
+            .map_err(Self::map_stream_upload_failure)?;
         self.finalize_stream_put_with_authorized_write_tags_on_admitted_route(
-            &route, req, authorized, tags,
+            &route,
+            &finalization,
+            req,
+            authorized,
+            tags,
         )
     }
 
     pub(super) fn finalize_stream_put_with_authorized_write_tags_on_admitted_route(
         &self,
         route: &storage::ActivePutObjectRoute<'_>,
+        finalization: &AuthorizedStreamPutFinalization<'_, '_>,
         req: &AuthorizedFinalizeStreamPutRequest<'_>,
         authorized: &AuthorizedPutObjectWrite,
         tags: AuthorizedWriteTags<'_>,
     ) -> Result<PutObjectResult, ServerError> {
+        if finalization.encryption() != &authorized.write_encryption.object_encryption() {
+            return Err(ServerError::InvalidRequest {
+                reason: "authorized write encryption does not match the durable stream session"
+                    .to_string(),
+            });
+        }
         let tags = match tags {
             AuthorizedWriteTags::Bound => authorized.tags(),
             AuthorizedWriteTags::TrustedDerived(tags) => tags,
@@ -746,7 +749,7 @@ impl Coordinator {
             total_size: req.total_size,
             metadata_blob: req.metadata_blob,
             system_metadata: req.system_metadata,
-            write_encryption: req.write_encryption,
+            sse_customer: None,
             tags,
             cond: req.cond,
             acl: authorized.acl(),
@@ -767,7 +770,13 @@ impl Coordinator {
                 self.maybe_run_bucket_write_handle_loaded_hook(
                     finalize.object.bucket_name_typed().as_str(),
                 );
-                self.finalize_stream_put_for_loaded_bucket(route, bucket_handle, &finalize)
+                self.finalize_stream_put_for_loaded_bucket(
+                    route,
+                    bucket_handle,
+                    &finalize,
+                    finalization,
+                    &authorized.write_encryption,
+                )
             })
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
@@ -790,6 +799,15 @@ impl Coordinator {
         let route = admission
             .active_put_object_route(req.object.bucket_name_typed(), req.object.key_typed())
             .map_err(super::map_store_failure)?;
+        let finalization = route
+            .authorize_stream_finalization(req.session_id)
+            .map_err(Self::map_stream_upload_failure)?;
+        let write_encryption = self.resume_write_encryption(
+            finalization.encryption(),
+            req.sse_customer,
+            crate::sse::SseCustomerSegmentScope::object(),
+            false,
+        )?;
         let request = BucketHandleRequest::new().requiring_lifecycle_view();
         route
             .with_bucket_write_snapshot(request.resolve_to_storage_request(), |snapshot| {
@@ -804,7 +822,13 @@ impl Coordinator {
                 self.maybe_run_bucket_write_handle_loaded_hook(
                     req.object.bucket_name_typed().as_str(),
                 );
-                self.finalize_stream_put_for_loaded_bucket(&route, bucket_handle, req)
+                self.finalize_stream_put_for_loaded_bucket(
+                    &route,
+                    bucket_handle,
+                    req,
+                    &finalization,
+                    &write_encryption,
+                )
             })
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
@@ -814,11 +838,12 @@ impl Coordinator {
         route: &impl StreamPutFinalizationRoute,
         bucket_handle: LoadedBucketHandle,
         req: &FinalizeStreamPutRequest,
+        finalization: &AuthorizedStreamPutFinalization<'_, '_>,
+        write_encryption: &ActiveWriteEncryption,
     ) -> Result<PutObjectResult, ServerError> {
         let bucket_info = bucket_handle.bucket().clone();
         let lifecycle = self.cached_bucket_lifecycle_for_loaded_handle(&bucket_handle)?;
         let key = req.object.key();
-        let session_id = req.session_id;
         let crc64 = req.crc64;
         let total_size = req.total_size;
         let metadata_blob = req.metadata_blob;
@@ -842,13 +867,17 @@ impl Coordinator {
                 }
             }
             let mut prepare = |snapshot: StreamPutFinalizeSnapshot| {
-                let write_encryption = ActiveWriteEncryption::from_stored_and_active(
-                    &snapshot.session.encryption,
-                    req.write_encryption,
-                )?;
+                if snapshot.session.encryption != *finalization.encryption()
+                    || snapshot.session.encryption != write_encryption.object_encryption()
+                {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "stream finalization encryption does not match the durable session"
+                            .to_string(),
+                    });
+                }
                 let system_metadata = Self::object_system_metadata_with_default_checksum(
                     req.system_metadata,
-                    &write_encryption,
+                    write_encryption,
                     crc64,
                 );
                 if !cond.is_empty() {
@@ -868,7 +897,7 @@ impl Coordinator {
                 let metadata_blob =
                     storage::SerializedMetadataBlob::from(metadata_blob.serialize()?);
                 let (system_metadata_blob, encryption) =
-                    Self::prepare_stored_system_metadata(&system_metadata, &write_encryption)?;
+                    Self::prepare_stored_system_metadata(&system_metadata, write_encryption)?;
                 let owner = Self::effective_put_object_owner(
                     &bucket_info,
                     req.object.requester(),
@@ -892,7 +921,7 @@ impl Coordinator {
                 })
             };
             let outcome = route
-                .finalize(session_id, total_size, &mut prepare)
+                .finalize(finalization, total_size, &mut prepare)
                 .map_err(|error| Coordinator::map_put_object_stream_failure(key, cond, error))??;
             let lifecycle_expiration = Self::current_object_write_lifecycle_expiration_for_config(
                 lifecycle.as_ref(),

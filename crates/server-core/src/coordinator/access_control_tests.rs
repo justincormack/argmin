@@ -4427,7 +4427,7 @@ fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
                     total_size: 4,
                     metadata_blob: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
-                    write_encryption: ActiveWriteEncryptionRef::None,
+                    sse_customer: None,
                     tags: None,
                     cond: NO_WRITE,
                     acl: NO_PUT_OBJECT_ACL.into(),

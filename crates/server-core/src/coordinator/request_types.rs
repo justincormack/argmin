@@ -3,7 +3,6 @@
 
 use checksum::{ChecksumAlgorithm, RawChecksum};
 
-use super::authz_types::ActiveWriteEncryptionRef;
 use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
 use crate::conditional::{DeleteCondition, ReadCondition, WriteCondition};
 use crate::error::ServerError;
@@ -415,7 +414,6 @@ pub struct AuthorizedFinalizeStreamPutRequest<'a> {
     pub total_size: u64,
     pub metadata_blob: &'a MetadataBlob,
     pub system_metadata: &'a SystemMetadata,
-    pub write_encryption: ActiveWriteEncryptionRef<'a>,
     pub cond: &'a WriteCondition,
 }
 
@@ -1219,7 +1217,7 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub total_size: u64,
     pub metadata_blob: &'a MetadataBlob,
     pub system_metadata: &'a SystemMetadata,
-    pub write_encryption: ActiveWriteEncryptionRef<'a>,
+    pub sse_customer: Option<&'a SseCustomerRequest>,
     pub tags: Option<&'a s3_types::TagSet>,
     pub cond: &'a WriteCondition,
     pub acl: PutObjectWriteAcl<'a>,

@@ -486,6 +486,7 @@ impl super::StorageCluster {
             session_id,
             total_size,
             || Ok(()),
+            |_| Ok(()),
             action,
         )
     }
@@ -496,6 +497,9 @@ impl super::StorageCluster {
         session_id: &SessionId,
         total_size: u64,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        mut validate_authorized_session: impl FnMut(
+            &StreamUploadRecord,
+        ) -> Result<(), ObjectPgActionError>,
         mut action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
         let publisher =
@@ -736,6 +740,7 @@ impl super::StorageCluster {
                 Err(error) => return Err(error),
             };
             require_valid_route().map_err(ObjectPgActionError::Store)?;
+            validate_authorized_session(&storage_snapshot.session)?;
             let Some(effective_bucket_write_reservation) =
                 storage_snapshot.session.bucket_write_reservation.as_ref()
             else {
@@ -975,6 +980,7 @@ impl super::StorageCluster {
                 }
                 Err(error) => return Err(error),
             };
+            validate_authorized_session(&storage_snapshot.session)?;
             #[cfg(test)]
             maybe_run_before_snapshot_reinspection_action_hook(
                 self.metadata_command_apply_test_hook_scope_id(),

@@ -7061,7 +7061,7 @@ fn object_segments_get_object_survives_delete_mid_read() {
             total_size: expected.len() as u64,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),

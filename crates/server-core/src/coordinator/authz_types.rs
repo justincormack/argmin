@@ -171,16 +171,6 @@ pub enum ActiveWriteEncryption {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum ActiveWriteEncryptionRef<'a> {
-    None,
-    SseCustomer(&'a SseCustomerWriteContext),
-    Managed {
-        algorithm: ManagedEncryptionAlgorithm,
-        write: &'a ManagedEncryptionWriteContext,
-    },
-}
-
 impl ActiveWriteEncryption {
     pub(super) fn sse_customer(write: SseCustomerWriteContext) -> Self {
         Self::SseCustomer {
@@ -197,26 +187,6 @@ impl ActiveWriteEncryption {
             encryption: write.encryption().clone(),
             algorithm,
             write: Some(write),
-        }
-    }
-
-    pub fn as_ref(&self) -> ActiveWriteEncryptionRef<'_> {
-        match self {
-            Self::None => ActiveWriteEncryptionRef::None,
-            Self::SseCustomer {
-                write: Some(sse_customer),
-                ..
-            } => ActiveWriteEncryptionRef::SseCustomer(sse_customer),
-            Self::SseCustomer { write: None, .. } => ActiveWriteEncryptionRef::None,
-            Self::Managed {
-                algorithm,
-                write: Some(write),
-                ..
-            } => ActiveWriteEncryptionRef::Managed {
-                algorithm: *algorithm,
-                write,
-            },
-            Self::Managed { write: None, .. } => ActiveWriteEncryptionRef::None,
         }
     }
 
@@ -260,75 +230,6 @@ impl ActiveWriteEncryption {
                 reason: "SSE-S3 write context is required for streaming segment encryption"
                     .to_string(),
             }),
-        }
-    }
-
-    pub(super) fn from_stored_and_active(
-        encryption: &ObjectEncryption,
-        active: ActiveWriteEncryptionRef<'_>,
-    ) -> Result<Self, ServerError> {
-        match (encryption, active) {
-            (ObjectEncryption::None, ActiveWriteEncryptionRef::None) => Ok(Self::None),
-            (ObjectEncryption::None, ActiveWriteEncryptionRef::SseCustomer(_))
-            | (ObjectEncryption::None, ActiveWriteEncryptionRef::Managed { .. }) => {
-                Err(ServerError::InvalidRequest {
-                    reason: "write encryption context does not match unencrypted session"
-                        .to_string(),
-                })
-            }
-            (
-                ObjectEncryption::SseCustomer(state),
-                ActiveWriteEncryptionRef::SseCustomer(sse_customer),
-            ) => {
-                if sse_customer.encryption() != encryption {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "SSE-C write context does not match session encryption state"
-                            .to_string(),
-                    });
-                }
-                let _ = state;
-                Ok(Self::sse_customer(sse_customer.clone()))
-            }
-            (ObjectEncryption::SseCustomer(state), ActiveWriteEncryptionRef::None) => {
-                Ok(Self::SseCustomer {
-                    encryption: ObjectEncryption::SseCustomer(state.clone()),
-                    write: None,
-                })
-            }
-            (ObjectEncryption::SseCustomer(_), ActiveWriteEncryptionRef::Managed { .. }) => {
-                Err(ServerError::InvalidRequest {
-                    reason: "managed write context may not be used for an SSE-C session"
-                        .to_string(),
-                })
-            }
-            (
-                ObjectEncryption::SseS3(_),
-                ActiveWriteEncryptionRef::Managed { algorithm, write },
-            ) => {
-                if Some(algorithm) != encryption.managed_encryption_algorithm() {
-                    return Err(ServerError::InternalError {
-                        reason: "SSE-S3 session is missing managed write encryption context"
-                            .to_string(),
-                    });
-                }
-                if write.encryption() != encryption {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "SSE-S3 write context does not match session encryption state"
-                            .to_string(),
-                    });
-                }
-                Ok(Self::managed(algorithm, write.clone()))
-            }
-            (ObjectEncryption::SseS3(state), ActiveWriteEncryptionRef::None) => Ok(Self::Managed {
-                encryption: ObjectEncryption::SseS3(state.clone()),
-                algorithm: ManagedEncryptionAlgorithm::Aes256,
-                write: None,
-            }),
-            (ObjectEncryption::SseS3(_), ActiveWriteEncryptionRef::SseCustomer(_)) => {
-                Err(ServerError::InvalidRequest {
-                    reason: "SSE-C headers may not be used for an SSE-S3 session".to_string(),
-                })
-            }
         }
     }
 }

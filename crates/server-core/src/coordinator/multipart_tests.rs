@@ -6380,14 +6380,6 @@ fn stream_put_happy_path() {
     full_data.extend_from_slice(segment1);
     let crc = checksum::crc64::checksum(&full_data);
     let metadata = MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap();
-    let write_encryption = coord
-        .load_stream_put_write_encryption(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("mykey"),
-            &session_id,
-            None,
-        )
-        .unwrap();
     let result = coord
         .finalize_stream_put(&FinalizeStreamPutRequest {
             object: object_request("bucket", "mykey", test_requester()),
@@ -6396,7 +6388,7 @@ fn stream_put_happy_path() {
             total_size: full_data.len() as u64,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: write_encryption.as_ref(),
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7115,7 +7107,6 @@ fn finalize_stream_put_from_authorized_write_commits_authorized_acl_and_tags() {
                 total_size: 5,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                write_encryption: ActiveWriteEncryptionRef::None,
                 cond: NO_WRITE,
             },
             &authorized,
@@ -7181,10 +7172,6 @@ fn finalize_stream_put_rejects_mismatched_sse_c_write_context() {
     );
     let wrong_request =
         SseCustomerRequest::new([3u8; SSE_C_CUSTOMER_KEY_LEN], "wrong-md5".to_string());
-    let wrong_context = coord
-        .prepare_sse_customer_write_context(Some(&wrong_request))
-        .unwrap()
-        .expect("expected SSE-C write context");
     let err = coord
         .finalize_stream_put(&FinalizeStreamPutRequest {
             object: object_request("bucket", "obj", test_requester()),
@@ -7193,7 +7180,7 @@ fn finalize_stream_put_rejects_mismatched_sse_c_write_context() {
             total_size: 5,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &system_metadata,
-            write_encryption: ActiveWriteEncryptionRef::SseCustomer(&wrong_context),
+            sse_customer: Some(&wrong_request),
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7205,14 +7192,24 @@ fn finalize_stream_put_rejects_mismatched_sse_c_write_context() {
 }
 
 #[test]
-fn finalize_stream_put_rejects_mismatched_sse_s3_write_context() {
+fn finalize_stream_put_rejects_authority_from_another_managed_session() {
     let dir = test_util::tempdir();
     let coord = setup_coordinator(dir.path());
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let session_id = begin_stream_put_test(&coord, "bucket", "obj").unwrap();
+    let authorized = coord
+        .authorize_put_object_write(&AuthorizePutObjectRequest {
+            object: object_request("bucket", "obj", test_requester()),
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            tags: None,
+            encryption: WriteEncryptionRequest::none(),
+        })
+        .unwrap();
+    let session_id = coord.begin_stream_put_session(&authorized).unwrap();
     coord
         .append_plaintext_stream_segment_for_test("bucket", "obj", &session_id, 0, b"hello")
         .unwrap();
@@ -7223,25 +7220,28 @@ fn finalize_stream_put_rejects_mismatched_sse_s3_write_context() {
         Some(ChecksumType::FullObject),
         "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=".to_string(),
     );
-    let wrong_context = coord.prepare_managed_write_context().unwrap();
-    let err = coord
-        .finalize_stream_put(&FinalizeStreamPutRequest {
+    let crossed_authority = coord
+        .authorize_put_object_write(&AuthorizePutObjectRequest {
             object: object_request("bucket", "obj", test_requester()),
-            session_id: &session_id,
-            crc64: checksum::crc64::checksum(b"hello"),
-            total_size: 5,
-            metadata_blob: &MetadataBlob::new(),
-            system_metadata: &system_metadata,
-            write_encryption: ActiveWriteEncryptionRef::Managed {
-                algorithm: ManagedEncryptionAlgorithm::Aes256,
-                write: &wrong_context,
-            },
-            tags: None,
-            cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
             policy_context: PutObjectPolicyContext::default(),
-            requested_object_lock: ObjectLockState::default(),
+            object_lock: ObjectLockState::default(),
+            tags: None,
+            encryption: WriteEncryptionRequest::none(),
         })
+        .unwrap();
+    let err = coord
+        .finalize_stream_put_from_authorized_write(
+            &AuthorizedFinalizeStreamPutRequest {
+                session_id: &session_id,
+                crc64: checksum::crc64::checksum(b"hello"),
+                total_size: 5,
+                metadata_blob: &MetadataBlob::new(),
+                system_metadata: &system_metadata,
+                cond: &WriteCondition::default(),
+            },
+            &crossed_authority,
+        )
         .unwrap_err();
     assert!(matches!(err, ServerError::InvalidRequest { .. }));
 }
@@ -7293,7 +7293,7 @@ fn finalize_stream_put_does_not_reauthorize_after_stream_start() {
             total_size: 5,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7387,7 +7387,7 @@ fn stream_put_zero_byte_object() {
             total_size: 0,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7438,7 +7438,7 @@ fn finalize_stream_put_persists_tags_in_initial_commit() {
             total_size: 5,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: Some(&tags),
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7508,7 +7508,7 @@ fn stream_put_append_after_finalize_fails() {
             total_size: 0,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7554,7 +7554,7 @@ fn stream_put_finalize_after_abort_fails() {
             total_size: 0,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7619,7 +7619,7 @@ fn stream_put_bucket_key_mismatch_finalize() {
             total_size: 0,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7691,7 +7691,7 @@ fn stream_put_overwrite_existing_object() {
             total_size: new_data.len() as u64,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7761,7 +7761,7 @@ fn stream_put_with_write_condition() {
             total_size: 7,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &cond,
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7785,7 +7785,7 @@ fn stream_put_with_write_condition() {
             total_size: 5,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &bad_cond,
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7837,7 +7837,7 @@ fn stream_put_multiple_segments_correct_manifest() {
             total_size: full_data.len() as u64,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -7931,7 +7931,7 @@ fn stream_put_overwrite_with_normal_put_cleans_segments() {
             total_size: 11,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -8014,7 +8014,7 @@ fn stream_put_delete_cleans_segments() {
             total_size: 9,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -8080,7 +8080,7 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
             total_size: 9,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -8144,7 +8144,7 @@ fn stream_put_upload_part_copy_from_stream_source() {
             total_size: 11,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -8228,7 +8228,7 @@ fn upload_part_copy_streams_multisegment_source_and_persists_checksum() {
             total_size: data.len() as u64,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -8370,7 +8370,7 @@ fn upload_part_copy_source_read_failure_aborts_destination_stream_session() {
             total_size: data.len() as u64,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -8675,7 +8675,7 @@ fn stream_put_duplicate_segment_index_rejected() {
             total_size: 5,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -9469,7 +9469,7 @@ fn object_segments_integrity_readback() {
             total_size: 16,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -9608,7 +9608,7 @@ fn stream_put_delete_then_reput() {
             total_size: 2,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -9687,7 +9687,7 @@ fn stream_put_overwrite_with_stream_put() {
             total_size: 8,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -9709,7 +9709,7 @@ fn stream_put_overwrite_with_stream_put() {
             total_size: 8,
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),

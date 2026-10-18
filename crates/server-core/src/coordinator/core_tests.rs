@@ -355,8 +355,6 @@ fn execute_publication_failure_operation(
         .map(|_| ()),
         PublicationFailureOperation::FinalizeStreamPut => {
             let session_id = stream_session.expect("stream operation has a prepared session");
-            let write_encryption = coord
-                .load_stream_put_write_encryption(bucket, key, session_id, None)?;
             coord
                 .finalize_stream_put(&FinalizeStreamPutRequest {
                     object: object_request(bucket.as_str(), key.as_str(), test_requester()),
@@ -365,7 +363,7 @@ fn execute_publication_failure_operation(
                     total_size: b"published-stream-put".len() as u64,
                     metadata_blob: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
-                    write_encryption: write_encryption.as_ref(),
+                    sse_customer: None,
                     tags: None,
                     cond: &WriteCondition::default(),
                     acl: NO_PUT_OBJECT_ACL.into(),
@@ -2578,11 +2576,9 @@ fn stream_put_finalization_expires_inside_command_build() {
                 total_size: 0,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                write_encryption: ActiveWriteEncryptionRef::None,
                 cond: NO_WRITE,
             },
             &prepared.authorized_write,
-            None,
         )
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
@@ -13051,9 +13047,6 @@ fn stream_put_finalize_request_maps_command_log_conflict_to_slow_down() {
     );
 
     let metadata = MetadataBlob::new();
-    let write_encryption = coord
-        .load_stream_put_write_encryption(&bucket, &key, &session_id, None)
-        .unwrap();
     let err = coord
         .finalize_stream_put(&FinalizeStreamPutRequest {
             object: object_request("bucket", "key", test_requester()),
@@ -13062,7 +13055,7 @@ fn stream_put_finalize_request_maps_command_log_conflict_to_slow_down() {
             total_size: 0,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: write_encryption.as_ref(),
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -13109,9 +13102,6 @@ fn stream_put_finalize_version_reservation_maps_command_log_conflict_to_slow_dow
     );
 
     let metadata = MetadataBlob::new();
-    let write_encryption = coord
-        .load_stream_put_write_encryption(&bucket, &key, &session_id, None)
-        .unwrap();
     let err = coord
         .finalize_stream_put(&FinalizeStreamPutRequest {
             object: object_request("bucket", "key", test_requester()),
@@ -13120,7 +13110,7 @@ fn stream_put_finalize_version_reservation_maps_command_log_conflict_to_slow_dow
             total_size: 0,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: write_encryption.as_ref(),
+            sse_customer: None,
             tags: None,
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -13197,7 +13187,7 @@ fn stream_put_finalize_retries_stale_snapshot_past_legacy_budget() {
             total_size: stream_body.len() as u64,
             metadata_blob: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
-            write_encryption: ActiveWriteEncryptionRef::None,
+            sse_customer: None,
             tags: None,
             cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),

@@ -7,6 +7,270 @@ use crate::test_support::{
 };
 
 #[test]
+fn stream_finalization_authority_is_bound_to_its_exact_admitted_route() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("stream-finalization-route-authority");
+    let key = crate::tests::object_key("object");
+    let session_id = crate::tests::stream_session_id("finalize-route");
+    let encryption = crate::ObjectEncryption::SseS3(crate::SseS3ObjectState::new(
+        9,
+        [10; crate::SSE_S3_WRAP_NONCE_LEN],
+        [11; crate::SSE_S3_WRAPPED_DEK_LEN],
+        [12; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    ));
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .create_put_object_stream_session_record(&bucket, &key, &session_id, encryption.clone())
+        .unwrap();
+
+    let issuer_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let foreign_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let issuer_admission = issuer_handle.admit_current_route().unwrap();
+    let foreign_admission = foreign_handle.admit_current_route().unwrap();
+    let issuer_route = issuer_admission
+        .active_put_object_route(&bucket, &key)
+        .unwrap();
+    let foreign_route = foreign_admission
+        .active_put_object_route(&bucket, &key)
+        .unwrap();
+    let authority = issuer_route
+        .authorize_stream_finalization(&session_id)
+        .unwrap();
+    assert_eq!(authority.encryption(), &encryption);
+
+    let rejected: Result<
+        Result<crate::FinalizeStreamPutOutcome<()>, &'static str>,
+        crate::StreamUploadFailure,
+    > = foreign_route.finalize_stream(&authority, 0, |_| {
+        panic!("a foreign route must be rejected before command preparation")
+    });
+    let error = rejected.unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+
+    let issuing_result = issuer_route
+        .finalize_stream(&authority, 0, |_| {
+            Err::<crate::PreparedStreamPutCommit<()>, _>("issuing-route-canary")
+        })
+        .unwrap();
+    assert_eq!(issuing_result.unwrap_err(), "issuing-route-canary");
+    let stored = issuer_route.load_stream_session(&session_id).unwrap();
+    assert_eq!(stored.encryption, encryption);
+}
+
+#[test]
+fn stream_finalization_authority_rejects_session_mutation_after_initial_snapshot() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("stream-finalization-snapshot-authority");
+    let key = crate::tests::object_key("object");
+    let session_id = crate::tests::stream_session_id("snapshot-auth");
+    let encryption = crate::ObjectEncryption::SseS3(crate::SseS3ObjectState::new(
+        9,
+        [10; crate::SSE_S3_WRAP_NONCE_LEN],
+        [11; crate::SSE_S3_WRAPPED_DEK_LEN],
+        [12; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    ));
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .create_put_object_stream_session_record(&bucket, &key, &session_id, encryption.clone())
+        .unwrap();
+
+    let route_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = route_handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let authority = route.authorize_stream_finalization(&session_id).unwrap();
+    let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+    let next_log_index_before = map.test_next_metadata_command_log_index(pg_id);
+
+    let hook_map = Arc::clone(&map);
+    let hook_session_id = session_id.clone();
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_closure = Arc::clone(&hook_ran);
+    let _hook =
+        cluster.test_install_before_stream_put_finalize_command_id_hook(Arc::new(move || {
+            if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let primary = hook_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            pg.test_force_stream_upload_next_segment_vid(
+                &hook_session_id,
+                GenerationId::new(2).unwrap(),
+            )
+            .unwrap();
+        }));
+
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_closure = Arc::clone(&action_calls);
+    let error = route
+        .finalize_stream(&authority, 0, move |_| {
+            action_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, &'static str>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: 0,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: encryption.clone(),
+            })
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+    assert!(hook_ran.load(Ordering::SeqCst));
+    assert_eq!(
+        action_calls.load(Ordering::SeqCst),
+        1,
+        "the changed retry snapshot must be rejected before command preparation"
+    );
+    assert_eq!(
+        map.test_next_metadata_command_log_index(pg_id),
+        next_log_index_before,
+        "rejected finalization must not allocate or publish a metadata command"
+    );
+    let stored = route.load_stream_session(&session_id).unwrap();
+    assert_eq!(stored.next_segment_vid, GenerationId::new(2).unwrap());
+}
+
+#[test]
+fn stream_finalization_authority_rejects_changed_post_apply_reinspection_snapshot() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("stream-finalization-reinspection-authority");
+    let key = crate::tests::object_key("object");
+    let session_id = crate::tests::stream_session_id("reinspect-auth");
+    let encryption = crate::ObjectEncryption::SseS3(crate::SseS3ObjectState::new(
+        9,
+        [10; crate::SSE_S3_WRAP_NONCE_LEN],
+        [11; crate::SSE_S3_WRAPPED_DEK_LEN],
+        [12; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    ));
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .create_put_object_stream_session_record(&bucket, &key, &session_id, encryption.clone())
+        .unwrap();
+
+    let route_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = route_handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let authority = route.authorize_stream_finalization(&session_id).unwrap();
+    let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+
+    let force_reinspection = Arc::new(AtomicBool::new(false));
+    let force_reinspection_for_hook = Arc::clone(&force_reinspection);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_session_id = session_id.clone();
+    let _apply_hook =
+        cluster.test_install_before_object_metadata_command_apply_hook(Arc::new(move |command| {
+            matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.matches_stream_session(&hook_bucket, &hook_key, &hook_session_id)
+                        && !force_reinspection_for_hook.swap(true, Ordering::SeqCst)
+            )
+        }));
+
+    let reinspection_map = Arc::clone(&map);
+    let reinspection_session_id = session_id.clone();
+    let reinspection_mutated = Arc::new(AtomicBool::new(false));
+    let reinspection_mutated_for_hook = Arc::clone(&reinspection_mutated);
+    let _reinspection_hook = cluster.test_install_snapshot_reinspection_hook(Arc::new(move || {
+        if !reinspection_mutated_for_hook.swap(true, Ordering::SeqCst) {
+            let primary = reinspection_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            pg.test_force_stream_upload_next_segment_vid(
+                &reinspection_session_id,
+                GenerationId::new(2).unwrap(),
+            )
+            .unwrap();
+        }
+        Duration::from_secs(5)
+    }));
+
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_closure = Arc::clone(&action_calls);
+    let error = route
+        .finalize_stream(&authority, 0, move |_| {
+            action_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, &'static str>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: 0,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: encryption.clone(),
+            })
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+    assert!(force_reinspection.load(Ordering::SeqCst));
+    assert!(reinspection_mutated.load(Ordering::SeqCst));
+    assert_eq!(
+        action_calls.load(Ordering::SeqCst),
+        1,
+        "changed post-apply reinspection state must be rejected before preparation"
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    let stored = route.load_stream_session(&session_id).unwrap();
+    assert_eq!(stored.next_segment_vid, GenerationId::new(2).unwrap());
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+        Err(crate::MetadataError::ObjectNotFound)
+    ));
+}
+
+#[test]
 fn stream_reservation_existence_observation_binds_bucket_key_and_session() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

@@ -189,6 +189,53 @@ pub struct ActivePutObjectRoute<'admission> {
     object_pg_id: ObjectMetadataPgId,
 }
 
+/// Non-cloneable authority to finalize one exact PutObject stream session.
+///
+/// The subject is minted only after loading the session through an admitted
+/// [`ActivePutObjectRoute`]. Its fields remain private so callers cannot pair
+/// one session's encryption or reservation authority with another session.
+///
+/// ```compile_fail
+/// use storage::AuthorizedStreamPutFinalization;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn cache_authority(authority: &AuthorizedStreamPutFinalization<'_, '_>) {
+///     require_clone(authority);
+/// }
+/// ```
+pub struct AuthorizedStreamPutFinalization<'route, 'admission> {
+    route: &'route ActivePutObjectRoute<'admission>,
+    session: StreamUploadRecord,
+}
+
+impl AuthorizedStreamPutFinalization<'_, '_> {
+    #[must_use]
+    pub fn encryption(&self) -> &ObjectEncryption {
+        &self.session.encryption
+    }
+
+    fn matches_current_session(&self, current: &StreamUploadRecord) -> bool {
+        let reservation_matches = match (
+            self.session.bucket_write_reservation.as_ref(),
+            current.bucket_write_reservation.as_ref(),
+        ) {
+            (Some(expected), Some(current)) => expected.has_same_stable_identity(current),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        self.session.session_id == current.session_id
+            && self.session.bucket == current.bucket
+            && self.session.key == current.key
+            && self.session.target == current.target
+            && self.session.state == current.state
+            && self.session.created_at == current.created_at
+            && self.session.cleanup_after == current.cleanup_after
+            && self.session.encryption == current.encryption
+            && self.session.next_segment_vid == current.next_segment_vid
+            && reservation_matches
+    }
+}
+
 /// Non-cloneable active authority for multipart control operations on one
 /// object.
 ///
@@ -545,7 +592,7 @@ impl From<StoreError> for AdmittedStreamAppendError {
     }
 }
 
-impl ActivePutObjectRoute<'_> {
+impl<'admission> ActivePutObjectRoute<'admission> {
     fn effect_route(&self) -> PutObjectMutationEffectRoute<'_> {
         PutObjectMutationEffectRoute {
             bucket_pg_id: self.bucket_pg_id,
@@ -685,6 +732,30 @@ impl ActivePutObjectRoute<'_> {
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
+    pub fn authorize_stream_finalization<'route>(
+        &'route self,
+        session_id: &SessionId,
+    ) -> Result<AuthorizedStreamPutFinalization<'route, 'admission>, crate::StreamUploadFailure>
+    {
+        let session = self.load_stream_session(session_id)?;
+        if session.bucket != self.bucket
+            || session.key != self.key
+            || session.session_id != *session_id
+            || session.target != StreamUploadTarget::PutObject
+        {
+            return Err(crate::StreamUploadFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "stream finalization subject does not match the admitted PutObject route"
+                        .to_string(),
+                },
+            ));
+        }
+        Ok(AuthorizedStreamPutFinalization {
+            route: self,
+            session,
+        })
+    }
+
     pub fn abort_stream_session(
         &self,
         session_id: &SessionId,
@@ -803,17 +874,40 @@ impl ActivePutObjectRoute<'_> {
 
     pub fn finalize_stream<T, E>(
         &self,
-        session_id: &SessionId,
+        authorization: &AuthorizedStreamPutFinalization<'_, '_>,
         total_size: u64,
         action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, crate::StreamUploadFailure> {
+        if !std::ptr::eq(self, authorization.route)
+            || authorization.session.bucket != self.bucket
+            || authorization.session.key != self.key
+            || authorization.session.target != StreamUploadTarget::PutObject
+        {
+            return Err(crate::StreamUploadFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "stream finalization authority does not match the admitted PutObject route"
+                        .to_string(),
+                },
+            ));
+        }
         self.admission
             .cluster
             .finalize_put_object_stream_with_route_validation(
                 self.effect_route(),
-                session_id,
+                &authorization.session.session_id,
                 total_size,
                 || self.admission.require_valid_now_raw(),
+                |current| {
+                    if authorization.matches_current_session(current) {
+                        Ok(())
+                    } else {
+                        Err(ObjectPgActionError::InvalidRequest {
+                            reason:
+                                "stream finalization authority no longer matches the durable session"
+                                    .to_string(),
+                        })
+                    }
+                },
                 action,
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)

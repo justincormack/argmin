@@ -1,8 +1,9 @@
 # Remove The Unreachable Plaintext Payload Profile Plan
 
-Status: in progress. Phase 0 is complete; Phase 1 has started by closing the production write
-resolver's plaintext fallback. The design decision to remove the plaintext payload state is
-accepted.
+Status: in progress. Phase 0 is complete. Phase 1 has closed the production write resolver's
+plaintext fallback and removed the caller-selected stream-finalization encryption sentinel; the
+remaining active plaintext variant and its call sites are still being migrated. The design
+decision to remove the plaintext payload state is accepted.
 
 ## Context
 
@@ -22,10 +23,11 @@ If the managed key provider is unavailable, an implicit SSE-S3 write fails. It m
 back to plaintext. There is no AWS-facing request or bucket configuration that selects plaintext.
 
 Despite this, the internal model still contains `ObjectEncryption::None`,
-`ActiveWriteEncryption::None`, `ActiveWriteEncryptionRef::None`, an object-encryption discriminator
-tag for `None`, plaintext segment-size branches, plaintext read/write branches, and extensive test
-fixtures built around them. The chunked-encryption plan consequently spends design effort keeping
-an unreachable plaintext profile aligned with the encrypted profiles.
+`ActiveWriteEncryption::None`, an object-encryption discriminator tag for `None`, plaintext
+segment-size branches, plaintext read/write branches, and extensive test fixtures built around
+them. Phase 1 has removed the former caller-selected `ActiveWriteEncryptionRef` finalization
+sentinel. The chunked-encryption plan consequently still spends design effort keeping an
+unreachable durable plaintext profile aligned with the encrypted profiles.
 
 This plan removes that unsupported state before implementing the new chunked encrypted codec. The
 repository is pre-release and supports neither existing installations nor format migration, so the
@@ -389,6 +391,35 @@ The removal of the active-write variants and migration of all call sites that me
 compiling slice; Phase 1 may not leave a removed variant referenced by tests.
 
 Exit: no production command or stored record can be constructed from a plaintext write context.
+
+#### Phase 1 implementation ledger
+
+- The production resolver now returns only managed or SSE-C write authority. Missing managed-key
+  configuration fails before stream-session creation rather than falling back to plaintext.
+- `ActiveWriteEncryptionRef` and both finalization request fields that carried it have been
+  removed. An admitted `ActivePutObjectRoute` now loads the exact durable session and mints a
+  non-cloneable `AuthorizedStreamPutFinalization`. The capability borrows the exact admitted route,
+  thereby binding its publication domain and immutable deadline as well as the bucket, key,
+  session ID, target, encryption state, allocator position, cleanup cutoff, and stable reservation
+  identity. The storage retry loop revalidates that complete subject against every authoritative
+  snapshot before command preparation, including the post-apply reinspection path; neither a
+  stale-command-build retry nor safe-abandonment reinspection can silently carry the old authority
+  onto a changed session.
+- Production finalization accepts only the `ActiveWriteEncryption` retained by the original
+  opaque `AuthorizedPutObjectWrite` and requires its stored encryption state to equal the
+  capability's session state. HTTP, buffered PutObject, promoted streaming PutObject, POST Object,
+  and CopyObject can no longer provide a replacement encryption value or a no-context sentinel.
+- Crossed managed-session authority, equivalent routes from another publication domain, and wrong
+  SSE-C request-key regressions reject before terminal publication. A deterministic mutation in
+  the snapshot-to-command gap also proves that reinspection rejects the changed allocator state
+  without allocating or publishing a terminal command. A separate safe-abandonment regression
+  changes the session before the post-apply snapshot load and proves its preparation callback is
+  not invoked again. The capability's private representation and non-`Clone` property are also
+  pinned by compile-fail coverage.
+
+Remaining in Phase 1: remove `ActiveWriteEncryption::None` and its plaintext encryption/checksum
+branches, migrate the active-write test call sites needed for that compiling slice, and complete
+the provider-failure non-mutation canaries across the write-operation families.
 
 ### Phase 2: Migrate the positive test corpus
 

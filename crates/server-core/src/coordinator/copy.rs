@@ -494,16 +494,19 @@ impl Coordinator {
                 system_metadata.set_checksum(algo, None, b64);
             }
 
+            let finalization = destination_route
+                .authorize_stream_finalization(&session_id)
+                .map_err(Self::map_stream_upload_failure)?;
             let put_result = self
                 .finalize_stream_put_with_authorized_write_tags_on_admitted_route(
                     &destination_route,
+                    &finalization,
                     &AuthorizedFinalizeStreamPutRequest {
                         session_id: &session_id,
                         crc64: crc64.finalize(),
                         total_size,
                         metadata_blob: &metadata_blob,
                         system_metadata: &system_metadata,
-                        write_encryption: dst_write_encryption.as_ref(),
                         cond: dst_cond,
                     },
                     &dst_authorized,

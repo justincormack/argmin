@@ -4281,11 +4281,9 @@ impl HttpFrontend {
                     total_size,
                     metadata_blob: &ctx.metadata_blob,
                     system_metadata: &ctx.system_metadata,
-                    write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
                     cond: &crate::conditional::WriteCondition::default(),
                 },
                 &ctx.authorized_write,
-                ctx.sse_customer.as_ref(),
             )?;
 
         let mut resp = S3Response::post_object(
@@ -4761,11 +4759,9 @@ impl HttpFrontend {
                         total_size,
                         metadata_blob: &metadata_blob,
                         system_metadata: &system_metadata,
-                        write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
                         cond: &ctx.cond,
                     },
                     authorized_write,
-                    ctx.sse_customer.as_ref(),
                 )
         })?;
 
