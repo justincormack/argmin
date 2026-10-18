@@ -3,14 +3,16 @@
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BlockedEncryptionTypes, EncryptionType, ServerSideEncryption, ServerSideEncryptionByDefault,
-    ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    BlockedEncryptionTypes, CompletedMultipartUpload, CompletedPart, EncryptionType,
+    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+    ServerSideEncryptionRule,
 };
 use s3_tests::{
     assert_s3_err_code, content_md5_header, create_bucket_with_sse_c_enabled, err_status,
-    raw_bucket, send_signed_request,
+    post_object_to_test_endpoint, raw_bucket, send_signed_request,
     shape::{assert_shape, id_headers, shape},
-    sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+    sigv4_post_fields_for_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
+    SendRetryingOperationAborted, CTX,
 };
 
 fn endpoint_is_https() -> bool {
@@ -82,6 +84,294 @@ async fn cleanup(bucket: &str, key: Option<&str>) {
         let _ = s3_tests::delete_object_retrying_operation_aborted(client, bucket, key).await;
     }
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
+}
+
+async fn assert_sse_s3_put_selection(bucket: &str, key: &str, explicit: bool) {
+    let client = CTX.client();
+    let body = format!("write-selection-{key}").into_bytes();
+    let put = s3_tests::retrying_operation_aborted("write-selection PutObject", || {
+        let body = body.clone();
+        async move {
+            let mut request = client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body));
+            if explicit {
+                request = request.server_side_encryption(ServerSideEncryption::Aes256);
+            }
+            request.send().await
+        }
+    })
+    .await;
+    assert_eq!(
+        put.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "PutObject did not report SSE-S3 for {key}"
+    );
+
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("write-selection HeadObject")
+        .await
+        .expect("write-selection HeadObject");
+    assert_eq!(
+        head.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "HeadObject did not report SSE-S3 for {key}"
+    );
+    assert_eq!(head.content_length(), Some(body.len() as i64));
+}
+
+async fn assert_sse_s3_head_selection(bucket: &str, key: &str) {
+    let head = CTX
+        .client()
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("write-selection HeadObject")
+        .await
+        .expect("write-selection HeadObject");
+    assert_eq!(
+        head.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "HeadObject did not report SSE-S3 for {key}"
+    );
+}
+
+async fn assert_sse_s3_post_selection(bucket: &str, key: &str, explicit: bool) {
+    let conditions = explicit
+        .then(|| serde_json::json!({"x-amz-server-side-encryption": "AES256"}))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut fields = sigv4_post_fields_for_credentials(
+        CTX.access_key(),
+        CTX.secret_key(),
+        CTX.region(),
+        bucket,
+        key,
+        &conditions,
+    );
+    if explicit {
+        fields.push((
+            "x-amz-server-side-encryption".to_string(),
+            "AES256".to_string(),
+        ));
+    }
+    let field_refs = fields
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let (status, body) = post_object_to_test_endpoint(
+        CTX.endpoint(),
+        CTX.tls_ca_pem(),
+        bucket,
+        &field_refs,
+        b"write-selection-post",
+        "write-selection.txt",
+    );
+    assert_eq!(status, 204, "POST Object failed: {body}");
+    assert_sse_s3_head_selection(bucket, key).await;
+}
+
+async fn assert_sse_s3_copy_selection(
+    bucket: &str,
+    source_key: &str,
+    destination_key: &str,
+    explicit: bool,
+) {
+    assert_sse_s3_put_selection(bucket, source_key, explicit).await;
+    let client = CTX.client();
+    let mut request = client
+        .copy_object()
+        .bucket(bucket)
+        .key(destination_key)
+        .copy_source(format!("{bucket}/{source_key}"));
+    if explicit {
+        request = request.server_side_encryption(ServerSideEncryption::Aes256);
+    }
+    let copy = request
+        .send_retrying_operation_aborted("write-selection CopyObject")
+        .await
+        .expect("write-selection CopyObject");
+    assert_eq!(
+        copy.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "CopyObject did not report SSE-S3 for {destination_key}"
+    );
+    assert_sse_s3_head_selection(bucket, destination_key).await;
+}
+
+async fn create_sse_s3_multipart_upload(bucket: &str, key: &str, explicit: bool) -> String {
+    let client = CTX.client();
+    let mut request = client.create_multipart_upload().bucket(bucket).key(key);
+    if explicit {
+        request = request.server_side_encryption(ServerSideEncryption::Aes256);
+    }
+    let create = request
+        .send_retrying_operation_aborted("write-selection CreateMultipartUpload")
+        .await
+        .expect("write-selection CreateMultipartUpload");
+    assert_eq!(
+        create.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "CreateMultipartUpload did not report SSE-S3 for {key}"
+    );
+    create.upload_id().expect("multipart upload ID").to_string()
+}
+
+async fn complete_sse_s3_multipart_upload(bucket: &str, key: &str, upload_id: &str, etag: &str) {
+    let complete = CTX
+        .client()
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                .build(),
+        )
+        .send_retrying_operation_aborted("write-selection CompleteMultipartUpload")
+        .await
+        .expect("write-selection CompleteMultipartUpload");
+    assert_eq!(
+        complete.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "CompleteMultipartUpload did not report SSE-S3 for {key}"
+    );
+    assert_sse_s3_head_selection(bucket, key).await;
+}
+
+async fn assert_sse_s3_multipart_selection(bucket: &str, key: &str, explicit: bool) {
+    let client = CTX.client();
+    let upload_id = create_sse_s3_multipart_upload(bucket, key, explicit).await;
+    let part = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"write-selection-part"))
+        .send()
+        .await
+        .expect("write-selection UploadPart");
+    assert_eq!(
+        part.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "UploadPart did not report inherited SSE-S3 for {key}"
+    );
+    complete_sse_s3_multipart_upload(
+        bucket,
+        key,
+        &upload_id,
+        part.e_tag().expect("UploadPart ETag"),
+    )
+    .await;
+}
+
+async fn assert_sse_s3_upload_part_copy_selection(
+    bucket: &str,
+    source_key: &str,
+    destination_key: &str,
+    explicit: bool,
+) {
+    assert_sse_s3_put_selection(bucket, source_key, explicit).await;
+    let client = CTX.client();
+    let upload_id = create_sse_s3_multipart_upload(bucket, destination_key, explicit).await;
+    let part = client
+        .upload_part_copy()
+        .bucket(bucket)
+        .key(destination_key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .copy_source(format!("{bucket}/{source_key}"))
+        .send_retrying_operation_aborted("write-selection UploadPartCopy")
+        .await
+        .expect("write-selection UploadPartCopy");
+    assert_eq!(
+        part.server_side_encryption(),
+        Some(&ServerSideEncryption::Aes256),
+        "UploadPartCopy did not report inherited SSE-S3 for {destination_key}"
+    );
+    complete_sse_s3_multipart_upload(
+        bucket,
+        destination_key,
+        &upload_id,
+        part.copy_part_result()
+            .and_then(|result| result.e_tag())
+            .expect("UploadPartCopy ETag"),
+    )
+    .await;
+}
+
+async fn assert_sse_s3_operation_selection_matrix(bucket: &str, prefix: &str, explicit: bool) {
+    let put_key = format!("{prefix}-put");
+    let post_key = format!("{prefix}-post");
+    let copy_source = format!("{prefix}-copy-source");
+    let copy_destination = format!("{prefix}-copy-destination");
+    let multipart_key = format!("{prefix}-multipart");
+    let part_copy_source = format!("{prefix}-part-copy-source");
+    let part_copy_destination = format!("{prefix}-part-copy-destination");
+
+    assert_sse_s3_put_selection(bucket, &put_key, explicit).await;
+    assert_sse_s3_post_selection(bucket, &post_key, explicit).await;
+    assert_sse_s3_copy_selection(bucket, &copy_source, &copy_destination, explicit).await;
+    assert_sse_s3_multipart_selection(bucket, &multipart_key, explicit).await;
+    assert_sse_s3_upload_part_copy_selection(
+        bucket,
+        &part_copy_source,
+        &part_copy_destination,
+        explicit,
+    )
+    .await;
+
+    for key in [
+        put_key,
+        post_key,
+        copy_source,
+        copy_destination,
+        multipart_key,
+        part_copy_source,
+        part_copy_destination,
+    ] {
+        s3_tests::delete_object_retrying_operation_aborted(CTX.client(), bucket, &key)
+            .await
+            .expect("delete write-selection object");
+    }
+}
+
+#[test]
+fn test_bucket_encryption_write_selection_matrix() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        assert_sse_s3_operation_selection_matrix(&bucket, "implicit-fresh", false).await;
+
+        client
+            .put_bucket_encryption()
+            .bucket(&bucket)
+            .server_side_encryption_configuration(sse_s3_bucket_encryption(EncryptionType::SseC))
+            .send_retrying_operation_aborted("set explicit AES256 bucket encryption")
+            .await
+            .expect("set explicit AES256 bucket encryption");
+        assert_sse_s3_operation_selection_matrix(&bucket, "explicit-bucket-default", false).await;
+
+        client
+            .delete_bucket_encryption()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("delete explicit bucket encryption")
+            .await
+            .expect("delete explicit bucket encryption");
+        assert_sse_s3_operation_selection_matrix(&bucket, "implicit-after-delete", false).await;
+        assert_sse_s3_operation_selection_matrix(&bucket, "explicit-request", true).await;
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
 }
 
 #[test]

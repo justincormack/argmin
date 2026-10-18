@@ -2,6 +2,11 @@
 
 Status: In progress (Phase 0 clean reference benchmark pending)
 
+The accepted [`remove-plaintext-payload-profile-plan.md`](remove-plaintext-payload-profile-plan.md)
+removes the unreachable `ObjectEncryption::None` state before this plan's profile-interface work.
+Accordingly, this plan covers only encrypted payload codecs paired with SSE-S3 or SSE-C. References
+to plaintext below mean decrypted logical data, not a supported unencrypted durable profile.
+
 ## Context
 
 Argmin currently encrypts each internal payload segment as one AES-256-GCM record. Newly written
@@ -102,8 +107,8 @@ provider-interoperability review.
 - Preserve bounded memory and streaming writes.
 - Use one encryption-context and payload-codec implementation across PutObject, POST Object,
   CopyObject, CreateMultipartUpload/UploadPart/CompleteMultipartUpload, and UploadPartCopy.
-- Route encrypted and plaintext payloads through one profile-neutral write/read orchestration
-  contract, with profile-specific integrity and range implementations behind that boundary.
+- Route every encrypted payload codec through one profile-neutral write/read orchestration
+  contract, with codec-specific integrity and range implementations behind that boundary.
 - Make the payload profile explicit and versioned in durable metadata, commands, RPCs, fixtures,
   diagnostics, and the storage format ledger.
 
@@ -112,8 +117,7 @@ provider-interoperability review.
 - Encrypting an entire S3 object or completed multipart manifest as one Cobblestone message.
 - Changing S3's checksum, ETag, range, or encryption-header behavior.
 - Removing shard CRC64 acknowledgements or the scrub/repair machinery.
-- Providing efficient unauthenticated partial reads for unencrypted payloads. That requires a
-  separate chunk-checksum or authenticated-tree design.
+- Providing or retaining an unencrypted payload format.
 - General partial EC reconstruction in the initial implementation. A later optimization may add it
   for already-known erasures without changing the persisted encryption profile.
 - Binding payload encryption to physical placement, route epochs, nodes, PGs, EC shape, or shard
@@ -123,16 +127,14 @@ provider-interoperability review.
 
 ## Common Payload-Profile Boundary
 
-Do not preserve the current shape in which the plaintext branch copies bytes while encrypted
-branches are special-cased before and after the otherwise shared storage path. Separate two
-concerns explicitly:
+After the plaintext-removal plan lands, separate two concerns explicitly:
 
-1. the AWS-visible encryption mode and key state (`None`, SSE-S3, or SSE-C); and
+1. the AWS-visible encryption mode and key state (SSE-S3 or SSE-C); and
 2. the internal, versioned payload protection/codec profile used to frame, verify, range-map, and
    stream each segment.
 
-Use one sealed profile interface or compiler-exhaustive enum dispatch for both encrypted and
-plaintext payloads. The common orchestration owns exact logical subjects, range selection,
+Use one sealed profile interface or compiler-exhaustive enum dispatch for all encrypted payload
+codecs. The common orchestration owns exact logical subjects, range selection,
 retained/deletion-exclusion leases, response commitment, bounded output chunks, cancellation, and
 the rule that a body is successful only after profile finalization. Each profile implementation
 owns:
@@ -149,59 +151,30 @@ granularity. It must give the HTTP, copy, and storage orchestration one bounded 
 the same cancellation and error contract. A profile may internally buffer a complete segment; it
 may not reintroduce a second raw-`Vec` publication or read path around that contract. Conformance
 tests run the same write, full-read, range, copy, cancellation, retained-route, and late-error
-scenarios against every enabled profile and assert the intended profile-specific release boundary.
+scenarios against every enabled codec and both supported key modes, asserting each codec's intended
+release boundary.
 
-### Plaintext profile policy
+### Plaintext payload removal
 
-Do not implement plaintext as AEAD under a fixed, empty, or otherwise public "null key." Such a tag
-would consume encryption CPU and framing overhead while providing no meaningful authentication,
-and would obscure rather than describe the persisted security property. A secret MAC-only design
-would be a distinct keyed-integrity format and needs its own key lifecycle and threat-model review.
-
-For the initial Cobblestone work, keep the current plaintext format behind an explicit
-`PlaintextWholeSegmentCrc`-style **reader** adapter while its durable representation remains
-accepted. There is no AWS-facing plaintext writer today: an absent bucket encryption configuration
-means AWS's automatic SSE-S3 default, and deleting the configuration restores that default rather
-than disabling encryption. Do not add a non-AWS request mode or manufacture an impossible S3
-object merely to make a symmetric benchmark matrix. Full and range reads retain their current
-physical validation guarantees; the adapter may consequently buffer or read more than the
-encrypted profile. That performance difference is intentional and documented rather than hidden
-in shared orchestration. If the plaintext representation remains supported, measure its reader in
-a storage-owned retained-format microbenchmark rather than claiming end-to-end S3 writer coverage.
-
-If unencrypted range workloads later justify equivalent granularity, design a separate,
-explicitly versioned plaintext chunk-integrity profile, for example 16 KiB plaintext records with
-per-record checksums bound to segment position and exact logical subject. CRC or an unkeyed digest
-would detect accidental corruption but would not become authentication merely by sharing the
-Cobblestone geometry. Measure metadata/framing overhead, checksum cost, range IO, and corruption
-semantics before selecting that profile. It is an independent format project, not a prerequisite
-for the encrypted range improvement.
-
-An incremental plaintext full-reader could lower TTFB without changing the persisted format by
-rolling CRC while streaming and retaining enough trailing output that a final mismatch terminates
-below the declared `Content-Length`. That permits callers to observe earlier bytes before a late
-body error and is therefore weaker than per-record authenticated release. Adopt it only through an
-explicit profile contract and client matrix; do not obtain it accidentally by moving the existing
-final CRC check after response completion.
-
-### Future modern-only builds
-
-A future compile-time modern-only configuration may exclude plaintext or other legacy writers and
-AWS-facing options, but it should select an explicit supported-profile registry rather than fork
-the storage and HTTP pipelines. Disabled profiles must never be silently reinterpreted: either keep
-their readers for deliberate read-old/write-new operation or reject existing unsupported durable
-state before serving. Build and test the full and modern-only registries independently, including
-AWS-compatible rejection behavior for disabled request options. Do not make completion of this
-plan depend on that future product configuration.
+Do not implement plaintext as AEAD under a fixed, empty, or otherwise public "null key," and do not
+retain it as a legacy reader. There is no production plaintext writer, no released deployment, and
+no supported upgrade format. The dedicated removal plan deletes the state and advances all
+containing formats so former plaintext data fails at the current-format boundary before serving.
+An absent or deleted bucket-encryption configuration remains a distinct AWS control-plane state,
+but its effective writer is automatic SSE-S3.
 
 ### Phase 0 implementation inventory and target seam
 
-The current code has no independent payload-codec choice. `ActiveWriteEncryption` combines the
-AWS-visible key mode with whole-segment framing: `None` copies into a new `Vec`, while SSE-C and
-SSE-S3 call their whole-segment AES-GCM helpers. On reads, `SegmentPayloadRecord` carries only
-`ObjectEncryption`; the reader loads a complete stored segment, chooses plaintext or whole-segment
-AEAD from that value, and only then slices the requested logical range. `max_stored_segment_size`
-likewise assumes the only encrypted representation is `plaintext length + one 16-byte tag`.
+The current code has no independent payload-codec choice. The prerequisite removal deliberately
+does not add one: it leaves a single fixed whole-segment AES-GCM representation after deleting the
+plaintext state. Before that removal,
+`ActiveWriteEncryption` still contains a dead `None` arm; SSE-C and SSE-S3 call their whole-segment
+AES-GCM helpers. On reads, `SegmentPayloadRecord` carries only `ObjectEncryption`; the reader loads
+a complete stored segment, chooses its legacy branch from that value, and only then slices the
+requested logical range. After removal, `max_stored_segment_size` still assumes the only supported
+representation is `plaintext length + one 16-byte tag`; this plan replaces that assumption with
+the first explicit durable codec discriminator and profile-owned geometry. The discriminator and
+its containing-format changes land in this plan, not in the plaintext-removal prerequisite.
 
 The write-path inventory is:
 
@@ -245,7 +218,6 @@ The initial release guarantees are deliberately different behind the common cont
 
 | Profile | Earliest plaintext release | Successful finalization requirement | Late failure behavior |
 | --- | --- | --- | --- |
-| `PlaintextWholeSegmentCrcV1` | Per segment, after that complete segment's required physical CRC validation. | Exact logical/stored length and whole-segment CRC evidence agree for every requested segment. | Emit no bytes from the failing segment. If the response is uncommitted, return the mapped error; otherwise abort the transport, even when no body bytes were emitted. |
 | `SegmentAes256GcmV1` | Per segment, after that complete segment AEAD record authenticates. | AEAD, exact length, and required physical-health processing complete for every requested segment. | Emit no bytes from the failing segment. If the response is uncommitted, return the mapped error; otherwise abort the transport, even when no body bytes were emitted. |
 | `Cobblestone256SegmentV1` | Per 16 KiB chunk, only after that chunk authenticates. | Canonical terminal-chunk/length rules, every selected/full-read chunk, and final physical-health processing complete. | If headers or prior authenticated chunks were emitted, send no bytes from the failing chunk and abort the transport; otherwise return the mapped pre-response error. |
 
@@ -681,8 +653,7 @@ A CRC mismatch discovered only after all corresponding logical ciphertext has pa
 physical diagnostic and repair event, not by itself a reason to retroactively fail the authenticated
 client response. If logical bytes from that shard remain unauthenticated, continue to gate those
 bytes on AEAD and enter the diagnostic path; an unrecoverable AEAD failure follows the committed
-response rules above. Unencrypted reads do not have this separation and must not release data early
-without an independently authenticated chunk-integrity design.
+response rules above.
 
 The full reader should stream authenticated chunks rather than requiring an 8 MiB ciphertext and
 plaintext allocation. It must not release a chunk before its tag verifies. Whole-object S3
@@ -695,15 +666,18 @@ authenticated chunks can be withdrawn.
 Persist an explicit segment payload-codec profile alongside the independently modeled
 `ObjectEncryption` key/mode state, for example:
 
-- `PlaintextWholeSegmentCrcV1` for the current plaintext representation;
 - `SegmentAes256GcmV1` for the current encrypted representation;
 - `Cobblestone256SegmentV1` for the proposed representation.
 
 The exact names are less important than making the distinction durable and exhaustive. Validate
-the allowed cross-product: plaintext codec with `ObjectEncryption::None`, and encrypted codecs with
-the applicable SSE-S3 or SSE-C state. Crossed codec/key-state combinations fail closed. Stored size
-calculations must become profile-aware; they can no longer assume either identity framing or
-`plaintext length + 16`.
+the allowed cross-product of each encrypted codec with the applicable SSE-S3 or SSE-C state.
+Crossed codec/key-state combinations fail closed. Stored size calculations must become
+profile-aware; they can no longer assume `plaintext length + 16`.
+
+This is the first slice that introduces that discriminator. Its prior current state is the one
+implicit legacy encrypted representation left by the plaintext-removal plan; the format bump and
+immutable old/new evidence here must make that transition explicit rather than assuming the
+removal plan already persisted a codec choice.
 
 Update every containing representation named by the storage-format dependency ledger, including:
 
@@ -760,10 +734,8 @@ acknowledgement evidence is validated before installation and encoded as a self-
 - Add counters for logical range bytes, stored bytes read, shard bytes read, bytes reconstructed,
   bytes decrypted, AEAD records opened, CRC bytes processed, buffer checkouts and actual buffer
   allocations, and repair fallback.
-- Benchmark the current reachable encrypted range/full-read path end to end. If the dormant
-  plaintext reader remains supported, benchmark it separately through a storage-owned
-  retained-format harness; do not expose a plaintext S3 writer.
-- Inventory every existing plaintext/encrypted branch and specify the sealed common profile
+- Benchmark the current reachable encrypted range/full-read path end to end.
+- Inventory every existing encrypted branch and specify the sealed common profile
   interface, including per-profile release guarantees and finalization errors.
 - Freeze current encryption-state, segment, command, and RPC fixtures.
 - Add negative tests demonstrating the current context boundary without treating them as an
@@ -794,10 +766,11 @@ Implementation update (2026-10-17):
   handler processing, response encoding, and response decoding. The counters intentionally expose
   each pass actually taken.
 - The current reader still obtains and decrypts one complete stored segment before returning any
-  selected bytes. `ObjectEncryption::None` bypasses the decrypt step; SSE-C and SSE-S3 each open
-  one whole-segment AEAD record. The common sealed profile interface, durable-profile dimensions,
-  release guarantees, and benchmark matrix are specified above. Implementing that interface is
-  later phase work; Phase 0 retains only the clean reference benchmark as an open exit item.
+  selected bytes. SSE-C and SSE-S3 each open one whole-segment AEAD record. The prerequisite
+  plaintext-removal plan owns deletion of the dead bypass. The common sealed profile interface,
+  durable-profile dimensions, release guarantees, and benchmark matrix are specified above.
+  Implementing that interface is later phase work; Phase 0 retains only the clean reference
+  benchmark as an open exit item.
 - The format-evidence audit found existing exact fixtures for `ObjectEncryption` state, the
   metadata-command corpus (including encrypted stream-session state), and the SSE-S3 segment
   cipher. This slice adds the missing deterministic SSE-C whole-segment cipher vector and a
@@ -812,8 +785,7 @@ Implementation update (2026-10-17):
 - The target seam is an exhaustive internal durable-profile registry producing opaque,
   subject-bound incremental encoders and readers. It owns stored-size/range geometry, plaintext
   release, and consuming finalization; AWS-visible key mode remains a separate dimension. The
-  initial plaintext, legacy segment-AEAD, and Cobblestone release/error guarantees are recorded
-  above.
+  legacy segment-AEAD and Cobblestone release/error guarantees are recorded above.
 - The reviewed upstream baseline is C2SP commit
   `d757bb90e5966d92d17353a3964ca1af776b63e0`. Because the specification remains untagged and in
   development, writer enablement requires a fresh upstream review. The implementation choice is a
@@ -824,10 +796,9 @@ Implementation update (2026-10-17):
 - The production S3 writer audit found that plaintext is unreachable by design. An absent or
   deleted bucket-encryption configuration resolves to the AWS automatic SSE-S3 default, and the
   coordinator consequently always selects managed AES256 unless the request selects SSE-C. The
-  reproducible end-to-end benchmark therefore covers the reachable legacy segment-AEAD profile
-  and records that fact explicitly; a fabricated plaintext S3 fixture would test no production
-  behavior. A retained-format plaintext-reader benchmark is required only if that dormant reader
-  remains in the supported-profile registry.
+  accepted prerequisite plan removes the dormant plaintext state rather than building a reader or
+  benchmark for it. The reproducible end-to-end benchmark therefore covers the reachable legacy
+  encrypted segment profile.
 - `scripts/bench-payload-read` runs the release server and AWS SDK client against the real HTTP,
   authorization, storage, EC, checksum, and decryption path. It fixes object/range sizes and
   warm-up/sample counts, records revision/toolchain/kernel/CPU/provider inputs and the selected
@@ -868,8 +839,8 @@ the eventual reader exists before the first payload effect.
   complete valid and invalid cross-product at construction, decoding, apply/recovery, and restart.
 - Integrate the codec with every encrypted write path while retaining the old reader if required by
   the selected format transition.
-- Put the current plaintext representation and both encrypted representations behind the common
-  profile contract; do not retain a raw plaintext bypass in write, read, range, or copy paths.
+- Put the current and proposed encrypted representations behind the common profile contract; the
+  prerequisite removal must leave no plaintext bypass in write, read, range, or copy paths.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
@@ -959,7 +930,6 @@ profiles. At minimum, the current registry contains these valid pairs:
 
 | Payload codec | `ObjectEncryption` state |
 |---|---|
-| `PlaintextWholeSegmentCrcV1` | `None` |
 | `SegmentAes256GcmV1` | SSE-S3 |
 | `SegmentAes256GcmV1` | SSE-C |
 | `Cobblestone256SegmentV1` | SSE-S3 |
@@ -970,8 +940,9 @@ codec or encryption-state variant forces an explicit compatibility decision and 
 For every valid pair, use production constructors to write, encode/decode, apply/recover, restart,
 and read positive canaries. Independently construct immutable malformed fixtures for:
 
-- each encrypted codec paired with `ObjectEncryption::None`;
-- the plaintext codec paired independently with SSE-S3 and SSE-C;
+- former plaintext discriminator tag 0 in every prior live-payload carrier, and old tag-0
+  delete-marker carriers replaced by the explicit payloadless schema shape, rejected as
+  unsupported current state before effects;
 - unknown codec and encryption-state tags;
 - a current encryption state carrying the wrong current/previous codec profile;
 - current codec tags containing bytes framed under another codec, in both old-to-new and
