@@ -206,17 +206,11 @@ impl Coordinator {
             ));
         }
 
-        if request_encryption.explicit_managed_encryption().is_some()
-            || bucket.encryption.default_encryption == ManagedEncryptionAlgorithm::Aes256
-        {
-            let managed_write = self.prepare_managed_write_context()?;
-            return Ok(ActiveWriteEncryption::managed(
-                ManagedEncryptionAlgorithm::Aes256,
-                managed_write,
-            ));
-        }
-
-        Ok(ActiveWriteEncryption::none())
+        let algorithm = request_encryption
+            .explicit_managed_encryption()
+            .unwrap_or(bucket.encryption.default_encryption);
+        let managed_write = self.prepare_managed_write_context()?;
+        Ok(ActiveWriteEncryption::managed(algorithm, managed_write))
     }
 
     pub(super) fn resume_write_encryption(

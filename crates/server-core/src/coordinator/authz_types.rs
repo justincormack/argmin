@@ -182,10 +182,6 @@ pub enum ActiveWriteEncryptionRef<'a> {
 }
 
 impl ActiveWriteEncryption {
-    pub(super) fn none() -> Self {
-        Self::None
-    }
-
     pub(super) fn sse_customer(write: SseCustomerWriteContext) -> Self {
         Self::SseCustomer {
             encryption: write.encryption().clone(),

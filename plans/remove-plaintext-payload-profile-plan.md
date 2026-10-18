@@ -1,6 +1,7 @@
 # Remove The Unreachable Plaintext Payload Profile Plan
 
-Status: proposed for implementation; the design decision to remove the plaintext payload state is
+Status: in progress. Phase 0 is complete; Phase 1 has started by closing the production write
+resolver's plaintext fallback. The design decision to remove the plaintext payload state is
 accepted.
 
 ## Context
@@ -295,6 +296,64 @@ symbol spellings.
 
 Exit: every current producer, consumer, durable carrier, and test class has an owner and intended
 replacement.
+
+#### Phase 0 inventory result (2026-10-18)
+
+The source inventory found no genuine production plaintext producer. `BucketSummary` contains an
+`EffectiveBucketEncryptionConfig`, whose default encryption is always AES-256, so the final
+`ActiveWriteEncryption::None` branch in `resolve_write_encryption` was unreachable. Phase 1 removes
+that fallback first and pins missing-provider failure before durable stream-session creation.
+
+The initial exact source baseline is an audit aid rather than a permanent name-based boundary:
+
+| Construction | Occurrences | Files | Owner and replacement |
+| --- | ---: | ---: | --- |
+| `ObjectEncryption::None` | 492 | 47 | `storage` owns the durable variant. Positive storage fixtures move to the canonical encrypted fixture or production ciphertext; server-core payload tests use real SSE-S3/SSE-C writes; delete-marker uses move to the payloadless row shape; only immutable malformed evidence remains. |
+| `ActiveWriteEncryption::None` | 2 | 2 | `server-core` owns both the unreachable resolver/resume construction and the checksum-metadata branch. Remove them in Phase 1. |
+| `ActiveWriteEncryptionRef::None` | 44 | 8 | `server-core` owns the caller-selected finalization sentinel. Remove the request fields and derive exact session-bound authority inside finalization. |
+| `ObjectEncryptionType::None` | 6 | 2 | `storage` owns the durable tag. Reserve byte 0 as an explicitly rejected former plaintext tag in Phase 3. |
+
+The production producer/consumer ownership is:
+
+| Surface | Current role | Replacement owner |
+| --- | --- | --- |
+| Write selection and resume | `server-core::coordinator::{authz_types,streaming}` can produce or resume plaintext active state | Phase 1 makes new selection managed-or-SSE-C only and removes caller-selected resume/finalization sentinels. |
+| Segment encryption, checksum sealing, read decryption, and copy compatibility | `server-core::coordinator::{object_state,streaming,runtime,copy}` branches on plaintext | Phase 1 closes new write authority; Phase 3 removes the remaining durable-reader branches after positive fixtures migrate. |
+| Durable logical state and geometry | `storage::types` owns `ObjectEncryption`, tag 0, default construction, and plaintext geometry | Phase 3 removes the variant/default/tag and exposes fixed encrypted legacy geometry. |
+| SQLite rows | PG schema 6 stores tags 0/1/2 in `objects`, `multipart_uploads`, and `stream_uploads`; object tag 0 is also the delete-marker sentinel | PG schema 7 requires tags 1/2 for every payload-bearing row and nullable encryption columns only for canonical delete markers. Multipart uploads and stream sessions remain payload-bearing and require tags 1/2. |
+| Row loading, canonical state, checkpoint, command apply/recovery, repair, reclaim, backfill, and scavenging | `storage::{pg_store,metadata_command,storage_rpc,cluster,node}` decode or propagate the durable enum | Phase 3 advances the authoritative containers together and rejects old state before effects. |
+| Tests and models | Storage metadata/command/model fixtures dominate the 492 positive constructions; server-core uses the active sentinel primarily in streaming-finalization tests | Phase 2 supplies storage-owned encrypted metadata fixtures and production ciphertext fixtures before Phase 3 removes the durable variant. Phase 1 migrates finalization tests with the active API. |
+
+The complete direct containing-format decision is now frozen as follows. Self-versioned nested
+carriers advance when their accepted grammar changes; outer wrappers whose grammar is unchanged do
+not advance merely because they carry a newly versioned inner value, but receive new composite
+evidence.
+
+| Format | Baseline | Decision for removal | Reason/evidence obligation |
+| --- | ---: | ---: | --- |
+| Per-PG SQLite schema/catalogue | 6 | **7** | Encryption columns become live-or-payloadless and tag 0 becomes structurally invalid. Preserve schema-6 bytes as startup rejection evidence. |
+| Applied metadata-command envelope | 8 | **9** | Commands and snapshots lose a formerly accepted nested encryption variant. Preserve the exact v8 aggregate and add recovery/replica rejection evidence. |
+| Storage-node RPC frame/payload | 22 | **23** | Object, upload, session, command-build, and snapshot payload decoders lose tag 0. Add authenticated old/new server-boundary rejection evidence. |
+| Canonical metadata-state digest | 5 | **6** | Object-row canonical values change from integer tag 0 to null for markers and reject plaintext live rows. |
+| Metadata checkpoint payload | 3 | **4** | The checkpoint carries complete physical object/upload/session rows and its accepted logical row grammar changes. Preserve the exact v3 aggregate. |
+| SSE-C object state | 3 | **3 (no bump)** | The tag-1 state bytes and cryptographic profile do not change; append containing-format dependency evidence. |
+| SSE-S3 object state | 1 | **1 (no bump)** | The tag-2 state bytes and cryptographic profile do not change; append containing-format dependency evidence. |
+| Storage-RPC authentication binding | 2 | **2 (no bump)** | Binding grammar is unchanged and carries a self-versioned v23 frame. Append exact inner-v23 composite and authenticated v22 rejection evidence. |
+| Storage-RPC authenticated transport | 1 | **1 (no bump)** | Transport framing is unchanged and carries the independently versioned binding/frame. |
+| Storage-node TLS protocol | `argmin-storage-rpc/1` | **no change** | Negotiation semantics and bytes are unchanged. |
+| Runtime-map/config proof carriers | runtime config 5 and current proof-carrier versions | **no outer bump** | They carry the independently versioned canonical-state digest in an unchanged fixed-width carrier; append noncurrent-v5/current-v6 proof rejection and acceptance evidence. |
+| Control-plane, Raft, standalone, and peering containers | current ledger vector | **no outer bump unless their encoded field grammar changes during implementation** | They carry self-versioned metadata commands, checkpoints, RPC frames, or proof carriers. Phase 3 must append composite evidence and re-audit the production writer/reader registry before landing; discovery of raw unversioned encryption fields changes this decision. |
+
+Tag 0 currently has two distinct roles that must not be conflated during migration:
+
+- `objects.status = 1` requires `encryption_type = 0` and null state for delete markers; this moves
+  to nullable encryption columns and status-sensitive constraints in schema 7; and
+- live objects, multipart uploads, and stream sessions may currently carry tag 0 as plaintext;
+  those states are rejected rather than translated.
+
+The Phase 0 exit condition is satisfied: all known production and test producers, consumers,
+direct carriers, and payloadless-sentinel sites have an owner and replacement. Phase 3 retains a
+mandatory final registry/ledger comparison so a newly introduced carrier cannot be omitted.
 
 Preimplementation AWS evidence recorded on 2026-10-18:
 

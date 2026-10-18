@@ -8123,6 +8123,40 @@ fn begin_stream_put_rejects_sse_s3_without_provider() {
 }
 
 #[test]
+fn begin_stream_put_implicit_sse_s3_without_provider_fails_before_session_creation() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_managed_key_provider(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let err = begin_stream_put_with_authorized_request_test(
+        &coord,
+        object_request_with_expected_owner("bucket", "key", test_requester(), None),
+        NO_PUT_OBJECT_ACL.into(),
+        PutObjectPolicyContext::default(),
+        WriteEncryptionRequest::none(),
+        ObjectLockState::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::NotImplemented { ref feature }
+        if feature == "SSE-S3 requires managed key provider configuration"
+    ));
+    assert_eq!(
+        storage::test_support::stream_upload_session_count_for_object(
+            &coord.storage_node(),
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+        )
+        .unwrap(),
+        0,
+        "implicit SSE-S3 failure must not create a stream session"
+    );
+}
+
+#[test]
 fn begin_stream_part_rejects_non_owner_requester() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
