@@ -5747,23 +5747,37 @@ fn direct_put_irreversible_handoff_wakes_static_authorized_recovery() {
         }));
     let action_calls = Arc::new(AtomicUsize::new(0));
     let action_calls_for_commit = Arc::clone(&action_calls);
-    let error = cluster
-        .commit_direct_put_object_from_payload_shards(
-            &commit_req,
-            &written.written_shards,
-            move |_| {
-                action_calls_for_commit.fetch_add(1, Ordering::SeqCst);
-                Ok::<(), ()>(())
-            },
-        )
-        .unwrap_err();
+    let result = cluster.commit_direct_put_object_from_payload_shards(
+        &commit_req,
+        &written.written_shards,
+        move |_| {
+            action_calls_for_commit.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), ()>(())
+        },
+    );
 
     assert!(!inject_once.load(Ordering::SeqCst));
     assert_eq!(action_calls.load(Ordering::SeqCst), 1);
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::MetadataCommandOutcomeUnconfirmed { .. })
-    ));
+    match result {
+        Err(crate::ObjectPgActionError::Store(StoreError::MetadataCommandOutcomeUnconfirmed {
+            ..
+        })) => {}
+        Ok(Ok(outcome)) => {
+            // Once ownership has been relinquished, the static recovery worker may apply
+            // the command before the foreground request re-enters recovery admission. In
+            // that ordering the request legitimately projects the authorized result.
+            assert_eq!(outcome.version_id, crate::VersionId::Null);
+            assert_eq!(outcome.live_size, payload.len() as u64);
+            assert_eq!(outcome.stale_generation_id, None);
+            assert!(
+                pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none(),
+                "successful foreground projection requires completed authorized recovery"
+            );
+            assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 0);
+        }
+        Ok(Err(error)) => panic!("direct PUT action unexpectedly failed: {error:?}"),
+        Err(error) => panic!("unexpected direct PUT recovery handoff error: {error:?}"),
+    }
     assert!(
         recovery_sweeper.test_wake_count() > wake_count_before_commit,
         "direct PUT recovery handoff must wake the static recovery owner"
