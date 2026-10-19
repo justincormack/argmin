@@ -1,7 +1,9 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{bucket_name, multipart_upload_id, object_key, stream_session_id};
+use super::{
+    bucket_name, metadata_only_test_encryption, multipart_upload_id, object_key, stream_session_id,
+};
 use crate::metadata_command::{
     DeleteFinalizedBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
     MetadataCommandLogIndex, MetadataCommandPayload,
@@ -56,7 +58,7 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     });
 
     // Put
@@ -110,7 +112,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     });
     store.put_object_meta(&req1).unwrap();
 
@@ -130,7 +132,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     });
     store.put_object_meta(&req2).unwrap();
 
@@ -167,7 +169,7 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         });
         store.put_object_meta(&req).unwrap();
     }
@@ -208,7 +210,7 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         });
         store.put_object_meta(&req).unwrap();
     }
@@ -248,7 +250,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         });
         store.put_object_meta(&req).unwrap();
     }
@@ -355,7 +357,7 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     });
     store.put_object_meta(&req).unwrap();
 
@@ -382,7 +384,7 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     });
     store.put_object_meta(&req).unwrap();
 
@@ -670,7 +672,7 @@ fn delete_bucket_clears_object_version_counter_records() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
     let counter_rows = store
@@ -1725,7 +1727,7 @@ fn list_aborting_multipart_upload_bucket_witnesses_returns_one_key_per_bucket() 
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             })
             .unwrap();
     }
@@ -1839,7 +1841,7 @@ fn file_metadata_object_has_standard_layout() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -1872,7 +1874,7 @@ fn mpu_create_and_get_upload() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -1924,7 +1926,7 @@ fn mpu_create_upload_with_checksum_fields() {
                 )
                 .unwrap(),
             ),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -1956,7 +1958,7 @@ fn mpu_create_upload_with_checksum_fields() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
     let rec2 = store
@@ -1989,7 +1991,7 @@ fn mpu_part_checksum_round_trip() {
                 )
                 .unwrap(),
             ),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -2128,7 +2130,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
                 )
                 .unwrap(),
             ),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -2147,7 +2149,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         metadata_blob: Some(vec![].into()),
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
 
     let cksum = ChecksumBytes::new([0xDE, 0xAD]).unwrap();
@@ -2237,7 +2239,7 @@ fn mpu_set_upload_state_transition() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -2290,7 +2292,7 @@ fn mpu_delete_upload_cascades_parts() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -2362,7 +2364,7 @@ fn mpu_upsert_part_and_get() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -2440,7 +2442,7 @@ fn mpu_list_parts_pagination() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -2538,7 +2540,7 @@ fn mpu_list_uploads_pagination() {
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             })
             .unwrap();
     }
@@ -2605,7 +2607,7 @@ fn mpu_list_uploads_with_prefix() {
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             })
             .unwrap();
     }
@@ -2715,7 +2717,7 @@ fn mpu_list_uploads_authenticated_stale_marker_preserves_position() {
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             })
             .unwrap();
     }
@@ -2767,7 +2769,7 @@ fn mpu_list_uploads_stale_marker_advances_across_cluster_epochs() {
         public_read: false,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     store
         .create_multipart_upload(&create(old_upload_id.clone()))
@@ -2814,7 +2816,7 @@ fn mpu_get_missing_part_returns_part_not_found() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -2851,7 +2853,7 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -3207,7 +3209,7 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 }
@@ -3908,7 +3910,7 @@ mod prop_tests {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             });
             store.put_object_meta(&req).unwrap();
         }
@@ -3979,7 +3981,7 @@ mod prop_tests {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
     }
 
@@ -4665,7 +4667,7 @@ fn stream_upload_create_get_delete() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -4701,7 +4703,7 @@ fn stream_upload_state_transitions() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -4762,7 +4764,7 @@ fn stream_upload_upload_part_kind() {
                 upload_id: multipart_upload_id("mpu-123"),
                 part_number: 3,
             },
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -4788,7 +4790,7 @@ fn stream_segment_append_and_list() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -4840,6 +4842,8 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
+            // This test writes literal stored bytes. Keep it in the explicitly deferred payload
+            // fixture corpus until it creates matching production ciphertext and geometry.
             encryption: ObjectEncryption::None,
         })
         .unwrap();
@@ -4889,7 +4893,7 @@ fn stream_segment_cascade_delete() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -4942,7 +4946,7 @@ fn put_object_with_segments_persists_manifest() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             &[
                 ObjectSegmentRecord {
@@ -5014,7 +5018,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             &[ObjectSegmentRecord {
                 bucket: bucket_name("bucket"),
@@ -5051,7 +5055,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             &[ObjectSegmentRecord {
                 bucket: bucket_name("bucket"),
@@ -5109,7 +5113,7 @@ fn delete_object_segments_cleanup() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             &[ObjectSegmentRecord {
                 bucket: bucket_name("bucket"),
@@ -5243,7 +5247,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -5331,7 +5335,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -5361,7 +5365,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
                 upload_id: multipart_upload_id("mpu-1"),
                 part_number: 1,
             },
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -5412,7 +5416,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
                 upload_id: multipart_upload_id("mpu-1"),
                 part_number: 1,
             },
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -5478,7 +5482,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -5491,7 +5495,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
                 upload_id: multipart_upload_id("mpu-correct"),
                 part_number: 1,
             },
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -5545,7 +5549,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -5559,7 +5563,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 upload_id: multipart_upload_id("mpu-zc"),
                 part_number: 1,
             },
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
     store
@@ -5640,7 +5644,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 upload_id: multipart_upload_id("mpu-zc"),
                 part_number: 1,
             },
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
     store
@@ -5818,7 +5822,7 @@ fn delete_stream_upload_removes_matching_object_generation_reservation() {
             bucket: bucket.clone(),
             key: key.clone(),
             target: StreamUploadTarget::PutObject,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
     store.delete_stream_upload(&session_id).unwrap();
@@ -6101,7 +6105,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -6114,7 +6118,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 upload_id: multipart_upload_id("mpu-cpc"),
                 part_number: 1,
             },
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -6183,7 +6187,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -6196,7 +6200,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 upload_id: multipart_upload_id("mpu-vid"),
                 part_number: 1,
             },
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -6268,7 +6272,7 @@ fn get_object_version_null() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -6300,7 +6304,7 @@ fn get_object_version_versioned() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -6341,7 +6345,7 @@ fn delete_object_version_null() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -6378,7 +6382,7 @@ fn delete_object_version_specific_leaves_others() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -6425,7 +6429,7 @@ fn list_object_versions_basic() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -6468,7 +6472,7 @@ fn list_object_versions_pagination() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -6526,7 +6530,7 @@ fn list_object_versions_start_at_uses_inclusive_key_lower_bound() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -6573,7 +6577,7 @@ fn list_object_versions_with_prefix() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -6614,7 +6618,7 @@ fn list_object_versions_includes_delete_markers() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -6681,7 +6685,7 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
     store
@@ -6701,7 +6705,7 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
     store
@@ -6778,7 +6782,7 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
     store
@@ -6851,7 +6855,7 @@ fn put_object_meta_marks_displaced_live_version_noncurrent() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -6895,7 +6899,7 @@ fn put_delete_marker_marks_displaced_live_version_noncurrent() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
     store
@@ -6944,7 +6948,7 @@ fn null_live_write_marks_displaced_numbered_version_noncurrent() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
     store
@@ -6964,7 +6968,7 @@ fn null_live_write_marks_displaced_numbered_version_noncurrent() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -7007,7 +7011,7 @@ fn deleting_current_live_version_clears_revealed_live_noncurrent_timestamp() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -7055,7 +7059,7 @@ fn deleting_current_delete_marker_clears_revealed_live_noncurrent_timestamp() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
     store
@@ -7117,7 +7121,7 @@ fn next_version_id_increments() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -7168,7 +7172,7 @@ fn next_version_id_does_not_reuse_deleted_version() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
     store.delete_object_version(&bucket, &key, v1).unwrap();
@@ -7214,7 +7218,7 @@ fn object_tags_round_trip() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -7354,7 +7358,7 @@ fn list_all_stream_uploads_returns_sessions() {
             bucket: bucket_name("bucket"),
             key: object_key("k1"),
             target: StreamUploadTarget::PutObject,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
     store
@@ -7363,7 +7367,7 @@ fn list_all_stream_uploads_returns_sessions() {
             bucket: bucket_name("bucket"),
             key: object_key("k2"),
             target: StreamUploadTarget::PutObject,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -7392,7 +7396,7 @@ fn list_stream_uploads_for_bucket_page_paginates_and_scopes_bucket() {
                 bucket: bucket_name(bucket),
                 key: object_key(key),
                 target: StreamUploadTarget::PutObject,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             })
             .unwrap();
     }
@@ -7441,7 +7445,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -7980,7 +7984,7 @@ fn complete_multipart_commit_no_such_upload() {
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let parts = vec![ObjectPartRecord {
         bucket: bucket_name("bucket"),
@@ -8176,7 +8180,7 @@ fn live_object_object_lock_round_trip() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -8211,7 +8215,7 @@ fn put_object_retention_and_legal_hold_round_trip() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -8306,7 +8310,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
             public_read: false,
             object_lock,
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
         .unwrap();
 
@@ -8339,7 +8343,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: sample_object_lock_state(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let parts = vec![ObjectPartRecord {
         bucket: bucket_name("bucket"),

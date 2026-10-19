@@ -1,7 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{bucket_name, object_key};
+use super::{bucket_name, metadata_only_test_encryption, object_key};
 use crate::types::*;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -599,7 +599,7 @@ mod tests {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         })
     }
 

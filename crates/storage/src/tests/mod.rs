@@ -1,7 +1,10 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::types::{BucketName, ObjectKey, SessionId, UploadId, SESSION_ID_LEN, UPLOAD_ID_LEN};
+use crate::types::{
+    BucketName, ObjectEncryption, ObjectKey, SessionId, SseS3ObjectState, UploadId, SESSION_ID_LEN,
+    SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN, SSE_S3_WRAP_NONCE_LEN, UPLOAD_ID_LEN,
+};
 
 mod integration_tests;
 mod metadata_tests;
@@ -14,6 +17,20 @@ pub(super) fn bucket_name(name: impl Into<String>) -> BucketName {
 
 pub(super) fn object_key(key: impl Into<String>) -> ObjectKey {
     ObjectKey::try_from(key.into()).expect("storage tests must use valid object keys")
+}
+
+/// Canonical encrypted state for metadata-only fixtures.
+///
+/// The wrapped key material is intentionally synthetic and cannot be used to read payload.
+/// Payload-bearing tests must create encryption state and ciphertext through the production
+/// crypto path instead.
+pub(super) fn metadata_only_test_encryption() -> ObjectEncryption {
+    ObjectEncryption::SseS3(SseS3ObjectState::new(
+        1,
+        [2; SSE_S3_WRAP_NONCE_LEN],
+        [3; SSE_S3_WRAPPED_DEK_LEN],
+        [4; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    ))
 }
 
 pub(crate) fn object_tags(xml: &str) -> crate::SerializedTagSet {

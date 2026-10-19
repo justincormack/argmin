@@ -8,6 +8,7 @@ use crate::metadata_command::{
     PendingMetadataCommandInspection,
 };
 use crate::node_runtime::traits::PgMetadataStore;
+use crate::tests::metadata_only_test_encryption;
 use crate::PgTopology;
 
 #[path = "publication_model.rs"]
@@ -64,7 +65,7 @@ fn multipart_upload_schema_rejects_invalid_identity_values() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         },
     )
     .unwrap();
@@ -126,7 +127,7 @@ fn current_pg_schema_v6_checksum_tags_match_frozen_owner_encoding_and_require_ve
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: Some(checksum),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         },
     )
     .unwrap();
@@ -2356,7 +2357,7 @@ fn test_live_object(bucket: BucketName, key: ObjectKey, generation_id: u64) -> P
         metadata_blob: Some(SerializedMetadataBlob::default()),
         system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     }
 }
 
@@ -2440,7 +2441,7 @@ fn test_commit_multipart_req(bucket: BucketName, key: ObjectKey) -> CommitMultip
         metadata_blob: Some(SerializedMetadataBlob::default()),
         system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     }
 }
 
@@ -2634,7 +2635,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     public_read: false,
                     object_lock: ObjectLockState::default(),
                     checksum: None,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
             )
         },
@@ -2659,7 +2660,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     public_read: false,
                     object_lock: ObjectLockState::default(),
                     checksum: None,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
             )
             .unwrap();
@@ -2975,7 +2976,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     public_read: false,
                     object_lock: ObjectLockState::default(),
                     checksum: None,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
             )
             .unwrap();
@@ -3018,7 +3019,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     public_read: false,
                     object_lock: ObjectLockState::default(),
                     checksum: None,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
             )
             .unwrap();
@@ -3054,7 +3055,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     public_read: false,
                     object_lock: ObjectLockState::default(),
                     checksum: None,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
             )
             .unwrap();
@@ -3090,7 +3091,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     public_read: false,
                     object_lock: ObjectLockState::default(),
                     checksum: None,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
             )
             .unwrap();
@@ -3106,7 +3107,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                         ),
                         part_number: 1,
                     },
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
             )
             .unwrap();
@@ -3138,7 +3139,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     bucket: trusted_bucket_name("commit-fail-delete-stream"),
                     key: trusted_object_key("object"),
                     target: StreamUploadTarget::PutObject,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
             )
             .unwrap();
@@ -3264,7 +3265,7 @@ fn metadata_digest_cache_tracks_multipart_upload_create() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         },
     )
     .unwrap();
@@ -3302,7 +3303,7 @@ fn metadata_command_apply_tracks_multipart_upload_create_digest() {
         public_read: false,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let command = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
@@ -3649,6 +3650,8 @@ fn insert_digest_multipart_upload(store: &PgStore, upload_id: &UploadId) {
     let owner = test_owner();
     let bucket = trusted_bucket_name("digest-bucket");
     let key = trusted_object_key("object");
+    let encryption = metadata_only_test_encryption();
+    let encryption_state = encryption.encode_state();
     store
         .conn
         .execute(
@@ -3674,8 +3677,8 @@ fn insert_digest_multipart_upload(store: &PgStore, upload_id: &UploadId) {
                 owner.canonical_id.as_str(),
                 Option::<u8>::None,
                 Option::<u8>::None,
-                ObjectEncryption::None.encryption_type() as u8,
-                Option::<&[u8]>::None,
+                encryption.encryption_type() as u8,
+                encryption_state.as_deref(),
                 PgStore::serialize_acl_grants(&AclGrants::default()),
                 0_i64,
                 1_i64,
@@ -5359,7 +5362,7 @@ fn install_metadata_transfer_checkpoint_base_restores_complete_stream_session() 
         state: StreamUploadState::InProgress,
         created_at: 123,
         cleanup_after: Some(456),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::new(7).unwrap(),
         bucket_write_reservation: Some(proof),
     };
@@ -6348,7 +6351,7 @@ fn pending_metadata_command_slot_rejects_huge_repeated_count_before_allocation()
                 metadata_blob: Some(SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             segments: Vec::new(),
             generation_reservation_id: reservation_id.clone(),
@@ -6440,7 +6443,7 @@ fn pending_metadata_command_slot_rejects_proofless_create_multipart_upload() {
                     public_read: false,
                     object_lock: ObjectLockState::default(),
                     checksum: None,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
                 GenerationId::MIN,
                 None,
@@ -7823,7 +7826,7 @@ fn terminal_stream_upload_cleanup_record_excludes_allocator_floor() {
         state: StreamUploadState::InProgress,
         created_at: 123,
         cleanup_after: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::new(2).unwrap(),
         bucket_write_reservation: None,
     };
@@ -7862,7 +7865,7 @@ fn abort_stream_upload_command_binds_stable_reservation_identity() {
         state: StreamUploadState::InProgress,
         created_at: 123,
         cleanup_after: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::MIN,
         bucket_write_reservation: Some(proof.clone()),
     };
@@ -7941,7 +7944,7 @@ fn abort_multipart_command_validates_cleanup_before_accepting_lagging_stream_all
         state: StreamUploadState::InProgress,
         created_at: 456,
         cleanup_after: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::MIN,
         bucket_write_reservation: None,
     };
@@ -8067,6 +8070,8 @@ fn metadata_state_digest_covers_stream_upload_state() {
         |store| {
             let bucket = trusted_bucket_name("digest-bucket");
             let key = trusted_object_key("object");
+            let encryption = metadata_only_test_encryption();
+            let encryption_state = encryption.encode_state();
             store
                 .conn
                 .execute(
@@ -8083,8 +8088,8 @@ fn metadata_state_digest_covers_stream_upload_state() {
                         Option::<i64>::None,
                         StreamUploadState::InProgress as u8,
                         104_i64,
-                        ObjectEncryption::None.encryption_type() as u8,
-                        Option::<&[u8]>::None,
+                        encryption.encryption_type() as u8,
+                        encryption_state.as_deref(),
                     ],
                 )
                 .unwrap();
@@ -8105,6 +8110,8 @@ fn metadata_state_digest_covers_stream_upload_state() {
             let bucket = trusted_bucket_name("digest-bucket");
             let key = trusted_object_key("object");
             let okh = [5_u8; 16];
+            let encryption = metadata_only_test_encryption();
+            let encryption_state = encryption.encode_state();
             store
                 .conn
                 .execute(
@@ -8121,8 +8128,8 @@ fn metadata_state_digest_covers_stream_upload_state() {
                         Option::<i64>::None,
                         StreamUploadState::InProgress as u8,
                         105_i64,
-                        ObjectEncryption::None.encryption_type() as u8,
-                        Option::<&[u8]>::None,
+                        encryption.encryption_type() as u8,
+                        encryption_state.as_deref(),
                     ],
                 )
                 .unwrap();
@@ -8823,7 +8830,7 @@ fn stale_delete_marker_delete_command_cannot_delete_newer_null_marker() {
                 metadata_blob: Some(SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             segments: Vec::new(),
             generation_reservation_id: replacement_reservation_id.clone(),
@@ -8949,7 +8956,7 @@ fn recovered_object_delete_commands_reject_mismatched_reclaim_roots_before_mutat
                 metadata_blob: Some(SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             segments: vec![live_segment],
             generation_reservation_id: reservation_id.clone(),
@@ -9377,7 +9384,7 @@ fn direct_put_terminal_cleanup_command_with_write_sequence(
                 metadata_blob: Some(SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             segments: Vec::new(),
             generation_reservation_id: reservation_id.clone(),
@@ -9416,6 +9423,8 @@ fn insert_direct_put_terminal_staging(
     reservation_id: &SessionId,
 ) {
     let proof = direct_put_terminal_cleanup_proof(bucket, key);
+    let encryption = metadata_only_test_encryption();
+    let encryption_state = encryption.encode_state();
     store
         .conn
         .execute(
@@ -9452,8 +9461,8 @@ fn insert_direct_put_terminal_staging(
                 Option::<i64>::None,
                 StreamUploadState::InProgress as u8,
                 1_i64,
-                ObjectEncryption::None.encryption_type() as u8,
-                Option::<&[u8]>::None,
+                encryption.encryption_type() as u8,
+                encryption_state.as_deref(),
                 proof.reservation_id,
                 proof.owner_token,
                 proof.cluster_epoch.get() as i64,
@@ -9951,7 +9960,7 @@ fn list_objects_prefix_and_start_after() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -10096,7 +10105,7 @@ fn list_objects_pagination() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -10154,7 +10163,7 @@ fn list_objects_start_at_is_inclusive() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -10197,7 +10206,7 @@ fn object_layout_schema_rejects_invalid_discriminant() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -10240,7 +10249,7 @@ fn stored_object_tags_reject_noncanonical_xml_when_decoded() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 

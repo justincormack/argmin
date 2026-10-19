@@ -2,8 +2,8 @@
 
 Status: in progress. Phases 0 and 1 are complete. Production write selection and active write
 authority are encrypted-only, including terminal publication and provider-failure behavior. Phase
-2's positive test-corpus migration is next. The design decision to remove the plaintext payload
-state is accepted.
+2's positive test-corpus migration is in progress. The design decision to remove the plaintext
+payload state is accepted.
 
 ## Context
 
@@ -450,6 +450,21 @@ this phase compiles and tests independently:
 At this phase's exit no positive production, integration, property, or model test constructs
 `ObjectEncryption::None`. The only remaining uses are the production definitions/branches being
 removed in Phase 3 and immutable owner-local malformed/rejection evidence.
+
+#### Phase 2 implementation ledger
+
+- Storage now owns `metadata_only_test_encryption`, a canonical SSE-S3 state for tests that exercise
+  metadata semantics without reading payload. Its name and documentation prohibit using its
+  synthetic wrapped-key bytes in payload-bearing fixtures; those fixtures must continue through
+  the production crypto path.
+- The generic metadata-store suite, its state-machine/property generator, and the PgStore metadata
+  suite now use encrypted state for their positive live-object, multipart-upload, part-session,
+  listing, versioning, digest, and command-application fixtures. Direct SQL setup in that corpus
+  writes the matching encoded encryption state rather than crossing an SSE-S3 discriminator with
+  a null state.
+- This slice removes 116 positive `ObjectEncryption::None` constructions. The remaining 371 source
+  occurrences are deliberately left for the payload-bearing/command-codec fixture migrations and
+  Phase 3's production removal and immutable rejection evidence; Phase 2 is not yet complete.
 
 ### Phase 3: Atomically close durable and recovery state
 
