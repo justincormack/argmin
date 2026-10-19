@@ -3192,7 +3192,7 @@ fn applied_stream_abort_reopen_releases_stream_create_reservation() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
 
@@ -3327,7 +3327,7 @@ fn unpublished_stream_abort_reopen_retains_live_session_reservation() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let stream_create_bucket_write_reservation = {
@@ -3449,7 +3449,7 @@ fn unpublished_stream_create_reopen_releases_command_reservation() {
                     bucket: bucket.clone(),
                     key: key.clone(),
                     target: crate::StreamUploadTarget::PutObject,
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
                 1,
                 proof.clone(),
@@ -3549,7 +3549,7 @@ fn partially_applied_older_stream_create_fails_closed_without_cleanup() {
                     bucket: bucket.clone(),
                     key: key.clone(),
                     target: crate::StreamUploadTarget::PutObject,
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
                 1,
                 proof.clone(),
@@ -3831,7 +3831,7 @@ fn stream_abort_matching_pending_install_race_returns_success() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let stream_create_bucket_write_reservation = {
@@ -3921,7 +3921,7 @@ fn stream_put_waits_for_unrelated_abort_authorized_recovery() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let waiter_session_id = crate::SessionId::try_from("59".repeat(16)).unwrap();
@@ -3930,7 +3930,7 @@ fn stream_put_waits_for_unrelated_abort_authorized_recovery() {
             &bucket,
             &waiter_key,
             &waiter_session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let stream_create_bucket_write_reservation = {
@@ -4006,7 +4006,7 @@ fn stream_put_waits_for_unrelated_abort_authorized_recovery() {
                             metadata_blob: crate::SerializedMetadataBlob::default(),
                             system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                             object_lock: crate::ObjectLockState::default(),
-                            encryption: crate::ObjectEncryption::None,
+                            encryption: crate::tests::metadata_only_test_encryption(),
                         })
                     },
                 ))
@@ -4080,7 +4080,7 @@ fn stream_put_create_waits_for_unrelated_abort_authorized_recovery() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let waiter_session_id = crate::SessionId::try_from("5d".repeat(16)).unwrap();
@@ -4141,7 +4141,7 @@ fn stream_put_create_waits_for_unrelated_abort_authorized_recovery() {
                     create_bucket,
                     create_key,
                     create_session_id,
-                    crate::ObjectEncryption::None,
+                    crate::tests::metadata_only_test_encryption(),
                 ))
                 .unwrap();
         });
@@ -4276,7 +4276,7 @@ fn assert_stream_create_post_snapshot_race_waits_for_authorized_recovery(
                     create_bucket,
                     create_key,
                     create_session_id,
-                    crate::ObjectEncryption::None,
+                    crate::tests::metadata_only_test_encryption(),
                 ))
                 .unwrap();
         });
@@ -5648,7 +5648,7 @@ fn stream_put_finalize_missing_session_same_pg_does_not_call_action() {
                 metadata_blob: crate::SerializedMetadataBlob::default(),
                 system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
+                encryption: crate::tests::metadata_only_test_encryption(),
             })
         })
         .unwrap_err();
@@ -5700,7 +5700,7 @@ fn stream_put_finalize_action_failure_preserves_stream_write_proof() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let result: Result<crate::FinalizeStreamPutOutcome<()>, &str> = cluster
@@ -5750,7 +5750,7 @@ fn stream_put_finalize_releases_only_its_session_write_proof() {
                 &bucket,
                 &key,
                 session_id,
-                crate::ObjectEncryption::None,
+                crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
     }
@@ -5795,7 +5795,7 @@ fn stream_put_finalize_releases_only_its_session_write_proof() {
                 metadata_blob: crate::SerializedMetadataBlob::default(),
                 system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
+                encryption: crate::tests::metadata_only_test_encryption(),
             })
         })
         .unwrap()
@@ -5850,7 +5850,7 @@ fn generic_pending_drain_rejects_stream_put_with_substituted_proof() {
                 &bucket,
                 &key,
                 session_id,
-                crate::ObjectEncryption::None,
+                crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
     }
@@ -5907,7 +5907,7 @@ fn generic_pending_drain_rejects_stream_put_with_substituted_proof() {
                 metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
+                encryption: crate::tests::metadata_only_test_encryption(),
             },
             segments: Vec::new(),
             generation_reservation_id: first_session.clone(),

@@ -502,7 +502,11 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   exact applied-command matching, partial-apply retry, mismatch rejection, pending-command
   contention, and empty-session abort tests. These cases do not write or read payload; the adjacent
   append tests remain coupled to their production-compatible ciphertext migration.
-- The remaining 203 source occurrences are deliberately left for the payload-bearing and
+- The empty-session recovery and finalization slice removes another 17 positive plaintext
+  constructions from reopen/recovery, abort races, zero-byte finalization and reservation-proof
+  binding, and segment-free malformed-proof rejection. Tests that stage or inspect non-empty
+  payload remain coupled to their production-compatible ciphertext migration.
+- The remaining 186 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 
