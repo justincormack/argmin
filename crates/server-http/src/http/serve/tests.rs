@@ -323,13 +323,14 @@ Connection: close\r\n\r\n",
         let installer = std::thread::spawn(move || {
             runtime_handle.install(installed_candidate).unwrap();
         });
-        let pending_handle = storage_handle.clone();
-        tokio::task::spawn_blocking(move || {
-            pending_handle.test_wait_until_route_publication_is_pending();
-        })
-        .await
-        .unwrap();
 
+        // Do not wait separately for the transient Draining state here. The
+        // publication can interrupt the body-frame wait and return to Open
+        // before a separate observer acquires the admission-gate lock. Such
+        // an observer would then miss the completed transition and wait
+        // forever. The bounded join proves publication completed, while the
+        // candidate and response assertions below prove that this exact
+        // publication interrupted the admitted request.
         tokio::time::timeout(
             PROGRESS_TIMEOUT,
             tokio::task::spawn_blocking(move || installer.join().unwrap()),
