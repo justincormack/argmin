@@ -679,7 +679,7 @@ fn unix_peering_metadata_certificate_preserves_get_and_list_without_write_author
     retained
         .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
         .unwrap();
-    assert_eq!(bytes, payload);
+    assert_eq!(bytes, committed.encrypted.storage_bytes);
 
     let reservation_id = crate::tests::stream_session_id("peering-write");
     assert!(matches!(
@@ -1034,7 +1034,7 @@ fn unix_retained_read_reconstructs_with_historical_primary_down_and_corrupt_surv
     retained
         .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
         .unwrap();
-    assert_eq!(bytes, payload);
+    assert_eq!(bytes, committed.encrypted.storage_bytes);
 
     drop(retained);
     drop(cluster);
@@ -11864,8 +11864,8 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
         data_pg_id: committed.written.data_pg_id,
         segment_okh: committed.segment_okh,
         segment_vid: committed.generation_id,
-        stored_size: committed.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&committed.payload),
+        stored_size: committed.encrypted.storage_bytes.len(),
+        segment_crc64: committed.encrypted.storage_crc64,
         ec: committed.written.ec,
     };
 
@@ -11904,7 +11904,7 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
             &mut historical_read,
         )
         .unwrap();
-    assert_eq!(historical_read, committed.payload);
+    assert_eq!(historical_read, committed.encrypted.storage_bytes);
 
     for written in &committed.written.written_shards {
         let location = committed

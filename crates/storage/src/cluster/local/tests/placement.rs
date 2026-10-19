@@ -4,6 +4,35 @@
 use super::*;
 use crate::test_support::StorageClusterTopologyTestSupport as _;
 
+fn encrypted_stored_shard_len(segment: &CommittedDirectSegment) -> usize {
+    segment
+        .encrypted
+        .storage_bytes
+        .len()
+        .div_ceil(usize::from(segment.written.ec.k))
+}
+
+fn overwrite_shard_with_same_length_corruption(
+    shard_path: &std::path::Path,
+    expected_shard_len: usize,
+) {
+    let mut corrupt_bytes = std::fs::read(shard_path).unwrap();
+    assert_eq!(corrupt_bytes.len(), expected_shard_len);
+    let original_crc64 = checksum::crc64::checksum(&corrupt_bytes);
+    let first = corrupt_bytes
+        .first_mut()
+        .expect("encrypted shard must contain at least the AEAD tag");
+    *first = first.wrapping_add(1);
+    assert_ne!(checksum::crc64::checksum(&corrupt_bytes), original_crc64);
+
+    std::fs::write(shard_path, &corrupt_bytes).unwrap();
+    assert_eq!(
+        std::fs::metadata(shard_path).unwrap().len(),
+        expected_shard_len as u64,
+        "checksum corruption must preserve the physical shard length"
+    );
+}
+
 #[test]
 fn object_payload_placement_diagnostic_distinguishes_mismatch_from_unavailability() {
     let tmp = test_util::tempdir();
@@ -1759,11 +1788,12 @@ fn placed_segment_recovery_treats_length_corrupt_shard_as_recoverable() {
         .unwrap();
         let segment =
             write_committed_direct_segment(&cluster, b"phase-five-length-corrupt-payload");
-        let shard_size = segment
-            .payload
-            .len()
-            .div_ceil(usize::from(segment.written.ec.k));
-        let corrupt_len = if extra_length { shard_size + 1 } else { 1 };
+        let shard_size = encrypted_stored_shard_len(&segment);
+        let corrupt_len = if extra_length {
+            shard_size + 1
+        } else {
+            shard_size - 1
+        };
         let shard_path = cluster
             .test_payload_shard_file_path(
                 segment.written.data_pg_id,
@@ -1773,7 +1803,16 @@ fn placed_segment_recovery_treats_length_corrupt_shard_as_recoverable() {
                 0,
             )
             .unwrap();
+        assert_eq!(
+            std::fs::metadata(&shard_path).unwrap().len(),
+            shard_size as u64
+        );
+        assert_eq!(corrupt_len > shard_size, extra_length);
         std::fs::write(&shard_path, vec![0xAB; corrupt_len]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&shard_path).unwrap().len(),
+            corrupt_len as u64
+        );
 
         let mut recovered = Vec::new();
         cluster
@@ -1782,8 +1821,8 @@ fn placed_segment_recovery_treats_length_corrupt_shard_as_recoverable() {
                     data_pg_id: segment.written.data_pg_id,
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.generation_id,
-                    stored_size: segment.payload.len(),
-                    segment_crc64: checksum::crc64::checksum(&segment.payload),
+                    stored_size: segment.encrypted.storage_bytes.len(),
+                    segment_crc64: segment.encrypted.storage_crc64,
                     ec: segment.written.ec,
                 },
                 &mut recovered,
@@ -1791,7 +1830,7 @@ fn placed_segment_recovery_treats_length_corrupt_shard_as_recoverable() {
             .unwrap();
 
         assert_eq!(
-            recovered, segment.payload,
+            recovered, segment.encrypted.storage_bytes,
             "failed to recover when corrupt shard extra_length={extra_length}"
         );
     }
@@ -1817,10 +1856,7 @@ fn placed_segment_recovery_treats_checksum_corrupt_shard_as_recoverable() {
     .unwrap();
     let segment =
         write_committed_direct_segment(&cluster, b"phase-eleven-checksum-corrupt-payload");
-    let shard_size = segment
-        .payload
-        .len()
-        .div_ceil(usize::from(segment.written.ec.k));
+    let shard_size = encrypted_stored_shard_len(&segment);
     let shard_path = cluster
         .test_payload_shard_file_path(
             segment.written.data_pg_id,
@@ -1830,7 +1866,7 @@ fn placed_segment_recovery_treats_checksum_corrupt_shard_as_recoverable() {
             0,
         )
         .unwrap();
-    std::fs::write(&shard_path, vec![0xAB; shard_size]).unwrap();
+    overwrite_shard_with_same_length_corruption(&shard_path, shard_size);
 
     let mut recovered = Vec::new();
     cluster
@@ -1839,15 +1875,15 @@ fn placed_segment_recovery_treats_checksum_corrupt_shard_as_recoverable() {
                 data_pg_id: segment.written.data_pg_id,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
-                stored_size: segment.payload.len(),
-                segment_crc64: checksum::crc64::checksum(&segment.payload),
+                stored_size: segment.encrypted.storage_bytes.len(),
+                segment_crc64: segment.encrypted.storage_crc64,
                 ec: segment.written.ec,
             },
             &mut recovered,
         )
         .unwrap();
 
-    assert_eq!(recovered, segment.payload);
+    assert_eq!(recovered, segment.encrypted.storage_bytes);
 }
 
 #[test]
@@ -1887,15 +1923,15 @@ fn placed_segment_recovery_treats_missing_shard_as_recoverable() {
                 data_pg_id: segment.written.data_pg_id,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
-                stored_size: segment.payload.len(),
-                segment_crc64: checksum::crc64::checksum(&segment.payload),
+                stored_size: segment.encrypted.storage_bytes.len(),
+                segment_crc64: segment.encrypted.storage_crc64,
                 ec: segment.written.ec,
             },
             &mut recovered,
         )
         .unwrap();
 
-    assert_eq!(recovered, segment.payload);
+    assert_eq!(recovered, segment.encrypted.storage_bytes);
 }
 
 #[test]
@@ -1935,8 +1971,8 @@ fn placed_segment_recovery_rejects_more_missing_shards_than_ec_can_tolerate() {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
     let mut recovered = Vec::new();
@@ -2008,8 +2044,8 @@ fn placed_segment_read_preserves_temporary_unavailability_when_ec_cannot_complet
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
 
@@ -2077,8 +2113,8 @@ fn placed_segment_read_carries_direct_temporary_unavailability_into_ec_failure()
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
 
@@ -2138,8 +2174,8 @@ fn repair_placed_segment_payload_shards_restores_multiple_missing_physical_shard
                 data_pg_id: segment.written.data_pg_id,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
-                stored_size: segment.payload.len(),
-                segment_crc64: checksum::crc64::checksum(&segment.payload),
+                stored_size: segment.encrypted.storage_bytes.len(),
+                segment_crc64: segment.encrypted.storage_crc64,
                 ec: segment.written.ec,
             },
             &shard_indices,
@@ -2168,14 +2204,14 @@ fn repair_placed_segment_payload_shards_restores_multiple_missing_physical_shard
                 data_pg_id: segment.written.data_pg_id,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
-                stored_size: segment.payload.len(),
-                segment_crc64: checksum::crc64::checksum(&segment.payload),
+                stored_size: segment.encrypted.storage_bytes.len(),
+                segment_crc64: segment.encrypted.storage_crc64,
                 ec: segment.written.ec,
             },
             &mut read_back,
         )
         .unwrap();
-    assert_eq!(read_back, segment.payload);
+    assert_eq!(read_back, segment.encrypted.storage_bytes);
 }
 
 #[test]
@@ -2217,19 +2253,16 @@ fn placed_segment_payload_shard_repair_targets_identifies_and_clears_missing_and
             corrupt_shard.get(),
         )
         .unwrap();
-    let corrupt_size = segment
-        .payload
-        .len()
-        .div_ceil(usize::from(segment.written.ec.k));
+    let corrupt_size = encrypted_stored_shard_len(&segment);
     std::fs::remove_file(&missing_path).unwrap();
-    std::fs::write(&corrupt_path, vec![0xAB; corrupt_size]).unwrap();
+    overwrite_shard_with_same_length_corruption(&corrupt_path, corrupt_size);
 
     let req = crate::SegmentStoredBytesRequest {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
     let health = cluster.placed_segment_payload_shard_health(req).unwrap();
@@ -2355,8 +2388,8 @@ fn placed_segment_payload_shard_health_uses_reconstructed_pg_route_snapshot() {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
     let current_epoch = ClusterEpoch::new(route.cluster_epoch().get() + 1).unwrap();
@@ -2574,8 +2607,8 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
     let mut desired_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
@@ -2698,7 +2731,7 @@ fn placed_segment_read_uses_recorded_historical_placement_epoch() {
         )
         .unwrap();
 
-    assert_eq!(recovered, fixture.segment.payload);
+    assert_eq!(recovered, fixture.segment.encrypted.storage_bytes);
 }
 
 #[test]
@@ -4158,8 +4191,8 @@ fn repair_placed_segment_payload_shards_if_needed_noops_for_clean_segment() {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
     let health = cluster.placed_segment_payload_shard_health(req).unwrap();
@@ -4181,7 +4214,7 @@ fn repair_placed_segment_payload_shards_if_needed_noops_for_clean_segment() {
 }
 
 #[test]
-fn placed_segment_payload_shard_health_treats_zero_byte_segment_as_full_shard_set() {
+fn placed_segment_payload_shard_health_treats_encrypted_empty_payload_as_full_shard_set() {
     let tmp = test_util::tempdir();
     let node_ids = [
         NodeId::new(0),
@@ -4203,8 +4236,8 @@ fn placed_segment_payload_shard_health_treats_zero_byte_segment_as_full_shard_se
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: 0,
-        segment_crc64: checksum::crc64::checksum(&[]),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
 
@@ -4268,19 +4301,16 @@ fn repair_placed_segment_payload_shards_if_needed_repairs_identified_targets() {
             corrupt_shard.get(),
         )
         .unwrap();
-    let corrupt_size = segment
-        .payload
-        .len()
-        .div_ceil(usize::from(segment.written.ec.k));
+    let corrupt_size = encrypted_stored_shard_len(&segment);
     std::fs::remove_file(&missing_path).unwrap();
-    std::fs::write(&corrupt_path, vec![0xAB; corrupt_size]).unwrap();
+    overwrite_shard_with_same_length_corruption(&corrupt_path, corrupt_size);
 
     let req = crate::SegmentStoredBytesRequest {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
     let repaired = cluster
@@ -4323,10 +4353,7 @@ fn read_recovery_queues_observed_corrupt_placed_shard_repair_once() {
     .unwrap();
     let segment = write_committed_direct_segment(&cluster, b"phase-eleven-read-repair-schedule");
     let data_shard_index = ShardIndex::new(0);
-    let shard_size = segment
-        .payload
-        .len()
-        .div_ceil(usize::from(segment.written.ec.k));
+    let shard_size = encrypted_stored_shard_len(&segment);
     let shard_path = cluster
         .test_payload_shard_file_path(
             segment.written.data_pg_id,
@@ -4336,13 +4363,13 @@ fn read_recovery_queues_observed_corrupt_placed_shard_repair_once() {
             data_shard_index.get(),
         )
         .unwrap();
-    std::fs::write(&shard_path, vec![0xAB; shard_size]).unwrap();
+    overwrite_shard_with_same_length_corruption(&shard_path, shard_size);
     let req = crate::SegmentStoredBytesRequest {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
 
@@ -4354,7 +4381,7 @@ fn read_recovery_queues_observed_corrupt_placed_shard_repair_once() {
         cluster
             .read_segment_payload_stored_bytes_into(req, &mut recovered)
             .unwrap();
-        assert_eq!(recovered, segment.payload);
+        assert_eq!(recovered, segment.encrypted.storage_bytes);
     }
 
     let work = cluster
@@ -4410,10 +4437,7 @@ fn repair_placed_segment_payload_shard_queues_other_failed_shards_after_verifica
         write_committed_direct_segment(&cluster, b"phase-eleven-repair-verifies-full-set");
     let repaired_shard_index = ShardIndex::new(0);
     let other_shard_index = ShardIndex::new(segment.written.ec.k + segment.written.ec.m - 1);
-    let shard_size = segment
-        .payload
-        .len()
-        .div_ceil(usize::from(segment.written.ec.k));
+    let shard_size = encrypted_stored_shard_len(&segment);
     for shard_index in [repaired_shard_index, other_shard_index] {
         let shard_path = cluster
             .test_payload_shard_file_path(
@@ -4424,14 +4448,14 @@ fn repair_placed_segment_payload_shard_queues_other_failed_shards_after_verifica
                 shard_index.get(),
             )
             .unwrap();
-        std::fs::write(&shard_path, vec![0xAB; shard_size]).unwrap();
+        overwrite_shard_with_same_length_corruption(&shard_path, shard_size);
     }
     let req = crate::SegmentStoredBytesRequest {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
 
@@ -4484,10 +4508,7 @@ fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard
     .unwrap();
     let segment = write_committed_direct_segment(&cluster, b"phase-eleven-repair-corrupt-shard");
     let shard_index = ShardIndex::new(0);
-    let shard_size = segment
-        .payload
-        .len()
-        .div_ceil(usize::from(segment.written.ec.k));
+    let shard_size = encrypted_stored_shard_len(&segment);
     let shard_path = cluster
         .test_payload_shard_file_path(
             segment.written.data_pg_id,
@@ -4497,8 +4518,8 @@ fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard
             shard_index.get(),
         )
         .unwrap();
-    let corrupt_bytes = vec![0xAB; shard_size];
-    std::fs::write(&shard_path, &corrupt_bytes).unwrap();
+    overwrite_shard_with_same_length_corruption(&shard_path, shard_size);
+    let corrupt_bytes = std::fs::read(&shard_path).unwrap();
 
     let repaired = cluster
         .repair_placed_segment_payload_shards(
@@ -4506,8 +4527,8 @@ fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard
                 data_pg_id: segment.written.data_pg_id,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
-                stored_size: segment.payload.len(),
-                segment_crc64: checksum::crc64::checksum(&segment.payload),
+                stored_size: segment.encrypted.storage_bytes.len(),
+                segment_crc64: segment.encrypted.storage_crc64,
                 ec: segment.written.ec,
             },
             &[shard_index],
@@ -4534,14 +4555,14 @@ fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard
                 data_pg_id: segment.written.data_pg_id,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
-                stored_size: segment.payload.len(),
-                segment_crc64: checksum::crc64::checksum(&segment.payload),
+                stored_size: segment.encrypted.storage_bytes.len(),
+                segment_crc64: segment.encrypted.storage_crc64,
                 ec: segment.written.ec,
             },
             &mut read_back,
         )
         .unwrap();
-    assert_eq!(read_back, segment.payload);
+    assert_eq!(read_back, segment.encrypted.storage_bytes);
 }
 
 #[test]
@@ -4595,8 +4616,8 @@ fn repair_placed_segment_payload_shards_rejects_non_active_pg_route_without_writ
                     data_pg_id: segment.written.data_pg_id,
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.generation_id,
-                    stored_size: segment.payload.len(),
-                    segment_crc64: checksum::crc64::checksum(&segment.payload),
+                    stored_size: segment.encrypted.storage_bytes.len(),
+                    segment_crc64: segment.encrypted.storage_crc64,
                     ec: segment.written.ec,
                 },
                 &[shard_index],
@@ -4656,8 +4677,8 @@ fn repair_placed_segment_payload_shards_rejects_stale_operation_epoch_without_wr
                 data_pg_id: segment.written.data_pg_id,
                 segment_okh: segment.segment_okh,
                 segment_vid: segment.generation_id,
-                stored_size: segment.payload.len(),
-                segment_crc64: checksum::crc64::checksum(&segment.payload),
+                stored_size: segment.encrypted.storage_bytes.len(),
+                segment_crc64: segment.encrypted.storage_crc64,
                 ec: segment.written.ec,
             },
             &[shard_index],
@@ -4700,8 +4721,8 @@ fn repair_placed_segment_payload_shards_rejects_invalid_target_sets() {
         data_pg_id: segment.written.data_pg_id,
         segment_okh: segment.segment_okh,
         segment_vid: segment.generation_id,
-        stored_size: segment.payload.len(),
-        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        stored_size: segment.encrypted.storage_bytes.len(),
+        segment_crc64: segment.encrypted.storage_crc64,
         ec: segment.written.ec,
     };
 

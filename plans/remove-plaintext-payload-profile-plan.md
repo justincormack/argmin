@@ -526,7 +526,14 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   terminal-session cleanup, and streamed append fanout now persist coherent ciphertext and
   encrypted metadata. A shared encrypted direct-PUT request fixture preserves the logical/stored
   payload distinction for the remaining test migration.
-- The remaining 126 source occurrences are deliberately left for the payload-bearing and
+- The shared committed-direct-segment slice removes another two positive plaintext constructions.
+  The common fixture now persists coherent SSE-S3 ciphertext, and object-read lease, retained-route,
+  Unix, placement, repair, backfill, scavenger, and replay tests explicitly distinguish logical
+  plaintext metadata from reconstructed stored ciphertext. The encrypted empty-object health
+  canary now covers its reachable tag-bearing representation rather than an impossible zero-byte
+  stored segment. Corruption fixtures derive physical shard geometry from ciphertext and pin
+  checksum corruption as same-length while testing short and long length corruption separately.
+- The remaining 124 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 

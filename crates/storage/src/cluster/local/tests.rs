@@ -263,6 +263,7 @@ struct CommittedDirectSegment {
     generation_id: crate::GenerationId,
     segment_okh: [u8; 16],
     payload: Vec<u8>,
+    encrypted: crate::tests::SseS3SegmentTestFixture,
     written: crate::DirectPutWrittenSegment,
     locations: Vec<ShardLocation>,
 }
@@ -545,6 +546,7 @@ fn write_committed_direct_segment_for_with_versioning(
     let generation_id = cluster
         .reserve_put_object_generation(bucket, key, &reservation_id)
         .unwrap();
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     let written = cluster
         .write_direct_put_segment_payload_shards(
             bucket,
@@ -552,7 +554,7 @@ fn write_committed_direct_segment_for_with_versioning(
             generation_id,
             0,
             &segment_okh,
-            payload,
+            &encrypted.storage_bytes,
         )
         .unwrap();
     let commit_req = crate::CommitDirectPutObjectReq {
@@ -564,16 +566,16 @@ fn write_committed_direct_segment_for_with_versioning(
         acl_grants: crate::AclGrants::default(),
         public_read: false,
         generation_id,
-        size: payload.len() as u64,
+        size: encrypted.logical_size,
         etag_crc64: checksum::crc64::checksum(payload),
         ec: written.ec,
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
+        encryption: encrypted.encryption.clone(),
         segment_index: 0,
-        segment_crc64: checksum::crc64::checksum(payload),
+        segment_crc64: encrypted.storage_crc64,
         segment_okh,
         segment_vid: generation_id,
         data_pg_id: written.data_pg_id,
@@ -601,6 +603,7 @@ fn write_committed_direct_segment_for_with_versioning(
         generation_id,
         segment_okh,
         payload: payload.to_vec(),
+        encrypted,
         written,
         locations,
     }

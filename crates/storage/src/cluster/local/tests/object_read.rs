@@ -480,6 +480,7 @@ fn retained_read_with_unavailable_lease_nodes(
 #[derive(Debug)]
 struct RetainedReadTestOutcome {
     bytes: Vec<u8>,
+    expected_storage_bytes: Vec<u8>,
     read_shard_indices: Vec<u8>,
 }
 
@@ -512,7 +513,7 @@ fn retained_read_with_unavailable_lease_nodes_and_failure(
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
     let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
     let payload = b"retained EC read excludes every unleased shard location";
-    write_committed_direct_segment_for_with_versioning(
+    let committed = write_committed_direct_segment_for_with_versioning(
         &cluster,
         &bucket,
         &key,
@@ -585,6 +586,7 @@ fn retained_read_with_unavailable_lease_nodes_and_failure(
         .clone();
     Ok(RetainedReadTestOutcome {
         bytes,
+        expected_storage_bytes: committed.encrypted.storage_bytes,
         read_shard_indices,
     })
 }
@@ -592,10 +594,7 @@ fn retained_read_with_unavailable_lease_nodes_and_failure(
 #[test]
 fn retained_read_healthy_path_reads_only_the_data_shards() {
     let outcome = retained_read_with_unavailable_lease_nodes(&[]).unwrap();
-    assert_eq!(
-        outcome.bytes,
-        b"retained EC read excludes every unleased shard location"
-    );
+    assert_eq!(outcome.bytes, outcome.expected_storage_bytes);
     assert_eq!(
         outcome.read_shard_indices,
         (0..SharedStorageNode::DEFAULT_EC_SHAPE.k).collect::<Vec<_>>(),
@@ -607,10 +606,7 @@ fn retained_read_healthy_path_reads_only_the_data_shards() {
 fn retained_read_reconstructs_from_exact_successfully_leased_node_subset() {
     let outcome =
         retained_read_with_unavailable_lease_nodes(&[NodeId::new(0), NodeId::new(1)]).unwrap();
-    assert_eq!(
-        outcome.bytes,
-        b"retained EC read excludes every unleased shard location"
-    );
+    assert_eq!(outcome.bytes, outcome.expected_storage_bytes);
 }
 
 #[test]
@@ -691,7 +687,7 @@ fn retained_reads_do_not_reconnect_to_a_recently_unreachable_lease_node() {
     let bucket = crate::tests::bucket_name("broad-lease-unavailable-cache");
     let key = crate::tests::object_key("read");
     let payload = b"readable from the two surviving EC shards";
-    write_committed_direct_segment_for(&cluster, &bucket, &key, payload);
+    let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, payload);
     let read = || {
         let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
         let admission = handle.admit_current_route().unwrap();
@@ -721,16 +717,16 @@ fn retained_reads_do_not_reconnect_to_a_recently_unreachable_lease_node() {
     };
 
     let before = attempts.load(Ordering::Relaxed);
-    assert_eq!(read(), payload);
+    assert_eq!(read(), committed.encrypted.storage_bytes);
     assert_eq!(attempts.load(Ordering::Relaxed), before + 1);
-    assert_eq!(read(), payload);
+    assert_eq!(read(), committed.encrypted.storage_bytes);
     assert_eq!(attempts.load(Ordering::Relaxed), before + 1);
 
     recovered.store(true, Ordering::Relaxed);
     std::thread::sleep(OBJECT_PAYLOAD_LEASE_UNAVAILABLE_RETRY + Duration::from_millis(20));
-    assert_eq!(read(), payload);
+    assert_eq!(read(), committed.encrypted.storage_bytes);
     assert_eq!(attempts.load(Ordering::Relaxed), before + 2);
-    assert_eq!(read(), payload);
+    assert_eq!(read(), committed.encrypted.storage_bytes);
     assert_eq!(attempts.load(Ordering::Relaxed), before + 3);
 }
 
@@ -903,7 +899,7 @@ fn active_object_payload_read_binds_its_subject_segments_and_lease() {
     let cluster = current_cluster(&map);
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
     let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
-    write_committed_direct_segment_for_with_versioning(
+    let committed = write_committed_direct_segment_for_with_versioning(
         &cluster,
         &bucket,
         &key,
@@ -935,7 +931,7 @@ fn active_object_payload_read_binds_its_subject_segments_and_lease() {
     active
         .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
         .unwrap();
-    assert_eq!(bytes, b"active payload");
+    assert_eq!(bytes, committed.encrypted.storage_bytes);
 
     let crossed = segment.with_test_segment_index(segment.segment_index() + 1);
     assert!(!active.contains_object_payload_segments(
@@ -965,7 +961,7 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
     let cluster = current_cluster(&map);
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
     let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
-    write_committed_direct_segment_for_with_versioning(
+    let committed = write_committed_direct_segment_for_with_versioning(
         &cluster,
         &bucket,
         &key,
@@ -1025,7 +1021,7 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
     retained
         .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
         .unwrap();
-    assert_eq!(bytes, b"retained payload");
+    assert_eq!(bytes, committed.encrypted.storage_bytes);
     assert!(retained.covers_complete_object_payload_layout(
         &bucket,
         &key,
