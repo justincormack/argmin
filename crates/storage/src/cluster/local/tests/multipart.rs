@@ -1115,7 +1115,7 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -1222,7 +1222,7 @@ fn multipart_upload_lookup_fails_closed_while_metadata_pg_is_peering() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -1426,7 +1426,7 @@ fn multipart_create_terminal_install_conflict_reinspects_before_draining_newer_c
                         public_read: false,
                         object_lock: crate::ObjectLockState::default(),
                         checksum: None,
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                 ))
             },
@@ -1582,7 +1582,7 @@ fn multipart_create_command_id_race_drains_winner_and_reruns_authorization_actio
                         public_read: false,
                         object_lock: crate::ObjectLockState::default(),
                         checksum: None,
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                 ))
             },
@@ -1649,7 +1649,7 @@ fn multipart_create_command_applies_to_all_acting_object_pg_nodes() {
         public_read: true,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     let outcome = cluster
@@ -1728,7 +1728,7 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     let _serial = lock_metadata_command_apply_hook_test();
@@ -1910,7 +1910,7 @@ fn multipart_create_waits_after_transferring_unrelated_authorized_recovery() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     let create_result = thread::scope(|scope| {
@@ -2010,7 +2010,7 @@ fn multipart_create_partial_apply_reopens_and_converges() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     let fail_once = Arc::new(AtomicBool::new(true));
@@ -2155,7 +2155,7 @@ fn multipart_create_retry_rejects_same_request_with_mismatched_generation() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     cluster
@@ -2238,7 +2238,7 @@ fn multipart_abort_command_removes_upload_from_all_acting_object_pg_nodes() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -2287,7 +2287,7 @@ fn multipart_abort_command_removes_upload_from_all_acting_object_pg_nodes() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(

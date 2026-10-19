@@ -2283,7 +2283,7 @@ fn stream_upload_part_create_rejects_raced_upload_state(target_state: crate::Upl
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(

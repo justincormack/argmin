@@ -494,7 +494,11 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   validation, and durable allocator replay tests. These cases create, move, reject, or inspect
   metadata without exposing payload bytes; the three payload-bearing fanout cases remain for a
   production-compatible ciphertext migration.
-- The remaining 231 source occurrences are deliberately left for the payload-bearing and
+- The recovery and multipart-management slice removes another 18 positive plaintext
+  constructions from abandoned stream-create recovery, multipart create/convergence, empty-upload
+  abort, and raced UploadPart-session creation tests. Payload-bearing append, completion cleanup,
+  and uploaded-part abort cases remain coupled to their later ciphertext migration.
+- The remaining 213 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 
