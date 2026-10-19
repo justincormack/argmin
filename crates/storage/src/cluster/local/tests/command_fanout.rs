@@ -496,7 +496,7 @@ fn low_level_put_object_stream_create_uses_durable_bucket_reservation() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
 
@@ -564,7 +564,7 @@ fn partially_applied_stream_create_converges_after_bucket_reservation_expires() 
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
 
@@ -592,7 +592,7 @@ fn partially_applied_stream_create_converges_after_bucket_reservation_expires() 
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
 
@@ -841,7 +841,7 @@ fn stream_put_create_keeps_reservation_until_pending_converges() {
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: crate::StreamUploadTarget::PutObject,
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                 ))
             },
@@ -876,7 +876,7 @@ fn stream_put_create_keeps_reservation_until_pending_converges() {
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: crate::StreamUploadTarget::PutObject,
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                 ))
             },
@@ -967,7 +967,7 @@ fn stream_put_create_preserves_reservation_when_pending_owner_check_fails() {
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: crate::StreamUploadTarget::PutObject,
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                 ))
             },
@@ -1028,7 +1028,7 @@ fn live_put_object_stream_create_keeps_reservation_and_clears_pending_slot() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let pg_id = PgId::new(1);
     let command = MetadataCommandEnvelope::new(
@@ -1137,7 +1137,7 @@ fn put_object_stream_create_open_time_convergence_preserves_bucket_write_reserva
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     drop(hook_guard);
@@ -1234,7 +1234,7 @@ fn stream_create_command_rejects_missing_bucket_write_reservation_proof() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let command = MetadataCommandEnvelope::new(
             cluster
@@ -1330,7 +1330,7 @@ fn stream_create_fanout_rejects_crossed_target_reservation_authority_without_mut
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: target.clone(),
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                     crate::clock::current_time_millis(),
                     crossed_proof.clone(),
@@ -1417,7 +1417,7 @@ fn stream_create_command_rejects_stale_bucket_incarnation_proof() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let command = MetadataCommandEnvelope::new(
             cluster
@@ -1495,7 +1495,7 @@ fn stream_create_command_allows_bucket_metadata_generation_change() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let command = MetadataCommandEnvelope::new(
             cluster
@@ -1560,7 +1560,7 @@ fn low_level_put_object_stream_create_retries_durable_delete_drain() {
             &retry_bucket,
             &retry_key,
             &retry_session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         );
         result_tx.send(result).unwrap();
     });
@@ -1624,7 +1624,7 @@ fn low_level_put_object_stream_create_bounds_durable_delete_drain_wait() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap_err();
     assert!(

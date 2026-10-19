@@ -29,7 +29,7 @@ fn logical_upload_part_stream_session_count_binds_the_complete_target() {
                 upload_id: upload_id.clone(),
                 part_number: 1,
             },
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
         crate::CreateStreamUploadReq {
             session_id: crate::SessionId::try_from("02".repeat(16)).unwrap(),
@@ -39,7 +39,7 @@ fn logical_upload_part_stream_session_count_binds_the_complete_target() {
                 upload_id: upload_id.clone(),
                 part_number: 1,
             },
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
         crate::CreateStreamUploadReq {
             session_id: crate::SessionId::try_from("03".repeat(16)).unwrap(),
@@ -49,7 +49,7 @@ fn logical_upload_part_stream_session_count_binds_the_complete_target() {
                 upload_id: crossed_upload_id.clone(),
                 part_number: 1,
             },
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
         crate::CreateStreamUploadReq {
             session_id: crate::SessionId::try_from("04".repeat(16)).unwrap(),
@@ -59,14 +59,14 @@ fn logical_upload_part_stream_session_count_binds_the_complete_target() {
                 upload_id: upload_id.clone(),
                 part_number: 2,
             },
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
         crate::CreateStreamUploadReq {
             session_id: crate::SessionId::try_from("05".repeat(16)).unwrap(),
             bucket: bucket.clone(),
             key: key.clone(),
             target: crate::StreamUploadTarget::PutObject,
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
         crate::CreateStreamUploadReq {
             session_id: crate::SessionId::try_from("06".repeat(16)).unwrap(),
@@ -76,7 +76,7 @@ fn logical_upload_part_stream_session_count_binds_the_complete_target() {
                 upload_id: upload_id.clone(),
                 part_number: 1,
             },
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
     ];
     for session in &sessions {
@@ -88,7 +88,7 @@ fn logical_upload_part_stream_session_count_binds_the_complete_target() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .test_create_stream_upload(&deadline_session)
@@ -102,7 +102,7 @@ fn logical_upload_part_stream_session_count_binds_the_complete_target() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .test_create_stream_upload(&second_deadline_session)
@@ -293,7 +293,7 @@ fn multipart_create_route_derives_the_object_subject_from_its_capability() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
@@ -500,7 +500,7 @@ fn multipart_create_route_retry_preserves_the_first_provisional_issuance_identit
                             bucket: bucket_for_hook.clone(),
                             key: key_for_hook.clone(),
                             target: crate::StreamUploadTarget::PutObject,
-                            encryption: crate::ObjectEncryption::None,
+                            encryption: crate::tests::metadata_only_test_encryption(),
                         },
                         123,
                         unrelated_proof.clone(),
@@ -538,7 +538,7 @@ fn multipart_create_route_retry_preserves_the_first_provisional_issuance_identit
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let route_handle =
         crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
@@ -602,7 +602,7 @@ fn multipart_abort_route_rejects_a_crossed_object_subject_before_mutation() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -669,7 +669,7 @@ fn multipart_state_observation_rejects_crossed_same_pg_key() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -726,7 +726,7 @@ fn multipart_abort_fanout_rejects_live_crossed_reservation_subjects() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(

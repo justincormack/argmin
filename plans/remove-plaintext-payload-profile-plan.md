@@ -489,7 +489,12 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   move or inspect metadata without reading payload, so they use the explicitly metadata-only
   encrypted state. Frozen command, storage-RPC v22, canonical-state v5/checkpoint v3, and tag-0
   golden evidence remains byte-for-byte unchanged until Phase 3 advances the owning formats.
-- The remaining 263 source occurrences are deliberately left for the payload-bearing and
+- The local command and route slice removes another 32 positive plaintext constructions from
+  stream-create fanout/recovery, multipart route and logical-observation, object-metadata
+  validation, and durable allocator replay tests. These cases create, move, reject, or inspect
+  metadata without exposing payload bytes; the three payload-bearing fanout cases remain for a
+  production-compatible ciphertext migration.
+- The remaining 231 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 

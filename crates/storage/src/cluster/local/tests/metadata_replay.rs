@@ -840,7 +840,7 @@ fn stream_segment_vid_allocation_survives_reopen_without_runtime_state() {
                 &bucket,
                 &key,
                 &session_id,
-                crate::ObjectEncryption::None,
+                crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
         let (_target, first) = cluster
@@ -916,7 +916,7 @@ fn stream_segment_vid_allocation_is_visible_to_already_open_handle() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
 

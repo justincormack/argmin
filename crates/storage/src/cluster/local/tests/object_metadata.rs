@@ -139,7 +139,7 @@ fn object_delete_central_validation_rejects_live_crossed_reservation_subjects() 
                 metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
+                encryption: crate::tests::metadata_only_test_encryption(),
             }),
         )
         .unwrap();
@@ -390,7 +390,7 @@ fn multipart_creation_fanout_rejects_live_crossed_reservation_subjects() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let pg_id = PgId::new(0);
     let command = |proof| {
