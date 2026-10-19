@@ -478,7 +478,13 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   storage-owned production-compatible SSE-S3 segment fixture. Its wrapped DEK, ciphertext,
   logical/stored checksums, authentication-tag overhead, and 1+0 shard geometry are coherent;
   the test no longer pairs plaintext shard bytes with encrypted metadata or a partial 4+2 layout.
-- The remaining 288 source occurrences are deliberately left for the payload-bearing and
+- The storage integration suite removes another 17 positive plaintext constructions. Tests that
+  exercise independent metadata state use the explicitly metadata-only fixture; shard lifecycle,
+  persistence, versioning, reclaim, multipart completion, UploadPart, and abort coverage now use
+  coherent ciphertext, logical and stored checksums, and matching EC geometry. The production-
+  compatible fixture now also models the multipart part-number nonce scope rather than reusing the
+  ordinary object scope.
+- The remaining 271 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 

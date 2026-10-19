@@ -1,7 +1,10 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{bucket_name, multipart_upload_id, object_key, stream_session_id};
+use super::{
+    bucket_name, metadata_only_test_encryption, multipart_upload_id, object_key,
+    sse_s3_multipart_segment_test_fixture, sse_s3_segment_test_fixture, stream_session_id,
+};
 use crate::metadata_command::{
     DeleteFinalizedBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
     MetadataCommandLogIndex, MetadataCommandPayload,
@@ -25,9 +28,13 @@ fn shard_and_metadata_roundtrip() {
     let hash = [0x42u8; 16];
     let shard_key = ShardKey::new(&hash, 1, 0);
     let shard_data = b"the actual object data payload";
+    let fixture = sse_s3_segment_test_fixture(shard_data, 0);
 
     // Write shard.
-    let ack = store.write_shard(&shard_key, shard_data).unwrap();
+    let ack = store
+        .write_shard(&shard_key, &fixture.storage_bytes)
+        .unwrap();
+    assert_eq!(ack.crc64, fixture.storage_crc64);
 
     // Write object metadata referencing the shard.
     let req = PutObjectReq::Live(PutLiveObjectReq {
@@ -38,21 +45,21 @@ fn shard_and_metadata_roundtrip() {
         acl_grants: AclGrants::default(),
         public_read: false,
         generation_id: GenerationId::MIN,
-        size: shard_data.len() as u64,
-        etag: ObjectEtag::single_part(ack.crc64),
-        ec: EcShape { k: 4, m: 2 },
+        size: fixture.logical_size,
+        etag: ObjectEtag::single_part(fixture.payload_crc64),
+        ec: EcShape { k: 1, m: 0 },
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: fixture.encryption,
     });
     store.put_object_meta(&req).unwrap();
 
     // Read back both.
     let read = store.read_shard(&shard_key).unwrap();
-    assert_eq!(read.data, shard_data);
+    assert_eq!(read.data, fixture.storage_bytes);
     assert_eq!(read.crc64, ack.crc64);
 
     let obj = store
@@ -60,7 +67,7 @@ fn shard_and_metadata_roundtrip() {
         .unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, shard_data.len() as u64);
-    assert_eq!(live.etag, ObjectEtag::single_part(ack.crc64));
+    assert_eq!(live.etag, ObjectEtag::single_part(fixture.payload_crc64));
     assert_eq!(live.owner, test_owner());
 }
 
@@ -135,7 +142,9 @@ fn full_lifecycle() {
     let hash = [0xAA; 16];
     let shard_key = ShardKey::new(&hash, 1, 0);
     let data = b"hello world";
-    let ack = pg.write_shard(&shard_key, data).unwrap();
+    let fixture = sse_s3_segment_test_fixture(data, 0);
+    let ack = pg.write_shard(&shard_key, &fixture.storage_bytes).unwrap();
+    assert_eq!(ack.crc64, fixture.storage_crc64);
 
     pg.put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
         bucket: bucket_name("my-bucket"),
@@ -145,15 +154,15 @@ fn full_lifecycle() {
         acl_grants: AclGrants::default(),
         public_read: false,
         generation_id: GenerationId::MIN,
-        size: data.len() as u64,
-        etag: ObjectEtag::single_part(ack.crc64),
-        ec: EcShape { k: 4, m: 2 },
+        size: fixture.logical_size,
+        etag: ObjectEtag::single_part(fixture.payload_crc64),
+        ec: EcShape { k: 1, m: 0 },
         layout: ObjectLayout::Standard,
         tags: None,
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: fixture.encryption,
     }))
     .unwrap();
 
@@ -168,7 +177,7 @@ fn full_lifecycle() {
     assert_eq!(obj.as_live().unwrap().size, 11);
 
     let read = pg.read_shard(&shard_key).unwrap();
-    assert_eq!(read.data, b"hello world");
+    assert_eq!(read.data, fixture.storage_bytes);
 
     // DeleteObject: remove metadata + shard.
     pg.delete_object_meta(&bucket_name("my-bucket"), &object_key("greeting.txt"))
@@ -193,11 +202,13 @@ fn pg_store_persistence() {
 
     let key = ShardKey::new(&[0xBB; 16], 1, 0);
     let data = b"persistent data";
+    let fixture = sse_s3_segment_test_fixture(data, 0);
 
     // Write data, then drop the store.
     {
         let store = crate::PgStore::open(&pg_dir, 0).unwrap();
-        store.write_shard(&key, data).unwrap();
+        let ack = store.write_shard(&key, &fixture.storage_bytes).unwrap();
+        assert_eq!(ack.crc64, fixture.storage_crc64);
         store
             .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
                 bucket: bucket_name("bucket"),
@@ -209,13 +220,13 @@ fn pg_store_persistence() {
                 generation_id: GenerationId::MIN,
                 size: data.len() as u64,
                 etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
-                ec: EcShape { k: 4, m: 2 },
+                ec: EcShape { k: 1, m: 0 },
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: fixture.encryption.clone(),
             }))
             .unwrap();
     }
@@ -225,7 +236,7 @@ fn pg_store_persistence() {
         let store = crate::PgStore::open(&pg_dir, 0).unwrap();
 
         let read = store.read_shard(&key).unwrap();
-        assert_eq!(read.data, data);
+        assert_eq!(read.data, fixture.storage_bytes);
 
         let obj = store
             .get_object_meta(&bucket_name("bucket"), &object_key("k"))
@@ -257,6 +268,12 @@ fn multipart_upload_lifecycle() {
     let bucket = bucket_name("bucket");
     let key = object_key("k");
     let upload_id = multipart_upload_id("mpu-1");
+    let part1_data = b"part-one-data-here";
+    let part2_data = b"part-two-data-here";
+    let part1_fixture = sse_s3_multipart_segment_test_fixture(part1_data, 1, 0);
+    let part2_fixture = sse_s3_multipart_segment_test_fixture(part2_data, 2, 0);
+    let encryption = part1_fixture.encryption.clone();
+    assert_eq!(part2_fixture.encryption, encryption);
 
     {
         let store = metadata_node.get_pg(0).unwrap();
@@ -287,26 +304,19 @@ fn multipart_upload_lifecycle() {
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: encryption.clone(),
             })
             .unwrap();
     }
 
     // Write the two parts through the placed EC payload path and persist the
     // corresponding staging segment descriptors.
-    let part1_data = b"part-one-data-here";
-    let part2_data = b"part-two-data-here";
     let mut committed_parts = Vec::new();
-    for (part_number, data, segment_okh, segment_vid) in [
-        (1, part1_data.as_slice(), [0x11; 16], GenerationId::MIN),
-        (
-            2,
-            part2_data.as_slice(),
-            [0x22; 16],
-            GenerationId::new(2).unwrap(),
-        ),
+    let mut expected_stored_payload = Vec::new();
+    for (part_number, fixture, segment_okh, segment_vid) in [
+        (1, part1_fixture, [0x11; 16], GenerationId::MIN),
+        (2, part2_fixture, [0x22; 16], GenerationId::new(2).unwrap()),
     ] {
-        let segment_crc64 = checksum::crc64::checksum(data);
         let segment = MultipartPartSegmentRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -314,8 +324,8 @@ fn multipart_upload_lifecycle() {
             version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
             part_number,
             segment_index: 0,
-            size: data.len() as u64,
-            segment_crc64,
+            size: fixture.logical_size,
+            segment_crc64: fixture.storage_crc64,
             segment_okh,
             segment_vid,
             data_pg_id: 0,
@@ -328,9 +338,9 @@ fn multipart_upload_lifecycle() {
                 &StreamUploadSegmentRecord {
                     session_id: stream_session_id(format!("mpu-part-{part_number}")),
                     segment_index: 0,
-                    size: data.len() as u64,
-                    segment_crc64,
-                    payload_crc64: segment_crc64,
+                    size: fixture.logical_size,
+                    segment_crc64: fixture.storage_crc64,
+                    payload_crc64: fixture.payload_crc64,
                     segment_okh,
                     segment_vid,
                     data_pg_id: 0,
@@ -338,7 +348,7 @@ fn multipart_upload_lifecycle() {
                     ec_k: ec.k,
                     ec_m: ec.m,
                 },
-                data,
+                &fixture.storage_bytes,
             )
             .unwrap();
         assert_eq!(written.len(), usize::from(ec.k + ec.m));
@@ -350,9 +360,9 @@ fn multipart_upload_lifecycle() {
             upload_id: upload_id.clone(),
             part_number,
             generation: 0,
-            size: data.len() as u64,
-            payload_crc64: segment_crc64,
-            etag: segment_crc64.to_be_bytes().to_vec(),
+            size: fixture.logical_size,
+            payload_crc64: fixture.payload_crc64,
+            etag: fixture.payload_crc64.to_be_bytes().to_vec(),
             etag_kind: EtagKind::Crc64,
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
@@ -382,6 +392,7 @@ fn multipart_upload_lifecycle() {
             data_pg_id: 0,
             checksum: None,
         });
+        expected_stored_payload.extend_from_slice(&fixture.storage_bytes);
     }
 
     // Verify parts are listed.
@@ -413,7 +424,7 @@ fn multipart_upload_lifecycle() {
         metadata_blob: Some(vec![].into()),
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption,
     };
     {
         let store = metadata_node.get_pg(0).unwrap();
@@ -463,7 +474,8 @@ fn multipart_upload_lifecycle() {
             .unwrap_or_else(|error| panic!("read multipart part {part_number}: {error:?}"));
         read_payload.extend_from_slice(&segment_payload);
     }
-    assert_eq!(read_payload, [part1_data.as_slice(), part2_data].concat());
+    assert_eq!(read_payload, expected_stored_payload);
+    assert_ne!(read_payload, [part1_data.as_slice(), part2_data].concat());
 }
 
 // ── 2. Streaming UploadPart lifecycle ──────────────────────────────────
@@ -475,6 +487,9 @@ fn streaming_upload_part_lifecycle() {
     let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+    let seg_data = b"streaming-part-segment";
+    let fixture = sse_s3_multipart_segment_test_fixture(seg_data, 1, 0);
+    let ec = EcShape { k: 1, m: 0 };
 
     // Create multipart upload first.
     store
@@ -492,15 +507,17 @@ fn streaming_upload_part_lifecycle() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: fixture.encryption.clone(),
         })
         .unwrap();
 
     // Write shard data.
-    let seg_data = b"streaming-part-segment";
     let hash = [0xBBu8; 16];
     let shard_key = ShardKey::new(&hash, 1, 0);
-    let ack = store.write_shard(&shard_key, seg_data).unwrap();
+    let ack = store
+        .write_shard(&shard_key, &fixture.storage_bytes)
+        .unwrap();
+    assert_eq!(ack.crc64, fixture.storage_crc64);
 
     // Create streaming session for part 1.
     store
@@ -512,7 +529,7 @@ fn streaming_upload_part_lifecycle() {
                 upload_id: multipart_upload_id("mpu-sp"),
                 part_number: 1,
             },
-            encryption: ObjectEncryption::None,
+            encryption: fixture.encryption.clone(),
         })
         .unwrap();
 
@@ -521,15 +538,15 @@ fn streaming_upload_part_lifecycle() {
         .append_stream_segment(&StreamUploadSegmentRecord {
             session_id: stream_session_id("ss-part"),
             segment_index: 0,
-            size: seg_data.len() as u64,
-            segment_crc64: ack.crc64,
-            payload_crc64: ack.crc64,
+            size: fixture.logical_size,
+            segment_crc64: fixture.storage_crc64,
+            payload_crc64: fixture.payload_crc64,
             segment_okh: hash,
             segment_vid: GenerationId::MIN,
             data_pg_id: 0,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
-            ec_k: 4,
-            ec_m: 2,
+            ec_k: ec.k,
+            ec_m: ec.m,
         })
         .unwrap();
 
@@ -541,14 +558,14 @@ fn streaming_upload_part_lifecycle() {
         version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
         part_number: 1,
         segment_index: 0,
-        size: seg_data.len() as u64,
-        segment_crc64: ack.crc64,
+        size: fixture.logical_size,
+        segment_crc64: fixture.storage_crc64,
         segment_okh: hash,
         segment_vid: GenerationId::MIN,
         data_pg_id: 0,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
-        ec_k: 4,
-        ec_m: 2,
+        ec_k: ec.k,
+        ec_m: ec.m,
     }];
 
     let displaced_segments = store
@@ -558,14 +575,14 @@ fn streaming_upload_part_lifecycle() {
                 upload_id: multipart_upload_id("mpu-sp"),
                 part_number: 1,
                 generation: 0,
-                size: seg_data.len() as u64,
-                payload_crc64: 0,
-                etag: ack.crc64.to_be_bytes().to_vec(),
+                size: fixture.logical_size,
+                payload_crc64: fixture.payload_crc64,
+                etag: fixture.payload_crc64.to_be_bytes().to_vec(),
                 etag_kind: EtagKind::Crc64,
                 part_vid: GenerationId::MIN,
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
-                ec_k: 4,
-                ec_m: 2,
+                ec_k: ec.k,
+                ec_m: ec.m,
                 last_modified: 0,
                 checksum: None,
             },
@@ -591,6 +608,13 @@ fn streaming_upload_part_lifecycle() {
         .get_multipart_part(&multipart_upload_id("mpu-sp"), 1)
         .unwrap();
     assert_eq!(part.size, seg_data.len() as u64);
+    assert_eq!(
+        EcShape {
+            k: part.ec_k,
+            m: part.ec_m,
+        },
+        ec
+    );
 
     // Part segments readable.
     let segs = store
@@ -598,9 +622,19 @@ fn streaming_upload_part_lifecycle() {
         .unwrap();
     assert_eq!(segs.len(), 1);
     assert_eq!(segs[0].segment_okh, hash);
+    assert_eq!(
+        EcShape {
+            k: segs[0].ec_k,
+            m: segs[0].ec_m,
+        },
+        ec
+    );
 
     // Shard still readable.
-    assert_eq!(store.read_shard(&shard_key).unwrap().data, seg_data);
+    assert_eq!(
+        store.read_shard(&shard_key).unwrap().data,
+        fixture.storage_bytes
+    );
 }
 
 // ── 4. Versioned object lifecycle ──────────────────────────────────────
@@ -629,6 +663,7 @@ fn versioned_object_lifecycle() {
 
     // Write 3 versions with shards.
     let mut shard_keys = Vec::new();
+    let mut shard_payloads = Vec::new();
     let mut version_ids = Vec::new();
     for i in 1..=3u64 {
         let vid = VersionId::Versioned(NonZeroU64::new(i).unwrap());
@@ -637,8 +672,11 @@ fn versioned_object_lifecycle() {
         let hash = [i as u8; 16];
         let sk = ShardKey::new(&hash, 1, 0);
         let data = format!("version-{i}-data");
-        store.write_shard(&sk, data.as_bytes()).unwrap();
+        let fixture = sse_s3_segment_test_fixture(data.as_bytes(), 0);
+        let ack = store.write_shard(&sk, &fixture.storage_bytes).unwrap();
+        assert_eq!(ack.crc64, fixture.storage_crc64);
         shard_keys.push(sk);
+        shard_payloads.push(fixture.storage_bytes.clone());
 
         store
             .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
@@ -649,15 +687,15 @@ fn versioned_object_lifecycle() {
                 acl_grants: AclGrants::default(),
                 public_read: false,
                 generation_id: GenerationId::MIN,
-                ec: EcShape { k: 4, m: 2 },
-                size: data.len() as u64,
+                ec: EcShape { k: 1, m: 0 },
+                size: fixture.logical_size,
                 etag: ObjectEtag::SinglePart([i as u8, 0, 0, 0, 0, 0, 0, 0]),
                 layout: ObjectLayout::Standard,
                 tags: None,
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: fixture.encryption,
             }))
             .unwrap();
     }
@@ -717,11 +755,11 @@ fn versioned_object_lifecycle() {
     // Remaining shards still readable.
     assert_eq!(
         store.read_shard(&shard_keys[0]).unwrap().data,
-        b"version-1-data"
+        shard_payloads[0]
     );
     assert_eq!(
         store.read_shard(&shard_keys[2]).unwrap().data,
-        b"version-3-data"
+        shard_payloads[2]
     );
 }
 
@@ -741,7 +779,9 @@ fn object_overwrite_with_reclaim() {
     // Write gen 1 object + shard.
     let hash1 = [0x10u8; 16];
     let sk1 = ShardKey::new(&hash1, gen1.get(), 0);
-    store.write_shard(&sk1, b"gen-1-data").unwrap();
+    let fixture1 = sse_s3_segment_test_fixture(b"gen-1-data", 0);
+    let ack1 = store.write_shard(&sk1, &fixture1.storage_bytes).unwrap();
+    assert_eq!(ack1.crc64, fixture1.storage_crc64);
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
@@ -752,15 +792,15 @@ fn object_overwrite_with_reclaim() {
             acl_grants: AclGrants::default(),
             public_read: false,
             generation_id: gen1,
-            ec: EcShape { k: 4, m: 2 },
-            size: 10,
+            ec: EcShape { k: 1, m: 0 },
+            size: fixture1.logical_size,
             etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: fixture1.encryption,
         }))
         .unwrap();
 
@@ -776,7 +816,7 @@ fn object_overwrite_with_reclaim() {
                 segment_okh: hash1,
                 segment_vid: gen1,
                 data_pg_id: 0,
-                ec: EcShape { k: 4, m: 2 },
+                ec: EcShape { k: 1, m: 0 },
             }],
         })
         .unwrap();
@@ -784,7 +824,9 @@ fn object_overwrite_with_reclaim() {
     // Overwrite with gen 2.
     let hash2 = [0x20u8; 16];
     let sk2 = ShardKey::new(&hash2, gen2.get(), 0);
-    store.write_shard(&sk2, b"gen-2-data").unwrap();
+    let fixture2 = sse_s3_segment_test_fixture(b"gen-2-data", 0);
+    let ack2 = store.write_shard(&sk2, &fixture2.storage_bytes).unwrap();
+    assert_eq!(ack2.crc64, fixture2.storage_crc64);
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
@@ -795,15 +837,15 @@ fn object_overwrite_with_reclaim() {
             acl_grants: AclGrants::default(),
             public_read: false,
             generation_id: gen2,
-            ec: EcShape { k: 4, m: 2 },
-            size: 10,
+            ec: EcShape { k: 1, m: 0 },
+            size: fixture2.logical_size,
             etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
             layout: ObjectLayout::Standard,
             tags: None,
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: fixture2.encryption,
         }))
         .unwrap();
 
@@ -843,7 +885,7 @@ fn object_overwrite_with_reclaim() {
         .is_none());
 
     // Gen 2 shard still readable.
-    assert_eq!(store.read_shard(&sk2).unwrap().data, b"gen-2-data");
+    assert_eq!(store.read_shard(&sk2).unwrap().data, fixture2.storage_bytes);
 }
 
 // ── 6. Bucket deletion lifecycle ───────────────────────────────────────
@@ -885,7 +927,7 @@ fn bucket_deletion_lifecycle() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -963,6 +1005,7 @@ fn multipart_abort_cleanup() {
     let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
     let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+    let fixture = sse_s3_multipart_segment_test_fixture(b"abort-me", 1, 0);
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
@@ -979,28 +1022,29 @@ fn multipart_abort_cleanup() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: fixture.encryption.clone(),
         })
         .unwrap();
 
     // Write a shard.
     let hash = [0xDD; 16];
     let sk = ShardKey::new(&hash, 1, 0);
-    store.write_shard(&sk, b"abort-me").unwrap();
+    let ack = store.write_shard(&sk, &fixture.storage_bytes).unwrap();
+    assert_eq!(ack.crc64, fixture.storage_crc64);
 
     // Upsert part with segments.
     let part = MultipartPartRecord {
         upload_id: multipart_upload_id("mpu-abort"),
         part_number: 1,
         generation: 0,
-        size: 8,
-        payload_crc64: 0,
+        size: fixture.logical_size,
+        payload_crc64: fixture.payload_crc64,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
         part_vid: GenerationId::MIN,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
-        ec_k: 4,
-        ec_m: 2,
+        ec_k: 1,
+        ec_m: 0,
         last_modified: 0,
         checksum: None,
     };
@@ -1011,14 +1055,14 @@ fn multipart_abort_cleanup() {
         version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
         part_number: 1,
         segment_index: 0,
-        size: 8,
-        segment_crc64: 999,
+        size: fixture.logical_size,
+        segment_crc64: fixture.storage_crc64,
         segment_okh: hash,
         segment_vid: GenerationId::MIN,
         data_pg_id: 0,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
-        ec_k: 4,
-        ec_m: 2,
+        ec_k: 1,
+        ec_m: 0,
     }];
     store
         .upsert_multipart_part_segments(&part, &segments)
@@ -1028,7 +1072,7 @@ fn multipart_abort_cleanup() {
     let p = store
         .get_multipart_part(&multipart_upload_id("mpu-abort"), 1)
         .unwrap();
-    assert_eq!(p.size, 8);
+    assert_eq!(p.size, fixture.logical_size);
     let segs = store
         .get_all_multipart_part_segments_for_upload(&multipart_upload_id("mpu-abort"))
         .unwrap();
@@ -1061,7 +1105,7 @@ fn multipart_abort_cleanup() {
     assert!(segs.is_empty());
 
     // Shard still exists (shard cleanup is caller's responsibility).
-    assert_eq!(store.read_shard(&sk).unwrap().data, b"abort-me");
+    assert_eq!(store.read_shard(&sk).unwrap().data, fixture.storage_bytes);
 
     // Clean up shard.
     store.delete_shard(&sk).unwrap();
@@ -1115,7 +1159,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -1145,7 +1189,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         }))
         .unwrap();
 
@@ -1189,7 +1233,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             }))
             .unwrap();
     }
@@ -1253,7 +1297,7 @@ fn persistence_complex_state_through_reopen() {
                 bucket: bucket_name("bucket"),
                 key: object_key("k1"),
                 target: StreamUploadTarget::PutObject,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             })
             .unwrap();
 
@@ -1290,7 +1334,7 @@ fn persistence_complex_state_through_reopen() {
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             })
             .unwrap();
 

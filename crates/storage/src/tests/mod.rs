@@ -52,6 +52,24 @@ pub(super) fn sse_s3_segment_test_fixture(
     plaintext: &[u8],
     segment_index: u32,
 ) -> SseS3SegmentTestFixture {
+    sse_s3_scoped_segment_test_fixture(plaintext, 0, segment_index)
+}
+
+/// Build a production-compatible whole-segment SSE-S3 multipart-part fixture.
+pub(super) fn sse_s3_multipart_segment_test_fixture(
+    plaintext: &[u8],
+    part_number: u16,
+    segment_index: u32,
+) -> SseS3SegmentTestFixture {
+    assert!(part_number > 0, "multipart part numbers are positive");
+    sse_s3_scoped_segment_test_fixture(plaintext, part_number, segment_index)
+}
+
+fn sse_s3_scoped_segment_test_fixture(
+    plaintext: &[u8],
+    segment_scope: u16,
+    segment_index: u32,
+) -> SseS3SegmentTestFixture {
     const MANAGED_WRAP_AAD: &[u8] = b"argmin:sse-s3:wrap:v1";
     const MANAGED_SEGMENT_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
 
@@ -72,7 +90,8 @@ pub(super) fn sse_s3_segment_test_fixture(
     let mut segment_nonce = [0; AES_GCM_NONCE_LEN];
     segment_nonce[..SSE_S3_SEGMENT_NONCE_PREFIX_LEN].copy_from_slice(&segment_nonce_prefix);
     let scope_end = SSE_S3_SEGMENT_NONCE_PREFIX_LEN + SSE_C_SEGMENT_NONCE_SCOPE_LEN;
-    segment_nonce[SSE_S3_SEGMENT_NONCE_PREFIX_LEN..scope_end].copy_from_slice(&0u16.to_be_bytes());
+    segment_nonce[SSE_S3_SEGMENT_NONCE_PREFIX_LEN..scope_end]
+        .copy_from_slice(&segment_scope.to_be_bytes());
     segment_nonce[scope_end..].copy_from_slice(&segment_index.to_be_bytes());
 
     let mut storage_bytes = plaintext.to_vec();
