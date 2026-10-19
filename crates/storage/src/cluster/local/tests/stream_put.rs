@@ -302,7 +302,7 @@ fn stream_reservation_existence_observation_binds_bucket_key_and_session() {
             &bucket,
             &first_key,
             &first_session,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     cluster
@@ -310,7 +310,7 @@ fn stream_reservation_existence_observation_binds_bucket_key_and_session() {
             &bucket,
             &second_key,
             &second_session,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
 
@@ -352,7 +352,7 @@ fn topology_test_support_binds_stream_placement_to_exact_put_session() {
                 &bucket,
                 &key,
                 &session_id,
-                crate::ObjectEncryption::None,
+                crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
         let crosses = cluster
@@ -737,7 +737,7 @@ fn stream_put_create_pending_install_race_reruns_authorization_action() {
                             bucket: bucket.clone(),
                             key: key.clone(),
                             target: crate::StreamUploadTarget::PutObject,
-                            encryption: crate::ObjectEncryption::None,
+                            encryption: crate::tests::metadata_only_test_encryption(),
                         },
                     ))
                 }
@@ -899,7 +899,7 @@ fn stream_put_create_command_id_race_releases_reservation_and_retries() {
                             bucket: bucket.clone(),
                             key: key.clone(),
                             target: crate::StreamUploadTarget::PutObject,
-                            encryption: crate::ObjectEncryption::None,
+                            encryption: crate::tests::metadata_only_test_encryption(),
                         },
                     ))
                 }
@@ -2222,7 +2222,7 @@ fn abandoned_put_object_stream_upload_does_not_block_bucket_delete() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let generation_id = cluster
         .reserve_put_object_generation(&bucket, &key, &session_id)
@@ -2303,7 +2303,7 @@ fn active_put_object_stream_upload_blocks_bucket_delete() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
@@ -2386,7 +2386,7 @@ fn old_empty_put_object_stream_with_live_proof_blocks_bucket_delete() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     cluster
@@ -2464,7 +2464,7 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
                 &bucket,
                 &key,
                 &session_id,
-                crate::ObjectEncryption::None,
+                crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
     });
@@ -2488,7 +2488,7 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
             target: crate::StreamUploadTarget::PutObject,
             state: crate::StreamUploadState::InProgress,
             created_at: 1_000,
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
         initial_next_segment_vid: crate::GenerationId::MIN,
         cleanup_after: None,
@@ -2527,7 +2527,7 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let mutation_client = cluster
         .object_mutation_metadata_primary_client(&bucket, &key)
@@ -2582,7 +2582,7 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
                     metadata_blob: crate::SerializedMetadataBlob::default(),
                     system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 })
             })
             .unwrap()
@@ -2645,7 +2645,7 @@ fn bucket_delete_refreshes_stale_stream_proof_for_live_heartbeated_reservation()
                 &bucket,
                 &key,
                 &session_id,
-                crate::ObjectEncryption::None,
+                crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
     });
@@ -2740,7 +2740,7 @@ fn expired_put_object_stream_proof_allows_bucket_delete_cleanup() {
                 &bucket,
                 &key,
                 &session_id,
-                crate::ObjectEncryption::None,
+                crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
     });
@@ -2821,7 +2821,7 @@ fn stream_session_scavenger_aborts_only_expired_put_object_proofs() {
                 &expired_bucket,
                 &expired_key,
                 &expired_session,
-                crate::ObjectEncryption::None,
+                crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
     });
@@ -2831,7 +2831,7 @@ fn stream_session_scavenger_aborts_only_expired_put_object_proofs() {
                 &live_bucket,
                 &live_key,
                 &live_session,
-                crate::ObjectEncryption::None,
+                crate::tests::metadata_only_test_encryption(),
             )
             .unwrap();
         assert_eq!(
@@ -2898,7 +2898,7 @@ fn stream_session_scavenger_does_not_age_abort_upload_part_sessions() {
                         public_read: false,
                         object_lock: crate::ObjectLockState::default(),
                         checksum: None,
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                 ))
             },
@@ -2992,7 +2992,7 @@ fn active_put_object_stream_upload_blocks_bucket_delete_from_independent_fronten
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
 
@@ -3054,7 +3054,7 @@ fn bucket_delete_treats_conflicting_stream_reservation_proof_as_abandoned() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
 
@@ -3189,7 +3189,7 @@ fn bucket_delete_stream_cleanup_tolerates_concurrent_missing_session() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
@@ -3265,7 +3265,7 @@ fn bucket_delete_stream_cleanup_rejects_wrong_pg_stream_row() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
@@ -3365,7 +3365,7 @@ fn stream_put_record_pending_install_race_releases_reservation_and_retries() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     assert!(hook_ran.load(Ordering::SeqCst));

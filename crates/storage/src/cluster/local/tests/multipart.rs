@@ -2770,7 +2770,7 @@ fn multipart_abort_retries_after_pending_install_conflict() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -2818,7 +2818,7 @@ fn multipart_abort_retries_after_pending_install_conflict() {
                                 bucket: bucket_for_hook.clone(),
                                 key: key_for_hook.clone(),
                                 target: crate::StreamUploadTarget::PutObject,
-                                encryption: crate::ObjectEncryption::None,
+                                encryption: crate::tests::metadata_only_test_encryption(),
                             },
                             123,
                             proof_for_hook.clone(),
@@ -2895,7 +2895,7 @@ fn assert_multipart_abort_matching_pending_install_race_returns_success(authoriz
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -3032,7 +3032,7 @@ fn authorized_multipart_abort_rejects_stale_upload_row() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -3929,7 +3929,7 @@ fn upload_part_stream_create_pending_install_race_reloads_after_abort() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     first_cluster
         .create_multipart_upload(
@@ -4080,7 +4080,7 @@ fn upload_part_stream_create_install_error_preserves_pending_owner_proof() {
                         upload_id: upload_id_from_label("proofowner"),
                         part_number: 1,
                     },
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
                 456,
                 owned_proof.clone(),
@@ -4173,7 +4173,7 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -4226,7 +4226,7 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
                                     upload_id: hook_upload_id.clone(),
                                     part_number: 2,
                                 },
-                                encryption: crate::ObjectEncryption::None,
+                                encryption: crate::tests::metadata_only_test_encryption(),
                             },
                             789,
                             hook_proof.clone(),
@@ -4457,7 +4457,7 @@ fn begin_upload_part_stream_existing_session_mismatch_releases_bucket_write_proo
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -4489,7 +4489,7 @@ fn begin_upload_part_stream_existing_session_mismatch_releases_bucket_write_proo
                 upload_id: upload_id.clone(),
                 part_number: 9,
             },
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
     )
     .unwrap();
@@ -4568,7 +4568,7 @@ fn create_upload_part_stream_existing_session_mismatch_releases_bucket_write_pro
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -4600,7 +4600,7 @@ fn create_upload_part_stream_existing_session_mismatch_releases_bucket_write_pro
                 upload_id: upload_id.clone(),
                 part_number: 9,
             },
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
     )
     .unwrap();
@@ -4666,7 +4666,7 @@ fn upload_part_stream_create_zero_apply_reopens_and_converges() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     cluster
         .create_multipart_upload(

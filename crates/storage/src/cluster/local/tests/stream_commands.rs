@@ -9422,7 +9422,7 @@ fn stream_segment_prepare_uses_durable_session_vid_allocator() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let req = crate::PrepareStreamUploadSegmentAppendReq {
@@ -9558,7 +9558,7 @@ fn stream_segment_prepare_allocates_vid_after_validation() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let (_target, segment) = cluster

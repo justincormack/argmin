@@ -510,7 +510,13 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   multipart and stream metadata reads, historical recovery, scavenger validation, heartbeat
   renewal, append preparation, and stale/Peering session-create rejection. Unix tests that stage
   payload bytes remain coupled to their production-compatible ciphertext migration.
-- The remaining 178 source occurrences are deliberately left for the payload-bearing and
+- The local multipart and stream-control slice removes another 37 positive plaintext
+  constructions from empty-upload abort contention, UploadPart and PutObject session-create
+  retry/recovery, reservation ownership, bucket-delete/scavenger coordination, heartbeat renewal,
+  and segment-ID allocation fixtures. These tests exercise metadata allocation and convergence
+  without writing shard payload; adjacent append, uploaded-part, and cleanup tests remain coupled
+  to their production-compatible ciphertext migration.
+- The remaining 141 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 
