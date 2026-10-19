@@ -6974,7 +6974,7 @@ mod tests {
             initiated_object_identity: None,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         }
     }
 
@@ -7117,7 +7117,10 @@ mod tests {
             candidate.checksum_config().map(|config| config.algorithm()),
             Some(ChecksumAlgorithm::Crc32)
         );
-        assert!(matches!(candidate.encryption(), ObjectEncryption::None));
+        assert_eq!(
+            candidate.encryption(),
+            &crate::tests::metadata_only_test_encryption()
+        );
         assert_eq!(
             format!("{candidate:?}"),
             "MultipartUploadPartCandidate { .. }"
@@ -7150,7 +7153,10 @@ mod tests {
         assert_eq!(candidate.key().as_str(), "private-durable-key");
         assert_eq!(candidate.owner().principal, "lookup-owner");
         assert_eq!(candidate.initiator().principal, "lookup-initiator");
-        assert!(matches!(candidate.encryption(), ObjectEncryption::None));
+        assert_eq!(
+            candidate.encryption(),
+            &crate::tests::metadata_only_test_encryption()
+        );
         assert_eq!(
             format!("{candidate:?}"),
             "MultipartUploadCompletionCandidate { .. }"
@@ -7181,7 +7187,7 @@ mod tests {
             last_modified: 17,
             tags: Some(SerializedTagSet::default()),
             system_metadata_blob: Some(SerializedSystemMetadataBlob::new(vec![19, 23])),
-            encryption: ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let lookup = MultipartUploadCompletionLookup::from_management_lookup(
             MultipartUploadManagementLookup::Replay(Box::new(replay)),
@@ -7199,7 +7205,10 @@ mod tests {
         assert_eq!(replay.size(), 13);
         assert_eq!(replay.last_modified(), 17);
         assert!(replay.tags().is_some());
-        assert!(matches!(replay.encryption(), ObjectEncryption::None));
+        assert_eq!(
+            replay.encryption(),
+            &crate::tests::metadata_only_test_encryption()
+        );
         assert_eq!(
             format!("{replay:?}"),
             "AuthorizedMultipartCompletionReplay { .. }"
@@ -7338,7 +7347,7 @@ mod tests {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         });
         let segment = ObjectSegmentRecord {
             bucket,

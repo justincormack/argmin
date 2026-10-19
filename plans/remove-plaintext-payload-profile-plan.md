@@ -471,7 +471,10 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   capability-binding, and metadata-application fixtures. The frozen v22 plaintext wire specimen
   remains unchanged so Phase 3 can preserve it as immutable historical rejection evidence when
   the containing format advances.
-- The remaining 300 source occurrences are deliberately left for the payload-bearing and
+- The owner-local command/type slice migrates another 11 proof-validation, command-matching,
+  opaque-capability, replay, and placement-diagnostic fixtures. Stable command and encryption
+  golden encodings remain unchanged for preservation as historical evidence during Phase 3.
+- The remaining 289 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 
