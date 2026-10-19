@@ -97,6 +97,7 @@ struct Fixture {
     bucket: crate::BucketName,
     key: crate::ObjectKey,
     reservation: crate::SessionId,
+    encrypted: crate::tests::SseS3SegmentTestFixture,
     _directory: test_util::TempDir,
 }
 
@@ -116,29 +117,20 @@ impl Fixture {
             bucket,
             key,
             reservation: crate::tests::stream_session_id("overlap"),
+            encrypted: crate::tests::sse_s3_segment_test_fixture(DATA, 0),
             _directory: directory,
         }
     }
 
     fn prepared(&self) -> crate::PreparedDirectPutObjectCommit {
-        crate::PreparedDirectPutObjectCommit {
-            versioning: crate::BucketVersioningState::Disabled,
-            owner: crate::OwnerIdentity::from_principal("owner"),
-            acl_grants: crate::AclGrants::default(),
-            public_read: false,
-            etag_crc64: checksum::crc64::checksum(DATA),
-            tags: None,
-            metadata_blob: crate::SerializedMetadataBlob::default(),
-            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-            object_lock: crate::ObjectLockState::default(),
-            encryption: crate::ObjectEncryption::None,
-            bucket_write_reservation: acquire_test_bucket_write_proof(
-                &self.cluster,
-                &self.bucket,
-                crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-                Some(self.key.as_str()),
-            ),
-        }
+        prepared_encrypted_direct_put(
+            &self.cluster,
+            &self.bucket,
+            &self.key,
+            crate::BucketVersioningState::Disabled,
+            DATA,
+            &self.encrypted,
+        )
     }
 
     fn write_command_payload(
@@ -154,7 +146,7 @@ impl Fixture {
                 identity.ec,
                 &identity.segment_okh,
                 identity.segment_vid,
-                DATA,
+                &self.encrypted.storage_bytes,
             )
             .map_err(diagnostic)?;
         Ok(crate::DirectPutWrittenSegment {
@@ -170,15 +162,17 @@ impl Fixture {
         written: &crate::DirectPutWrittenSegment,
         prepared: &crate::PreparedDirectPutObjectCommit,
     ) -> Result<MetadataCommandEnvelope, String> {
-        let request = direct_put_commit_req_with_bucket_write_proof(
-            DirectPutCommitReqFixture {
+        let request = encrypted_direct_put_commit_req_with_bucket_write_proof(
+            EncryptedDirectPutCommitReqFixture {
                 bucket: &self.bucket,
                 key: &self.key,
                 reservation_id: self.reservation.clone(),
                 generation_id: identity.segment_vid,
-                payload: DATA,
+                versioning: crate::BucketVersioningState::Disabled,
                 segment_okh: identity.segment_okh,
                 written,
+                plaintext: DATA,
+                encrypted: &self.encrypted,
             },
             prepared.bucket_write_reservation.clone(),
         );
@@ -338,14 +332,18 @@ impl Fixture {
                     data_pg_id: segment.data_pg_id,
                     segment_okh: segment.segment_okh,
                     segment_vid: segment.segment_vid,
-                    stored_size: DATA.len(),
+                    stored_size: self.encrypted.storage_bytes.len(),
                     segment_crc64: segment.segment_crc64,
                     ec: COMMAND_EC,
                 },
                 &mut body,
             )
             .map_err(diagnostic)?;
-        equal(body.as_slice(), DATA, "command payload is recoverable")
+        equal(
+            body.as_slice(),
+            self.encrypted.storage_bytes.as_slice(),
+            "command encrypted payload is recoverable",
+        )
     }
 }
 
@@ -418,8 +416,8 @@ fn replay(state: &State) -> Result<(), String> {
                     .write_direct_object_payload(
                         &fixture.reservation,
                         generation,
-                        DATA.len() as u64,
-                        DATA,
+                        fixture.encrypted.logical_size,
+                        &fixture.encrypted.storage_bytes,
                     )
                     .map_err(diagnostic)?;
                 caller_files = fixture.files(direct_payload_test_identity(&staged))?;
@@ -480,8 +478,8 @@ fn replay(state: &State) -> Result<(), String> {
                         .write_direct_object_payload(
                             &fixture.reservation,
                             generation,
-                            DATA.len() as u64,
-                            DATA,
+                            fixture.encrypted.logical_size,
+                            &fixture.encrypted.storage_bytes,
                         )
                         .map_err(diagnostic)?,
                 );

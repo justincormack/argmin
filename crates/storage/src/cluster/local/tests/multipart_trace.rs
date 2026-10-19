@@ -63,6 +63,10 @@ fn multipart_trace_slot(seed: u8) -> usize {
     usize::from(seed % 3)
 }
 
+fn multipart_trace_encryption() -> crate::ObjectEncryption {
+    crate::tests::sse_s3_multipart_segment_test_fixture(&[], 1, 0).encryption
+}
+
 fn create_multipart_trace_upload(
     cluster: &crate::StorageCluster,
     bucket: &crate::BucketName,
@@ -82,7 +86,7 @@ fn create_multipart_trace_upload(
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: multipart_trace_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -158,7 +162,7 @@ fn stale_create_multipart_trace_upload(
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: multipart_trace_encryption(),
     };
     let err = stale_cluster
         .create_multipart_upload(
@@ -335,14 +339,14 @@ fn stale_abort_multipart_trace_upload(
     Ok(())
 }
 
-fn upload_copied_test_multipart_part(
+fn upload_multipart_trace_part(
     cluster: &crate::StorageCluster,
     bucket: &crate::BucketName,
     key: &crate::ObjectKey,
     upload_id: &crate::UploadId,
     part_number: u32,
     payload_seed: u8,
-    payloads: [&[u8]; 2],
+    payloads: &[&[u8]],
 ) -> crate::MultipartPartRecord {
     let session_seed = payload_seed.max(1);
     let session_nonce = STREAMED_MULTIPART_PART_SESSION_NONCE.fetch_add(1, Ordering::SeqCst);
@@ -354,6 +358,7 @@ fn upload_copied_test_multipart_part(
     let upload = cluster
         .load_in_progress_multipart_upload(bucket, key, upload_id)
         .unwrap();
+    assert_eq!(upload.encryption, multipart_trace_encryption());
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -363,12 +368,13 @@ fn upload_copied_test_multipart_part(
         .unwrap();
 
     let mut staged_segments = Vec::new();
-    for (segment_index, payload) in payloads.into_iter().enumerate() {
-        let mut segment_okh = [payload_seed
-            .wrapping_add(u8::try_from(segment_index).unwrap())
-            .max(1); 16];
-        let segment_nonce = session_nonce + u64::try_from(segment_index).unwrap();
-        segment_okh[..8].copy_from_slice(&segment_nonce.to_be_bytes());
+    for (segment_index, payload) in payloads.iter().copied().enumerate() {
+        let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(
+            payload,
+            u16::try_from(part_number).unwrap(),
+            u32::try_from(segment_index).unwrap(),
+        );
+        assert_eq!(encrypted.encryption, multipart_trace_encryption());
         let (_target, segment) = cluster
             .prepare_stream_segment_append(
                 bucket,
@@ -376,14 +382,14 @@ fn upload_copied_test_multipart_part(
                 &crate::PrepareStreamUploadSegmentAppendReq {
                     session_id: session_id.clone(),
                     segment_index: u32::try_from(segment_index).unwrap(),
-                    size: payload.len() as u64,
-                    segment_crc64: checksum::crc64::checksum(payload),
-                    payload_crc64: checksum::crc64::checksum(payload),
+                    size: encrypted.logical_size,
+                    segment_crc64: encrypted.storage_crc64,
+                    payload_crc64: encrypted.payload_crc64,
                 },
             )
             .unwrap();
         let written_shards = cluster
-            .write_stream_segment_payload_shards(&segment, payload)
+            .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
             .unwrap();
         let shard_batch = written_shards
             .iter()
@@ -399,6 +405,24 @@ fn upload_copied_test_multipart_part(
                 &shard_batch,
             )
             .unwrap();
+        let mut stored_bytes = Vec::new();
+        cluster
+            .read_segment_payload_stored_bytes_into(
+                crate::SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: encrypted.storage_bytes.len(),
+                    segment_crc64: encrypted.storage_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                },
+                &mut stored_bytes,
+            )
+            .unwrap();
+        assert_eq!(stored_bytes, encrypted.storage_bytes);
         staged_segments.push(segment);
     }
 
@@ -434,7 +458,7 @@ fn upload_copied_test_multipart_part(
         .unwrap()
         .unwrap()
         .value;
-    assert_eq!(staged_segments.len(), 2);
+    assert_eq!(staged_segments.len(), payloads.len());
     part
 }
 
@@ -604,14 +628,14 @@ fn run_multipart_trace(ops: &[MultipartTraceOp]) -> TestCaseResult {
                 }
                 let segment_seed = payload_seed.wrapping_add(step as u8).max(1);
                 let payload = format!("multipart trace payload {step} {payload_seed}");
-                let (_shard_keys, part, _segment) = upload_streamed_test_multipart_part(
+                let part = upload_multipart_trace_part(
                     &cluster,
                     &bucket,
                     &upload.key,
                     &upload.upload_id,
                     upload.next_part_number,
-                    [segment_seed; 16],
-                    payload.as_bytes(),
+                    segment_seed,
+                    &[payload.as_bytes()],
                 );
                 upload.parts.push(part);
                 upload.next_part_number += 1;
@@ -628,14 +652,14 @@ fn run_multipart_trace(ops: &[MultipartTraceOp]) -> TestCaseResult {
                 }
                 let first_payload = format!("copied trace payload {step} {payload_seed} a");
                 let second_payload = format!("copied trace payload {step} {payload_seed} b");
-                let part = upload_copied_test_multipart_part(
+                let part = upload_multipart_trace_part(
                     &cluster,
                     &bucket,
                     &upload.key,
                     &upload.upload_id,
                     upload.next_part_number,
                     payload_seed.wrapping_add(step as u8).max(1),
-                    [first_payload.as_bytes(), second_payload.as_bytes()],
+                    &[first_payload.as_bytes(), second_payload.as_bytes()],
                 );
                 upload.parts.push(part);
                 upload.next_part_number += 1;
@@ -766,6 +790,10 @@ fn multipart_trace_exercises_bucket_delete_recreate() {
         MultipartTraceOp::Create {
             slot_seed: 1,
             key_seed: 1,
+        },
+        MultipartTraceOp::UploadStreamPart {
+            slot_seed: 1,
+            payload_seed: 8,
         },
         MultipartTraceOp::UploadCopiedPart {
             slot_seed: 1,

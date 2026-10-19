@@ -533,7 +533,14 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   canary now covers its reachable tag-bearing representation rather than an impossible zero-byte
   stored segment. Corruption fixtures derive physical shard geometry from ciphertext and pin
   checksum corruption as same-length while testing short and long length corruption separately.
-- The remaining 124 source occurrences are deliberately left for the payload-bearing and
+- The bounded state-model slice removes another four positive plaintext constructions. Direct-PUT
+  ownership, cancellation, cleanup-progress, and overlapping-shard schedules now bind each staged
+  payload and pending command to one coherent SSE-S3 ciphertext fixture while preserving plaintext
+  logical size and ETag assertions. Multipart lifecycle traces now bind upload metadata to coherent
+  SSE-S3 state and encrypt both streamed and copied parts with part-scoped nonces, logical sizes,
+  and distinct stored and payload CRCs; each staged segment is reconstructed and compared with its
+  exact ciphertext before terminal processing.
+- The remaining 120 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 

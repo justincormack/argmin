@@ -100,6 +100,7 @@ fn cancellation_progress(
     let mut identities = [None, None];
     let prepared = [fixture.prepared(0), fixture.prepared(1)];
     for actor in 0..2 {
+        let encrypted = &fixture.encrypted[actor];
         let generation = routes[actor]
             .reserve_generation(&fixture.reservations[actor])
             .map_err(diagnostic)?;
@@ -107,8 +108,8 @@ fn cancellation_progress(
             .write_direct_object_payload(
                 &fixture.reservations[actor],
                 generation,
-                DATA[actor].len() as u64,
-                DATA[actor],
+                encrypted.logical_size,
+                &encrypted.storage_bytes,
             )
             .map_err(diagnostic)?;
         identities[actor] = Some(direct_payload_test_identity(&payload));
