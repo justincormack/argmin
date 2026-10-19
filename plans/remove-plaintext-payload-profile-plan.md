@@ -498,7 +498,11 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   constructions from abandoned stream-create recovery, multipart create/convergence, empty-upload
   abort, and raced UploadPart-session creation tests. Payload-bearing append, completion cleanup,
   and uploaded-part abort cases remain coupled to their later ciphertext migration.
-- The remaining 213 source occurrences are deliberately left for the payload-bearing and
+- The stream-session creation slice removes another ten positive plaintext constructions from
+  exact applied-command matching, partial-apply retry, mismatch rejection, pending-command
+  contention, and empty-session abort tests. These cases do not write or read payload; the adjacent
+  append tests remain coupled to their production-compatible ciphertext migration.
+- The remaining 203 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 

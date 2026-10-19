@@ -281,7 +281,7 @@ fn applied_stream_create_matching_binds_requested_cleanup_deadline_for_both_targ
             bucket: bucket.clone(),
             key: key.clone(),
             target,
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let proof = crate::metadata_command::BucketWriteReservationProof {
             bucket: bucket.clone(),
@@ -355,7 +355,7 @@ fn stream_put_create_partial_apply_retry_reuses_existing_session() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     let _serial = lock_metadata_command_apply_hook_test();
@@ -481,7 +481,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_created_at() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     cluster
@@ -552,7 +552,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_allocator_floor(
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     cluster
@@ -625,14 +625,14 @@ fn stream_put_create_drains_unrelated_pending_create_before_new_session() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     let second_create = crate::CreateStreamUploadReq {
         session_id: second_session_id.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     let _serial = lock_metadata_command_apply_hook_test();
@@ -731,7 +731,7 @@ fn stream_put_create_retries_after_pending_install_conflict() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: crate::StreamUploadTarget::PutObject,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
 
     let pg_id = PgId::new(object_pg);
@@ -768,7 +768,7 @@ fn stream_put_create_retries_after_pending_install_conflict() {
                                 bucket: bucket_for_hook.clone(),
                                 key: key_for_hook.clone(),
                                 target: crate::StreamUploadTarget::PutObject,
-                                encryption: crate::ObjectEncryption::None,
+                                encryption: crate::tests::metadata_only_test_encryption(),
                             },
                             123,
                             proof_for_hook.clone(),
@@ -845,7 +845,7 @@ fn stream_abort_yields_after_one_pending_drain_before_budget_recheck() {
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            crate::tests::metadata_only_test_encryption(),
         )
         .unwrap();
     let pg_id = PgId::new(object_pg);
@@ -934,7 +934,7 @@ fn stream_abort_missing_session_does_not_succeed_after_unrelated_pending_command
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: crate::StreamUploadTarget::PutObject,
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                     123,
                     proof,
