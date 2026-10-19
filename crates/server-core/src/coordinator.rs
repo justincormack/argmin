@@ -35,7 +35,8 @@ use storage::{
 };
 
 use self::authz_results::*;
-pub use self::authz_types::{ActiveWriteEncryption, AuthorizedPutObjectWrite};
+use self::authz_types::ActiveWriteEncryption;
+pub use self::authz_types::AuthorizedPutObjectWrite;
 pub use self::infra::BackgroundWorkerMode;
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;

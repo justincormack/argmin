@@ -221,18 +221,9 @@ impl Coordinator {
         sse_customer_headers_required: bool,
     ) -> Result<ActiveWriteEncryption, ServerError> {
         match encryption {
-            ObjectEncryption::None => {
-                let sse_customer = self.prepare_existing_sse_customer_write_context(
-                    encryption,
-                    sse_customer,
-                    segment_scope,
-                    sse_customer_headers_required,
-                )?;
-                Ok(match sse_customer {
-                    Some(sse_customer) => ActiveWriteEncryption::sse_customer(sse_customer),
-                    None => ActiveWriteEncryption::None,
-                })
-            }
+            ObjectEncryption::None => Err(ServerError::InternalError {
+                reason: "plaintext payload state cannot authorize an active write".to_string(),
+            }),
             ObjectEncryption::SseCustomer(state) => {
                 let sse_customer = self.prepare_existing_sse_customer_write_context(
                     encryption,
@@ -242,10 +233,9 @@ impl Coordinator {
                 )?;
                 Ok(match sse_customer {
                     Some(sse_customer) => ActiveWriteEncryption::sse_customer(sse_customer),
-                    None => ActiveWriteEncryption::SseCustomer {
-                        encryption: ObjectEncryption::SseCustomer(state.clone()),
-                        write: None,
-                    },
+                    None => {
+                        ActiveWriteEncryption::sse_customer_without_write_context(state.clone())
+                    }
                 })
             }
             ObjectEncryption::SseS3(state) => {
@@ -270,7 +260,8 @@ impl Coordinator {
         }
     }
 
-    pub fn load_stream_put_write_encryption(
+    #[cfg(test)]
+    pub(super) fn load_stream_put_write_encryption(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -286,6 +277,7 @@ impl Coordinator {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn load_stream_put_write_encryption_with_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
@@ -305,8 +297,8 @@ impl Coordinator {
         )
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn load_stream_part_write_encryption(
+    #[cfg(test)]
+    pub(super) fn load_stream_part_write_encryption(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -324,7 +316,7 @@ impl Coordinator {
         )
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(test)]
     pub(super) fn load_stream_part_write_encryption_with_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
@@ -423,7 +415,10 @@ impl Coordinator {
         encryption: &ObjectEncryption,
     ) -> Result<(), ServerError> {
         match encryption {
-            ObjectEncryption::None | ObjectEncryption::SseCustomer(_) => Ok(()),
+            ObjectEncryption::None => Err(ServerError::InternalError {
+                reason: "plaintext payload state cannot authorize an active write".to_string(),
+            }),
+            ObjectEncryption::SseCustomer(_) => Ok(()),
             ObjectEncryption::SseS3(_) => {
                 if self.managed_key_provider.is_some() {
                     Ok(())
@@ -444,15 +439,9 @@ impl Coordinator {
         headers_required: bool,
     ) -> Result<Option<SseCustomerWriteContext>, ServerError> {
         match encryption {
-            ObjectEncryption::None => {
-                if sse_customer.is_some() {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "SSE-C headers may not be used for an unencrypted multipart upload"
-                            .to_string(),
-                    });
-                }
-                Ok(None)
-            }
+            ObjectEncryption::None => Err(ServerError::InternalError {
+                reason: "plaintext payload state cannot authorize an active write".to_string(),
+            }),
             ObjectEncryption::SseCustomer(state) => {
                 let Some(request) = sse_customer else {
                     if headers_required {

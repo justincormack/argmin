@@ -203,6 +203,92 @@ fn copy_object_basic() {
 }
 
 #[test]
+fn copy_object_implicit_sse_s3_without_provider_fails_before_destination_creation() {
+    let tmp = test_util::tempdir();
+    let configured = setup_coordinator(tmp.path());
+    configured
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &configured,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"source remains intact",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let unconfigured = Coordinator::new_with_storage_cluster(
+        configured.storage_node(),
+        "us-east-1".to_string(),
+        None,
+    )
+    .unwrap();
+
+    let err = unconfigured
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::NotImplemented { ref feature }
+        if feature == "SSE-S3 requires managed key provider configuration"
+    ));
+
+    let err = configured
+        .head_object(&GetObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "dst",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    let source = configured
+        .get_object(&GetObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "src",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+            sse_customer: None,
+        })
+        .unwrap();
+    assert_eq!(source.body.read_all().unwrap(), b"source remains intact");
+}
+
+#[test]
 fn copy_object_does_not_copy_website_redirect_without_explicit_override() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());

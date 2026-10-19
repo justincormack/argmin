@@ -1,9 +1,9 @@
 # Remove The Unreachable Plaintext Payload Profile Plan
 
-Status: in progress. Phase 0 is complete. Phase 1 has closed the production write resolver's
-plaintext fallback and removed the caller-selected stream-finalization encryption sentinel; the
-remaining active plaintext variant and its call sites are still being migrated. The design
-decision to remove the plaintext payload state is accepted.
+Status: in progress. Phases 0 and 1 are complete. Production write selection and active write
+authority are encrypted-only, including terminal publication and provider-failure behavior. Phase
+2's positive test-corpus migration is next. The design decision to remove the plaintext payload
+state is accepted.
 
 ## Context
 
@@ -22,12 +22,13 @@ Consequently, every production S3 write currently resolves to one of these state
 If the managed key provider is unavailable, an implicit SSE-S3 write fails. It must never fall
 back to plaintext. There is no AWS-facing request or bucket configuration that selects plaintext.
 
-Despite this, the internal model still contains `ObjectEncryption::None`,
-`ActiveWriteEncryption::None`, an object-encryption discriminator tag for `None`, plaintext
-segment-size branches, plaintext read/write branches, and extensive test fixtures built around
-them. Phase 1 has removed the former caller-selected `ActiveWriteEncryptionRef` finalization
-sentinel. The chunked-encryption plan consequently still spends design effort keeping an
-unreachable durable plaintext profile aligned with the encrypted profiles.
+Despite this, the durable internal model still contains `ObjectEncryption::None`, an
+object-encryption discriminator tag for `None`, plaintext segment-size branches, plaintext read
+branches, and extensive test fixtures built around them. Phase 1 removed both the former
+caller-selected `ActiveWriteEncryptionRef` finalization sentinel and
+`ActiveWriteEncryption::None`; no active write path can now mint plaintext authority. The
+chunked-encryption plan consequently still spends design effort keeping an unreachable durable
+plaintext profile aligned with the encrypted profiles.
 
 This plan removes that unsupported state before implementing the new chunked encrypted codec. The
 repository is pre-release and supports neither existing installations nor format migration, so the
@@ -409,6 +410,14 @@ Exit: no production command or stored record can be constructed from a plaintext
   opaque `AuthorizedPutObjectWrite` and requires its stored encryption state to equal the
   capability's session state. HTTP, buffered PutObject, promoted streaming PutObject, POST Object,
   and CopyObject can no longer provide a replacement encryption value or a no-context sentinel.
+- `ActiveWriteEncryption::None` has been removed. The active-write type is now coordinator-private
+  and opaque even to sibling modules: its private representation contains a concrete SSE-C or
+  SSE-S3 state, and construction is possible only from a validated write context or the exact
+  resumed SSE-C state. Segment encryption, checksum sealing, and stored-encryption projection are
+  methods on that wrapper, so removing the named variant cannot be bypassed by pairing an encrypted
+  enum variant with `ObjectEncryption::None`. A durable tag-0 session is rejected rather than
+  resumed into mutation authority while the durable variant remains temporarily readable until
+  Phase 3.
 - Crossed managed-session authority, equivalent routes from another publication domain, and wrong
   SSE-C request-key regressions reject before terminal publication. A deterministic mutation in
   the snapshot-to-command gap also proves that reinspection rejects the changed allocator state
@@ -416,10 +425,14 @@ Exit: no production command or stored record can be constructed from a plaintext
   changes the session before the post-apply snapshot load and proves its preparation callback is
   not invoked again. The capability's private representation and non-`Clone` property are also
   pinned by compile-fail coverage.
+- Missing managed-key configuration now has non-mutation canaries for buffered PutObject,
+  promoted and explicitly streamed PutObject, POST Object, CopyObject, CreateMultipartUpload,
+  UploadPart, UploadPartCopy, and CompleteMultipartUpload. They verify the relevant destination
+  object, stream session, multipart upload, and part state rather than asserting only the returned
+  error. Together with the existing SSE-C missing-validator and wrong-key tests, these pin failure
+  rather than plaintext fallback across every active write family.
 
-Remaining in Phase 1: remove `ActiveWriteEncryption::None` and its plaintext encryption/checksum
-branches, migrate the active-write test call sites needed for that compiling slice, and complete
-the provider-failure non-mutation canaries across the write-operation families.
+Phase 1 is complete.
 
 ### Phase 2: Migrate the positive test corpus
 

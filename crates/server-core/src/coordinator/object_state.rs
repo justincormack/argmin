@@ -73,41 +73,8 @@ impl Coordinator {
         write_encryption: &ActiveWriteEncryption,
     ) -> Result<(SerializedSystemMetadataBlob, ObjectEncryption), ServerError> {
         let mut stored_system_metadata = system_metadata.clone();
-        let stored_encryption = match write_encryption {
-            ActiveWriteEncryption::None => ObjectEncryption::None,
-            ActiveWriteEncryption::SseCustomer {
-                write: Some(sse_customer_write),
-                ..
-            } => {
-                let checksum = stored_system_metadata.take_checksum();
-                sse_customer_write.seal_checksum_metadata(checksum.as_ref())?
-            }
-            ActiveWriteEncryption::Managed { write, .. } => {
-                let checksum = stored_system_metadata.take_checksum();
-                if let Some(write) = write.as_ref() {
-                    write.seal_checksum_metadata(checksum.as_ref())?
-                } else if checksum.is_none() {
-                    write_encryption.object_encryption()
-                } else {
-                    return Err(ServerError::InternalError {
-                        reason: "SSE-S3 write context is required when storing checksum metadata for this object"
-                            .to_string(),
-                    });
-                }
-            }
-            ActiveWriteEncryption::SseCustomer { write: None, .. } => {
-                let checksum = stored_system_metadata.take_checksum();
-                if checksum.is_none() {
-                    write_encryption.object_encryption()
-                } else {
-                    return Err(ServerError::InvalidRequest {
-                        reason:
-                            "SSE-C headers are required when storing checksum metadata for this object"
-                                .to_string(),
-                    });
-                }
-            }
-        };
+        let checksum = stored_system_metadata.take_checksum();
+        let stored_encryption = write_encryption.seal_checksum_metadata(checksum.as_ref())?;
         Ok((
             SerializedSystemMetadataBlob::from(stored_system_metadata.serialize()?),
             stored_encryption,

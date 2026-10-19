@@ -7,9 +7,11 @@ use super::request_types::{
 use super::response_types::BucketSummary;
 use crate::error::ServerError;
 use crate::sse::{ManagedEncryptionWriteContext, SseCustomerWriteContext};
+use crate::system_metadata::ObjectChecksumMetadata;
 use s3_types::AclGrants;
 use storage::{
     BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey, ObjectLockState,
+    SseCustomerObjectState, SseS3ObjectState,
 };
 
 #[derive(Debug, Clone)]
@@ -158,24 +160,38 @@ impl ExpectedBucketOwnerRequest for AuthorizedPutObjectWrite {
 }
 
 #[derive(Debug, Clone)]
-pub enum ActiveWriteEncryption {
-    None,
+pub(super) struct ActiveWriteEncryption {
+    kind: ActiveWriteEncryptionKind,
+}
+
+#[derive(Debug, Clone)]
+enum ActiveWriteEncryptionKind {
     SseCustomer {
-        encryption: ObjectEncryption,
+        state: SseCustomerObjectState,
         write: Option<SseCustomerWriteContext>,
     },
     Managed {
-        encryption: ObjectEncryption,
-        algorithm: ManagedEncryptionAlgorithm,
-        write: Option<ManagedEncryptionWriteContext>,
+        state: SseS3ObjectState,
+        write: ManagedEncryptionWriteContext,
     },
 }
 
 impl ActiveWriteEncryption {
     pub(super) fn sse_customer(write: SseCustomerWriteContext) -> Self {
-        Self::SseCustomer {
-            encryption: write.encryption().clone(),
-            write: Some(write),
+        let ObjectEncryption::SseCustomer(state) = write.encryption() else {
+            unreachable!("SSE-C write context must contain SSE-C encryption state");
+        };
+        Self {
+            kind: ActiveWriteEncryptionKind::SseCustomer {
+                state: state.clone(),
+                write: Some(write),
+            },
+        }
+    }
+
+    pub(super) fn sse_customer_without_write_context(state: SseCustomerObjectState) -> Self {
+        Self {
+            kind: ActiveWriteEncryptionKind::SseCustomer { state, write: None },
         }
     }
 
@@ -183,53 +199,84 @@ impl ActiveWriteEncryption {
         algorithm: ManagedEncryptionAlgorithm,
         write: ManagedEncryptionWriteContext,
     ) -> Self {
-        Self::Managed {
-            encryption: write.encryption().clone(),
-            algorithm,
-            write: Some(write),
+        debug_assert_eq!(algorithm, ManagedEncryptionAlgorithm::Aes256);
+        let ObjectEncryption::SseS3(state) = write.encryption() else {
+            unreachable!("managed write context must contain SSE-S3 encryption state");
+        };
+        Self {
+            kind: ActiveWriteEncryptionKind::Managed {
+                state: state.clone(),
+                write,
+            },
         }
     }
 
     pub(super) fn is_sse_customer(&self) -> bool {
-        matches!(self, Self::SseCustomer { .. })
+        matches!(self.kind, ActiveWriteEncryptionKind::SseCustomer { .. })
     }
 
     pub(super) fn can_store_checksum_metadata(&self) -> bool {
         matches!(
-            self,
-            Self::None
-                | Self::SseCustomer { write: Some(_), .. }
-                | Self::Managed { write: Some(_), .. }
+            self.kind,
+            ActiveWriteEncryptionKind::SseCustomer { write: Some(_), .. }
+                | ActiveWriteEncryptionKind::Managed { .. }
         )
     }
 
     pub(super) fn object_encryption(&self) -> ObjectEncryption {
-        match self {
-            Self::None => ObjectEncryption::None,
-            Self::SseCustomer { encryption, .. } | Self::Managed { encryption, .. } => {
-                encryption.clone()
+        match &self.kind {
+            ActiveWriteEncryptionKind::SseCustomer { state, .. } => {
+                ObjectEncryption::SseCustomer(state.clone())
+            }
+            ActiveWriteEncryptionKind::Managed { state, .. } => {
+                ObjectEncryption::SseS3(state.clone())
             }
         }
     }
 
-    pub fn encrypt_segment(&self, segment_index: u32, data: &[u8]) -> Result<Vec<u8>, ServerError> {
-        match self {
-            Self::None => Ok(data.to_vec()),
-            Self::SseCustomer {
+    pub(super) fn seal_checksum_metadata(
+        &self,
+        checksum: Option<&ObjectChecksumMetadata>,
+    ) -> Result<ObjectEncryption, ServerError> {
+        match &self.kind {
+            ActiveWriteEncryptionKind::SseCustomer {
+                write: Some(write), ..
+            } => write.seal_checksum_metadata(checksum),
+            ActiveWriteEncryptionKind::SseCustomer { state, write: None } => {
+                if checksum.is_none() {
+                    Ok(ObjectEncryption::SseCustomer(state.clone()))
+                } else {
+                    Err(ServerError::InvalidRequest {
+                        reason: "SSE-C headers are required when storing checksum metadata for this object"
+                            .to_string(),
+                    })
+                }
+            }
+            ActiveWriteEncryptionKind::Managed { write, .. } => {
+                write.seal_checksum_metadata(checksum)
+            }
+        }
+    }
+
+    pub(super) fn encrypt_segment(
+        &self,
+        segment_index: u32,
+        data: &[u8],
+    ) -> Result<Vec<u8>, ServerError> {
+        match &self.kind {
+            ActiveWriteEncryptionKind::SseCustomer {
                 write: Some(sse_customer),
                 ..
             } => sse_customer.encrypt_segment(segment_index, data),
-            Self::Managed {
-                write: Some(write), ..
-            } => write.encrypt_segment(segment_index, data),
-            Self::SseCustomer { write: None, .. } => Err(ServerError::InvalidRequest {
-                reason: "SSE-C write context is required for streaming segment encryption"
-                    .to_string(),
-            }),
-            Self::Managed { write: None, .. } => Err(ServerError::InternalError {
-                reason: "SSE-S3 write context is required for streaming segment encryption"
-                    .to_string(),
-            }),
+            ActiveWriteEncryptionKind::Managed { write, .. } => {
+                write.encrypt_segment(segment_index, data)
+            }
+            ActiveWriteEncryptionKind::SseCustomer { write: None, .. } => {
+                Err(ServerError::InvalidRequest {
+                    reason: "SSE-C write context is required for streaming segment encryption"
+                        .to_string(),
+                })
+            }
         }
     }
 }

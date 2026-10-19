@@ -8157,6 +8157,146 @@ fn begin_stream_put_implicit_sse_s3_without_provider_fails_before_session_creati
 }
 
 #[test]
+fn buffered_put_implicit_sse_s3_without_provider_fails_before_object_creation() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_managed_key_provider(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let err = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"must not be stored as plaintext",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::NotImplemented { ref feature }
+        if feature == "SSE-S3 requires managed key provider configuration"
+    ));
+
+    let err = coord
+        .head_object(&GetObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+}
+
+#[test]
+fn promoted_put_implicit_sse_s3_without_provider_fails_before_session_creation() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_managed_key_provider(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data = vec![0x5a; INTERNAL_SEGMENT_SIZE + 1];
+
+    let err = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: &data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::NotImplemented { ref feature }
+        if feature == "SSE-S3 requires managed key provider configuration"
+    ));
+    assert_eq!(
+        storage::test_support::stream_upload_session_count_for_object(
+            &coord.storage_node(),
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+        )
+        .unwrap(),
+        0,
+        "provider failure must not promote PUT into a stream session"
+    );
+    let err = coord
+        .head_object(&GetObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+}
+
+#[test]
+fn create_multipart_upload_implicit_sse_s3_without_provider_fails_before_upload_creation() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_managed_key_provider(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let err = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: WriteEncryptionRequest::none(),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::NotImplemented { ref feature }
+        if feature == "SSE-S3 requires managed key provider configuration"
+    ));
+    assert_eq!(
+        storage::test_support::multipart_upload_count_for_object(
+            &coord.storage_node(),
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+        )
+        .unwrap(),
+        0,
+        "implicit SSE-S3 failure must not create a multipart upload"
+    );
+}
+
+#[test]
 fn begin_stream_part_rejects_non_owner_requester() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());

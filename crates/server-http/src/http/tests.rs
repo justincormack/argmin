@@ -114,16 +114,34 @@ mod tests {
     }
 
     fn setup_frontend_with_sse_s3(dir: &std::path::Path) -> HttpFrontend {
-        let storage_cluster = storage::test_support::open_default_test_storage_cluster(dir);
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
-        let coordinator = Coordinator::new_with_managed_key_provider_for_storage_cluster(
-            Arc::clone(&storage_cluster),
-            "us-east-1".to_string(),
-            None,
-            sse_s3_provider,
-        )
+        setup_frontend_with_optional_sse_s3(dir, Some(sse_s3_provider))
+    }
+
+    fn setup_frontend_without_sse_s3(dir: &std::path::Path) -> HttpFrontend {
+        setup_frontend_with_optional_sse_s3(dir, None)
+    }
+
+    fn setup_frontend_with_optional_sse_s3(
+        dir: &std::path::Path,
+        sse_s3_provider: Option<StaticManagedKeyProvider>,
+    ) -> HttpFrontend {
+        let storage_cluster = storage::test_support::open_default_test_storage_cluster(dir);
+        let coordinator = match sse_s3_provider {
+            Some(provider) => Coordinator::new_with_managed_key_provider_for_storage_cluster(
+                Arc::clone(&storage_cluster),
+                "us-east-1".to_string(),
+                None,
+                provider,
+            ),
+            None => Coordinator::new_with_storage_cluster(
+                Arc::clone(&storage_cluster),
+                "us-east-1".to_string(),
+                None,
+            ),
+        }
         .unwrap();
         let mut credentials = auth::CredentialStore::new();
         credentials
@@ -4304,6 +4322,45 @@ mod tests {
             storage::test_support::stream_upload_session_count(&fe.test_storage_cluster).unwrap(),
             0,
             "policy-denied POST should not create a stream session"
+        );
+    }
+
+    #[test]
+    fn prepare_streaming_post_object_without_managed_provider_does_not_create_session() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend_without_sse_s3(tmp.path());
+        create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
+
+        let req = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "",
+            vec![(
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            )],
+            vec![],
+        );
+        let fields = signed_post_policy_fields("mybucket", "mykey", &[], &[]);
+
+        let err = match fe.prepare_streaming_post_object(
+            &req,
+            "mybucket",
+            &fields,
+            Some("upload.txt"),
+        ) {
+            Ok(_) => panic!("expected missing managed-provider failure"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            err,
+            ServerError::NotImplemented { ref feature }
+            if feature == "SSE-S3 requires managed key provider configuration"
+        ));
+        assert_eq!(
+            storage::test_support::stream_upload_session_count(&fe.test_storage_cluster).unwrap(),
+            0,
+            "provider failure must not create a POST Object stream session"
         );
     }
 

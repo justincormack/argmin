@@ -122,6 +122,216 @@ fn create_multipart_upload_unique_ids() {
 }
 
 #[test]
+fn managed_multipart_mutations_without_provider_leave_upload_unchanged() {
+    let tmp = test_util::tempdir();
+    let configured = setup_coordinator(tmp.path());
+    configured
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let upload = configured
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: WriteEncryptionRequest::none(),
+        })
+        .unwrap();
+    let unconfigured = Coordinator::new_with_storage_cluster(
+        configured.storage_node(),
+        "us-east-1".to_string(),
+        None,
+    )
+    .unwrap();
+
+    let err = test_helpers::upload_part(
+        &unconfigured,
+        &UploadPartRequest {
+            upload: multipart_object_request("bucket", "key", &upload.upload_id, test_requester()),
+            part_number: 1,
+            data: b"must not be stored as plaintext",
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::NotImplemented { ref feature }
+        if feature == "SSE-S3 requires managed key provider configuration"
+    ));
+    assert_eq!(
+        upload_part_stream_session_count(&configured, "bucket", "key", &upload.upload_id, 1),
+        0,
+        "provider failure must not create an UploadPart stream session"
+    );
+    let parts = configured
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request("bucket", "key", &upload.upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap();
+    assert!(parts.parts.is_empty());
+
+    let uploaded = test_helpers::upload_part(
+        &configured,
+        &UploadPartRequest {
+            upload: multipart_object_request("bucket", "key", &upload.upload_id, test_requester()),
+            part_number: 1,
+            data: b"encrypted multipart data",
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+    let err = unconfigured
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request("bucket", "key", &upload.upload_id, test_requester()),
+            parts: &[CompletePart {
+                part_number: 1,
+                etag: uploaded.etag,
+                checksum: None,
+            }],
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: NO_WRITE,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::InternalError { ref reason }
+        if reason == "SSE-S3 key provider is not configured"
+    ));
+
+    let parts = configured
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request("bucket", "key", &upload.upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap();
+    assert_eq!(parts.parts.len(), 1);
+    assert_eq!(
+        storage::test_support::multipart_upload_count_for_object(
+            &configured.storage_node(),
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+        )
+        .unwrap(),
+        1,
+        "provider failure must not consume the multipart upload"
+    );
+    let err = configured
+        .head_object(&GetObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+}
+
+#[test]
+fn upload_part_copy_without_managed_provider_leaves_destination_upload_unchanged() {
+    let tmp = test_util::tempdir();
+    let configured = setup_coordinator(tmp.path());
+    configured
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &configured,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"encrypted copy source",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let upload = configured
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: WriteEncryptionRequest::none(),
+        })
+        .unwrap();
+    let unconfigured = Coordinator::new_with_storage_cluster(
+        configured.storage_node(),
+        "us-east-1".to_string(),
+        None,
+    )
+    .unwrap();
+
+    let err = unconfigured
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("bucket", "src", None),
+            upload: multipart_object_request("bucket", "dst", &upload.upload_id, test_requester()),
+            part_number: 1,
+            copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::NotImplemented { ref feature }
+        if feature == "SSE-S3 requires managed key provider configuration"
+    ));
+    assert_eq!(
+        upload_part_stream_session_count(&configured, "bucket", "dst", &upload.upload_id, 1),
+        0,
+        "provider failure must not create an UploadPartCopy stream session"
+    );
+    let parts = configured
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request("bucket", "dst", &upload.upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap();
+    assert!(parts.parts.is_empty());
+    let source = configured
+        .get_object(&GetObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "src",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+            sse_customer: None,
+        })
+        .unwrap();
+    assert_eq!(source.body.read_all().unwrap(), b"encrypted copy source");
+}
+
+#[test]
 fn create_multipart_upload_requires_bucket() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
