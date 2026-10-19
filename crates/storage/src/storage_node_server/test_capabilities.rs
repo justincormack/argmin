@@ -83,7 +83,7 @@
             metadata_blob: crate::SerializedMetadataBlob::default(),
             system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
             object_lock: crate::ObjectLockState::default(),
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
             segment_index: 0,
             segment_crc64: 99,
             segment_okh: [7; 16],
@@ -106,7 +106,7 @@
             public_read: false,
             object_lock: crate::ObjectLockState::default(),
             checksum: None,
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let terminal_multipart_part = crate::MultipartPartRecord {
             upload_id: upload_id.clone(),
@@ -128,7 +128,7 @@
             bucket: bucket.clone(),
             key: key.clone(),
             target: StreamUploadTarget::PutObject,
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let expected_stream_command =
             CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
@@ -156,7 +156,7 @@
                 upload_id: upload_id.clone(),
                 part_number: 1,
             },
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let expected_upload_part_stream_command =
             CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
@@ -188,7 +188,7 @@
                     metadata_blob: None,
                     system_metadata_blob: None,
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
                 &[],
             )
@@ -620,7 +620,7 @@
             metadata_blob: crate::SerializedMetadataBlob::default(),
             system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
             object_lock: crate::ObjectLockState::default(),
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let put_finalize_command = crate::clock::with_time_override(1_000, || {
             primary_route
@@ -1258,7 +1258,7 @@
                 etag_crc64: [0x72; 8],
                 system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
+                encryption: crate::tests::metadata_only_test_encryption(),
                 conditional_completion: false,
             });
         assert_eq!(

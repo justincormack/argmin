@@ -1098,7 +1098,7 @@
                             upload_id: upload_id.clone(),
                             part_number: 1,
                         },
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                     1,
                     test_bucket_write_reservation_proof(bucket.clone(), &key),
@@ -1122,7 +1122,7 @@
             initiated_object_identity: None,
             object_lock: crate::ObjectLockState::default(),
             checksum: None,
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let commit_session_id = SessionId::try_from("18".repeat(16)).unwrap();
         let commit_command = MetadataCommandEnvelope::new(
@@ -2268,7 +2268,7 @@
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: crate::StreamUploadTarget::PutObject,
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                     123,
                     test_bucket_write_reservation_proof(bucket.clone(), &key),
@@ -3712,7 +3712,7 @@
                     metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                     system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
                 segments: Vec::new(),
                 generation_reservation_id: reservation_id,

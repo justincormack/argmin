@@ -5357,7 +5357,7 @@ mod tests {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let mut ordered_request = request.clone();
         ordered_request.upload_id = ordered_upload_id;
@@ -5477,7 +5477,7 @@ mod tests {
             metadata_blob: Some(SerializedMetadataBlob::new(vec![1, 2, 3])),
             system_metadata_blob: Some(SerializedSystemMetadataBlob::new(vec![4, 5, 6])),
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         });
         let request = StorageRpcObjectReadAuthSubjectRequest {
             object: StorageRpcObjectRequest {
@@ -5661,7 +5661,7 @@ mod tests {
             metadata_blob: Some(SerializedMetadataBlob::new(vec![1, 2, 3])),
             system_metadata_blob: Some(SerializedSystemMetadataBlob::new(vec![4, 5, 6])),
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         });
         let response = StorageRpcDirectPutCommitSnapshotResponse {
             snapshot: DirectPutCommitStorageSnapshot {
@@ -5732,7 +5732,7 @@ mod tests {
             metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
             system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
             segment_index: 0,
             segment_crc64: 99,
             segment_okh: [7; 16],
