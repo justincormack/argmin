@@ -33,8 +33,9 @@ use crate::storage_rpc::{
     StorageRpcReadHandleAcquireResponse, StorageRpcStreamError,
     STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
 };
+use crate::tests::metadata_only_test_encryption;
 use crate::types::{
-    DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, SerializedMetadataBlob,
+    DeleteMarkerRecord, EtagKind, ObjectLockState, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, StorageClass, StreamUploadPartSnapshot,
 };
 use crate::ShardScavengerObservationReason;
@@ -2042,7 +2043,7 @@ fn local_object_listing_metadata_route_rejects_foreign_scan_pg_rows() {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         },
         &[],
     )
@@ -2062,7 +2063,7 @@ fn local_object_listing_metadata_route_rejects_foreign_scan_pg_rows() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         },
     )
     .unwrap();
@@ -2430,7 +2431,7 @@ fn local_multipart_creation_metadata_route_binds_exact_object_subject() {
         public_read: false,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     assert_eq!(
         route
@@ -2858,7 +2859,7 @@ fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority(
         bucket: bucket.clone(),
         key: key.clone(),
         target: StreamUploadTarget::PutObject,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     assert!(!route.matching_stream_upload_exists(&request, None).unwrap());
 
@@ -2957,7 +2958,7 @@ fn unix_stream_upload_creation_metadata_route_rejects_foreign_subject_before_rpc
         bucket,
         key: crate::tests::object_key("unix-stream-creation-route-crossed-key"),
         target: StreamUploadTarget::PutObject,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     assert!(matches!(
         route
@@ -3216,7 +3217,7 @@ fn upload_part_stream_upload_match_accepts_existing_row_without_create_proof() {
             upload_id: upload_id.clone(),
             part_number: 1,
         },
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let proof = crate::metadata_command::BucketWriteReservationProof {
         bucket: bucket.clone(),
@@ -3245,7 +3246,7 @@ fn upload_part_stream_upload_match_accepts_existing_row_without_create_proof() {
         state: StreamUploadState::InProgress,
         created_at: command.session.created_at,
         cleanup_after: command.cleanup_after,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         next_segment_vid: command.initial_next_segment_vid,
         bucket_write_reservation: None,
     };
@@ -3282,7 +3283,7 @@ fn stream_upload_match_binds_cleanup_deadline_for_put_and_upload_part() {
             bucket: bucket.clone(),
             key: key.clone(),
             target: target.clone(),
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         };
         let proof = crate::metadata_command::BucketWriteReservationProof {
             bucket: bucket.clone(),
@@ -3311,7 +3312,7 @@ fn stream_upload_match_binds_cleanup_deadline_for_put_and_upload_part() {
             state: StreamUploadState::InProgress,
             created_at: command.session.created_at,
             cleanup_after: command.cleanup_after,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
             next_segment_vid: command.initial_next_segment_vid,
             bucket_write_reservation: matches!(
                 command.session.target,
@@ -3356,7 +3357,7 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 target: StreamUploadTarget::PutObject,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -3460,7 +3461,7 @@ fn test_live_stored_object(
         metadata_blob: None,
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     })
 }
 
@@ -3529,7 +3530,7 @@ fn test_multipart_upload_record(
         initiated_object_identity: None,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     }
 }
 
@@ -4233,7 +4234,7 @@ fn test_metadata_command_recovery_chain(
                     bucket,
                     key,
                     target: StreamUploadTarget::PutObject,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
                 123,
                 proof,

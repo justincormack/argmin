@@ -8,6 +8,7 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_cleanup_response,
     StorageRpcMetadataCommandPendingSlotCleanupResponse,
 };
+use crate::tests::metadata_only_test_encryption;
 use crate::{PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind, PgState};
 use std::sync::mpsc;
 
@@ -63,7 +64,7 @@ fn create_stream_upload_command_for_rpc_test(
                     bucket: bucket.clone(),
                     key: key.clone(),
                     target,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
                 1,
                 test_bucket_write_reservation_proof(bucket, &key),

@@ -21,6 +21,7 @@ use crate::storage_rpc::{
     StorageRpcBucketWriteReservationsListResponse, StorageRpcLifecycleSweepBucketsResponse,
     StorageRpcLifecycleSweepRootsResponse,
 };
+use crate::tests::metadata_only_test_encryption;
 
 #[derive(Clone, Copy)]
 enum HistoricalReplicaHeadAuthorization {
@@ -2915,7 +2916,7 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
         )
         .unwrap();

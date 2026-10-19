@@ -462,9 +462,14 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   listing, versioning, digest, and command-application fixtures. Direct SQL setup in that corpus
   writes the matching encoded encryption state rather than crossing an SSE-S3 discriminator with
   a null state.
-- This slice removes 116 positive `ObjectEncryption::None` constructions. The remaining 371 source
-  occurrences are deliberately left for the payload-bearing/command-codec fixture migrations and
-  Phase 3's production removal and immutable rejection evidence; Phase 2 is not yet complete.
+- The first metadata-store slice removes 116 positive `ObjectEncryption::None` constructions.
+- The node-client transport slice migrates another 56 request, response, route-capability,
+  command-building, and installed Unix-RPC fixtures. These tests move typed metadata and commands
+  but do not read or write payload under the synthetic key material; raw shard-transport tests are
+  independent of the migrated encryption records.
+- The remaining 315 source occurrences are deliberately left for the payload-bearing and
+  command-codec fixture migrations plus Phase 3's production removal and immutable rejection
+  evidence. Phase 2 is not yet complete.
 
 ### Phase 3: Atomically close durable and recovery state
 

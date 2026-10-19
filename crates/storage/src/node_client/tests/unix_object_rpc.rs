@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::tests::metadata_only_test_encryption;
 
 fn retained_object_mutation_route<'a>(
     client: &'a UnixStorageNodeClient,
@@ -260,7 +261,7 @@ fn unix_multipart_creation_route_rejects_foreign_authority_before_rpc() {
         public_read: false,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
     proof.operation_kind =
@@ -488,7 +489,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 target: StreamUploadTarget::PutObject,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -551,7 +552,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -565,7 +566,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
                     upload_id: part_upload_id.clone(),
                     part_number: 1,
                 },
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -1134,7 +1135,7 @@ fn unix_object_mutation_scan_route_rejects_foreign_response_subjects() {
         state: StreamUploadState::InProgress,
         created_at: 1,
         cleanup_after: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::new(10).unwrap(),
         bucket_write_reservation: None,
     };
@@ -1424,7 +1425,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
                         metadata_blob: None,
                         system_metadata_blob: None,
                         object_lock: ObjectLockState::default(),
-                        encryption: ObjectEncryption::None,
+                        encryption: metadata_only_test_encryption(),
                     },
                     &[],
                 )
@@ -1736,7 +1737,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: StreamUploadTarget::PutObject,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let correct_stream_creation_route = client
         .open_stream_upload_creation_metadata_route(
@@ -1802,7 +1803,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         public_read: false,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let correct_multipart_creation_route =
         ObjectMutationMetadataNodeClient::open_multipart_upload_creation_metadata_route(
@@ -2131,7 +2132,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         segment_index: 0,
         segment_crc64: 99,
         segment_okh: [7; 16],
@@ -2207,7 +2208,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: StreamUploadTarget::PutObject,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let mut current_proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
     current_proof.operation_kind =
@@ -2235,7 +2236,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         public_read: false,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let part_create = CreateStreamUploadReq {
         session_id: part_session_id.clone(),
@@ -2245,7 +2246,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             upload_id: upload_id.clone(),
             part_number: 1,
         },
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let mut reserved_generation = None;
     let _time = crate::clock::test_time_override_guard(1_000);
@@ -2305,7 +2306,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             upload_id: upload_id.clone(),
             part_number: 2,
         },
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let mut part_create_proof = current_proof.clone();
     part_create_proof.operation_kind =
@@ -2561,7 +2562,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         metadata_blob: SerializedMetadataBlob::default(),
         system_metadata_blob: SerializedSystemMetadataBlob::default(),
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let correct_command = correct_put_finalization_route
         .build_commit_command(
@@ -2841,7 +2842,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         public_read: false,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let part = test_multipart_part_record(upload_id.clone(), 1);
     let _time = crate::clock::test_time_override_guard(1_000);
@@ -3064,7 +3065,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         metadata_blob: Some(SerializedMetadataBlob::default()),
         system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         expected_stale_payload_source: snapshot.stale_payload_source.clone(),
         expected_current_object_identity: snapshot.current_object_identity,
         conditional_completion: false,
@@ -3314,7 +3315,7 @@ fn installed_unix_object_scan_routes_reject_misplaced_durable_rows_as_payload_de
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             &[],
         )
@@ -3334,7 +3335,7 @@ fn installed_unix_object_scan_routes_reject_misplaced_durable_rows_as_payload_de
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -3483,7 +3484,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             std::slice::from_ref(&segment),
         )
@@ -3546,7 +3547,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         bucket: bucket.clone(),
         key: crate::tests::object_key("object-mutation-listed-stream-key"),
         target: StreamUploadTarget::PutObject,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let generation_id = GenerationId::new(19).unwrap();
     let reclaim_generation_id = GenerationId::new(21).unwrap();
@@ -3600,7 +3601,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
             std::slice::from_ref(&segment),
         )
@@ -3811,7 +3812,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         bucket: bucket.clone(),
         key: key.clone(),
         target: StreamUploadTarget::PutObject,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let stream_creation_route = client
         .open_stream_upload_creation_metadata_route(
@@ -3934,7 +3935,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             upload_id: missing_upload_id.clone(),
             part_number: 1,
         },
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let err = stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
@@ -3965,7 +3966,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         public_read: false,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let mut multipart_proof = proof.clone();
     multipart_proof.operation_kind =
@@ -4098,7 +4099,7 @@ fn unix_object_mutation_client_rejects_stale_upload_part_stream_command_epoch() 
             upload_id,
             part_number: 1,
         },
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
     proof.cluster_epoch = stale_epoch;
@@ -4240,7 +4241,7 @@ fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 target: crate::StreamUploadTarget::PutObject,
-                encryption: crate::ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -5046,7 +5047,7 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
                     last_modified: 2,
                     tags: None,
                     system_metadata_blob: None,
-                    encryption: ObjectEncryption::None,
+                    encryption: metadata_only_test_encryption(),
                 },
             )),
             &upload.bucket,
@@ -5102,7 +5103,7 @@ fn unix_object_mutation_client_loads_multipart_upload_over_rpc() {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
         };
         let proof = BucketWriteReservationProof {
             bucket: bucket.clone(),
@@ -5187,7 +5188,7 @@ fn unix_multipart_creation_match_accepts_ordered_command_for_provisional_id() {
         public_read: false,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let mut ordered_request = request.clone();
     ordered_request.upload_id = ordered_upload_id;
@@ -5380,7 +5381,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         segment_index: 0,
         segment_crc64: 99,
         segment_okh: [7; 16],
@@ -5534,7 +5535,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
         state: StreamUploadState::InProgress,
         created_at: 1,
         cleanup_after: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::new(2).unwrap(),
         bucket_write_reservation: None,
     };
@@ -5740,7 +5741,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
             state: StreamUploadState::InProgress,
             created_at: 1,
             cleanup_after: None,
-            encryption: ObjectEncryption::None,
+            encryption: metadata_only_test_encryption(),
             next_segment_vid: GenerationId::new(11).unwrap(),
             bucket_write_reservation: Some(proof.clone()),
         },
@@ -5761,7 +5762,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
         metadata_blob: SerializedMetadataBlob::default(),
         system_metadata_blob: SerializedSystemMetadataBlob::default(),
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let command = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
@@ -5968,7 +5969,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
         }),
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let snapshot = StreamUploadPartStorageSnapshot {
         auth_snapshot: StreamUploadPartSnapshot {
@@ -5983,7 +5984,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
                 state: StreamUploadState::InProgress,
                 created_at: 1,
                 cleanup_after: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
                 next_segment_vid: GenerationId::new(31).unwrap(),
                 bucket_write_reservation: None,
             },
@@ -6145,7 +6146,7 @@ fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() 
                 state: StreamUploadState::InProgress,
                 created_at: 1,
                 cleanup_after: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
                 next_segment_vid: GenerationId::new(31).unwrap(),
                 bucket_write_reservation: None,
             },
@@ -6251,7 +6252,7 @@ fn unix_complete_multipart_uses_durable_initiation_identity() {
         metadata_blob: Some(SerializedMetadataBlob::default()),
         system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let upload = {
         let node = SharedStorageNode::open_with_default_ec_shape(
@@ -6287,7 +6288,7 @@ fn unix_complete_multipart_uses_durable_initiation_identity() {
                 public_read: false,
                 object_lock: ObjectLockState::default(),
                 checksum: None,
-                encryption: ObjectEncryption::None,
+                encryption: metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -6332,7 +6333,7 @@ fn unix_complete_multipart_uses_durable_initiation_identity() {
         metadata_blob: Some(SerializedMetadataBlob::default()),
         system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         expected_stale_payload_source: None,
         expected_current_object_identity: Some(current_identity),
         conditional_completion: true,
@@ -6409,7 +6410,7 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         metadata_blob: Some(SerializedMetadataBlob::default()),
         system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
         object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
         expected_stale_payload_source: None,
         expected_current_object_identity: Some(crate::MultipartObjectIdentity::Live {
             version_id: VersionId::from_u64(2),
@@ -6666,7 +6667,7 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
         initiated_object_identity: None,
         object_lock: ObjectLockState::default(),
         checksum: None,
-        encryption: ObjectEncryption::None,
+        encryption: metadata_only_test_encryption(),
     };
     let cleanup = crate::types::AbortMultipartUploadCleanup {
         upload,
