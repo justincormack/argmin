@@ -516,7 +516,12 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   and segment-ID allocation fixtures. These tests exercise metadata allocation and convergence
   without writing shard payload; adjacent append, uploaded-part, and cleanup tests remain coupled
   to their production-compatible ciphertext migration.
-- The remaining 141 source occurrences are deliberately left for the payload-bearing and
+- The direct-PUT route slice removes another 12 positive plaintext constructions. Payload-bearing
+  route-ownership, pending-command, cleanup, deadline, response-loss, and versioned-convergence
+  tests now shard production-compatible SSE-S3 ciphertext while keeping logical size and ETag CRC
+  separate from stored size and CRC. Metadata-only crossed-proof and stale-snapshot fixtures use
+  the explicitly synthetic encrypted state.
+- The remaining 129 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 

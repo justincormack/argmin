@@ -29,6 +29,76 @@ fn direct_payload_test_identity(
     }
 }
 
+fn prepared_encrypted_direct_put(
+    cluster: &crate::StorageCluster,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    versioning: crate::BucketVersioningState,
+    plaintext: &[u8],
+    fixture: &crate::tests::SseS3SegmentTestFixture,
+) -> crate::PreparedDirectPutObjectCommit {
+    crate::PreparedDirectPutObjectCommit {
+        versioning,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(plaintext),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: fixture.encryption.clone(),
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            cluster,
+            bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    }
+}
+
+struct EncryptedDirectPutCommitReqFixture<'a> {
+    bucket: &'a crate::BucketName,
+    key: &'a crate::ObjectKey,
+    reservation_id: crate::SessionId,
+    generation_id: crate::GenerationId,
+    versioning: crate::BucketVersioningState,
+    segment_okh: [u8; 16],
+    written: &'a crate::DirectPutWrittenSegment,
+    plaintext: &'a [u8],
+    encrypted: &'a crate::tests::SseS3SegmentTestFixture,
+}
+
+fn encrypted_direct_put_commit_req_with_bucket_write_proof(
+    fixture: EncryptedDirectPutCommitReqFixture<'_>,
+    bucket_write_reservation: crate::metadata_command::BucketWriteReservationProof,
+) -> crate::CommitDirectPutObjectReq {
+    crate::CommitDirectPutObjectReq {
+        bucket: fixture.bucket.clone(),
+        key: fixture.key.clone(),
+        generation_reservation_id: fixture.reservation_id,
+        versioning: fixture.versioning,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        generation_id: fixture.generation_id,
+        size: fixture.encrypted.logical_size,
+        etag_crc64: checksum::crc64::checksum(fixture.plaintext),
+        ec: fixture.written.ec,
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: fixture.encrypted.encryption.clone(),
+        segment_index: 0,
+        segment_crc64: fixture.encrypted.storage_crc64,
+        segment_okh: fixture.segment_okh,
+        segment_vid: fixture.generation_id,
+        data_pg_id: fixture.written.data_pg_id,
+        bucket_write_reservation,
+    }
+}
+
 fn assert_direct_payload_shards_exist(
     cluster: &crate::StorageCluster,
     identity: DirectPayloadTestIdentity,
@@ -104,36 +174,28 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
     let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let plaintext = b"opaque direct payload";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(plaintext, 0);
     let commit_reservation_id = crate::tests::stream_session_id("opaque-commit");
     let commit_generation_id = route.reserve_generation(&commit_reservation_id).unwrap();
     let commit_payload = route
         .write_direct_object_payload(
             &commit_reservation_id,
             commit_generation_id,
-            21,
-            b"opaque direct payload",
+            fixture.logical_size,
+            &fixture.storage_bytes,
         )
         .unwrap();
     let commit_identity = direct_payload_test_identity(&commit_payload);
     assert_direct_payload_shards_exist(&cluster, commit_identity);
-    let prepared = crate::PreparedDirectPutObjectCommit {
-        versioning: crate::BucketVersioningState::Disabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        etag_crc64: checksum::crc64::checksum(b"opaque direct payload"),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &cluster,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
+    let prepared = prepared_encrypted_direct_put(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        plaintext,
+        &fixture,
+    );
 
     let crossed_key_route = admission
         .active_put_object_route(&bucket, &other_key)
@@ -158,8 +220,8 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
         .write_direct_object_payload(
             &discard_reservation_id,
             discard_generation_id,
-            21,
-            b"opaque direct payload",
+            fixture.logical_size,
+            &fixture.storage_bytes,
         )
         .unwrap();
     let discard_identity = direct_payload_test_identity(&discard_payload);
@@ -224,36 +286,28 @@ fn opaque_direct_put_payload_rejects_same_epoch_cross_cluster_commit_and_cleans_
     let receiver_route = receiver_admission
         .active_put_object_route(&bucket, &key)
         .unwrap();
+    let plaintext = b"same epoch issuer payload";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(plaintext, 0);
     let reservation_id = crate::tests::stream_session_id("cross-cluster");
     let generation_id = issuer_route.reserve_generation(&reservation_id).unwrap();
     let payload = issuer_route
         .write_direct_object_payload(
             &reservation_id,
             generation_id,
-            26,
-            b"same epoch issuer payload",
+            fixture.logical_size,
+            &fixture.storage_bytes,
         )
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
     assert_direct_payload_shards_exist(&issuer, payload_identity);
-    let prepared = crate::PreparedDirectPutObjectCommit {
-        versioning: crate::BucketVersioningState::Disabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        etag_crc64: checksum::crc64::checksum(b"same epoch issuer payload"),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &receiver,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
+    let prepared = prepared_encrypted_direct_put(
+        &receiver,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        plaintext,
+        &fixture,
+    );
 
     let error = receiver_route
         .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
@@ -344,37 +398,35 @@ fn matching_pending_direct_put_retries_transient_abandonment_scan_and_preserves_
     let reservation_id = crate::tests::stream_session_id("inspect-failure");
     let generation_id = route.reserve_generation(&reservation_id).unwrap();
     let data = b"payload owned by a matching pending command";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .write_direct_object_payload(
+            &reservation_id,
+            generation_id,
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
-    let prepared = crate::PreparedDirectPutObjectCommit {
-        versioning: crate::BucketVersioningState::Disabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        etag_crc64: checksum::crc64::checksum(data),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &cluster,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
-    let request = direct_put_commit_req_with_bucket_write_proof(
-        DirectPutCommitReqFixture {
+    let prepared = prepared_encrypted_direct_put(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        data,
+        &fixture,
+    );
+    let request = encrypted_direct_put_commit_req_with_bucket_write_proof(
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id: reservation_id.clone(),
             generation_id,
-            payload: data,
+            versioning: crate::BucketVersioningState::Disabled,
             segment_okh: payload.segment_okh,
             written: &payload.written,
+            plaintext: data,
+            encrypted: &fixture,
         },
         prepared.bucket_write_reservation.clone(),
     );
@@ -491,36 +543,34 @@ fn matching_published_direct_put_returns_before_trailing_payload_ack_work() {
     let reservation_id = crate::tests::stream_session_id("published");
     let generation_id = route.reserve_generation(&reservation_id).unwrap();
     let data = b"payload owned by a published pending command";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .write_direct_object_payload(
+            &reservation_id,
+            generation_id,
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
-    let prepared = crate::PreparedDirectPutObjectCommit {
-        versioning: crate::BucketVersioningState::Disabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        etag_crc64: checksum::crc64::checksum(data),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &cluster,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
-    let request = direct_put_commit_req_with_bucket_write_proof(
-        DirectPutCommitReqFixture {
+    let prepared = prepared_encrypted_direct_put(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        data,
+        &fixture,
+    );
+    let request = encrypted_direct_put_commit_req_with_bucket_write_proof(
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id,
             generation_id,
-            payload: data,
+            versioning: crate::BucketVersioningState::Disabled,
             segment_okh: payload.segment_okh,
             written: &payload.written,
+            plaintext: data,
+            encrypted: &fixture,
         },
         prepared.bucket_write_reservation.clone(),
     );
@@ -648,37 +698,35 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
     let reservation_id = crate::tests::stream_session_id("phys-mismatch");
     let generation_id = route.reserve_generation(&reservation_id).unwrap();
     let data = b"payload whose staging keys overlap the pending command";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let pending_payload = route
-        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .write_direct_object_payload(
+            &reservation_id,
+            generation_id,
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let payload_identity = direct_payload_test_identity(&pending_payload);
-    let prepared = crate::PreparedDirectPutObjectCommit {
-        versioning: crate::BucketVersioningState::Disabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        etag_crc64: checksum::crc64::checksum(data),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &cluster,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
-    let mut pending_request = direct_put_commit_req_with_bucket_write_proof(
-        DirectPutCommitReqFixture {
+    let prepared = prepared_encrypted_direct_put(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        data,
+        &fixture,
+    );
+    let mut pending_request = encrypted_direct_put_commit_req_with_bucket_write_proof(
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id: reservation_id.clone(),
             generation_id,
-            payload: data,
+            versioning: crate::BucketVersioningState::Disabled,
             segment_okh: pending_payload.segment_okh,
             written: &pending_payload.written,
+            plaintext: data,
+            encrypted: &fixture,
         },
         prepared.bucket_write_reservation.clone(),
     );
@@ -716,7 +764,12 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
     pending_payload.disarm();
 
     let mismatched_payload = route
-        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .write_direct_object_payload(
+            &reservation_id,
+            generation_id,
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     assert_eq!(
         direct_payload_test_identity(&mismatched_payload).segment_okh,
@@ -849,7 +902,7 @@ fn direct_put_fanout_rejects_live_crossed_reservation_subjects() {
                         metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                         system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                         object_lock: crate::ObjectLockState::default(),
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     },
                     segments: Vec::new(),
                     generation_reservation_id: reservation_id.clone(),
@@ -1943,28 +1996,24 @@ fn direct_put_budget_expiry_after_pending_install_returns_snapshot_conflict_and_
     let reservation_id = crate::tests::stream_session_id("install-expiry");
     let generation_id = route.reserve_generation(&reservation_id).unwrap();
     let data = b"direct PUT inherited budget expiry after pending install";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .write_direct_object_payload(
+            &reservation_id,
+            generation_id,
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
-    let prepared = crate::PreparedDirectPutObjectCommit {
-        versioning: crate::BucketVersioningState::Enabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        etag_crc64: checksum::crc64::checksum(data),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &cluster,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
+    let prepared = prepared_encrypted_direct_put(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Enabled,
+        data,
+        &fixture,
+    );
 
     let _serial = lock_metadata_command_apply_hook_test();
     let expired = Arc::new(AtomicBool::new(false));
@@ -2054,36 +2103,34 @@ fn direct_put_retry_reconstructs_matching_witness_before_reservation_validation(
     let reservation_id = crate::tests::stream_session_id("adopt-witness");
     let generation_id = route.reserve_generation(&reservation_id).unwrap();
     let data = b"direct PUT matching pending witness adoption";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .write_direct_object_payload(
+            &reservation_id,
+            generation_id,
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
-    let prepared = crate::PreparedDirectPutObjectCommit {
-        versioning: crate::BucketVersioningState::Enabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        etag_crc64: checksum::crc64::checksum(data),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &cluster,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
-    let request = direct_put_commit_req_with_bucket_write_proof(
-        DirectPutCommitReqFixture {
+    let prepared = prepared_encrypted_direct_put(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Enabled,
+        data,
+        &fixture,
+    );
+    let request = encrypted_direct_put_commit_req_with_bucket_write_proof(
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id: reservation_id.clone(),
             generation_id,
-            payload: data,
+            versioning: crate::BucketVersioningState::Enabled,
             segment_okh: payload.segment_okh,
             written: &payload.written,
+            plaintext: data,
+            encrypted: &fixture,
         },
         prepared.bucket_write_reservation.clone(),
     );
@@ -2171,27 +2218,23 @@ fn versioned_direct_put_hands_transported_trailing_contention_to_recovery() {
     let reservation_id = crate::tests::stream_session_id("direct-timeout");
     let generation_id = route.reserve_generation(&reservation_id).unwrap();
     let data = b"versioned direct PUT replica timeout";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .write_direct_object_payload(
+            &reservation_id,
+            generation_id,
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
-    let prepared = crate::PreparedDirectPutObjectCommit {
-        versioning: crate::BucketVersioningState::Enabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        etag_crc64: checksum::crc64::checksum(data),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &cluster,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
+    let prepared = prepared_encrypted_direct_put(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Enabled,
+        data,
+        &fixture,
+    );
 
     let _serial = lock_metadata_command_apply_hook_test();
     let trailing_replica_attempts = Arc::new(AtomicUsize::new(0));
@@ -2339,27 +2382,23 @@ fn versioned_direct_put_converges_primary_apply_response_loss_before_success() {
     let reservation_id = crate::tests::stream_session_id("response-loss");
     let generation_id = route.reserve_generation(&reservation_id).unwrap();
     let data = b"versioned direct PUT apply response loss";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .write_direct_object_payload(
+            &reservation_id,
+            generation_id,
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
-    let prepared = crate::PreparedDirectPutObjectCommit {
-        versioning: crate::BucketVersioningState::Enabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        etag_crc64: checksum::crc64::checksum(data),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &cluster,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
+    let prepared = prepared_encrypted_direct_put(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Enabled,
+        data,
+        &fixture,
+    );
 
     let _serial = lock_metadata_command_apply_hook_test();
     let primary_response_lost = Arc::new(AtomicBool::new(false));
@@ -6005,7 +6044,7 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
                     metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                     system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 }),
             )
             .unwrap();
@@ -6160,7 +6199,7 @@ fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
                         metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                         system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                         object_lock: crate::ObjectLockState::default(),
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: crate::tests::metadata_only_test_encryption(),
                     }),
                 )
                 .unwrap();
