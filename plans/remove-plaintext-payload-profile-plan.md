@@ -474,7 +474,11 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
 - The owner-local command/type slice migrates another 11 proof-validation, command-matching,
   opaque-capability, replay, and placement-diagnostic fixtures. Stable command and encryption
   golden encodings remain unchanged for preservation as historical evidence during Phase 3.
-- The remaining 289 source occurrences are deliberately left for the payload-bearing and
+- The first payload-bearing slice replaces the same-PG stream append atomicity fixture with a
+  storage-owned production-compatible SSE-S3 segment fixture. Its wrapped DEK, ciphertext,
+  logical/stored checksums, authentication-tag overhead, and 1+0 shard geometry are coherent;
+  the test no longer pairs plaintext shard bytes with encrypted metadata or a partial 4+2 layout.
+- The remaining 288 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    bucket_name, metadata_only_test_encryption, multipart_upload_id, object_key, stream_session_id,
+    bucket_name, metadata_only_test_encryption, multipart_upload_id, object_key,
+    sse_s3_segment_test_fixture, stream_session_id,
 };
 use crate::metadata_command::{
     DeleteFinalizedBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
@@ -4835,6 +4836,12 @@ fn stream_segment_append_and_list() {
 #[test]
 fn stream_segment_publish_with_shards_same_pg_is_atomic() {
     let (_dir, store) = make_pg_store();
+    let plaintext = b"bbbb";
+    let fixture = sse_s3_segment_test_fixture(plaintext, 0);
+    assert_eq!(
+        fixture.storage_bytes.len(),
+        plaintext.len() + fixture.encryption.segment_ciphertext_extra_len()
+    );
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
@@ -4842,14 +4849,14 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
-            // This test writes literal stored bytes. Keep it in the explicitly deferred payload
-            // fixture corpus until it creates matching production ciphertext and geometry.
-            encryption: ObjectEncryption::None,
+            encryption: fixture.encryption.clone(),
         })
         .unwrap();
 
-    let shard = ShardKey::new(&[0xA1; 16], 1, 0);
-    let ack = store.write_shard(&shard, b"bbbb").unwrap();
+    let segment_okh = [0xA1; 16];
+    let segment_vid = GenerationId::new(1).unwrap();
+    let shard = ShardKey::new(&segment_okh, segment_vid.get(), 0);
+    let ack = store.write_shard(&shard, &fixture.storage_bytes).unwrap();
     store.test_delete_shard_row(&shard).unwrap();
     assert!(matches!(
         store.read_shard(&shard),
@@ -4859,15 +4866,15 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
     let segment = StreamUploadSegmentRecord {
         session_id: stream_session_id("sess-publish"),
         segment_index: 0,
-        size: 4,
-        segment_crc64: 99,
-        payload_crc64: 99,
-        segment_okh: [0x44; 16],
-        segment_vid: GenerationId::new(1).unwrap(),
+        size: fixture.logical_size,
+        segment_crc64: fixture.storage_crc64,
+        payload_crc64: fixture.payload_crc64,
+        segment_okh,
+        segment_vid,
         data_pg_id: 0,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
-        ec_k: 4,
-        ec_m: 2,
+        ec_k: 1,
+        ec_m: 0,
     };
     let shard_batch = [(&shard, ack)];
 
@@ -4880,7 +4887,16 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].segment_index, 0);
-    assert_eq!(store.read_shard(&shard).unwrap().data, b"bbbb");
+    assert_eq!(segments[0].size, plaintext.len() as u64);
+    assert_eq!(segments[0].segment_crc64, fixture.storage_crc64);
+    assert_eq!(segments[0].payload_crc64, fixture.payload_crc64);
+    assert_eq!(segments[0].ec_k, 1);
+    assert_eq!(segments[0].ec_m, 0);
+    assert_eq!(
+        store.read_shard(&shard).unwrap().data,
+        fixture.storage_bytes
+    );
+    assert_ne!(fixture.storage_bytes, plaintext);
 }
 
 #[test]
