@@ -1789,6 +1789,7 @@ fn direct_put_registers_payload_acks_on_routed_data_pg_primary() {
     assert_eq!(generation_id, crate::GenerationId::MIN);
 
     let payload = b"direct put payload with routed data acks";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     let segment_okh = [62; 16];
     let written = cluster
         .write_direct_put_segment_payload_shards(
@@ -1797,40 +1798,25 @@ fn direct_put_registers_payload_acks_on_routed_data_pg_primary() {
             generation_id,
             0,
             &segment_okh,
-            payload,
+            &encrypted.storage_bytes,
         )
         .unwrap();
     assert_eq!(written.data_pg_id, data_pg);
 
-    let commit_req = crate::CommitDirectPutObjectReq {
-        bucket: bucket.clone(),
-        key: key.clone(),
-        generation_reservation_id: reservation_id,
-        versioning: crate::BucketVersioningState::Disabled,
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        generation_id,
-        size: payload.len() as u64,
-        etag_crc64: checksum::crc64::checksum(payload),
-        ec: written.ec,
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
-        segment_index: 0,
-        segment_crc64: checksum::crc64::checksum(payload),
-        segment_okh,
-        segment_vid: generation_id,
-        data_pg_id: written.data_pg_id,
-        bucket_write_reservation: acquire_test_bucket_write_proof(
-            &cluster,
-            &bucket,
-            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
-            Some(key.as_str()),
-        ),
-    };
+    let commit_req = encrypted_direct_put_commit_req(
+        &cluster,
+        EncryptedDirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            versioning: crate::BucketVersioningState::Disabled,
+            segment_okh,
+            written: &written,
+            plaintext: payload,
+            encrypted: &encrypted,
+        },
+    );
     cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
             Ok::<(), ()>(())
@@ -1861,14 +1847,14 @@ fn direct_put_registers_payload_acks_on_routed_data_pg_primary() {
                 data_pg_id: data_pg,
                 segment_okh,
                 segment_vid: generation_id,
-                stored_size: payload.len(),
-                segment_crc64: checksum::crc64::checksum(payload),
+                stored_size: encrypted.storage_bytes.len(),
+                segment_crc64: encrypted.storage_crc64,
                 ec: written.ec,
             },
             &mut readback,
         )
         .unwrap();
-    assert_eq!(readback, payload);
+    assert_eq!(readback, encrypted.storage_bytes);
 }
 
 #[test]
@@ -2535,6 +2521,7 @@ fn direct_put_metadata_command_applies_to_all_acting_object_pg_nodes() {
         .reserve_put_object_generation(&bucket, &key, &reservation_id)
         .unwrap();
     let payload = b"direct put metadata command replication";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     let segment_okh = [63; 16];
     let written = cluster
         .write_direct_put_segment_payload_shards(
@@ -2543,22 +2530,23 @@ fn direct_put_metadata_command_applies_to_all_acting_object_pg_nodes() {
             generation_id,
             0,
             &segment_okh,
-            payload,
+            &encrypted.storage_bytes,
         )
         .unwrap();
-    let mut commit_req = direct_put_commit_req(
+    let commit_req = encrypted_direct_put_commit_req(
         &cluster,
-        DirectPutCommitReqFixture {
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id,
             generation_id,
-            payload,
+            versioning: crate::BucketVersioningState::Enabled,
             segment_okh,
             written: &written,
+            plaintext: payload,
+            encrypted: &encrypted,
         },
     );
-    commit_req.versioning = crate::BucketVersioningState::Enabled;
 
     let outcome = cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
@@ -2605,6 +2593,7 @@ fn already_recorded_direct_put_fanout_cleans_terminal_stream_uploads() {
         .reserve_put_object_generation(&bucket, &key, &reservation_id)
         .unwrap();
     let payload = b"direct put already-recorded fanout cleanup";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     let segment_okh = [68; 16];
     let written = cluster
         .write_direct_put_segment_payload_shards(
@@ -2613,19 +2602,21 @@ fn already_recorded_direct_put_fanout_cleans_terminal_stream_uploads() {
             generation_id,
             0,
             &segment_okh,
-            payload,
+            &encrypted.storage_bytes,
         )
         .unwrap();
-    let commit_req = direct_put_commit_req(
+    let commit_req = encrypted_direct_put_commit_req(
         &cluster,
-        DirectPutCommitReqFixture {
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id: reservation_id.clone(),
             generation_id,
-            payload,
+            versioning: crate::BucketVersioningState::Disabled,
             segment_okh,
             written: &written,
+            plaintext: payload,
+            encrypted: &encrypted,
         },
     );
     let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -2655,7 +2646,7 @@ fn already_recorded_direct_put_fanout_cleans_terminal_stream_uploads() {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 target: crate::StreamUploadTarget::PutObject,
-                encryption: crate::ObjectEncryption::None,
+                encryption: encrypted.encryption.clone(),
             },
         )
         .unwrap();
@@ -2699,12 +2690,14 @@ fn stream_put_staging_commands_apply_to_all_acting_object_pg_nodes() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("32".repeat(16)).unwrap();
+    let payload = b"stream staging command replication";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     cluster
         .create_put_object_stream_session_record(
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            encrypted.encryption.clone(),
         )
         .unwrap();
 
@@ -2720,7 +2713,6 @@ fn stream_put_staging_commands_apply_to_all_acting_object_pg_nodes() {
         ));
     }
 
-    let payload = b"stream staging command replication";
     let (_target, segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -2728,15 +2720,15 @@ fn stream_put_staging_commands_apply_to_all_acting_object_pg_nodes() {
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
                 segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
+                payload_crc64: encrypted.payload_crc64,
             },
         )
         .unwrap();
     assert_eq!(segment.data_pg_id, data_pg);
     let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
     let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
         .iter()
@@ -2753,6 +2745,26 @@ fn stream_put_staging_commands_apply_to_all_acting_object_pg_nodes() {
         )
         .unwrap();
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+
+    let stored_bytes_request = || crate::SegmentStoredBytesRequest {
+        data_pg_id: segment.data_pg_id,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.segment_vid,
+        stored_size: encrypted.storage_bytes.len(),
+        segment_crc64: encrypted.storage_crc64,
+        ec: EcShape {
+            k: segment.ec_k,
+            m: segment.ec_m,
+        },
+    };
+    let mut pre_abort_readback = Vec::new();
+    cluster
+        .read_segment_payload_stored_bytes_into(stored_bytes_request(), &mut pre_abort_readback)
+        .unwrap();
+    assert_eq!(
+        pre_abort_readback.as_slice(),
+        encrypted.storage_bytes.as_slice()
+    );
 
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
@@ -2784,19 +2796,6 @@ fn stream_put_staging_commands_apply_to_all_acting_object_pg_nodes() {
 
     let mut readback = Vec::new();
     assert!(cluster
-        .read_segment_payload_stored_bytes_into(
-            crate::SegmentStoredBytesRequest {
-                data_pg_id: segment.data_pg_id,
-                segment_okh: segment.segment_okh,
-                segment_vid: segment.segment_vid,
-                stored_size: payload.len(),
-                segment_crc64: checksum::crc64::checksum(payload),
-                ec: EcShape {
-                    k: segment.ec_k,
-                    m: segment.ec_m,
-                },
-            },
-            &mut readback,
-        )
+        .read_segment_payload_stored_bytes_into(stored_bytes_request(), &mut readback)
         .is_err());
 }

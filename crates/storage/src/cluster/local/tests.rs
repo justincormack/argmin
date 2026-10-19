@@ -1036,6 +1036,61 @@ fn direct_put_commit_req_with_bucket_write_proof(
     }
 }
 
+struct EncryptedDirectPutCommitReqFixture<'a> {
+    bucket: &'a crate::BucketName,
+    key: &'a crate::ObjectKey,
+    reservation_id: crate::SessionId,
+    generation_id: crate::GenerationId,
+    versioning: crate::BucketVersioningState,
+    segment_okh: [u8; 16],
+    written: &'a crate::DirectPutWrittenSegment,
+    plaintext: &'a [u8],
+    encrypted: &'a crate::tests::SseS3SegmentTestFixture,
+}
+
+fn encrypted_direct_put_commit_req(
+    cluster: &crate::StorageCluster,
+    fixture: EncryptedDirectPutCommitReqFixture<'_>,
+) -> crate::CommitDirectPutObjectReq {
+    let bucket_write_reservation = acquire_test_bucket_write_proof(
+        cluster,
+        fixture.bucket,
+        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+        Some(fixture.key.as_str()),
+    );
+    encrypted_direct_put_commit_req_with_bucket_write_proof(fixture, bucket_write_reservation)
+}
+
+fn encrypted_direct_put_commit_req_with_bucket_write_proof(
+    fixture: EncryptedDirectPutCommitReqFixture<'_>,
+    bucket_write_reservation: crate::metadata_command::BucketWriteReservationProof,
+) -> crate::CommitDirectPutObjectReq {
+    crate::CommitDirectPutObjectReq {
+        bucket: fixture.bucket.clone(),
+        key: fixture.key.clone(),
+        generation_reservation_id: fixture.reservation_id,
+        versioning: fixture.versioning,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        generation_id: fixture.generation_id,
+        size: fixture.encrypted.logical_size,
+        etag_crc64: checksum::crc64::checksum(fixture.plaintext),
+        ec: fixture.written.ec,
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: fixture.encrypted.encryption.clone(),
+        segment_index: 0,
+        segment_crc64: fixture.encrypted.storage_crc64,
+        segment_okh: fixture.segment_okh,
+        segment_vid: fixture.generation_id,
+        data_pg_id: fixture.written.data_pg_id,
+        bucket_write_reservation,
+    }
+}
+
 fn assert_direct_put_metadata_on_acting_nodes(
     map: &LocalClusterMap,
     node_ids: &[NodeId],

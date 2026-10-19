@@ -521,7 +521,12 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   tests now shard production-compatible SSE-S3 ciphertext while keeping logical size and ETag CRC
   separate from stored size and CRC. Metadata-only crossed-proof and stale-snapshot fixtures use
   the explicitly synthetic encrypted state.
-- The remaining 129 source occurrences are deliberately left for the payload-bearing and
+- The command-fanout slice removes another three positive plaintext constructions and migrates
+  the adjacent shared-helper caller. Direct-PUT acknowledgement routing, metadata-command fanout,
+  terminal-session cleanup, and streamed append fanout now persist coherent ciphertext and
+  encrypted metadata. A shared encrypted direct-PUT request fixture preserves the logical/stored
+  payload distinction for the remaining test migration.
+- The remaining 126 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 
