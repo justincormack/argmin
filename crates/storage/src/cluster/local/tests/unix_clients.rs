@@ -546,7 +546,7 @@ fn unix_peering_metadata_certificate_preserves_get_and_list_without_write_author
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     active_cluster
         .create_multipart_upload(
@@ -1813,7 +1813,7 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
                     bucket: bucket.clone(),
                     key: key.clone(),
                     target: crate::StreamUploadTarget::PutObject,
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
                 now_ms,
                 crate::BucketWriteReservationProof {
@@ -3716,7 +3716,7 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 target: crate::StreamUploadTarget::PutObject,
-                encryption: crate::ObjectEncryption::None,
+                encryption: crate::tests::metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -3953,7 +3953,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 target: crate::StreamUploadTarget::PutObject,
-                encryption: crate::ObjectEncryption::None,
+                encryption: crate::tests::metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -4629,7 +4629,7 @@ fn frontend_unix_stream_heartbeat_renews_old_epoch_proof_and_session_row() {
             bucket: bucket.clone(),
             key: key.clone(),
             target: crate::StreamUploadTarget::PutObject,
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let command = crate::metadata_command::MetadataCommandEnvelope::new(
             crate::metadata_command::MetadataCommandId::new(
@@ -4747,7 +4747,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 target: crate::StreamUploadTarget::PutObject,
-                encryption: crate::ObjectEncryption::None,
+                encryption: crate::tests::metadata_only_test_encryption(),
             },
         )
         .unwrap();
@@ -8521,7 +8521,7 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     source_cluster
         .create_multipart_upload(
@@ -10458,7 +10458,7 @@ fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::metadata_only_test_encryption(),
     };
     current_cluster
         .create_multipart_upload(
