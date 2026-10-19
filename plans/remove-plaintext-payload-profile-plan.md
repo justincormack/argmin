@@ -540,7 +540,14 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   SSE-S3 state and encrypt both streamed and copied parts with part-scoped nonces, logical sizes,
   and distinct stored and payload CRCs; each staged segment is reconstructed and compared with its
   exact ciphertext before terminal processing.
-- The remaining 120 source occurrences are deliberately left for the payload-bearing and
+- The streamed-PutObject contention slice removes another 12 positive plaintext constructions.
+  Pending-install, command-ID, abandonment, reissue, and overwrite tests now create an encrypted
+  session and stage production-compatible ciphertext through one helper that keeps logical size,
+  payload CRC, stored CRC, and durable encryption state coherent. The helper reconstructs every
+  staged segment before publication. Direct-PUT contenders in the same schedules now also persist
+  ciphertext and use the encrypted terminal request fixture, so the races contain no indirect
+  plaintext winner.
+- The remaining 108 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 

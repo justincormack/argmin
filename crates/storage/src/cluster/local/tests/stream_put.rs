@@ -6,6 +6,77 @@ use crate::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterTopologyTestSupport as _,
 };
 
+fn stage_encrypted_put_object_stream_segment(
+    cluster: &crate::StorageCluster,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    session_id: &crate::SessionId,
+    plaintext: &[u8],
+) -> (
+    crate::tests::SseS3SegmentTestFixture,
+    crate::StreamUploadSegmentRecord,
+) {
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(plaintext, 0);
+    cluster
+        .create_put_object_stream_session_record(
+            bucket,
+            key,
+            session_id,
+            encrypted.encryption.clone(),
+        )
+        .unwrap();
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            bucket,
+            key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
+                payload_crc64: encrypted.payload_crc64,
+            },
+        )
+        .unwrap();
+    let written = cluster
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
+        .unwrap();
+    let shard_batch = written
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            bucket,
+            key,
+            session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap();
+
+    let mut stored_bytes = Vec::new();
+    cluster
+        .read_segment_payload_stored_bytes_into(
+            crate::SegmentStoredBytesRequest {
+                data_pg_id: segment.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                stored_size: encrypted.storage_bytes.len(),
+                segment_crc64: encrypted.storage_crc64,
+                ec: EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            },
+            &mut stored_bytes,
+        )
+        .unwrap();
+    assert_eq!(stored_bytes, encrypted.storage_bytes);
+    (encrypted, segment)
+}
+
 #[test]
 fn stream_finalization_authority_is_bound_to_its_exact_admitted_route() {
     let tmp = test_util::tempdir();
@@ -431,48 +502,18 @@ fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
 
     let session_id =
         crate::SessionId::try_from("33333333333333333333333333333333".to_string()).unwrap();
-    first_cluster
-        .create_put_object_stream_session_record(
-            &bucket,
-            &key,
-            &session_id,
-            crate::ObjectEncryption::None,
-        )
-        .unwrap();
     let loser_payload = b"loser stream put";
     let loser_crc64 = checksum::crc64::checksum(loser_payload);
-    let (_target, segment) = first_cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: loser_payload.len() as u64,
-                segment_crc64: loser_crc64,
-                payload_crc64: loser_crc64,
-            },
-        )
-        .unwrap();
-    let written_shards = first_cluster
-        .write_stream_segment_payload_shards(&segment, loser_payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    first_cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let (loser_encrypted, _) = stage_encrypted_put_object_stream_segment(
+        &first_cluster,
+        &bucket,
+        &key,
+        &session_id,
+        loser_payload,
+    );
 
     let winner_payload = b"winner before stream finalize";
+    let winner_encrypted = crate::tests::sse_s3_segment_test_fixture(winner_payload, 0);
     let winner_reservation_id =
         crate::SessionId::try_from("44444444444444444444444444444444".to_string()).unwrap();
     let winner_generation_id = second_cluster
@@ -485,23 +526,23 @@ fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
             winner_generation_id,
             0,
             &[0x94; 16],
-            winner_payload,
+            &winner_encrypted.storage_bytes,
         )
         .unwrap();
-    let winner_req = direct_put_commit_req(
+    let winner_req = encrypted_direct_put_commit_req(
         &first_cluster,
-        DirectPutCommitReqFixture {
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id: winner_reservation_id,
             generation_id: winner_generation_id,
-            payload: winner_payload,
+            versioning: crate::BucketVersioningState::Enabled,
             segment_okh: [0x94; 16],
             written: &winner_written,
+            plaintext: winner_payload,
+            encrypted: &winner_encrypted,
         },
     );
-    let mut winner_req = winner_req;
-    winner_req.versioning = crate::BucketVersioningState::Enabled;
 
     let hook_ran = Arc::new(AtomicBool::new(false));
     let action_calls = Arc::new(AtomicUsize::new(0));
@@ -556,7 +597,7 @@ fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
             &bucket,
             &key,
             &session_id,
-            loser_payload.len() as u64,
+            loser_encrypted.logical_size,
             move |snapshot| {
                 calls_for_action.fetch_add(1, Ordering::SeqCst);
                 if snapshot.existing_etag.is_some() {
@@ -573,7 +614,7 @@ fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
                         metadata_blob: crate::SerializedMetadataBlob::default(),
                         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                         object_lock: crate::ObjectLockState::default(),
-                        encryption: crate::ObjectEncryption::None,
+                        encryption: loser_encrypted.encryption.clone(),
                     })
                 }
             },
@@ -646,6 +687,7 @@ fn stream_put_create_pending_install_race_reruns_authorization_action() {
     create_test_bucket(&first_cluster, &bucket);
 
     let winner_payload = b"winner before stream create";
+    let winner_encrypted = crate::tests::sse_s3_segment_test_fixture(winner_payload, 0);
     let winner_reservation_id =
         crate::SessionId::try_from("55555555555555555555555555555555".to_string()).unwrap();
     let winner_generation_id = second_cluster
@@ -658,19 +700,21 @@ fn stream_put_create_pending_install_race_reruns_authorization_action() {
             winner_generation_id,
             0,
             &[0x95; 16],
-            winner_payload,
+            &winner_encrypted.storage_bytes,
         )
         .unwrap();
-    let winner_req = direct_put_commit_req(
+    let winner_req = encrypted_direct_put_commit_req(
         &first_cluster,
-        DirectPutCommitReqFixture {
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id: winner_reservation_id,
             generation_id: winner_generation_id,
-            payload: winner_payload,
+            versioning: crate::BucketVersioningState::Disabled,
             segment_okh: [0x95; 16],
             written: &winner_written,
+            plaintext: winner_payload,
+            encrypted: &winner_encrypted,
         },
     );
 
@@ -809,6 +853,7 @@ fn stream_put_create_command_id_race_releases_reservation_and_retries() {
     create_test_bucket(&first_cluster, &bucket);
 
     let winner_payload = b"winner before stream create command id";
+    let winner_encrypted = crate::tests::sse_s3_segment_test_fixture(winner_payload, 0);
     let winner_reservation_id =
         crate::SessionId::try_from("56565656565656565656565656565656".to_string()).unwrap();
     let winner_generation_id = second_cluster
@@ -821,19 +866,21 @@ fn stream_put_create_command_id_race_releases_reservation_and_retries() {
             winner_generation_id,
             0,
             &[0x96; 16],
-            winner_payload,
+            &winner_encrypted.storage_bytes,
         )
         .unwrap();
-    let winner_req = direct_put_commit_req(
+    let winner_req = encrypted_direct_put_commit_req(
         &first_cluster,
-        DirectPutCommitReqFixture {
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id: winner_reservation_id,
             generation_id: winner_generation_id,
-            payload: winner_payload,
+            versioning: crate::BucketVersioningState::Disabled,
             segment_okh: [0x96; 16],
             written: &winner_written,
+            plaintext: winner_payload,
+            encrypted: &winner_encrypted,
         },
     );
 
@@ -980,14 +1027,15 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
 
     let session_id =
         crate::SessionId::try_from("5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a".to_string()).unwrap();
-    first_cluster
-        .create_put_object_stream_session_record(
-            &bucket,
-            &key,
-            &session_id,
-            crate::ObjectEncryption::None,
-        )
-        .unwrap();
+    let stream_payload = b"stream finalize retries after command-id contention";
+    let stream_crc64 = checksum::crc64::checksum(stream_payload);
+    let (stream_encrypted, _) = stage_encrypted_put_object_stream_segment(
+        &first_cluster,
+        &bucket,
+        &key,
+        &session_id,
+        stream_payload,
+    );
     let stream_generation_id = {
         let primary = first_map
             .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
@@ -996,40 +1044,9 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
         crate::PgMetadataStore::get_object_generation_reservation(&*pg, &bucket, &key, &session_id)
             .unwrap()
     };
-    let stream_payload = b"stream finalize retries after command-id contention";
-    let stream_crc64 = checksum::crc64::checksum(stream_payload);
-    let (_target, stream_segment) = first_cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: stream_payload.len() as u64,
-                segment_crc64: stream_crc64,
-                payload_crc64: stream_crc64,
-            },
-        )
-        .unwrap();
-    let stream_written = first_cluster
-        .write_stream_segment_payload_shards(&stream_segment, stream_payload)
-        .unwrap();
-    let stream_shard_batch = stream_written
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    first_cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            stream_segment.segment_index,
-            &stream_segment,
-            &stream_shard_batch,
-        )
-        .unwrap();
 
     let winner_payload = b"winner before stream finalize command id";
+    let winner_encrypted = crate::tests::sse_s3_segment_test_fixture(winner_payload, 0);
     let winner_reservation_id =
         crate::SessionId::try_from("5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b".to_string()).unwrap();
     let winner_generation_id = second_cluster
@@ -1042,19 +1059,21 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
             winner_generation_id,
             0,
             &[0x5b; 16],
-            winner_payload,
+            &winner_encrypted.storage_bytes,
         )
         .unwrap();
-    let winner_req = direct_put_commit_req(
+    let winner_req = encrypted_direct_put_commit_req(
         &first_cluster,
-        DirectPutCommitReqFixture {
+        EncryptedDirectPutCommitReqFixture {
             bucket: &bucket,
             key: &key,
             reservation_id: winner_reservation_id,
             generation_id: winner_generation_id,
-            payload: winner_payload,
+            versioning: crate::BucketVersioningState::Disabled,
             segment_okh: [0x5b; 16],
             written: &winner_written,
+            plaintext: winner_payload,
+            encrypted: &winner_encrypted,
         },
     );
 
@@ -1201,7 +1220,7 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
             &bucket,
             &key,
             &session_id,
-            stream_payload.len() as u64,
+            stream_encrypted.logical_size,
             move |snapshot| {
                 calls_for_action.fetch_add(1, Ordering::SeqCst);
                 if mode == StreamPutFinalizeCommandIdRace::StaleSnapshotPastLegacyBudget
@@ -1220,7 +1239,7 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
                     metadata_blob: crate::SerializedMetadataBlob::default(),
                     system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: stream_encrypted.encryption.clone(),
                 })
             },
         )
@@ -1588,47 +1607,11 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
         (&first_session, b"first streamed object".as_slice()),
         (&second_session, b"second streamed object".as_slice()),
     ] {
-        cluster
-            .create_put_object_stream_session_record(
-                &bucket,
-                &key,
-                session_id,
-                crate::ObjectEncryption::None,
-            )
-            .unwrap();
         let crc64 = checksum::crc64::checksum(payload);
-        let (_target, segment) = cluster
-            .prepare_stream_segment_append(
-                &bucket,
-                &key,
-                &crate::PrepareStreamUploadSegmentAppendReq {
-                    session_id: session_id.clone(),
-                    segment_index: 0,
-                    size: payload.len() as u64,
-                    segment_crc64: crc64,
-                    payload_crc64: crc64,
-                },
-            )
-            .unwrap();
-        let written = cluster
-            .write_stream_segment_payload_shards(&segment, payload)
-            .unwrap();
-        let shard_batch = written
-            .iter()
-            .map(|written| (&written.key, written.ack))
-            .collect::<Vec<_>>();
+        let (encrypted, _) =
+            stage_encrypted_put_object_stream_segment(&cluster, &bucket, &key, session_id, payload);
         cluster
-            .commit_stream_segment_append(
-                &bucket,
-                &key,
-                session_id,
-                segment.segment_index,
-                &segment,
-                &shard_batch,
-            )
-            .unwrap();
-        cluster
-            .finalize_put_object_stream(&bucket, &key, session_id, payload.len() as u64, |_| {
+            .finalize_put_object_stream(&bucket, &key, session_id, encrypted.logical_size, |_| {
                 Ok::<_, ()>(crate::PreparedStreamPutCommit {
                     value: (),
                     versioning: crate::BucketVersioningState::Disabled,
@@ -1640,7 +1623,7 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
                     metadata_blob: crate::SerializedMetadataBlob::default(),
                     system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: encrypted.encryption.clone(),
                 })
             })
             .unwrap()
@@ -1691,46 +1674,10 @@ fn stream_put_finalize_retries_definitive_command_contention_before_publication(
     create_test_bucket(&cluster, &bucket);
 
     let session_id = crate::tests::stream_session_id("put-contention");
-    cluster
-        .create_put_object_stream_session_record(
-            &bucket,
-            &key,
-            &session_id,
-            crate::ObjectEncryption::None,
-        )
-        .unwrap();
     let payload = b"stream PUT publication contention";
     let payload_crc64 = checksum::crc64::checksum(payload);
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
-                payload_crc64,
-            },
-        )
-        .unwrap();
-    let written = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let (encrypted, _) =
+        stage_encrypted_put_object_stream_segment(&cluster, &bucket, &key, &session_id, payload);
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let hook_attempts = Arc::clone(&attempts);
@@ -1753,7 +1700,7 @@ fn stream_put_finalize_retries_definitive_command_contention_before_publication(
         }));
 
     let outcome = cluster
-        .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+        .finalize_put_object_stream(&bucket, &key, &session_id, encrypted.logical_size, |_| {
             Ok::<_, ()>(crate::PreparedStreamPutCommit {
                 value: (),
                 versioning: crate::BucketVersioningState::Enabled,
@@ -1765,7 +1712,7 @@ fn stream_put_finalize_retries_definitive_command_contention_before_publication(
                 metadata_blob: crate::SerializedMetadataBlob::default(),
                 system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
+                encryption: encrypted.encryption.clone(),
             })
         })
         .expect("definitive pre-publication contention must be retried")
@@ -1810,46 +1757,10 @@ fn stream_put_finalize_budget_expiry_after_safe_abandonment_returns_snapshot_con
     create_test_bucket(&cluster, &bucket);
 
     let session_id = crate::tests::stream_session_id("put-safe-abandon");
-    cluster
-        .create_put_object_stream_session_record(
-            &bucket,
-            &key,
-            &session_id,
-            crate::ObjectEncryption::None,
-        )
-        .unwrap();
     let payload = b"stream PUT safe abandonment reinspection";
     let payload_crc64 = checksum::crc64::checksum(payload);
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
-                payload_crc64,
-            },
-        )
-        .unwrap();
-    let written = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let (encrypted, _) =
+        stage_encrypted_put_object_stream_segment(&cluster, &bucket, &key, &session_id, payload);
 
     let expired = Arc::new(AtomicBool::new(false));
     let hook_expired = Arc::clone(&expired);
@@ -1873,7 +1784,7 @@ fn stream_put_finalize_budget_expiry_after_safe_abandonment_returns_snapshot_con
         }));
     let action_calls = AtomicUsize::new(0);
     let error = cluster
-        .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+        .finalize_put_object_stream(&bucket, &key, &session_id, encrypted.logical_size, |_| {
             action_calls.fetch_add(1, Ordering::SeqCst);
             Ok::<_, ()>(crate::PreparedStreamPutCommit {
                 value: (),
@@ -1886,7 +1797,7 @@ fn stream_put_finalize_budget_expiry_after_safe_abandonment_returns_snapshot_con
                 metadata_blob: crate::SerializedMetadataBlob::default(),
                 system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
+                encryption: encrypted.encryption.clone(),
             })
         })
         .unwrap_err();
@@ -1933,46 +1844,10 @@ fn stream_put_reissue_confirmation_checks_published_replacement_before_trailing_
     create_test_bucket(&cluster, &bucket);
 
     let session_id = crate::tests::stream_session_id("put-reissue");
-    cluster
-        .create_put_object_stream_session_record(
-            &bucket,
-            &key,
-            &session_id,
-            crate::ObjectEncryption::None,
-        )
-        .unwrap();
     let payload = b"stream PUT replacement publication";
     let payload_crc64 = checksum::crc64::checksum(payload);
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
-                payload_crc64,
-            },
-        )
-        .unwrap();
-    let written = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let (encrypted, segment) =
+        stage_encrypted_put_object_stream_segment(&cluster, &bucket, &key, &session_id, payload);
 
     let pg_id = PgId::new(object_pg);
     let primary = map
@@ -2023,7 +1898,7 @@ fn stream_put_reissue_confirmation_checks_published_replacement_before_trailing_
                 metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                 object_lock: crate::ObjectLockState::default(),
-                encryption: crate::ObjectEncryption::None,
+                encryption: encrypted.encryption.clone(),
             },
             segments: vec![crate::ObjectSegmentRecord {
                 bucket: bucket.clone(),
