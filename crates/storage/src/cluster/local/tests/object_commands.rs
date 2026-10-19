@@ -4439,7 +4439,7 @@ fn assert_new_object_foreground_waiter_reinspects_cleanup_derivative(
                     bucket: bucket.clone(),
                     key: key.clone(),
                     target: crate::StreamUploadTarget::PutObject,
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
                 123,
                 proof.clone(),

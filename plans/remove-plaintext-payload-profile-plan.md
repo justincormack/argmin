@@ -484,7 +484,12 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   coherent ciphertext, logical and stored checksums, and matching EC geometry. The production-
   compatible fixture now also models the multipart part-number nonce scope rather than reusing the
   ordinary object scope.
-- The remaining 271 source occurrences are deliberately left for the payload-bearing and
+- The metadata-command support, storage-node RPC error-path, pending-command scavenger, and
+  abandoned-recovery fixtures remove another eight positive plaintext constructions. These tests
+  move or inspect metadata without reading payload, so they use the explicitly metadata-only
+  encrypted state. Frozen command, storage-RPC v22, canonical-state v5/checkpoint v3, and tag-0
+  golden evidence remains byte-for-byte unchanged until Phase 3 advances the owning formats.
+- The remaining 263 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 

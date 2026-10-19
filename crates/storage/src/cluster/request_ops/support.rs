@@ -3176,7 +3176,7 @@ mod authorized_multipart_upload_create_issuance_tests {
             public_read: false,
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         }
     }
 

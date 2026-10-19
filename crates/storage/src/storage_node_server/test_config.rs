@@ -7061,7 +7061,7 @@
             metadata_blob: Some(crate::SerializedMetadataBlob::default()),
             system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
             object_lock: crate::ObjectLockState::default(),
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
             expected_stale_payload_source: None,
             expected_current_object_identity: None,
             conditional_completion: false,
@@ -7154,7 +7154,7 @@
                     public_read: false,
                     object_lock: crate::ObjectLockState::default(),
                     checksum: None,
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
             )
             .unwrap();
@@ -7168,7 +7168,7 @@
                         upload_id: upload_id.clone(),
                         part_number: 1,
                     },
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
             )
             .unwrap();
@@ -10791,7 +10791,7 @@
             public_read: false,
             object_lock: crate::ObjectLockState::default(),
             checksum: None,
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         };
         let node = Arc::clone(&server._node);
         let (upload, cleanup, command_log_index_before) =
