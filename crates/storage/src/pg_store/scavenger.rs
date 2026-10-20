@@ -2896,12 +2896,8 @@ impl PgStore {
                 Box::from(format!("invalid object encryption type: {encryption_type}")),
             )
         })?;
-        let extra = match encryption_type {
-            ObjectEncryptionType::None => 0,
-            ObjectEncryptionType::SseCustomer | ObjectEncryptionType::SseS3 => {
-                OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64
-            }
-        };
+        let _ = encryption_type;
+        let extra = OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64;
         logical_size.checked_add(extra).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 3,
@@ -3883,15 +3879,17 @@ mod tests {
     fn shard_scavenger_payload_references_include_segment_size_crc_and_epoch() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 7).unwrap();
+        let encryption = crate::tests::metadata_only_test_encryption();
+        let encryption_state = encryption.encode_state().unwrap();
 
         store
             .conn
             .execute(
                 "INSERT INTO objects \
                  (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
-                  last_modified, ec_k, ec_m, status, data_layout, parts_count, encryption_type, \
+                  last_modified, ec_k, ec_m, status, data_layout, parts_count, encryption_type, encryption_state, \
                   owner_principal, owner_canonical_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 rusqlite::params![
                     "bucket",
                     "object",
@@ -3907,7 +3905,8 @@ mod tests {
                     0i64,
                     1i64,
                     1i64,
-                    2i64,
+                    encryption.encryption_type() as u8,
+                    encryption_state,
                     "owner",
                     "c".repeat(32),
                 ],
@@ -3968,9 +3967,9 @@ mod tests {
             .execute(
                 "INSERT INTO objects \
                  (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
-                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, \
+                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, encryption_state, \
                   owner_principal, owner_canonical_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     "bucket",
                     "segment-object",
@@ -3985,7 +3984,8 @@ mod tests {
                     2i64,
                     0i64,
                     0i64,
-                    2i64,
+                    encryption.encryption_type() as u8,
+                    encryption.encode_state().unwrap(),
                     "owner",
                     "c".repeat(32),
                 ],
@@ -4327,14 +4327,16 @@ mod tests {
             .unwrap());
 
         assert!(store.test_clear_pending_metadata_command_slot().unwrap());
+        let encryption = crate::tests::metadata_only_test_encryption();
+        let encryption_state = encryption.encode_state().unwrap();
         store
             .conn
             .execute(
                 "INSERT INTO objects \
                  (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
-                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, \
+                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, encryption_state, \
                   owner_principal, owner_canonical_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     bucket,
                     key,
@@ -4349,7 +4351,8 @@ mod tests {
                     durable_segment.ec_m as i64,
                     0i64,
                     0i64,
-                    2i64,
+                    encryption.encryption_type() as u8,
+                    encryption_state,
                     "owner",
                     "c".repeat(32),
                 ],
@@ -4577,14 +4580,16 @@ mod tests {
         ));
 
         assert!(store.test_clear_pending_metadata_command_slot().unwrap());
+        let encryption = crate::tests::metadata_only_test_encryption();
+        let encryption_state = encryption.encode_state().unwrap();
         store
             .conn
             .execute(
                 "INSERT INTO objects \
                  (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
-                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, \
+                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, encryption_state, \
                   owner_principal, owner_canonical_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     bucket,
                     key,
@@ -4599,7 +4604,8 @@ mod tests {
                     0i64,
                     0i64,
                     0i64,
-                    2i64,
+                    encryption.encryption_type() as u8,
+                    encryption_state,
                     "owner",
                     "c".repeat(32),
                 ],

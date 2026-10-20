@@ -221,9 +221,6 @@ impl Coordinator {
         sse_customer_headers_required: bool,
     ) -> Result<ActiveWriteEncryption, ServerError> {
         match encryption {
-            ObjectEncryption::None => Err(ServerError::InternalError {
-                reason: "plaintext payload state cannot authorize an active write".to_string(),
-            }),
             ObjectEncryption::SseCustomer(state) => {
                 let sse_customer = self.prepare_existing_sse_customer_write_context(
                     encryption,
@@ -415,9 +412,6 @@ impl Coordinator {
         encryption: &ObjectEncryption,
     ) -> Result<(), ServerError> {
         match encryption {
-            ObjectEncryption::None => Err(ServerError::InternalError {
-                reason: "plaintext payload state cannot authorize an active write".to_string(),
-            }),
             ObjectEncryption::SseCustomer(_) => Ok(()),
             ObjectEncryption::SseS3(_) => {
                 if self.managed_key_provider.is_some() {
@@ -439,9 +433,6 @@ impl Coordinator {
         headers_required: bool,
     ) -> Result<Option<SseCustomerWriteContext>, ServerError> {
         match encryption {
-            ObjectEncryption::None => Err(ServerError::InternalError {
-                reason: "plaintext payload state cannot authorize an active write".to_string(),
-            }),
             ObjectEncryption::SseCustomer(state) => {
                 let Some(request) = sse_customer else {
                     if headers_required {
@@ -483,15 +474,6 @@ impl Coordinator {
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<Option<SseCustomerResponseHeaders>, ServerError> {
         match encryption {
-            ObjectEncryption::None => {
-                if sse_customer.is_some() {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "SSE-C headers may not be used for an unencrypted object"
-                            .to_string(),
-                    });
-                }
-                Ok(None)
-            }
             ObjectEncryption::SseCustomer(state) => {
                 let request = sse_customer.ok_or(ServerError::InvalidRequest {
                     reason: "SSE-C headers are required for this object".to_string(),

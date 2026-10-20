@@ -128,7 +128,6 @@ impl Coordinator {
                     }
                 }
             }
-            ObjectEncryption::None => {}
         }
         Ok(system_metadata)
     }

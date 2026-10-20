@@ -86,7 +86,7 @@ fn multipart_upload_schema_rejects_invalid_identity_values() {
 }
 
 #[test]
-fn current_pg_schema_v6_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
+fn current_pg_schema_v7_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
     assert_eq!(
@@ -94,7 +94,7 @@ fn current_pg_schema_v6_checksum_tags_match_frozen_owner_encoding_and_require_ve
             .conn
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        6
+        7
     );
     let bucket = trusted_bucket_name("checksum-tag-schema-bucket");
     let upload_id = crate::tests::multipart_upload_id("checksum-tag-schema-upload");
@@ -4692,14 +4692,16 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
         "unframed-v1",
         "framed-v1",
         "framed-v2",
-        "framed-v4",
+        "framed-v3",
+        "framed-v5",
     ] {
         let (checkpoint_crc64, checkpoint_bytes) = if format == "corrupt" {
             (second_checkpoint.checkpoint_crc64, vec![0])
         } else {
             let encoding_version = match format {
                 "framed-v2" => 2,
-                "framed-v4" => 4,
+                "framed-v3" => 3,
+                "framed-v5" => 5,
                 _ => 1,
             };
             let mut unsupported = second_checkpoint.clone();
@@ -5577,7 +5579,7 @@ fn metadata_command_replica_state_rejects_unsupported_carrier_encodings() {
         (
             "state_digest_encoding_version",
             "state-digest",
-            [4_u8, 6_u8],
+            [5_u8, 7_u8],
         ),
     ] {
         for version in versions {
@@ -6825,7 +6827,7 @@ fn recovery_rejects_resealed_unsupported_abandoned_command_versions_before_mutat
 
 #[test]
 fn recovery_rejects_resealed_unsupported_pending_command_versions_before_mutation() {
-    for version in [7_u16, 9] {
+    for version in [7_u16, 8, 10] {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let command = create_bucket_probe_command(
@@ -6918,7 +6920,7 @@ fn recovery_rejects_resealed_unsupported_pending_command_versions_before_mutatio
 
 #[test]
 fn recovery_rejects_resealed_unsupported_applied_command_versions_before_mutation() {
-    for version in [7_u16, 9] {
+    for version in [7_u16, 8, 10] {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let command = create_bucket_probe_command(
@@ -10431,7 +10433,7 @@ fn object_schema_rejects_delete_marker_with_object_lock_state() {
         .execute(
             "INSERT INTO objects \
              (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-             VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?5, ?6, '', 0, 0, 1900000000, 2)",
+             VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, NULL, NULL, NULL, ?5, ?6, '', 0, 0, 1900000000, 2)",
             params![
                 "bucket",
                 "key",
@@ -10451,5 +10453,101 @@ fn object_schema_rejects_delete_marker_with_object_lock_state() {
             },
             _
         )
+    ));
+}
+
+#[test]
+fn object_schema_accepts_only_encrypted_live_rows_and_payloadless_delete_markers() {
+    let owner_id = CanonicalUserId::from_principal("owner");
+    let encryption = crate::tests::metadata_only_test_encryption();
+    let encryption_state = encryption.encode_state().unwrap();
+
+    for (label, encryption_type, encryption_state) in [
+        ("tag-zero-absent", Some(0_i64), None),
+        ("tag-zero-present", Some(0_i64), Some(vec![1])),
+        ("missing-type", None, Some(encryption_state.clone())),
+        ("missing-state", Some(1_i64), None),
+    ] {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let error = store
+            .conn
+            .execute(
+                "INSERT INTO objects \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
+                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, \
+                  encryption_state, owner_principal, owner_canonical_id) \
+                 VALUES ('bucket', ?1, 0, 1, 1, 0, X'', 0, 1, 1, 0, 0, 0, ?2, ?3, 'owner', ?4)",
+                params![label, encryption_type, encryption_state, owner_id.as_str()],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::ConstraintViolation,
+                    ..
+                },
+                _
+            )
+        ));
+    }
+
+    for (label, encryption_type, encryption_state) in [
+        (
+            "marker-with-type",
+            Some(encryption.encryption_type() as u8),
+            None,
+        ),
+        ("marker-with-state", None, Some(encryption_state.clone())),
+    ] {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let error = store
+            .conn
+            .execute(
+                "INSERT INTO objects \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
+                  last_modified, ec_k, ec_m, status, data_layout, encryption_type, \
+                  encryption_state, owner_principal, owner_canonical_id) \
+                 VALUES ('bucket', ?1, 1, 1, NULL, 0, X'', 0, 1, 0, 0, 1, 0, ?2, ?3, 'owner', ?4)",
+                params![label, encryption_type, encryption_state, owner_id.as_str()],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ffi::ErrorCode::ConstraintViolation,
+                    ..
+                },
+                _
+            )
+        ));
+    }
+
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO objects \
+             (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, \
+              last_modified, ec_k, ec_m, status, data_layout, encryption_type, encryption_state, \
+              owner_principal, owner_canonical_id) \
+             VALUES ('bucket', 'marker', 1, 1, NULL, 0, X'', 0, 1, 0, 0, 1, 0, NULL, NULL, \
+                     'owner', ?1)",
+            params![owner_id.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        store
+            .get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("marker"),
+                VersionId::Versioned(std::num::NonZeroU64::new(1).unwrap()),
+            )
+            .unwrap(),
+        StoredObject::DeleteMarker(_)
     ));
 }

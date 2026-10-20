@@ -1,9 +1,9 @@
 # Remove The Unreachable Plaintext Payload Profile Plan
 
-Status: in progress. Phases 0, 1, and 2 are complete. Production write selection and active write
-authority are encrypted-only, including terminal publication and provider-failure behavior. The
-positive test corpus no longer constructs plaintext payload state; Phase 3's atomic durable-format
-closure is next. The design decision to remove the plaintext payload state is accepted.
+Status: in progress. Phases 0 through 3 are complete. Production write selection, active write
+authority, durable state, recovery, and transport are encrypted-only. Payloadless delete markers
+use their own schema shape rather than an encryption sentinel. Phase 4's chunked-encryption-plan
+simplification remains. The design decision to remove the plaintext payload state is accepted.
 
 ## Context
 
@@ -621,6 +621,38 @@ Exit: current durable live state accepts only SSE-S3 or SSE-C, canonical delete 
 explicitly payloadless, and every prior plaintext or tag-0-marker carrier is rejected before
 effects. No test passes by constructing a state production cannot create, except explicit
 owner-local malformed rejection fixtures.
+
+#### Phase 3 implementation ledger (2026-10-20)
+
+- Removed `ObjectEncryption::None`, `ObjectEncryptionType::None`, the default implementation, and
+  all plaintext geometry/decryption/copy branches. The only current encryption discriminators are
+  SSE-C tag 1 and SSE-S3 tag 2; both the full and header-only metadata-command readers and the
+  storage-RPC payload reader reject former tag 0.
+- Advanced the atomic format vector to PG schema 7, metadata-command 9, storage-RPC 23,
+  canonical-state 6, and metadata-checkpoint 4. The independently versioned runtime config,
+  control-plane containers, RPC authentication binding, SSE-C state 3, and SSE-S3 state 1 retain
+  their outer versions and have refreshed composite evidence for the new nested vector.
+- Schema 7 represents live rows with a required tag 1/2 plus required state. Delete markers require
+  null encryption type and null encryption state. Owner-local SQL tests independently reject tag 0
+  with absent or present state, either missing live column, and either populated marker column;
+  a null/null marker is loaded successfully through the production row decoder.
+- The append-only schema catalogue now retains versions 1 through 7. Schema 6 and the prior v8
+  command, v22 RPC, canonical-state-v5, and checkpoint-v3 representations remain immutable
+  rejection evidence. Recovery, pending-slot inspection, authenticated RPC dispatch, checkpoint
+  catalogue/install, runtime-config proof parsing, and replica-state loading reject noncurrent
+  carriers before mutation.
+- The all-variant metadata-command evidence retains the former v8 checksum corpus beside the new
+  v9 corpus. Exact bytes for every v8 all-variant specimen whose payload contained the removed
+  plaintext state are stored append-only; the remaining v8 specimens are reconstructed from their
+  unchanged payload fixtures. Both historical sets are checksum-verified and rejected by the
+  production header and full-envelope readers. Storage-RPC evidence likewise retains the exact
+  plaintext-bearing v22 multipart-match frame and the exact v19 pending-slot payload carrying a v8
+  command, and proves rejection at their first production readers. Checkpoint evidence retains
+  immutable v2 and v3 tuples beside v4, and current outer control-plane/RPC aggregates bind the
+  unchanged wrappers to canonical-state v6 and RPC v23.
+
+Phase 3 exit is satisfied. The full workspace suite passes with the reduced state space and the
+malformed matrix fails closed at each owner boundary.
 
 ### Phase 4: Simplify the chunked-encryption design
 

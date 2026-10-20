@@ -8464,7 +8464,7 @@ impl IntoTestCanonicalStateDigest for CanonicalStateDigest {
     }
 }
 
-pub(crate) const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 5;
+pub(crate) const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum MetadataProofCarrierVersionError {

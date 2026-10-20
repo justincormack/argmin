@@ -1303,7 +1303,6 @@ impl std::fmt::Debug for SerializedBucketTagSet {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ObjectEncryptionType {
-    None = 0,
     SseCustomer = 1,
     SseS3 = 2,
 }
@@ -1312,7 +1311,6 @@ impl ObjectEncryptionType {
     #[must_use]
     pub(crate) fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(Self::None),
             1 => Some(Self::SseCustomer),
             2 => Some(Self::SseS3),
             _ => None,
@@ -1322,8 +1320,6 @@ impl ObjectEncryptionType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ObjectEncryptionDecodeError {
-    #[error("unexpected encryption_state for unencrypted object")]
-    UnexpectedStateForUnencryptedObject,
     #[error("missing encryption_state for SSE-C object")]
     MissingSseCustomerState,
     #[error("missing encryption_state for SSE-S3 object")]
@@ -1862,10 +1858,8 @@ impl SseS3ObjectState {
 }
 
 /// Persisted object encryption state.
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ObjectEncryption {
-    #[default]
-    None,
     SseCustomer(SseCustomerObjectState),
     SseS3(SseS3ObjectState),
 }
@@ -1873,7 +1867,6 @@ pub enum ObjectEncryption {
 impl std::fmt::Debug for ObjectEncryption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::None => f.write_str("None"),
             Self::SseCustomer(state) => f.debug_tuple("SseCustomer").field(state).finish(),
             Self::SseS3(state) => f.debug_tuple("SseS3").field(state).finish(),
         }
@@ -1884,7 +1877,6 @@ impl ObjectEncryption {
     #[must_use]
     pub(crate) fn encryption_type(&self) -> ObjectEncryptionType {
         match self {
-            Self::None => ObjectEncryptionType::None,
             Self::SseCustomer(_) => ObjectEncryptionType::SseCustomer,
             Self::SseS3(_) => ObjectEncryptionType::SseS3,
         }
@@ -1893,24 +1885,14 @@ impl ObjectEncryption {
     #[must_use]
     pub(crate) fn encode_state(&self) -> Option<Vec<u8>> {
         match self {
-            Self::None => None,
             Self::SseCustomer(state) => Some(state.encode()),
             Self::SseS3(state) => Some(state.encode()),
         }
     }
 
     #[must_use]
-    pub const fn is_encrypted(&self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    #[must_use]
     pub const fn segment_ciphertext_extra_len(&self) -> usize {
-        if self.is_encrypted() {
-            OBJECT_ENCRYPTION_SEGMENT_TAG_LEN
-        } else {
-            0
-        }
+        OBJECT_ENCRYPTION_SEGMENT_TAG_LEN
     }
 
     #[must_use]
@@ -1922,7 +1904,7 @@ impl ObjectEncryption {
     pub const fn managed_encryption_algorithm(&self) -> Option<ManagedEncryptionAlgorithm> {
         match self {
             Self::SseS3(_) => Some(ManagedEncryptionAlgorithm::Aes256),
-            Self::None | Self::SseCustomer(_) => None,
+            Self::SseCustomer(_) => None,
         }
     }
 
@@ -1931,10 +1913,6 @@ impl ObjectEncryption {
         state: Option<Vec<u8>>,
     ) -> Result<Self, ObjectEncryptionDecodeError> {
         match (encryption_type, state) {
-            (ObjectEncryptionType::None, None) => Ok(Self::None),
-            (ObjectEncryptionType::None, Some(_)) => {
-                Err(ObjectEncryptionDecodeError::UnexpectedStateForUnencryptedObject)
-            }
             (ObjectEncryptionType::SseCustomer, Some(bytes)) => {
                 Ok(Self::SseCustomer(SseCustomerObjectState::decode(&bytes)?))
             }
@@ -7499,14 +7477,6 @@ mod tests {
 
     #[test]
     fn object_encryption_encoding_matches_golden_baseline() {
-        let none = ObjectEncryption::None;
-        assert_eq!(none.encryption_type() as u8, 0);
-        assert_eq!(none.encode_state(), None);
-        assert_eq!(
-            ObjectEncryption::decode(ObjectEncryptionType::from_u8(0).unwrap(), None).unwrap(),
-            none
-        );
-
         let customer_state =
             SseCustomerObjectState::new(7, [1; 16], [2; 32], [3; 16], [4; 12], [5; 48], [6; 6])
                 .with_encrypted_checksum_metadata([7; 12], vec![8, 9, 10, 11])
@@ -7644,10 +7614,7 @@ mod tests {
 
     #[test]
     fn object_encryption_decode_reports_typed_errors() {
-        assert_eq!(
-            ObjectEncryptionType::from_u8(0),
-            Some(ObjectEncryptionType::None)
-        );
+        assert_eq!(ObjectEncryptionType::from_u8(0), None);
         assert_eq!(
             ObjectEncryptionType::from_u8(1),
             Some(ObjectEncryptionType::SseCustomer)
@@ -7659,10 +7626,6 @@ mod tests {
         assert_eq!(ObjectEncryptionType::from_u8(3), None);
         assert_eq!(ObjectEncryptionType::from_u8(u8::MAX), None);
 
-        assert_eq!(
-            ObjectEncryption::decode(ObjectEncryptionType::None, Some(vec![1])).unwrap_err(),
-            ObjectEncryptionDecodeError::UnexpectedStateForUnencryptedObject
-        );
         assert_eq!(
             ObjectEncryption::decode(ObjectEncryptionType::SseCustomer, None).unwrap_err(),
             ObjectEncryptionDecodeError::MissingSseCustomerState

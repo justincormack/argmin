@@ -1294,12 +1294,8 @@ impl PgStore {
                 let system_metadata_blob: Option<SerializedSystemMetadataBlob> = row
                     .get::<_, Option<Vec<u8>>>(16)?
                     .map(SerializedSystemMetadataBlob::from);
-                let encryption = Self::parse_object_encryption(
-                    row.get::<_, u8>(17)?,
-                    row.get::<_, Option<Vec<u8>>>(18)?,
-                    17,
-                    18,
-                )?;
+                let encryption_type: Option<u8> = row.get(17)?;
+                let encryption_state: Option<Vec<u8>> = row.get(18)?;
                 if size != 0
                     || generation_id.is_some()
                     || !etag.is_empty()
@@ -1310,7 +1306,8 @@ impl PgStore {
                     || tags.is_some()
                     || metadata_blob.is_some()
                     || system_metadata_blob.is_some()
-                    || encryption != ObjectEncryption::None
+                    || encryption_type.is_some()
+                    || encryption_state.is_some()
                     || !acl_grants.is_empty()
                     || public_read
                     || object_lock != ObjectLockState::default()

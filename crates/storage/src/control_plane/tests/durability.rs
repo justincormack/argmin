@@ -2599,7 +2599,7 @@ fn file_backed_authority_rejects_current_pg_nodes_absent_from_current_map() {
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-            "pg=7,active,1:99,1,1,1,2,5,3,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
+            "pg=7,active,1:99,1,1,1,2,6,3,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
         ),
     )
     .unwrap();
@@ -2623,7 +2623,7 @@ fn file_backed_authority_rejects_current_pg_future_metadata_transfer_epoch() {
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-            "pg=7,peering,1,-,-,-,-,-,-,9,1,10,5,11,3,9,1,10,5,11,9,1,10,5,11,2,1,0,0,-,0,-,-,0,-,-,-,-,0,-,-\n",
+            "pg=7,peering,1,-,-,-,-,-,-,9,1,10,6,11,3,9,1,10,6,11,9,1,10,6,11,2,1,0,0,-,0,-,-,0,-,-,-,-,0,-,-\n",
         ),
     )
     .unwrap();
@@ -2648,7 +2648,7 @@ fn file_backed_authority_rejects_active_imported_provenance_without_epoch() {
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-            "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,1,-,0,-,-,0,-,-,-,-,0,-,2\n",
+            "pg=7,active,1,1,9,1,10,6,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,1,-,0,-,-,0,-,-,-,-,0,-,2\n",
         ),
     )
     .unwrap();
@@ -2770,7 +2770,7 @@ fn file_backed_authority_rejects_history_pg_future_metadata_transfer_epoch() {
             "cluster_epoch=4\n",
             "history=2,1\n",
             "history_node=2,1\n",
-            "history_pg=2,7,peering,1,-,9,1,10,5,11,2,1,3,9,1,10,5,11,9,1,10,5,11,2,1\n",
+            "history_pg=2,7,peering,1,-,9,1,10,6,11,2,1,3,9,1,10,6,11,9,1,10,6,11,2,1\n",
             "node=1,active,1,healthy,11,4,100,200,-,6e6f64652d312e736f636b\n",
         ),
     )
@@ -2792,7 +2792,7 @@ fn file_backed_authority_rejects_incomplete_compact_history_routes() {
             "active PG 7 has no primary",
         ),
         (
-            "history_pg=2,7,peering,1,-,9,1,10,5,11,2,1,2,9,1,10,5,11,9,1,10,5,11,-,-\n",
+            "history_pg=2,7,peering,1,-,9,1,10,6,11,2,1,2,9,1,10,6,11,9,1,10,6,11,-,-\n",
             "PG 7 has incomplete metadata transfer route state",
         ),
     ];
@@ -2824,7 +2824,7 @@ fn file_backed_authority_rejects_broken_compact_history_transfer_chains() {
             concat!(
                 "history=2,1\n",
                 "history_node=2,1\n",
-                "history_pg=2,7,peering,1,-,9,1,10,5,11,1,1,1,9,1,10,5,11,9,1,10,5,11,2,1\n",
+                "history_pg=2,7,peering,1,-,9,1,10,6,11,1,1,1,9,1,10,6,11,9,1,10,6,11,2,1\n",
             ),
             "PG 7 metadata transfer source route epoch is not older than route epoch",
         ),
@@ -2833,7 +2833,7 @@ fn file_backed_authority_rejects_broken_compact_history_transfer_chains() {
             concat!(
                 "history=2,1\n",
                 "history_node=2,1\n",
-                "history_pg=2,7,peering,1,-,9,1,10,5,11,1,1,1,9,1,10,5,11,9,1,10,5,11,1,1\n",
+                "history_pg=2,7,peering,1,-,9,1,10,6,11,1,1,1,9,1,10,6,11,9,1,10,6,11,1,1\n",
             ),
             "PG 7 references missing metadata transfer source route epoch 1",
         ),
@@ -2845,7 +2845,7 @@ fn file_backed_authority_rejects_broken_compact_history_transfer_chains() {
                 "history_pg_absent=1,7\n",
                 "history=2,1\n",
                 "history_node=2,1\n",
-                "history_pg=2,7,peering,1,-,9,1,10,5,11,1,1,1,9,1,10,5,11,9,1,10,5,11,1,1\n",
+                "history_pg=2,7,peering,1,-,9,1,10,6,11,1,1,1,9,1,10,6,11,9,1,10,6,11,1,1\n",
             ),
             "PG 7 references missing metadata transfer source PG at epoch 1",
         ),
@@ -2859,7 +2859,7 @@ fn file_backed_authority_rejects_broken_compact_history_transfer_chains() {
                 "history=2,1\n",
                 "history_node=2,1\n",
                 "history_node=2,2\n",
-                "history_pg=2,7,peering,1,-,9,1,10,5,11,1,1,1,9,1,10,5,11,9,1,10,5,11,1,1\n",
+                "history_pg=2,7,peering,1,-,9,1,10,6,11,1,1,1,9,1,10,6,11,9,1,10,6,11,1,1\n",
             ),
             "PG 7 metadata transfer source node 1 does not match source route primary 2 at epoch 1",
         ),
@@ -3018,7 +3018,7 @@ fn file_backed_authority_rejects_current_pg_observation_outside_acting_set() {
             "cluster_epoch=2\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
             "node=2,active,1,healthy,12,2,100,200,-,6e6f64652d322e736f636b\n",
-            "node_pg=2,7,peering,2,100,0,1,0,5,0,-,-,-,2\n",
+            "node_pg=2,7,peering,2,100,0,1,0,6,0,-,-,-,2\n",
             "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0,-,-\n",
         ),
     )
@@ -3043,7 +3043,7 @@ fn file_backed_authority_rejects_current_pg_observation_wrong_epoch() {
             "authority_incarnation=1\n",
             "cluster_epoch=3\n",
             "node=1,active,1,healthy,11,3,100,200,-,6e6f64652d312e736f636b\n",
-            "node_pg=1,7,peering,2,100,0,1,0,5,0,-,-,-,2\n",
+            "node_pg=1,7,peering,2,100,0,1,0,6,0,-,-,-,2\n",
             "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0,-,-\n",
         ),
     )
@@ -3068,8 +3068,8 @@ fn file_backed_authority_rejects_active_pg_observation_with_mismatched_proof() {
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-            "node_pg=1,7,active,2,100,9,1,10,5,12,-,-,-,2\n",
-            "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
+            "node_pg=1,7,active,2,100,9,1,10,6,12,-,-,-,2\n",
+            "pg=7,active,1,1,9,1,10,6,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
         ),
     )
     .unwrap();
@@ -3095,8 +3095,8 @@ fn file_backed_authority_accepts_active_pg_observation_after_metadata_progress()
         "initial_topology=-\n",
         "max_committed_timestamp_ms=100\nlease_grant_horizon=-\n",
         "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-        "node_pg=1,7,active,2,100,10,1,20,5,30,-,-,-,2\n",
-        "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
+        "node_pg=1,7,active,2,100,10,1,20,6,30,-,-,-,2\n",
+        "pg=7,active,1,1,9,1,10,6,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
     ))
     .unwrap();
     store
@@ -3123,19 +3123,19 @@ fn control_plane_state_rejects_each_unsupported_metadata_proof_carrier() {
         "initial_topology=-\n",
         "max_committed_timestamp_ms=100\nlease_grant_horizon=-\n",
         "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-        "node_pg=1,7,active,2,100,10,1,20,5,30,-,-,-,2\n",
-        "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
+        "node_pg=1,7,active,2,100,10,1,20,6,30,-,-,-,2\n",
+        "pg=7,active,1,1,9,1,10,6,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
     );
     parse_snapshot(current).unwrap();
 
     for (unsupported, expected) in [
         (
-            current.replacen(",10,1,20,5,30,", ",10,2,20,5,30,", 1),
+            current.replacen(",10,1,20,6,30,", ",10,2,20,6,30,", 1),
             "unsupported metadata-command log-hash encoding version 2",
         ),
         (
-            current.replacen(",10,1,20,5,30,", ",10,1,20,6,30,", 1),
-            "unsupported canonical-state digest encoding version 6",
+            current.replacen(",10,1,20,6,30,", ",10,1,20,5,30,", 1),
+            "unsupported canonical-state digest encoding version 5",
         ),
     ] {
         assert!(matches!(
@@ -4315,8 +4315,8 @@ fn file_backed_authority_rejects_active_pg_observation_with_non_current_pending_
             "history_node=1,1\n",
             "history_pg=1,7,active,1,1,-,-,-,-,-,-,0,-,-,-,-,-,-,-,-,-,-,-,-,-\n",
             "node=1,active,1,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-            "node_pg=1,7,active,2,100,9,1,10,5,11,1,1,1,2\n",
-            "pg=7,active,1,1,9,1,10,5,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
+            "node_pg=1,7,active,2,100,9,1,10,6,11,1,1,1,2\n",
+            "pg=7,active,1,1,9,1,10,6,11,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0,-,2\n",
         ),
     )
     .unwrap();

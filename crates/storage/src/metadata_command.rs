@@ -40,7 +40,7 @@ impl MetadataCommandLogHashIssuer {
 }
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 8;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 9;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 
@@ -3894,7 +3894,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
 
     fn skip_object_encryption(&mut self) -> Result<(), String> {
         let encryption_type = self.read_u8()?;
-        if !matches!(encryption_type, 0..=2) {
+        if !matches!(encryption_type, 1..=2) {
             return Err(format!("invalid object encryption type {encryption_type}"));
         }
         let has_state = match self.read_u8()? {
@@ -3910,8 +3910,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             }
         };
         match (encryption_type, has_state) {
-            (0, false) | (1 | 2, true) => Ok(()),
-            (0, true) => Err("unencrypted object must not carry encryption state".to_string()),
+            (1 | 2, true) => Ok(()),
             (1 | 2, false) => Err("encrypted object is missing encryption state".to_string()),
             _ => unreachable!("object encryption type was validated above"),
         }
@@ -5108,6 +5107,41 @@ mod tests {
         SSE_S3_WRAP_NONCE_LEN,
     };
 
+    const IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS: [u64; 30] = [
+        0x71a9bbc9ce6a4fd0,
+        0x8697ef94149db4bc,
+        0x61e7f8e2afd78c9f,
+        0x0412af3aa90e32ca,
+        0xc4a86c877b1c0c2c,
+        0x66d202f5d9712865,
+        0xaa66d925e5636dad,
+        0x8d57d9e2b7f4a004,
+        0x6a3fdd87a4c32dc6,
+        0xa7e13d241790dd39,
+        0x21cafc8ba2f6aeec,
+        0x58de2febf2be7113,
+        0x5557a041275887df,
+        0xb4670776e325241e,
+        0x1ec1fe03d7650627,
+        0x0959cfe7ac8f5973,
+        0x9d60968757eaf6b3,
+        0x28f9b55e7857054b,
+        0x23e3a99024fcc267,
+        0x47e5a0e3e83cb014,
+        0x6b109e9e9ffa40f0,
+        0x79e56095cf71ee33,
+        0x161da0cc5f64396a,
+        0x3ab8eb397b567b2c,
+        0x826e52beae0fedb3,
+        0x444848e146e7aa8f,
+        0xa6b95fe10fa3193c,
+        0x51fb982ed65dc1a6,
+        0xf0cac1d2c9877f40,
+        0xe3f90eee6e075dbd,
+    ];
+    const V8_PLAINTEXT_ALL_VARIANT_INDICES: [usize; 14] =
+        [3, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 27];
+
     fn decode_metadata_command_envelope_for_test(
         bytes: &[u8],
     ) -> Result<MetadataCommandEnvelope, MetadataCommandFormatError> {
@@ -5115,6 +5149,89 @@ mod tests {
             bytes,
             &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
         )
+    }
+
+    fn assert_immutable_v8_command_is_rejected(
+        current: &MetadataCommandEnvelope,
+        expected_v8_checksum: u64,
+    ) {
+        let v8_bytes = current.command_bytes_with_encoding_version_for_test(8);
+        assert_eq!(
+            checksum::crc64::checksum(&v8_bytes),
+            expected_v8_checksum,
+            "the historical v8 command specimen changed"
+        );
+        let expected = MetadataCommandFormatError::UnsupportedVersion {
+            format: MetadataCommandRecordFormat::Applied,
+            version: 8,
+        };
+        assert_eq!(
+            decode_metadata_command_log_entry_header(&v8_bytes),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            decode_metadata_command_envelope_for_test(&v8_bytes),
+            Err(expected)
+        );
+    }
+
+    fn decode_fixture_hex(encoded: &str) -> Vec<u8> {
+        assert_eq!(encoded.len() % 2, 0, "hex fixture must contain whole bytes");
+        encoded
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|digits| {
+                let high = char::from(digits[0]).to_digit(16).expect("hex digit");
+                let low = char::from(digits[1]).to_digit(16).expect("hex digit");
+                u8::try_from((high << 4) | low).expect("decoded hex byte")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plaintext_bearing_metadata_command_v8_specimens_are_immutable_and_rejected() {
+        let mut observed_indices = Vec::new();
+        for line in include_str!("metadata_command_v8_plaintext_rejection.hex").lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut fields = line.split_ascii_whitespace();
+            let index = fields
+                .next()
+                .expect("fixture index")
+                .parse::<usize>()
+                .expect("numeric fixture index");
+            let expected_checksum =
+                u64::from_str_radix(fields.next().expect("fixture checksum"), 16)
+                    .expect("hexadecimal fixture checksum");
+            let bytes = decode_fixture_hex(fields.next().expect("fixture command bytes"));
+            assert_eq!(fields.next(), None, "fixture line has trailing fields");
+            assert_eq!(
+                expected_checksum, IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS[index],
+                "fixture checksum does not match the v8 all-variant corpus"
+            );
+            assert_eq!(
+                checksum::crc64::checksum(&bytes),
+                expected_checksum,
+                "fixture command bytes changed"
+            );
+            let expected = MetadataCommandFormatError::UnsupportedVersion {
+                format: MetadataCommandRecordFormat::Applied,
+                version: 8,
+            };
+            assert_eq!(
+                decode_metadata_command_log_entry_header(&bytes),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                decode_metadata_command_envelope_for_test(&bytes),
+                Err(expected)
+            );
+            observed_indices.push(index);
+        }
+        assert_eq!(observed_indices, V8_PLAINTEXT_ALL_VARIANT_INDICES);
     }
 
     #[test]
@@ -5826,13 +5943,14 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0x328ff7137ea3be2a);
+        assert_eq!(envelope.checksum_crc64(), 0xb6c72836bcd8a653);
+        assert_immutable_v8_command_is_rejected(&envelope, 0x328ff7137ea3be2a);
     }
 
     #[test]
-    fn current_metadata_command_v8_checksum_tags_match_frozen_owner_encoding_and_require_version_bump(
+    fn current_metadata_command_v9_checksum_tags_match_frozen_owner_encoding_and_require_version_bump(
     ) {
-        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 8);
+        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 9);
 
         let cases = [
             (None, &[0_u8][..]),
@@ -5990,7 +6108,7 @@ mod tests {
         assert_eq!(applied_header.command_kind_name(), Some("CreateBucket"));
 
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        for version in [6_u16, 7_u16, 9_u16] {
+        for version in [6_u16, 7_u16, 8_u16, 10_u16] {
             let mut unsupported_version = envelope.command_bytes();
             unsupported_version[version_offset..version_offset + 2]
                 .copy_from_slice(&version.to_le_bytes());
@@ -6093,6 +6211,23 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_header_and_full_decoders_reject_former_plaintext_tag() {
+        for encoded in [&[0, 0][..], &[0, 1, 0, 0, 0, 0][..]] {
+            let mut header_decoder = MetadataCommandLogEntryDecoder::new(encoded);
+            assert_eq!(
+                header_decoder.skip_object_encryption(),
+                Err("invalid object encryption type 0".to_owned())
+            );
+
+            let mut full_decoder = MetadataCommandLogEntryDecoder::new(encoded);
+            assert_eq!(
+                full_decoder.read_object_encryption(),
+                Err("invalid object encryption type".to_owned())
+            );
+        }
+    }
+
+    #[test]
     fn metadata_command_versioning_encoding_is_stable() {
         let command = PutBucketVersioningCommand::from_bucket(
             test_bucket_record("bucket", 11),
@@ -6112,10 +6247,11 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x65261f074dffbfdd);
+        assert_eq!(envelope.checksum_crc64(), 0xe16ec0228f84a7a4);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
+        assert_immutable_v8_command_is_rejected(&envelope, 0x65261f074dffbfdd);
     }
 
     #[test]
@@ -6140,10 +6276,11 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xe831011ef83a6db1);
+        assert_eq!(envelope.checksum_crc64(), 0x6c79de3b3a4175c8);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
+        assert_immutable_v8_command_is_rejected(&envelope, 0xe831011ef83a6db1);
     }
 
     #[test]
@@ -6205,59 +6342,57 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xb04572ea1cc3d0ca);
+        assert_eq!(envelope.checksum_crc64(), 0x340dadcfdeb8c8b3);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
+        assert_immutable_v8_command_is_rejected(&envelope, 0xb04572ea1cc3d0ca);
     }
 
     #[test]
     fn metadata_command_bucket_property_encoding_is_stable() {
+        const IMMUTABLE_V8_CHECKSUMS: [u64; 7] = [
+            0xf70e404a89d91598,
+            0x755df7dfe3db5f5b,
+            0x8f0e46bd03e32f95,
+            0x5bbe010b382a95ab,
+            0x8f74aaf5db9d8fcf,
+            0x03d9d254468ac211,
+            0x24311600a316ccee,
+        ];
         let id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
             PgId::new(3),
             MetadataCommandLogIndex::new(12).unwrap(),
         );
         let mutations = [
-            (
-                BucketPropertyMutation::ObjectLock(BucketObjectLockConfig {
-                    enabled: true,
-                    default_retention: Some(ObjectLockDefaultRetention {
-                        mode: ObjectLockMode::Governance,
-                        period: RetentionPeriod::days(7).unwrap(),
-                    }),
+            BucketPropertyMutation::ObjectLock(BucketObjectLockConfig {
+                enabled: true,
+                default_retention: Some(ObjectLockDefaultRetention {
+                    mode: ObjectLockMode::Governance,
+                    period: RetentionPeriod::days(7).unwrap(),
                 }),
-                0,
-            ),
-            (
-                BucketPropertyMutation::Encryption(BucketEncryptionConfig {
-                    default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
-                    sse_c_blocked: false,
-                }),
-                0,
-            ),
-            (
-                BucketPropertyMutation::PublicAccessBlock(Some(PublicAccessBlockConfig {
-                    block_public_acls: true,
-                    ignore_public_acls: false,
-                    block_public_policy: true,
-                    restrict_public_buckets: false,
-                })),
-                0,
-            ),
-            (BucketPropertyMutation::PublicAccessBlock(None), 0),
-            (
-                BucketPropertyMutation::OwnershipControls(Some(BucketOwnershipControls {
-                    object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
-                })),
-                0,
-            ),
-            (BucketPropertyMutation::OwnershipControls(None), 0),
-            (BucketPropertyMutation::AbacEnabled(true), 0),
+            }),
+            BucketPropertyMutation::Encryption(BucketEncryptionConfig {
+                default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+                sse_c_blocked: false,
+            }),
+            BucketPropertyMutation::PublicAccessBlock(Some(PublicAccessBlockConfig {
+                block_public_acls: true,
+                ignore_public_acls: false,
+                block_public_policy: true,
+                restrict_public_buckets: false,
+            })),
+            BucketPropertyMutation::PublicAccessBlock(None),
+            BucketPropertyMutation::OwnershipControls(Some(BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+            })),
+            BucketPropertyMutation::OwnershipControls(None),
+            BucketPropertyMutation::AbacEnabled(true),
         ];
 
         let mut checksums = Vec::new();
-        for (offset, (mutation, _expected_checksum)) in mutations.into_iter().enumerate() {
+        for (offset, mutation) in mutations.into_iter().enumerate() {
             let command = PutBucketPropertyCommand::from_bucket_and_mutation(
                 test_bucket_record("bucket", 20 + offset as u64),
                 mutation.clone(),
@@ -6281,24 +6416,35 @@ mod tests {
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
             assert_full_envelope_decoder_round_trips(&envelope);
+            assert_immutable_v8_command_is_rejected(&envelope, IMMUTABLE_V8_CHECKSUMS[offset]);
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
             checksums,
             [
-                0xf70e404a89d91598,
-                0x755df7dfe3db5f5b,
-                0x8f0e46bd03e32f95,
-                0x5bbe010b382a95ab,
-                0x8f74aaf5db9d8fcf,
-                0x03d9d254468ac211,
-                0x24311600a316ccee,
+                0xe8e816ff7bf9b05f,
+                0x17d1de3c96b6bae6,
+                0x212f0307c3da3c36,
+                0xdc338e59a6650453,
+                0x08f925a745d21e37,
+                0x87910d7184f1da68,
+                0xa3bc99523d595d16,
             ]
         );
     }
 
     #[test]
     fn metadata_command_bucket_subresource_encoding_is_stable() {
+        const IMMUTABLE_V8_CHECKSUMS: [u64; 8] = [
+            0xffd8c35832d7b06e,
+            0xf21830fe61ba0a46,
+            0xed4d0bc49b68701f,
+            0xae834c1ed8772f89,
+            0xd7d22787168b5a1d,
+            0x3d44ed501cbbe617,
+            0x460a2616c108e19a,
+            0xc32270dff10719e9,
+        ];
         let bucket = BucketName::try_from("bucket").unwrap();
         let id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -6358,19 +6504,20 @@ mod tests {
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
             assert_full_envelope_decoder_round_trips(&envelope);
+            assert_immutable_v8_command_is_rejected(&envelope, IMMUTABLE_V8_CHECKSUMS[offset]);
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
             checksums,
             [
-                0xffd8c35832d7b06e,
-                0xf21830fe61ba0a46,
-                0xed4d0bc49b68701f,
-                0xae834c1ed8772f89,
-                0xd7d22787168b5a1d,
-                0x3d44ed501cbbe617,
-                0x460a2616c108e19a,
-                0xc32270dff10719e9,
+                0x280d8e001c7892d8,
+                0xc3b201a540224dbe,
+                0x07fd5687ccc1c430,
+                0x9f297d45f9ef6871,
+                0x2a5855e9e3453bb9,
+                0x0ceedc0b3d23a1ef,
+                0xbfa60568ec10b398,
+                0xf2884184d09f5e11,
             ]
         );
     }
@@ -6400,6 +6547,16 @@ mod tests {
             ec_k: 2,
             ec_m: 1,
         };
+        let sse_s3_encryption = ObjectEncryption::SseS3(
+            SseS3ObjectState::new(
+                9,
+                [10; SSE_S3_WRAP_NONCE_LEN],
+                [11; SSE_S3_WRAPPED_DEK_LEN],
+                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_encrypted_checksum_metadata([13; SSE_S3_CHECKSUM_NONCE_LEN], vec![14, 15, 16])
+            .unwrap(),
+        );
         let object = PutLiveObjectReq {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -6416,7 +6573,7 @@ mod tests {
             metadata_blob: Some(SerializedMetadataBlob::default()),
             system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: sse_s3_encryption.clone(),
         };
         let multipart_object = PutLiveObjectReq {
             layout: ObjectLayout::MultipartManifest {
@@ -6466,16 +6623,6 @@ mod tests {
         let multipart_checksum =
             MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, Some(ChecksumType::Composite))
                 .unwrap();
-        let sse_s3_encryption = ObjectEncryption::SseS3(
-            SseS3ObjectState::new(
-                9,
-                [10; SSE_S3_WRAP_NONCE_LEN],
-                [11; SSE_S3_WRAPPED_DEK_LEN],
-                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-            )
-            .with_encrypted_checksum_metadata([13; SSE_S3_CHECKSUM_NONCE_LEN], vec![14, 15, 16])
-            .unwrap(),
-        );
         let multipart_upload = MultipartUploadRecord {
             upload_id: upload_id.clone(),
             bucket: bucket.clone(),
@@ -6496,7 +6643,7 @@ mod tests {
             }),
             object_lock: ObjectLockState::default(),
             checksum: None,
-            encryption: ObjectEncryption::None,
+            encryption: sse_s3_encryption.clone(),
         };
         let multipart_upload_with_checksum = MultipartUploadRecord {
             checksum: Some(multipart_checksum),
@@ -6665,7 +6812,7 @@ mod tests {
                     },
                     state: StreamUploadState::InProgress,
                     created_at: 558,
-                    encryption: ObjectEncryption::None,
+                    encryption: sse_s3_encryption.clone(),
                 }],
                 stream_upload_segments: vec![stream_segment.clone()],
                 write_sequence: 43,
@@ -6792,7 +6939,7 @@ mod tests {
                         public_read: true,
                         object_lock: ObjectLockState::default(),
                         checksum: None,
-                        encryption: ObjectEncryption::None,
+                        encryption: sse_s3_encryption.clone(),
                     },
                     generation_id,
                     None,
@@ -6822,7 +6969,7 @@ mod tests {
                         },
                         state: StreamUploadState::InProgress,
                         created_at: 562,
-                        encryption: ObjectEncryption::None,
+                        encryption: sse_s3_encryption.clone(),
                     }],
                     stream_upload_segments: vec![stream_segment.clone()],
                 },
@@ -6835,7 +6982,7 @@ mod tests {
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: StreamUploadTarget::PutObject,
-                        encryption: ObjectEncryption::None,
+                    encryption: sse_s3_encryption.clone(),
                     },
                     561,
                     Some(9_999),
@@ -6852,7 +6999,7 @@ mod tests {
                             upload_id: upload_id.clone(),
                             part_number: 2,
                         },
-                        encryption: ObjectEncryption::None,
+                        encryption: sse_s3_encryption.clone(),
                     },
                     562,
                     bucket_write_reservation.clone(),
@@ -6952,42 +7099,54 @@ mod tests {
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
             assert_full_envelope_decoder_round_trips(&envelope);
+            if !V8_PLAINTEXT_ALL_VARIANT_INDICES.contains(&offset) {
+                assert_immutable_v8_command_is_rejected(
+                    &envelope,
+                    IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS[offset],
+                );
+            }
             checksums.push(envelope.checksum_crc64());
         }
         assert_eq!(
             checksums,
             [
-                0x71a9bbc9ce6a4fd0,
-                0x8697ef94149db4bc,
-                0x61e7f8e2afd78c9f,
-                0x0412af3aa90e32ca,
-                0xc4a86c877b1c0c2c,
-                0x66d202f5d9712865,
-                0xaa66d925e5636dad,
-                0x8d57d9e2b7f4a004,
-                0x6a3fdd87a4c32dc6,
-                0xa7e13d241790dd39,
-                0x21cafc8ba2f6aeec,
-                0x58de2febf2be7113,
-                0x5557a041275887df,
-                0xb4670776e325241e,
-                0x1ec1fe03d7650627,
-                0x0959cfe7ac8f5973,
-                0x9d60968757eaf6b3,
-                0x28f9b55e7857054b,
-                0x23e3a99024fcc267,
-                0x47e5a0e3e83cb014,
-                0x6b109e9e9ffa40f0,
-                0x79e56095cf71ee33,
-                0x161da0cc5f64396a,
-                0x3ab8eb397b567b2c,
-                0x826e52beae0fedb3,
-                0x444848e146e7aa8f,
-                0xa6b95fe10fa3193c,
-                0x51fb982ed65dc1a6,
-                0xf0cac1d2c9877f40,
-                0xe3f90eee6e075dbd,
+                0x560b92ed27206719,
+                0x73f31f71b0768f45,
+                0xa54d6796eed17c66,
+                0x3f2b08a56ce4b720,
+                0x2965bbd38603c665,
+                0xcff8d9c66eeae3c9,
+                0x4badc6c95dbb83c8,
+                0xc0c61800736607cf,
+                0xde032085ff9700ab,
+                0xdbe56a55330c853f,
+                0x54f2176004fde949,
+                0xa8e28bddc869006b,
+                0xa7d06b75c54d9165,
+                0xa5ee3b52193411b5,
+                0xc96729af359631c9,
+                0x474e24dda919ae87,
+                0xfb2100bea73327c0,
+                0x218688cd6c394aee,
+                0xe74f7ba138ebc000,
+                0xf0dad41b5838eed2,
+                0x3de7e7bf451096fb,
+                0x4113393c1d6c0f79,
+                0xa4e2faf23d9c73ba,
+                0x0895a2a73cef327a,
+                0x353e3a18274cb6fc,
+                0x26b4d61219b7db7d,
+                0x1bd6b489d18901a8,
+                0xcd05f457ba38e599,
+                0xed6b3fe9aa005ae5,
+                0xbab1ba7d2cabcfed,
             ]
+        );
+
+        assert_eq!(IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS.len(), checksums.len());
+        assert_ne!(
+            IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS.as_slice(),
+            checksums.as_slice()
         );
 
         let append_id = MetadataCommandId::new(

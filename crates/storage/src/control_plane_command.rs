@@ -2783,7 +2783,7 @@ mod tests {
             bytes,
             [
                 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x11, 0x12, 0x13, 0x14, 0x15,
-                0x16, 0x17, 0x18, 0x05, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                0x16, 0x17, 0x18, 0x06, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
             ]
         );
         let mut reader = PayloadReader::new(&bytes);
@@ -2805,8 +2805,8 @@ mod tests {
             ),
             (
                 17,
-                6,
-                "unsupported canonical-state digest encoding version 6",
+                5,
+                "unsupported canonical-state digest encoding version 5",
             ),
         ] {
             let mut malformed = bytes.clone();
@@ -3485,8 +3485,8 @@ mod tests {
             (
                 2_799,
                 [
-                    109, 192, 98, 243, 4, 193, 71, 28, 42, 173, 72, 124, 238, 155, 208, 206, 233,
-                    19, 93, 195, 8, 132, 123, 63, 52, 251, 198, 111, 177, 157, 240, 116,
+                    176, 60, 187, 59, 79, 111, 95, 22, 247, 81, 68, 65, 39, 17, 107, 9, 103, 76,
+                    108, 232, 16, 252, 42, 10, 29, 251, 219, 146, 18, 190, 85, 159,
                 ],
             )
         );

@@ -1097,9 +1097,7 @@ impl ReadRuntime {
         sse_customer_request: Option<&SseCustomerRequest>,
         stored_bytes: &mut Vec<u8>,
     ) -> Result<(), ServerError> {
-        let encrypted = !matches!(segment.encryption, ObjectEncryption::None);
         let result = match &segment.encryption {
-            ObjectEncryption::None => Ok(()),
             ObjectEncryption::SseCustomer(state) => {
                 let request = sse_customer_request.ok_or(ServerError::InvalidRequest {
                     reason: "SSE-C headers are required for this object".to_string(),
@@ -1146,12 +1144,10 @@ impl ReadRuntime {
             }
         };
         result?;
-        if encrypted {
-            observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
-                decrypted_bytes: u64::try_from(stored_bytes.len()).unwrap_or(u64::MAX),
-                ..observability::PayloadReadMetricDelta::default()
-            });
-        }
+        observability::record_payload_read_metrics(observability::PayloadReadMetricDelta {
+            decrypted_bytes: u64::try_from(stored_bytes.len()).unwrap_or(u64::MAX),
+            ..observability::PayloadReadMetricDelta::default()
+        });
         Ok(())
     }
 }

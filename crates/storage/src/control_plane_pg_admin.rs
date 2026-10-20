@@ -494,30 +494,30 @@ mod tests {
         ) in [
             (
                 2,
-                5,
+                6,
                 1,
-                5,
+                6,
                 "source metadata-command log-hash version is unsupported",
             ),
             (
                 1,
-                6,
-                1,
                 5,
+                1,
+                6,
                 "source canonical-state digest version is unsupported",
             ),
             (
                 1,
-                5,
+                6,
                 2,
-                5,
+                6,
                 "imported metadata-command log-hash version is unsupported",
             ),
             (
                 1,
-                5,
-                1,
                 6,
+                1,
+                5,
                 "imported canonical-state digest version is unsupported",
             ),
         ] {

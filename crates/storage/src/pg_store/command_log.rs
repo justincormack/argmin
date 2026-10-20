@@ -7680,7 +7680,7 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn canonical_metadata_state_v5_digests_are_stable() {
+    fn canonical_metadata_state_v6_digests_are_stable() {
         let table = &METADATA_DIGEST_TABLES[0];
         assert_eq!(table.name, "bucket_subresources");
         let values = vec![
@@ -7717,21 +7717,45 @@ mod canonical_format_baseline_tests {
             (
                 0x8e12_8dbf_237c_be5e,
                 0x64a9_e3d9_b3ad_266d,
-                0x7b41_179d_44a2_8eb5,
+                0xb0ef_93dd_134e_269e,
             )
         );
     }
 
     #[test]
-    fn current_checksum_tags_match_frozen_canonical_state_v5_and_checkpoint_v3_evidence_and_require_version_bumps(
+    fn current_checksum_tags_match_frozen_canonical_state_v6_and_checkpoint_v4_evidence_and_require_version_bumps(
     ) {
-        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 5);
-        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 3);
+        // Immutable checkpoint-v2 evidence produced with canonical-state v5 and the former
+        // plaintext encryption tag. This tuple is rejection evidence only and must never be
+        // regenerated from current structs.
+        const HISTORICAL_CHECKPOINT_V2_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
+            0xaf12_e777_e798_6326,
+            0x628c_2605_8430_0187,
+            7_177,
+            [
+                43, 167, 154, 203, 225, 110, 170, 130, 120, 205, 134, 158, 119, 158, 134, 21, 65,
+                23, 33, 14, 109, 147, 232, 228, 139, 29, 135, 45, 114, 191, 209, 191,
+            ],
+        );
+        const HISTORICAL_CHECKPOINT_V3_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
+            0xaf12_e777_e798_6326,
+            0xaee3_00e7_7c85_39ce,
+            7_563,
+            [
+                73, 225, 247, 225, 57, 46, 87, 253, 244, 249, 98, 226, 194, 240, 88, 170, 80, 223,
+                60, 48, 33, 2, 153, 255, 59, 18, 244, 132, 67, 107, 214, 60,
+            ],
+        );
+        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 6);
+        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 4);
 
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let upload_id = UploadId::new("c".repeat(UPLOAD_ID_LEN)).unwrap();
         let owner = OwnerIdentity::from_principal("owner");
+        let encryption = crate::tests::metadata_only_test_encryption();
+        let encryption_type = encryption.encryption_type() as u8;
+        let encryption_state = encryption.encode_state().unwrap();
         store
             .conn
             .execute(
@@ -7743,7 +7767,7 @@ mod canonical_format_baseline_tests {
                   object_generation_id, object_lock_retention_mode, object_lock_retain_until, \
                   object_lock_legal_hold) \
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-                         ?14, NULL, ?15, ?16, ?17, NULL, NULL, ?18)",
+                         ?14, ?15, ?16, ?17, ?18, NULL, NULL, ?19)",
                 params![
                     upload_id.as_str(),
                     "checksum-bucket",
@@ -7758,7 +7782,8 @@ mod canonical_format_baseline_tests {
                     owner.canonical_id.as_str(),
                     ChecksumAlgorithm::Crc64nvme.wire_tag(),
                     ChecksumType::FullObject.wire_tag(),
-                    ObjectEncryption::None.encryption_type() as u8,
+                    encryption_type,
+                    encryption_state,
                     PgStore::serialize_acl_grants(&AclGrants::default()),
                     0_i64,
                     1_i64,
@@ -7799,23 +7824,26 @@ mod canonical_format_baseline_tests {
 
         let encoded = encode_metadata_command_checkpoint_payload(&checkpoint).unwrap();
         let encoded_sha256 = checksum::compute_checksum(ChecksumAlgorithm::Sha256, &encoded);
+        let current_evidence = (
+            checkpoint.state_digest.value(),
+            checkpoint.checkpoint_crc64,
+            encoded.len(),
+            <[u8; 32]>::try_from(encoded_sha256.bytes()).unwrap(),
+        );
         assert_eq!(
+            current_evidence,
             (
-                checkpoint.state_digest.value(),
-                checkpoint.checkpoint_crc64,
-                encoded.len(),
-                encoded_sha256.bytes(),
-            ),
-            (
-                0xaf12_e777_e798_6326,
-                0xaee3_00e7_7c85_39ce,
-                7_563,
-                &[
-                    73, 225, 247, 225, 57, 46, 87, 253, 244, 249, 98, 226, 194, 240, 88, 170, 80,
-                    223, 60, 48, 33, 2, 153, 255, 59, 18, 244, 132, 67, 107, 214, 60,
-                ][..],
+                0x7a1c_7ac9_e135_9fc5,
+                0x8ccc_c515_6f99_c704,
+                7_652,
+                [
+                    123, 25, 100, 228, 221, 28, 84, 116, 91, 214, 116, 220, 6, 200, 79, 95, 122, 6,
+                    31, 140, 160, 245, 127, 254, 69, 129, 170, 143, 2, 56, 63, 53,
+                ],
             )
         );
+        assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V2_EVIDENCE);
+        assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V3_EVIDENCE);
 
         let mut checkpoint_v2 = checkpoint.clone();
         for (table, block) in METADATA_DIGEST_TABLES
@@ -7830,7 +7858,7 @@ mod canonical_format_baseline_tests {
                         .columns
                         .iter()
                         .position(|candidate| candidate == column)
-                        .expect("v3 checkpoint must contain every v2 canonical column")
+                        .expect("v4 checkpoint must contain every v2 canonical column")
                 })
                 .collect::<Vec<_>>();
             for row in &mut block.rows {
@@ -7861,12 +7889,12 @@ mod canonical_format_baseline_tests {
                 encoded_v2_sha256.bytes(),
             ),
             (
-                0xaf12_e777_e798_6326,
-                0x628c_2605_8430_0187,
-                7_177,
+                0x7a1c_7ac9_e135_9fc5,
+                0x46ef_9335_040a_8d95,
+                7_266,
                 &[
-                    43, 167, 154, 203, 225, 110, 170, 130, 120, 205, 134, 158, 119, 158, 134, 21,
-                    65, 23, 33, 14, 109, 147, 232, 228, 139, 29, 135, 45, 114, 191, 209, 191,
+                    103, 226, 132, 243, 42, 254, 65, 8, 17, 97, 83, 118, 112, 7, 20, 188, 231, 247,
+                    140, 253, 242, 34, 141, 125, 130, 180, 158, 204, 182, 20, 121, 53,
                 ][..],
             )
         );

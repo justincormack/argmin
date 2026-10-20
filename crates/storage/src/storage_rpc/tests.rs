@@ -16,6 +16,21 @@ mod tests {
         out
     }
 
+    fn bytes_from_hex(encoded: &str) -> Vec<u8> {
+        assert_eq!(encoded.len() % 2, 0, "hex fixture must contain whole bytes");
+        encoded
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|digits| {
+                let high = char::from(digits[0]).to_digit(16).expect("hex digit");
+                let low = char::from(digits[1]).to_digit(16).expect("hex digit");
+                u8::try_from((high << 4) | low).expect("decoded hex byte")
+            })
+            .collect()
+    }
+
     fn metadata_command_decode_authority_for_test() -> MetadataCommandDecodeAuthority {
         MetadataCommandDecodeAuthority::new_for_test()
     }
@@ -50,6 +65,19 @@ mod tests {
             after_sampling_delay.remaining_on_receiver_wall(receiver_wall_ms),
             4_000
         );
+    }
+
+    #[test]
+    fn storage_rpc_payload_decoder_rejects_former_plaintext_encryption_tag() {
+        for encoded in [&[0, 0][..], &[0, 1, 0, 0, 0, 0][..]] {
+            let mut decoder = StorageRpcDecoder::new(encoded);
+            assert_eq!(
+                decoder.read_object_encryption(),
+                Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid object encryption type"
+                ))
+            );
+        }
     }
 
     #[test]
@@ -245,7 +273,12 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 22, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
             0, 0, 0, 202, 74, 215, 141, 132, 131, 9, 128, 97, 98, 99,
         ];
-        assert_eq!(bytes, V22_FRAME);
+        const V23_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 23, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 219, 185, 232, 25, 191, 51, 112, 119, 97, 98, 99,
+        ];
+        assert_eq!(bytes, V23_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
@@ -266,13 +299,25 @@ mod tests {
             decode_storage_rpc_frame(V21_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(21))
         );
+        assert_eq!(
+            decode_storage_rpc_frame(V22_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(22))
+        );
     }
 
     #[test]
-    fn current_storage_rpc_v22_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
+    fn current_storage_rpc_v23_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
     {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 22);
-        const EXPECTED_V22_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65160008070605040302013a0068010000ffac5bdc61c4e5260700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 23);
+        const HISTORICAL_V22_PLAINTEXT_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65160008070605040302013a0068010000ffac5bdc61c4e5260700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
+        const EXPECTED_V23_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605040302013a00c1010000ce03353b9e5164410700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
+
+        let historical_v22 = bytes_from_hex(HISTORICAL_V22_PLAINTEXT_FRAME_HEX);
+        assert_eq!(hex_bytes(&historical_v22), HISTORICAL_V22_PLAINTEXT_FRAME_HEX);
+        assert_eq!(
+            decode_storage_rpc_frame(&historical_v22),
+            Err(StorageRpcFrameError::UnsupportedVersion(22))
+        );
 
         let bucket = BucketName::try_from("rpc").unwrap();
         let key = ObjectKey::try_from("k").unwrap();
@@ -304,7 +349,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-                encryption: ObjectEncryption::None,
+                encryption: crate::tests::metadata_only_test_encryption(),
             },
             expected_command: None,
         };
@@ -317,8 +362,8 @@ mod tests {
         )
         .unwrap();
         let encoded_frame_hex = hex_bytes(&frame);
-        assert_eq!(encoded_frame_hex.len(), EXPECTED_V22_FRAME_HEX.len());
-        assert_eq!(encoded_frame_hex, EXPECTED_V22_FRAME_HEX);
+        assert_eq!(encoded_frame_hex.len(), EXPECTED_V23_FRAME_HEX.len());
+        assert_eq!(encoded_frame_hex, EXPECTED_V23_FRAME_HEX);
 
         let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
         assert_eq!(
@@ -336,8 +381,8 @@ mod tests {
     }
 
     #[test]
-    fn current_storage_rpc_v22_encryption_state_encoding_is_frozen() {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 22);
+    fn current_storage_rpc_v23_encryption_state_encoding_is_frozen() {
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 23);
         let bucket = BucketName::try_from("encrypted-rpc").unwrap();
         let key = ObjectKey::try_from("key").unwrap();
         let encryption = ObjectEncryption::SseS3(
@@ -545,8 +590,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(21))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(23)),
-            Err(StorageRpcFrameError::UnsupportedVersion(23))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(22)),
+            Err(StorageRpcFrameError::UnsupportedVersion(22))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(24)),
+            Err(StorageRpcFrameError::UnsupportedVersion(24))
         );
     }
 
@@ -1212,11 +1261,30 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_v19_pending_slot_remove_deadline_payload_is_stable() {
+    fn storage_rpc_v19_pending_slot_remove_deadline_payload_is_immutable_rejection_evidence() {
         const V19_PENDING_SLOT_REMOVE_PAYLOAD: &[u8] = &[
             7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 201, 112, 67, 123, 254, 81, 94,
             45, 69, 0, 0, 0, 23, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 109, 101, 116, 97,
             100, 97, 116, 97, 45, 99, 111, 109, 109, 97, 110, 100, 8, 0, 1, 0, 0, 0, 0, 0,
+            0, 0, 3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 21, 0, 6, 0, 0, 0, 98, 117, 99,
+            107, 101, 116, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 7, 6, 5, 4, 3, 2, 1,
+        ];
+
+        assert!(matches!(
+            decode_metadata_command_pending_slot_request(
+                V19_PENDING_SLOT_REMOVE_PAYLOAD,
+                &metadata_command_decode_authority_for_test(),
+            ),
+            Err(StorageRpcPayloadError::InvalidMetadataCommandEnvelope)
+        ));
+    }
+
+    #[test]
+    fn current_storage_rpc_v23_pending_slot_remove_deadline_payload_is_stable() {
+        const V23_PENDING_SLOT_REMOVE_PAYLOAD: &[u8] = &[
+            7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 153, 226, 239, 57, 109, 229, 22,
+            116, 69, 0, 0, 0, 23, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 109, 101, 116, 97,
+            100, 97, 116, 97, 45, 99, 111, 109, 109, 97, 110, 100, 9, 0, 1, 0, 0, 0, 0, 0,
             0, 0, 3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 21, 0, 6, 0, 0, 0, 98, 117, 99,
             107, 101, 116, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 7, 6, 5, 4, 3, 2, 1,
         ];
@@ -1246,10 +1314,10 @@ mod tests {
         };
 
         let encoded = encode_metadata_command_pending_slot_request(&request).unwrap();
-        assert_eq!(encoded, V19_PENDING_SLOT_REMOVE_PAYLOAD);
+        assert_eq!(encoded, V23_PENDING_SLOT_REMOVE_PAYLOAD);
         assert_eq!(
             decode_metadata_command_pending_slot_request(
-                V19_PENDING_SLOT_REMOVE_PAYLOAD,
+                V23_PENDING_SLOT_REMOVE_PAYLOAD,
                 &metadata_command_decode_authority_for_test(),
             )
             .unwrap(),
@@ -1574,7 +1642,7 @@ mod tests {
         assert_eq!(decoded.commands[0].post_state_digest, 1234);
 
         for offset in [16, 29, 38] {
-            for version in [4, 6] {
+            for version in [5, 7] {
                 let mut unsupported = bytes.clone();
                 unsupported[offset] = version;
                 assert_eq!(
@@ -1604,7 +1672,7 @@ mod tests {
 
         assert_eq!(decoded, request);
 
-        for version in [4, 6] {
+        for version in [5, 7] {
             let mut unsupported = bytes.clone();
             unsupported[16] = version;
             assert_eq!(
@@ -1630,7 +1698,7 @@ mod tests {
         let bytes = encode_metadata_command_transfer_matching_state_request(&request);
         assert_eq!(
             hex_bytes(&bytes),
-            "0700000003000000000000000b0000000400000000000000012e1600000000000005d204000000000000"
+            "0700000003000000000000000b0000000400000000000000012e1600000000000006d204000000000000"
         );
         let decoded = decode_metadata_command_transfer_matching_state_request(&bytes).unwrap();
 
@@ -1638,7 +1706,7 @@ mod tests {
 
         for (offset, versions, carrier) in [
             (24, &[2][..], "log-hash"),
-            (33, &[4, 6][..], "state-digest"),
+            (33, &[5, 7][..], "state-digest"),
         ] {
             for version in versions {
                 let mut unsupported = bytes.clone();
@@ -1701,12 +1769,11 @@ mod tests {
                 payload_sha256,
             ),
             (
-                0x9f9b_42d2_1111_d2a0,
+                0x8252_edae_7939_028d,
                 7_079,
                 [
-                    106, 39, 58, 149, 225, 125, 131, 221, 38, 179, 191, 153, 175, 243, 23,
-                    91, 226, 68, 187, 170, 27, 119, 183, 140, 44, 202, 150, 157, 164, 112,
-                    65, 60,
+                    197, 99, 138, 179, 20, 136, 67, 213, 58, 9, 200, 208, 30, 181, 230, 53,
+                    188, 187, 172, 203, 22, 70, 182, 35, 34, 215, 40, 144, 16, 244, 138, 100,
                 ],
             )
         );
@@ -1714,7 +1781,7 @@ mod tests {
 
         assert_eq!(decoded, request.checkpoint);
 
-        for unsupported in [1_u16, 2, 4] {
+        for unsupported in [1_u16, 2, 3, 5] {
             let mut unsupported_checkpoint = request.checkpoint.clone();
             crate::PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
                 &mut unsupported_checkpoint,
@@ -1734,7 +1801,7 @@ mod tests {
         }
         for (offset, versions, carrier) in [
             (30, &[2][..], "log-hash"),
-            (39, &[4, 6][..], "state-digest"),
+            (39, &[5, 7][..], "state-digest"),
         ] {
             for version in versions {
                 let mut unsupported_bytes = bytes.clone();
@@ -2286,7 +2353,7 @@ mod tests {
 
         for (offset, versions, carrier) in [
             (16, &[2][..], "log-hash"),
-            (25, &[4, 6][..], "state-digest"),
+            (25, &[5, 7][..], "state-digest"),
         ] {
             for version in versions {
                 let mut unsupported = bytes.clone();

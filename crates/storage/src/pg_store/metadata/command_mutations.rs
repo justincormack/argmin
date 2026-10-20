@@ -1214,12 +1214,12 @@ impl PgStore {
             "INSERT OR REPLACE INTO objects \
              (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
               storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-             VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?6, ?7, ?8, 0)"
+             VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, NULL, NULL, ?6, ?7, ?8, 0)"
         } else {
             "INSERT INTO objects \
              (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
               storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-             VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?6, ?7, ?8, 0)"
+             VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, NULL, NULL, ?6, ?7, ?8, 0)"
         };
         self.execute_cached_metadata(
             sql,

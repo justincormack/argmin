@@ -271,9 +271,6 @@ impl Coordinator {
             let same_key_same_bucket = src_bucket == dst_bucket && src_key == dst_key;
             let encryption_attrs_unchanged =
                 match (&src_record.encryption, req.destination_encryption) {
-                    (ObjectEncryption::None, WriteEncryptionRequest::None) => true,
-                    (ObjectEncryption::None, WriteEncryptionRequest::Managed(_)) => false,
-                    (ObjectEncryption::None, WriteEncryptionRequest::SseCustomer(_)) => false,
                     (ObjectEncryption::SseCustomer(_), WriteEncryptionRequest::None) => false,
                     (ObjectEncryption::SseCustomer(_), WriteEncryptionRequest::Managed(_)) => false,
                     (

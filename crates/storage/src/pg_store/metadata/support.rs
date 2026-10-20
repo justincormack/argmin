@@ -586,14 +586,17 @@ impl PgStore {
             "test listing objects (commit txn)",
             |store| {
                 let owner = OwnerIdentity::from_principal("listing-scale-test-owner");
+                let encryption = crate::tests::metadata_only_test_encryption();
+                let encryption_type = encryption.encryption_type() as u8;
+                let encryption_state = encryption.encode_state().unwrap();
                 let mut statement = store
                     .conn
                     .prepare_cached(
                         "INSERT INTO objects \
                          (bucket, key, version_id, write_sequence, generation_id, size, etag, \
                           etag_kind, last_modified, ec_k, ec_m, owner_principal, \
-                          owner_canonical_id) \
-                         VALUES (?1, ?2, 0, ?3, ?3, 0, ?4, 0, 1, 1, 0, ?5, ?6)",
+                          owner_canonical_id, encryption_type, encryption_state) \
+                         VALUES (?1, ?2, 0, ?3, ?3, 0, ?4, 0, 1, 1, 0, ?5, ?6, ?7, ?8)",
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "prepare test listing objects",
@@ -615,6 +618,8 @@ impl PgStore {
                             [0_u8; 8].as_slice(),
                             &owner.principal,
                             owner.canonical_id.as_str(),
+                            encryption_type,
+                            encryption_state.as_slice(),
                         ])
                         .map_err(|source| MetadataError::Db {
                             context: "insert test listing object",
@@ -637,6 +642,9 @@ impl PgStore {
             "test listing multipart uploads (commit txn)",
             |store| {
                 let owner = OwnerIdentity::from_principal("listing-scale-test-owner");
+                let encryption = crate::tests::metadata_only_test_encryption();
+                let encryption_type = encryption.encryption_type() as u8;
+                let encryption_state = encryption.encode_state().unwrap();
                 let mut statement = store
                     .conn
                     .prepare_cached(
@@ -644,8 +652,8 @@ impl PgStore {
                          (upload_id, bucket, key, initiated_at, metadata_blob, \
                           system_metadata_blob, owner_principal, owner_canonical_id, \
                           initiator_principal, initiator_canonical_id, object_generation_id, \
-                          listing_cluster_epoch, listing_log_index) \
-                         VALUES (?1, ?2, ?3, 1, X'', X'', ?5, ?6, ?5, ?6, ?4, 1, ?4)",
+                          listing_cluster_epoch, listing_log_index, encryption_type, encryption_state) \
+                         VALUES (?1, ?2, ?3, 1, X'', X'', ?5, ?6, ?5, ?6, ?4, 1, ?4, ?7, ?8)",
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "prepare test listing multipart uploads",
@@ -667,6 +675,8 @@ impl PgStore {
                             sequence,
                             &owner.principal,
                             owner.canonical_id.as_str(),
+                            encryption_type,
+                            encryption_state.as_slice(),
                         ])
                         .map_err(|source| MetadataError::Db {
                             context: "insert test listing multipart upload",

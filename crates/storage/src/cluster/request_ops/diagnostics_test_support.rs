@@ -1269,11 +1269,6 @@ impl super::StorageCluster {
                 encryption.encrypted_checksum_metadata()
             }
             ObjectEncryption::SseS3(encryption) => encryption.encrypted_checksum_metadata(),
-            ObjectEncryption::None => {
-                return Err(ObjectPgActionError::InvalidRequest {
-                    reason: "selected checksum observation is not encrypted".to_string(),
-                });
-            }
         };
         let cleartext_checksum = cleartext_checksum.as_bytes();
         let contains_supplied_cleartext =
@@ -1311,13 +1306,6 @@ impl super::StorageCluster {
             .ok_or_else(|| ObjectPgActionError::InvalidRequest {
                 reason: "right encryption-state observation is not a live object".to_string(),
             })?;
-        if matches!(left.encryption, ObjectEncryption::None)
-            || matches!(right.encryption, ObjectEncryption::None)
-        {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "encryption-state comparison requires two encrypted objects".to_string(),
-            });
-        }
         Ok(left.encryption != right.encryption)
     }
 

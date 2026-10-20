@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 6;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 7;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -130,7 +130,7 @@ CREATE TABLE objects (
     parts_count   INTEGER,
     metadata_blob BLOB,
     system_metadata_blob BLOB,
-    encryption_type INTEGER NOT NULL DEFAULT 0,
+    encryption_type INTEGER,
     encryption_state BLOB,
     owner_principal TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
@@ -152,7 +152,7 @@ CREATE TABLE objects (
     CHECK (status IN (0, 1)),
     CHECK (etag_kind IN (0, 1)),
     CHECK (data_layout IN (0, 1)),
-    CHECK (encryption_type IN (0, 1, 2)),
+    CHECK (encryption_type IS NULL OR encryption_type IN (1, 2)),
     CHECK (
         (multipart_completion_upload_id IS NULL AND multipart_completion_fingerprint IS NULL)
         OR
@@ -163,12 +163,14 @@ CREATE TABLE objects (
     CHECK (
         (status = 0 AND (
             generation_id IS NOT NULL AND generation_id > 0 AND
-            (data_layout = 0 AND parts_count IS NULL) OR
-            (data_layout = 1 AND parts_count IS NOT NULL AND parts_count > 0)
+            encryption_type IS NOT NULL AND encryption_type IN (1, 2) AND
+            encryption_state IS NOT NULL AND
+            ((data_layout = 0 AND parts_count IS NULL) OR
+             (data_layout = 1 AND parts_count IS NOT NULL AND parts_count > 0))
         )) OR
         (status = 1 AND generation_id IS NULL AND data_layout = 0 AND parts_count IS NULL AND tags IS NULL AND metadata_blob IS NULL AND system_metadata_blob IS NULL
          AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0
-         AND encryption_type = 0 AND encryption_state IS NULL AND public_read = 0
+         AND encryption_type IS NULL AND encryption_state IS NULL AND public_read = 0
          AND object_lock_retention_mode IS NULL AND object_lock_retain_until IS NULL
          AND object_lock_legal_hold = 0 AND became_noncurrent_at IS NULL)
     ),
@@ -206,8 +208,8 @@ CREATE TABLE multipart_uploads (
     metadata_blob    BLOB NOT NULL,
     system_metadata_blob BLOB NOT NULL,
     owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
-    encryption_type  INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
-    encryption_state BLOB,
+    encryption_type  INTEGER NOT NULL CHECK (encryption_type IN (1, 2)),
+    encryption_state BLOB NOT NULL,
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
     initiator_principal TEXT NOT NULL CHECK (length(initiator_principal) BETWEEN 1 AND 256),
     initiator_canonical_id TEXT NOT NULL CHECK (length(initiator_canonical_id) IN (32, 64)),
@@ -300,8 +302,8 @@ CREATE TABLE stream_uploads (
     state         INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
     cleanup_after INTEGER CHECK (cleanup_after > 0),
-    encryption_type INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
-    encryption_state BLOB,
+    encryption_type INTEGER NOT NULL CHECK (encryption_type IN (1, 2)),
+    encryption_state BLOB NOT NULL,
     next_segment_vid INTEGER NOT NULL DEFAULT 1 CHECK (next_segment_vid > 0),
     bucket_write_reservation_id TEXT,
     bucket_write_owner_token TEXT,
@@ -804,8 +806,8 @@ CREATE TABLE metadata_command_replica_state (
     applied_log_hash_encoding_version INTEGER NOT NULL DEFAULT 1 \
         CHECK (applied_log_hash_encoding_version = 1),
     applied_log_hash  INTEGER NOT NULL DEFAULT 0,
-    state_digest_encoding_version INTEGER NOT NULL DEFAULT 5 \
-        CHECK (state_digest_encoding_version = 5),
+    state_digest_encoding_version INTEGER NOT NULL DEFAULT 6 \
+        CHECK (state_digest_encoding_version = 6),
     state_digest      INTEGER NOT NULL DEFAULT 0
 ) STRICT";
 
@@ -1285,6 +1287,10 @@ mod tests {
             version: 6,
             catalogue: include_str!("schema_manifests/pg_schema_v6.catalogue"),
         },
+        FrozenPgSchemaManifest {
+            version: 7,
+            catalogue: include_str!("schema_manifests/pg_schema_v7.catalogue"),
+        },
     ];
 
     fn canonical_pg_schema_catalogue(conn: &Connection) -> String {
@@ -1409,7 +1415,7 @@ mod tests {
             .iter()
             .map(|manifest| manifest.version)
             .collect::<Vec<_>>();
-        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7]);
         for manifest in FROZEN_PG_SCHEMA_MANIFESTS {
             validate_frozen_pg_schema_catalogue(manifest.catalogue);
         }
@@ -1538,7 +1544,7 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        for version in [1, 2, 3, 4, 5, 7] {
+        for version in [1, 2, 3, 4, 5, 6, 8] {
             let conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "user_version", version).unwrap();
 
