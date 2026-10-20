@@ -566,11 +566,16 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   is reconstructed as exact ciphertext before the race, cleanup is checked with the encrypted
   stored length and CRC, and the payload-free foreign-terminal fixture uses the explicitly
   metadata-only state.
-- The remaining 56 source occurrences are deliberately left for the shared multipart
-  payload-bearing helpers, command-codec fixture migrations, Phase 3's production removal, and
-  immutable rejection evidence. The adjacent same-part replacement and UploadPartCopy cleanup
-  races still inherit the shared plaintext multipart seed and move with that atomic helper slice.
-  Phase 2 is not yet complete.
+- The shared multipart-payload slice removes another 14 positive plaintext constructions. The
+  common UploadPart helper now encrypts each part-scoped segment, proves its state matches the
+  durable upload, reconstructs the exact ciphertext before finalization, and returns that stored
+  representation for non-vacuous preservation and cleanup checks. Multipart completion,
+  same-part replacement, UploadPartCopy staging, abort recovery, partial-apply/reopen,
+  response-loss, Peering, lifecycle, and pending-install races now use that path or the same
+  encrypted append primitive; multi-segment cases use distinct segment nonces.
+- The remaining 42 source occurrences are deliberately left for the direct-PUT recovery helper,
+  residual owner-local fixtures, command-codec fixture migrations, Phase 3's production removal,
+  and immutable rejection evidence. Phase 2 is not yet complete.
 
 ### Phase 3: Atomically close durable and recovery state
 

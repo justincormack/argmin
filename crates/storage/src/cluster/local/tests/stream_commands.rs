@@ -189,64 +189,6 @@ fn create_encrypted_test_multipart_upload(
         .unwrap()
 }
 
-fn append_encrypted_multipart_stream_segment(
-    cluster: &crate::StorageCluster,
-    bucket: &BucketName,
-    key: &ObjectKey,
-    session_id: &crate::SessionId,
-    segment_index: u32,
-    encrypted: &crate::tests::SseS3SegmentTestFixture,
-) -> crate::StreamUploadSegmentRecord {
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            bucket,
-            key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index,
-                size: encrypted.logical_size,
-                segment_crc64: encrypted.storage_crc64,
-                payload_crc64: encrypted.payload_crc64,
-            },
-        )
-        .unwrap();
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            bucket,
-            key,
-            session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
-    segment
-}
-
-fn encrypted_stream_segment_read_request(
-    segment: &crate::StreamUploadSegmentRecord,
-    encrypted: &crate::tests::SseS3SegmentTestFixture,
-) -> crate::SegmentStoredBytesRequest {
-    crate::SegmentStoredBytesRequest {
-        data_pg_id: segment.data_pg_id,
-        segment_okh: segment.segment_okh,
-        segment_vid: segment.segment_vid,
-        stored_size: encrypted.storage_bytes.len(),
-        segment_crc64: encrypted.storage_crc64,
-        ec: EcShape {
-            k: segment.ec_k,
-            m: segment.ec_m,
-        },
-    }
-}
-
 #[test]
 fn failed_stream_append_after_session_abort_removes_all_staged_payload() {
     let _serial = lock_payload_cleanup_hook_test();
@@ -3754,7 +3696,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
         let mut readback = Vec::new();
         cluster
             .read_segment_payload_stored_bytes_into(
-                encrypted_stream_segment_read_request(segment, encrypted),
+                encrypted_test_stream_segment_read_request(segment, encrypted),
                 &mut readback,
             )
             .unwrap();
@@ -3830,7 +3772,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
         let mut readback = Vec::new();
         let error = cluster
             .read_segment_payload_stored_bytes_into(
-                encrypted_stream_segment_read_request(segment, encrypted),
+                encrypted_test_stream_segment_read_request(segment, encrypted),
                 &mut readback,
             )
             .unwrap_err();
@@ -6274,7 +6216,7 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
         )
         .unwrap();
 
-    let segment = append_encrypted_multipart_stream_segment(
+    let segment = append_encrypted_test_multipart_stream_segment(
         &cluster,
         &bucket,
         &key,
@@ -6353,7 +6295,7 @@ fn stream_part_finalize_abandons_expired_install_then_retries_transported_conten
         )
         .unwrap();
 
-    let segment = append_encrypted_multipart_stream_segment(
+    let segment = append_encrypted_test_multipart_stream_segment(
         &cluster,
         &bucket,
         &key,
@@ -6518,7 +6460,7 @@ fn multipart_payload_snapshot_does_not_treat_shard_rows_without_files_as_absent(
         )
         .unwrap();
 
-    let segment = append_encrypted_multipart_stream_segment(
+    let segment = append_encrypted_test_multipart_stream_segment(
         &cluster,
         &bucket,
         &key,
@@ -7056,7 +6998,7 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
             &session_id,
         )
         .unwrap();
-    let segment = append_encrypted_multipart_stream_segment(
+    let segment = append_encrypted_test_multipart_stream_segment(
         &cluster,
         &bucket,
         &key,
@@ -7211,7 +7153,7 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
         )
         .unwrap();
     assert_bucket_write_reservations_released(&map, &bucket);
-    let segment = append_encrypted_multipart_stream_segment(
+    let segment = append_encrypted_test_multipart_stream_segment(
         &cluster,
         &bucket,
         &key,
@@ -7372,7 +7314,7 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
             &session_id,
         )
         .unwrap();
-    let segment = append_encrypted_multipart_stream_segment(
+    let segment = append_encrypted_test_multipart_stream_segment(
         &cluster,
         &bucket,
         &key,
@@ -7894,7 +7836,7 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
             &session_id,
         )
         .unwrap();
-    let segment = append_encrypted_multipart_stream_segment(
+    let segment = append_encrypted_test_multipart_stream_segment(
         &cluster,
         &bucket,
         &key,
@@ -8412,7 +8354,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
         )
         .unwrap();
 
-    let segment = append_encrypted_multipart_stream_segment(
+    let segment = append_encrypted_test_multipart_stream_segment(
         &first_cluster,
         &bucket,
         &key,
@@ -8423,7 +8365,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
     let mut staged_readback = Vec::new();
     first_cluster
         .read_segment_payload_stored_bytes_into(
-            encrypted_stream_segment_read_request(&segment, &encrypted),
+            encrypted_test_stream_segment_read_request(&segment, &encrypted),
             &mut staged_readback,
         )
         .unwrap();
@@ -8542,7 +8484,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
     let mut readback = Vec::new();
     let error = first_cluster
         .read_segment_payload_stored_bytes_into(
-            encrypted_stream_segment_read_request(&segment, &encrypted),
+            encrypted_test_stream_segment_read_request(&segment, &encrypted),
             &mut readback,
         )
         .unwrap_err();
@@ -8595,67 +8537,30 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
     // segments. Use two staged segments so terminal MPU cleanup proves it
     // removes every copied segment payload when completion wins the slot.
     let first_payload = b"copied source segment one";
-    let (_target, first_segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: first_payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(first_payload),
-                payload_crc64: checksum::crc64::checksum(first_payload),
-            },
-        )
-        .unwrap();
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&first_segment, first_payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            first_segment.segment_index,
-            &first_segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let first_encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(first_payload, 2, 0);
+    assert_eq!(req.encryption, first_encrypted.encryption);
+    let first_segment = append_encrypted_test_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &first_encrypted,
+    );
     let second_payload = b"copied source segment two";
-    let (_target, second_segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 1,
-                size: second_payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(second_payload),
-                payload_crc64: checksum::crc64::checksum(second_payload),
-            },
-        )
-        .unwrap();
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&second_segment, second_payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            second_segment.segment_index,
-            &second_segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let second_encrypted =
+        crate::tests::sse_s3_multipart_segment_test_fixture(second_payload, 2, 1);
+    assert_eq!(req.encryption, second_encrypted.encryption);
+    let second_segment = append_encrypted_test_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        1,
+        &second_encrypted,
+    );
+    assert_encrypted_test_stream_segment_stored(&cluster, &first_segment, &first_encrypted);
+    assert_encrypted_test_stream_segment_stored(&cluster, &second_segment, &second_encrypted);
 
     let hook_ran = Arc::new(AtomicBool::new(false));
     let action_calls = Arc::new(AtomicUsize::new(0));
@@ -8838,24 +8743,14 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
         ));
     }
 
-    for (segment, payload) in [
-        (&first_segment, first_payload.as_slice()),
-        (&second_segment, second_payload.as_slice()),
+    for (segment, encrypted) in [
+        (&first_segment, &first_encrypted),
+        (&second_segment, &second_encrypted),
     ] {
         let mut readback = Vec::new();
         let error = cluster
             .read_segment_payload_stored_bytes_into(
-                crate::SegmentStoredBytesRequest {
-                    data_pg_id: segment.data_pg_id,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    stored_size: payload.len(),
-                    segment_crc64: checksum::crc64::checksum(payload),
-                    ec: EcShape {
-                        k: segment.ec_k,
-                        m: segment.ec_m,
-                    },
-                },
+                encrypted_test_stream_segment_read_request(segment, encrypted),
                 &mut readback,
             )
             .unwrap_err();
@@ -8911,7 +8806,7 @@ fn upload_part_stream_finalize_replaces_same_part_with_displaced_cleanup() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: sse_s3_multipart_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -8927,27 +8822,29 @@ fn upload_part_stream_finalize_replaces_same_part_with_displaced_cleanup() {
         .unwrap();
 
     let first_payload = b"first streamed multipart part";
-    let (_first_shards, first_part, first_segment) = upload_streamed_test_multipart_part(
-        &cluster,
-        &bucket,
-        &key,
-        &upload_id,
-        1,
-        [0x5b; 16],
-        first_payload,
-    );
+    let (_first_shards, first_part, first_segment, first_encrypted) =
+        upload_streamed_test_multipart_part(
+            &cluster,
+            &bucket,
+            &key,
+            &upload_id,
+            1,
+            [0x5b; 16],
+            first_payload,
+        );
     assert_eq!(first_part.generation, 0);
 
     let second_payload = b"replacement streamed multipart part";
-    let (_second_shards, second_part, second_segment) = upload_streamed_test_multipart_part(
-        &cluster,
-        &bucket,
-        &key,
-        &upload_id,
-        1,
-        [0x5c; 16],
-        second_payload,
-    );
+    let (_second_shards, second_part, second_segment, second_encrypted) =
+        upload_streamed_test_multipart_part(
+            &cluster,
+            &bucket,
+            &key,
+            &upload_id,
+            1,
+            [0x5c; 16],
+            second_payload,
+        );
     assert_eq!(second_part.generation, 1);
 
     for node_id in node_ids {
@@ -8973,8 +8870,8 @@ fn upload_part_stream_finalize_replaces_same_part_with_displaced_cleanup() {
                 data_pg_id: first_segment.data_pg_id,
                 segment_okh: first_segment.segment_okh,
                 segment_vid: first_segment.segment_vid,
-                stored_size: first_payload.len(),
-                segment_crc64: checksum::crc64::checksum(first_payload),
+                stored_size: first_encrypted.storage_bytes.len(),
+                segment_crc64: first_encrypted.storage_crc64,
                 ec: EcShape {
                     k: first_segment.ec_k,
                     m: first_segment.ec_m,
@@ -8995,8 +8892,8 @@ fn upload_part_stream_finalize_replaces_same_part_with_displaced_cleanup() {
                 data_pg_id: second_segment.data_pg_id,
                 segment_okh: second_segment.segment_okh,
                 segment_vid: second_segment.segment_vid,
-                stored_size: second_payload.len(),
-                segment_crc64: checksum::crc64::checksum(second_payload),
+                stored_size: second_encrypted.storage_bytes.len(),
+                segment_crc64: second_encrypted.storage_crc64,
                 ec: EcShape {
                     k: second_segment.ec_k,
                     m: second_segment.ec_m,
@@ -9005,7 +8902,7 @@ fn upload_part_stream_finalize_replaces_same_part_with_displaced_cleanup() {
             &mut second_readback,
         )
         .unwrap();
-    assert_eq!(second_readback, second_payload);
+    assert_eq!(second_readback, second_encrypted.storage_bytes);
 
     assert_clean_metadata_command_stream(&map, &[2]);
 }

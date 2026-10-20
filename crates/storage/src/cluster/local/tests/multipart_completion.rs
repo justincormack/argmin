@@ -1213,7 +1213,7 @@ fn already_recorded_multipart_completion_fanout_cleans_terminal_stream_uploads()
                     upload_id: req.upload_id.clone(),
                     part_number: 2,
                 },
-                encryption: crate::ObjectEncryption::None,
+                encryption: req.encryption.clone(),
             },
         )
         .unwrap();
@@ -1454,7 +1454,7 @@ fn multipart_completion_rejects_stale_selected_part_row() {
     create_test_bucket(&cluster, &bucket);
     let (req, _) = seed_streamed_multipart_completion(&cluster, &bucket, &key, "stalepart");
 
-    let (_replacement_shards, replacement_part, _replacement_segment) =
+    let (_replacement_shards, replacement_part, _replacement_segment, _replacement_encrypted) =
         upload_streamed_test_multipart_part(
             &cluster,
             &bucket,
@@ -2120,7 +2120,7 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: sse_s3_multipart_test_encryption(),
     };
     cluster
         .create_multipart_upload(
@@ -2148,36 +2148,16 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
         .unwrap();
 
     let payload = b"streamed multipart command part";
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
-            },
-        )
-        .unwrap();
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let segment = append_encrypted_test_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &encrypted,
+    );
+    assert_encrypted_test_stream_segment_stored(&cluster, &segment, &encrypted);
 
     let payload_crc64 = checksum::crc64::checksum(payload);
     let expected_part = crate::MultipartPartRecord {
@@ -5181,24 +5161,16 @@ fn multipart_completion_drains_other_upload_same_key_and_resnapshots_stale_paylo
             "only the non-injected completion should allocate a barrier on node {node_id:?}"
         );
     }
+    let first_encrypted =
+        crate::tests::sse_s3_multipart_segment_test_fixture(b"streamed completion", 1, 0);
     let mut first_readback = Vec::new();
     cluster
         .read_segment_payload_stored_bytes_into(
-            crate::SegmentStoredBytesRequest {
-                data_pg_id: first_segment.data_pg_id,
-                segment_okh: first_segment.segment_okh,
-                segment_vid: first_segment.segment_vid,
-                stored_size: first_segment.size as usize,
-                segment_crc64: first_segment.segment_crc64,
-                ec: EcShape {
-                    k: first_segment.ec_k,
-                    m: first_segment.ec_m,
-                },
-            },
+            encrypted_test_multipart_part_segment_read_request(&first_segment, &first_encrypted),
             &mut first_readback,
         )
         .unwrap();
-    assert_eq!(first_readback, b"streamed completion");
+    assert_eq!(first_readback, first_encrypted.storage_bytes);
     assert_terminal_multipart_upload_invariants(
         &map,
         &node_ids,
