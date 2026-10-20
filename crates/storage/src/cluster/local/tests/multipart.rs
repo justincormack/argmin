@@ -1297,16 +1297,16 @@ fn multipart_create_terminal_install_conflict_reinspects_before_draining_newer_c
     let winner_generation_id = second_cluster
         .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
         .unwrap();
-    let winner_written = second_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            winner_generation_id,
-            0,
-            &[0x96; 16],
-            winner_payload,
-        )
-        .unwrap();
+    let winner_written = write_encrypted_direct_put_segment_payload_shards(
+        &second_cluster,
+        &bucket,
+        &key,
+        winner_generation_id,
+        0,
+        &[0x96; 16],
+        winner_payload,
+    )
+    .unwrap();
     let winner_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {
@@ -1496,16 +1496,16 @@ fn multipart_create_command_id_race_drains_winner_and_reruns_authorization_actio
     let winner_generation_id = second_cluster
         .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
         .unwrap();
-    let winner_written = second_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            winner_generation_id,
-            0,
-            &[0x97; 16],
-            winner_payload,
-        )
-        .unwrap();
+    let winner_written = write_encrypted_direct_put_segment_payload_shards(
+        &second_cluster,
+        &bucket,
+        &key,
+        winner_generation_id,
+        0,
+        &[0x97; 16],
+        winner_payload,
+    )
+    .unwrap();
     let winner_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {

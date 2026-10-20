@@ -376,16 +376,16 @@ fn cluster_shard_scavenger_marks_slow_writer_candidate_and_resolves_after_publis
         .unwrap();
     let payload = b"slow writer shard scavenger candidate";
     let segment_okh = [0xd4; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written
         .written_shards
         .iter()
@@ -523,16 +523,16 @@ fn cluster_shard_scavenger_treats_pending_direct_put_as_referenced() {
         .unwrap();
     let payload = b"pending direct put shard scavenger reference";
     let segment_okh = [0xd6; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written
         .written_shards
         .iter()
@@ -708,16 +708,16 @@ fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
         .unwrap();
     let payload = b"wrong-node shard scavenger candidate";
     let segment_okh = [0xd5; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -802,8 +802,8 @@ fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
             data_pg_id: written.data_pg_id,
             segment_okh,
             segment_vid: generation_id,
-            stored_size: payload.len(),
-            segment_crc64: checksum::crc64::checksum(payload),
+            stored_size: written.encrypted.storage_bytes.len(),
+            segment_crc64: written.encrypted.storage_crc64,
             ec: written.ec,
         },
         shard_index: misplaced_shard.shard_index(),

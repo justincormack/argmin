@@ -1061,16 +1061,16 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                     .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
                 let payload = format!("trace-stale-direct-put-cleanup-{step}-{seed}");
                 let segment_okh = [seed.wrapping_add(step as u8).wrapping_add(79); 16];
-                let staged_written = source_cluster
-                    .write_direct_put_segment_payload_shards(
-                        &bucket,
-                        &key,
-                        generation_id,
-                        0,
-                        &segment_okh,
-                        payload.as_bytes(),
-                    )
-                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                let staged_written = write_encrypted_direct_put_segment_payload_shards(
+                    &source_cluster,
+                    &bucket,
+                    &key,
+                    generation_id,
+                    0,
+                    &segment_okh,
+                    payload.as_bytes(),
+                )
+                .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
                 source_cluster
                     .test_register_payload_shard_acks(
                         staged_written.data_pg_id,

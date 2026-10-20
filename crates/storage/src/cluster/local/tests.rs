@@ -993,7 +993,46 @@ struct DirectPutCommitReqFixture<'a> {
     generation_id: crate::GenerationId,
     payload: &'a [u8],
     segment_okh: [u8; 16],
-    written: &'a crate::DirectPutWrittenSegment,
+    written: &'a EncryptedDirectPutWrittenSegment,
+}
+
+struct EncryptedDirectPutWrittenSegment {
+    plaintext_crc64: u64,
+    encrypted: crate::tests::SseS3SegmentTestFixture,
+    written: crate::DirectPutWrittenSegment,
+}
+
+impl std::ops::Deref for EncryptedDirectPutWrittenSegment {
+    type Target = crate::DirectPutWrittenSegment;
+
+    fn deref(&self) -> &Self::Target {
+        &self.written
+    }
+}
+
+fn write_encrypted_direct_put_segment_payload_shards(
+    cluster: &crate::StorageCluster,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    generation_id: crate::GenerationId,
+    segment_index: u32,
+    segment_okh: &[u8; 16],
+    plaintext: &[u8],
+) -> Result<EncryptedDirectPutWrittenSegment, crate::StoreError> {
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(plaintext, segment_index);
+    let written = cluster.write_direct_put_segment_payload_shards(
+        bucket,
+        key,
+        generation_id,
+        segment_index,
+        segment_okh,
+        &encrypted.storage_bytes,
+    )?;
+    Ok(EncryptedDirectPutWrittenSegment {
+        plaintext_crc64: checksum::crc64::checksum(plaintext),
+        encrypted,
+        written,
+    })
 }
 
 fn direct_put_commit_req(
@@ -1013,6 +1052,14 @@ fn direct_put_commit_req_with_bucket_write_proof(
     fixture: DirectPutCommitReqFixture<'_>,
     bucket_write_reservation: crate::metadata_command::BucketWriteReservationProof,
 ) -> crate::CommitDirectPutObjectReq {
+    assert_eq!(
+        fixture.payload.len() as u64,
+        fixture.written.encrypted.logical_size
+    );
+    assert_eq!(
+        checksum::crc64::checksum(fixture.payload),
+        fixture.written.plaintext_crc64
+    );
     crate::CommitDirectPutObjectReq {
         bucket: fixture.bucket.clone(),
         key: fixture.key.clone(),
@@ -1022,16 +1069,16 @@ fn direct_put_commit_req_with_bucket_write_proof(
         acl_grants: crate::AclGrants::default(),
         public_read: false,
         generation_id: fixture.generation_id,
-        size: fixture.payload.len() as u64,
-        etag_crc64: checksum::crc64::checksum(fixture.payload),
+        size: fixture.written.encrypted.logical_size,
+        etag_crc64: fixture.written.plaintext_crc64,
         ec: fixture.written.ec,
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
+        encryption: fixture.written.encrypted.encryption.clone(),
         segment_index: 0,
-        segment_crc64: checksum::crc64::checksum(fixture.payload),
+        segment_crc64: fixture.written.encrypted.storage_crc64,
         segment_okh: fixture.segment_okh,
         segment_vid: fixture.generation_id,
         data_pg_id: fixture.written.data_pg_id,

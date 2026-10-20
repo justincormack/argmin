@@ -949,16 +949,16 @@ fn direct_put_terminal_install_conflict_reinspects_before_draining_newer_command
     let loser_generation_id = first_cluster
         .reserve_put_object_generation(&bucket, &key, &loser_reservation_id)
         .unwrap();
-    let loser_written = first_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            loser_generation_id,
-            0,
-            &[0x91; 16],
-            loser_payload,
-        )
-        .unwrap();
+    let loser_written = write_encrypted_direct_put_segment_payload_shards(
+        &first_cluster,
+        &bucket,
+        &key,
+        loser_generation_id,
+        0,
+        &[0x91; 16],
+        loser_payload,
+    )
+    .unwrap();
     let loser_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {
@@ -978,16 +978,16 @@ fn direct_put_terminal_install_conflict_reinspects_before_draining_newer_command
     let winner_generation_id = second_cluster
         .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
         .unwrap();
-    let winner_written = second_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            winner_generation_id,
-            0,
-            &[0x92; 16],
-            winner_payload,
-        )
-        .unwrap();
+    let winner_written = write_encrypted_direct_put_segment_payload_shards(
+        &second_cluster,
+        &bucket,
+        &key,
+        winner_generation_id,
+        0,
+        &[0x92; 16],
+        winner_payload,
+    )
+    .unwrap();
     let winner_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {
@@ -1198,16 +1198,16 @@ fn direct_put_transferred_contender_exits_without_retrying_drain() {
         .reserve_put_object_generation(&bucket, &key, &reservation_id)
         .unwrap();
     let segment_okh = [0x93; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            b"uninstalled direct PUT candidate",
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        b"uninstalled direct PUT candidate",
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -1687,16 +1687,16 @@ fn direct_put_pending_install_race_keeps_bucket_write_proof_for_retry() {
     let loser_generation_id = first_cluster
         .reserve_put_object_generation(&bucket, &loser_key, &loser_reservation_id)
         .unwrap();
-    let loser_written = first_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &loser_key,
-            loser_generation_id,
-            0,
-            &[0xb1; 16],
-            loser_payload,
-        )
-        .unwrap();
+    let loser_written = write_encrypted_direct_put_segment_payload_shards(
+        &first_cluster,
+        &bucket,
+        &loser_key,
+        loser_generation_id,
+        0,
+        &[0xb1; 16],
+        loser_payload,
+    )
+    .unwrap();
     let command_reservation = first_cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
@@ -1723,16 +1723,16 @@ fn direct_put_pending_install_race_keeps_bucket_write_proof_for_retry() {
     let winner_generation_id = second_cluster
         .reserve_put_object_generation(&bucket, &winner_key, &winner_reservation_id)
         .unwrap();
-    let winner_written = second_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &winner_key,
-            winner_generation_id,
-            0,
-            &[0xb2; 16],
-            winner_payload,
-        )
-        .unwrap();
+    let winner_written = write_encrypted_direct_put_segment_payload_shards(
+        &second_cluster,
+        &bucket,
+        &winner_key,
+        winner_generation_id,
+        0,
+        &[0xb2; 16],
+        winner_payload,
+    )
+    .unwrap();
     let winner_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {
@@ -1860,16 +1860,16 @@ fn direct_put_committed_response_loss_retry_returns_existing_commit() {
         .unwrap();
     let payload = b"direct put committed response loss retry";
     let segment_okh = [0xb3; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -2545,16 +2545,16 @@ fn direct_put_overwrite_committed_response_loss_retry_preserves_reclaim_generati
         .unwrap();
     let first_payload = b"original direct put object";
     let first_segment_okh = [0xc4; 16];
-    let first_written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            first_generation_id,
-            0,
-            &first_segment_okh,
-            first_payload,
-        )
-        .unwrap();
+    let first_written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        first_generation_id,
+        0,
+        &first_segment_okh,
+        first_payload,
+    )
+    .unwrap();
     let first_commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -2584,16 +2584,16 @@ fn direct_put_overwrite_committed_response_loss_retry_preserves_reclaim_generati
         .unwrap();
     let overwrite_payload = b"replacement direct put object after response loss";
     let overwrite_segment_okh = [0xc5; 16];
-    let overwrite_written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            overwrite_generation_id,
-            0,
-            &overwrite_segment_okh,
-            overwrite_payload,
-        )
-        .unwrap();
+    let overwrite_written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        overwrite_generation_id,
+        0,
+        &overwrite_segment_okh,
+        overwrite_payload,
+    )
+    .unwrap();
     let overwrite_commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -2698,16 +2698,16 @@ fn copy_object_destination_committed_response_loss_retry_returns_existing_commit
         .reserve_put_object_generation(&bucket, &dst_key, &reservation_id)
         .unwrap();
     let dst_segment_okh = [0xcc; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &dst_key,
-            generation_id,
-            0,
-            &dst_segment_okh,
-            &source_segment.payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &dst_key,
+        generation_id,
+        0,
+        &dst_segment_okh,
+        &source_segment.payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -2832,16 +2832,16 @@ fn stale_direct_put_reservation_cannot_resurrect_deleted_null_version() {
     let stale_generation_id = cluster
         .reserve_put_object_generation(&bucket, &key, &stale_reservation_id)
         .unwrap();
-    let stale_written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            stale_generation_id,
-            0,
-            &[0xa1; 16],
-            stale_payload,
-        )
-        .unwrap();
+    let stale_written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        stale_generation_id,
+        0,
+        &[0xa1; 16],
+        stale_payload,
+    )
+    .unwrap();
     let stale_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -2878,16 +2878,16 @@ fn stale_direct_put_reservation_cannot_resurrect_deleted_null_version() {
         let generation_id = cluster
             .reserve_put_object_generation(&bucket, &key, &reservation_id)
             .unwrap();
-        let written = cluster
-            .write_direct_put_segment_payload_shards(
-                &bucket,
-                &key,
-                generation_id,
-                0,
-                &[segment_byte; 16],
-                payload,
-            )
-            .unwrap();
+        let written = write_encrypted_direct_put_segment_payload_shards(
+            &cluster,
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &[segment_byte; 16],
+            payload,
+        )
+        .unwrap();
         let req = direct_put_commit_req(
             &cluster,
             DirectPutCommitReqFixture {
@@ -2987,16 +2987,16 @@ fn direct_put_pre_command_route_error_releases_bucket_write_proof() {
         .unwrap();
     let payload = b"direct put route failure";
     let segment_okh = [0xb3; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let command_reservation = cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
@@ -3088,16 +3088,16 @@ fn non_current_epoch_direct_put_commit_fails_closed_and_cleans_unowned_state() {
         .unwrap();
     let payload = b"stale epoch direct put";
     let segment_okh = [0xb4; 16];
-    let written = current_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &current_cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let bucket_write_reservation = current_cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
@@ -3267,16 +3267,16 @@ fn control_plane_peering_direct_put_old_primary_fails_closed_and_cleans_unowned_
         .unwrap();
     let payload = b"control-plane peering stale direct put";
     let segment_okh = [0xc7; 16];
-    let written = source_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &source_cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     source_cluster
         .test_register_payload_shard_acks(written.data_pg_id, &written.written_shards)
         .unwrap();
@@ -3597,16 +3597,16 @@ fn control_plane_peering_copy_object_destination_old_primary_fails_closed_and_cl
         .test_object_pg_metadata_proof(&bucket, &dst_key)
         .unwrap();
     let dst_segment_okh = [0xca; 16];
-    let written = source_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &dst_key,
-            generation_id,
-            0,
-            &dst_segment_okh,
-            &source_segment.payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &source_cluster,
+        &bucket,
+        &dst_key,
+        generation_id,
+        0,
+        &dst_segment_okh,
+        &source_segment.payload,
+    )
+    .unwrap();
     source_cluster
         .test_register_payload_shard_acks(written.data_pg_id, &written.written_shards)
         .unwrap();
@@ -3857,16 +3857,16 @@ fn direct_put_publish_validation_fails_closed_when_acknowledged_shard_file_is_mi
         .unwrap();
     let payload = b"direct put publish validation";
     let segment_okh = [0xd1; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let data_pg_id = DataPgId::new_for_test(PgId::new(written.data_pg_id));
     let placement_key =
         super::super::super::segment_payload_placement_key(&segment_okh, generation_id);
@@ -3962,16 +3962,16 @@ fn direct_put_publish_validation_rejects_truncated_shard_batch() {
         .unwrap();
     let payload = b"direct put truncated shard batch";
     let segment_okh = [0xd3; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let truncated = written.written_shards[..written.written_shards.len() - 1].to_vec();
     let commit_req = direct_put_commit_req(
         &cluster,
@@ -4036,16 +4036,16 @@ fn direct_put_retries_transient_precommand_observation_within_shared_budget() {
         .unwrap();
     let payload = b"direct put transient observation retry";
     let segment_okh = [0xd7; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -4120,16 +4120,16 @@ fn direct_put_does_not_evaluate_condition_after_local_snapshot_crosses_deadline(
         .unwrap();
     let payload = b"direct put local snapshot deadline";
     let segment_okh = [0xd8; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let mut commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -4230,16 +4230,16 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
     let loser_generation_id = first_cluster
         .reserve_put_object_generation(&bucket, &key, &loser_reservation_id)
         .unwrap();
-    let loser_written = first_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            loser_generation_id,
-            0,
-            &[0xa1; 16],
-            loser_payload,
-        )
-        .unwrap();
+    let loser_written = write_encrypted_direct_put_segment_payload_shards(
+        &first_cluster,
+        &bucket,
+        &key,
+        loser_generation_id,
+        0,
+        &[0xa1; 16],
+        loser_payload,
+    )
+    .unwrap();
     let loser_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {
@@ -4259,16 +4259,16 @@ fn assert_direct_put_command_id_race_drains_winner_and_reruns_precondition_actio
     let winner_generation_id = second_cluster
         .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
         .unwrap();
-    let winner_written = second_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            winner_generation_id,
-            0,
-            &[0xa2; 16],
-            winner_payload,
-        )
-        .unwrap();
+    let winner_written = write_encrypted_direct_put_segment_payload_shards(
+        &second_cluster,
+        &bucket,
+        &key,
+        winner_generation_id,
+        0,
+        &[0xa2; 16],
+        winner_payload,
+    )
+    .unwrap();
     let winner_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {
@@ -4736,16 +4736,16 @@ fn assert_direct_put_late_log_conflict_recovery_handoff(handoff: DirectPutLateCo
         .reserve_put_object_generation(&bucket, &key, &loser_reservation_id)
         .unwrap();
     let loser_segment_okh = [0xd1; 16];
-    let loser_written = first_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            loser_generation_id,
-            0,
-            &loser_segment_okh,
-            loser_payload,
-        )
-        .unwrap();
+    let loser_written = write_encrypted_direct_put_segment_payload_shards(
+        &first_cluster,
+        &bucket,
+        &key,
+        loser_generation_id,
+        0,
+        &loser_segment_okh,
+        loser_payload,
+    )
+    .unwrap();
     let loser_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {
@@ -4765,16 +4765,16 @@ fn assert_direct_put_late_log_conflict_recovery_handoff(handoff: DirectPutLateCo
         .reserve_put_object_generation(&bucket, &key, &winner_reservation_id)
         .unwrap();
     let winner_segment_okh = [0xd2; 16];
-    let winner_written = second_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            winner_generation_id,
-            0,
-            &winner_segment_okh,
-            winner_payload,
-        )
-        .unwrap();
+    let winner_written = write_encrypted_direct_put_segment_payload_shards(
+        &second_cluster,
+        &bucket,
+        &key,
+        winner_generation_id,
+        0,
+        &winner_segment_okh,
+        winner_payload,
+    )
+    .unwrap();
     let winner_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {
@@ -5064,16 +5064,16 @@ fn direct_put_retries_irreversible_uncertainty_on_the_active_route() {
         .unwrap();
     let payload = b"direct PUT same-route recovery";
     let segment_okh = [0x6d; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -5177,16 +5177,16 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_waits_for_unrela
         .unwrap();
     let payload = b"direct PUT terminal cleanup handoff";
     let segment_okh = [0x4f; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -5206,16 +5206,16 @@ fn direct_put_terminal_cleanup_handoff_projects_same_object_and_waits_for_unrela
         .unwrap();
     let contender_payload = b"same-object direct PUT contender";
     let contender_segment_okh = [0x50; 16];
-    let contender_written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            contender_generation_id,
-            0,
-            &contender_segment_okh,
-            contender_payload,
-        )
-        .unwrap();
+    let contender_written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        contender_generation_id,
+        0,
+        &contender_segment_okh,
+        contender_payload,
+    )
+    .unwrap();
     let contender_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -5504,16 +5504,16 @@ fn object_tagging_waits_for_direct_put_terminal_cleanup_authorized_recovery() {
         .unwrap();
     let payload = b"tag object after direct PUT terminal cleanup handoff";
     let segment_okh = [0x53; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -5702,16 +5702,16 @@ fn direct_put_irreversible_handoff_wakes_static_authorized_recovery() {
         .unwrap();
     let payload = b"direct PUT route transition";
     let segment_okh = [0x9d; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -5836,16 +5836,16 @@ fn direct_put_log_conflict_pending_visibility_error_cleans_new_payload() {
         .unwrap();
     let payload = b"direct put pending visibility error";
     let segment_okh = [0xc6; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -5936,16 +5936,16 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
     let loser_generation_id = first_cluster
         .reserve_put_object_generation(&bucket, &key, &loser_reservation_id)
         .unwrap();
-    let loser_written = first_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            loser_generation_id,
-            0,
-            &[0xb1; 16],
-            loser_payload,
-        )
-        .unwrap();
+    let loser_written = write_encrypted_direct_put_segment_payload_shards(
+        &first_cluster,
+        &bucket,
+        &key,
+        loser_generation_id,
+        0,
+        &[0xb1; 16],
+        loser_payload,
+    )
+    .unwrap();
     let loser_req = direct_put_commit_req(
         &first_cluster,
         DirectPutCommitReqFixture {
@@ -6067,16 +6067,16 @@ fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
     let loser_generation_id = cluster
         .reserve_put_object_generation(&bucket, &key, &loser_reservation_id)
         .unwrap();
-    let loser_written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            loser_generation_id,
-            0,
-            &[0xc1; 16],
-            loser_payload,
-        )
-        .unwrap();
+    let loser_written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        loser_generation_id,
+        0,
+        &[0xc1; 16],
+        loser_payload,
+    )
+    .unwrap();
     let loser_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -6096,16 +6096,16 @@ fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
     let contender_generation_id = cluster
         .reserve_put_object_generation(&bucket, &key, &contender_reservation_id)
         .unwrap();
-    let contender_written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            contender_generation_id,
-            0,
-            &[0xc2; 16],
-            contender_payload,
-        )
-        .unwrap();
+    let contender_written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        contender_generation_id,
+        0,
+        &[0xc2; 16],
+        contender_payload,
+    )
+    .unwrap();
     let contender_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {

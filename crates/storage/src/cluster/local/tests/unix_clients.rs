@@ -5833,16 +5833,16 @@ fn authenticated_unix_direct_put_does_not_allocate_version_after_action_crosses_
         .unwrap();
     let payload = b"authenticated direct put action deadline";
     let segment_okh = [0xd9; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let mut commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -6031,16 +6031,16 @@ fn authenticated_unix_direct_put_recovers_across_delayed_route_transition_certif
         .unwrap();
     let payload = b"authenticated route transition direct put";
     let segment_okh = [0xda; 16];
-    let written = cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &cluster,
         DirectPutCommitReqFixture {
@@ -6256,16 +6256,16 @@ fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state
         .unwrap();
     let payload = b"stale epoch remote direct put";
     let segment_okh = [0xc4; 16];
-    let written = current_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &current_cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     let commit_req = direct_put_commit_req(
         &current_cluster,
         DirectPutCommitReqFixture {
@@ -6462,16 +6462,16 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
         .unwrap();
     let payload = b"control-plane peering stale unix direct put";
     let segment_okh = [0xc8; 16];
-    let written = source_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &segment_okh,
-            payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &source_cluster,
+        &bucket,
+        &key,
+        generation_id,
+        0,
+        &segment_okh,
+        payload,
+    )
+    .unwrap();
     source_cluster
         .test_register_payload_shard_acks(written.data_pg_id, &written.written_shards)
         .unwrap();
@@ -6868,16 +6868,16 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
         .test_object_pg_metadata_proof(&bucket, &dst_key)
         .unwrap();
     let dst_segment_okh = [0xcc; 16];
-    let written = source_cluster
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &dst_key,
-            generation_id,
-            0,
-            &dst_segment_okh,
-            &source_segment.payload,
-        )
-        .unwrap();
+    let written = write_encrypted_direct_put_segment_payload_shards(
+        &source_cluster,
+        &bucket,
+        &dst_key,
+        generation_id,
+        0,
+        &dst_segment_okh,
+        &source_segment.payload,
+    )
+    .unwrap();
     source_cluster
         .test_register_payload_shard_acks(written.data_pg_id, &written.written_shards)
         .unwrap();

@@ -1,9 +1,9 @@
 # Remove The Unreachable Plaintext Payload Profile Plan
 
-Status: in progress. Phases 0 and 1 are complete. Production write selection and active write
-authority are encrypted-only, including terminal publication and provider-failure behavior. Phase
-2's positive test-corpus migration is in progress. The design decision to remove the plaintext
-payload state is accepted.
+Status: in progress. Phases 0, 1, and 2 are complete. Production write selection and active write
+authority are encrypted-only, including terminal publication and provider-failure behavior. The
+positive test corpus no longer constructs plaintext payload state; Phase 3's atomic durable-format
+closure is next. The design decision to remove the plaintext payload state is accepted.
 
 ## Context
 
@@ -591,9 +591,16 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   generation captured with the segment list. Historical backfill/scavenger reference fixtures now
   persist the logical size and exact SSE-S3 state corresponding to their ciphertext; secondary
   scan candidates also write ciphertext and record its stored length and checksum.
-- The remaining 25 source occurrences are deliberately left for the direct-PUT recovery helper,
-  residual owner-local fixtures, command-codec fixture migrations, Phase 3's production removal,
-  and immutable rejection evidence. Phase 2 is not yet complete.
+- The final shared direct-PUT recovery slice removes the last positive fixture construction. One
+  opaque encrypted staged result now owns the production-compatible SSE-S3 ciphertext, logical
+  checksum, stored checksum, encryption state, and shard acknowledgements used by recovery,
+  contention, Unix, multipart-competitor, and scavenger schedules. Command construction derives
+  its durable fields from that result and rejects a crossed logical payload before publication, so
+  tests cannot pair plaintext shards with encrypted metadata through the shared helper.
+- The remaining 24 source occurrences are production definitions and branches removed atomically
+  in Phase 3, plus immutable owner-local codec/golden evidence retained to prove rejection after
+  the containing formats advance. No positive production, integration, property, or model fixture
+  constructs `ObjectEncryption::None`; Phase 2 is complete.
 
 ### Phase 3: Atomically close durable and recovery state
 
