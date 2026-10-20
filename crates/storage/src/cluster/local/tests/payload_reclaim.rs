@@ -189,16 +189,17 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("03".repeat(16)).unwrap();
+    let payload = b"stream append payload with routed data acks";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     cluster
         .create_put_object_stream_session_record(
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            encrypted.encryption.clone(),
         )
         .unwrap();
 
-    let payload = b"stream append payload with routed data acks";
     let (_, segment_record) = cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -206,16 +207,16 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
                 segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
+                payload_crc64: encrypted.payload_crc64,
             },
         )
         .unwrap();
     assert_eq!(segment_record.data_pg_id, data_pg);
 
     let written = cluster
-        .write_stream_segment_payload_shards(&segment_record, payload)
+        .write_stream_segment_payload_shards(&segment_record, &encrypted.storage_bytes)
         .unwrap();
     let shard_batch: Vec<(&ShardKey, crate::WriteAck)> = written
         .iter()
@@ -248,8 +249,8 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
                 data_pg_id: data_pg,
                 segment_okh: segment_record.segment_okh,
                 segment_vid: segment_record.segment_vid,
-                stored_size: payload.len(),
-                segment_crc64: checksum::crc64::checksum(payload),
+                stored_size: encrypted.storage_bytes.len(),
+                segment_crc64: encrypted.storage_crc64,
                 ec: EcShape {
                     k: segment_record.ec_k,
                     m: segment_record.ec_m,
@@ -258,7 +259,7 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
             &mut readback,
         )
         .unwrap();
-    assert_eq!(readback, payload);
+    assert_eq!(readback, encrypted.storage_bytes);
 }
 
 #[test]

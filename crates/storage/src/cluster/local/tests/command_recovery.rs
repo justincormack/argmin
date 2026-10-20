@@ -5530,15 +5530,16 @@ fn stale_duplicate_stream_append_index_is_reissued_before_apply() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("65".repeat(16)).unwrap();
+    let payload = b"stream append duplicate index reissue";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     cluster
         .create_put_object_stream_session_record(
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            encrypted.encryption.clone(),
         )
         .unwrap();
-    let payload = b"stream append duplicate index reissue";
     let (target, segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -5546,14 +5547,14 @@ fn stale_duplicate_stream_append_index_is_reissued_before_apply() {
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
                 segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
+                payload_crc64: encrypted.payload_crc64,
             },
         )
         .unwrap();
     let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
     let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
         .iter()
@@ -5597,6 +5598,8 @@ fn stale_duplicate_stream_append_index_is_reissued_before_apply() {
             &mut work_budget,
         )
         .unwrap();
+
+    assert_encrypted_test_stream_segment_stored(&cluster, &segment, &encrypted);
 
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     for node_id in node_ids {

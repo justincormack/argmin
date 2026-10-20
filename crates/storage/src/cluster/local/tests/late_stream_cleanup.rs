@@ -62,24 +62,28 @@ fn assert_abort_fences_delayed_stream_write(target: Target, pause_after: PauseAf
     let cluster = StorageCluster::from_static_local_map(map).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("a4".repeat(16)).unwrap();
-    let expected_target = match target {
+    let payload = b"delayed stream payload";
+    let (expected_target, encrypted) = match target {
         Target::PutObject => {
+            let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
             cluster
                 .create_put_object_stream_session_record(
                     &bucket,
                     &key,
                     &session_id,
-                    crate::ObjectEncryption::None,
+                    encrypted.encryption.clone(),
                 )
                 .unwrap();
-            crate::StreamUploadTarget::PutObject
+            (crate::StreamUploadTarget::PutObject, encrypted)
         }
         Target::UploadPart => {
+            let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 2, 0);
             let (completion, _) =
                 seed_streamed_multipart_completion(&cluster, &bucket, &key, "latestreamcleanup");
             let upload = cluster
                 .load_in_progress_multipart_upload(&bucket, &key, &completion.upload_id)
                 .unwrap();
+            assert_eq!(upload.encryption, encrypted.encryption);
             cluster
                 .create_upload_part_stream_session(
                     &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -87,15 +91,17 @@ fn assert_abort_fences_delayed_stream_write(target: Target, pause_after: PauseAf
                     &session_id,
                 )
                 .unwrap();
-            crate::StreamUploadTarget::UploadPart {
-                upload_id: completion.upload_id,
-                part_number: 2,
-            }
+            (
+                crate::StreamUploadTarget::UploadPart {
+                    upload_id: completion.upload_id,
+                    part_number: 2,
+                },
+                encrypted,
+            )
         }
     };
     let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
-    let payload = b"delayed stream payload";
     let (actual_target, segment) = cluster
         .prepare_stream_segment_append_with_route_validation(
             crate::cluster::PutObjectMutationEffectRoute {
@@ -108,9 +114,9 @@ fn assert_abort_fences_delayed_stream_write(target: Target, pause_after: PauseAf
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
                 segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
+                payload_crc64: encrypted.payload_crc64,
             },
             || admission.require_valid_now_raw(),
         )
@@ -125,7 +131,7 @@ fn assert_abort_fences_delayed_stream_write(target: Target, pause_after: PauseAf
     let write = || {
         cluster.write_stream_segment_payload_shards_with_route_validation::<StoreError>(
             &segment,
-            payload,
+            &encrypted.storage_bytes,
             admission.effect_fence(),
             || admission.require_valid_now_raw(),
             &mut || Ok(()),
@@ -140,6 +146,7 @@ fn assert_abort_fences_delayed_stream_write(target: Target, pause_after: PauseAf
         cluster
             .commit_stream_segment_append(&bucket, &key, &session_id, 0, &segment, &batch)
             .unwrap();
+        assert_encrypted_test_stream_segment_stored(&cluster, &segment, &encrypted);
         assert_eq!(
             shard_state(&cluster, &segment),
             vec![(true, true); absent.len()],

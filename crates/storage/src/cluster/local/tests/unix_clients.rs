@@ -8849,6 +8849,8 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
         crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let upload_id = upload_id_from_label("unixpeerfin");
+    let payload = b"peering unix streamed upload part finalize";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
     let create = crate::CreateMultipartUploadReq {
         upload_id: upload_id.clone(),
         bucket: bucket.clone(),
@@ -8862,7 +8864,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: encrypted.encryption.clone(),
     };
     source_cluster
         .create_multipart_upload(
@@ -8887,8 +8889,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             &session_id,
         )
         .unwrap();
-    let payload = b"peering unix streamed upload part finalize";
-    let payload_crc64 = checksum::crc64::checksum(payload);
+    let payload_crc64 = encrypted.payload_crc64;
     let (_target, segment) = source_cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -8896,14 +8897,14 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
                 segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
                 payload_crc64,
             },
         )
         .unwrap();
     let written = source_cluster
-        .write_stream_segment_payload_shards(&segment, payload)
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
     let placement_key = super::super::super::segment_payload_placement_key(
         &segment.segment_okh,
@@ -8933,6 +8934,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             &shard_batch,
         )
         .unwrap();
+    assert_encrypted_test_stream_segment_stored(&source_cluster, &segment, &encrypted);
     let source_data_pg_primary = source_routes
         .iter()
         .find(|route| route.pg_id() == PgId::new(segment.data_pg_id))
@@ -9322,16 +9324,17 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
         crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let session_id = crate::tests::stream_session_id("unixpeerputfin");
+    let payload = b"peering unix streamed put object finalize";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     source_cluster
         .create_put_object_stream_session_record(
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            encrypted.encryption.clone(),
         )
         .unwrap();
-    let payload = b"peering unix streamed put object finalize";
-    let payload_crc64 = checksum::crc64::checksum(payload);
+    let payload_crc64 = encrypted.payload_crc64;
     let (_target, segment) = source_cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -9339,14 +9342,14 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
                 segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
                 payload_crc64,
             },
         )
         .unwrap();
     let written = source_cluster
-        .write_stream_segment_payload_shards(&segment, payload)
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
     let placement_key = super::super::super::segment_payload_placement_key(
         &segment.segment_okh,
@@ -9376,6 +9379,7 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             &shard_batch,
         )
         .unwrap();
+    assert_encrypted_test_stream_segment_stored(&source_cluster, &segment, &encrypted);
     let source_data_pg_primary = source_routes
         .iter()
         .find(|route| route.pg_id() == PgId::new(segment.data_pg_id))
@@ -9764,6 +9768,10 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
         crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let upload_id = upload_id_from_label("unixpeercopyfin");
+    let payloads = [
+        b"peering unix copied source segment one".as_slice(),
+        b"peering unix copied source segment two".as_slice(),
+    ];
     let create = crate::CreateMultipartUploadReq {
         upload_id: upload_id.clone(),
         bucket: bucket.clone(),
@@ -9777,7 +9785,8 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::sse_s3_multipart_segment_test_fixture(payloads[0], 2, 0)
+            .encryption,
     };
     source_cluster
         .create_multipart_upload(
@@ -9804,14 +9813,10 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
         .unwrap();
 
     let mut staged = Vec::new();
-    for (segment_index, payload) in [
-        b"peering unix copied source segment one".as_slice(),
-        b"peering unix copied source segment two".as_slice(),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let payload_crc64 = checksum::crc64::checksum(payload);
+    for (segment_index, payload) in payloads.into_iter().enumerate() {
+        let encrypted =
+            crate::tests::sse_s3_multipart_segment_test_fixture(payload, 2, segment_index as u32);
+        let payload_crc64 = encrypted.payload_crc64;
         let (_target, segment) = source_cluster
             .prepare_stream_segment_append(
                 &bucket,
@@ -9819,14 +9824,14 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
                 &crate::PrepareStreamUploadSegmentAppendReq {
                     session_id: session_id.clone(),
                     segment_index: segment_index as u32,
-                    size: payload.len() as u64,
-                    segment_crc64: payload_crc64,
+                    size: encrypted.logical_size,
+                    segment_crc64: encrypted.storage_crc64,
                     payload_crc64,
                 },
             )
             .unwrap();
         let written = source_cluster
-            .write_stream_segment_payload_shards(&segment, payload)
+            .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
             .unwrap();
         let placement_key = super::super::super::segment_payload_placement_key(
             &segment.segment_okh,
@@ -9856,6 +9861,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
                 &shard_batch,
             )
             .unwrap();
+        assert_encrypted_test_stream_segment_stored(&source_cluster, &segment, &encrypted);
         let source_data_pg_primary = source_routes
             .iter()
             .find(|route| route.pg_id() == PgId::new(segment.data_pg_id))
@@ -10240,19 +10246,20 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
     let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
     let session_id = crate::tests::stream_session_id("unixstaleappend");
+    let payload = b"stale unix stream append";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     current_cluster
         .create_put_object_stream_session_record(
             &bucket,
             &key,
             &session_id,
-            crate::ObjectEncryption::None,
+            encrypted.encryption.clone(),
         )
         .unwrap();
     let before_object_pg_proof = current_cluster
         .test_object_pg_metadata_proof(&bucket, &key)
         .unwrap();
-    let payload = b"stale unix stream append";
-    let payload_crc64 = checksum::crc64::checksum(payload);
+    let payload_crc64 = encrypted.payload_crc64;
     let (_target, segment) = current_cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -10260,15 +10267,46 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
                 segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
                 payload_crc64,
             },
         )
         .unwrap();
     let written = current_cluster
-        .write_stream_segment_payload_shards(&segment, payload)
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let placement_key = super::super::super::segment_payload_placement_key(
+        &segment.segment_okh,
+        segment.segment_vid,
+    );
+    let written_locations = current_cluster
+        .place_payload_shards(
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &placement_key,
+        )
+        .unwrap();
+    for (written_shard, location) in written.iter().zip(written_locations) {
+        let config = server_configs
+            .iter()
+            .find(|config| config.node_id == location.node_id())
+            .unwrap();
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let shard = remote
+            .read_shard_file(segment.data_pg_id, &written_shard.key)
+            .unwrap();
+        assert_eq!(shard.len() as u64, written_shard.ack.stored_size);
+        assert_eq!(checksum::crc64::checksum(&shard), written_shard.ack.crc64);
+    }
     let shard_batch = written
         .iter()
         .map(|written| (&written.key, written.ack))
@@ -10636,6 +10674,8 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
     let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
     let upload_id = upload_id_from_label("unixstalefinal");
+    let payload = b"stale unix streamed upload part finalize";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
     let create = crate::CreateMultipartUploadReq {
         upload_id: upload_id.clone(),
         bucket: bucket.clone(),
@@ -10649,7 +10689,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: encrypted.encryption.clone(),
     };
     current_cluster
         .create_multipart_upload(
@@ -10674,8 +10714,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
             &session_id,
         )
         .unwrap();
-    let payload = b"stale unix streamed upload part finalize";
-    let payload_crc64 = checksum::crc64::checksum(payload);
+    let payload_crc64 = encrypted.payload_crc64;
     let (_target, segment) = current_cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -10683,14 +10722,14 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
                 segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
                 payload_crc64,
             },
         )
         .unwrap();
     let written = current_cluster
-        .write_stream_segment_payload_shards(&segment, payload)
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
     let shard_batch = written
         .iter()
@@ -10706,6 +10745,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
             &shard_batch,
         )
         .unwrap();
+    assert_encrypted_test_stream_segment_stored(&current_cluster, &segment, &encrypted);
     let before_object_pg_proof = current_cluster
         .test_object_pg_metadata_proof(&bucket, &key)
         .unwrap();
@@ -10913,6 +10953,10 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
     let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
     let upload_id = upload_id_from_label("unixstalecopyfin");
+    let payloads = [
+        b"stale unix copied source segment one".as_slice(),
+        b"stale unix copied source segment two".as_slice(),
+    ];
     let create = crate::CreateMultipartUploadReq {
         upload_id: upload_id.clone(),
         bucket: bucket.clone(),
@@ -10926,7 +10970,8 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
         public_read: false,
         object_lock: crate::ObjectLockState::default(),
         checksum: None,
-        encryption: crate::ObjectEncryption::None,
+        encryption: crate::tests::sse_s3_multipart_segment_test_fixture(payloads[0], 2, 0)
+            .encryption,
     };
     current_cluster
         .create_multipart_upload(
@@ -10953,14 +10998,10 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
         .unwrap();
 
     let mut staged = Vec::new();
-    for (segment_index, payload) in [
-        b"stale unix copied source segment one".as_slice(),
-        b"stale unix copied source segment two".as_slice(),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let payload_crc64 = checksum::crc64::checksum(payload);
+    for (segment_index, payload) in payloads.into_iter().enumerate() {
+        let encrypted =
+            crate::tests::sse_s3_multipart_segment_test_fixture(payload, 2, segment_index as u32);
+        let payload_crc64 = encrypted.payload_crc64;
         let (_target, segment) = current_cluster
             .prepare_stream_segment_append(
                 &bucket,
@@ -10968,14 +11009,14 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
                 &crate::PrepareStreamUploadSegmentAppendReq {
                     session_id: session_id.clone(),
                     segment_index: segment_index as u32,
-                    size: payload.len() as u64,
-                    segment_crc64: payload_crc64,
+                    size: encrypted.logical_size,
+                    segment_crc64: encrypted.storage_crc64,
                     payload_crc64,
                 },
             )
             .unwrap();
         let written = current_cluster
-            .write_stream_segment_payload_shards(&segment, payload)
+            .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
             .unwrap();
         let shard_batch = written
             .iter()
@@ -10991,6 +11032,7 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
                 &shard_batch,
             )
             .unwrap();
+        assert_encrypted_test_stream_segment_stored(&current_cluster, &segment, &encrypted);
         staged.push((segment, written));
     }
     let before_object_pg_proof = current_cluster

@@ -573,7 +573,14 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   same-part replacement, UploadPartCopy staging, abort recovery, partial-apply/reopen,
   response-loss, Peering, lifecycle, and pending-install races now use that path or the same
   encrypted append primitive; multi-segment cases use distinct segment nonces.
-- The remaining 42 source occurrences are deliberately left for the direct-PUT recovery helper,
+- The residual stream-payload slice removes another nine positive plaintext constructions.
+  Routed acknowledgement, delayed-abort fencing, duplicate-index recovery, stale-epoch Unix
+  cleanup, Peering finalization, and UploadPartCopy preservation tests now bind sessions and
+  uploads to coherent SSE-S3 state, write exact ciphertext with distinct multipart segment
+  nonces, and either reconstruct that ciphertext or verify every unpublished placed shard against
+  its write acknowledgement before testing preservation or cleanup. This completes the positive
+  stream-append fixture migration outside the production branches removed in Phase 3.
+- The remaining 33 source occurrences are deliberately left for the direct-PUT recovery helper,
   residual owner-local fixtures, command-codec fixture migrations, Phase 3's production removal,
   and immutable rejection evidence. Phase 2 is not yet complete.
 
