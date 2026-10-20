@@ -553,7 +553,13 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   coherent SSE-S3 ciphertext while retaining distinct logical size, payload CRC, stored size, and
   stored CRC evidence. Successful/preserved payload cases reconstruct and compare the exact
   ciphertext; cleanup cases continue to inspect every acknowledgement and physical shard.
-- The remaining 90 source occurrences are deliberately left for the payload-bearing and
+- The streamed-PutObject finalization slice removes another 23 positive plaintext constructions.
+  Pending-command draining, terminal cleanup handoff, Peering rejection, ETag validation,
+  matching-install races, versioned reservation, and exact-witness convergence now bind every
+  payload-bearing session and committed object to coherent SSE-S3 ciphertext. Zero-byte sessions
+  carry real managed encryption state without inventing a stored segment, while the unrelated
+  abort-only fixture uses the explicitly metadata-only state.
+- The remaining 67 source occurrences are deliberately left for the multipart payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 
