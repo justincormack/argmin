@@ -1,9 +1,9 @@
 # Remove The Unreachable Plaintext Payload Profile Plan
 
-Status: in progress. Phases 0 through 3 are complete. Production write selection, active write
-authority, durable state, recovery, and transport are encrypted-only. Payloadless delete markers
-use their own schema shape rather than an encryption sentinel. Phase 4's chunked-encryption-plan
-simplification remains. The design decision to remove the plaintext payload state is accepted.
+Status: complete (2026-10-20). Production write selection, active write authority, durable state,
+recovery, transport, tests, benchmarks, and the follow-on chunked-encryption design are
+encrypted-only. Payloadless delete markers use their own schema shape rather than an encryption
+sentinel.
 
 ## Context
 
@@ -22,15 +22,13 @@ Consequently, every production S3 write currently resolves to one of these state
 If the managed key provider is unavailable, an implicit SSE-S3 write fails. It must never fall
 back to plaintext. There is no AWS-facing request or bucket configuration that selects plaintext.
 
-Despite this, the durable internal model still contains `ObjectEncryption::None`, an
+At the start of this plan, the durable internal model still contained `ObjectEncryption::None`, an
 object-encryption discriminator tag for `None`, plaintext segment-size branches, plaintext read
-branches, and extensive test fixtures built around them. Phase 1 removed both the former
-caller-selected `ActiveWriteEncryptionRef` finalization sentinel and
-`ActiveWriteEncryption::None`; no active write path can now mint plaintext authority. The
-chunked-encryption plan consequently still spends design effort keeping an unreachable durable
-plaintext profile aligned with the encrypted profiles.
+branches, and extensive test fixtures built around them. The completed work removed those states
+and the former caller-selected `ActiveWriteEncryptionRef` finalization sentinel. No active write,
+durable carrier, recovery path, benchmark, or follow-on codec design can now select plaintext.
 
-This plan removes that unsupported state before implementing the new chunked encrypted codec. The
+This plan removed that unsupported state before implementing the new chunked encrypted codec. The
 repository is pre-release and supports neither existing installations nor format migration, so the
 correct behavior for old plaintext durable state is current-format rejection before serving, not a
 fallback reader.
@@ -665,6 +663,26 @@ malformed matrix fails closed at each owner boundary.
 
 Exit: the chunked-encryption plan contains no obligation to preserve or emulate an unreachable
 plaintext payload mode.
+
+#### Phase 4 implementation ledger (2026-10-20)
+
+- The chunked-encryption design now has exactly two internal payload-codec profiles: the current
+  whole-segment AES-256-GCM representation and the proposed Cobblestone-256 representation. Each
+  is paired exhaustively with SSE-S3 and SSE-C key state; there is no plaintext codec entry,
+  conformance row, range implementation, or null-key emulation.
+- The common profile contract owns only encrypted framing, authentication, stored geometry,
+  plaintext-release boundaries, and finalization. The current whole-segment profile may buffer a
+  complete segment; the proposed profile may release authenticated 16 KiB chunks. Neither may
+  bypass the common contract with a raw plaintext publication or read path.
+- The payload-read benchmark covers the production-reachable SSE-S3 path and deliberately does
+  not add a plaintext axis. AWS-visible encryption mode is kept distinct from the future internal
+  codec identity, so the same harness can compare the two encrypted codecs without mislabelling
+  either one.
+- Storage routing, format, performance, and encryption guidance now state the encrypted-only
+  boundary. The immutable format ledger retains former tag-0 evidence solely to prove rejection;
+  it is not a supported reader profile or a benchmark/conformance obligation.
+
+Phase 4 exit is satisfied. This plan is complete.
 
 ## Test Matrix
 

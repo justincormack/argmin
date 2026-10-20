@@ -10,6 +10,11 @@ The current server does implement per-object S3 encryption semantics for
 this area should be tracked here rather than in the old
 integration-framework bootstrap plan.
 
+All current payload-bearing durable state is encrypted. An absent or deleted
+bucket encryption configuration selects automatic SSE-S3; it does not select a
+plaintext internal profile. Future SSE-KMS support must extend the encrypted
+key-state/profile cross-product and must not recreate a plaintext fallback.
+
 This plan covers the three main S3 encryption families:
 - SSE-S3
 - SSE-KMS

@@ -87,6 +87,11 @@ AEAD records, CRC work, buffer-pool activity, and repair fallback. It retains
 the SDK's collected `Bytes` directly so the timed full-read path does not add a
 second whole-response allocation and copy.
 
+The payload-codec comparison therefore has no plaintext benchmark axis. Compare
+the current whole-segment AES-GCM codec and future encrypted codecs under the
+same SSE-S3 or SSE-C key mode; former tag-0 bytes are immutable rejection
+evidence, not a supported performance profile.
+
 Reference runs require a clean worktree, making the printed source revision a
 complete identifier for the measured source. The runner refuses a dirty tree
 by default. `ALLOW_DIRTY_BENCHMARK=1` permits exploratory development runs, but

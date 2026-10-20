@@ -2,8 +2,8 @@
 
 Status: In progress (Phase 0 clean reference benchmark pending)
 
-The accepted [`remove-plaintext-payload-profile-plan.md`](remove-plaintext-payload-profile-plan.md)
-removes the unreachable `ObjectEncryption::None` state before this plan's profile-interface work.
+The completed [`remove-plaintext-payload-profile-plan.md`](remove-plaintext-payload-profile-plan.md)
+removed the unreachable `ObjectEncryption::None` state before this plan's profile-interface work.
 Accordingly, this plan covers only encrypted payload codecs paired with SSE-S3 or SSE-C. References
 to plaintext below mean decrypted logical data, not a supported unencrypted durable profile.
 
@@ -127,7 +127,7 @@ provider-interoperability review.
 
 ## Common Payload-Profile Boundary
 
-After the plaintext-removal plan lands, separate two concerns explicitly:
+With plaintext removal complete, separate two concerns explicitly:
 
 1. the AWS-visible encryption mode and key state (SSE-S3 or SSE-C); and
 2. the internal, versioned payload protection/codec profile used to frame, verify, range-map, and
@@ -154,27 +154,27 @@ tests run the same write, full-read, range, copy, cancellation, retained-route, 
 scenarios against every enabled codec and both supported key modes, asserting each codec's intended
 release boundary.
 
-### Plaintext payload removal
+### Encrypted-only prerequisite
 
 Do not implement plaintext as AEAD under a fixed, empty, or otherwise public "null key," and do not
-retain it as a legacy reader. There is no production plaintext writer, no released deployment, and
-no supported upgrade format. The dedicated removal plan deletes the state and advances all
-containing formats so former plaintext data fails at the current-format boundary before serving.
+retain it as a compatibility reader. There is no production plaintext writer, no released
+deployment, and no supported upgrade format. The completed removal plan deleted the state and
+advanced all containing formats so former plaintext data fails at the current-format boundary
+before serving.
 An absent or deleted bucket-encryption configuration remains a distinct AWS control-plane state,
 but its effective writer is automatic SSE-S3.
 
 ### Phase 0 implementation inventory and target seam
 
-The current code has no independent payload-codec choice. The prerequisite removal deliberately
-does not add one: it leaves a single fixed whole-segment AES-GCM representation after deleting the
-plaintext state. Before that removal,
-`ActiveWriteEncryption` still contains a dead `None` arm; SSE-C and SSE-S3 call their whole-segment
-AES-GCM helpers. On reads, `SegmentPayloadRecord` carries only `ObjectEncryption`; the reader loads
-a complete stored segment, chooses its legacy branch from that value, and only then slices the
-requested logical range. After removal, `max_stored_segment_size` still assumes the only supported
-representation is `plaintext length + one 16-byte tag`; this plan replaces that assumption with
-the first explicit durable codec discriminator and profile-owned geometry. The discriminator and
-its containing-format changes land in this plan, not in the plaintext-removal prerequisite.
+The current code has no independent payload-codec choice. The completed prerequisite deliberately
+did not add one: it left a single fixed whole-segment AES-GCM representation after deleting the
+plaintext state. SSE-C and SSE-S3 both call their whole-segment AES-GCM helpers. On reads,
+`SegmentPayloadRecord` carries only `ObjectEncryption`; the reader loads and authenticates a
+complete stored segment, then slices the requested logical range. `max_stored_segment_size` still
+assumes the only supported representation is `plaintext length + one 16-byte tag`; this plan
+replaces that assumption with the first explicit durable codec discriminator and profile-owned
+geometry. The discriminator and its containing-format changes land in this plan, not in the
+completed plaintext-removal prerequisite.
 
 The write-path inventory is:
 
@@ -675,9 +675,9 @@ Crossed codec/key-state combinations fail closed. Stored size calculations must 
 profile-aware; they can no longer assume `plaintext length + 16`.
 
 This is the first slice that introduces that discriminator. Its prior current state is the one
-implicit legacy encrypted representation left by the plaintext-removal plan; the format bump and
-immutable old/new evidence here must make that transition explicit rather than assuming the
-removal plan already persisted a codec choice.
+implicit whole-segment encrypted representation left by the plaintext-removal plan; the format
+bump and immutable old/new evidence here must make that transition explicit rather than assuming
+the removal plan already persisted a codec choice.
 
 Update every containing representation named by the storage-format dependency ledger, including:
 
@@ -767,7 +767,7 @@ Implementation update (2026-10-17):
   each pass actually taken.
 - The current reader still obtains and decrypts one complete stored segment before returning any
   selected bytes. SSE-C and SSE-S3 each open one whole-segment AEAD record. The prerequisite
-  plaintext-removal plan owns deletion of the dead bypass. The common sealed profile interface,
+  completed plaintext-removal plan deleted the dead bypass. The common sealed profile interface,
   durable-profile dimensions, release guarantees, and benchmark matrix are specified above.
   Implementing that interface is later phase work; Phase 0 retains only the clean reference
   benchmark as an open exit item.
@@ -785,7 +785,7 @@ Implementation update (2026-10-17):
 - The target seam is an exhaustive internal durable-profile registry producing opaque,
   subject-bound incremental encoders and readers. It owns stored-size/range geometry, plaintext
   release, and consuming finalization; AWS-visible key mode remains a separate dimension. The
-  legacy segment-AEAD and Cobblestone release/error guarantees are recorded above.
+  whole-segment AEAD and Cobblestone release/error guarantees are recorded above.
 - The reviewed upstream baseline is C2SP commit
   `d757bb90e5966d92d17353a3964ca1af776b63e0`. Because the specification remains untagged and in
   development, writer enablement requires a fresh upstream review. The implementation choice is a
@@ -796,9 +796,9 @@ Implementation update (2026-10-17):
 - The production S3 writer audit found that plaintext is unreachable by design. An absent or
   deleted bucket-encryption configuration resolves to the AWS automatic SSE-S3 default, and the
   coordinator consequently always selects managed AES256 unless the request selects SSE-C. The
-  accepted prerequisite plan removes the dormant plaintext state rather than building a reader or
-  benchmark for it. The reproducible end-to-end benchmark therefore covers the reachable legacy
-  encrypted segment profile.
+  completed prerequisite removed the dormant plaintext state rather than building a reader or
+  benchmark for it. The reproducible end-to-end benchmark therefore covers the reachable current
+  whole-segment encrypted profile.
 - `scripts/bench-payload-read` runs the release server and AWS SDK client against the real HTTP,
   authorization, storage, EC, checksum, and decryption path. It fixes object/range sizes and
   warm-up/sample counts, records revision/toolchain/kernel/CPU/provider inputs and the selected
@@ -840,7 +840,7 @@ the eventual reader exists before the first payload effect.
 - Integrate the codec with every encrypted write path while retaining the old reader if required by
   the selected format transition.
 - Put the current and proposed encrypted representations behind the common profile contract; the
-  prerequisite removal must leave no plaintext bypass in write, read, range, or copy paths.
+  completed prerequisite leaves no plaintext bypass in write, read, range, or copy paths.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.

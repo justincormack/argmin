@@ -74,6 +74,11 @@ Every public `StorageCluster` operation must fit one of these classes:
   coordination.
 - Payload bytes are always accessed through placed IO. Production request paths
   must not call node or PG shard read/write/delete APIs directly.
+- Every current payload-bearing object, multipart upload, stream session, part,
+  and segment has concrete SSE-S3 or SSE-C state. Payloadless delete markers
+  have their own row shape. There is no plaintext placed-IO profile, and former
+  tag-0 carriers are rejected before shard IO rather than routed to a fallback
+  reader.
 - Payload shard ack rows are metadata rows in the data PG and must route
   through that PG's primary. They hold shard checksums/sizes while payload
   files are placed through the cluster map.
