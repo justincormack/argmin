@@ -3395,20 +3395,21 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_capture_keeps_segments_and_encryption_from_one_pg_snapshot() {
+    fn test_payload_capture_keeps_segments_and_generation_from_one_pg_snapshot() {
         let tmp = test_util::tempdir();
         let node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap());
         let bucket = create_bucket_for_snapshot_test(&node, "bucket");
         let key = object_key("key");
         let old_generation = GenerationId::MIN;
         let old_size = 47;
+        let old_encryption = test_managed_object_encryption();
         put_segmented_object_for_snapshot_test(
             &node,
             &bucket,
             &key,
             old_generation,
             old_size,
-            test_managed_object_encryption(),
+            old_encryption,
         );
 
         let object_pg_id = node.pg_topology().object_pg_for(&bucket, &key);
@@ -3434,7 +3435,12 @@ mod tests {
                 &replacement_key,
                 GenerationId::new(2).unwrap(),
                 80,
-                crate::ObjectEncryption::None,
+                crate::ObjectEncryption::SseS3(crate::SseS3ObjectState::new(
+                    19,
+                    [20; crate::SSE_S3_WRAP_NONCE_LEN],
+                    [21; crate::SSE_S3_WRAPPED_DEK_LEN],
+                    [22; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+                )),
             )
         });
 
@@ -3451,10 +3457,11 @@ mod tests {
             .first()
             .expect("old segmented payload was captured");
         assert_eq!(segment.segment_vid, old_generation);
+        assert_eq!(snapshot.generation_id(), Some(old_generation));
         assert_eq!(
             snapshot.stored_size_for(segment),
             Some(old_size as usize + crate::OBJECT_ENCRYPTION_SEGMENT_TAG_LEN),
-            "replacement cannot pair old segments with its unencrypted metadata"
+            "replacement cannot pair old segments with its newer generation"
         );
         assert_eq!(
             node.test_get_object_version(&bucket, &key, VersionId::Null)

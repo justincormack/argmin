@@ -586,7 +586,12 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   response-loss schedules now write coherent SSE-S3 ciphertext and publish its logical size,
   stored CRC, and encryption state; the bucket-delete schedule proves every staged physical shard
   exists before starting its pre-publication concurrency interleaving.
-- The remaining 27 source occurrences are deliberately left for the direct-PUT recovery helper,
+- The object-snapshot/backfill slice removes another two positive plaintext constructions. The
+  concurrent snapshot fixture now races two valid encrypted object generations and pins the exact
+  generation captured with the segment list. Historical backfill/scavenger reference fixtures now
+  persist the logical size and exact SSE-S3 state corresponding to their ciphertext; secondary
+  scan candidates also write ciphertext and record its stored length and checksum.
+- The remaining 25 source occurrences are deliberately left for the direct-PUT recovery helper,
   residual owner-local fixtures, command-codec fixture migrations, Phase 3's production removal,
   and immutable rejection evidence. Phase 2 is not yet complete.
 

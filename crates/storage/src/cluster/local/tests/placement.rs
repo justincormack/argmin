@@ -2641,18 +2641,37 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
     }
 }
 
+struct BackfillScavengerSegmentReference {
+    request: crate::SegmentStoredBytesRequest,
+    logical_size: u64,
+    encryption: crate::ObjectEncryption,
+}
+
+impl BackfillScavengerSegmentReference {
+    fn new(
+        request: crate::SegmentStoredBytesRequest,
+        encrypted: &crate::tests::SseS3SegmentTestFixture,
+    ) -> Self {
+        Self {
+            request,
+            logical_size: encrypted.logical_size,
+            encryption: encrypted.encryption.clone(),
+        }
+    }
+}
+
 fn record_backfill_scavenger_object_segment_reference(
     cluster: &crate::StorageCluster,
     source_epoch: ClusterEpoch,
-    req: crate::SegmentStoredBytesRequest,
+    reference: BackfillScavengerSegmentReference,
     bucket: crate::BucketName,
     key: crate::ObjectKey,
 ) {
     record_backfill_scavenger_object_segment_reference_on_pg(
         cluster,
-        PgId::new(req.data_pg_id),
+        PgId::new(reference.request.data_pg_id),
         source_epoch,
-        req,
+        reference,
         bucket,
         key,
     );
@@ -2662,10 +2681,15 @@ fn record_backfill_scavenger_object_segment_reference_on_pg(
     cluster: &crate::StorageCluster,
     metadata_pg_id: PgId,
     source_epoch: ClusterEpoch,
-    req: crate::SegmentStoredBytesRequest,
+    reference: BackfillScavengerSegmentReference,
     bucket: crate::BucketName,
     key: crate::ObjectKey,
 ) {
+    let BackfillScavengerSegmentReference {
+        request: req,
+        logical_size,
+        encryption,
+    } = reference;
     let primary = cluster
         .local_map
         .metadata_pg_primary_node(cluster.operation_epoch(), metadata_pg_id)
@@ -2681,7 +2705,7 @@ fn record_backfill_scavenger_object_segment_reference_on_pg(
             acl_grants: crate::AclGrants::default(),
             public_read: false,
             generation_id: req.segment_vid,
-            size: req.stored_size as u64,
+            size: logical_size,
             etag: crate::ObjectEtag::single_part(req.segment_crc64),
             ec: req.ec,
             layout: crate::ObjectLayout::Standard,
@@ -2689,14 +2713,14 @@ fn record_backfill_scavenger_object_segment_reference_on_pg(
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: crate::ObjectLockState::default(),
-            encryption: crate::ObjectEncryption::None,
+            encryption,
         },
         &[crate::ObjectSegmentRecord {
             bucket,
             key,
             version_id: crate::VersionId::Null,
             segment_index: 0,
-            size: req.stored_size as u64,
+            size: logical_size,
             segment_crc64: req.segment_crc64,
             segment_okh: req.segment_okh,
             segment_vid: req.segment_vid,
@@ -3513,7 +3537,7 @@ fn shard_scavenger_backfill_candidate_scan_records_historical_payloads() {
     record_backfill_scavenger_object_segment_reference(
         &fixture.desired_cluster,
         fixture.source_route.cluster_epoch(),
-        fixture.req,
+        BackfillScavengerSegmentReference::new(fixture.req, &fixture.segment.encrypted),
         bucket,
         key,
     );
@@ -3561,7 +3585,7 @@ fn shard_scavenger_backfill_candidate_scan_ignores_unrelated_epoch_advance() {
     record_backfill_scavenger_object_segment_reference(
         &fixture.desired_cluster,
         fixture.source_route.cluster_epoch(),
-        fixture.req,
+        BackfillScavengerSegmentReference::new(fixture.req, &fixture.segment.encrypted),
         bucket,
         key,
     );
@@ -3655,7 +3679,7 @@ fn shard_scavenger_backfill_candidate_scan_skips_unchanged_effective_placement()
     record_backfill_scavenger_object_segment_reference(
         &same_placement_cluster,
         source_epoch,
-        fixture.req,
+        BackfillScavengerSegmentReference::new(fixture.req, &fixture.segment.encrypted),
         bucket,
         key,
     );
@@ -3694,7 +3718,7 @@ fn shard_scavenger_backfill_candidate_scan_limit_skips_already_queued_candidates
         &fixture.desired_cluster,
         PgId::new(1),
         fixture.source_route.cluster_epoch(),
-        fixture.req,
+        BackfillScavengerSegmentReference::new(fixture.req, &fixture.segment.encrypted),
         first_bucket,
         first_key,
     );
@@ -3714,6 +3738,7 @@ fn shard_scavenger_backfill_candidate_scan_limit_skips_already_queued_candidates
     let second_segment_okh = [0x42; 16];
     let second_generation_id = crate::GenerationId::new(2).unwrap();
     let second_payload = b"phase-eleven-scanner-backfill-limit-second";
+    let second_encrypted = crate::tests::sse_s3_segment_test_fixture(second_payload, 0);
     let second_written = fixture
         .source_cluster
         .write_direct_put_segment_payload_shards(
@@ -3722,7 +3747,7 @@ fn shard_scavenger_backfill_candidate_scan_limit_skips_already_queued_candidates
             second_generation_id,
             0,
             &second_segment_okh,
-            second_payload,
+            &second_encrypted.storage_bytes,
         )
         .unwrap();
     fixture
@@ -3733,15 +3758,15 @@ fn shard_scavenger_backfill_candidate_scan_limit_skips_already_queued_candidates
         data_pg_id: second_written.data_pg_id,
         segment_okh: second_segment_okh,
         segment_vid: second_generation_id,
-        stored_size: second_payload.len(),
-        segment_crc64: checksum::crc64::checksum(second_payload),
+        stored_size: second_encrypted.storage_bytes.len(),
+        segment_crc64: second_encrypted.storage_crc64,
         ec: second_written.ec,
     };
     record_backfill_scavenger_object_segment_reference_on_pg(
         &fixture.desired_cluster,
         PgId::new(1),
         fixture.source_route.cluster_epoch(),
-        second_req,
+        BackfillScavengerSegmentReference::new(second_req, &second_encrypted),
         second_bucket,
         second_key,
     );
@@ -3791,7 +3816,7 @@ fn shard_scavenger_backfill_candidate_scan_bounds_pg_enumeration() {
         &fixture.desired_cluster,
         PgId::new(1),
         fixture.source_route.cluster_epoch(),
-        fixture.req,
+        BackfillScavengerSegmentReference::new(fixture.req, &fixture.segment.encrypted),
         bucket,
         key,
     );
@@ -3843,7 +3868,7 @@ fn shard_scavenger_backfill_candidate_scan_bounds_current_epoch_reference_rows()
             &fixture.desired_cluster,
             PgId::new(1),
             fixture.desired_route.cluster_epoch(),
-            request,
+            BackfillScavengerSegmentReference::new(request, &fixture.segment.encrypted),
             crate::BucketName::try_from(format!("bounded-current-epoch-{suffix}")).unwrap(),
             crate::ObjectKey::try_from(format!("bounded-current-epoch-{suffix}")).unwrap(),
         );
@@ -3908,7 +3933,7 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
         &fixture.desired_cluster,
         PgId::new(1),
         fixture.source_route.cluster_epoch(),
-        fixture.req,
+        BackfillScavengerSegmentReference::new(fixture.req, &fixture.segment.encrypted),
         first_bucket,
         first_key,
     );
@@ -3919,6 +3944,7 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
     let second_segment_okh = [0x42; 16];
     let second_generation_id = crate::GenerationId::new(2).unwrap();
     let second_payload = b"phase-eleven-scanner-backfill-cursor-second";
+    let second_encrypted = crate::tests::sse_s3_segment_test_fixture(second_payload, 0);
     let second_written = fixture
         .source_cluster
         .write_direct_put_segment_payload_shards(
@@ -3927,7 +3953,7 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
             second_generation_id,
             0,
             &second_segment_okh,
-            second_payload,
+            &second_encrypted.storage_bytes,
         )
         .unwrap();
     fixture
@@ -3938,8 +3964,8 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
         data_pg_id: second_written.data_pg_id,
         segment_okh: second_segment_okh,
         segment_vid: second_generation_id,
-        stored_size: second_payload.len(),
-        segment_crc64: checksum::crc64::checksum(second_payload),
+        stored_size: second_encrypted.storage_bytes.len(),
+        segment_crc64: second_encrypted.storage_crc64,
         ec: second_written.ec,
     };
     assert!(fixture.req.segment_vid.get() < second_req.segment_vid.get());
@@ -3947,7 +3973,7 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
         &fixture.desired_cluster,
         PgId::new(1),
         fixture.source_route.cluster_epoch(),
-        second_req,
+        BackfillScavengerSegmentReference::new(second_req, &second_encrypted),
         second_bucket,
         second_key,
     );
@@ -4008,7 +4034,7 @@ fn storage_backfill_candidate_scanner_retains_cursor_across_route_publication() 
         &fixture.desired_cluster,
         PgId::new(1),
         fixture.source_route.cluster_epoch(),
-        fixture.req,
+        BackfillScavengerSegmentReference::new(fixture.req, &fixture.segment.encrypted),
         first_bucket,
         first_key,
     );
@@ -4020,6 +4046,7 @@ fn storage_backfill_candidate_scanner_retains_cursor_across_route_publication() 
     let second_segment_okh = [0x72; 16];
     let second_generation_id = crate::GenerationId::new(2).unwrap();
     let second_payload = b"storage-owned-backfill-cursor-second";
+    let second_encrypted = crate::tests::sse_s3_segment_test_fixture(second_payload, 0);
     let second_written = fixture
         .source_cluster
         .write_direct_put_segment_payload_shards(
@@ -4028,7 +4055,7 @@ fn storage_backfill_candidate_scanner_retains_cursor_across_route_publication() 
             second_generation_id,
             0,
             &second_segment_okh,
-            second_payload,
+            &second_encrypted.storage_bytes,
         )
         .unwrap();
     fixture
@@ -4039,8 +4066,8 @@ fn storage_backfill_candidate_scanner_retains_cursor_across_route_publication() 
         data_pg_id: second_written.data_pg_id,
         segment_okh: second_segment_okh,
         segment_vid: second_generation_id,
-        stored_size: second_payload.len(),
-        segment_crc64: checksum::crc64::checksum(second_payload),
+        stored_size: second_encrypted.storage_bytes.len(),
+        segment_crc64: second_encrypted.storage_crc64,
         ec: second_written.ec,
     };
     assert!(fixture.req.segment_vid.get() < second_req.segment_vid.get());
@@ -4048,7 +4075,7 @@ fn storage_backfill_candidate_scanner_retains_cursor_across_route_publication() 
         &fixture.desired_cluster,
         PgId::new(1),
         fixture.source_route.cluster_epoch(),
-        second_req,
+        BackfillScavengerSegmentReference::new(second_req, &second_encrypted),
         second_bucket,
         second_key,
     );
