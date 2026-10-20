@@ -580,7 +580,13 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   nonces, and either reconstruct that ciphertext or verify every unpublished placed shard against
   its write acknowledgement before testing preservation or cleanup. This completes the positive
   stream-append fixture migration outside the production branches removed in Phase 3.
-- The remaining 33 source occurrences are deliberately left for the direct-PUT recovery helper,
+- The residual standalone-fixture slice removes another six positive plaintext constructions.
+  Metadata-only authorization, stream-sweeper, object-subject, and bucket-delete fixtures use the
+  explicitly synthetic encrypted state. The two payload-bearing direct-PUT reservation and Unix
+  response-loss schedules now write coherent SSE-S3 ciphertext and publish its logical size,
+  stored CRC, and encryption state; the bucket-delete schedule proves every staged physical shard
+  exists before starting its pre-publication concurrency interleaving.
+- The remaining 27 source occurrences are deliberately left for the direct-PUT recovery helper,
   residual owner-local fixtures, command-codec fixture migrations, Phase 3's production removal,
   and immutable rejection evidence. Phase 2 is not yet complete.
 

@@ -35,6 +35,19 @@ pub(crate) const NO_READ: &ReadCondition = &ReadCondition {
     if_modified_since: None,
     if_unmodified_since: None,
 };
+
+/// Canonical encrypted state for coordinator tests that inspect metadata only.
+///
+/// The wrapped key material is synthetic; payload-bearing fixtures must use the
+/// production encryption helpers instead.
+pub(crate) fn metadata_only_object_encryption() -> storage::ObjectEncryption {
+    storage::ObjectEncryption::SseS3(storage::SseS3ObjectState::new(
+        1,
+        [2; storage::SSE_S3_WRAP_NONCE_LEN],
+        [3; storage::SSE_S3_WRAPPED_DEK_LEN],
+        [4; storage::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    ))
+}
 pub(crate) const NO_WRITE: &WriteCondition = &WriteCondition::None;
 pub(crate) const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
 pub(crate) const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;

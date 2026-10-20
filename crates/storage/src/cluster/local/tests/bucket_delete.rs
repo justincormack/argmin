@@ -3161,6 +3161,7 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
     let bucket_write_proof =
         crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
     let payload = b"visible";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(payload, 0);
     let generation_reservation_id = crate::SessionId::try_from("72".repeat(16)).unwrap();
     let generation_id = cluster
         .reserve_put_object_generation(&bucket, &key, &generation_reservation_id)
@@ -3173,7 +3174,7 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
             generation_id,
             0,
             &segment_okh,
-            payload,
+            &encrypted.storage_bytes,
         )
         .unwrap();
     let commit_req = crate::CommitDirectPutObjectReq {
@@ -3185,21 +3186,32 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
         acl_grants: crate::AclGrants::default(),
         public_read: false,
         generation_id,
-        size: payload.len() as u64,
+        size: encrypted.logical_size,
         etag_crc64: checksum::crc64::checksum(payload),
         ec: written.ec,
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
         object_lock: crate::ObjectLockState::default(),
-        encryption: crate::ObjectEncryption::None,
+        encryption: encrypted.encryption.clone(),
         segment_index: 0,
-        segment_crc64: checksum::crc64::checksum(payload),
+        segment_crc64: encrypted.storage_crc64,
         segment_okh,
         segment_vid: generation_id,
         data_pg_id: written.data_pg_id,
         bucket_write_reservation: bucket_write_proof,
     };
+    for shard_index in 0..written.ec.k + written.ec.m {
+        assert!(cluster
+            .test_payload_shard_file_exists(
+                written.data_pg_id,
+                written.ec,
+                &segment_okh,
+                generation_id,
+                shard_index,
+            )
+            .unwrap());
+    }
 
     let delete_started = Arc::new((Mutex::new(false), Condvar::new()));
     let delete_waiting = Arc::new((Mutex::new(false), Condvar::new()));

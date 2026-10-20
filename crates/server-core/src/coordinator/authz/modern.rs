@@ -1346,8 +1346,8 @@ mod tests {
     use storage::{
         BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
         BucketVersioningState, CanonicalUserId, EcShape, EffectiveBucketEncryptionConfig,
-        GenerationId, ObjectEncryption, ObjectEtag, ObjectKey, ObjectLayout, OwnerIdentity,
-        PublicAccessBlockConfig, StorageClass,
+        GenerationId, ObjectEtag, ObjectKey, ObjectLayout, OwnerIdentity, PublicAccessBlockConfig,
+        StorageClass,
     };
 
     fn modern_bucket(ownership: Option<BucketObjectOwnership>) -> ModernBucketSummary {
@@ -1403,7 +1403,7 @@ mod tests {
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
+            encryption: crate::coordinator::test_support::metadata_only_object_encryption(),
         })
     }
 

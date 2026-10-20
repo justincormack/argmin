@@ -10027,12 +10027,13 @@
             .reserve_generation(&generation_reservation_id)
             .unwrap();
         let data = b"authenticated direct PUT pending install response loss";
+        let encrypted = crate::tests::sse_s3_segment_test_fixture(data, 0);
         let payload = route
             .write_direct_object_payload(
                 &generation_reservation_id,
                 generation_id,
-                data.len() as u64,
-                data,
+                encrypted.logical_size,
+                &encrypted.storage_bytes,
             )
             .unwrap();
         let data_pg_id = payload.written.data_pg_id;
@@ -10075,7 +10076,7 @@
             metadata_blob: crate::SerializedMetadataBlob::default(),
             system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
             object_lock: crate::ObjectLockState::default(),
-            encryption: crate::ObjectEncryption::None,
+            encryption: encrypted.encryption.clone(),
             bucket_write_reservation: proof,
         };
 

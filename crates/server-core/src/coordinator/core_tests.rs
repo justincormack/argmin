@@ -7296,7 +7296,7 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
             &bucket,
             &key,
             &session_id,
-            storage::ObjectEncryption::None,
+            metadata_only_object_encryption(),
             Some(cleanup_after),
         )
         .unwrap();

@@ -1605,7 +1605,7 @@ fn seed_multipart_upload_record(
             public_read: false,
             object_lock: crate::ObjectLockState::default(),
             checksum: None,
-            encryption: crate::ObjectEncryption::None,
+            encryption: crate::tests::metadata_only_test_encryption(),
         },
     )
     .unwrap();

@@ -2472,7 +2472,7 @@ mod tests {
                     metadata_blob: None,
                     system_metadata_blob: None,
                     object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: crate::tests::metadata_only_test_encryption(),
                 },
                 &[],
             )
