@@ -559,9 +559,18 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   payload-bearing session and committed object to coherent SSE-S3 ciphertext. Zero-byte sessions
   carry real managed encryption state without inventing a stored segment, while the unrelated
   abort-only fixture uses the explicitly metadata-only state.
-- The remaining 67 source occurrences are deliberately left for the multipart payload-bearing and
-  command-codec fixture migrations plus Phase 3's production removal and immutable rejection
-  evidence. Phase 2 is not yet complete.
+- The streamed-UploadPart finalization slice removes another 11 positive plaintext constructions.
+  Payload-CRC rejection, allocator cleanup, pending-command contention, partial-apply reopen,
+  terminal-slot recovery, committed-response loss, and abort-winner cleanup now bind the upload,
+  session, staged segment, and terminal part to one part-scoped SSE-S3 fixture. Preserved payload
+  is reconstructed as exact ciphertext before the race, cleanup is checked with the encrypted
+  stored length and CRC, and the payload-free foreign-terminal fixture uses the explicitly
+  metadata-only state.
+- The remaining 56 source occurrences are deliberately left for the shared multipart
+  payload-bearing helpers, command-codec fixture migrations, Phase 3's production removal, and
+  immutable rejection evidence. The adjacent same-part replacement and UploadPartCopy cleanup
+  races still inherit the shared plaintext multipart seed and move with that atomic helper slice.
+  Phase 2 is not yet complete.
 
 ### Phase 3: Atomically close durable and recovery state
 

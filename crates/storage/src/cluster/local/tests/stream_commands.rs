@@ -150,6 +150,86 @@ fn create_encrypted_put_stream_session(
     encrypted
 }
 
+fn create_encrypted_test_multipart_upload(
+    cluster: &crate::StorageCluster,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    upload_id: &crate::UploadId,
+    encryption: crate::ObjectEncryption,
+) -> crate::MultipartUploadRecord {
+    let request = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption,
+    };
+    cluster
+        .create_multipart_upload(
+            bucket,
+            key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), request.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    cluster
+        .load_in_progress_multipart_upload(bucket, key, upload_id)
+        .unwrap()
+}
+
+fn append_encrypted_multipart_stream_segment(
+    cluster: &crate::StorageCluster,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    session_id: &crate::SessionId,
+    segment_index: u32,
+    encrypted: &crate::tests::SseS3SegmentTestFixture,
+) -> crate::StreamUploadSegmentRecord {
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            bucket,
+            key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index,
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
+                payload_crc64: encrypted.payload_crc64,
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            bucket,
+            key,
+            session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap();
+    segment
+}
+
 fn encrypted_stream_segment_read_request(
     segment: &crate::StreamUploadSegmentRecord,
     encrypted: &crate::tests::SseS3SegmentTestFixture,
@@ -6176,37 +6256,16 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partcrcmismatch");
-    let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: crate::OwnerIdentity::from_principal("initiator"),
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        object_lock: crate::ObjectLockState::default(),
-        checksum: None,
-        encryption: crate::ObjectEncryption::None,
-    };
-    cluster
-        .create_multipart_upload(
-            &bucket,
-            &key,
-            crate::BucketSnapshotRequest::default(),
-            |_snapshot, existing_object| {
-                assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let payload = b"stream part payload crc mismatch";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let upload = create_encrypted_test_multipart_upload(
+        &cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        encrypted.encryption.clone(),
+    );
     let session_id = crate::SessionId::try_from("92".repeat(16)).unwrap();
-    let upload = cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -6215,45 +6274,21 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
         )
         .unwrap();
 
-    let payload = b"stream part payload crc mismatch";
-    let payload_crc64 = checksum::crc64::checksum(payload);
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
-                payload_crc64,
-            },
-        )
-        .unwrap();
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let segment = append_encrypted_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &encrypted,
+    );
 
     let part = crate::MultipartPartRecord {
         upload_id: upload_id.clone(),
         part_number: 1,
         generation: 0,
-        size: payload.len() as u64,
-        payload_crc64: payload_crc64 ^ 1,
+        size: encrypted.logical_size,
+        payload_crc64: encrypted.payload_crc64 ^ 1,
         etag: vec![0x92; 8],
         etag_kind: crate::EtagKind::Crc64,
         part_vid: crate::GenerationId::MIN,
@@ -6300,37 +6335,16 @@ fn stream_part_finalize_abandons_expired_install_then_retries_transported_conten
     create_test_bucket(&cluster, &bucket);
 
     let upload_id = upload_id_from_label("partcontention");
-    let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: crate::OwnerIdentity::from_principal("initiator"),
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        object_lock: crate::ObjectLockState::default(),
-        checksum: None,
-        encryption: crate::ObjectEncryption::None,
-    };
-    cluster
-        .create_multipart_upload(
-            &bucket,
-            &key,
-            crate::BucketSnapshotRequest::default(),
-            |_snapshot, existing_object| {
-                assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let payload = b"UploadPartCopy finalization contention";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let upload = create_encrypted_test_multipart_upload(
+        &cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        encrypted.encryption.clone(),
+    );
     let session_id = crate::tests::stream_session_id("part-contention");
-    let upload = cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -6339,46 +6353,22 @@ fn stream_part_finalize_abandons_expired_install_then_retries_transported_conten
         )
         .unwrap();
 
-    let payload = b"UploadPartCopy finalization contention";
-    let payload_crc64 = checksum::crc64::checksum(payload);
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
-                payload_crc64,
-            },
-        )
-        .unwrap();
-    let written = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let segment = append_encrypted_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &encrypted,
+    );
 
     let part = crate::MultipartPartRecord {
         upload_id: upload_id.clone(),
         part_number: 1,
         generation: 0,
-        size: payload.len() as u64,
-        payload_crc64,
-        etag: payload_crc64.to_be_bytes().to_vec(),
+        size: encrypted.logical_size,
+        payload_crc64: encrypted.payload_crc64,
+        etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
         part_vid: crate::GenerationId::MIN,
         placement_cluster_epoch: segment.placement_cluster_epoch,
@@ -6509,38 +6499,17 @@ fn multipart_payload_snapshot_does_not_treat_shard_rows_without_files_as_absent(
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partpayloadrowwithoutfile");
-    let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: crate::OwnerIdentity::from_principal("initiator"),
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        object_lock: crate::ObjectLockState::default(),
-        checksum: None,
-        encryption: crate::ObjectEncryption::None,
-    };
-    cluster
-        .create_multipart_upload(
-            &bucket,
-            &key,
-            crate::BucketSnapshotRequest::default(),
-            |_snapshot, existing_object| {
-                assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let payload = b"multipart snapshot row without shard file";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let upload = create_encrypted_test_multipart_upload(
+        &cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        encrypted.encryption.clone(),
+    );
 
     let session_id = crate::SessionId::try_from("93".repeat(16)).unwrap();
-    let upload = cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -6549,46 +6518,22 @@ fn multipart_payload_snapshot_does_not_treat_shard_rows_without_files_as_absent(
         )
         .unwrap();
 
-    let payload = b"multipart snapshot row without shard file";
-    let payload_crc64 = checksum::crc64::checksum(payload);
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: payload_crc64,
-                payload_crc64,
-            },
-        )
-        .unwrap();
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let segment = append_encrypted_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &encrypted,
+    );
 
     let part = crate::MultipartPartRecord {
         upload_id: upload_id.clone(),
         part_number: 1,
         generation: 0,
-        size: payload.len() as u64,
-        payload_crc64,
-        etag: payload_crc64.to_be_bytes().to_vec(),
+        size: encrypted.logical_size,
+        payload_crc64: encrypted.payload_crc64,
+        etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
         part_vid: crate::GenerationId::MIN,
         placement_cluster_epoch: segment.placement_cluster_epoch,
@@ -7094,37 +7039,16 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partfinalizedrain");
-    let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: crate::OwnerIdentity::from_principal("initiator"),
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        object_lock: crate::ObjectLockState::default(),
-        checksum: None,
-        encryption: crate::ObjectEncryption::None,
-    };
-    cluster
-        .create_multipart_upload(
-            &bucket,
-            &key,
-            crate::BucketSnapshotRequest::default(),
-            |_snapshot, existing_object| {
-                assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let payload = b"stream part finalize pending drain allocator cleanup";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let upload = create_encrypted_test_multipart_upload(
+        &cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        encrypted.encryption.clone(),
+    );
     let session_id = crate::SessionId::try_from("47".repeat(16)).unwrap();
-    let upload = cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -7132,38 +7056,15 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
             &session_id,
         )
         .unwrap();
-    let payload = b"stream part finalize pending drain allocator cleanup";
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
-            },
-        )
-        .unwrap();
+    let segment = append_encrypted_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &encrypted,
+    );
     assert_stream_next_segment_vid(&map, NodeId::new(1), object_pg, &session_id, 2);
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
 
     let _serial = lock_metadata_command_apply_hook_test();
     let fail_once = Arc::new(AtomicBool::new(true));
@@ -7194,9 +7095,9 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
         upload_id: upload_id.clone(),
         part_number: 1,
         generation: 0,
-        size: payload.len() as u64,
-        payload_crc64: segment.payload_crc64,
-        etag: segment.payload_crc64.to_be_bytes().to_vec(),
+        size: encrypted.logical_size,
+        payload_crc64: encrypted.payload_crc64,
+        etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
         part_vid: crate::GenerationId::MIN,
         placement_cluster_epoch: segment.placement_cluster_epoch,
@@ -7292,37 +7193,16 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partfinalizematch");
-    let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: crate::OwnerIdentity::from_principal("initiator"),
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        object_lock: crate::ObjectLockState::default(),
-        checksum: None,
-        encryption: crate::ObjectEncryption::None,
-    };
-    cluster
-        .create_multipart_upload(
-            &bucket,
-            &key,
-            crate::BucketSnapshotRequest::default(),
-            |_snapshot, existing_object| {
-                assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let payload = b"stream part same pending install race";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let upload = create_encrypted_test_multipart_upload(
+        &cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        encrypted.encryption.clone(),
+    );
     let session_id = crate::SessionId::try_from("4b".repeat(16)).unwrap();
-    let upload = cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
@@ -7331,45 +7211,22 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
         )
         .unwrap();
     assert_bucket_write_reservations_released(&map, &bucket);
-    let payload = b"stream part same pending install race";
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
-            },
-        )
-        .unwrap();
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let segment = append_encrypted_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &encrypted,
+    );
 
     let expected_part = crate::MultipartPartRecord {
         upload_id: upload_id.clone(),
         part_number: 1,
         generation: 0,
-        size: payload.len() as u64,
-        payload_crc64: segment.payload_crc64,
-        etag: segment.payload_crc64.to_be_bytes().to_vec(),
+        size: encrypted.logical_size,
+        payload_crc64: encrypted.payload_crc64,
+        etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
         part_vid: crate::GenerationId::MIN,
         placement_cluster_epoch: segment.placement_cluster_epoch,
@@ -7498,37 +7355,16 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partfinalizereopen");
-    let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: crate::OwnerIdentity::from_principal("initiator"),
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        object_lock: crate::ObjectLockState::default(),
-        checksum: None,
-        encryption: crate::ObjectEncryption::None,
-    };
-    cluster
-        .create_multipart_upload(
-            &bucket,
-            &key,
-            crate::BucketSnapshotRequest::default(),
-            |_snapshot, existing_object| {
-                assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let payload = b"stream part finalize partial apply survives reopen";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let upload = create_encrypted_test_multipart_upload(
+        &cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        encrypted.encryption.clone(),
+    );
     let session_id = crate::SessionId::try_from("4e".repeat(16)).unwrap();
-    let upload = cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -7536,45 +7372,22 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
             &session_id,
         )
         .unwrap();
-    let payload = b"stream part finalize partial apply survives reopen";
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
-            },
-        )
-        .unwrap();
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let segment = append_encrypted_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &encrypted,
+    );
 
     let expected_part = crate::MultipartPartRecord {
         upload_id: upload_id.clone(),
         part_number: 1,
         generation: 0,
-        size: payload.len() as u64,
-        payload_crc64: segment.payload_crc64,
-        etag: segment.payload_crc64.to_be_bytes().to_vec(),
+        size: encrypted.logical_size,
+        payload_crc64: encrypted.payload_crc64,
+        etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
         part_vid: crate::GenerationId::MIN,
         placement_cluster_epoch: segment.placement_cluster_epoch,
@@ -7709,34 +7522,15 @@ fn upload_part_stream_create_does_not_expose_foreign_terminal_pending_upload() {
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
+    let metadata_encryption = crate::tests::metadata_only_test_encryption();
     let create_upload = |key: &ObjectKey, upload_id: crate::UploadId| {
-        let request = crate::CreateMultipartUploadReq {
-            upload_id: upload_id.clone(),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            tags: None,
-            metadata_blob: crate::SerializedMetadataBlob::default(),
-            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-            initiator: crate::OwnerIdentity::from_principal("initiator"),
-            owner: crate::OwnerIdentity::from_principal("owner"),
-            acl_grants: crate::AclGrants::default(),
-            public_read: false,
-            object_lock: crate::ObjectLockState::default(),
-            checksum: None,
-            encryption: crate::ObjectEncryption::None,
-        };
-        cluster
-            .create_multipart_upload(
-                &bucket,
-                key,
-                crate::BucketSnapshotRequest::default(),
-                |_snapshot, existing_object| {
-                    assert!(existing_object.is_none());
-                    Ok::<_, ()>(((), request.clone()))
-                },
-            )
-            .unwrap()
-            .unwrap();
+        create_encrypted_test_multipart_upload(
+            &cluster,
+            &bucket,
+            key,
+            &upload_id,
+            metadata_encryption.clone(),
+        );
         upload_id
     };
     let foreign_upload_id = create_upload(
@@ -7775,7 +7569,7 @@ fn upload_part_stream_create_does_not_expose_foreign_terminal_pending_upload() {
                         upload_id: foreign_upload_id.clone(),
                         part_number: 1,
                     },
-                    encryption: crate::ObjectEncryption::None,
+                    encryption: metadata_encryption.clone(),
                 },
                 123,
                 stale_proof.clone(),
@@ -8083,37 +7877,16 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
     let crossed_bucket = crate::tests::bucket_name("stream-part-finalize-crossed-bucket");
     create_test_bucket(&cluster, &crossed_bucket);
     let upload_id = upload_id_from_label("terminalslot");
-    let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: crate::OwnerIdentity::from_principal("initiator"),
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        object_lock: crate::ObjectLockState::default(),
-        checksum: None,
-        encryption: crate::ObjectEncryption::None,
-    };
-    cluster
-        .create_multipart_upload(
-            &bucket,
-            &key,
-            crate::BucketSnapshotRequest::default(),
-            |_snapshot, existing_object| {
-                assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let payload = b"stream part terminal pending slot";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let upload = create_encrypted_test_multipart_upload(
+        &cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        encrypted.encryption.clone(),
+    );
     let session_id = crate::SessionId::try_from("4d".repeat(16)).unwrap();
-    let upload = cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
@@ -8121,45 +7894,22 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
             &session_id,
         )
         .unwrap();
-    let payload = b"stream part terminal pending slot";
-    let (_target, segment) = cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
-            },
-        )
-        .unwrap();
-    let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
-    cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
-        )
-        .unwrap();
+    let segment = append_encrypted_multipart_stream_segment(
+        &cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &encrypted,
+    );
 
     let part = crate::MultipartPartRecord {
         upload_id: upload_id.clone(),
         part_number: 1,
         generation: 0,
-        size: payload.len() as u64,
-        payload_crc64: segment.payload_crc64,
-        etag: segment.payload_crc64.to_be_bytes().to_vec(),
+        size: encrypted.logical_size,
+        payload_crc64: encrypted.payload_crc64,
+        etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
         part_vid: crate::GenerationId::MIN,
         placement_cluster_epoch: segment.placement_cluster_epoch,
@@ -8417,37 +8167,16 @@ fn upload_part_stream_finalize_committed_response_loss_retry_sees_terminal_part(
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partlostresp");
-    let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: crate::OwnerIdentity::from_principal("initiator"),
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        object_lock: crate::ObjectLockState::default(),
-        checksum: None,
-        encryption: crate::ObjectEncryption::None,
-    };
-    cluster
-        .create_multipart_upload(
-            &bucket,
-            &key,
-            crate::BucketSnapshotRequest::default(),
-            |_snapshot, existing_object| {
-                assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let payload = b"stream part committed response loss";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let upload = create_encrypted_test_multipart_upload(
+        &cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        encrypted.encryption.clone(),
+    );
     let session_id = crate::SessionId::try_from("5b".repeat(16)).unwrap();
-    let upload = cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
     cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -8455,7 +8184,6 @@ fn upload_part_stream_finalize_committed_response_loss_retry_sees_terminal_part(
             &session_id,
         )
         .unwrap();
-    let payload = b"stream part committed response loss";
     let (_target, segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -8463,14 +8191,14 @@ fn upload_part_stream_finalize_committed_response_loss_retry_sees_terminal_part(
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: session_id.clone(),
                 segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
+                size: encrypted.logical_size,
+                segment_crc64: encrypted.storage_crc64,
+                payload_crc64: encrypted.payload_crc64,
             },
         )
         .unwrap();
     let written_shards = cluster
-        .write_stream_segment_payload_shards(&segment, payload)
+        .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
     let shard_batch = written_shards
         .iter()
@@ -8495,9 +8223,9 @@ fn upload_part_stream_finalize_committed_response_loss_retry_sees_terminal_part(
         upload_id: upload_id.clone(),
         part_number: 1,
         generation: 0,
-        size: payload.len() as u64,
-        payload_crc64: segment.payload_crc64,
-        etag: segment.payload_crc64.to_be_bytes().to_vec(),
+        size: encrypted.logical_size,
+        payload_crc64: encrypted.payload_crc64,
+        etag: encrypted.payload_crc64.to_be_bytes().to_vec(),
         etag_kind: crate::EtagKind::Crc64,
         part_vid: crate::GenerationId::MIN,
         placement_cluster_epoch: segment.placement_cluster_epoch,
@@ -8665,38 +8393,17 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
         crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
     create_test_bucket(&first_cluster, &bucket);
     let upload_id = upload_id_from_label("partfinalizeabort");
-    let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        tags: None,
-        metadata_blob: crate::SerializedMetadataBlob::default(),
-        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: crate::OwnerIdentity::from_principal("initiator"),
-        owner: crate::OwnerIdentity::from_principal("owner"),
-        acl_grants: crate::AclGrants::default(),
-        public_read: false,
-        object_lock: crate::ObjectLockState::default(),
-        checksum: None,
-        encryption: crate::ObjectEncryption::None,
-    };
-    first_cluster
-        .create_multipart_upload(
-            &bucket,
-            &key,
-            crate::BucketSnapshotRequest::default(),
-            |_snapshot, existing_object| {
-                assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let payload = b"stream part finalize loses the pending slot to abort";
+    let encrypted = crate::tests::sse_s3_multipart_segment_test_fixture(payload, 1, 0);
+    let upload = create_encrypted_test_multipart_upload(
+        &first_cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        encrypted.encryption.clone(),
+    );
 
     let session_id = crate::SessionId::try_from("59".repeat(16)).unwrap();
-    let upload = first_cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
     first_cluster
         .create_upload_part_stream_session(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
@@ -8705,37 +8412,22 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
         )
         .unwrap();
 
-    let payload = b"stream part finalize loses the pending slot to abort";
-    let (_target, segment) = first_cluster
-        .prepare_stream_segment_append(
-            &bucket,
-            &key,
-            &crate::PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index: 0,
-                size: payload.len() as u64,
-                segment_crc64: checksum::crc64::checksum(payload),
-                payload_crc64: checksum::crc64::checksum(payload),
-            },
-        )
-        .unwrap();
-    let written_shards = first_cluster
-        .write_stream_segment_payload_shards(&segment, payload)
-        .unwrap();
-    let shard_batch = written_shards
-        .iter()
-        .map(|written| (&written.key, written.ack))
-        .collect::<Vec<_>>();
+    let segment = append_encrypted_multipart_stream_segment(
+        &first_cluster,
+        &bucket,
+        &key,
+        &session_id,
+        0,
+        &encrypted,
+    );
+    let mut staged_readback = Vec::new();
     first_cluster
-        .commit_stream_segment_append(
-            &bucket,
-            &key,
-            &session_id,
-            segment.segment_index,
-            &segment,
-            &shard_batch,
+        .read_segment_payload_stored_bytes_into(
+            encrypted_stream_segment_read_request(&segment, &encrypted),
+            &mut staged_readback,
         )
         .unwrap();
+    assert_eq!(staged_readback, encrypted.storage_bytes);
 
     let pg_id = PgId::new(2);
     let hook_ran = Arc::new(AtomicBool::new(false));
@@ -8850,17 +8542,7 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
     let mut readback = Vec::new();
     let error = first_cluster
         .read_segment_payload_stored_bytes_into(
-            crate::SegmentStoredBytesRequest {
-                data_pg_id: segment.data_pg_id,
-                segment_okh: segment.segment_okh,
-                segment_vid: segment.segment_vid,
-                stored_size: payload.len(),
-                segment_crc64: checksum::crc64::checksum(payload),
-                ec: EcShape {
-                    k: segment.ec_k,
-                    m: segment.ec_m,
-                },
-            },
+            encrypted_stream_segment_read_request(&segment, &encrypted),
             &mut readback,
         )
         .unwrap_err();
