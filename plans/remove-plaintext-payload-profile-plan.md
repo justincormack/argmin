@@ -547,7 +547,13 @@ removed in Phase 3 and immutable owner-local malformed/rejection evidence.
   staged segment before publication. Direct-PUT contenders in the same schedules now also persist
   ciphertext and use the encrypted terminal request fixture, so the races contain no indirect
   plaintext winner.
-- The remaining 108 source occurrences are deliberately left for the payload-bearing and
+- The stream-append recovery and cleanup slice removes another 18 positive plaintext
+  constructions. Append preparation, partial apply, command-ID collision, authorized recovery,
+  abandonment, duplicate-segment cleanup, missing-shard validation, and abort races now shard
+  coherent SSE-S3 ciphertext while retaining distinct logical size, payload CRC, stored size, and
+  stored CRC evidence. Successful/preserved payload cases reconstruct and compare the exact
+  ciphertext; cleanup cases continue to inspect every acknowledgement and physical shard.
+- The remaining 90 source occurrences are deliberately left for the payload-bearing and
   command-codec fixture migrations plus Phase 3's production removal and immutable rejection
   evidence. Phase 2 is not yet complete.
 
