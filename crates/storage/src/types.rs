@@ -4537,9 +4537,10 @@ pub(crate) struct DirectPutWrittenSegment {
 ///
 /// Its lifetime is tied to the exact non-cloneable route admission which
 /// issued it. Storage retains that owner together with the subject, placement,
-/// integrity, and cleanup identity, so callers cannot cross publication
-/// domains or combine a payload write with independently constructed physical
-/// metadata. An armed handle cleans issuer-owned staging when dropped.
+/// bucket incarnation, integrity, and cleanup identity, so callers cannot
+/// cross publication domains or combine a payload write with independently
+/// constructed physical metadata. An armed handle cleans issuer-owned staging
+/// when dropped.
 pub struct DirectPutPayloadWrite<'admission> {
     pub(crate) owner: &'admission crate::cluster::StorageClusterRouteAdmission,
     pub(crate) armed: std::cell::Cell<bool>,
@@ -4547,6 +4548,7 @@ pub struct DirectPutPayloadWrite<'admission> {
     pub(crate) key: ObjectKey,
     pub(crate) generation_reservation_id: SessionId,
     pub(crate) generation_id: GenerationId,
+    pub(crate) bucket_incarnation_generation: u64,
     pub(crate) logical_size: u64,
     pub(crate) segment_index: u32,
     pub(crate) segment_crc64: u64,

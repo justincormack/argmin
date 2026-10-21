@@ -339,7 +339,7 @@ impl Coordinator {
                                 write_encryption,
                             )?;
                         let generation_reservation = put_route
-                            .reserve_generation()
+                            .reserve_generation(&proof)
                             .map_err(Coordinator::map_direct_put_failure)?;
                         let storage_bytes =
                             write_encryption.encrypt_segment(0, req.data)?;

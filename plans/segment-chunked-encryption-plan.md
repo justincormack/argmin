@@ -842,6 +842,14 @@ Implementation update (2026-10-21):
 - This completes the direct-PUT ordering and ownership prerequisite only. The reservation must next
   mint the canonical standard-object encryption subject, and the streamed PUT, copy, and multipart
   identity work below remains open.
+- The direct-PUT reservation is now also minted only from the exact bucket-write proof for the
+  admitted bucket, key, epoch, and canonical direct-commit operation. Storage captures the proof's
+  bucket-incarnation generation in the non-cloneable reservation and carries it through the opaque
+  staged-payload handle; terminal publication rejects a different incarnation before command
+  construction. Crossed key, operation, and incarnation proofs are rejected before the object
+  generation allocator advances. This supplies the complete storage-owned object identity needed
+  for the next slice to mint the standard-object encryption subject without letting the
+  coordinator assemble its fields.
 
 - Introduce private canonical context codecs and opaque subject constructors.
 - Ensure every write path exposes its existing or newly allocated immutable generation to the

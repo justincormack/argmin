@@ -340,10 +340,22 @@ fn direct_put_generation_reservations_are_minted_exclusively_and_drop_independen
     let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
-    let first = route.reserve_generation().unwrap();
+    let first_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let first = route.reserve_generation(&first_proof).unwrap();
     let first_id = first.reservation_id.clone();
     let first_generation = first.generation_id();
-    let second = route.reserve_generation().unwrap();
+    let second_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let second = route.reserve_generation(&second_proof).unwrap();
     let second_id = second.reservation_id.clone();
     let second_generation = second.generation_id();
 
@@ -398,6 +410,134 @@ fn direct_put_generation_reservations_are_minted_exclusively_and_drop_independen
             Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
         ));
     }
+    cluster
+        .release_bucket_write_reservation_proof(&first_proof)
+        .unwrap();
+    cluster
+        .release_bucket_write_reservation_proof(&second_proof)
+        .unwrap();
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn direct_put_generation_reservation_rejects_crossed_bucket_write_authority_before_mutation() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("direct-put-proof-subject");
+    let key = crate::tests::object_key("target");
+    let crossed_key = crate::tests::object_key("crossed");
+    create_test_bucket(&cluster, &bucket);
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+
+    let cases = [
+        (
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(crossed_key.as_str()),
+            crate::tests::stream_session_id("cross-key"),
+        ),
+        (
+            crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+            crate::tests::stream_session_id("cross-op"),
+        ),
+    ];
+    let object_pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id().get();
+    for (operation, target, reservation_id) in cases {
+        let proof = acquire_test_bucket_write_proof(&cluster, &bucket, operation, target);
+        let error = route
+            .test_reserve_generation_with_id_and_proof(&reservation_id, &proof)
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::DirectPutFailureKind::InternalError);
+        assert_eq!(error.diagnostic_cause_label(), "invalid_request");
+        for node in map.nodes.values() {
+            let pg = node.storage_node().get_pg(object_pg_id).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_object_generation_reservation(
+                    &*pg,
+                    &bucket,
+                    &key,
+                    &reservation_id,
+                ),
+                Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+            ));
+        }
+        cluster
+            .release_bucket_write_reservation_proof(&proof)
+            .unwrap();
+        assert_bucket_write_reservations_released(&map, &bucket);
+    }
+
+    let reservation_id = crate::tests::stream_session_id("cross-inc");
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let mut crossed_incarnation = proof.clone();
+    crossed_incarnation.bucket_incarnation_generation = crossed_incarnation
+        .bucket_incarnation_generation
+        .checked_add(1)
+        .unwrap();
+    let error = route
+        .test_reserve_generation_with_id_and_proof(&reservation_id, &crossed_incarnation)
+        .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::DirectPutFailureKind::MetadataCommandContention
+    );
+    assert_eq!(
+        error.diagnostic_cause_label(),
+        "bucket_write_reservation_conflict"
+    );
+    for node in map.nodes.values() {
+        let pg = node.storage_node().get_pg(object_pg_id).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &reservation_id,
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+    }
+    cluster
+        .release_bucket_write_reservation_proof(&proof)
+        .unwrap();
+    assert_bucket_write_reservations_released(&map, &bucket);
+
+    let valid_reservation_id = crate::tests::stream_session_id("valid-after");
+    let valid_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let valid = route
+        .test_reserve_generation_with_id_and_proof(&valid_reservation_id, &valid_proof)
+        .unwrap();
+    assert_eq!(
+        valid.generation_id(),
+        crate::GenerationId::MIN,
+        "rejected proof subjects must not advance the object-generation allocator"
+    );
+    drop(valid);
+    cluster
+        .release_bucket_write_reservation_proof(&valid_proof)
+        .unwrap();
+    assert_bucket_write_reservations_released(&map, &bucket);
 }
 
 #[test]

@@ -195,7 +195,8 @@ pub struct ActivePutObjectRoute<'admission> {
 /// [`ActivePutObjectRoute`] before payload encryption begins; production
 /// callers cannot reacquire the same durable reservation. The token is
 /// deliberately non-cloneable and binds the route admission, object subject,
-/// reservation identity, and generation. Staging consumes the token and
+/// exact direct-PUT bucket-write authority, bucket incarnation, reservation
+/// identity, and generation. Staging consumes the token and
 /// transfers ownership to
 /// [`DirectPutPayloadWrite`]; dropping it first releases the durable
 /// reservation.
@@ -215,6 +216,7 @@ pub struct DirectPutGenerationReservation<'admission> {
     key: ObjectKey,
     reservation_id: SessionId,
     generation_id: GenerationId,
+    bucket_incarnation_generation: u64,
 }
 
 impl DirectPutGenerationReservation<'_> {
@@ -738,6 +740,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
 
     pub fn reserve_generation(
         &self,
+        bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<DirectPutGenerationReservation<'admission>, crate::DirectPutFailure> {
         let reservation_id = random_hex_identifier("").map_err(|_| {
                 crate::DirectPutFailure::from_object_pg_action(ObjectPgActionError::Store(
@@ -751,13 +754,62 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             })?;
         let reservation_id = SessionId::try_from(reservation_id)
             .expect("hex-encoded direct PUT reservation IDs must be valid");
-        self.reserve_generation_with_id(&reservation_id)
+        self.reserve_generation_with_id(&reservation_id, bucket_write_reservation)
     }
 
     fn reserve_generation_with_id(
         &self,
         reservation_id: &SessionId,
+        bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<DirectPutGenerationReservation<'admission>, crate::DirectPutFailure> {
+        if !bucket_write_reservation.matches_exact_mutation_subject(
+            self.admission.cluster.operation_epoch(),
+            &self.bucket,
+            PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(self.key.as_str()),
+        ) {
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT generation reservation does not match bucket write authority"
+                        .to_string(),
+                },
+            ));
+        }
+        let remaining_validity = self
+            .admission
+            .remaining_validity_raw()
+            .map_err(ObjectPgActionError::Store)
+            .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+        let reservation_primary = self
+            .admission
+            .cluster
+            .local_map
+            .metadata_pg_primary_node(
+                self.admission.cluster.operation_epoch(),
+                self.bucket_pg_id.pg_id(),
+            )
+            .map_err(ObjectPgActionError::Store)
+            .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+        let reservation_client = reservation_primary.bucket_write_reservation_client();
+        let reservation_route = reservation_client
+            .open_bucket_write_reservation_route(
+                self.admission.cluster.operation_epoch(),
+                self.bucket_pg_id,
+                &self.bucket,
+            )
+            .map_err(bucket_snapshot_error_to_object_pg_action_error)
+            .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+        let proof_validation = match remaining_validity {
+            Some(remaining) => reservation_route.validate_bucket_write_reservation_proof_until(
+                bucket_write_reservation,
+                Instant::now() + remaining,
+            ),
+            None => reservation_route
+                .validate_bucket_write_reservation_proof(bucket_write_reservation),
+        };
+        proof_validation
+            .map_err(bucket_snapshot_error_to_object_pg_action_error)
+            .map_err(crate::DirectPutFailure::from_object_pg_action)?;
         let generation_id = self
             .admission
             .cluster
@@ -774,6 +826,8 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             key: self.key.clone(),
             reservation_id: reservation_id.clone(),
             generation_id,
+            bucket_incarnation_generation: bucket_write_reservation
+                .bucket_incarnation_generation,
         })
     }
 
@@ -784,7 +838,34 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         &self,
         reservation_id: &SessionId,
     ) -> Result<DirectPutGenerationReservation<'admission>, crate::DirectPutFailure> {
-        self.reserve_generation_with_id(reservation_id)
+        let reservation = self
+            .admission
+            .cluster
+            .acquire_durable_bucket_write_reservation(
+                &self.bucket,
+                PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                Some(self.key.as_str()),
+            )
+            .map_err(bucket_snapshot_error_to_object_pg_action_error)
+            .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+        let bucket_write_reservation = BucketWriteReservationProof::from(&reservation.record);
+        let result = self.reserve_generation_with_id(reservation_id, &bucket_write_reservation);
+        let _ = self
+            .admission
+            .cluster
+            .release_bucket_write_reservation_proof(&bucket_write_reservation);
+        result
+    }
+
+    /// Exercises proof-subject rejection with a deterministic generation
+    /// reservation identity.
+    #[cfg(test)]
+    pub(super) fn test_reserve_generation_with_id_and_proof(
+        &self,
+        reservation_id: &SessionId,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<DirectPutGenerationReservation<'admission>, crate::DirectPutFailure> {
+        self.reserve_generation_with_id(reservation_id, bucket_write_reservation)
     }
 
     pub fn create_stream_session<T, E>(
@@ -1041,6 +1122,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         let payload = self.write_direct_object_payload_for_reserved_generation(
             &generation_reservation.reservation_id,
             generation_reservation.generation_id,
+            generation_reservation.bucket_incarnation_generation,
             logical_size,
             data,
         )?;
@@ -1052,6 +1134,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         &self,
         generation_reservation_id: &SessionId,
         generation_id: GenerationId,
+        bucket_incarnation_generation: u64,
         logical_size: u64,
         data: &[u8],
     ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
@@ -1077,6 +1160,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             key: self.key.clone(),
             generation_reservation_id: generation_reservation_id.clone(),
             generation_id,
+            bucket_incarnation_generation,
             logical_size,
             segment_index,
             segment_crc64: checksum::crc64::checksum(data),
@@ -1097,9 +1181,27 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         logical_size: u64,
         data: &[u8],
     ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
+        let reservation = self
+            .admission
+            .cluster
+            .acquire_durable_bucket_write_reservation(
+                &self.bucket,
+                PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                Some(self.key.as_str()),
+            )
+            .map_err(bucket_snapshot_error_to_object_pg_action_error)
+            .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+        let proof = BucketWriteReservationProof::from(&reservation.record);
+        let bucket_incarnation_generation = proof.bucket_incarnation_generation;
+        self.admission
+            .cluster
+            .release_bucket_write_reservation_proof(&proof)
+            .map_err(bucket_snapshot_error_to_object_pg_action_error)
+            .map_err(crate::DirectPutFailure::from_object_pg_action)?;
         self.write_direct_object_payload_for_reserved_generation(
             generation_reservation_id,
             generation_id,
+            bucket_incarnation_generation,
             logical_size,
             data,
         )
@@ -1127,7 +1229,12 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 },
             ));
         }
-        if payload.placement_cluster_epoch != prepared.bucket_write_reservation.cluster_epoch {
+        if payload.placement_cluster_epoch != prepared.bucket_write_reservation.cluster_epoch
+            || payload.bucket_incarnation_generation
+                != prepared
+                    .bucket_write_reservation
+                    .bucket_incarnation_generation
+        {
             self.admission
                 .cluster
                 .release_bucket_write_reservation_proof(&prepared.bucket_write_reservation)
@@ -1135,7 +1242,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 .map_err(crate::DirectPutFailure::from_object_pg_action)?;
             return Err(crate::DirectPutFailure::from_object_pg_action(
                 ObjectPgActionError::InvalidRequest {
-                    reason: "direct PUT payload does not match bucket write reservation epoch"
+                    reason: "direct PUT payload does not match bucket write reservation subject"
                         .to_string(),
                 },
             ));
