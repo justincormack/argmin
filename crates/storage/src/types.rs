@@ -6973,6 +6973,48 @@ pub struct StreamUploadRecord {
     pub bucket_write_reservation: Option<crate::BucketWriteReservationProof>,
 }
 
+impl StreamUploadRecord {
+    pub(crate) fn has_same_append_authority(&self, current: &Self) -> bool {
+        self.has_same_stable_identity_ignoring_allocator(current)
+    }
+
+    pub(crate) fn has_same_stable_identity(&self, current: &Self) -> bool {
+        self.has_same_stable_identity_ignoring_allocator(current)
+            && self.next_segment_vid == current.next_segment_vid
+    }
+
+    fn has_same_stable_identity_ignoring_allocator(&self, current: &Self) -> bool {
+        let reservation_matches = match (
+            self.bucket_write_reservation.as_ref(),
+            current.bucket_write_reservation.as_ref(),
+        ) {
+            (Some(expected), Some(current)) => expected.has_same_stable_identity(current),
+            (None, None) => true,
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        self.session_id == current.session_id
+            && self.bucket == current.bucket
+            && self.key == current.key
+            && self.target == current.target
+            && self.state == current.state
+            && self.created_at == current.created_at
+            && self.cleanup_after == current.cleanup_after
+            && self.encryption == current.encryption
+            && reservation_matches
+    }
+}
+
+/// Exact durable state captured by an authorized streamed PutObject append.
+///
+/// This is comparison evidence rather than independently sufficient
+/// authority: the storage node must match it against the session and object
+/// generation while holding the object-PG mutation lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpectedStreamPutAppendState {
+    pub(crate) session: StreamUploadRecord,
+    pub(crate) generation_id: GenerationId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamUploadRecordPage {
     pub uploads: Vec<StreamUploadRecord>,

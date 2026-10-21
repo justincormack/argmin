@@ -429,6 +429,10 @@
             let (target, segment) = primary_route
                 .prepare_stream_segment_append(
                     &stream_append_request,
+                    Some(&crate::ExpectedStreamPutAppendState {
+                        session: session.clone(),
+                        generation_id: reserved_generation,
+                    }),
                     AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                 )
                 .unwrap();
@@ -1700,6 +1704,7 @@
                             segment_index: 1,
                             ..stream_append_request.clone()
                         },
+                        expected_put_state: None,
                         effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
                             authority_valid_until_ms: 5_000,
                             portable_wall_valid_until_ms: 4_000,
@@ -1888,6 +1893,7 @@
                     primary_route
                         .prepare_stream_segment_append(
                             &stream_append_request,
+                            None,
                             AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                         )
                         .map(|_| ()),

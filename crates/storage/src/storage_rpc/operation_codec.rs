@@ -1854,6 +1854,14 @@ pub(crate) fn encode_stream_segment_append_prepare_request(
 ) -> Vec<u8> {
     let mut out = encode_object_request(&request.object);
     put_prepare_stream_segment_append_req(&mut out, &request.request);
+    match &request.expected_put_state {
+        Some(expected) => {
+            put_u8(&mut out, 1);
+            put_stream_upload_record(&mut out, &expected.session);
+            put_u64(&mut out, expected.generation_id.get());
+        }
+        None => put_u8(&mut out, 0),
+    }
     match request.effect_deadline {
         Some(deadline) => {
             put_u8(&mut out, 1);
@@ -1871,6 +1879,32 @@ pub(crate) fn decode_stream_segment_append_prepare_request(
     let mut decoder = StorageRpcDecoder::new(bytes);
     let object = decoder.read_rpc_object_request()?;
     let request = decoder.read_prepare_stream_segment_append_req()?;
+    let expected_put_state = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(crate::ExpectedStreamPutAppendState {
+            session: decoder.read_stream_upload_record()?,
+            generation_id: crate::GenerationId::new(decoder.read_u64()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid expected stream PutObject generation",
+                ),
+            )?,
+        }),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid expected stream PutObject state tag",
+            ));
+        }
+    };
+    if expected_put_state.as_ref().is_some_and(|expected| {
+        expected.session.session_id != request.session_id
+            || expected.session.bucket != object.bucket
+            || expected.session.key != object.key
+            || !matches!(expected.session.target, crate::StreamUploadTarget::PutObject)
+    }) {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "expected stream PutObject state does not match request subject",
+        ));
+    }
     let effect_deadline = match decoder.read_u8()? {
         0 => None,
         1 => Some(StorageRpcAdmittedRouteEffectDeadline {
@@ -1894,6 +1928,7 @@ pub(crate) fn decode_stream_segment_append_prepare_request(
     Ok(StorageRpcStreamSegmentAppendPrepareRequest {
         object,
         request,
+        expected_put_state,
         effect_deadline,
     })
 }

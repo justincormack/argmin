@@ -278,7 +278,12 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 23, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
             0, 0, 0, 219, 185, 232, 25, 191, 51, 112, 119, 97, 98, 99,
         ];
-        assert_eq!(bytes, V23_FRAME);
+        const V24_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 24, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 227, 38, 97, 110, 223, 29, 108, 239, 97, 98, 99,
+        ];
+        assert_eq!(bytes, V24_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
@@ -303,20 +308,30 @@ mod tests {
             decode_storage_rpc_frame(V22_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(22))
         );
+        assert_eq!(
+            decode_storage_rpc_frame(V23_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(23))
+        );
     }
 
     #[test]
-    fn current_storage_rpc_v23_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
+    fn current_storage_rpc_v24_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
     {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 23);
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 24);
         const HISTORICAL_V22_PLAINTEXT_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65160008070605040302013a0068010000ffac5bdc61c4e5260700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
-        const EXPECTED_V23_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605040302013a00c1010000ce03353b9e5164410700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
+        const HISTORICAL_V23_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605040302013a00c1010000ce03353b9e5164410700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
+        const EXPECTED_V24_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65180008070605040302013a00c1010000cd0075499ca4e0b50700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
 
         let historical_v22 = bytes_from_hex(HISTORICAL_V22_PLAINTEXT_FRAME_HEX);
         assert_eq!(hex_bytes(&historical_v22), HISTORICAL_V22_PLAINTEXT_FRAME_HEX);
         assert_eq!(
             decode_storage_rpc_frame(&historical_v22),
             Err(StorageRpcFrameError::UnsupportedVersion(22))
+        );
+        let historical_v23 = bytes_from_hex(HISTORICAL_V23_FRAME_HEX);
+        assert_eq!(
+            decode_storage_rpc_frame(&historical_v23),
+            Err(StorageRpcFrameError::UnsupportedVersion(23))
         );
 
         let bucket = BucketName::try_from("rpc").unwrap();
@@ -362,8 +377,8 @@ mod tests {
         )
         .unwrap();
         let encoded_frame_hex = hex_bytes(&frame);
-        assert_eq!(encoded_frame_hex.len(), EXPECTED_V23_FRAME_HEX.len());
-        assert_eq!(encoded_frame_hex, EXPECTED_V23_FRAME_HEX);
+        assert_eq!(encoded_frame_hex.len(), EXPECTED_V24_FRAME_HEX.len());
+        assert_eq!(encoded_frame_hex, EXPECTED_V24_FRAME_HEX);
 
         let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
         assert_eq!(
@@ -381,8 +396,8 @@ mod tests {
     }
 
     #[test]
-    fn current_storage_rpc_v23_encryption_state_encoding_is_frozen() {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 23);
+    fn current_storage_rpc_v24_encryption_state_encoding_is_frozen() {
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 24);
         let bucket = BucketName::try_from("encrypted-rpc").unwrap();
         let key = ObjectKey::try_from("key").unwrap();
         let encryption = ObjectEncryption::SseS3(
@@ -488,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_v21_stream_segment_append_prepare_payload_is_stable() {
+    fn storage_rpc_v21_stream_segment_append_prepare_payload_is_immutable_rejection_evidence() {
         const V21_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD: &[u8] = b"\
             \x07\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x0b\x00\x00\x00\
             \x06\x00\x00\x00bucket\x03\x00\x00\x00key\
@@ -496,6 +511,13 @@ mod tests {
             \x05\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00\
             \x07\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\
             \x00";
+        const V24_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD: &[u8] = b"\
+            \x07\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x0b\x00\x00\x00\
+            \x06\x00\x00\x00bucket\x03\x00\x00\x00key\
+            \x20\x00\x00\x000123456789abcdef0123456789abcdef\
+            \x05\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00\
+            \x07\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\
+            \x00\x00";
         let request = StorageRpcStreamSegmentAppendPrepareRequest {
             object: StorageRpcObjectRequest {
                 node_id: NodeId::new(7),
@@ -511,14 +533,19 @@ mod tests {
                 segment_crc64: 7,
                 payload_crc64: 8,
             },
+            expected_put_state: None,
             effect_deadline: None,
         };
         let payload = encode_stream_segment_append_prepare_request(&request);
 
-        assert_eq!(payload, V21_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD);
+        assert_eq!(payload, V24_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD);
+        assert!(decode_stream_segment_append_prepare_request(
+            V21_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD
+        )
+        .is_err());
         assert_eq!(
             decode_stream_segment_append_prepare_request(
-                V21_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD
+                V24_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD
             )
             .unwrap(),
             request
@@ -594,8 +621,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(22))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(24)),
-            Err(StorageRpcFrameError::UnsupportedVersion(24))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(23)),
+            Err(StorageRpcFrameError::UnsupportedVersion(23))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(25)),
+            Err(StorageRpcFrameError::UnsupportedVersion(25))
         );
     }
 
@@ -5474,7 +5505,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_segment_append_prepare_request_round_trips_effect_deadline_at_cap() {
+    fn stream_segment_append_prepare_request_round_trips_effect_deadline_within_cap() {
         let request = StorageRpcStreamSegmentAppendPrepareRequest {
             object: StorageRpcObjectRequest {
                 node_id: NodeId::new(7),
@@ -5490,6 +5521,7 @@ mod tests {
                 segment_crc64: u64::MAX,
                 payload_crc64: u64::MAX,
             },
+            expected_put_state: None,
             effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
                 authority_valid_until_ms: u64::MAX,
                 portable_wall_valid_until_ms: u64::MAX
@@ -5498,10 +5530,7 @@ mod tests {
         };
 
         let payload = encode_stream_segment_append_prepare_request(&request);
-        assert_eq!(
-            payload.len(),
-            STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN
-        );
+        assert!(payload.len() <= STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN);
         let frame = encode_storage_rpc_frame(
             17,
             StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare,
@@ -5513,6 +5542,66 @@ mod tests {
             decode_stream_segment_append_prepare_request(&decoded_frame.payload).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn stream_segment_append_prepare_request_binds_expected_put_state() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let session_id = SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap();
+        let request = StorageRpcStreamSegmentAppendPrepareRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(3),
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            request: PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 4,
+                size: 5,
+                segment_crc64: 6,
+                payload_crc64: 7,
+            },
+            expected_put_state: Some(crate::ExpectedStreamPutAppendState {
+                session: StreamUploadRecord {
+                    session_id,
+                    bucket,
+                    key,
+                    target: StreamUploadTarget::PutObject,
+                    state: StreamUploadState::InProgress,
+                    created_at: 8,
+                    cleanup_after: Some(9),
+                    encryption: crate::tests::metadata_only_test_encryption(),
+                    next_segment_vid: GenerationId::new(10).unwrap(),
+                    bucket_write_reservation: None,
+                },
+                generation_id: GenerationId::new(11).unwrap(),
+            }),
+            effect_deadline: None,
+        };
+        let encoded = encode_stream_segment_append_prepare_request(&request);
+        assert_eq!(
+            hex_bytes(&encoded),
+            "07000000010000000000000003000000060000006275636b6574030000006b65792000000030313233343536373839616263646566303132333435363738396162636465660400000005000000000000000600000000000000070000000000000001200000003031323334353637383961626364656630313233343536373839616263646566060000006275636b6574030000006b657900000800000000000000010900000000000000020155000000010000000102020202020202020202020203030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030304040404040400000000000000000000000000000a00000000000000000b0000000000000000"
+        );
+        assert_eq!(
+            decode_stream_segment_append_prepare_request(&encoded).unwrap(),
+            request
+        );
+
+        let mut crossed = request;
+        crossed.expected_put_state.as_mut().unwrap().session.key =
+            ObjectKey::try_from("other").unwrap();
+        assert!(matches!(
+            decode_stream_segment_append_prepare_request(
+                &encode_stream_segment_append_prepare_request(&crossed)
+            ),
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "expected stream PutObject state does not match request subject"
+            ))
+        ));
     }
 
     #[test]

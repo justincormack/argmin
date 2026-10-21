@@ -2538,6 +2538,7 @@ impl UnixStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
+        expected_put_state: Option<&crate::ExpectedStreamPutAppendState>,
         effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let expected_session =
@@ -2546,6 +2547,7 @@ impl UnixStorageNodeClient {
         let rpc_request = StorageRpcStreamSegmentAppendPrepareRequest {
             object: self.object_request(pg_id.pg_id(), bucket, key),
             request: request.clone(),
+            expected_put_state: expected_put_state.cloned(),
             effect_deadline,
         };
         let payload = encode_stream_segment_append_prepare_request(&rpc_request);
@@ -4688,9 +4690,10 @@ impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'
         )
     }
 
-    fn prepare_segment_append(
+    fn prepare_segment_append_with_expected_put_state(
         &self,
         request: &PrepareStreamUploadSegmentAppendReq,
+        expected_put_state: Option<&crate::ExpectedStreamPutAppendState>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
@@ -4712,6 +4715,7 @@ impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'
             &self.bucket,
             &self.key,
             request,
+            expected_put_state,
             effect_deadline,
         )
     }

@@ -438,7 +438,21 @@ impl Coordinator {
                     &mut last_heartbeat_millis,
                 )
                 .map_err(Self::map_stream_upload_failure)?;
-                let storage_chunk = dst_write_encryption.encrypt_segment(segment_index, &chunk)?;
+                let segment_authorization = destination_route
+                    .authorize_stream_segment(
+                        &session_id,
+                        segment_index,
+                        u64::try_from(chunk.len()).map_err(|_| ServerError::InternalError {
+                            reason: "copy segment length does not fit the encryption subject"
+                                .to_string(),
+                        })?,
+                    )
+                    .map_err(Self::map_stream_upload_failure)?;
+                let storage_chunk = dst_write_encryption.encrypt_standard_object_segment(
+                    segment_authorization.encryption_subject(),
+                    segment_index,
+                    &chunk,
+                )?;
                 Self::heartbeat_copy_object_stream_if_due(
                     &destination_route,
                     &session_id,
@@ -449,11 +463,8 @@ impl Coordinator {
                     &destination_route,
                     req.destination.bucket.name_typed(),
                     req.destination.key_typed(),
-                    super::AdmittedStreamSegmentAppend::new(
-                        &session_id,
-                        segment_index,
-                        super::StreamSegmentAppendPayload::new(&storage_chunk, chunk_crc64),
-                    ),
+                    segment_authorization,
+                    super::StreamSegmentAppendPayload::new(&storage_chunk, chunk_crc64),
                     || {
                         Self::heartbeat_copy_object_stream_if_due(
                             &destination_route,

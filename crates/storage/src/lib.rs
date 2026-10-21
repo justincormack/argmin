@@ -95,18 +95,19 @@ pub use cluster::{
     ActiveBucketMetadataScan, ActiveBucketRoute, ActiveMultipartObjectRoute,
     ActiveObjectMetadataMutationRoute, ActiveObjectMetadataScan, ActiveObjectPayloadRead,
     ActiveObjectReadRoute, ActivePutObjectRoute, AuthorizedStreamPutFinalization,
-    BucketIdentityGenerations, BucketWriteSnapshotAction, DirectPutEncryptionReservation,
-    DirectPutGenerationReservation, DirectPutSegmentEncryptionReservation,
-    LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome, LocalClusterMap,
-    LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
-    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
-    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PreparedStandaloneEmbeddedTopology,
-    ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedObjectPayloadRead,
-    RetainedStreamUploadCleanup, StorageCluster, StorageClusterRouteAdmission,
-    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
-    StorageClusterRuntimeMapRefreshError, StorageClusterRuntimeMapRefreshLoop,
-    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
-    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
+    AuthorizedStreamPutSegment, BucketIdentityGenerations, BucketWriteSnapshotAction,
+    DirectPutEncryptionReservation, DirectPutGenerationReservation,
+    DirectPutSegmentEncryptionReservation, LeasedObjectReadSnapshot,
+    LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
+    LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
+    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
+    ObjectPayloadLease, PreparedStandaloneEmbeddedTopology, ProcessLocalRegistryKey,
+    ReleasedObjectPayloadLease, RetainedObjectPayloadRead, RetainedStreamUploadCleanup,
+    StorageCluster, StorageClusterRouteAdmission, StorageClusterRouteHandle,
+    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshError,
+    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
+    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
+    StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 pub use control_plane_client_bootstrap::{
     control_plane_clock_recovery_socket_path, ControlPlaneAdminClientBootstrap,
@@ -2108,10 +2109,7 @@ pub mod test_support {
     pub use static_topology::StaticInitialControlPlaneTopologyTestSupport;
 
     mod stream_route;
-    pub use stream_route::{
-        ActivePutObjectRouteTestSupport, ActiveStreamRouteTestSupport,
-        StorageClusterStreamSessionTestSupport,
-    };
+    pub use stream_route::{ActiveStreamRouteTestSupport, StorageClusterStreamSessionTestSupport};
 
     mod topology;
     #[cfg(test)]
@@ -3976,6 +3974,7 @@ pub(crate) use traits::PgMetadataStore;
 pub(crate) use types::BucketSubresourceAux;
 #[cfg(test)]
 pub(crate) use types::DirectPutWrittenSegment;
+pub(crate) use types::ExpectedStreamPutAppendState;
 pub(crate) use types::MultipartUploadIdKey;
 #[cfg(test)]
 pub(crate) use types::SegmentStoredBytesRequest;

@@ -3389,7 +3389,8 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
             &first_session,
         )
         .unwrap();
-    assert_eq!(route.load_session().unwrap().session_id, first_session);
+    let loaded_first = route.load_session().unwrap();
+    assert_eq!(loaded_first.session_id, first_session);
     assert!(route.load_segments().unwrap().is_empty());
 
     let append = PrepareStreamUploadSegmentAppendReq {
@@ -3399,13 +3400,49 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
         segment_crc64: 41,
         payload_crc64: 41,
     };
+    let first_generation = PgMetadataStore::get_object_generation_reservation(
+        &*storage_node.get_pg(0).unwrap(),
+        &bucket,
+        &key,
+        &first_session,
+    )
+    .unwrap();
     let (_, prepared) = route
-        .prepare_segment_append(
+        .prepare_segment_append_with_expected_put_state(
             &append,
+            Some(&crate::ExpectedStreamPutAppendState {
+                session: loaded_first,
+                generation_id: first_generation,
+            }),
             AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
         )
         .unwrap();
     assert_eq!(prepared.session_id, first_session);
+
+    let first_before_crossed_generation = route.load_session().unwrap();
+    let crossed_generation = GenerationId::new(first_generation.get() + 100).unwrap();
+    let next_append = PrepareStreamUploadSegmentAppendReq {
+        segment_index: 1,
+        ..append.clone()
+    };
+    assert!(matches!(
+        route
+            .prepare_segment_append_with_expected_put_state(
+                &next_append,
+                Some(&crate::ExpectedStreamPutAppendState {
+                    session: first_before_crossed_generation.clone(),
+                    generation_id: crossed_generation,
+                }),
+                AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+            )
+            .unwrap_err(),
+        ObjectPgActionError::InvalidRequest { .. }
+    ));
+    assert_eq!(
+        route.load_session().unwrap(),
+        first_before_crossed_generation,
+        "crossed generation authority must not advance the bound session allocator"
+    );
 
     let second_before = storage_node
         .get_pg(0)
@@ -3416,8 +3453,9 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
     crossed_append.session_id = second_session.clone();
     assert!(matches!(
         route
-            .prepare_segment_append(
+            .prepare_segment_append_with_expected_put_state(
                 &crossed_append,
+                None,
                 AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             )
             .unwrap_err(),

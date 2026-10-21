@@ -348,6 +348,56 @@ pub struct AuthorizedStreamPutFinalization<'route, 'admission> {
     session: StreamUploadRecord,
 }
 
+/// Non-cloneable authority to encrypt and append one exact PutObject stream
+/// segment.
+///
+/// Storage derives this capability from the durable stream session and its
+/// existing object-generation reservation. Callers can inspect the bound
+/// encryption state and opaque segment subject, but cannot assemble or alter
+/// the bucket incarnation, object generation, segment index, or logical size.
+///
+/// ```compile_fail
+/// use storage::AuthorizedStreamPutSegment;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn duplicate(segment: &AuthorizedStreamPutSegment<'_, '_>) {
+///     require_clone(segment);
+/// }
+/// ```
+pub struct AuthorizedStreamPutSegment<'route, 'admission> {
+    route: &'route ActivePutObjectRoute<'admission>,
+    session: StreamUploadRecord,
+    generation_id: GenerationId,
+    segment_index: u32,
+    subject: SegmentEncryptionSubject,
+}
+
+impl AuthorizedStreamPutSegment<'_, '_> {
+    #[must_use]
+    pub fn session_id(&self) -> &SessionId {
+        &self.session.session_id
+    }
+
+    #[must_use]
+    pub fn segment_index(&self) -> u32 {
+        self.segment_index
+    }
+
+    #[must_use]
+    pub fn encryption(&self) -> &ObjectEncryption {
+        &self.session.encryption
+    }
+
+    #[must_use]
+    pub fn encryption_subject(&self) -> &SegmentEncryptionSubject {
+        &self.subject
+    }
+
+    fn matches_current_session(&self, current: &StreamUploadRecord) -> bool {
+        self.session.has_same_append_authority(current)
+    }
+}
+
 impl AuthorizedStreamPutFinalization<'_, '_> {
     #[must_use]
     pub fn encryption(&self) -> &ObjectEncryption {
@@ -355,24 +405,7 @@ impl AuthorizedStreamPutFinalization<'_, '_> {
     }
 
     fn matches_current_session(&self, current: &StreamUploadRecord) -> bool {
-        let reservation_matches = match (
-            self.session.bucket_write_reservation.as_ref(),
-            current.bucket_write_reservation.as_ref(),
-        ) {
-            (Some(expected), Some(current)) => expected.has_same_stable_identity(current),
-            (None, None) => true,
-            (Some(_), None) | (None, Some(_)) => false,
-        };
-        self.session.session_id == current.session_id
-            && self.session.bucket == current.bucket
-            && self.session.key == current.key
-            && self.session.target == current.target
-            && self.session.state == current.state
-            && self.session.created_at == current.created_at
-            && self.session.cleanup_after == current.cleanup_after
-            && self.session.encryption == current.encryption
-            && self.session.next_segment_vid == current.next_segment_vid
-            && reservation_matches
+        self.session.has_same_stable_identity(current)
     }
 }
 
@@ -421,6 +454,14 @@ struct PutObjectMutationEffectRoute<'a> {
     bucket: &'a BucketName,
     key: &'a ObjectKey,
     effect_fence: AdmittedRouteEffectFence,
+}
+
+struct StreamAppendCallbacks<Validate, BeforePrepare, RequireRoute, AfterPrepare, MaintainLease> {
+    validate_session: Validate,
+    before_prepare: BeforePrepare,
+    require_valid_route: RequireRoute,
+    after_prepare: AfterPrepare,
+    maintain_lease: MaintainLease,
 }
 
 #[derive(Clone, Copy)]
@@ -1015,6 +1056,89 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
+    fn load_stream_object_generation(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        self.admission
+            .require_valid_now_raw()
+            .map_err(ObjectPgActionError::from)?;
+        let generation_client = self
+            .admission
+            .cluster
+            .object_generation_metadata_primary_client(&self.bucket, &self.key)
+            .map_err(ObjectPgActionError::from)?;
+        generation_client
+            .open_object_generation_metadata_route(
+                self.admission.cluster.operation_epoch(),
+                self.object_pg_id,
+                &self.bucket,
+                &self.key,
+            )
+            .and_then(|route| route.object_generation_reservation(session_id))
+    }
+
+    /// Binds one stream segment to the exact durable PutObject session and
+    /// object-generation reservation before encryption begins.
+    pub fn authorize_stream_segment<'route>(
+        &'route self,
+        session_id: &SessionId,
+        segment_index: u32,
+        logical_plaintext_len: u64,
+    ) -> Result<AuthorizedStreamPutSegment<'route, 'admission>, crate::StreamUploadFailure> {
+        let session = self.load_stream_session(session_id)?;
+        let Some(bucket_write_reservation) = session.bucket_write_reservation.as_ref() else {
+            return Err(crate::StreamUploadFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "PutObject stream session is missing bucket write proof".to_string(),
+                },
+            ));
+        };
+        if session.bucket != self.bucket
+            || session.key != self.key
+            || session.session_id != *session_id
+            || session.target != StreamUploadTarget::PutObject
+            || session.state != StreamUploadState::InProgress
+            || bucket_write_reservation.bucket != self.bucket
+            || bucket_write_reservation.operation_kind
+                != PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            || bucket_write_reservation.target_context.as_deref() != Some(self.key.as_str())
+        {
+            return Err(crate::StreamUploadFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason:
+                        "stream segment subject does not match the admitted PutObject route"
+                            .to_string(),
+                },
+            ));
+        }
+        let generation_id = self
+            .load_stream_object_generation(session_id)
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
+        self.admission
+            .require_valid_now_raw()
+            .map_err(ObjectPgActionError::from)
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
+        let subject = SegmentEncryptionSubject::standard_object(
+            ObjectEncryptionSubject::standard_object(
+                bucket_write_reservation.bucket_incarnation_generation,
+                &self.bucket,
+                &self.key,
+                generation_id,
+                &session.encryption,
+            ),
+            segment_index,
+            logical_plaintext_len,
+        );
+        Ok(AuthorizedStreamPutSegment {
+            route: self,
+            session,
+            generation_id,
+            segment_index,
+            subject,
+        })
+    }
+
     pub fn authorize_stream_finalization<'route>(
         &'route self,
         session_id: &SessionId,
@@ -1053,38 +1177,211 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
-    pub fn append_stream_segment(
+    fn validate_stream_segment_authorization(
         &self,
-        input: StreamSegmentAppendInput<'_>,
+        authorization: &AuthorizedStreamPutSegment<'_, '_>,
+        storage_bytes: &[u8],
+    ) -> Result<(), crate::StreamUploadFailure> {
+        let logical_size = if storage_bytes.is_empty() {
+            0
+        } else {
+            storage_bytes
+                .len()
+                .checked_sub(
+                    authorization
+                        .session
+                        .encryption
+                        .segment_ciphertext_extra_len(),
+                )
+                .ok_or_else(|| {
+                    crate::StreamUploadFailure::from_object_pg_action(
+                        ObjectPgActionError::InvalidRequest {
+                            reason: "encrypted stream segment shorter than authentication tag"
+                                .to_string(),
+                        },
+                    )
+                })? as u64
+        };
+        if !std::ptr::eq(self, authorization.route)
+            || authorization.session.bucket != self.bucket
+            || authorization.session.key != self.key
+            || authorization.session.target != StreamUploadTarget::PutObject
+            || !authorization.subject.matches_standard_object_segment(
+                &authorization.session.encryption,
+                authorization.segment_index,
+                logical_size,
+            )
+        {
+            return Err(crate::StreamUploadFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason:
+                        "stream segment authorization does not match the admitted PutObject route or payload"
+                            .to_string(),
+                },
+            ));
+        }
+        let current_generation = match self
+            .load_stream_object_generation(&authorization.session.session_id)
+        {
+            Ok(generation_id) => generation_id,
+            Err(ObjectPgActionError::Metadata(
+                MetadataError::ObjectGenerationReservationNotFound { .. },
+            )) => {
+                return Err(crate::StreamUploadFailure::from_object_pg_action(
+                    ObjectPgActionError::InvalidRequest {
+                        reason: "stream segment object generation reservation changed".to_string(),
+                    },
+                ));
+            }
+            Err(error) => {
+                return Err(crate::StreamUploadFailure::from_object_pg_action(error));
+            }
+        };
+        if current_generation != authorization.generation_id {
+            return Err(crate::StreamUploadFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "stream segment object generation reservation changed".to_string(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Appends bytes encrypted under the exact subject minted from this
+    /// route's durable stream session and object-generation reservation.
+    pub fn append_authorized_stream_segment(
+        &self,
+        authorization: AuthorizedStreamPutSegment<'_, '_>,
+        payload_crc64: u64,
+        storage_bytes: &[u8],
     ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
+        self.validate_stream_segment_authorization(&authorization, storage_bytes)?;
+        let input = StreamSegmentAppendInput {
+            session_id: &authorization.session.session_id,
+            segment_index: authorization.segment_index,
+            payload_crc64,
+            storage_bytes,
+        };
+        let expected_put_state = crate::ExpectedStreamPutAppendState {
+            session: authorization.session.clone(),
+            generation_id: authorization.generation_id,
+        };
         self.admission
             .cluster
             .append_stream_segment_with_route_validation(
                 self.effect_route(),
                 input,
-                || self.admission.require_valid_now_raw(),
-                || {},
-                || Ok(()),
+                Some(expected_put_state),
+                StreamAppendCallbacks {
+                    validate_session: |current: &StreamUploadRecord| {
+                        if authorization.matches_current_session(current) {
+                            Ok(())
+                        } else {
+                            Err(ObjectPgActionError::InvalidRequest {
+                                reason: "stream segment authorization no longer matches the durable session"
+                                    .to_string(),
+                            })
+                        }
+                    },
+                    before_prepare: || {},
+                    require_valid_route: || self.admission.require_valid_now_raw(),
+                    after_prepare: || {},
+                    maintain_lease: || Ok(()),
+                },
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
-    /// Append one segment while maintaining a caller-owned reservation between
-    /// preparation, erasure-coded shard writes, and metadata commit.
-    pub fn append_stream_segment_with_lease_maintenance(
+    #[cfg(test)]
+    pub(crate) fn test_append_authorized_stream_segment_with_before_prepare(
         &self,
-        input: StreamSegmentAppendInput<'_>,
+        authorization: AuthorizedStreamPutSegment<'_, '_>,
+        payload_crc64: u64,
+        storage_bytes: &[u8],
+        before_prepare: impl FnMut(),
+    ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
+        self.validate_stream_segment_authorization(&authorization, storage_bytes)?;
+        let input = StreamSegmentAppendInput {
+            session_id: &authorization.session.session_id,
+            segment_index: authorization.segment_index,
+            payload_crc64,
+            storage_bytes,
+        };
+        let expected_put_state = crate::ExpectedStreamPutAppendState {
+            session: authorization.session.clone(),
+            generation_id: authorization.generation_id,
+        };
+        self.admission
+            .cluster
+            .append_stream_segment_with_route_validation(
+                self.effect_route(),
+                input,
+                Some(expected_put_state),
+                StreamAppendCallbacks {
+                    validate_session: |current: &StreamUploadRecord| {
+                        if authorization.matches_current_session(current) {
+                            Ok(())
+                        } else {
+                            Err(ObjectPgActionError::InvalidRequest {
+                                reason: "stream segment authorization no longer matches the durable session"
+                                    .to_string(),
+                            })
+                        }
+                    },
+                    before_prepare,
+                    require_valid_route: || self.admission.require_valid_now_raw(),
+                    after_prepare: || {},
+                    maintain_lease: || Ok(()),
+                },
+            )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
+    }
+
+    /// Appends one authorized segment while maintaining the caller-owned
+    /// reservation between preparation, shard writes, and publication.
+    pub fn append_authorized_stream_segment_with_lease_maintenance(
+        &self,
+        authorization: AuthorizedStreamPutSegment<'_, '_>,
+        payload_crc64: u64,
+        storage_bytes: &[u8],
         mut maintain_lease: impl FnMut() -> Result<(), crate::StreamUploadFailure>,
     ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
+        self.validate_stream_segment_authorization(&authorization, storage_bytes)?;
+        let input = StreamSegmentAppendInput {
+            session_id: &authorization.session.session_id,
+            segment_index: authorization.segment_index,
+            payload_crc64,
+            storage_bytes,
+        };
+        let expected_put_state = crate::ExpectedStreamPutAppendState {
+            session: authorization.session.clone(),
+            generation_id: authorization.generation_id,
+        };
         let result = self
             .admission
             .cluster
             .append_stream_segment_with_route_validation(
                 self.effect_route(),
                 input,
-                || self.admission.require_valid_now_raw(),
-                || {},
-                || maintain_lease().map_err(AdmittedStreamAppendError::Maintenance),
+                Some(expected_put_state),
+                StreamAppendCallbacks {
+                    validate_session: |current: &StreamUploadRecord| {
+                        if authorization.matches_current_session(current) {
+                            Ok(())
+                        } else {
+                            Err(ObjectPgActionError::InvalidRequest {
+                                reason: "stream segment authorization no longer matches the durable session"
+                                    .to_string(),
+                            })
+                        }
+                    },
+                    before_prepare: || {},
+                    require_valid_route: || self.admission.require_valid_now_raw(),
+                    after_prepare: || {},
+                    maintain_lease: || {
+                        maintain_lease().map_err(AdmittedStreamAppendError::Maintenance)
+                    },
+                },
             );
         match result {
             Ok(outcome) => Ok(outcome),
@@ -1102,43 +1399,62 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
     ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
+        let session = self.load_stream_session(input.session_id)?;
+        let logical_size = if input.storage_bytes.is_empty() {
+            0
+        } else {
+            input
+                .storage_bytes
+                .len()
+                .checked_sub(session.encryption.segment_ciphertext_extra_len())
+                .ok_or_else(|| {
+                    crate::StreamUploadFailure::from_object_pg_action(
+                        ObjectPgActionError::InvalidRequest {
+                            reason: "encrypted stream segment shorter than authentication tag"
+                                .to_string(),
+                        },
+                    )
+                })? as u64
+        };
+        let authorization = if matches!(session.target, StreamUploadTarget::PutObject) {
+            let authorization =
+                self.authorize_stream_segment(input.session_id, input.segment_index, logical_size)?;
+            self.validate_stream_segment_authorization(&authorization, input.storage_bytes)?;
+            Some(authorization)
+        } else {
+            None
+        };
+        let expected_put_state = authorization.as_ref().map(|authorization| {
+            crate::ExpectedStreamPutAppendState {
+                session: authorization.session.clone(),
+                generation_id: authorization.generation_id,
+            }
+        });
         self.admission
             .cluster
             .append_stream_segment_with_route_validation(
                 self.effect_route(),
                 input,
-                || self.admission.require_valid_now_raw(),
-                after_prepare,
-                || Ok(()),
+                expected_put_state,
+                StreamAppendCallbacks {
+                    validate_session: |current: &StreamUploadRecord| {
+                        if let Some(authorization) = authorization.as_ref() {
+                            if !authorization.matches_current_session(current) {
+                                return Err(ObjectPgActionError::InvalidRequest {
+                                    reason: "stream segment authorization no longer matches the durable session"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                        Ok(())
+                    },
+                    before_prepare: || {},
+                    require_valid_route: || self.admission.require_valid_now_raw(),
+                    after_prepare,
+                    maintain_lease: || Ok(()),
+                },
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub(crate) fn test_append_stream_segment_with_after_prepare_and_lease_maintenance(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-        after_prepare: impl FnMut(),
-        mut maintain_lease: impl FnMut() -> Result<(), crate::StreamUploadFailure>,
-    ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
-        let result = self
-            .admission
-            .cluster
-            .append_stream_segment_with_route_validation(
-                self.effect_route(),
-                input,
-                || self.admission.require_valid_now_raw(),
-                after_prepare,
-                || maintain_lease().map_err(AdmittedStreamAppendError::Maintenance),
-            );
-        match result {
-            Ok(outcome) => Ok(outcome),
-            Err(AdmittedStreamAppendError::Storage(error)) => {
-                Err(crate::StreamUploadFailure::from_object_pg_action(error))
-            }
-            Err(AdmittedStreamAppendError::Maintenance(error)) => Err(error),
-        }
     }
 
     pub fn heartbeat_stream_session(
@@ -1667,9 +1983,14 @@ impl ActiveMultipartObjectRoute<'_> {
             .append_stream_segment_with_route_validation(
                 self.stream_effect_route(),
                 input,
-                || self.admission.require_valid_now_raw(),
-                || {},
-                || Ok(()),
+                None,
+                StreamAppendCallbacks {
+                    validate_session: |_: &StreamUploadRecord| Ok(()),
+                    before_prepare: || {},
+                    require_valid_route: || self.admission.require_valid_now_raw(),
+                    after_prepare: || {},
+                    maintain_lease: || Ok(()),
+                },
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
@@ -1686,9 +2007,14 @@ impl ActiveMultipartObjectRoute<'_> {
             .append_stream_segment_with_route_validation(
                 self.stream_effect_route(),
                 input,
-                || self.admission.require_valid_now_raw(),
-                after_prepare,
-                || Ok(()),
+                None,
+                StreamAppendCallbacks {
+                    validate_session: |_: &StreamUploadRecord| Ok(()),
+                    before_prepare: || {},
+                    require_valid_route: || self.admission.require_valid_now_raw(),
+                    after_prepare,
+                    maintain_lease: || Ok(()),
+                },
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }

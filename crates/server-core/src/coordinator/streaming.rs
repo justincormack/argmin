@@ -8,9 +8,7 @@ use storage::{
 };
 
 #[cfg(test)]
-use storage::test_support::{
-    ActivePutObjectRouteTestSupport as _, ActiveStreamRouteTestSupport as _,
-};
+use storage::test_support::ActiveStreamRouteTestSupport as _;
 
 #[cfg(feature = "deep-tracing")]
 use super::INTERNAL_SEGMENT_SIZE;
@@ -42,6 +40,7 @@ trait StreamSegmentMutationRoute {
     ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure>;
 }
 
+#[cfg(test)]
 impl StreamSegmentMutationRoute for storage::ActivePutObjectRoute<'_> {
     #[cfg(not(test))]
     fn append_segment(
@@ -586,12 +585,27 @@ impl Coordinator {
         route: &storage::ActivePutObjectRoute<'_>,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &SessionId,
-        segment_index: u32,
+        authorization: storage::AuthorizedStreamPutSegment<'_, '_>,
         payload: super::StreamSegmentAppendPayload<'_>,
     ) -> Result<(), ServerError> {
-        self.append_stream_segment_on_route(route, bucket, key, session_id, segment_index, payload)
-            .map_err(Self::map_stream_upload_failure)
+        let session_id = authorization.session_id().clone();
+        let segment_index = authorization.segment_index();
+        let outcome = route
+            .append_authorized_stream_segment(
+                authorization,
+                payload.payload_crc64,
+                payload.storage_bytes,
+            )
+            .map_err(Self::map_stream_upload_failure)?;
+        Self::emit_stream_segment_layout(
+            &outcome.target,
+            bucket.as_str(),
+            key.as_str(),
+            &session_id,
+            segment_index,
+            outcome.logical_size as usize,
+        );
+        Ok(())
     }
 
     pub(super) fn append_stream_segment_on_admitted_put_route_with_lease_maintenance(
@@ -599,51 +613,36 @@ impl Coordinator {
         route: &storage::ActivePutObjectRoute<'_>,
         bucket: &BucketName,
         key: &ObjectKey,
-        append: super::AdmittedStreamSegmentAppend<'_>,
+        authorization: storage::AuthorizedStreamPutSegment<'_, '_>,
+        payload: super::StreamSegmentAppendPayload<'_>,
         maintain_lease: impl FnMut() -> Result<(), storage::StreamUploadFailure>,
     ) -> Result<(), ServerError> {
-        let super::AdmittedStreamSegmentAppend {
-            session_id,
-            segment_index,
-            payload,
-        } = append;
+        let session_id = authorization.session_id().clone();
+        let segment_index = authorization.segment_index();
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::append_stream_segment",
             "bucket={:?} key={:?} session_id={:?} segment_index={} bytes={}",
             bucket,
             key,
-            session_id,
+            &session_id,
             segment_index,
             payload.storage_bytes.len()
         );
-        let input = StreamSegmentAppendInput {
-            session_id,
-            segment_index,
-            payload_crc64: payload.payload_crc64,
-            storage_bytes: payload.storage_bytes,
-        };
-
-        #[cfg(test)]
         let outcome = route
-            .test_append_stream_segment_with_after_prepare_and_lease_maintenance(
-                input,
-                || {
-                    self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
-                },
+            .append_authorized_stream_segment_with_lease_maintenance(
+                authorization,
+                payload.payload_crc64,
+                payload.storage_bytes,
                 maintain_lease,
             )
-            .map_err(Self::map_stream_upload_failure)?;
-        #[cfg(not(test))]
-        let outcome = route
-            .append_stream_segment_with_lease_maintenance(input, maintain_lease)
             .map_err(Self::map_stream_upload_failure)?;
 
         Self::emit_stream_segment_layout(
             &outcome.target,
             bucket.as_str(),
             key.as_str(),
-            session_id,
+            &session_id,
             segment_index,
             outcome.logical_size as usize,
         );

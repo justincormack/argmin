@@ -5,6 +5,7 @@ use super::*;
 use crate::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterTopologyTestSupport as _,
 };
+use crate::PgMetadataStore as _;
 
 fn stage_encrypted_put_object_stream_segment(
     cluster: &crate::StorageCluster,
@@ -75,6 +76,188 @@ fn stage_encrypted_put_object_stream_segment(
         .unwrap();
     assert_eq!(stored_bytes, encrypted.storage_bytes);
     (encrypted, segment)
+}
+
+#[test]
+fn stream_segment_encryption_authority_binds_route_generation_and_geometry() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("stream-segment-subject");
+    let key = crate::tests::object_key("object");
+    let session_id = crate::tests::stream_session_id("subject-session");
+    let plaintext = b"subject-bound stream payload";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(plaintext, 0);
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            encrypted.encryption.clone(),
+        )
+        .unwrap();
+
+    let issuer_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let foreign_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let issuer_admission = issuer_handle.admit_current_route().unwrap();
+    let foreign_admission = foreign_handle.admit_current_route().unwrap();
+    let issuer_route = issuer_admission
+        .active_put_object_route(&bucket, &key)
+        .unwrap();
+    let foreign_route = foreign_admission
+        .active_put_object_route(&bucket, &key)
+        .unwrap();
+
+    let crossed = issuer_route
+        .authorize_stream_segment(&session_id, 0, plaintext.len() as u64)
+        .unwrap();
+    assert!(crossed
+        .encryption_subject()
+        .matches_standard_object_segment(&encrypted.encryption, 0, plaintext.len() as u64,));
+    assert!(!crossed
+        .encryption_subject()
+        .matches_standard_object_segment(&encrypted.encryption, 0, plaintext.len() as u64 + 1,));
+    let error = foreign_route
+        .append_authorized_stream_segment(
+            crossed,
+            encrypted.payload_crc64,
+            &encrypted.storage_bytes,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+
+    let stale = issuer_route
+        .authorize_stream_segment(&session_id, 0, plaintext.len() as u64)
+        .unwrap();
+    cluster
+        .release_object_generation_reservation(&bucket, &key, &session_id)
+        .unwrap();
+    let error = issuer_route
+        .append_authorized_stream_segment(stale, encrypted.payload_crc64, &encrypted.storage_bytes)
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+
+    let successful_session = crate::tests::stream_session_id("success-subject");
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &successful_session,
+            encrypted.encryption.clone(),
+        )
+        .unwrap();
+    let wrong_geometry = issuer_route
+        .authorize_stream_segment(&successful_session, 0, plaintext.len() as u64)
+        .unwrap();
+    let error = issuer_route
+        .append_authorized_stream_segment(
+            wrong_geometry,
+            encrypted.payload_crc64,
+            &encrypted.storage_bytes[..encrypted.storage_bytes.len() - 1],
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+    let authorization = issuer_route
+        .authorize_stream_segment(&successful_session, 0, plaintext.len() as u64)
+        .unwrap();
+    let outcome = issuer_route
+        .append_authorized_stream_segment(
+            authorization,
+            encrypted.payload_crc64,
+            &encrypted.storage_bytes,
+        )
+        .unwrap();
+    assert_eq!(outcome.target, crate::StreamUploadTarget::PutObject);
+    assert_eq!(outcome.logical_size, plaintext.len() as u64);
+}
+
+#[test]
+fn stream_segment_authority_is_rechecked_atomically_before_allocator_mutation() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("stream-segment-atomic-authority");
+    let key = crate::tests::object_key("object");
+    let session_id = crate::tests::stream_session_id("atomic-authority");
+    let plaintext = b"atomic stream append authority";
+    let encrypted = crate::tests::sse_s3_segment_test_fixture(plaintext, 0);
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            encrypted.encryption.clone(),
+        )
+        .unwrap();
+
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let authorization = route
+        .authorize_stream_segment(&session_id, 0, plaintext.len() as u64)
+        .unwrap();
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(0))
+        .unwrap();
+    let before = primary
+        .storage_node()
+        .get_pg(0)
+        .unwrap()
+        .get_stream_upload(&session_id)
+        .unwrap();
+    let shard_write_guard = crate::test_support::install_payload_shard_write_attempt_hook(
+        &cluster,
+        Arc::new(|_| Ok(())),
+    );
+    let error = route
+        .test_append_authorized_stream_segment_with_before_prepare(
+            authorization,
+            encrypted.payload_crc64,
+            &encrypted.storage_bytes,
+            || {
+                let pg = primary.storage_node().get_pg(0).unwrap();
+                pg.test_force_stream_upload_cleanup_after(&session_id, Some(1))
+                    .unwrap();
+                let changed = pg.get_stream_upload(&session_id).unwrap();
+                assert_eq!(changed.state, crate::StreamUploadState::InProgress);
+                assert_ne!(changed.cleanup_after, before.cleanup_after);
+                assert_eq!(changed.next_segment_vid, before.next_segment_vid);
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+    assert_eq!(
+        error.invalid_request_reason(),
+        Some("stream segment authorization no longer matches the durable session")
+    );
+
+    let pg = primary.storage_node().get_pg(0).unwrap();
+    let after = pg.get_stream_upload(&session_id).unwrap();
+    assert_eq!(after.state, crate::StreamUploadState::InProgress);
+    assert_eq!(after.cleanup_after, Some(1));
+    assert_eq!(after.next_segment_vid, before.next_segment_vid);
+    assert!(pg.list_stream_segments(&session_id).unwrap().is_empty());
+    assert_eq!(shard_write_guard.finish().count(), 0);
 }
 
 #[test]

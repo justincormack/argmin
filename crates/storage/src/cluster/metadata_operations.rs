@@ -6489,7 +6489,7 @@ impl StorageCluster {
             .map(|node| node.retained_object_mutation_metadata_client())
     }
 
-    fn object_generation_metadata_primary_client(
+    pub(super) fn object_generation_metadata_primary_client(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

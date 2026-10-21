@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 23;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 24;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -387,8 +387,11 @@ const STORAGE_RPC_MAX_STREAM_UPLOAD_BUCKET_WRITE_RESERVATION_UPDATE_PAYLOAD_LEN:
         + 16;
 const STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN;
+// Includes the exact expected PutObject session carried for under-lock
+// validation. Object encryption state is bounded by its u16 checksum-metadata
+// length and all remaining subject/proof strings have smaller protocol caps.
 const STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN + 4 + 8 + 8 + 8 + 1 + 8 + 8;
+    128 * 1024;
 const STORAGE_RPC_MAX_STREAM_FINALIZE_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_MULTIPART_COMPLETION_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
     2 * 1024 * 1024;

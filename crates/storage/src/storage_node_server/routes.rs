@@ -1810,6 +1810,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
     fn prepare_stream_segment_append(
         &self,
         request: &PrepareStreamUploadSegmentAppendReq,
+        expected_put_state: Option<&crate::ExpectedStreamPutAppendState>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), StorageNodeObjectRouteError> {
         self.route.require_valid_now()?;
@@ -1826,7 +1827,13 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
                 self.route.key,
                 &request.session_id,
             )
-            .and_then(|route| route.prepare_segment_append(request, effect_fence))
+            .and_then(|route| {
+                route.prepare_segment_append_with_expected_put_state(
+                    request,
+                    expected_put_state,
+                    effect_fence,
+                )
+            })
             .map_err(StorageNodeObjectRouteError::Object)?;
         segment.placement_cluster_epoch = self.route.fence.cluster_epoch;
         Ok((target, segment))

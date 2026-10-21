@@ -4865,7 +4865,11 @@ impl StorageNodeConnectionHandler {
         };
         let effect_fence =
             admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
-        let outcome = match route.prepare_stream_segment_append(&request.request, effect_fence) {
+        let outcome = match route.prepare_stream_segment_append(
+            &request.request,
+            request.expected_put_state.as_ref(),
+            effect_fence,
+        ) {
             Ok((target, segment)) => StorageRpcStreamSegmentAppendPrepareOutcome::Prepared {
                 target,
                 segment: Box::new(segment),

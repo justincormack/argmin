@@ -344,7 +344,7 @@ impl Coordinator {
                         let encryption_reservation = generation_reservation
                             .bind_encryption(&write_encryption.object_encryption())
                             .bind_standard_segment(req.data.len() as u64);
-                        let storage_bytes = write_encryption.encrypt_direct_put_segment(
+                        let storage_bytes = write_encryption.encrypt_standard_object_segment(
                             encryption_reservation.encryption_subject(),
                             0,
                             req.data,
@@ -465,14 +465,28 @@ impl Coordinator {
         let object_crc64 = checksum::crc64::checksum(req.data);
         let write_encryption = &authorized.write_encryption;
         for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
+            let segment_index = idx as u32;
             let chunk_crc64 = checksum::crc64::checksum(chunk);
-            let chunk_storage = write_encryption.encrypt_segment(idx as u32, chunk)?;
+            let segment_authorization = route
+                .authorize_stream_segment(
+                    session_id,
+                    segment_index,
+                    u64::try_from(chunk.len()).map_err(|_| ServerError::InternalError {
+                        reason: "stream segment length does not fit the encryption subject"
+                            .to_string(),
+                    })?,
+                )
+                .map_err(Self::map_stream_upload_failure)?;
+            let chunk_storage = write_encryption.encrypt_standard_object_segment(
+                segment_authorization.encryption_subject(),
+                segment_index,
+                chunk,
+            )?;
             self.append_stream_segment_on_admitted_put_route(
                 route,
                 authorized.bucket_typed(),
                 authorized.key_typed(),
-                session_id,
-                idx as u32,
+                segment_authorization,
                 super::StreamSegmentAppendPayload::new(&chunk_storage, chunk_crc64),
             )?;
         }
@@ -613,23 +627,32 @@ impl Coordinator {
         let route = admission
             .active_put_object_route(req.bucket, req.key)
             .map_err(super::map_store_failure)?;
-        let session = route
-            .load_stream_session(req.session_id)
+        let segment_authorization = route
+            .authorize_stream_segment(
+                req.session_id,
+                req.segment_index,
+                u64::try_from(req.data.len()).map_err(|_| ServerError::InternalError {
+                    reason: "stream segment length does not fit the encryption subject".to_string(),
+                })?,
+            )
             .map_err(Self::map_stream_upload_failure)?;
         let write_encryption = self.resume_write_encryption(
-            &session.encryption,
+            segment_authorization.encryption(),
             req.sse_customer,
             crate::sse::SseCustomerSegmentScope::object(),
             false,
         )?;
         let payload_crc64 = checksum::crc64::checksum(req.data);
-        let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
+        let storage_data = write_encryption.encrypt_standard_object_segment(
+            segment_authorization.encryption_subject(),
+            req.segment_index,
+            req.data,
+        )?;
         self.append_stream_segment_on_admitted_put_route(
             &route,
             req.bucket,
             req.key,
-            req.session_id,
-            req.segment_index,
+            segment_authorization,
             super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
         )
     }

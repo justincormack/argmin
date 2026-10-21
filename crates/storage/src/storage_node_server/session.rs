@@ -1043,6 +1043,16 @@ fn object_pg_error_response(error: ObjectPgActionError) -> StorageRpcErrorRespon
         ObjectPgActionError::Store(error @ StoreError::RouteMapExpired { .. }) => {
             store_error_response(error)
         }
+        ObjectPgActionError::Store(error @ StoreError::RouteCapabilitySubjectMismatch { .. }) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: error.to_string(),
+            }
+        }
+        ObjectPgActionError::InvalidRequest { reason } => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: reason,
+        },
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),

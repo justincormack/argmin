@@ -118,6 +118,7 @@ fn assert_abort_fences_delayed_stream_write(target: Target, pause_after: PauseAf
                 segment_crc64: encrypted.storage_crc64,
                 payload_crc64: encrypted.payload_crc64,
             },
+            None,
             || admission.require_valid_now_raw(),
         )
         .unwrap();

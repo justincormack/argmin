@@ -2643,14 +2643,21 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         payload_crc64: 99,
     };
     let (target, _) = correct_stream_session_route
-        .prepare_segment_append(&append, effect_fence)
+        .prepare_segment_append_with_expected_put_state(
+            &append,
+            Some(&crate::ExpectedStreamPutAppendState {
+                session: session.clone(),
+                generation_id: snapshot.generation_id,
+            }),
+            effect_fence,
+        )
         .unwrap();
     assert_eq!(target, StreamUploadTarget::PutObject);
     let mut crossed_append = append.clone();
     crossed_append.session_id = part_session_id.clone();
     assert!(matches!(
         correct_stream_session_route
-            .prepare_segment_append(&crossed_append, effect_fence)
+            .prepare_segment_append_with_expected_put_state(&crossed_append, None, effect_fence)
             .unwrap_err(),
         ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
             operation: "prepare stream segment append",
@@ -2659,6 +2666,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     let append_rpc_request = crate::storage_rpc::StorageRpcStreamSegmentAppendPrepareRequest {
         object: client.object_request(wrong_pg.pg_id(), &bucket, &key),
         request: append,
+        expected_put_state: None,
         effect_deadline: None,
     };
     let wrong_append_error = client

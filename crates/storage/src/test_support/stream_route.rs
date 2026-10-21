@@ -104,30 +104,3 @@ impl ActiveStreamRouteTestSupport for ActiveMultipartObjectRoute<'_> {
         )
     }
 }
-
-/// PUT-specific admitted-route scheduling support which preserves the
-/// caller-owned reservation heartbeat during the injected pause.
-pub trait ActivePutObjectRouteTestSupport {
-    fn test_append_stream_segment_with_after_prepare_and_lease_maintenance(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-        after_prepare: impl FnMut(),
-        maintain_lease: impl FnMut() -> Result<(), StreamUploadFailure>,
-    ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure>;
-}
-
-impl ActivePutObjectRouteTestSupport for ActivePutObjectRoute<'_> {
-    fn test_append_stream_segment_with_after_prepare_and_lease_maintenance(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-        after_prepare: impl FnMut(),
-        maintain_lease: impl FnMut() -> Result<(), StreamUploadFailure>,
-    ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure> {
-        ActivePutObjectRoute::test_append_stream_segment_with_after_prepare_and_lease_maintenance(
-            self,
-            input,
-            after_prepare,
-            maintain_lease,
-        )
-    }
-}

@@ -309,11 +309,29 @@ impl LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
+        expected_put_state: Option<&crate::ExpectedStreamPutAppendState>,
         effect_fence: Option<AdmittedRouteEffectFence>,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let session = pg.get_stream_upload(&request.session_id)?;
         validate_stream_upload_session_binding(&session, bucket, key)?;
+        match (&session.target, expected_put_state) {
+            (StreamUploadTarget::PutObject, Some(expected))
+                if expected.session.has_same_append_authority(&session) => {}
+            (StreamUploadTarget::PutObject, Some(_) | None) => {
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "stream segment authorization no longer matches the durable session"
+                        .to_string(),
+                });
+            }
+            (StreamUploadTarget::UploadPart { .. }, Some(_)) => {
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "PutObject stream segment authority cannot authorize UploadPart"
+                        .to_string(),
+                });
+            }
+            (StreamUploadTarget::UploadPart { .. }, None) => {}
+        }
         reject_duplicate_stream_segment_index(&pg, &request.session_id, request.segment_index)?;
         let pg_topology = self.storage_node.pg_topology();
         let segment_okh =
@@ -322,6 +340,13 @@ impl LocalStorageNodeClient {
             StreamUploadTarget::PutObject => {
                 let generation_id =
                     pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
+                if expected_put_state
+                    .is_some_and(|expected| expected.generation_id != generation_id)
+                {
+                    return Err(ObjectPgActionError::InvalidRequest {
+                        reason: "stream segment object generation reservation changed".to_string(),
+                    });
+                }
                 if let Some(effect_fence) = effect_fence {
                     effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
                 }
@@ -3879,9 +3904,10 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
         )
     }
 
-    fn prepare_segment_append(
+    fn prepare_segment_append_with_expected_put_state(
         &self,
         request: &PrepareStreamUploadSegmentAppendReq,
+        expected_put_state: Option<&crate::ExpectedStreamPutAppendState>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         effect_fence.require_valid_for(self.route_cluster_epoch)?;
@@ -3896,6 +3922,7 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
             &self.bucket,
             &self.key,
             request,
+            expected_put_state,
             Some(effect_fence),
         )
     }

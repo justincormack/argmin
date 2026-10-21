@@ -6886,16 +6886,35 @@ impl StorageCluster {
         let pg_id = object_pg_id.pg_id();
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let (target, mut segment_record) = mutation_client
-            .open_stream_upload_session_metadata_route(
+        let stream_route = mutation_client.open_stream_upload_session_metadata_route(
                 self.operation_epoch(),
                 object_pg_id,
                 bucket,
                 key,
                 &request.session_id,
-            )?
-            .prepare_segment_append(
+            )?;
+        let session = stream_route.load_session()?;
+        let expected_put_state = if matches!(session.target, StreamUploadTarget::PutObject) {
+            let generation_route = self
+                .object_generation_metadata_primary_client(bucket, key)?
+                .open_object_generation_metadata_route(
+                    self.operation_epoch(),
+                    object_pg_id,
+                    bucket,
+                    key,
+                )?;
+            Some(crate::ExpectedStreamPutAppendState {
+                generation_id: generation_route
+                    .object_generation_reservation(&request.session_id)?,
+                session,
+            })
+        } else {
+            None
+        };
+        let (target, mut segment_record) = stream_route
+            .prepare_segment_append_with_expected_put_state(
                 request,
+                expected_put_state.as_ref(),
                 AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             )?;
         segment_record.placement_cluster_epoch = self.operation_epoch();
@@ -6911,36 +6930,73 @@ impl StorageCluster {
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
     ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
-        self.append_stream_segment_with_route_validation(
-            PutObjectMutationEffectRoute {
+        let route = PutObjectMutationEffectRoute {
                 bucket_pg_id: self.bucket_metadata_pg(bucket),
                 object_pg_id: self.object_metadata_pg(bucket, key),
                 bucket,
                 key,
                 effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-            },
+            };
+        let session = self.load_stream_upload_session_on_route(route, input.session_id)?;
+        let expected_put_state = if matches!(session.target, StreamUploadTarget::PutObject) {
+            let generation_route = self
+                .object_generation_metadata_primary_client(bucket, key)?
+                .open_object_generation_metadata_route(
+                    self.operation_epoch(),
+                    route.object_pg_id,
+                    bucket,
+                    key,
+                )?;
+            Some(crate::ExpectedStreamPutAppendState {
+                generation_id: generation_route
+                    .object_generation_reservation(input.session_id)?,
+                session,
+            })
+        } else {
+            None
+        };
+        self.append_stream_segment_with_route_validation(
+            route,
             input,
-            || Ok(()),
-            after_prepare,
-            || Ok(()),
+            expected_put_state,
+            StreamAppendCallbacks {
+                validate_session: |_: &StreamUploadRecord| Ok(()),
+                before_prepare: || {},
+                require_valid_route: || Ok(()),
+                after_prepare,
+                maintain_lease: || Ok(()),
+            },
         )
     }
 
-    fn append_stream_segment_with_route_validation<E>(
+    fn append_stream_segment_with_route_validation<E, Validate, BeforePrepare, RequireRoute, AfterPrepare, MaintainLease>(
         &self,
         route: PutObjectMutationEffectRoute<'_>,
         input: StreamSegmentAppendInput<'_>,
-        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
-        mut after_prepare: impl FnMut(),
-        mut maintain_lease: impl FnMut() -> Result<(), E>,
+        expected_put_state: Option<crate::ExpectedStreamPutAppendState>,
+        mut callbacks: StreamAppendCallbacks<
+            Validate,
+            BeforePrepare,
+            RequireRoute,
+            AfterPrepare,
+            MaintainLease,
+        >,
     ) -> Result<StreamSegmentAppendOutcome, E>
     where
         E: From<ObjectPgActionError> + From<StoreError>,
+        Validate: for<'session> FnMut(
+            &'session StreamUploadRecord,
+        ) -> Result<(), ObjectPgActionError>,
+        BeforePrepare: FnMut(),
+        RequireRoute: FnMut() -> Result<(), StoreError>,
+        AfterPrepare: FnMut(),
+        MaintainLease: FnMut() -> Result<(), E>,
     {
-        require_valid_route().map_err(ObjectPgActionError::Store)?;
+        (callbacks.require_valid_route)().map_err(ObjectPgActionError::Store)?;
         let session = self
             .load_stream_upload_session_on_route(route, input.session_id)
             .map_err(E::from)?;
+        (callbacks.validate_session)(&session).map_err(E::from)?;
         let logical_size = if input.storage_bytes.is_empty() {
             0
         } else {
@@ -6953,6 +7009,7 @@ impl StorageCluster {
                 })
                 .map_err(E::from)? as u64
         };
+        (callbacks.before_prepare)();
         let (target, segment_record) = self
             .prepare_stream_segment_append_with_route_validation(
                 route,
@@ -6963,19 +7020,20 @@ impl StorageCluster {
                     segment_crc64: checksum::crc64::checksum(input.storage_bytes),
                     payload_crc64: input.payload_crc64,
                 },
-                &mut require_valid_route,
+                expected_put_state.as_ref(),
+                &mut callbacks.require_valid_route,
             )
             .map_err(E::from)?;
-        after_prepare();
-        maintain_lease()?;
+        (callbacks.after_prepare)();
+        (callbacks.maintain_lease)()?;
         let written_shards = self.write_stream_segment_payload_shards_with_route_validation(
             &segment_record,
             input.storage_bytes,
             route.effect_fence,
-            &mut require_valid_route,
-            &mut maintain_lease,
+            &mut callbacks.require_valid_route,
+            &mut callbacks.maintain_lease,
         )?;
-        if let Err(error) = maintain_lease() {
+        if let Err(error) = (callbacks.maintain_lease)() {
             self.delete_stream_segment_payload_shard_keys_best_effort(
                 &segment_record,
                 written_shards.iter().map(|written| written.key.clone()),
@@ -6998,7 +7056,7 @@ impl StorageCluster {
             route,
             request,
             &target,
-            require_valid_route,
+            &mut callbacks.require_valid_route,
         )
         .map_err(E::from)?;
         Ok(StreamSegmentAppendOutcome {
@@ -7011,6 +7069,7 @@ impl StorageCluster {
         &self,
         route: PutObjectMutationEffectRoute<'_>,
         request: &PrepareStreamUploadSegmentAppendReq,
+        expected_put_state: Option<&crate::ExpectedStreamPutAppendState>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let pg_id = route.object_pg_id.pg_id();
@@ -7075,7 +7134,11 @@ impl StorageCluster {
                     route.key,
                     &request.session_id,
                 )?
-                .prepare_segment_append(request, route.effect_fence)?;
+                .prepare_segment_append_with_expected_put_state(
+                    request,
+                    expected_put_state,
+                    route.effect_fence,
+                )?;
             segment_record.placement_cluster_epoch = self.operation_epoch();
             return Ok((target, segment_record));
         }

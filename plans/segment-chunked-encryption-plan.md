@@ -182,8 +182,8 @@ The write-path inventory is:
 | Effective path | Current codec selection and identity timing | Required Phase 1/2 seam |
 | --- | --- | --- |
 | Buffered direct `PutObject` | Reserves the immutable object generation through a non-cloneable, one-use RAII handoff before encrypting segment zero. The current segment AEAD still does not consume that identity. | Mint the opaque standard-object subject from the reservation handoff, then construct the subject-bound segment encoder. |
-| Promoted buffered and streamed `PutObject`/POST Object | Session creation already durably reserves the eventual object generation under the session ID; append placement and finalization reload that reservation, but encryption does not consume it. Every append independently calls `encrypt_segment`. | Reuse the existing storage-owned reservation as the owner-minted encryption subject and expose it only through a subject-bound session encoder; do not duplicate it in `StreamUploadRecord`. |
-| `CopyObject` destination | Reads source chunks and feeds them to the same destination stream append/encryption path. | Use the same destination session subject and encoder as streamed PUT; source encryption state never supplies destination identity. |
+| Promoted buffered and streamed `PutObject`/POST Object | Session creation durably reserves the eventual object generation under the session ID. Each append now reloads that exact reservation through a non-cloneable storage capability, binds it to the session encryption state plus segment geometry before encryption, and consumes the capability during append. | Replace the current whole-segment cipher call with the common subject-bound session encoder without changing identity allocation or duplicating the generation in `StreamUploadRecord`. |
+| `CopyObject` destination | Reads source chunks and feeds them through the same destination session subject and append capability as streamed PUT; the source encryption state cannot supply destination identity. | Replace the current whole-segment cipher call with the same destination session encoder as streamed PUT. |
 | `UploadPart` | The session target binds upload ID and part number, but no immutable generation for the new part is fixed before its first encrypted segment. | Allocate and persist the part payload generation at session creation and bind every segment to upload, part number, part generation, and segment index. |
 | `UploadPartCopy` destination | Uses the same multipart stream append path after reading source chunks. | Use exactly the same part-session subject and encoder as ordinary `UploadPart`. |
 | Full and ranged object/copy-source reads | Infer the representation from `ObjectEncryption`, read and verify a complete segment, decrypt one AEAD record, then slice. | Dispatch on an explicit durable profile and let its subject-bound reader define stored spans, authentication, release, finalization, and physical-health evidence. |
@@ -781,9 +781,10 @@ Implementation update (2026-10-17):
 - The write/read inventory now identifies the current branch points and the identity-ordering gaps
   for direct PUT, streamed PUT/POST, CopyObject, UploadPart, UploadPartCopy, full reads, and range
   reads. Direct PUT now reserves its generation before encryption through a one-use storage-owned
-  handoff, but the current AEAD does not yet consume that subject. Streamed PUT durably reserves its
-  object generation at session creation but does not thread that reservation into encryption, and
-  UploadPart does not yet fix its replacement-part generation before encryption.
+  handoff, but the current AEAD does not yet consume that subject as cryptographic context. Streamed
+  PUT and CopyObject destinations now thread the existing session-owned generation reservation into
+  an owner-minted segment subject before encryption. UploadPart does not yet fix its replacement-part
+  generation before encryption.
 - The target seam is an exhaustive internal durable-profile registry producing opaque,
   subject-bound incremental encoders and readers. It owns stored-size/range geometry, plaintext
   release, and consuming finalization; AWS-visible key mode remains a separate dimension. The
@@ -840,8 +841,7 @@ Implementation update (2026-10-21):
   generation with an independently supplied reservation ID or manually compensates for staging
   failure.
 - This completed the direct-PUT ordering and ownership prerequisite used by the object- and
-  segment-subject work recorded below. Streamed PUT, copy, and multipart identity work remains
-  open.
+  segment-subject work recorded below. Multipart part identity work remains open.
 - The direct-PUT reservation is now also minted only from the exact bucket-write proof for the
   admitted bucket, key, epoch, and canonical direct-commit operation. Storage captures the proof's
   bucket-incarnation generation in the non-cloneable reservation and carries it through the opaque
@@ -883,6 +883,24 @@ Implementation update (2026-10-21):
   index, length, and same-wrap-nonce key-material fixtures pin this first provenance variant. The
   existing whole-segment ciphertext still uses its frozen legacy AAD until Phase 2 changes the
   durable profile.
+- Promoted buffered PUT, streamed PutObject/POST Object, and CopyObject destinations now reuse the
+  generation reservation already created with the durable stream session. An admitted object route
+  reloads the exact session, stable bucket-write proof, bucket incarnation, and reserved object
+  generation to mint a non-cloneable `AuthorizedStreamPutSegment` before encryption. The
+  coordinator can inspect only the session encryption state and opaque segment subject; append
+  consumes that authority and revalidates its issuing route, exact logical size, immutable
+  encryption material, current stable session identity, and unchanged generation reservation
+  before segment allocation or shard writes. The captured stable session and generation are also
+  carried in storage-RPC v24 and compared again under the object-PG mutation lock immediately
+  before `next_segment_vid` allocation; a deterministic validation-to-preparation interleaving
+  proves stale authority cannot allocate an additional segment or reach shard writes. The raw
+  PutObject append surface is now test-only;
+  production PutObject and CopyObject destinations cannot submit caller-assembled segment identity.
+  Heartbeat updates remain valid because matching compares stable reservation identity while
+  ignoring only the mutable lease deadline. The durable generation remains solely in the existing
+  object-generation reservation rather than being duplicated in `StreamUploadRecord`. Current
+  whole-segment ciphertext is intentionally unchanged until Phase 2 supplies the common
+  subject-bound encoder.
 
 - Introduce private canonical context codecs and opaque subject constructors.
 - Ensure every write path exposes its existing or newly allocated immutable generation to the
