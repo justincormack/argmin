@@ -271,11 +271,20 @@ pub struct DirectPutEncryptionReservation<'admission> {
     subject: ObjectEncryptionSubject,
 }
 
-impl DirectPutEncryptionReservation<'_> {
-    /// Returns the opaque subject which the encryption boundary must consume.
+impl<'admission> DirectPutEncryptionReservation<'admission> {
+    /// Extends this exact object subject with the sole standard-object segment
+    /// and transfers the generation reservation into that segment capability.
     #[must_use]
-    pub fn encryption_subject(&self) -> &ObjectEncryptionSubject {
-        &self.subject
+    pub fn bind_standard_segment(
+        self,
+        logical_plaintext_len: u64,
+    ) -> DirectPutSegmentEncryptionReservation<'admission> {
+        let segment_subject =
+            SegmentEncryptionSubject::standard_object(self.subject, 0, logical_plaintext_len);
+        DirectPutSegmentEncryptionReservation {
+            generation: self.generation,
+            subject: segment_subject,
+        }
     }
 }
 
@@ -283,6 +292,39 @@ impl std::fmt::Debug for DirectPutEncryptionReservation<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DirectPutEncryptionReservation")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Non-cloneable direct-PUT generation reservation bound to the exact
+/// standard-object segment encryption subject.
+///
+/// ```compile_fail
+/// use storage::DirectPutSegmentEncryptionReservation;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn duplicate(reservation: &DirectPutSegmentEncryptionReservation<'_>) {
+///     require_clone(reservation);
+/// }
+/// ```
+pub struct DirectPutSegmentEncryptionReservation<'admission> {
+    generation: DirectPutGenerationReservation<'admission>,
+    subject: SegmentEncryptionSubject,
+}
+
+impl DirectPutSegmentEncryptionReservation<'_> {
+    /// Returns the opaque segment subject which the encryption boundary must
+    /// consume.
+    #[must_use]
+    pub fn encryption_subject(&self) -> &SegmentEncryptionSubject {
+        &self.subject
+    }
+}
+
+impl std::fmt::Debug for DirectPutSegmentEncryptionReservation<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectPutSegmentEncryptionReservation")
             .finish_non_exhaustive()
     }
 }
@@ -1154,13 +1196,12 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
-    pub fn write_direct_object_payload(
+    pub fn write_direct_object_segment_payload(
         &self,
-        encryption_reservation: DirectPutEncryptionReservation<'admission>,
-        logical_size: u64,
+        encryption_reservation: DirectPutSegmentEncryptionReservation<'admission>,
         data: &[u8],
     ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
-        let DirectPutEncryptionReservation {
+        let DirectPutSegmentEncryptionReservation {
             generation: generation_reservation,
             subject: encryption_subject,
         } = encryption_reservation;
@@ -1180,11 +1221,25 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             generation_reservation.generation_id,
             generation_reservation.bucket_incarnation_generation,
             encryption_subject,
-            logical_size,
             data,
         )?;
         generation_reservation.disarm();
         Ok(payload)
+    }
+
+    /// Owner-local adapter for fixtures that prepare encrypted bytes before
+    /// entering the production segment-subject boundary.
+    #[cfg(test)]
+    pub(crate) fn write_direct_object_payload(
+        &self,
+        encryption_reservation: DirectPutEncryptionReservation<'admission>,
+        logical_size: u64,
+        data: &[u8],
+    ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
+        self.write_direct_object_segment_payload(
+            encryption_reservation.bind_standard_segment(logical_size),
+            data,
+        )
     }
 
     fn write_direct_object_payload_for_reserved_generation(
@@ -1192,8 +1247,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         generation_reservation_id: &SessionId,
         generation_id: GenerationId,
         bucket_incarnation_generation: u64,
-        encryption_subject: ObjectEncryptionSubject,
-        logical_size: u64,
+        encryption_subject: SegmentEncryptionSubject,
         data: &[u8],
     ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
         let segment_index = 0;
@@ -1211,6 +1265,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::DirectPutFailure::from_store)?;
+        let logical_size = encryption_subject.logical_plaintext_len();
         Ok(DirectPutPayloadWrite {
             owner: self.admission,
             armed: std::cell::Cell::new(true),
@@ -1253,12 +1308,16 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             .map_err(crate::DirectPutFailure::from_object_pg_action)?;
         let proof = BucketWriteReservationProof::from(&reservation.record);
         let bucket_incarnation_generation = proof.bucket_incarnation_generation;
-        let encryption_subject = ObjectEncryptionSubject::standard_object(
-            bucket_incarnation_generation,
-            &self.bucket,
-            &self.key,
-            generation_id,
-            encryption,
+        let encryption_subject = SegmentEncryptionSubject::standard_object(
+            ObjectEncryptionSubject::standard_object(
+                bucket_incarnation_generation,
+                &self.bucket,
+                &self.key,
+                generation_id,
+                encryption,
+            ),
+            0,
+            logical_size,
         );
         self.admission
             .cluster
@@ -1270,7 +1329,6 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             generation_id,
             bucket_incarnation_generation,
             encryption_subject,
-            logical_size,
             data,
         )
     }
@@ -1315,12 +1373,16 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 },
             ));
         }
-        let expected_encryption_subject = ObjectEncryptionSubject::standard_object(
-            payload.bucket_incarnation_generation,
-            &payload.bucket,
-            &payload.key,
-            payload.generation_id,
-            &prepared.encryption,
+        let expected_encryption_subject = SegmentEncryptionSubject::standard_object(
+            ObjectEncryptionSubject::standard_object(
+                payload.bucket_incarnation_generation,
+                &payload.bucket,
+                &payload.key,
+                payload.generation_id,
+                &prepared.encryption,
+            ),
+            payload.segment_index,
+            payload.logical_size,
         );
         if payload.encryption_subject != expected_encryption_subject {
             self.admission

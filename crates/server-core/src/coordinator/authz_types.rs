@@ -282,14 +282,22 @@ impl ActiveWriteEncryption {
 
     pub(super) fn encrypt_direct_put_segment(
         &self,
-        subject: &storage::ObjectEncryptionSubject,
+        subject: &storage::SegmentEncryptionSubject,
         segment_index: u32,
         data: &[u8],
     ) -> Result<Vec<u8>, ServerError> {
-        if !subject.matches_encryption(&self.object_encryption()) {
+        let logical_plaintext_len =
+            u64::try_from(data.len()).map_err(|_| ServerError::InternalError {
+                reason: "direct PUT segment length does not fit the encryption subject".to_string(),
+            })?;
+        if !subject.matches_standard_object_segment(
+            &self.object_encryption(),
+            segment_index,
+            logical_plaintext_len,
+        ) {
             return Err(ServerError::InternalError {
                 reason:
-                    "direct PUT encryption subject does not match the write encryption instance"
+                    "direct PUT segment subject does not match the write encryption instance or geometry"
                         .to_string(),
             });
         }

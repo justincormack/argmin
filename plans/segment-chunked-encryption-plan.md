@@ -1,6 +1,6 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phase 0 complete; Phase 1 exact encryption subjects next)
+Status: In progress (Phase 0 complete; Phase 1 exact encryption subjects underway)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -839,17 +839,16 @@ Implementation update (2026-10-21):
   while cleanup remains bound to the issuer. The coordinator no longer combines a caller-held
   generation with an independently supplied reservation ID or manually compensates for staging
   failure.
-- This completes the direct-PUT ordering and ownership prerequisite only. The reservation must next
-  mint the canonical standard-object encryption subject, and the streamed PUT, copy, and multipart
-  identity work below remains open.
+- This completed the direct-PUT ordering and ownership prerequisite used by the object- and
+  segment-subject work recorded below. Streamed PUT, copy, and multipart identity work remains
+  open.
 - The direct-PUT reservation is now also minted only from the exact bucket-write proof for the
   admitted bucket, key, epoch, and canonical direct-commit operation. Storage captures the proof's
   bucket-incarnation generation in the non-cloneable reservation and carries it through the opaque
   staged-payload handle; terminal publication rejects a different incarnation before command
   construction. Crossed key, operation, and incarnation proofs are rejected before the object
-  generation allocator advances. This supplies the complete storage-owned object identity needed
-  for the next slice to mint the standard-object encryption subject without letting the
-  coordinator assemble its fields.
+  generation allocator advances. This supplied the complete storage-owned object identity used to
+  mint the standard-object encryption subject without letting the coordinator assemble its fields.
 - The direct-PUT reservation now consumes that identity to mint a non-cloneable, opaque
   `ObjectEncryptionSubject` before encryption. Its frozen V1 canonical encoding is binary,
   versioned, profile-tagged, length-prefixed, and binds the current profile, the encryption
@@ -875,6 +874,15 @@ Implementation update (2026-10-21):
   still uses its frozen legacy AAD. Binding the canonical bytes into wrap, checksum, and segment
   cryptography remains coupled to the explicit durable-profile and containing-format bump, so no
   current-format fixture is silently reinterpreted.
+- The buffered direct-PUT capability now extends the object subject with a non-cloneable canonical
+  `SegmentEncryptionSubject` before encryption. The V1 extension binds standard-object provenance,
+  segment index zero, and the exact logical plaintext length. The encryption boundary validates
+  encryption material and geometry before producing bytes; staging consumes that same capability,
+  derives logical size from it rather than a parallel argument, and terminal publication
+  reconstructs the exact segment subject before command construction. Exact encoding plus crossed
+  index, length, and same-wrap-nonce key-material fixtures pin this first provenance variant. The
+  existing whole-segment ciphertext still uses its frozen legacy AAD until Phase 2 changes the
+  durable profile.
 
 - Introduce private canonical context codecs and opaque subject constructors.
 - Ensure every write path exposes its existing or newly allocated immutable generation to the

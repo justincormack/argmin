@@ -1440,6 +1440,8 @@ const OBJECT_ENCRYPTION_SUBJECT_DOMAIN: &[u8] = b"argmin:object-encryption-subje
 const OBJECT_ENCRYPTION_SUBJECT_VERSION: u8 = 1;
 const SEGMENT_AES_256_GCM_V1_PROFILE_TAG: u8 = 1;
 const OBJECT_ENCRYPTION_INSTANCE_ID_LEN: usize = 1 + OBJECT_ENCRYPTION_WRAP_NONCE_LEN;
+const SEGMENT_ENCRYPTION_SUBJECT_VERSION: u8 = 1;
+const STANDARD_OBJECT_SEGMENT_PROVENANCE_TAG: u8 = 1;
 
 /// Opaque canonical identity authenticated by one object's payload encryption.
 ///
@@ -1653,6 +1655,87 @@ impl std::fmt::Debug for ObjectEncryptionSubject {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ObjectEncryptionSubject")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque canonical identity for one encrypted standard-object segment.
+///
+/// The subject extends an owner-minted [`ObjectEncryptionSubject`] with the
+/// segment provenance, index, and logical plaintext length. It is deliberately
+/// non-cloneable and can only be derived from an existing object subject.
+///
+/// ```compile_fail
+/// use storage::SegmentEncryptionSubject;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn duplicate(subject: &SegmentEncryptionSubject) {
+///     require_clone(subject);
+/// }
+/// ```
+pub struct SegmentEncryptionSubject {
+    object: ObjectEncryptionSubject,
+    canonical: Box<[u8]>,
+    segment_index: u32,
+    logical_plaintext_len: u64,
+}
+
+impl SegmentEncryptionSubject {
+    pub(crate) fn standard_object(
+        object: ObjectEncryptionSubject,
+        segment_index: u32,
+        logical_plaintext_len: u64,
+    ) -> Self {
+        let mut canonical = Vec::with_capacity(object.canonical.len() + 1 + 1 + 4 + 8);
+        canonical.extend_from_slice(&object.canonical);
+        canonical.push(SEGMENT_ENCRYPTION_SUBJECT_VERSION);
+        canonical.push(STANDARD_OBJECT_SEGMENT_PROVENANCE_TAG);
+        canonical.extend_from_slice(&segment_index.to_be_bytes());
+        canonical.extend_from_slice(&logical_plaintext_len.to_be_bytes());
+        Self {
+            object,
+            canonical: canonical.into_boxed_slice(),
+            segment_index,
+            logical_plaintext_len,
+        }
+    }
+
+    /// Returns whether the supplied encryption state and segment geometry are
+    /// the exact values from which this subject was minted.
+    #[must_use]
+    pub fn matches_standard_object_segment(
+        &self,
+        encryption: &ObjectEncryption,
+        segment_index: u32,
+        logical_plaintext_len: u64,
+    ) -> bool {
+        self.object.matches_encryption(encryption)
+            && self.segment_index == segment_index
+            && self.logical_plaintext_len == logical_plaintext_len
+    }
+
+    pub(crate) fn logical_plaintext_len(&self) -> u64 {
+        self.logical_plaintext_len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical
+    }
+}
+
+impl PartialEq for SegmentEncryptionSubject {
+    fn eq(&self, other: &Self) -> bool {
+        self.object == other.object && self.canonical == other.canonical
+    }
+}
+
+impl Eq for SegmentEncryptionSubject {}
+
+impl std::fmt::Debug for SegmentEncryptionSubject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SegmentEncryptionSubject")
             .finish_non_exhaustive()
     }
 }
@@ -4781,7 +4864,7 @@ pub struct DirectPutPayloadWrite<'admission> {
     pub(crate) generation_reservation_id: SessionId,
     pub(crate) generation_id: GenerationId,
     pub(crate) bucket_incarnation_generation: u64,
-    pub(crate) encryption_subject: ObjectEncryptionSubject,
+    pub(crate) encryption_subject: SegmentEncryptionSubject,
     pub(crate) logical_size: u64,
     pub(crate) segment_index: u32,
     pub(crate) segment_crc64: u64,
@@ -7963,6 +8046,71 @@ mod tests {
             trailing,
         ] {
             assert!(ObjectEncryptionSubject::validate_canonical_for_test(&malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn standard_object_segment_subject_extends_exact_object_and_geometry() {
+        let bucket = BucketName::try_from("segment-subject-bucket").unwrap();
+        let key = ObjectKey::try_from("path/to/segment").unwrap();
+        let encryption = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        let object = ObjectEncryptionSubject::standard_object(
+            17,
+            &bucket,
+            &key,
+            GenerationId::new(23).unwrap(),
+            &encryption,
+        );
+        let mut expected = object.canonical_bytes().to_vec();
+        expected.extend_from_slice(&[SEGMENT_ENCRYPTION_SUBJECT_VERSION]);
+        expected.extend_from_slice(&[STANDARD_OBJECT_SEGMENT_PROVENANCE_TAG]);
+        expected.extend_from_slice(&3_u32.to_be_bytes());
+        expected.extend_from_slice(&65_537_u64.to_be_bytes());
+        let subject = SegmentEncryptionSubject::standard_object(object, 3, 65_537);
+
+        assert_eq!(subject.canonical_bytes(), expected);
+        assert!(subject.matches_standard_object_segment(&encryption, 3, 65_537));
+        assert!(!subject.matches_standard_object_segment(&encryption, 2, 65_537));
+        assert!(!subject.matches_standard_object_segment(&encryption, 3, 65_536));
+
+        let same_nonce_other_wrapped_dek = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [14; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        assert!(!subject.matches_standard_object_segment(&same_nonce_other_wrapped_dek, 3, 65_537,));
+
+        for crossed in [
+            SegmentEncryptionSubject::standard_object(
+                ObjectEncryptionSubject::standard_object(
+                    17,
+                    &bucket,
+                    &key,
+                    GenerationId::new(23).unwrap(),
+                    &encryption,
+                ),
+                2,
+                65_537,
+            ),
+            SegmentEncryptionSubject::standard_object(
+                ObjectEncryptionSubject::standard_object(
+                    17,
+                    &bucket,
+                    &key,
+                    GenerationId::new(23).unwrap(),
+                    &encryption,
+                ),
+                3,
+                65_536,
+            ),
+        ] {
+            assert_ne!(crossed, subject);
         }
     }
 
