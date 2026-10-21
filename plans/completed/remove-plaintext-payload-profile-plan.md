@@ -35,16 +35,16 @@ fallback reader.
 
 ## Relationship To Other Plans And Guides
 
-- [`segment-chunked-encryption-plan.md`](segment-chunked-encryption-plan.md) should assume only
+- [`segment-chunked-encryption-plan.md`](../segment-chunked-encryption-plan.md) should assume only
   encrypted payload codecs after this work. This removal should land before its profile-interface
   implementation.
-- [`storage-upgrade-versioning-plan.md`](storage-upgrade-versioning-plan.md) remains future work and
+- [`storage-upgrade-versioning-plan.md`](../storage-upgrade-versioning-plan.md) remains future work and
   does not authorize a plaintext compatibility reader or migration.
-- [`guides/versioning.md`](../guides/versioning.md) requires current readers to reject old formats
+- [`guides/versioning.md`](../../guides/versioning.md) requires current readers to reject old formats
   and requires incompatible nested-format changes to advance every unversioned containing format.
-- [`guides/storage-format-ledger.md`](../guides/storage-format-ledger.md) owns the exact version
+- [`guides/storage-format-ledger.md`](../../guides/storage-format-ledger.md) owns the exact version
   vector and immutable representation evidence that this change must update.
-- [`encryption-compat-plan.md`](encryption-compat-plan.md) continues to own future SSE-KMS behavior.
+- [`encryption-compat-plan.md`](../encryption-compat-plan.md) continues to own future SSE-KMS behavior.
   Adding another managed encryption mode must extend the encrypted state, not recreate plaintext.
 
 ## Goals

@@ -2,7 +2,8 @@
 
 Status: In progress (Phase 0 clean reference benchmark pending)
 
-The completed [`remove-plaintext-payload-profile-plan.md`](remove-plaintext-payload-profile-plan.md)
+The completed
+[`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
 removed the unreachable `ObjectEncryption::None` state before this plan's profile-interface work.
 Accordingly, this plan covers only encrypted payload codecs paired with SSE-S3 or SSE-C. References
 to plaintext below mean decrypted logical data, not a supported unencrypted durable profile.
