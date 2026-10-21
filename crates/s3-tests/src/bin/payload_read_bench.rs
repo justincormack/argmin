@@ -152,6 +152,14 @@ impl ReadWork {
 struct Sample {
     elapsed: Duration,
     work: ReadWork,
+    request_timings: Vec<RequestTiming>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestTiming {
+    headers: Duration,
+    body_ttfb: Duration,
+    complete: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -176,12 +184,21 @@ impl ReadKind {
     }
 }
 
-async fn read_once(client: &Client, bucket: &str, key: &str, kind: ReadKind) -> Bytes {
+fn get_request(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    kind: ReadKind,
+) -> aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder {
     let mut request = client.get_object().bucket(bucket).key(key);
     if let ReadKind::Range { start, end } = kind {
         request = request.range(format!("bytes={start}-{end}"));
     }
     request
+}
+
+async fn read_exact(client: &Client, bucket: &str, key: &str, kind: ReadKind) -> Bytes {
+    get_request(client, bucket, key, kind)
         .send()
         .await
         .expect("GET benchmark object")
@@ -190,6 +207,66 @@ async fn read_once(client: &Client, bucket: &str, key: &str, kind: ReadKind) -> 
         .await
         .expect("read benchmark response body")
         .into_bytes()
+}
+
+async fn read_and_time(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    kind: ReadKind,
+) -> (usize, RequestTiming) {
+    let started = Instant::now();
+    let response = get_request(client, bucket, key, kind)
+        .send()
+        .await
+        .expect("GET benchmark object");
+    let headers = started.elapsed();
+    let mut body = response.body;
+    let mut body_ttfb = None;
+    let mut body_len = 0usize;
+
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.expect("read benchmark response body chunk");
+        if chunk.is_empty() {
+            continue;
+        }
+        body_ttfb.get_or_insert_with(|| started.elapsed());
+        body_len = body_len
+            .checked_add(chunk.len())
+            .expect("benchmark response length fits usize");
+    }
+
+    let complete = started.elapsed();
+    let body_ttfb = body_ttfb.expect("non-empty benchmark response body");
+    (
+        body_len,
+        RequestTiming {
+            headers,
+            body_ttfb,
+            complete,
+        },
+    )
+}
+
+fn nearest_rank_percentile(
+    timings: &[RequestTiming],
+    percentile: usize,
+    select: impl Fn(&RequestTiming) -> Duration,
+) -> Duration {
+    assert!(!timings.is_empty());
+    assert!((1..=100).contains(&percentile));
+    let mut values = timings.iter().map(select).collect::<Vec<_>>();
+    values.sort_unstable();
+    let rank = values
+        .len()
+        .checked_mul(percentile)
+        .expect("percentile rank fits usize")
+        .div_ceil(100);
+    values[rank - 1]
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 async fn measure_case(
@@ -206,13 +283,13 @@ async fn measure_case(
         ReadKind::Range { start, end } => &payload[start..=end],
     };
     assert_eq!(
-        read_once(client, bucket, key, kind).await.as_ref(),
+        read_exact(client, bucket, key, kind).await.as_ref(),
         expected
     );
 
     for _ in 0..config.warmup_iters {
-        let body = read_once(client, bucket, key, kind).await;
-        assert_eq!(body.len(), expected.len());
+        let (body_len, _) = read_and_time(client, bucket, key, kind).await;
+        assert_eq!(body_len, expected.len());
     }
 
     let iterations = match kind {
@@ -221,17 +298,20 @@ async fn measure_case(
     };
     let mut samples = Vec::with_capacity(config.samples);
     for _ in 0..config.samples {
+        let mut request_timings = Vec::with_capacity(iterations);
         let before = observability::metrics_snapshot();
         let started = Instant::now();
         for _ in 0..iterations {
-            let body = read_once(client, bucket, key, kind).await;
-            assert_eq!(body.len(), expected.len());
+            let (body_len, timing) = read_and_time(client, bucket, key, kind).await;
+            assert_eq!(body_len, expected.len());
+            request_timings.push(timing);
         }
         let elapsed = started.elapsed();
         let after = observability::metrics_snapshot();
         samples.push(Sample {
             elapsed,
             work: ReadWork::between(&before, &after),
+            request_timings,
         });
     }
 
@@ -239,15 +319,25 @@ async fn measure_case(
         let requests_per_second = iterations as f64 / sample.elapsed.as_secs_f64();
         let logical_mib_per_second =
             (expected.len() * iterations) as f64 / sample.elapsed.as_secs_f64() / MIB as f64;
+        let headers_p50 =
+            nearest_rank_percentile(&sample.request_timings, 50, |timing| timing.headers);
+        let body_ttfb_p50 =
+            nearest_rank_percentile(&sample.request_timings, 50, |timing| timing.body_ttfb);
+        let complete_p50 =
+            nearest_rank_percentile(&sample.request_timings, 50, |timing| timing.complete);
         println!(
             "sample case={case_name} operation={} index={} iterations={iterations} \
              elapsed_ms={:.3} requests_s={requests_per_second:.3} logical_mib_s={logical_mib_per_second:.3} \
+             headers_p50_ms={:.3} body_ttfb_p50_ms={:.3} complete_p50_ms={:.3} \
              logical_bytes={} stored_bytes={} shard_bytes={} reconstructed_bytes={} \
              decrypted_bytes={} aead_records={} crc_bytes={} buffer_checkouts={} \
              buffer_allocations={} buffer_allocated_bytes={} repair_fallbacks={}",
             kind.name(),
             index + 1,
-            sample.elapsed.as_secs_f64() * 1000.0,
+            duration_ms(sample.elapsed),
+            duration_ms(headers_p50),
+            duration_ms(body_ttfb_p50),
+            duration_ms(complete_p50),
             sample.work.logical_bytes,
             sample.work.stored_bytes,
             sample.work.shard_bytes,
@@ -273,14 +363,39 @@ async fn measure_case(
     } else {
         rates[middle]
     };
+    let request_timings = samples
+        .iter()
+        .flat_map(|sample| sample.request_timings.iter().copied())
+        .collect::<Vec<_>>();
+    let headers_p50 = nearest_rank_percentile(&request_timings, 50, |timing| timing.headers);
+    let headers_p95 = nearest_rank_percentile(&request_timings, 95, |timing| timing.headers);
+    let headers_p99 = nearest_rank_percentile(&request_timings, 99, |timing| timing.headers);
+    let body_ttfb_p50 = nearest_rank_percentile(&request_timings, 50, |timing| timing.body_ttfb);
+    let body_ttfb_p95 = nearest_rank_percentile(&request_timings, 95, |timing| timing.body_ttfb);
+    let body_ttfb_p99 = nearest_rank_percentile(&request_timings, 99, |timing| timing.body_ttfb);
+    let complete_p50 = nearest_rank_percentile(&request_timings, 50, |timing| timing.complete);
+    let complete_p95 = nearest_rank_percentile(&request_timings, 95, |timing| timing.complete);
+    let complete_p99 = nearest_rank_percentile(&request_timings, 99, |timing| timing.complete);
     println!(
         "summary case={case_name} operation={} response_bytes={} median_requests_s={:.3} \
-         worst_requests_s={:.3} best_requests_s={:.3}",
+         worst_requests_s={:.3} best_requests_s={:.3} \
+         headers_p50_ms={:.3} headers_p95_ms={:.3} headers_p99_ms={:.3} \
+         body_ttfb_p50_ms={:.3} body_ttfb_p95_ms={:.3} body_ttfb_p99_ms={:.3} \
+         complete_p50_ms={:.3} complete_p95_ms={:.3} complete_p99_ms={:.3}",
         kind.name(),
         kind.expected_len(config.object_size),
         median_requests_per_second,
         rates[0],
         rates[rates.len() - 1],
+        duration_ms(headers_p50),
+        duration_ms(headers_p95),
+        duration_ms(headers_p99),
+        duration_ms(body_ttfb_p50),
+        duration_ms(body_ttfb_p95),
+        duration_ms(body_ttfb_p99),
+        duration_ms(complete_p50),
+        duration_ms(complete_p95),
+        duration_ms(complete_p99),
     );
 }
 
@@ -345,7 +460,9 @@ async fn main() -> Result<(), String> {
         start: range_start,
         end: range_end,
     };
-    println!("benchmark=payload_read_v1");
+    println!("benchmark=payload_read_v2");
+    println!("body_ttfb_definition=request_start_to_first_nonempty_sdk_body_bytes");
+    println!("latency_percentile_method=nearest_rank");
     println!("transport=http");
     println!(
         "ec_shape={}+{}",
@@ -388,4 +505,35 @@ async fn main() -> Result<(), String> {
 
     s3_tests::delete_all_and_bucket(&client, &encrypted_bucket, &[key.to_string()]).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timing(milliseconds: u64) -> RequestTiming {
+        let duration = Duration::from_millis(milliseconds);
+        RequestTiming {
+            headers: duration,
+            body_ttfb: duration,
+            complete: duration,
+        }
+    }
+
+    #[test]
+    fn latency_percentiles_use_nearest_rank() {
+        let timings = [timing(50), timing(10), timing(40), timing(20), timing(30)];
+        assert_eq!(
+            nearest_rank_percentile(&timings, 50, |value| value.body_ttfb),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            nearest_rank_percentile(&timings, 95, |value| value.body_ttfb),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            nearest_rank_percentile(&timings[..4], 50, |value| value.body_ttfb),
+            Duration::from_millis(20)
+        );
+    }
 }

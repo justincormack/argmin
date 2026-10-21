@@ -1,6 +1,6 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phase 0 clean reference benchmark pending)
+Status: In progress (Phase 0 TTFB evidence extension pending; Phase 1 exact encryption subjects next)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -806,9 +806,23 @@ Implementation update (2026-10-17):
   CRC64, SHA-256, and EC runtime backends, verifies the effective SSE-S3 mode with `HeadObject`, and
   reports timing together with every `payload_read_*` work counter. It does not claim an internal
   codec identity from that AWS-visible mode and does not copy the SDK's collected response solely
-  for measurement. Reference runs fail closed on a dirty worktree. The earlier dirty-tree
-  measurements are exploratory only; an authoritative baseline must be recorded after this
-  harness is committed and rerun from a clean source revision.
+  for measurement. Reference runs fail closed on a dirty worktree.
+- Benchmark protocol `payload_read_v2` separately records request-to-headers, request-to-first
+  non-empty SDK body bytes, and request-to-body-completion latency. The timed reader consumes
+  `Bytes` chunks without assembling another whole response. This makes the whole-segment profile's
+  current first-payload-byte delay a direct baseline for the chunked reader rather than inferring
+  it from aggregate throughput. The v2 clean-revision reference run remains pending until the
+  harness is committed; exploratory dirty-tree results are not authoritative evidence.
+- The authoritative Phase 0 baseline was recorded on 2026-10-21 from clean revision
+  `964de9ca4e90f5bb94ad9929a0c3a3933dce6082` on the default Ring provider. A 16 MiB full GET has a
+  median 109.335 requests/s and processes two complete segment records. A 4 KiB range has a median
+  342.586 requests/s but reads and CRC-checks 8,388,624 stored bytes, decrypts 8,388,608 bytes, and
+  opens one AEAD record per request. Neither case reconstructs or enters repair fallback. The full
+  environment, distribution, and per-request counters are recorded in `guides/performance.md`.
+
+The original Phase 0 exit is satisfied for work amplification, throughput, durable format
+evidence, and the target profile boundary. The later-added body-TTFB evidence extension remains
+open until `payload_read_v2` is committed and rerun from a clean revision.
 
 ### Phase 1: Exact encryption subjects
 

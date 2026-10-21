@@ -60,7 +60,7 @@ Use `./scripts/bench-payload-read --openssl` for the compile-time OpenSSL
 provider. Unlike the focused component benchmarks below, this starts the local
 release S3 server and an AWS SDK client and exercises HTTP, SigV4,
 authorization, object metadata, 4+2 EC shard reads, physical CRC validation,
-SSE-S3 decryption, response streaming, and SDK body collection. It is intended
+SSE-S3 decryption, response streaming, and SDK body consumption. It is intended
 to compare payload-codec changes on the same machine, not to represent a
 networked deployment's absolute throughput.
 
@@ -81,11 +81,18 @@ payload codec from that response: a future chunked codec will expose the same
 S3 encryption mode. It also does not create a plaintext S3 object: an absent or
 deleted bucket encryption configuration has AWS's automatic SSE-S3 default, so
 there is no production plaintext S3 writer. Each sample reports elapsed
-throughput and deltas for the `payload_read_*` work counters. These distinguish
-response bytes from stored and shard bytes, EC reconstruction, decrypted bytes,
-AEAD records, CRC work, buffer-pool activity, and repair fallback. It retains
-the SDK's collected `Bytes` directly so the timed full-read path does not add a
-second whole-response allocation and copy.
+throughput, per-request header latency, body time to first byte, completion
+latency, and deltas for the `payload_read_*` work counters. Body TTFB is measured
+from immediately before the SDK sends the request until the first non-empty SDK
+body chunk becomes visible; it therefore measures payload availability rather
+than merely receipt of HTTP response headers. Latencies use the nearest-rank
+p50/p95/p99 definition. The work counters distinguish response bytes from
+stored and shard bytes, EC reconstruction, decrypted bytes, AEAD records, CRC
+work, buffer-pool activity, and repair fallback. The timed reader consumes SDK
+`Bytes` chunks directly and sums their lengths, so it does not assemble or copy
+the whole response in the benchmark client. One untimed request per case is
+still collected and compared byte-for-byte with the expected payload as a
+correctness canary.
 
 The payload-codec comparison therefore has no plaintext benchmark axis. Compare
 the current whole-segment AES-GCM codec and future encrypted codecs under the
@@ -98,8 +105,48 @@ by default. `ALLOW_DIRTY_BENCHMARK=1` permits exploratory development runs, but
 marks them `reference_run=false`; their results must not be recorded as a
 reference baseline. The output records the CPU architecture and model, selected
 CRC64, SHA-256, and EC runtime backends, and compile-time crypto provider.
-Record the Phase 0 baseline here only after the benchmark harness itself has
-been committed and rerun from a clean tree.
+
+### Whole-segment encrypted-read baseline
+
+The throughput/work Phase 0 reference run was recorded on 2026-10-21 from clean source revision
+`964de9ca4e90f5bb94ad9929a0c3a3933dce6082` with the default benchmark settings:
+
+- Rust `1.98.1`, Linux `6.12.107+deb13-amd64`, x86-64;
+- AMD Ryzen 7 255 with Radeon 780M Graphics;
+- Ring crypto provider and SHA-256 backend;
+- `x86_64-avx512-vpclmulqdq` CRC64 backend and `x86_64-avx512` EC backend; and
+- HTTP, 4+2 EC, verified AWS-visible SSE-S3 AES256.
+
+| Operation | Response bytes | Median req/s | Worst req/s | Best req/s |
+|---|---:|---:|---:|---:|
+| Full GET | 16,777,216 | 109.335 | 108.033 | 110.684 |
+| Range GET | 4,096 | 342.586 | 337.801 | 356.570 |
+
+The five full-GET samples were 108.033, 109.335, 109.616, 108.035, and
+110.684 requests/s. The five range samples were 356.570, 353.193, 342.586,
+337.961, and 337.801 requests/s. The range began at byte 8,389,632, inside the
+second 8 MiB segment.
+
+The cumulative counters were identical across all five samples. Dividing each
+sample by its iteration count gives the actual work per request:
+
+| Operation | Logical bytes | Stored/shard bytes | Decrypted bytes | AEAD records | CRC bytes | Buffer checkouts |
+|---|---:|---:|---:|---:|---:|---:|
+| Full GET | 16,777,216 | 16,777,248 | 16,777,216 | 2 | 33,554,464 | 2 |
+| Range GET | 4,096 | 8,388,624 | 8,388,608 | 1 | 8,388,624 | 1 |
+
+Neither case reconstructed bytes, allocated new pool backing buffers, or
+entered repair fallback. The range row is the key Phase 0 result: returning
+4 KiB currently reads and authenticates one complete 8 MiB segment. Future
+codec measurements must retain these exact workload and environment fields and
+compare both throughput and work counters, not throughput alone.
+
+That revision used benchmark protocol `payload_read_v1`, which measured only
+aggregate completion throughput. Protocol `payload_read_v2` adds header,
+first-body-byte, and completion latency without adding timed whole-body
+collection. Its clean-revision reference values must be recorded after the v2
+harness itself is committed; dirty-tree exploratory values are not reference
+evidence.
 
 ## Checksums and erasure coding
 
