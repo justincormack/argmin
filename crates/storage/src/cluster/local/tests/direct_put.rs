@@ -132,13 +132,44 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
     let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let crossed_key_route = admission
+        .active_put_object_route(&bucket, &other_key)
+        .unwrap();
     let plaintext = b"opaque direct payload";
     let fixture = crate::tests::sse_s3_segment_test_fixture(plaintext, 0);
+    let crossed_reservation_id = crate::tests::stream_session_id("cross-gen");
+    let crossed_reservation = route
+        .test_reserve_generation_with_id(&crossed_reservation_id)
+        .unwrap();
+    let error = crossed_key_route
+        .write_direct_object_payload(
+            crossed_reservation,
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::DirectPutFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "invalid_request");
+    let object_pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id().get();
+    for node in map.nodes.values() {
+        let pg = node.storage_node().get_pg(object_pg_id).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &crossed_reservation_id,
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+    }
+
     let commit_reservation_id = crate::tests::stream_session_id("opaque-commit");
-    let commit_generation_id = route.reserve_generation(&commit_reservation_id).unwrap();
+    let commit_generation_id = route
+        .test_reserve_generation_with_id(&commit_reservation_id)
+        .unwrap();
     let commit_payload = route
         .write_direct_object_payload(
-            &commit_reservation_id,
             commit_generation_id,
             fixture.logical_size,
             &fixture.storage_bytes,
@@ -155,9 +186,6 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
         &fixture,
     );
 
-    let crossed_key_route = admission
-        .active_put_object_route(&bucket, &other_key)
-        .unwrap();
     let error = crossed_key_route
         .commit_direct_object(commit_payload, &prepared, |_| Ok::<(), ()>(()))
         .unwrap_err();
@@ -173,10 +201,11 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
     );
 
     let discard_reservation_id = crate::tests::stream_session_id("opaque-discard");
-    let discard_generation_id = route.reserve_generation(&discard_reservation_id).unwrap();
+    let discard_generation_id = route
+        .test_reserve_generation_with_id(&discard_reservation_id)
+        .unwrap();
     let discard_payload = route
         .write_direct_object_payload(
-            &discard_reservation_id,
             discard_generation_id,
             fixture.logical_size,
             &fixture.storage_bytes,
@@ -247,14 +276,11 @@ fn opaque_direct_put_payload_rejects_same_epoch_cross_cluster_commit_and_cleans_
     let plaintext = b"same epoch issuer payload";
     let fixture = crate::tests::sse_s3_segment_test_fixture(plaintext, 0);
     let reservation_id = crate::tests::stream_session_id("cross-cluster");
-    let generation_id = issuer_route.reserve_generation(&reservation_id).unwrap();
+    let generation_id = issuer_route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
     let payload = issuer_route
-        .write_direct_object_payload(
-            &reservation_id,
-            generation_id,
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
+        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
     assert_direct_payload_shards_exist(&issuer, payload_identity);
@@ -296,6 +322,85 @@ fn opaque_direct_put_payload_rejects_same_epoch_cross_cluster_commit_and_cleans_
 }
 
 #[test]
+fn direct_put_generation_reservations_are_minted_exclusively_and_drop_independently() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("dropped-direct-put-generation");
+    let key = crate::tests::object_key("unencrypted-payload");
+    create_test_bucket(&cluster, &bucket);
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let first = route.reserve_generation().unwrap();
+    let first_id = first.reservation_id.clone();
+    let first_generation = first.generation_id();
+    let second = route.reserve_generation().unwrap();
+    let second_id = second.reservation_id.clone();
+    let second_generation = second.generation_id();
+
+    assert_ne!(first_id, second_id);
+    assert_ne!(first_generation, second_generation);
+    let object_pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id().get();
+    for node in map.nodes.values() {
+        let pg = node.storage_node().get_pg(object_pg_id).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg, &bucket, &key, &first_id,
+            )
+            .unwrap(),
+            first_generation
+        );
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg, &bucket, &key, &second_id,
+            )
+            .unwrap(),
+            second_generation
+        );
+    }
+
+    drop(first);
+
+    for node in map.nodes.values() {
+        let pg = node.storage_node().get_pg(object_pg_id).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg, &bucket, &key, &first_id,
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg, &bucket, &key, &second_id,
+            )
+            .unwrap(),
+            second_generation
+        );
+    }
+
+    drop(second);
+
+    for node in map.nodes.values() {
+        let pg = node.storage_node().get_pg(object_pg_id).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg, &bucket, &key, &second_id,
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+    }
+}
+
+#[test]
 fn dropping_armed_direct_put_payload_cleans_issuer_staging() {
     let tmp = test_util::tempdir();
     let map = Arc::new(
@@ -315,9 +420,11 @@ fn dropping_armed_direct_put_payload_cleans_issuer_staging() {
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let reservation_id = crate::tests::stream_session_id("drop-direct");
-    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let generation_id = route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
     let payload = route
-        .write_direct_object_payload(&reservation_id, generation_id, 20, b"drop cleans payload")
+        .write_direct_object_payload(generation_id, 20, b"drop cleans payload")
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
     assert_direct_payload_shards_exist(&cluster, payload_identity);
@@ -354,16 +461,14 @@ fn matching_pending_direct_put_retries_transient_abandonment_scan_and_preserves_
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let reservation_id = crate::tests::stream_session_id("inspect-failure");
-    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let generation_id = route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
+    let expected_generation_id = generation_id.generation_id();
     let data = b"payload owned by a matching pending command";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(
-            &reservation_id,
-            generation_id,
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
+        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
     let prepared = prepared_encrypted_direct_put(
@@ -379,7 +484,7 @@ fn matching_pending_direct_put_retries_transient_abandonment_scan_and_preserves_
             bucket: &bucket,
             key: &key,
             reservation_id: reservation_id.clone(),
-            generation_id,
+            generation_id: expected_generation_id,
             versioning: crate::BucketVersioningState::Disabled,
             segment_okh: payload.segment_okh,
             written: &payload.written,
@@ -470,7 +575,7 @@ fn matching_pending_direct_put_retries_transient_abandonment_scan_and_preserves_
                 &reservation_id,
             )
             .unwrap(),
-            generation_id,
+            expected_generation_id,
             "durable pending ownership must retain the generation reservation"
         );
     }
@@ -499,16 +604,14 @@ fn matching_published_direct_put_returns_before_trailing_payload_ack_work() {
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let reservation_id = crate::tests::stream_session_id("published");
-    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let generation_id = route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
+    let expected_generation_id = generation_id.generation_id();
     let data = b"payload owned by a published pending command";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(
-            &reservation_id,
-            generation_id,
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
+        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
         .unwrap();
     let prepared = prepared_encrypted_direct_put(
         &cluster,
@@ -523,7 +626,7 @@ fn matching_published_direct_put_returns_before_trailing_payload_ack_work() {
             bucket: &bucket,
             key: &key,
             reservation_id,
-            generation_id,
+            generation_id: expected_generation_id,
             versioning: crate::BucketVersioningState::Disabled,
             segment_okh: payload.segment_okh,
             written: &payload.written,
@@ -654,16 +757,14 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let reservation_id = crate::tests::stream_session_id("phys-mismatch");
-    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let generation_id = route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
+    let expected_generation_id = generation_id.generation_id();
     let data = b"payload whose staging keys overlap the pending command";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let pending_payload = route
-        .write_direct_object_payload(
-            &reservation_id,
-            generation_id,
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
+        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
         .unwrap();
     let payload_identity = direct_payload_test_identity(&pending_payload);
     let prepared = prepared_encrypted_direct_put(
@@ -679,7 +780,7 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
             bucket: &bucket,
             key: &key,
             reservation_id: reservation_id.clone(),
-            generation_id,
+            generation_id: expected_generation_id,
             versioning: crate::BucketVersioningState::Disabled,
             segment_okh: pending_payload.segment_okh,
             written: &pending_payload.written,
@@ -722,9 +823,9 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
     pending_payload.disarm();
 
     let mismatched_payload = route
-        .write_direct_object_payload(
+        .test_write_direct_object_payload_for_generation(
             &reservation_id,
-            generation_id,
+            expected_generation_id,
             fixture.logical_size,
             &fixture.storage_bytes,
         )
@@ -781,7 +882,7 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
                 &reservation_id,
             )
             .unwrap(),
-            generation_id,
+            expected_generation_id,
             "the pending command must retain its generation reservation"
         );
         assert!(matches!(
@@ -1952,16 +2053,13 @@ fn direct_put_budget_expiry_after_pending_install_returns_snapshot_conflict_and_
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let reservation_id = crate::tests::stream_session_id("install-expiry");
-    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let generation_id = route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
     let data = b"direct PUT inherited budget expiry after pending install";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(
-            &reservation_id,
-            generation_id,
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
+        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
     let prepared = prepared_encrypted_direct_put(
@@ -2059,16 +2157,14 @@ fn direct_put_retry_reconstructs_matching_witness_before_reservation_validation(
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let reservation_id = crate::tests::stream_session_id("adopt-witness");
-    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let generation_id = route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
+    let expected_generation_id = generation_id.generation_id();
     let data = b"direct PUT matching pending witness adoption";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(
-            &reservation_id,
-            generation_id,
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
+        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
         .unwrap();
     let prepared = prepared_encrypted_direct_put(
         &cluster,
@@ -2083,7 +2179,7 @@ fn direct_put_retry_reconstructs_matching_witness_before_reservation_validation(
             bucket: &bucket,
             key: &key,
             reservation_id: reservation_id.clone(),
-            generation_id,
+            generation_id: expected_generation_id,
             versioning: crate::BucketVersioningState::Enabled,
             segment_okh: payload.segment_okh,
             written: &payload.written,
@@ -2146,7 +2242,7 @@ fn direct_put_retry_reconstructs_matching_witness_before_reservation_validation(
             .into_live()
             .expect("recovered direct PUT must publish a live object");
         assert_eq!(live.version_id, outcome.version_id);
-        assert_eq!(live.generation_id, generation_id);
+        assert_eq!(live.generation_id, expected_generation_id);
     }
 }
 
@@ -2174,16 +2270,14 @@ fn versioned_direct_put_hands_transported_trailing_contention_to_recovery() {
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let reservation_id = crate::tests::stream_session_id("direct-timeout");
-    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let generation_id = route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
+    let expected_generation_id = generation_id.generation_id();
     let data = b"versioned direct PUT replica timeout";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(
-            &reservation_id,
-            generation_id,
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
+        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
         .unwrap();
     let prepared = prepared_encrypted_direct_put(
         &cluster,
@@ -2250,7 +2344,7 @@ fn versioned_direct_put_hands_transported_trailing_contention_to_recovery() {
         let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
         let live = stored.as_live().expect("direct PUT object should be live");
         assert_eq!(live.version_id, outcome.version_id);
-        assert_eq!(live.generation_id, generation_id);
+        assert_eq!(live.generation_id, expected_generation_id);
         assert_eq!(live.size, data.len() as u64);
     }
     let trailing_pg = map
@@ -2338,16 +2432,14 @@ fn versioned_direct_put_converges_primary_apply_response_loss_before_success() {
     let admission = handle.admit_current_route().unwrap();
     let route = admission.active_put_object_route(&bucket, &key).unwrap();
     let reservation_id = crate::tests::stream_session_id("response-loss");
-    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let generation_id = route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
+    let expected_generation_id = generation_id.generation_id();
     let data = b"versioned direct PUT apply response loss";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(
-            &reservation_id,
-            generation_id,
-            fixture.logical_size,
-            &fixture.storage_bytes,
-        )
+        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
         .unwrap();
     let prepared = prepared_encrypted_direct_put(
         &cluster,
@@ -2512,7 +2604,7 @@ fn versioned_direct_put_converges_primary_apply_response_loss_before_success() {
         let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
         let live = stored.as_live().expect("direct PUT object should be live");
         assert_eq!(live.version_id, outcome.version_id);
-        assert_eq!(live.generation_id, generation_id);
+        assert_eq!(live.generation_id, expected_generation_id);
         assert_eq!(live.size, data.len() as u64);
     }
     assert_clean_metadata_command_stream(&map, &[object_pg]);

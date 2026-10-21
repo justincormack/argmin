@@ -474,11 +474,10 @@ fn replay(state: &State) -> Result<(), String> {
                 for owner in 0..2 {
                     let encrypted = &fixture.encrypted[owner];
                     let generation = routes[owner]
-                        .reserve_generation(&fixture.reservations[owner])
+                        .test_reserve_generation_with_id(&fixture.reservations[owner])
                         .map_err(diagnostic)?;
                     let payload = routes[owner]
                         .write_direct_object_payload(
-                            &fixture.reservations[owner],
                             generation,
                             encrypted.logical_size,
                             &encrypted.storage_bytes,

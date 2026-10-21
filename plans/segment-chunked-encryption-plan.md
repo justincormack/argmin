@@ -181,7 +181,7 @@ The write-path inventory is:
 
 | Effective path | Current codec selection and identity timing | Required Phase 1/2 seam |
 | --- | --- | --- |
-| Buffered direct `PutObject` | Encrypts segment zero before reserving the object generation. | Reserve the immutable payload generation first, mint the opaque standard-object subject, then construct the segment encoder. |
+| Buffered direct `PutObject` | Reserves the immutable object generation through a non-cloneable, one-use RAII handoff before encrypting segment zero. The current segment AEAD still does not consume that identity. | Mint the opaque standard-object subject from the reservation handoff, then construct the subject-bound segment encoder. |
 | Promoted buffered and streamed `PutObject`/POST Object | Session creation already durably reserves the eventual object generation under the session ID; append placement and finalization reload that reservation, but encryption does not consume it. Every append independently calls `encrypt_segment`. | Reuse the existing storage-owned reservation as the owner-minted encryption subject and expose it only through a subject-bound session encoder; do not duplicate it in `StreamUploadRecord`. |
 | `CopyObject` destination | Reads source chunks and feeds them to the same destination stream append/encryption path. | Use the same destination session subject and encoder as streamed PUT; source encryption state never supplies destination identity. |
 | `UploadPart` | The session target binds upload ID and part number, but no immutable generation for the new part is fixed before its first encrypted segment. | Allocate and persist the part payload generation at session creation and bind every segment to upload, part number, part generation, and segment index. |
@@ -780,9 +780,10 @@ Implementation update (2026-10-17):
   than silently rewriting the baseline.
 - The write/read inventory now identifies the current branch points and the identity-ordering gaps
   for direct PUT, streamed PUT/POST, CopyObject, UploadPart, UploadPartCopy, full reads, and range
-  reads. In particular, direct PUT encrypts before generation reservation; streamed PUT durably
-  reserves its object generation at session creation but does not thread that reservation into
-  encryption; and UploadPart does not yet fix its replacement-part generation before encryption.
+  reads. Direct PUT now reserves its generation before encryption through a one-use storage-owned
+  handoff, but the current AEAD does not yet consume that subject. Streamed PUT durably reserves its
+  object generation at session creation but does not thread that reservation into encryption, and
+  UploadPart does not yet fix its replacement-part generation before encryption.
 - The target seam is an exhaustive internal durable-profile registry producing opaque,
   subject-bound incremental encoders and readers. It owns stored-size/range geometry, plaintext
   release, and consuming finalization; AWS-visible key mode remains a separate dimension. The
@@ -826,6 +827,21 @@ Phase 0 exit is satisfied. Work amplification, throughput, body TTFB, the curren
 immutable format evidence, and the target profile boundary are recorded.
 
 ### Phase 1: Exact encryption subjects
+
+Implementation update (2026-10-21):
+
+- Buffered direct PutObject now reserves its immutable object generation before segment encryption.
+  `ActivePutObjectRoute::reserve_generation` mints the durable reservation identity internally and
+  returns an opaque, non-cloneable RAII reservation, so a production caller cannot obtain two
+  independently armed tokens for one idempotent reservation. Payload staging consumes it and
+  transfers cleanup ownership to `DirectPutPayloadWrite`. Dropping one of two independently minted
+  reservations releases only that reservation on every replica; crossed object routes fail closed
+  while cleanup remains bound to the issuer. The coordinator no longer combines a caller-held
+  generation with an independently supplied reservation ID or manually compensates for staging
+  failure.
+- This completes the direct-PUT ordering and ownership prerequisite only. The reservation must next
+  mint the canonical standard-object encryption subject, and the streamed PUT, copy, and multipart
+  identity work below remains open.
 
 - Introduce private canonical context codecs and opaque subject constructors.
 - Ensure every write path exposes its existing or newly allocated immutable generation to the

@@ -10024,13 +10024,12 @@
         let route = admission.active_put_object_route(&bucket, &key).unwrap();
         let generation_reservation_id = crate::tests::stream_session_id("install-loss");
         let generation_id = route
-            .reserve_generation(&generation_reservation_id)
+            .test_reserve_generation_with_id(&generation_reservation_id)
             .unwrap();
         let data = b"authenticated direct PUT pending install response loss";
         let encrypted = crate::tests::sse_s3_segment_test_fixture(data, 0);
         let payload = route
             .write_direct_object_payload(
-                &generation_reservation_id,
                 generation_id,
                 encrypted.logical_size,
                 &encrypted.storage_bytes,

@@ -338,27 +338,19 @@ impl Coordinator {
                                 &system_metadata,
                                 write_encryption,
                             )?;
-                        let transient_segment_id =
-                            Self::random_session_id("failed to generate direct put segment ID")?;
-
+                        let generation_reservation = put_route
+                            .reserve_generation()
+                            .map_err(Coordinator::map_direct_put_failure)?;
                         let storage_bytes =
                             write_encryption.encrypt_segment(0, req.data)?;
-                        let generation_id = put_route
-                            .reserve_generation(&transient_segment_id)
-                            .map_err(Coordinator::map_direct_put_failure)?;
 
-                        let written_payload = match put_route.write_direct_object_payload(
-                            &transient_segment_id,
-                            generation_id,
+                        let written_payload = put_route
+                            .write_direct_object_payload(
+                            generation_reservation,
                             req.data.len() as u64,
                             &storage_bytes,
-                        ) {
-                            Ok(written_segment) => written_segment,
-                            Err(error) => {
-                                put_route.release_generation_reservation(&transient_segment_id);
-                                return Err(Coordinator::map_direct_put_failure(error));
-                            }
-                        };
+                        )
+                            .map_err(Coordinator::map_direct_put_failure)?;
                         let prepared_commit = PreparedDirectPutObjectCommit {
                             versioning: bucket_info.versioning,
                             owner,

@@ -102,11 +102,10 @@ fn cancellation_progress(
     for actor in 0..2 {
         let encrypted = &fixture.encrypted[actor];
         let generation = routes[actor]
-            .reserve_generation(&fixture.reservations[actor])
+            .test_reserve_generation_with_id(&fixture.reservations[actor])
             .map_err(diagnostic)?;
         let payload = routes[actor]
             .write_direct_object_payload(
-                &fixture.reservations[actor],
                 generation,
                 encrypted.logical_size,
                 &encrypted.storage_bytes,
@@ -234,7 +233,10 @@ fn direct_put_release_fences_delayed_staging() {
     let route = admission
         .active_put_object_route(&fixture.bucket, &fixture.key)
         .unwrap();
-    let generation = route.reserve_generation(&fixture.reservations[0]).unwrap();
+    let generation_reservation = route
+        .test_reserve_generation_with_id(&fixture.reservations[0])
+        .unwrap();
+    let generation = generation_reservation.generation_id();
 
     // Derive the expected identities independently of the write result, so an
     // error returned after partial physical publication cannot hide leaked shards.
@@ -298,12 +300,8 @@ fn direct_put_release_fences_delayed_staging() {
         absent,
         "release must leave no staged payload"
     );
-    let late = route.write_direct_object_payload(
-        &fixture.reservations[0],
-        generation,
-        DATA[0].len() as u64,
-        DATA[0],
-    );
+    let late =
+        route.write_direct_object_payload(generation_reservation, DATA[0].len() as u64, DATA[0]);
     // Inspect before dropping any returned RAII payload: its compensation must
     // not mask the late write. Check physical state even when the call returns Err.
     assert_eq!(

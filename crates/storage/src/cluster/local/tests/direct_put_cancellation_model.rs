@@ -121,11 +121,10 @@ fn replay(state: &State) -> Result<(), String> {
                 for actor in 0..2 {
                     let encrypted = &fixture.encrypted[actor];
                     let generation = routes[actor]
-                        .reserve_generation(&fixture.reservations[actor])
+                        .test_reserve_generation_with_id(&fixture.reservations[actor])
                         .map_err(diagnostic)?;
                     let payload = routes[actor]
                         .write_direct_object_payload(
-                            &fixture.reservations[actor],
                             generation,
                             encrypted.logical_size,
                             &encrypted.storage_bytes,

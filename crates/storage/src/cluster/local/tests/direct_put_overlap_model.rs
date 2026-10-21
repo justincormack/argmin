@@ -364,7 +364,10 @@ fn replay(state: &State) -> Result<(), String> {
     let mut selected = None;
     for candidate in 0..128 {
         let reservation = crate::tests::stream_session_id(format!("overlap-{candidate}"));
-        let generation = route.reserve_generation(&reservation).map_err(diagnostic)?;
+        let generation_reservation = route
+            .test_reserve_generation_with_id(&reservation)
+            .map_err(diagnostic)?;
+        let generation = generation_reservation.generation_id();
         let okh = crate::direct_put_segment_key_hash(&reservation, 0);
         let mut shared_prefix = true;
         for index in 0..3 {
@@ -380,13 +383,14 @@ fn replay(state: &State) -> Result<(), String> {
         }
         if shared_prefix {
             fixture.reservation = reservation;
-            selected = Some(generation);
+            selected = Some(generation_reservation);
             break;
         }
-        route.release_generation_reservation(&reservation);
+        drop(generation_reservation);
     }
-    let generation =
-        selected.ok_or("no shared-prefix placement in 128 deterministic candidates")?;
+    let mut generation_reservation =
+        Some(selected.ok_or("no shared-prefix placement in 128 deterministic candidates")?);
+    let generation = generation_reservation.as_ref().unwrap().generation_id();
     let caller_okh = crate::direct_put_segment_key_hash(&fixture.reservation, 0);
     let mut command_okh = caller_okh;
     if state.layout == Layout::Disjoint {
@@ -414,8 +418,9 @@ fn replay(state: &State) -> Result<(), String> {
                 }
                 let staged = route
                     .write_direct_object_payload(
-                        &fixture.reservation,
-                        generation,
+                        generation_reservation
+                            .take()
+                            .ok_or("direct PUT generation reservation was already consumed")?,
                         fixture.encrypted.logical_size,
                         &fixture.encrypted.storage_bytes,
                     )
@@ -475,7 +480,7 @@ fn replay(state: &State) -> Result<(), String> {
             Step::Restage => {
                 payload = Some(
                     route
-                        .write_direct_object_payload(
+                        .test_write_direct_object_payload_for_generation(
                             &fixture.reservation,
                             generation,
                             fixture.encrypted.logical_size,

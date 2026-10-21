@@ -189,6 +189,50 @@ pub struct ActivePutObjectRoute<'admission> {
     object_pg_id: ObjectMetadataPgId,
 }
 
+/// Opaque ownership of one reserved direct-PutObject generation.
+///
+/// The reservation identity is minted internally by an admitted
+/// [`ActivePutObjectRoute`] before payload encryption begins; production
+/// callers cannot reacquire the same durable reservation. The token is
+/// deliberately non-cloneable and binds the route admission, object subject,
+/// reservation identity, and generation. Staging consumes the token and
+/// transfers ownership to
+/// [`DirectPutPayloadWrite`]; dropping it first releases the durable
+/// reservation.
+///
+/// ```compile_fail
+/// use storage::DirectPutGenerationReservation;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn duplicate(reservation: &DirectPutGenerationReservation<'_>) {
+///     require_clone(reservation);
+/// }
+/// ```
+pub struct DirectPutGenerationReservation<'admission> {
+    owner: &'admission StorageClusterRouteAdmission,
+    armed: std::cell::Cell<bool>,
+    bucket: BucketName,
+    key: ObjectKey,
+    reservation_id: SessionId,
+    generation_id: GenerationId,
+}
+
+impl DirectPutGenerationReservation<'_> {
+    /// Returns the immutable payload generation reserved for this write.
+    #[must_use]
+    pub fn generation_id(&self) -> GenerationId {
+        self.generation_id
+    }
+}
+
+impl std::fmt::Debug for DirectPutGenerationReservation<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectPutGenerationReservation")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Non-cloneable authority to finalize one exact PutObject stream session.
 ///
 /// The subject is minted only after loading the session through an admitted
@@ -569,6 +613,33 @@ impl DirectPutPayloadWrite<'_> {
     }
 }
 
+impl DirectPutGenerationReservation<'_> {
+    fn issued_by(&self, admission: &StorageClusterRouteAdmission) -> bool {
+        std::ptr::eq(self.owner, admission)
+    }
+
+    fn disarm(&self) {
+        self.armed.set(false);
+    }
+
+    fn release_on_owner(&self) {
+        if !self.armed.replace(false) {
+            return;
+        }
+        let _ = self.owner.cluster.release_object_generation_reservation(
+            &self.bucket,
+            &self.key,
+            &self.reservation_id,
+        );
+    }
+}
+
+impl Drop for DirectPutGenerationReservation<'_> {
+    fn drop(&mut self) {
+        self.release_on_owner();
+    }
+}
+
 impl Drop for DirectPutPayloadWrite<'_> {
     fn drop(&mut self) {
         self.cleanup_on_owner();
@@ -667,16 +738,53 @@ impl<'admission> ActivePutObjectRoute<'admission> {
 
     pub fn reserve_generation(
         &self,
+    ) -> Result<DirectPutGenerationReservation<'admission>, crate::DirectPutFailure> {
+        let reservation_id = random_hex_identifier("").map_err(|_| {
+                crate::DirectPutFailure::from_object_pg_action(ObjectPgActionError::Store(
+                    StoreError::Io {
+                        context: "generate direct PUT generation reservation ID",
+                        source: std::io::Error::other(
+                            "failed to generate random generation reservation ID",
+                        ),
+                    },
+                ))
+            })?;
+        let reservation_id = SessionId::try_from(reservation_id)
+            .expect("hex-encoded direct PUT reservation IDs must be valid");
+        self.reserve_generation_with_id(&reservation_id)
+    }
+
+    fn reserve_generation_with_id(
+        &self,
         reservation_id: &SessionId,
-    ) -> Result<GenerationId, crate::DirectPutFailure> {
-        self.admission
+    ) -> Result<DirectPutGenerationReservation<'admission>, crate::DirectPutFailure> {
+        let generation_id = self
+            .admission
             .cluster
             .reserve_put_object_generation_with_route_validation(
                 self.effect_route(),
                 reservation_id,
                 || self.admission.require_valid_now_raw(),
             )
-            .map_err(crate::DirectPutFailure::from_object_pg_action)
+            .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+        Ok(DirectPutGenerationReservation {
+            owner: self.admission,
+            armed: std::cell::Cell::new(true),
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            reservation_id: reservation_id.clone(),
+            generation_id,
+        })
+    }
+
+    /// Reserves a generation with a deterministic identity for owner-local
+    /// recovery and interleaving fixtures.
+    #[cfg(test)]
+    pub(super) fn test_reserve_generation_with_id(
+        &self,
+        reservation_id: &SessionId,
+    ) -> Result<DirectPutGenerationReservation<'admission>, crate::DirectPutFailure> {
+        self.reserve_generation_with_id(reservation_id)
     }
 
     pub fn create_stream_session<T, E>(
@@ -915,11 +1023,38 @@ impl<'admission> ActivePutObjectRoute<'admission> {
 
     pub fn write_direct_object_payload(
         &self,
+        generation_reservation: DirectPutGenerationReservation<'admission>,
+        logical_size: u64,
+        data: &[u8],
+    ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
+        if !generation_reservation.issued_by(self.admission)
+            || generation_reservation.bucket != self.bucket
+            || generation_reservation.key != self.key
+        {
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT generation reservation does not match admitted object route"
+                        .to_string(),
+                },
+            ));
+        }
+        let payload = self.write_direct_object_payload_for_reserved_generation(
+            &generation_reservation.reservation_id,
+            generation_reservation.generation_id,
+            logical_size,
+            data,
+        )?;
+        generation_reservation.disarm();
+        Ok(payload)
+    }
+
+    fn write_direct_object_payload_for_reserved_generation(
+        &self,
         generation_reservation_id: &SessionId,
         generation_id: GenerationId,
         logical_size: u64,
         data: &[u8],
-    ) -> Result<DirectPutPayloadWrite<'_>, crate::DirectPutFailure> {
+    ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
         let segment_index = 0;
         let segment_okh =
             crate::direct_put_segment_key_hash(generation_reservation_id, segment_index);
@@ -950,6 +1085,24 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             placement_cluster_epoch: self.admission.cluster.operation_epoch(),
             written,
         })
+    }
+
+    /// Constructs an owner-local malformed/recovery fixture after the normal
+    /// one-use generation capability has been consumed.
+    #[cfg(test)]
+    pub(super) fn test_write_direct_object_payload_for_generation(
+        &self,
+        generation_reservation_id: &SessionId,
+        generation_id: GenerationId,
+        logical_size: u64,
+        data: &[u8],
+    ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
+        self.write_direct_object_payload_for_reserved_generation(
+            generation_reservation_id,
+            generation_id,
+            logical_size,
+            data,
+        )
     }
 
     pub fn commit_direct_object<E>(
@@ -1022,13 +1175,6 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 action,
             )
             .map_err(crate::DirectPutFailure::from_object_pg_action)
-    }
-
-    pub fn release_generation_reservation(&self, reservation_id: &SessionId) {
-        let _ = self
-            .admission
-            .cluster
-            .release_object_generation_reservation(&self.bucket, &self.key, reservation_id);
     }
 
     pub fn discard_direct_object_payload(
