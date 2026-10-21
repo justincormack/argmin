@@ -108,8 +108,8 @@ CRC64, SHA-256, and EC runtime backends, and compile-time crypto provider.
 
 ### Whole-segment encrypted-read baseline
 
-The throughput/work Phase 0 reference run was recorded on 2026-10-21 from clean source revision
-`964de9ca4e90f5bb94ad9929a0c3a3933dce6082` with the default benchmark settings:
+The `payload_read_v2` Phase 0 reference run was recorded on 2026-10-21 from clean source revision
+`6062b37ac5ae652b7ad6c065b14fb804695d83ce` with the default benchmark settings:
 
 - Rust `1.98.1`, Linux `6.12.107+deb13-amd64`, x86-64;
 - AMD Ryzen 7 255 with Radeon 780M Graphics;
@@ -119,13 +119,25 @@ The throughput/work Phase 0 reference run was recorded on 2026-10-21 from clean 
 
 | Operation | Response bytes | Median req/s | Worst req/s | Best req/s |
 |---|---:|---:|---:|---:|
-| Full GET | 16,777,216 | 109.335 | 108.033 | 110.684 |
-| Range GET | 4,096 | 342.586 | 337.801 | 356.570 |
+| Full GET | 16,777,216 | 135.833 | 130.725 | 139.345 |
+| Range GET | 4,096 | 348.836 | 345.095 | 368.385 |
 
-The five full-GET samples were 108.033, 109.335, 109.616, 108.035, and
-110.684 requests/s. The five range samples were 356.570, 353.193, 342.586,
-337.961, and 337.801 requests/s. The range began at byte 8,389,632, inside the
+The five full-GET samples were 135.833, 130.725, 135.854, 139.345, and
+134.148 requests/s. The five range samples were 348.836, 367.661, 368.385,
+345.095, and 348.610 requests/s. The range began at byte 8,389,632, inside the
 second 8 MiB segment.
+
+| Operation | Headers p50/p95/p99 | Body TTFB p50/p95/p99 | Completion p50/p95/p99 |
+|---|---:|---:|---:|
+| Full GET | 0.522 / 0.646 / 0.763 ms | 3.288 / 3.678 / 4.534 ms | 7.320 / 8.143 / 8.831 ms |
+| Range GET | 0.473 / 0.650 / 0.787 ms | 2.750 / 3.062 / 3.193 ms | 2.751 / 3.064 / 3.194 ms |
+
+The 4 KiB range's first body bytes and completion are effectively simultaneous:
+the current profile withholds the requested bytes until it has read, CRC-checked,
+and authenticated the complete 8 MiB segment. The full GET exposes its first
+authenticated segment after about 3.3 ms at p50 and completes both segments
+after about 7.3 ms. These are the direct first-byte baselines that the chunked
+reader is expected to improve.
 
 The cumulative counters were identical across all five samples. Dividing each
 sample by its iteration count gives the actual work per request:
@@ -141,12 +153,11 @@ entered repair fallback. The range row is the key Phase 0 result: returning
 codec measurements must retain these exact workload and environment fields and
 compare both throughput and work counters, not throughput alone.
 
-That revision used benchmark protocol `payload_read_v1`, which measured only
-aggregate completion throughput. Protocol `payload_read_v2` adds header,
-first-body-byte, and completion latency without adding timed whole-body
-collection. Its clean-revision reference values must be recorded after the v2
-harness itself is committed; dirty-tree exploratory values are not reference
-evidence.
+For historical context, benchmark protocol `payload_read_v1` on clean revision
+`964de9ca4e90f5bb94ad9929a0c3a3933dce6082` reported 109.335 full GET requests/s
+and 342.586 range GET requests/s. It measured only aggregate completion
+throughput and used SDK whole-body collection, so it is not the comparison
+baseline for the chunked reader.
 
 ## Checksums and erasure coding
 

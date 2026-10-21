@@ -1,6 +1,6 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phase 0 TTFB evidence extension pending; Phase 1 exact encryption subjects next)
+Status: In progress (Phase 0 complete; Phase 1 exact encryption subjects next)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -811,18 +811,19 @@ Implementation update (2026-10-17):
   non-empty SDK body bytes, and request-to-body-completion latency. The timed reader consumes
   `Bytes` chunks without assembling another whole response. This makes the whole-segment profile's
   current first-payload-byte delay a direct baseline for the chunked reader rather than inferring
-  it from aggregate throughput. The v2 clean-revision reference run remains pending until the
-  harness is committed; exploratory dirty-tree results are not authoritative evidence.
-- The authoritative Phase 0 baseline was recorded on 2026-10-21 from clean revision
-  `964de9ca4e90f5bb94ad9929a0c3a3933dce6082` on the default Ring provider. A 16 MiB full GET has a
-  median 109.335 requests/s and processes two complete segment records. A 4 KiB range has a median
-  342.586 requests/s but reads and CRC-checks 8,388,624 stored bytes, decrypts 8,388,608 bytes, and
-  opens one AEAD record per request. Neither case reconstructs or enters repair fallback. The full
-  environment, distribution, and per-request counters are recorded in `guides/performance.md`.
+  it from aggregate throughput.
+- The authoritative `payload_read_v2` Phase 0 baseline was recorded on 2026-10-21 from clean
+  revision `6062b37ac5ae652b7ad6c065b14fb804695d83ce` on the default Ring provider. A 16 MiB full GET
+  has median 135.833 requests/s and body TTFB of 3.288/3.678/4.534 ms at p50/p95/p99. A 4 KiB range
+  has median 348.836 requests/s and body TTFB of 2.750/3.062/3.193 ms, but reads and CRC-checks
+  8,388,624 stored bytes, decrypts 8,388,608 bytes, and opens one AEAD record per request. Its body
+  TTFB and completion latency are effectively identical because the selected bytes remain withheld
+  until the complete 8 MiB segment is authenticated. Neither case reconstructs or enters repair
+  fallback. The full environment, distributions, completion latency, and per-request counters are
+  recorded in `guides/performance.md`.
 
-The original Phase 0 exit is satisfied for work amplification, throughput, durable format
-evidence, and the target profile boundary. The later-added body-TTFB evidence extension remains
-open until `payload_read_v2` is committed and rerun from a clean revision.
+Phase 0 exit is satisfied. Work amplification, throughput, body TTFB, the current durable format,
+immutable format evidence, and the target profile boundary are recorded.
 
 ### Phase 1: Exact encryption subjects
 
@@ -1059,7 +1060,7 @@ Measure both sequential GET and random `Range` GET for at least:
 - 4 KiB, 16 KiB, 64 KiB, 256 KiB, and 1 MiB ranges;
 - ranges crossing a 16 KiB chunk, EC shard, 8 MiB segment, and multipart-part boundary;
 - 4 KiB, 1 MiB, 8 MiB, 10 MiB, 64 MiB, and representative large objects;
-- encryption disabled, current AES-256-GCM segment format, and Cobblestone-256;
+- current AES-256-GCM segment format and Cobblestone-256 under the same SSE-S3 or SSE-C key mode;
 - `1+0`, redundant local EC, and multihost EC;
 - healthy reads and one missing/corrupt shard; and
 - cold-cache and warm-cache conditions where the platform permits reliable control.
