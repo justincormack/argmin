@@ -279,4 +279,20 @@ impl ActiveWriteEncryption {
             }
         }
     }
+
+    pub(super) fn encrypt_direct_put_segment(
+        &self,
+        subject: &storage::ObjectEncryptionSubject,
+        segment_index: u32,
+        data: &[u8],
+    ) -> Result<Vec<u8>, ServerError> {
+        if !subject.matches_encryption(&self.object_encryption()) {
+            return Err(ServerError::InternalError {
+                reason:
+                    "direct PUT encryption subject does not match the write encryption instance"
+                        .to_string(),
+            });
+        }
+        self.encrypt_segment(segment_index, data)
+    }
 }

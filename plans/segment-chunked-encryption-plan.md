@@ -850,6 +850,31 @@ Implementation update (2026-10-21):
   generation allocator advances. This supplies the complete storage-owned object identity needed
   for the next slice to mint the standard-object encryption subject without letting the
   coordinator assemble its fields.
+- The direct-PUT reservation now consumes that identity to mint a non-cloneable, opaque
+  `ObjectEncryptionSubject` before encryption. Its frozen V1 canonical encoding is binary,
+  versioned, profile-tagged, length-prefixed, and binds the current profile, the encryption
+  instance, bucket incarnation, bucket, key, and reserved payload generation. The current
+  encryption instance identifier reuses the already-random, immutable, persisted 96-bit DEK-wrap
+  nonce; the later durable-profile slice may replace that representation only through an explicit
+  context-version decision. The identifier prefixes that nonce with the durable SSE-C/SSE-S3 mode
+  tag so even a deliberately repeated nonce cannot cross key modes. Exact encoding, malformed
+  encoding, and independently crossed-field fixtures pin the codec.
+- The opaque capability separately retains an exact binding to all immutable encryption material:
+  wrapping/validator key identifiers and validator state where applicable, wrap salt and nonce,
+  wrapped DEK, and segment-nonce prefix. This state is deliberately not folded into the canonical
+  bytes because including the wrapped DEK in the context used to produce that wrapped DEK would be
+  circular. Encryption and terminal publication require both the canonical instance identifier
+  and this immutable binding to match. Only checksum nonce/ciphertext enrichment is excluded, so
+  the intended post-payload checksum sealing remains valid; same-wrap-nonce substitutions of key
+  identifier, wrapped DEK, or segment-nonce prefix fail closed.
+- Buffered direct PUT carries the bound subject through its encryption call and staged-payload
+  owner. The encryption boundary rejects a crossed encryption instance before producing bytes,
+  and terminal publication reconstructs the subject from the sealed encryption state and rejects
+  a mismatch before command construction while retaining normal payload/reservation cleanup.
+  This slice deliberately does not alter persisted ciphertext: the existing whole-segment profile
+  still uses its frozen legacy AAD. Binding the canonical bytes into wrap, checksum, and segment
+  cryptography remains coupled to the explicit durable-profile and containing-format bump, so no
+  current-format fixture is silently reinterpreted.
 
 - Introduce private canonical context codecs and opaque subject constructors.
 - Ensure every write path exposes its existing or newly allocated immutable generation to the

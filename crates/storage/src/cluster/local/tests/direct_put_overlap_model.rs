@@ -420,7 +420,8 @@ fn replay(state: &State) -> Result<(), String> {
                     .write_direct_object_payload(
                         generation_reservation
                             .take()
-                            .ok_or("direct PUT generation reservation was already consumed")?,
+                            .ok_or("direct PUT generation reservation was already consumed")?
+                            .bind_encryption(&fixture.encrypted.encryption),
                         fixture.encrypted.logical_size,
                         &fixture.encrypted.storage_bytes,
                     )
@@ -483,6 +484,7 @@ fn replay(state: &State) -> Result<(), String> {
                         .test_write_direct_object_payload_for_generation(
                             &fixture.reservation,
                             generation,
+                            &fixture.encrypted.encryption,
                             fixture.encrypted.logical_size,
                             &fixture.encrypted.storage_bytes,
                         )

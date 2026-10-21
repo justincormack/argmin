@@ -10030,7 +10030,7 @@
         let encrypted = crate::tests::sse_s3_segment_test_fixture(data, 0);
         let payload = route
             .write_direct_object_payload(
-                generation_id,
+                generation_id.bind_encryption(&encrypted.encryption),
                 encrypted.logical_size,
                 &encrypted.storage_bytes,
             )

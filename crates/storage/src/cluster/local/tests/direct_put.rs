@@ -143,7 +143,7 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
         .unwrap();
     let error = crossed_key_route
         .write_direct_object_payload(
-            crossed_reservation,
+            crossed_reservation.bind_encryption(&fixture.encryption),
             fixture.logical_size,
             &fixture.storage_bytes,
         )
@@ -170,7 +170,7 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
         .unwrap();
     let commit_payload = route
         .write_direct_object_payload(
-            commit_generation_id,
+            commit_generation_id.bind_encryption(&fixture.encryption),
             fixture.logical_size,
             &fixture.storage_bytes,
         )
@@ -206,7 +206,7 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
         .unwrap();
     let discard_payload = route
         .write_direct_object_payload(
-            discard_generation_id,
+            discard_generation_id.bind_encryption(&fixture.encryption),
             fixture.logical_size,
             &fixture.storage_bytes,
         )
@@ -280,7 +280,11 @@ fn opaque_direct_put_payload_rejects_same_epoch_cross_cluster_commit_and_cleans_
         .test_reserve_generation_with_id(&reservation_id)
         .unwrap();
     let payload = issuer_route
-        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
+        .write_direct_object_payload(
+            generation_id.bind_encryption(&fixture.encryption),
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
     assert_direct_payload_shards_exist(&issuer, payload_identity);
@@ -563,8 +567,13 @@ fn dropping_armed_direct_put_payload_cleans_issuer_staging() {
     let generation_id = route
         .test_reserve_generation_with_id(&reservation_id)
         .unwrap();
+    let encryption = crate::tests::metadata_only_test_encryption();
     let payload = route
-        .write_direct_object_payload(generation_id, 20, b"drop cleans payload")
+        .write_direct_object_payload(
+            generation_id.bind_encryption(&encryption),
+            20,
+            b"drop cleans payload",
+        )
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
     assert_direct_payload_shards_exist(&cluster, payload_identity);
@@ -579,6 +588,80 @@ fn dropping_armed_direct_put_payload_cleans_issuer_staging() {
         &reservation_id,
         payload_identity,
     );
+}
+
+#[test]
+fn direct_put_payload_rejects_same_nonce_changed_key_material_before_command_construction() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("direct-put-encryption-subject");
+    let key = crate::tests::object_key("crossed-instance");
+    create_test_bucket(&cluster, &bucket);
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let reservation_id = crate::tests::stream_session_id("encryption-cross");
+    let reservation = route
+        .test_reserve_generation_with_id(&reservation_id)
+        .unwrap();
+    let plaintext = b"encryption-subject payload";
+    let fixture = crate::tests::sse_s3_segment_test_fixture(plaintext, 0);
+    let payload = route
+        .write_direct_object_payload(
+            reservation.bind_encryption(&fixture.encryption),
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
+        .unwrap();
+    let payload_identity = direct_payload_test_identity(&payload);
+    let mut prepared = prepared_encrypted_direct_put(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        plaintext,
+        &fixture,
+    );
+    let crate::ObjectEncryption::SseS3(staged_encryption) = &fixture.encryption else {
+        panic!("direct PUT test fixture must use SSE-S3");
+    };
+    prepared.encryption = crate::ObjectEncryption::SseS3(crate::SseS3ObjectState::new(
+        staged_encryption.wrapping_key_id(),
+        *staged_encryption.wrap_nonce(),
+        [0xa5; crate::SSE_S3_WRAPPED_DEK_LEN],
+        *staged_encryption.segment_nonce_prefix(),
+    ));
+    let crate::ObjectEncryption::SseS3(prepared_encryption) = &prepared.encryption else {
+        unreachable!("prepared encryption was constructed as SSE-S3");
+    };
+    assert_eq!(
+        prepared_encryption.wrap_nonce(),
+        staged_encryption.wrap_nonce()
+    );
+    assert_ne!(prepared.encryption, fixture.encryption);
+
+    let error = route.commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()));
+    let error = error.unwrap_err();
+    assert_eq!(error.kind(), crate::DirectPutFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "invalid_request");
+    assert_direct_payload_staging_cleaned(
+        &map,
+        &cluster,
+        &bucket,
+        &key,
+        &reservation_id,
+        payload_identity,
+    );
+    assert_bucket_write_reservations_released(&map, &bucket);
 }
 
 #[test]
@@ -608,7 +691,11 @@ fn matching_pending_direct_put_retries_transient_abandonment_scan_and_preserves_
     let data = b"payload owned by a matching pending command";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
+        .write_direct_object_payload(
+            generation_id.bind_encryption(&fixture.encryption),
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
     let prepared = prepared_encrypted_direct_put(
@@ -751,7 +838,11 @@ fn matching_published_direct_put_returns_before_trailing_payload_ack_work() {
     let data = b"payload owned by a published pending command";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
+        .write_direct_object_payload(
+            generation_id.bind_encryption(&fixture.encryption),
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let prepared = prepared_encrypted_direct_put(
         &cluster,
@@ -904,7 +995,11 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
     let data = b"payload whose staging keys overlap the pending command";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let pending_payload = route
-        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
+        .write_direct_object_payload(
+            generation_id.bind_encryption(&fixture.encryption),
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let payload_identity = direct_payload_test_identity(&pending_payload);
     let prepared = prepared_encrypted_direct_put(
@@ -966,6 +1061,7 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
         .test_write_direct_object_payload_for_generation(
             &reservation_id,
             expected_generation_id,
+            &fixture.encryption,
             fixture.logical_size,
             &fixture.storage_bytes,
         )
@@ -2199,7 +2295,11 @@ fn direct_put_budget_expiry_after_pending_install_returns_snapshot_conflict_and_
     let data = b"direct PUT inherited budget expiry after pending install";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
+        .write_direct_object_payload(
+            generation_id.bind_encryption(&fixture.encryption),
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let payload_identity = direct_payload_test_identity(&payload);
     let prepared = prepared_encrypted_direct_put(
@@ -2304,7 +2404,11 @@ fn direct_put_retry_reconstructs_matching_witness_before_reservation_validation(
     let data = b"direct PUT matching pending witness adoption";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
+        .write_direct_object_payload(
+            generation_id.bind_encryption(&fixture.encryption),
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let prepared = prepared_encrypted_direct_put(
         &cluster,
@@ -2417,7 +2521,11 @@ fn versioned_direct_put_hands_transported_trailing_contention_to_recovery() {
     let data = b"versioned direct PUT replica timeout";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
+        .write_direct_object_payload(
+            generation_id.bind_encryption(&fixture.encryption),
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let prepared = prepared_encrypted_direct_put(
         &cluster,
@@ -2579,7 +2687,11 @@ fn versioned_direct_put_converges_primary_apply_response_loss_before_success() {
     let data = b"versioned direct PUT apply response loss";
     let fixture = crate::tests::sse_s3_segment_test_fixture(data, 0);
     let payload = route
-        .write_direct_object_payload(generation_id, fixture.logical_size, &fixture.storage_bytes)
+        .write_direct_object_payload(
+            generation_id.bind_encryption(&fixture.encryption),
+            fixture.logical_size,
+            &fixture.storage_bytes,
+        )
         .unwrap();
     let prepared = prepared_encrypted_direct_put(
         &cluster,

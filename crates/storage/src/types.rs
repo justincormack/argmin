@@ -1436,6 +1436,227 @@ pub const SSE_S3_WRAPPED_DEK_LEN: usize = OBJECT_ENCRYPTION_WRAPPED_DEK_LEN;
 pub const SSE_S3_SEGMENT_NONCE_PREFIX_LEN: usize = OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN;
 pub const SSE_S3_CHECKSUM_NONCE_LEN: usize = OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN;
 
+const OBJECT_ENCRYPTION_SUBJECT_DOMAIN: &[u8] = b"argmin:object-encryption-subject";
+const OBJECT_ENCRYPTION_SUBJECT_VERSION: u8 = 1;
+const SEGMENT_AES_256_GCM_V1_PROFILE_TAG: u8 = 1;
+const OBJECT_ENCRYPTION_INSTANCE_ID_LEN: usize = 1 + OBJECT_ENCRYPTION_WRAP_NONCE_LEN;
+
+/// Opaque canonical identity authenticated by one object's payload encryption.
+///
+/// Storage constructs this value from an exact object-generation reservation
+/// and the encryption instance bound to that reservation. Higher layers may
+/// carry it to the encryption boundary, but cannot assemble or alter its
+/// bucket, key, incarnation, generation, profile, or encryption-instance
+/// fields independently.
+pub struct ObjectEncryptionSubject {
+    canonical: Box<[u8]>,
+    encryption_instance_id: [u8; OBJECT_ENCRYPTION_INSTANCE_ID_LEN],
+    immutable_encryption_binding: ObjectEncryptionImmutableBinding,
+}
+
+#[derive(PartialEq, Eq)]
+enum ObjectEncryptionImmutableBinding {
+    SseCustomer {
+        validator_key_id: u32,
+        validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
+        validator_hmac: [u8; SSE_C_VALIDATOR_HMAC_LEN],
+        wrap_salt: [u8; SSE_C_WRAP_SALT_LEN],
+        wrap_nonce: [u8; SSE_C_WRAP_NONCE_LEN],
+        wrapped_dek: [u8; SSE_C_WRAPPED_DEK_LEN],
+        segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+    },
+    SseS3 {
+        wrapping_key_id: u32,
+        wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
+        wrapped_dek: [u8; SSE_S3_WRAPPED_DEK_LEN],
+        segment_nonce_prefix: [u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    },
+}
+
+impl ObjectEncryptionImmutableBinding {
+    fn from_encryption(encryption: &ObjectEncryption) -> Self {
+        match encryption {
+            ObjectEncryption::SseCustomer(state) => Self::SseCustomer {
+                validator_key_id: state.validator_key_id(),
+                validator_salt: *state.validator_salt(),
+                validator_hmac: *state.validator_hmac(),
+                wrap_salt: *state.wrap_salt(),
+                wrap_nonce: *state.wrap_nonce(),
+                wrapped_dek: *state.wrapped_dek(),
+                segment_nonce_prefix: *state.segment_nonce_prefix(),
+            },
+            ObjectEncryption::SseS3(state) => Self::SseS3 {
+                wrapping_key_id: state.wrapping_key_id(),
+                wrap_nonce: *state.wrap_nonce(),
+                wrapped_dek: *state.wrapped_dek(),
+                segment_nonce_prefix: *state.segment_nonce_prefix(),
+            },
+        }
+    }
+}
+
+impl ObjectEncryptionSubject {
+    pub(crate) fn standard_object(
+        bucket_incarnation_generation: u64,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        encryption: &ObjectEncryption,
+    ) -> Self {
+        let encryption_instance_id = encryption.encryption_instance_id();
+        let domain_len = u8::try_from(OBJECT_ENCRYPTION_SUBJECT_DOMAIN.len())
+            .expect("object encryption subject domain length must fit u8");
+        let bucket_len = u16::try_from(bucket.as_str().len())
+            .expect("validated bucket name length must fit u16");
+        let key_len =
+            u16::try_from(key.as_str().len()).expect("validated object key length must fit u16");
+        let mut canonical = Vec::with_capacity(
+            1 + OBJECT_ENCRYPTION_SUBJECT_DOMAIN.len()
+                + 1
+                + 1
+                + 1
+                + OBJECT_ENCRYPTION_INSTANCE_ID_LEN
+                + 8
+                + 2
+                + usize::from(bucket_len)
+                + 2
+                + usize::from(key_len)
+                + 8,
+        );
+        canonical.push(domain_len);
+        canonical.extend_from_slice(OBJECT_ENCRYPTION_SUBJECT_DOMAIN);
+        canonical.push(OBJECT_ENCRYPTION_SUBJECT_VERSION);
+        canonical.push(SEGMENT_AES_256_GCM_V1_PROFILE_TAG);
+        canonical.push(
+            u8::try_from(OBJECT_ENCRYPTION_INSTANCE_ID_LEN)
+                .expect("object encryption instance identifier length must fit u8"),
+        );
+        canonical.extend_from_slice(&encryption_instance_id);
+        canonical.extend_from_slice(&bucket_incarnation_generation.to_be_bytes());
+        canonical.extend_from_slice(&bucket_len.to_be_bytes());
+        canonical.extend_from_slice(bucket.as_str().as_bytes());
+        canonical.extend_from_slice(&key_len.to_be_bytes());
+        canonical.extend_from_slice(key.as_str().as_bytes());
+        canonical.extend_from_slice(&generation_id.get().to_be_bytes());
+        Self {
+            canonical: canonical.into_boxed_slice(),
+            encryption_instance_id,
+            immutable_encryption_binding: ObjectEncryptionImmutableBinding::from_encryption(
+                encryption,
+            ),
+        }
+    }
+
+    /// Returns whether this subject was minted for the supplied encryption
+    /// instance. This lets the encryption boundary reject crossed state while
+    /// the canonical subject itself remains opaque.
+    #[must_use]
+    pub fn matches_encryption(&self, encryption: &ObjectEncryption) -> bool {
+        self.encryption_instance_id == encryption.encryption_instance_id()
+            && self.immutable_encryption_binding
+                == ObjectEncryptionImmutableBinding::from_encryption(encryption)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical
+    }
+
+    #[cfg(test)]
+    fn validate_canonical_for_test(canonical: &[u8]) -> Result<Box<[u8]>, &'static str> {
+        fn take<'a>(
+            bytes: &'a [u8],
+            cursor: &mut usize,
+            len: usize,
+        ) -> Result<&'a [u8], &'static str> {
+            let end = cursor.checked_add(len).ok_or("length overflow")?;
+            let value = bytes.get(*cursor..end).ok_or("truncated subject")?;
+            *cursor = end;
+            Ok(value)
+        }
+
+        let mut cursor = 0;
+        let domain_len = usize::from(
+            *take(canonical, &mut cursor, 1)?
+                .first()
+                .ok_or("missing domain length")?,
+        );
+        if take(canonical, &mut cursor, domain_len)? != OBJECT_ENCRYPTION_SUBJECT_DOMAIN {
+            return Err("invalid domain");
+        }
+        if take(canonical, &mut cursor, 1)? != [OBJECT_ENCRYPTION_SUBJECT_VERSION] {
+            return Err("unsupported version");
+        }
+        if take(canonical, &mut cursor, 1)? != [SEGMENT_AES_256_GCM_V1_PROFILE_TAG] {
+            return Err("unsupported profile");
+        }
+        let instance_len = usize::from(
+            *take(canonical, &mut cursor, 1)?
+                .first()
+                .ok_or("missing encryption instance length")?,
+        );
+        if instance_len != OBJECT_ENCRYPTION_INSTANCE_ID_LEN {
+            return Err("invalid encryption instance length");
+        }
+        let encryption_instance_id: [u8; OBJECT_ENCRYPTION_INSTANCE_ID_LEN] =
+            take(canonical, &mut cursor, instance_len)?
+                .try_into()
+                .map_err(|_| "invalid encryption instance")?;
+        let bucket_incarnation_generation = u64::from_be_bytes(
+            take(canonical, &mut cursor, 8)?
+                .try_into()
+                .map_err(|_| "invalid bucket incarnation")?,
+        );
+        if bucket_incarnation_generation == 0 {
+            return Err("invalid bucket incarnation");
+        }
+        let bucket_len = usize::from(u16::from_be_bytes(
+            take(canonical, &mut cursor, 2)?
+                .try_into()
+                .map_err(|_| "invalid bucket length")?,
+        ));
+        let bucket = std::str::from_utf8(take(canonical, &mut cursor, bucket_len)?)
+            .map_err(|_| "invalid bucket encoding")?;
+        BucketName::try_from(bucket).map_err(|_| "invalid bucket")?;
+        let key_len = usize::from(u16::from_be_bytes(
+            take(canonical, &mut cursor, 2)?
+                .try_into()
+                .map_err(|_| "invalid key length")?,
+        ));
+        let key = std::str::from_utf8(take(canonical, &mut cursor, key_len)?)
+            .map_err(|_| "invalid key encoding")?;
+        ObjectKey::try_from(key).map_err(|_| "invalid key")?;
+        let generation = u64::from_be_bytes(
+            take(canonical, &mut cursor, 8)?
+                .try_into()
+                .map_err(|_| "invalid generation")?,
+        );
+        GenerationId::new(generation).ok_or("invalid generation")?;
+        if cursor != canonical.len() {
+            return Err("trailing subject bytes");
+        }
+        let _ = encryption_instance_id;
+        Ok(canonical.to_vec().into_boxed_slice())
+    }
+}
+
+impl PartialEq for ObjectEncryptionSubject {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical == other.canonical
+            && self.immutable_encryption_binding == other.immutable_encryption_binding
+    }
+}
+
+impl Eq for ObjectEncryptionSubject {}
+
+impl std::fmt::Debug for ObjectEncryptionSubject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectEncryptionSubject")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Stored per-object `SSE-C` state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerObjectState {
@@ -1874,6 +2095,17 @@ impl std::fmt::Debug for ObjectEncryption {
 }
 
 impl ObjectEncryption {
+    fn encryption_instance_id(&self) -> [u8; OBJECT_ENCRYPTION_INSTANCE_ID_LEN] {
+        let (mode, nonce) = match self {
+            Self::SseCustomer(state) => (ObjectEncryptionType::SseCustomer, state.wrap_nonce()),
+            Self::SseS3(state) => (ObjectEncryptionType::SseS3, state.wrap_nonce()),
+        };
+        let mut instance_id = [0; OBJECT_ENCRYPTION_INSTANCE_ID_LEN];
+        instance_id[0] = mode as u8;
+        instance_id[1..].copy_from_slice(nonce);
+        instance_id
+    }
+
     #[must_use]
     pub(crate) fn encryption_type(&self) -> ObjectEncryptionType {
         match self {
@@ -4549,6 +4781,7 @@ pub struct DirectPutPayloadWrite<'admission> {
     pub(crate) generation_reservation_id: SessionId,
     pub(crate) generation_id: GenerationId,
     pub(crate) bucket_incarnation_generation: u64,
+    pub(crate) encryption_subject: ObjectEncryptionSubject,
     pub(crate) logical_size: u64,
     pub(crate) segment_index: u32,
     pub(crate) segment_crc64: u64,
@@ -7524,6 +7757,213 @@ mod tests {
             .unwrap(),
             managed
         );
+    }
+
+    #[test]
+    fn object_encryption_subject_has_canonical_exact_encoding_and_rejects_crossed_fields() {
+        let bucket = BucketName::try_from("subject-bucket").unwrap();
+        let other_bucket = BucketName::try_from("subject-other").unwrap();
+        let key = ObjectKey::try_from("path/to/object").unwrap();
+        let other_key = ObjectKey::try_from("path/to/other").unwrap();
+        let encryption = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        let other_encryption = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [13; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        let same_nonce_other_wrapping_key = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            10,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        let same_nonce_other_wrapped_dek = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [14; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        let same_nonce_other_segment_nonce_prefix = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [15; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        let checksum_enriched_encryption = ObjectEncryption::SseS3(
+            SseS3ObjectState::new(
+                9,
+                [10; SSE_S3_WRAP_NONCE_LEN],
+                [11; SSE_S3_WRAPPED_DEK_LEN],
+                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_encrypted_checksum_metadata([16; SSE_S3_CHECKSUM_NONCE_LEN], vec![17, 18, 19])
+            .unwrap(),
+        );
+        let crossed_mode_encryption = ObjectEncryption::SseCustomer(SseCustomerObjectState::new(
+            9,
+            [1; SSE_C_VALIDATOR_SALT_LEN],
+            [2; SSE_C_VALIDATOR_HMAC_LEN],
+            [3; SSE_C_WRAP_SALT_LEN],
+            [10; SSE_C_WRAP_NONCE_LEN],
+            [11; SSE_C_WRAPPED_DEK_LEN],
+            [12; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        let subject = ObjectEncryptionSubject::standard_object(
+            17,
+            &bucket,
+            &key,
+            GenerationId::new(23).unwrap(),
+            &encryption,
+        );
+        let mut expected = vec![32];
+        expected.extend_from_slice(b"argmin:object-encryption-subject");
+        expected.extend_from_slice(&[1, 1, 13, 2]);
+        expected.extend_from_slice(&[10; 12]);
+        expected.extend_from_slice(&17_u64.to_be_bytes());
+        expected.extend_from_slice(&14_u16.to_be_bytes());
+        expected.extend_from_slice(b"subject-bucket");
+        expected.extend_from_slice(&14_u16.to_be_bytes());
+        expected.extend_from_slice(b"path/to/object");
+        expected.extend_from_slice(&23_u64.to_be_bytes());
+        assert_eq!(subject.canonical_bytes(), expected);
+        assert_eq!(
+            ObjectEncryptionSubject::validate_canonical_for_test(&expected)
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+        assert!(subject.matches_encryption(&encryption));
+        assert!(subject.matches_encryption(&checksum_enriched_encryption));
+        assert!(!subject.matches_encryption(&other_encryption));
+        assert!(!subject.matches_encryption(&same_nonce_other_wrapping_key));
+        assert!(!subject.matches_encryption(&same_nonce_other_wrapped_dek));
+        assert!(!subject.matches_encryption(&same_nonce_other_segment_nonce_prefix));
+        assert!(!subject.matches_encryption(&crossed_mode_encryption));
+
+        for crossed in [
+            ObjectEncryptionSubject::standard_object(
+                18,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &encryption,
+            ),
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &other_bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &encryption,
+            ),
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &other_key,
+                GenerationId::new(23).unwrap(),
+                &encryption,
+            ),
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(24).unwrap(),
+                &encryption,
+            ),
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &other_encryption,
+            ),
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &same_nonce_other_wrapping_key,
+            ),
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &same_nonce_other_wrapped_dek,
+            ),
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &same_nonce_other_segment_nonce_prefix,
+            ),
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &crossed_mode_encryption,
+            ),
+        ] {
+            assert_ne!(crossed, subject);
+        }
+    }
+
+    #[test]
+    fn object_encryption_subject_rejects_noncanonical_encodings() {
+        let encryption = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        let subject = ObjectEncryptionSubject::standard_object(
+            17,
+            &BucketName::try_from("subject-bucket").unwrap(),
+            &ObjectKey::try_from("path/to/object").unwrap(),
+            GenerationId::new(23).unwrap(),
+            &encryption,
+        );
+        let canonical = subject.canonical_bytes();
+        let domain_end = 1 + usize::from(canonical[0]);
+
+        let mut unsupported_version = canonical.to_vec();
+        unsupported_version[domain_end] = 2;
+        let mut unsupported_profile = canonical.to_vec();
+        unsupported_profile[domain_end + 1] = 2;
+        let mut invalid_instance_len = canonical.to_vec();
+        invalid_instance_len[domain_end + 2] = 12;
+        let mut invalid_incarnation = canonical.to_vec();
+        invalid_incarnation[domain_end + 3 + OBJECT_ENCRYPTION_INSTANCE_ID_LEN
+            ..domain_end + 3 + OBJECT_ENCRYPTION_INSTANCE_ID_LEN + 8]
+            .fill(0);
+        let mut invalid_bucket_len = canonical.to_vec();
+        let bucket_len_offset = domain_end + 3 + OBJECT_ENCRYPTION_INSTANCE_ID_LEN + 8;
+        invalid_bucket_len[bucket_len_offset..bucket_len_offset + 2]
+            .copy_from_slice(&u16::MAX.to_be_bytes());
+        let mut invalid_generation = canonical.to_vec();
+        let generation_offset = invalid_generation.len() - 8;
+        invalid_generation[generation_offset..].fill(0);
+        let mut trailing = canonical.to_vec();
+        trailing.push(0);
+
+        for malformed in [
+            unsupported_version,
+            unsupported_profile,
+            invalid_instance_len,
+            invalid_incarnation,
+            invalid_bucket_len,
+            invalid_generation,
+            trailing,
+        ] {
+            assert!(ObjectEncryptionSubject::validate_canonical_for_test(&malformed).is_err());
+        }
     }
 
     #[test]

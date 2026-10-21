@@ -341,12 +341,17 @@ impl Coordinator {
                         let generation_reservation = put_route
                             .reserve_generation(&proof)
                             .map_err(Coordinator::map_direct_put_failure)?;
-                        let storage_bytes =
-                            write_encryption.encrypt_segment(0, req.data)?;
+                        let encryption_reservation = generation_reservation
+                            .bind_encryption(&write_encryption.object_encryption());
+                        let storage_bytes = write_encryption.encrypt_direct_put_segment(
+                            encryption_reservation.encryption_subject(),
+                            0,
+                            req.data,
+                        )?;
 
                         let written_payload = put_route
                             .write_direct_object_payload(
-                            generation_reservation,
+                            encryption_reservation,
                             req.data.len() as u64,
                             &storage_bytes,
                         )

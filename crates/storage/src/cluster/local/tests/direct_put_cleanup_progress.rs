@@ -106,7 +106,7 @@ fn cancellation_progress(
             .map_err(diagnostic)?;
         let payload = routes[actor]
             .write_direct_object_payload(
-                generation,
+                generation.bind_encryption(&encrypted.encryption),
                 encrypted.logical_size,
                 &encrypted.storage_bytes,
             )
@@ -300,8 +300,12 @@ fn direct_put_release_fences_delayed_staging() {
         absent,
         "release must leave no staged payload"
     );
-    let late =
-        route.write_direct_object_payload(generation_reservation, DATA[0].len() as u64, DATA[0]);
+    let encryption = crate::tests::metadata_only_test_encryption();
+    let late = route.write_direct_object_payload(
+        generation_reservation.bind_encryption(&encryption),
+        DATA[0].len() as u64,
+        DATA[0],
+    );
     // Inspect before dropping any returned RAII payload: its compensation must
     // not mask the late write. Check physical state even when the call returns Err.
     assert_eq!(

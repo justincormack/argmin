@@ -219,11 +219,31 @@ pub struct DirectPutGenerationReservation<'admission> {
     bucket_incarnation_generation: u64,
 }
 
-impl DirectPutGenerationReservation<'_> {
+impl<'admission> DirectPutGenerationReservation<'admission> {
     /// Returns the immutable payload generation reserved for this write.
     #[must_use]
     pub fn generation_id(&self) -> GenerationId {
         self.generation_id
+    }
+
+    /// Binds this exact reserved object generation to one encryption instance
+    /// before the first payload byte is encrypted.
+    #[must_use]
+    pub fn bind_encryption(
+        self,
+        encryption: &ObjectEncryption,
+    ) -> DirectPutEncryptionReservation<'admission> {
+        let subject = ObjectEncryptionSubject::standard_object(
+            self.bucket_incarnation_generation,
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+            encryption,
+        );
+        DirectPutEncryptionReservation {
+            generation: self,
+            subject,
+        }
     }
 }
 
@@ -231,6 +251,38 @@ impl std::fmt::Debug for DirectPutGenerationReservation<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DirectPutGenerationReservation")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Non-cloneable direct-PUT generation reservation bound to one exact
+/// canonical encryption subject.
+///
+/// ```compile_fail
+/// use storage::DirectPutEncryptionReservation;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn duplicate(reservation: &DirectPutEncryptionReservation<'_>) {
+///     require_clone(reservation);
+/// }
+/// ```
+pub struct DirectPutEncryptionReservation<'admission> {
+    generation: DirectPutGenerationReservation<'admission>,
+    subject: ObjectEncryptionSubject,
+}
+
+impl DirectPutEncryptionReservation<'_> {
+    /// Returns the opaque subject which the encryption boundary must consume.
+    #[must_use]
+    pub fn encryption_subject(&self) -> &ObjectEncryptionSubject {
+        &self.subject
+    }
+}
+
+impl std::fmt::Debug for DirectPutEncryptionReservation<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectPutEncryptionReservation")
             .finish_non_exhaustive()
     }
 }
@@ -1104,10 +1156,14 @@ impl<'admission> ActivePutObjectRoute<'admission> {
 
     pub fn write_direct_object_payload(
         &self,
-        generation_reservation: DirectPutGenerationReservation<'admission>,
+        encryption_reservation: DirectPutEncryptionReservation<'admission>,
         logical_size: u64,
         data: &[u8],
     ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
+        let DirectPutEncryptionReservation {
+            generation: generation_reservation,
+            subject: encryption_subject,
+        } = encryption_reservation;
         if !generation_reservation.issued_by(self.admission)
             || generation_reservation.bucket != self.bucket
             || generation_reservation.key != self.key
@@ -1123,6 +1179,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             &generation_reservation.reservation_id,
             generation_reservation.generation_id,
             generation_reservation.bucket_incarnation_generation,
+            encryption_subject,
             logical_size,
             data,
         )?;
@@ -1135,6 +1192,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         generation_reservation_id: &SessionId,
         generation_id: GenerationId,
         bucket_incarnation_generation: u64,
+        encryption_subject: ObjectEncryptionSubject,
         logical_size: u64,
         data: &[u8],
     ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
@@ -1161,6 +1219,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             generation_reservation_id: generation_reservation_id.clone(),
             generation_id,
             bucket_incarnation_generation,
+            encryption_subject,
             logical_size,
             segment_index,
             segment_crc64: checksum::crc64::checksum(data),
@@ -1178,6 +1237,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         &self,
         generation_reservation_id: &SessionId,
         generation_id: GenerationId,
+        encryption: &ObjectEncryption,
         logical_size: u64,
         data: &[u8],
     ) -> Result<DirectPutPayloadWrite<'admission>, crate::DirectPutFailure> {
@@ -1193,6 +1253,13 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             .map_err(crate::DirectPutFailure::from_object_pg_action)?;
         let proof = BucketWriteReservationProof::from(&reservation.record);
         let bucket_incarnation_generation = proof.bucket_incarnation_generation;
+        let encryption_subject = ObjectEncryptionSubject::standard_object(
+            bucket_incarnation_generation,
+            &self.bucket,
+            &self.key,
+            generation_id,
+            encryption,
+        );
         self.admission
             .cluster
             .release_bucket_write_reservation_proof(&proof)
@@ -1202,6 +1269,7 @@ impl<'admission> ActivePutObjectRoute<'admission> {
             generation_reservation_id,
             generation_id,
             bucket_incarnation_generation,
+            encryption_subject,
             logical_size,
             data,
         )
@@ -1244,6 +1312,25 @@ impl<'admission> ActivePutObjectRoute<'admission> {
                 ObjectPgActionError::InvalidRequest {
                     reason: "direct PUT payload does not match bucket write reservation subject"
                         .to_string(),
+                },
+            ));
+        }
+        let expected_encryption_subject = ObjectEncryptionSubject::standard_object(
+            payload.bucket_incarnation_generation,
+            &payload.bucket,
+            &payload.key,
+            payload.generation_id,
+            &prepared.encryption,
+        );
+        if payload.encryption_subject != expected_encryption_subject {
+            self.admission
+                .cluster
+                .release_bucket_write_reservation_proof(&prepared.bucket_write_reservation)
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)
+                .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT payload does not match its encryption subject".to_string(),
                 },
             ));
         }

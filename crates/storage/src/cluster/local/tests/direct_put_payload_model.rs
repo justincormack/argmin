@@ -478,7 +478,7 @@ fn replay(state: &State) -> Result<(), String> {
                         .map_err(diagnostic)?;
                     let payload = routes[owner]
                         .write_direct_object_payload(
-                            generation,
+                            generation.bind_encryption(&encrypted.encryption),
                             encrypted.logical_size,
                             &encrypted.storage_bytes,
                         )
