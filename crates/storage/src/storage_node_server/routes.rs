@@ -1810,7 +1810,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
     fn prepare_stream_segment_append(
         &self,
         request: &PrepareStreamUploadSegmentAppendReq,
-        expected_put_state: Option<&crate::ExpectedStreamPutAppendState>,
+        expected_append_state: Option<&crate::ExpectedStreamAppendState>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), StorageNodeObjectRouteError> {
         self.route.require_valid_now()?;
@@ -1828,9 +1828,9 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
                 &request.session_id,
             )
             .and_then(|route| {
-                route.prepare_segment_append_with_expected_put_state(
+                route.prepare_segment_append_with_expected_append_state(
                     request,
-                    expected_put_state,
+                    expected_append_state,
                     effect_fence,
                 )
             })

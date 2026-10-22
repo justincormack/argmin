@@ -2126,6 +2126,11 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 25, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
             0, 242, 213, 94, 250, 228, 173, 21, 24, 97, 98, 99,
         ];
+        const V26_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 26, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
+            0, 170, 83, 137, 30, 251, 91, 70, 53, 97, 98, 99,
+        ];
         let old_request = encode_binding_with_encoded_frame(
             0x0102_0304_0506_0708,
             TOPOLOGY_DIGEST,
@@ -2174,7 +2179,7 @@ mod tests {
             decode_binding(&old_request),
             Err(StorageRpcAuthBindingError::Malformed)
         );
-        let request = encode_binding_with_encoded_frame(
+        let old_request = encode_binding_with_encoded_frame(
             0x0102_0304_0506_0708,
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
@@ -2183,13 +2188,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
+            decode_binding(&old_request),
+            Err(StorageRpcAuthBindingError::Malformed)
+        );
+        let request = encode_binding_with_encoded_frame(
+            0x0102_0304_0506_0708,
+            TOPOLOGY_DIGEST,
+            NodeId::new(0x1122_3344),
+            None,
+            V26_FRAME,
+        )
+        .unwrap();
+        assert_eq!(
             hex_bytes(&request),
             concat!(
                 "4152475352504342000201020304050607080000004030313233343536373839",
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "6162636465663031323334353637383961626364656611223344000000003718",
-                "0000006172676d696e2d73746f726167652d7270632d6672616d651900080706",
-                "0504030201030003000000f2d55efae4ad1518616263"
+                "0000006172676d696e2d73746f726167652d7270632d6672616d651a00080706",
+                "0504030201030003000000aa53891efb5b4635616263"
             )
         );
 
@@ -2203,7 +2220,7 @@ mod tests {
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
             Some(&transcript),
-            V25_FRAME,
+            V26_FRAME,
         )
         .unwrap();
         assert_eq!(
@@ -2213,8 +2230,8 @@ mod tests {
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "616263646566303132333435363738396162636465661122334401673e6f836a",
                 "950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037",
-                "180000006172676d696e2d73746f726167652d7270632d6672616d6519000807",
-                "060504030201030003000000f2d55efae4ad1518616263"
+                "180000006172676d696e2d73746f726167652d7270632d6672616d651a000807",
+                "060504030201030003000000aa53891efb5b4635616263"
             )
         );
 

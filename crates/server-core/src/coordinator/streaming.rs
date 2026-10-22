@@ -4,11 +4,13 @@
 use std::time::{Duration, Instant};
 use storage::{
     BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey, SessionId,
-    StreamSegmentAppendInput, StreamUploadTarget,
+    StreamUploadTarget,
 };
 
 #[cfg(test)]
-use storage::test_support::ActiveStreamRouteTestSupport as _;
+use storage::test_support::{
+    ActiveMultipartStreamRouteTestSupport as _, ActiveStreamRouteTestSupport as _,
+};
 
 #[cfg(feature = "deep-tracing")]
 use super::INTERNAL_SEGMENT_SIZE;
@@ -24,60 +26,6 @@ use crate::sse::{
     SseCustomerRequest, SseCustomerResponseHeaders, SseCustomerSegmentScope,
     SseCustomerWriteContext,
 };
-
-trait StreamSegmentMutationRoute {
-    #[cfg(not(test))]
-    fn append_segment(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure>;
-
-    #[cfg(test)]
-    fn append_segment_with_after_prepare(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-        after_prepare: impl FnMut(),
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure>;
-}
-
-#[cfg(test)]
-impl StreamSegmentMutationRoute for storage::ActivePutObjectRoute<'_> {
-    #[cfg(not(test))]
-    fn append_segment(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure> {
-        self.append_stream_segment(input)
-    }
-
-    #[cfg(test)]
-    fn append_segment_with_after_prepare(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-        after_prepare: impl FnMut(),
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure> {
-        self.test_append_stream_segment_with_after_prepare(input, after_prepare)
-    }
-}
-
-impl StreamSegmentMutationRoute for storage::ActiveMultipartObjectRoute<'_> {
-    #[cfg(not(test))]
-    fn append_segment(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure> {
-        self.append_stream_segment(input)
-    }
-
-    #[cfg(test)]
-    fn append_segment_with_after_prepare(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-        after_prepare: impl FnMut(),
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure> {
-        self.test_append_stream_segment_with_after_prepare(input, after_prepare)
-    }
-}
 
 impl Coordinator {
     pub fn retained_stream_upload_cleanup(
@@ -256,128 +204,18 @@ impl Coordinator {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn load_stream_put_write_encryption(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        sse_customer: Option<&SseCustomerRequest>,
-    ) -> Result<ActiveWriteEncryption, ServerError> {
-        self.load_stream_put_write_encryption_with_storage_node(
-            &self.storage_node(),
-            bucket,
-            key,
-            session_id,
-            sse_customer,
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn load_stream_put_write_encryption_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        sse_customer: Option<&SseCustomerRequest>,
-    ) -> Result<ActiveWriteEncryption, ServerError> {
-        let session = storage_node
-            .load_stream_upload_session(bucket, key, session_id)
-            .map_err(Self::map_stream_upload_failure)?;
-        self.resume_write_encryption(
-            &session.encryption,
-            sse_customer,
-            SseCustomerSegmentScope::object(),
-            false,
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn load_stream_part_write_encryption(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        part_number: u32,
-        sse_customer: Option<&SseCustomerRequest>,
-    ) -> Result<ActiveWriteEncryption, ServerError> {
-        self.load_stream_part_write_encryption_with_storage_node(
-            &self.storage_node(),
-            bucket,
-            key,
-            session_id,
-            part_number,
-            sse_customer,
-        )
-    }
-
-    #[cfg(test)]
-    pub(super) fn load_stream_part_write_encryption_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        part_number: u32,
-        sse_customer: Option<&SseCustomerRequest>,
-    ) -> Result<ActiveWriteEncryption, ServerError> {
-        let session = storage_node
-            .load_stream_upload_session(bucket, key, session_id)
-            .map_err(Self::map_stream_upload_failure)?;
-        self.resume_write_encryption(
-            &session.encryption,
-            sse_customer,
-            SseCustomerSegmentScope::multipart_part(part_number)?,
-            false,
-        )
-    }
-
     pub(super) fn load_stream_part_write_encryption_on_admitted_multipart_route(
         &self,
-        route: &storage::ActiveMultipartObjectRoute<'_>,
-        upload_id: &storage::UploadId,
-        session_id: &SessionId,
+        authorization: &storage::AuthorizedStreamPartSegment<'_, '_>,
         part_number: u32,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        let session = route
-            .load_stream_session(session_id)
-            .map_err(|error| Self::map_upload_part_stream_error(upload_id, error))?;
         self.resume_write_encryption(
-            &session.encryption,
+            authorization.encryption(),
             sse_customer,
             SseCustomerSegmentScope::multipart_part(part_number)?,
             false,
         )
-    }
-
-    #[cfg(test)]
-    fn load_stream_session_write_encryption(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        sse_customer: Option<&SseCustomerRequest>,
-    ) -> Result<ActiveWriteEncryption, ServerError> {
-        let target = self
-            .storage_node()
-            .load_stream_upload_session(bucket, key, session_id)
-            .map_err(Self::map_stream_upload_failure)?
-            .target;
-        match target {
-            StreamUploadTarget::PutObject => {
-                self.load_stream_put_write_encryption(bucket, key, session_id, sse_customer)
-            }
-            StreamUploadTarget::UploadPart { part_number, .. } => self
-                .load_stream_part_write_encryption(
-                    bucket,
-                    key,
-                    session_id,
-                    part_number,
-                    sse_customer,
-                ),
-        }
     }
 
     #[cfg(test)]
@@ -389,21 +227,88 @@ impl Coordinator {
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
-        let write_encryption = self.load_stream_session_write_encryption(
-            &trusted_bucket_name(bucket),
-            &trusted_object_key(key),
-            session_id,
-            None,
-        )?;
+        let bucket = trusted_bucket_name(bucket);
+        let key = trusted_object_key(key);
+        let admission = self.admit_storage_route_for_request()?;
+        let put_route = admission
+            .active_put_object_route(&bucket, &key)
+            .map_err(super::map_store_failure)?;
+        let session = put_route
+            .load_stream_session(session_id)
+            .map_err(Self::map_stream_upload_failure)?;
         let payload_crc64 = checksum::crc64::checksum(data);
-        let storage_data = write_encryption.encrypt_segment(segment_index, data)?;
-        self.append_stream_segment_for(
-            &trusted_bucket_name(bucket),
-            &trusted_object_key(key),
-            session_id,
-            segment_index,
-            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
-        )
+        match session.target {
+            StreamUploadTarget::PutObject => {
+                let authorization = put_route
+                    .authorize_stream_segment(session_id, segment_index, data.len() as u64)
+                    .map_err(Self::map_stream_upload_failure)?;
+                let write_encryption = self.resume_write_encryption(
+                    authorization.encryption(),
+                    None,
+                    SseCustomerSegmentScope::object(),
+                    false,
+                )?;
+                let storage_data = write_encryption.encrypt_standard_object_segment(
+                    authorization.encryption_subject(),
+                    segment_index,
+                    data,
+                )?;
+                let session_id = authorization.session_id().clone();
+                let outcome = put_route
+                    .test_append_authorized_stream_segment_with_after_prepare(
+                        authorization,
+                        payload_crc64,
+                        &storage_data,
+                        || self.maybe_run_stream_append_prepare_hook(&session_id, segment_index),
+                    )
+                    .map_err(Self::map_stream_upload_failure)?;
+                Self::emit_stream_segment_layout(
+                    &outcome.target,
+                    bucket.as_str(),
+                    key.as_str(),
+                    &session_id,
+                    segment_index,
+                    outcome.logical_size as usize,
+                );
+                Ok(())
+            }
+            StreamUploadTarget::UploadPart {
+                upload_id,
+                part_number,
+            } => {
+                let multipart_route = admission
+                    .active_multipart_object_route(&bucket, &key)
+                    .map_err(super::map_store_failure)?;
+                let authorization = multipart_route
+                    .authorize_stream_part_segment(
+                        &upload_id,
+                        session_id,
+                        part_number,
+                        segment_index,
+                        data.len() as u64,
+                    )
+                    .map_err(|error| Self::map_upload_part_stream_error(&upload_id, error))?;
+                let write_encryption = self
+                    .load_stream_part_write_encryption_on_admitted_multipart_route(
+                        &authorization,
+                        part_number,
+                        None,
+                    )?;
+                let storage_data = write_encryption.encrypt_multipart_part_segment(
+                    &authorization,
+                    segment_index,
+                    data,
+                )?;
+                self.append_stream_segment_on_admitted_multipart_route(
+                    &multipart_route,
+                    &upload_id,
+                    &bucket,
+                    &key,
+                    authorization,
+                    super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
+                )
+            }
+        }
     }
 
     pub(super) fn ensure_write_encryption_supported(
@@ -563,23 +468,6 @@ impl Coordinator {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn append_stream_segment_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        segment_index: u32,
-        payload: super::StreamSegmentAppendPayload<'_>,
-    ) -> Result<(), ServerError> {
-        let admission = self.admit_storage_route_for_request()?;
-        let route = admission
-            .active_put_object_route(bucket, key)
-            .map_err(super::map_store_failure)?;
-        self.append_stream_segment_on_route(&route, bucket, key, session_id, segment_index, payload)
-            .map_err(Self::map_stream_upload_failure)
-    }
-
     pub(super) fn append_stream_segment_on_admitted_put_route(
         &self,
         route: &storage::ActivePutObjectRoute<'_>,
@@ -656,59 +544,36 @@ impl Coordinator {
         upload_id: &storage::UploadId,
         bucket: &BucketName,
         key: &ObjectKey,
-        append: super::AdmittedStreamSegmentAppend<'_>,
-    ) -> Result<(), ServerError> {
-        let super::AdmittedStreamSegmentAppend {
-            session_id,
-            segment_index,
-            payload,
-        } = append;
-        self.append_stream_segment_on_route(route, bucket, key, session_id, segment_index, payload)
-            .map_err(|error| Self::map_upload_part_stream_error(upload_id, error))
-    }
-
-    fn append_stream_segment_on_route(
-        &self,
-        route: &impl StreamSegmentMutationRoute,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        segment_index: u32,
+        authorization: storage::AuthorizedStreamPartSegment<'_, '_>,
         payload: super::StreamSegmentAppendPayload<'_>,
-    ) -> Result<(), storage::StreamUploadFailure> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::append_stream_segment",
-            "bucket={:?} key={:?} session_id={:?} segment_index={} bytes={}",
-            bucket,
-            key,
-            session_id,
-            segment_index,
-            payload.storage_bytes.len()
-        );
-        let input = StreamSegmentAppendInput {
-            session_id,
-            segment_index,
-            payload_crc64: payload.payload_crc64,
-            storage_bytes: payload.storage_bytes,
-        };
-
+    ) -> Result<(), ServerError> {
+        let session_id = authorization.session_id().clone();
+        let segment_index = authorization.segment_index();
         #[cfg(test)]
-        let outcome = route.append_segment_with_after_prepare(input, || {
-            self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
-        })?;
+        let outcome = route
+            .test_append_authorized_stream_part_segment_with_after_prepare(
+                authorization,
+                payload.payload_crc64,
+                payload.storage_bytes,
+                || self.maybe_run_stream_append_prepare_hook(&session_id, segment_index),
+            )
+            .map_err(|error| Self::map_upload_part_stream_error(upload_id, error))?;
         #[cfg(not(test))]
-        let outcome = route.append_segment(input)?;
-
+        let outcome = route
+            .append_authorized_stream_part_segment(
+                authorization,
+                payload.payload_crc64,
+                payload.storage_bytes,
+            )
+            .map_err(|error| Self::map_upload_part_stream_error(upload_id, error))?;
         Self::emit_stream_segment_layout(
             &outcome.target,
             bucket.as_str(),
             key.as_str(),
-            session_id,
+            &session_id,
             segment_index,
             outcome.logical_size as usize,
         );
-
         Ok(())
     }
 

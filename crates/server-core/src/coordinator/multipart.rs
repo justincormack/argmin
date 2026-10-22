@@ -311,25 +311,33 @@ impl Coordinator {
         let route = admission
             .active_multipart_object_route(&req.bucket, &req.key)
             .map_err(super::map_store_failure)?;
+        let authorization = route
+            .authorize_stream_part_segment(
+                req.upload_id,
+                req.session_id,
+                req.part_number,
+                req.segment_index,
+                req.data.len() as u64,
+            )
+            .map_err(|error| Self::map_upload_part_stream_error(req.upload_id, error))?;
         let write_encryption = self.load_stream_part_write_encryption_on_admitted_multipart_route(
-            &route,
-            req.upload_id,
-            req.session_id,
+            &authorization,
             req.part_number,
             req.sse_customer,
         )?;
         let payload_crc64 = checksum::crc64::checksum(req.data);
-        let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
+        let storage_data = write_encryption.encrypt_multipart_part_segment(
+            &authorization,
+            req.segment_index,
+            req.data,
+        )?;
         self.append_stream_segment_on_admitted_multipart_route(
             &route,
             req.upload_id,
             &req.bucket,
             &req.key,
-            super::AdmittedStreamSegmentAppend::new(
-                req.session_id,
-                req.segment_index,
-                super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
-            ),
+            authorization,
+            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
         )
     }
 

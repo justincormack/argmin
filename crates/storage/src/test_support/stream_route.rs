@@ -3,9 +3,9 @@
 
 use super::TestStorageFailure;
 use crate::{
-    ActiveMultipartObjectRoute, ActivePutObjectRoute, BucketName, ObjectEncryption, ObjectKey,
-    SessionId, StorageCluster, StreamSegmentAppendInput, StreamSegmentAppendOutcome,
-    StreamUploadFailure,
+    ActiveMultipartObjectRoute, ActivePutObjectRoute, AuthorizedStreamPartSegment,
+    AuthorizedStreamPutSegment, BucketName, ObjectEncryption, ObjectKey, SessionId, StorageCluster,
+    StreamSegmentAppendOutcome, StreamUploadFailure,
 };
 
 /// Logical stream-session mutation support for cross-crate tests.
@@ -70,36 +70,56 @@ impl StorageClusterStreamSessionTestSupport for StorageCluster {
 /// deadline, placement, and mutation behavior; callers cannot construct an
 /// unbounded storage effect through this interface.
 pub trait ActiveStreamRouteTestSupport {
-    fn test_append_stream_segment_with_after_prepare(
+    fn test_append_authorized_stream_segment_with_after_prepare(
         &self,
-        input: StreamSegmentAppendInput<'_>,
+        authorization: AuthorizedStreamPutSegment<'_, '_>,
+        payload_crc64: u64,
+        storage_bytes: &[u8],
         after_prepare: impl FnMut(),
     ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure>;
 }
 
 impl ActiveStreamRouteTestSupport for ActivePutObjectRoute<'_> {
-    fn test_append_stream_segment_with_after_prepare(
+    fn test_append_authorized_stream_segment_with_after_prepare(
         &self,
-        input: StreamSegmentAppendInput<'_>,
+        authorization: AuthorizedStreamPutSegment<'_, '_>,
+        payload_crc64: u64,
+        storage_bytes: &[u8],
         after_prepare: impl FnMut(),
     ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure> {
-        ActivePutObjectRoute::test_append_stream_segment_with_after_prepare(
+        ActivePutObjectRoute::test_append_authorized_stream_segment_with_after_prepare(
             self,
-            input,
+            authorization,
+            payload_crc64,
+            storage_bytes,
             after_prepare,
         )
     }
 }
 
-impl ActiveStreamRouteTestSupport for ActiveMultipartObjectRoute<'_> {
-    fn test_append_stream_segment_with_after_prepare(
+pub trait ActiveMultipartStreamRouteTestSupport {
+    fn test_append_authorized_stream_part_segment_with_after_prepare(
         &self,
-        input: StreamSegmentAppendInput<'_>,
+        authorization: AuthorizedStreamPartSegment<'_, '_>,
+        payload_crc64: u64,
+        storage_bytes: &[u8],
+        after_prepare: impl FnMut(),
+    ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure>;
+}
+
+impl ActiveMultipartStreamRouteTestSupport for ActiveMultipartObjectRoute<'_> {
+    fn test_append_authorized_stream_part_segment_with_after_prepare(
+        &self,
+        authorization: AuthorizedStreamPartSegment<'_, '_>,
+        payload_crc64: u64,
+        storage_bytes: &[u8],
         after_prepare: impl FnMut(),
     ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure> {
-        ActiveMultipartObjectRoute::test_append_stream_segment_with_after_prepare(
+        ActiveMultipartObjectRoute::test_append_authorized_stream_part_segment_with_after_prepare(
             self,
-            input,
+            authorization,
+            payload_crc64,
+            storage_bytes,
             after_prepare,
         )
     }

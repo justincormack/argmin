@@ -288,7 +288,12 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 25, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
             0, 0, 0, 242, 213, 94, 250, 228, 173, 21, 24, 97, 98, 99,
         ];
-        assert_eq!(bytes, V25_FRAME);
+        const V26_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 26, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 170, 83, 137, 30, 251, 91, 70, 53, 97, 98, 99,
+        ];
+        assert_eq!(bytes, V26_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
@@ -321,16 +326,21 @@ mod tests {
             decode_storage_rpc_frame(V24_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(24))
         );
+        assert_eq!(
+            decode_storage_rpc_frame(V25_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(25))
+        );
     }
 
     #[test]
-    fn current_storage_rpc_v25_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
+    fn current_storage_rpc_v26_checksum_tags_match_frozen_owner_encoding_and_require_version_bump()
     {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 25);
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 26);
         const HISTORICAL_V22_PLAINTEXT_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65160008070605040302013a0068010000ffac5bdc61c4e5260700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a000000010401000000";
         const HISTORICAL_V23_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65170008070605040302013a00c1010000ce03353b9e5164410700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
         const EXPECTED_V24_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65180008070605040302013a00c1010000cd0075499ca4e0b50700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
-        const EXPECTED_V25_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65190008070605040302013a00c10100002c0d77796eafc07f0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
+        const HISTORICAL_V25_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d65190008070605040302013a00c10100002c0d77796eafc07f0700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
+        const EXPECTED_V26_FRAME_HEX: &str = "180000006172676d696e2d73746f726167652d7270632d6672616d651a0008070605040302013a00c10100006488e6712b9579150700000009000000000000000b00000003000000727063010000006b80000000757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757575757503000000727063010000006b000000000000000000010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432010000006f4000000036356337346331356136383631383762623662626639393538663439346663366238303036383033346136353961396164343439393162303863353866326432140000004152474d494e2d41434c2d4752414e54532f310a0000000104010201550000000100000001020202020202020202020202030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303040404040404000000000000000000000000000000";
 
         let historical_v22 = bytes_from_hex(HISTORICAL_V22_PLAINTEXT_FRAME_HEX);
         assert_eq!(hex_bytes(&historical_v22), HISTORICAL_V22_PLAINTEXT_FRAME_HEX);
@@ -347,6 +357,11 @@ mod tests {
         assert_eq!(
             decode_storage_rpc_frame(&historical_v24),
             Err(StorageRpcFrameError::UnsupportedVersion(24))
+        );
+        let historical_v25 = bytes_from_hex(HISTORICAL_V25_FRAME_HEX);
+        assert_eq!(
+            decode_storage_rpc_frame(&historical_v25),
+            Err(StorageRpcFrameError::UnsupportedVersion(25))
         );
 
         let bucket = BucketName::try_from("rpc").unwrap();
@@ -392,8 +407,15 @@ mod tests {
         )
         .unwrap();
         let encoded_frame_hex = hex_bytes(&frame);
-        assert_eq!(encoded_frame_hex.len(), EXPECTED_V25_FRAME_HEX.len());
-        assert_eq!(encoded_frame_hex, EXPECTED_V25_FRAME_HEX);
+        assert_eq!(encoded_frame_hex.len(), EXPECTED_V26_FRAME_HEX.len());
+        assert_eq!(
+            encoded_frame_hex
+                .bytes()
+                .zip(EXPECTED_V26_FRAME_HEX.bytes())
+                .position(|(actual, expected)| actual != expected),
+            None
+        );
+        assert_eq!(encoded_frame_hex, EXPECTED_V26_FRAME_HEX);
 
         let decoded_frame = decode_storage_rpc_frame(&frame).unwrap();
         assert_eq!(
@@ -411,8 +433,8 @@ mod tests {
     }
 
     #[test]
-    fn current_storage_rpc_v25_encryption_state_encoding_is_frozen() {
-        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 25);
+    fn current_storage_rpc_v26_encryption_state_encoding_is_frozen() {
+        assert_eq!(STORAGE_RPC_FRAME_ENCODING_VERSION, 26);
         let bucket = BucketName::try_from("encrypted-rpc").unwrap();
         let key = ObjectKey::try_from("key").unwrap();
         let encryption = ObjectEncryption::SseS3(
@@ -548,7 +570,7 @@ mod tests {
                 segment_crc64: 7,
                 payload_crc64: 8,
             },
-            expected_put_state: None,
+            expected_append_state: None,
             effect_deadline: None,
         };
         let payload = encode_stream_segment_append_prepare_request(&request);
@@ -644,8 +666,8 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(24))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(26)),
-            Err(StorageRpcFrameError::UnsupportedVersion(26))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(27)),
+            Err(StorageRpcFrameError::UnsupportedVersion(27))
         );
     }
 
@@ -1330,13 +1352,32 @@ mod tests {
     }
 
     #[test]
-    fn current_storage_rpc_v23_pending_slot_remove_deadline_payload_is_stable() {
+    fn storage_rpc_v23_pending_slot_remove_deadline_payload_is_immutable_rejection_evidence() {
         const V23_PENDING_SLOT_REMOVE_PAYLOAD: &[u8] = &[
             7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 153, 226, 239, 57, 109, 229, 22,
             116, 69, 0, 0, 0, 23, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 109, 101, 116, 97,
             100, 97, 116, 97, 45, 99, 111, 109, 109, 97, 110, 100, 9, 0, 1, 0, 0, 0, 0, 0,
             0, 0, 3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 21, 0, 6, 0, 0, 0, 98, 117, 99,
             107, 101, 116, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 7, 6, 5, 4, 3, 2, 1,
+        ];
+        assert!(matches!(
+            decode_metadata_command_pending_slot_request(
+                V23_PENDING_SLOT_REMOVE_PAYLOAD,
+                &metadata_command_decode_authority_for_test(),
+            ),
+            Err(StorageRpcPayloadError::InvalidMetadataCommandEnvelope)
+        ));
+    }
+
+    #[test]
+    fn current_storage_rpc_v26_pending_slot_remove_deadline_payload_is_stable() {
+        const V26_PENDING_SLOT_REMOVE_PAYLOAD: &[u8] = &[
+            7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 105, 84, 26, 254, 216, 56,
+            207, 159, 69, 0, 0, 0, 23, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 109, 101,
+            116, 97, 100, 97, 116, 97, 45, 99, 111, 109, 109, 97, 110, 100, 10, 0, 1, 0,
+            0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 21, 0, 6, 0, 0, 0,
+            98, 117, 99, 107, 101, 116, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 7, 6, 5, 4,
+            3, 2, 1,
         ];
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
@@ -1364,10 +1405,10 @@ mod tests {
         };
 
         let encoded = encode_metadata_command_pending_slot_request(&request).unwrap();
-        assert_eq!(encoded, V23_PENDING_SLOT_REMOVE_PAYLOAD);
+        assert_eq!(encoded, V26_PENDING_SLOT_REMOVE_PAYLOAD);
         assert_eq!(
             decode_metadata_command_pending_slot_request(
-                V23_PENDING_SLOT_REMOVE_PAYLOAD,
+                V26_PENDING_SLOT_REMOVE_PAYLOAD,
                 &metadata_command_decode_authority_for_test(),
             )
             .unwrap(),
@@ -1692,7 +1733,7 @@ mod tests {
         assert_eq!(decoded.commands[0].post_state_digest, 1234);
 
         for offset in [16, 29, 38] {
-            for version in [5, 7] {
+            for version in [6, 8] {
                 let mut unsupported = bytes.clone();
                 unsupported[offset] = version;
                 assert_eq!(
@@ -1722,7 +1763,7 @@ mod tests {
 
         assert_eq!(decoded, request);
 
-        for version in [5, 7] {
+        for version in [6, 8] {
             let mut unsupported = bytes.clone();
             unsupported[16] = version;
             assert_eq!(
@@ -1748,7 +1789,7 @@ mod tests {
         let bytes = encode_metadata_command_transfer_matching_state_request(&request);
         assert_eq!(
             hex_bytes(&bytes),
-            "0700000003000000000000000b0000000400000000000000012e1600000000000006d204000000000000"
+            "0700000003000000000000000b0000000400000000000000012e1600000000000007d204000000000000"
         );
         let decoded = decode_metadata_command_transfer_matching_state_request(&bytes).unwrap();
 
@@ -1756,7 +1797,7 @@ mod tests {
 
         for (offset, versions, carrier) in [
             (24, &[2][..], "log-hash"),
-            (33, &[5, 7][..], "state-digest"),
+            (33, &[6, 8][..], "state-digest"),
         ] {
             for version in versions {
                 let mut unsupported = bytes.clone();
@@ -1819,11 +1860,11 @@ mod tests {
                 payload_sha256,
             ),
             (
-                0x8252_edae_7939_028d,
-                7_079,
+                0xecad_b449_68f5_9778,
+                7_112,
                 [
-                    197, 99, 138, 179, 20, 136, 67, 213, 58, 9, 200, 208, 30, 181, 230, 53,
-                    188, 187, 172, 203, 22, 70, 182, 35, 34, 215, 40, 144, 16, 244, 138, 100,
+                    193, 221, 212, 47, 179, 0, 119, 223, 236, 199, 226, 60, 114, 2, 117, 73,
+                    254, 112, 40, 135, 213, 177, 145, 186, 248, 2, 133, 92, 61, 250, 174, 24,
                 ],
             )
         );
@@ -1831,7 +1872,7 @@ mod tests {
 
         assert_eq!(decoded, request.checkpoint);
 
-        for unsupported in [1_u16, 2, 3, 5] {
+        for unsupported in [1_u16, 2, 3, 4, 6] {
             let mut unsupported_checkpoint = request.checkpoint.clone();
             crate::PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
                 &mut unsupported_checkpoint,
@@ -1851,7 +1892,7 @@ mod tests {
         }
         for (offset, versions, carrier) in [
             (30, &[2][..], "log-hash"),
-            (39, &[5, 7][..], "state-digest"),
+            (39, &[6, 8][..], "state-digest"),
         ] {
             for version in versions {
                 let mut unsupported_bytes = bytes.clone();
@@ -2403,7 +2444,7 @@ mod tests {
 
         for (offset, versions, carrier) in [
             (16, &[2][..], "log-hash"),
-            (25, &[5, 7][..], "state-digest"),
+            (25, &[6, 8][..], "state-digest"),
         ] {
             for version in versions {
                 let mut unsupported = bytes.clone();
@@ -5540,7 +5581,7 @@ mod tests {
                 segment_crc64: u64::MAX,
                 payload_crc64: u64::MAX,
             },
-            expected_put_state: None,
+            expected_append_state: None,
             effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
                 authority_valid_until_ms: u64::MAX,
                 portable_wall_valid_until_ms: u64::MAX
@@ -5564,7 +5605,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_segment_append_prepare_request_binds_expected_put_state() {
+    fn stream_segment_append_prepare_request_binds_expected_append_state() {
         let bucket = BucketName::try_from("bucket").unwrap();
         let key = ObjectKey::try_from("key").unwrap();
         let session_id = SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap();
@@ -5583,7 +5624,7 @@ mod tests {
                 segment_crc64: 6,
                 payload_crc64: 7,
             },
-            expected_put_state: Some(crate::ExpectedStreamPutAppendState {
+            expected_append_state: Some(crate::ExpectedStreamAppendState::PutObject {
                 session: StreamUploadRecord {
                     session_id,
                     bucket,
@@ -5591,6 +5632,7 @@ mod tests {
                     target: StreamUploadTarget::PutObject,
                     state: StreamUploadState::InProgress,
                     created_at: 8,
+                    bucket_incarnation_generation: 1,
                     cleanup_after: Some(9),
                     encryption: crate::tests::metadata_only_test_encryption(),
                     next_segment_vid: GenerationId::new(10).unwrap(),
@@ -5603,7 +5645,7 @@ mod tests {
         let encoded = encode_stream_segment_append_prepare_request(&request);
         assert_eq!(
             hex_bytes(&encoded),
-            "07000000010000000000000003000000060000006275636b6574030000006b65792000000030313233343536373839616263646566303132333435363738396162636465660400000005000000000000000600000000000000070000000000000001200000003031323334353637383961626364656630313233343536373839616263646566060000006275636b6574030000006b657900000800000000000000010900000000000000020155000000010000000102020202020202020202020203030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030304040404040400000000000000000000000000000a00000000000000000b0000000000000000"
+            "07000000010000000000000003000000060000006275636b6574030000006b65792000000030313233343536373839616263646566303132333435363738396162636465660400000005000000000000000600000000000000070000000000000001200000003031323334353637383961626364656630313233343536373839616263646566060000006275636b6574030000006b6579000008000000000000000100000000000000010900000000000000020155000000010000000102020202020202020202020203030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030304040404040400000000000000000000000000000a00000000000000000b0000000000000000"
         );
         assert_eq!(
             decode_stream_segment_append_prepare_request(&encoded).unwrap(),
@@ -5611,14 +5653,105 @@ mod tests {
         );
 
         let mut crossed = request;
-        crossed.expected_put_state.as_mut().unwrap().session.key =
-            ObjectKey::try_from("other").unwrap();
+        let Some(crate::ExpectedStreamAppendState::PutObject { session, .. }) =
+            crossed.expected_append_state.as_mut()
+        else {
+            panic!("expected PutObject append state");
+        };
+        session.key = ObjectKey::try_from("other").unwrap();
         assert!(matches!(
             decode_stream_segment_append_prepare_request(
                 &encode_stream_segment_append_prepare_request(&crossed)
             ),
             Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
-                "expected stream PutObject state does not match request subject"
+                "expected stream append state does not match request subject"
+            ))
+        ));
+    }
+
+    #[test]
+    fn stream_segment_append_prepare_request_binds_upload_part_state() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let session_id = SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap();
+        let upload_id = UploadId::try_from("fe".repeat(UPLOAD_ID_LEN / 2)).unwrap();
+        let encryption = crate::tests::metadata_only_test_encryption();
+        let upload = MultipartUploadRecord {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            initiated_at: 12,
+            state: UploadState::InProgress,
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: OwnerIdentity::from_principal("owner"),
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_generation_id: GenerationId::new(13).unwrap(),
+            initiated_object_identity: None,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: encryption.clone(),
+        };
+        let request = StorageRpcStreamSegmentAppendPrepareRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(3),
+                bucket: bucket.clone(),
+                key: key.clone(),
+            },
+            request: PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 4,
+                size: 5,
+                segment_crc64: 6,
+                payload_crc64: 7,
+            },
+            expected_append_state: Some(crate::ExpectedStreamAppendState::UploadPart {
+                session: StreamUploadRecord {
+                    session_id,
+                    bucket,
+                    key,
+                    target: StreamUploadTarget::UploadPart {
+                        upload_id,
+                        part_number: 8,
+                    },
+                    state: StreamUploadState::InProgress,
+                    created_at: 9,
+                    bucket_incarnation_generation: 1,
+                    cleanup_after: Some(10),
+                    encryption,
+                    next_segment_vid: GenerationId::new(11).unwrap(),
+                    bucket_write_reservation: None,
+                },
+                upload: Box::new(upload),
+                part_generation_id: GenerationId::new(14).unwrap(),
+            }),
+            effect_deadline: None,
+        };
+
+        let encoded = encode_stream_segment_append_prepare_request(&request);
+        assert_eq!(
+            decode_stream_segment_append_prepare_request(&encoded).unwrap(),
+            request
+        );
+
+        let mut crossed = request;
+        let Some(crate::ExpectedStreamAppendState::UploadPart { upload, .. }) =
+            crossed.expected_append_state.as_mut()
+        else {
+            panic!("expected UploadPart append state");
+        };
+        upload.upload_id = UploadId::try_from("aa".repeat(UPLOAD_ID_LEN / 2)).unwrap();
+        assert!(matches!(
+            decode_stream_segment_append_prepare_request(
+                &encode_stream_segment_append_prepare_request(&crossed)
+            ),
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "expected stream append state does not match request subject"
             ))
         ));
     }

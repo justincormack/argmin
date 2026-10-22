@@ -614,9 +614,9 @@
                 "2\n",
                 "pg_routes 2\n",
                 "0 9 1 7 - - - - - - - 2 7 8\n",
-                "2 9 2 8 - 7 101 1 202 6 303 2 8 7\n",
+                "2 9 2 8 - 7 101 1 202 7 303 2 8 7\n",
                 "historical_pg_routes 2\n",
-                "0 3 1 7 - 8 404 1 505 6 606 2 7 8\n",
+                "0 3 1 7 - 8 404 1 505 7 606 2 7 8\n",
                 "2 6 2 8 - - - - - - - 2 8 7\n",
                 "pending_metadata_command_recoveries 0\n",
             )
@@ -674,17 +674,17 @@
                 crate::control_plane::PgMetadataProof::current(9, 10, 11),
             ));
         let current = encode_control_plane_runtime_config(&config);
-        assert!(current.contains("0 1 1 7 - 7 9 1 10 6 11 1 7\n"));
+        assert!(current.contains("0 1 1 7 - 7 9 1 10 7 11 1 7\n"));
         let path = tmp.path().join("runtime-config");
 
         for (unsupported, expected) in [
             (
-                current.replacen(" 9 1 10 6 11 ", " 9 2 10 6 11 ", 1),
+                current.replacen(" 9 1 10 7 11 ", " 9 2 10 7 11 ", 1),
                 "unsupported metadata-command log-hash encoding version 2",
             ),
             (
-                current.replacen(" 9 1 10 6 11 ", " 9 1 10 5 11 ", 1),
-                "unsupported canonical-state digest encoding version 5",
+                current.replacen(" 9 1 10 7 11 ", " 9 1 10 6 11 ", 1),
+                "unsupported canonical-state digest encoding version 6",
             ),
         ] {
             assert!(matches!(
@@ -699,7 +699,7 @@
             ));
         }
 
-        let incomplete = current.replacen(" 9 1 10 6 11 ", " 9 - 10 6 11 ", 1);
+        let incomplete = current.replacen(" 9 1 10 7 11 ", " 9 - 10 7 11 ", 1);
         let error = decode_control_plane_runtime_config(
             &path,
             config.data_dir,
@@ -5488,7 +5488,7 @@
             Some(storage_rpc_client_auth(credential, 9)),
         );
 
-        for unsupported_version in [1_u16, 2, 3, 5] {
+        for unsupported_version in [1_u16, 2, 3, 4, 6] {
             let mut unsupported = checkpoint.clone();
             PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
                 &mut unsupported,
@@ -5578,7 +5578,7 @@
             command: command.clone(),
         };
 
-        for unsupported_version in [7_u16, 8, 10] {
+        for unsupported_version in [8_u16, 9, 11] {
             let command_bytes =
                 command.command_bytes_with_encoding_version_for_test(unsupported_version);
             let payload = encode_metadata_command_request_with_raw_command_for_test(
@@ -5625,7 +5625,7 @@
     #[test]
     fn storage_node_server_rejects_unsupported_outer_frames_before_mutation_dispatch() {
         for authenticated in [false, true] {
-            for unsupported_version in [21_u16, 22, 23, 24, 26] {
+            for unsupported_version in [21_u16, 22, 23, 24, 25, 27] {
                 let tmp = test_util::tempdir();
                 let config = test_config(&tmp);
                 private_socket_dir(config.socket_path.parent().unwrap());

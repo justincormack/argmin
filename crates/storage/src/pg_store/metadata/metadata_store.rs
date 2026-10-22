@@ -5556,6 +5556,7 @@ impl PgMetadataStore for PgStore {
             target: req.target.clone(),
             state: StreamUploadState::InProgress,
             created_at: PgStore::now_millis(),
+            bucket_incarnation_generation: 1,
             encryption: req.encryption.clone(),
         };
         self.create_stream_upload_explicit(&session, GenerationId::MIN, None, None)

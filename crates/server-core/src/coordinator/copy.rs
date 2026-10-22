@@ -704,14 +704,7 @@ impl Coordinator {
             .as_ref()
             .map(|ctx| ctx.request().response_headers());
         let result = (|| {
-            let write_encryption = self
-                .load_stream_part_write_encryption_on_admitted_multipart_route(
-                    &multipart_route,
-                    &upload_id,
-                    session_id,
-                    part_number,
-                    req.sse_customer,
-                )?;
+            let mut write_encryption = None;
             let mut crc64 = checksum::crc64::Hasher::new();
             let mut total_size = 0u64;
             let mut segment_index = 0u32;
@@ -730,17 +723,35 @@ impl Coordinator {
                     checksum.update(&chunk);
                 }
                 let chunk_crc64 = checksum::crc64::checksum(&chunk);
-                let storage_chunk = write_encryption.encrypt_segment(segment_index, &chunk)?;
+                let authorization = multipart_route
+                    .authorize_stream_part_segment(
+                        &upload_id,
+                        session_id,
+                        part_number,
+                        segment_index,
+                        chunk.len() as u64,
+                    )
+                    .map_err(|error| Self::map_upload_part_stream_error(&upload_id, error))?;
+                if write_encryption.is_none() {
+                    write_encryption = Some(
+                        self.load_stream_part_write_encryption_on_admitted_multipart_route(
+                            &authorization,
+                            part_number,
+                            req.sse_customer,
+                        )?,
+                    );
+                }
+                let storage_chunk = write_encryption
+                    .as_ref()
+                    .expect("UploadPartCopy encryption is initialized above")
+                    .encrypt_multipart_part_segment(&authorization, segment_index, &chunk)?;
                 self.append_stream_segment_on_admitted_multipart_route(
                     &multipart_route,
                     &upload_id,
                     &bucket,
                     &key,
-                    super::AdmittedStreamSegmentAppend::new(
-                        session_id,
-                        segment_index,
-                        super::StreamSegmentAppendPayload::new(&storage_chunk, chunk_crc64),
-                    ),
+                    authorization,
+                    super::StreamSegmentAppendPayload::new(&storage_chunk, chunk_crc64),
                 )?;
                 segment_index =
                     segment_index

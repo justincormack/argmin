@@ -126,26 +126,6 @@ impl<'a> StreamSegmentAppendPayload<'a> {
     }
 }
 
-pub(crate) struct AdmittedStreamSegmentAppend<'a> {
-    pub(crate) session_id: &'a storage::SessionId,
-    pub(crate) segment_index: u32,
-    pub(crate) payload: StreamSegmentAppendPayload<'a>,
-}
-
-impl<'a> AdmittedStreamSegmentAppend<'a> {
-    pub(crate) fn new(
-        session_id: &'a storage::SessionId,
-        segment_index: u32,
-        payload: StreamSegmentAppendPayload<'a>,
-    ) -> Self {
-        Self {
-            session_id,
-            segment_index,
-            payload,
-        }
-    }
-}
-
 #[cfg(test)]
 fn trusted_bucket_name(name: impl Into<String>) -> BucketName {
     BucketName::try_from(name.into())

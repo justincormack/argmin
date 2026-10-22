@@ -1489,7 +1489,7 @@ pub(crate) struct StorageRpcStreamUploadsListResponse {
 pub(crate) struct StorageRpcStreamSegmentAppendPrepareRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) request: PrepareStreamUploadSegmentAppendReq,
-    pub(crate) expected_put_state: Option<crate::ExpectedStreamPutAppendState>,
+    pub(crate) expected_append_state: Option<crate::ExpectedStreamAppendState>,
     pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 

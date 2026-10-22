@@ -40,7 +40,7 @@ impl MetadataCommandLogHashIssuer {
 }
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 9;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 10;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 
@@ -1875,6 +1875,8 @@ impl CreateStreamUploadCommand {
                 target: request.target,
                 state: StreamUploadState::InProgress,
                 created_at: created_at_millis,
+                bucket_incarnation_generation: bucket_write_reservation
+                    .bucket_incarnation_generation,
                 encryption: request.encryption,
             },
             initial_next_segment_vid: GenerationId::MIN,
@@ -3125,12 +3127,12 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         }
     }
 
-    fn read_nonzero_u64(&mut self, field: &'static str) -> Result<(), String> {
+    fn read_nonzero_u64(&mut self, field: &'static str) -> Result<u64, String> {
         let value = self.read_u64()?;
         if value == 0 {
             Err(format!("{field} must be non-zero"))
         } else {
-            Ok(())
+            Ok(value)
         }
     }
 
@@ -3441,6 +3443,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_stream_upload_target()?;
         self.read_valid_u8("stream upload state", 0..=3)?;
         self.read_u64()?;
+        self.read_nonzero_u64("stream upload bucket incarnation generation")?;
         self.skip_object_encryption()?;
         self.read_nonzero_u64("next stream segment VID")?;
         self.skip_optional_u64()?;
@@ -3467,6 +3470,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_stream_upload_target()?;
         self.read_valid_u8("stream upload state", 0..=3)?;
         self.read_u64()?;
+        self.read_nonzero_u64("stream upload bucket incarnation generation")?;
         self.skip_object_encryption()
     }
 
@@ -3479,6 +3483,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             state: StreamUploadState::from_u8(self.read_u8()?)
                 .ok_or_else(|| "invalid stream upload state".to_string())?,
             created_at: self.read_u64()?,
+            bucket_incarnation_generation: self
+                .read_nonzero_u64("stream upload bucket incarnation generation")?,
             encryption: self.read_object_encryption()?,
         })
     }
@@ -3492,6 +3498,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             state: StreamUploadState::from_u8(self.read_u8()?)
                 .ok_or_else(|| "invalid stream upload state".to_string())?,
             created_at: self.read_u64()?,
+            bucket_incarnation_generation: self
+                .read_nonzero_u64("stream cleanup bucket incarnation generation")?,
             encryption: self.read_object_encryption()?,
         })
     }
@@ -4517,6 +4525,7 @@ fn encode_stream_upload_command_record(out: &mut Vec<u8>, session: &StreamUpload
     encode_stream_upload_target(out, &session.target);
     put_u8(out, session.state as u8);
     put_u64(out, session.created_at);
+    put_u64(out, session.bucket_incarnation_generation);
     encode_object_encryption(out, &session.encryption);
 }
 
@@ -4527,6 +4536,7 @@ fn encode_terminal_stream_cleanup(out: &mut Vec<u8>, session: &TerminalStreamCle
     encode_stream_upload_target(out, &session.target);
     put_u8(out, session.state as u8);
     put_u64(out, session.created_at);
+    put_u64(out, session.bucket_incarnation_generation);
     encode_object_encryption(out, &session.encryption);
 }
 
@@ -5139,8 +5149,41 @@ mod tests {
         0xf0cac1d2c9877f40,
         0xe3f90eee6e075dbd,
     ];
+    const IMMUTABLE_V9_ALL_VARIANT_CHECKSUMS: [u64; 30] = [
+        0x560b92ed27206719,
+        0x73f31f71b0768f45,
+        0xa54d6796eed17c66,
+        0x3f2b08a56ce4b720,
+        0x2965bbd38603c665,
+        0xcff8d9c66eeae3c9,
+        0x4badc6c95dbb83c8,
+        0xc0c61800736607cf,
+        0xde032085ff9700ab,
+        0xdbe56a55330c853f,
+        0x54f2176004fde949,
+        0xa8e28bddc869006b,
+        0xa7d06b75c54d9165,
+        0xa5ee3b52193411b5,
+        0xc96729af359631c9,
+        0x474e24dda919ae87,
+        0xfb2100bea73327c0,
+        0x218688cd6c394aee,
+        0xe74f7ba138ebc000,
+        0xf0dad41b5838eed2,
+        0x3de7e7bf451096fb,
+        0x4113393c1d6c0f79,
+        0xa4e2faf23d9c73ba,
+        0x0895a2a73cef327a,
+        0x353e3a18274cb6fc,
+        0x26b4d61219b7db7d,
+        0x1bd6b489d18901a8,
+        0xcd05f457ba38e599,
+        0xed6b3fe9aa005ae5,
+        0xbab1ba7d2cabcfed,
+    ];
     const V8_PLAINTEXT_ALL_VARIANT_INDICES: [usize; 14] =
         [3, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 27];
+    const V9_STREAM_SESSION_VARIANT_INDICES: [usize; 5] = [5, 18, 19, 20, 21];
 
     fn decode_metadata_command_envelope_for_test(
         bytes: &[u8],
@@ -5171,6 +5214,34 @@ mod tests {
         );
         assert_eq!(
             decode_metadata_command_envelope_for_test(&v8_bytes),
+            Err(expected)
+        );
+    }
+
+    fn assert_immutable_v9_command_is_rejected(
+        current: &MetadataCommandEnvelope,
+        expected_v9_checksum: u64,
+    ) {
+        let v9_bytes = current.command_bytes_with_encoding_version_for_test(9);
+        assert_eq!(
+            checksum::crc64::checksum(&v9_bytes),
+            expected_v9_checksum,
+            "the historical v9 command specimen changed"
+        );
+        assert_unsupported_applied_command(&v9_bytes, 9);
+    }
+
+    fn assert_unsupported_applied_command(bytes: &[u8], version: u16) {
+        let expected = MetadataCommandFormatError::UnsupportedVersion {
+            format: MetadataCommandRecordFormat::Applied,
+            version,
+        };
+        assert_eq!(
+            decode_metadata_command_log_entry_header(bytes),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            decode_metadata_command_envelope_for_test(bytes),
             Err(expected)
         );
     }
@@ -5232,6 +5303,28 @@ mod tests {
             observed_indices.push(index);
         }
         assert_eq!(observed_indices, V8_PLAINTEXT_ALL_VARIANT_INDICES);
+    }
+
+    #[test]
+    fn stream_session_metadata_command_v9_specimens_are_immutable_and_rejected() {
+        let fixture_lines: Vec<_> = include_str!("metadata_command_v9_stream_rejection.hex")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(fixture_lines.len(), V9_STREAM_SESSION_VARIANT_INDICES.len());
+
+        for (line, index) in fixture_lines
+            .into_iter()
+            .zip(V9_STREAM_SESSION_VARIANT_INDICES)
+        {
+            let bytes = decode_fixture_hex(line);
+            assert_eq!(
+                checksum::crc64::checksum(&bytes),
+                IMMUTABLE_V9_ALL_VARIANT_CHECKSUMS[index],
+                "historical v9 stream command {index} changed"
+            );
+            assert_unsupported_applied_command(&bytes, 9);
+        }
     }
 
     #[test]
@@ -5943,14 +6036,14 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0xb6c72836bcd8a653);
+        assert_eq!(envelope.checksum_crc64(), 0x0ec7_6f0b_a2c2_1db3);
         assert_immutable_v8_command_is_rejected(&envelope, 0x328ff7137ea3be2a);
     }
 
     #[test]
-    fn current_metadata_command_v9_checksum_tags_match_frozen_owner_encoding_and_require_version_bump(
+    fn current_metadata_command_v10_checksum_tags_match_frozen_owner_encoding_and_require_version_bump(
     ) {
-        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 9);
+        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 10);
 
         let cases = [
             (None, &[0_u8][..]),
@@ -6108,7 +6201,7 @@ mod tests {
         assert_eq!(applied_header.command_kind_name(), Some("CreateBucket"));
 
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        for version in [6_u16, 7_u16, 8_u16, 10_u16] {
+        for version in [6_u16, 7_u16, 8_u16, 9_u16, 11_u16] {
             let mut unsupported_version = envelope.command_bytes();
             unsupported_version[version_offset..version_offset + 2]
                 .copy_from_slice(&version.to_le_bytes());
@@ -6247,7 +6340,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xe16ec0228f84a7a4);
+        assert_eq!(envelope.checksum_crc64(), 0x596e871f919e1c44);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -6276,7 +6369,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x6c79de3b3a4175c8);
+        assert_eq!(envelope.checksum_crc64(), 0xd4799906245bce28);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -6342,7 +6435,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x340dadcfdeb8c8b3);
+        assert_eq!(envelope.checksum_crc64(), 0x8c0deaf2c0a27353);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -6422,13 +6515,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xe8e816ff7bf9b05f,
-                0x17d1de3c96b6bae6,
-                0x212f0307c3da3c36,
-                0xdc338e59a6650453,
-                0x08f925a745d21e37,
-                0x87910d7184f1da68,
-                0xa3bc99523d595d16,
+                0xc8c2ed216d985e16,
+                0xb045a41909009421,
+                0xe795eb9bdb069bb8,
+                0x607c39fd5c222530,
+                0xb4b69203bf953f54,
+                0x3f914a4c9aeb6188,
+                0x1ff32ef6c71e7c75,
             ]
         );
     }
@@ -6510,14 +6603,14 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x280d8e001c7892d8,
-                0xc3b201a540224dbe,
-                0x07fd5687ccc1c430,
-                0x9f297d45f9ef6871,
-                0x2a5855e9e3453bb9,
-                0x0ceedc0b3d23a1ef,
-                0xbfa60568ec10b398,
-                0xf2884184d09f5e11,
+                0x64ab7fbb371e6669,
+                0x914c5248228a85b6,
+                0x0cf497116cac8b2a,
+                0xcdd72ea89b47a079,
+                0x181fe509a5800a3e,
+                0x5e108fe65f8b69e7,
+                0x818b46b9c3afd6f5,
+                0xa0761269b2379619,
             ]
         );
     }
@@ -6812,6 +6905,7 @@ mod tests {
                     },
                     state: StreamUploadState::InProgress,
                     created_at: 558,
+                    bucket_incarnation_generation: 1,
                     encryption: sse_s3_encryption.clone(),
                 }],
                 stream_upload_segments: vec![stream_segment.clone()],
@@ -6969,6 +7063,7 @@ mod tests {
                         },
                         state: StreamUploadState::InProgress,
                         created_at: 562,
+                        bucket_incarnation_generation: 1,
                         encryption: sse_s3_encryption.clone(),
                     }],
                     stream_upload_segments: vec![stream_segment.clone()],
@@ -7099,7 +7194,15 @@ mod tests {
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
             assert_full_envelope_decoder_round_trips(&envelope);
-            if !V8_PLAINTEXT_ALL_VARIANT_INDICES.contains(&offset) {
+            if !V9_STREAM_SESSION_VARIANT_INDICES.contains(&offset) {
+                assert_immutable_v9_command_is_rejected(
+                    &envelope,
+                    IMMUTABLE_V9_ALL_VARIANT_CHECKSUMS[offset],
+                );
+            }
+            if !V8_PLAINTEXT_ALL_VARIANT_INDICES.contains(&offset)
+                && !V9_STREAM_SESSION_VARIANT_INDICES.contains(&offset)
+            {
                 assert_immutable_v8_command_is_rejected(
                     &envelope,
                     IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS[offset],
@@ -7110,42 +7213,47 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x560b92ed27206719,
-                0x73f31f71b0768f45,
-                0xa54d6796eed17c66,
-                0x3f2b08a56ce4b720,
-                0x2965bbd38603c665,
-                0xcff8d9c66eeae3c9,
-                0x4badc6c95dbb83c8,
-                0xc0c61800736607cf,
-                0xde032085ff9700ab,
-                0xdbe56a55330c853f,
-                0x54f2176004fde949,
-                0xa8e28bddc869006b,
-                0xa7d06b75c54d9165,
-                0xa5ee3b52193411b5,
-                0xc96729af359631c9,
-                0x474e24dda919ae87,
-                0xfb2100bea73327c0,
-                0x218688cd6c394aee,
-                0xe74f7ba138ebc000,
-                0xf0dad41b5838eed2,
-                0x3de7e7bf451096fb,
-                0x4113393c1d6c0f79,
-                0xa4e2faf23d9c73ba,
-                0x0895a2a73cef327a,
-                0x353e3a18274cb6fc,
-                0x26b4d61219b7db7d,
-                0x1bd6b489d18901a8,
-                0xcd05f457ba38e599,
-                0xed6b3fe9aa005ae5,
-                0xbab1ba7d2cabcfed,
+                0x3eede9801cfe1e42,
+                0x5887280c05dc5025,
+                0xdc6be059754dfe06,
+                0xf8b0e7b21f92730a,
+                0xb8eff0fa52f168d3,
+                0x41d09b39d9189d8a,
+                0x5d29c0afcc45220c,
+                0x16745a273ed1ef92,
+                0x369f01d04afce477,
+                0x5fe993c65ea86d35,
+                0xcbbb2b5ceee021a6,
+                0x8c7e41d4df870088,
+                0x1fff77945fc492d1,
+                0xb20aff9aa7c196d7,
+                0xac6a53153bdf3c01,
+                0x50aae01517ec29e5,
+                0x5ff7aefea9d7c581,
+                0x808236379c74e1f7,
+                0xed41ae2b9b0e0d5a,
+                0xf6450668c308d33f,
+                0x8c6503dad056ef7a,
+                0x6a1c8716af07d6ae,
+                0x473a32e3c2033fa1,
+                0x5ee27805f424e980,
+                0x94236a1a1c2d80f8,
+                0x81b17507f847496b,
+                0xe8bfaf63eb60bb7f,
+                0xdae1309f04cd62fb,
+                0xcb893da40e89340a,
+                0x516867c8eb5e791d,
             ]
         );
 
         assert_eq!(IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS.len(), checksums.len());
+        assert_eq!(IMMUTABLE_V9_ALL_VARIANT_CHECKSUMS.len(), checksums.len());
         assert_ne!(
             IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS.as_slice(),
+            checksums.as_slice()
+        );
+        assert_ne!(
+            IMMUTABLE_V9_ALL_VARIANT_CHECKSUMS.as_slice(),
             checksums.as_slice()
         );
 

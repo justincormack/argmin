@@ -1,6 +1,6 @@
 # Segment-Level Chunked Encryption And Authenticated Range Reads Plan
 
-Status: In progress (Phase 0 complete; Phase 1 exact encryption subjects underway)
+Status: In progress (Phase 0 complete; Phase 1 exact encryption subjects implemented)
 
 The completed
 [`remove-plaintext-payload-profile-plan.md`](completed/remove-plaintext-payload-profile-plan.md)
@@ -911,17 +911,42 @@ Implementation update (2026-10-21):
   Reservation apply also advances the durable generation high-water stored alongside the per-key
   write-order counter, without consuming a write sequence. A released generation therefore cannot
   be selected again after finalization, abort, recovery, or restart.
-  The reservation is deliberately not duplicated in `StreamUploadRecord`; the next slice must
-  consume it with upload ID, part number, bucket incarnation, and segment geometry to mint the
-  opaque multipart encryption subject before the first encryption call.
+  The payload-generation reservation is deliberately not duplicated in `StreamUploadRecord`.
+- UploadPart and UploadPartCopy now load that exact reservation and the authoritative upload before
+  encrypting each segment. Storage mints a non-cloneable `AuthorizedStreamPartSegment` that binds
+  bucket/key, bucket incarnation, upload ID, part number, the non-recycling part payload
+  generation, segment index, logical length, and the complete immutable encryption binding. The
+  coordinator can inspect only the encryption state and opaque segment subject. Append consumes
+  the capability; the local or Unix storage-node preparation path reloads and compares the exact
+  session, upload, generation, and encryption authority under the object-PG mutation lock before
+  advancing `next_segment_vid` or writing shards. Deterministic interleavings change immutable
+  encryption material after the initial check while leaving the session in progress and prove the
+  atomic check rejects without allocator or payload effects. Crossed route, upload, part,
+  generation, geometry, and same-wrap-nonce key-material cases fail closed. The raw production
+  multipart append entry point is removed; ordinary UploadPart and UploadPartCopy share this one
+  authority path.
+- Persisting the session's bucket incarnation and carrying the multipart append authority required
+  the coordinated current-format vector: PG schema 8, metadata-command 10, canonical state digest
+  7, metadata checkpoint 5, and storage RPC 26. The previous schema-7, command-9, digest-6,
+  checkpoint-4, and RPC-25 evidence remains immutable and is rejected by current readers. Exact v9
+  bytes are retained for every stream-session command whose representation changed, rather than
+  reconstructing the removed layout from current structs.
+- Phase 1's storage-owned subject and one-use capability boundary is complete. Incorporating the
+  canonical subject bytes into DEK wrapping, checksum sealing, and segment AEAD would change the
+  durable cryptographic profile, so that cryptographic binding remains coupled to the Phase 2
+  codec/profile bump rather than silently reinterpreting the current whole-segment ciphertext.
 
-- Introduce private canonical context codecs and opaque subject constructors.
-- Ensure every write path exposes its existing or newly allocated immutable generation to the
+- [x] Introduce private canonical context codecs and opaque subject constructors.
+- [x] Ensure every write path exposes its existing or newly allocated immutable generation to the
   owner-minted encryption subject before encryption.
-- Persist bucket incarnation, encryption-instance identity, and required payload provenance.
-- Bind DEK wrapping and encrypted checksum metadata to the base object subject.
-- Add exhaustive crossed-field and noncanonical-encoding tests.
-- Update the storage version dependency ledger before changing writers.
+- [x] Persist bucket incarnation, encryption-instance identity, and required payload provenance.
+- [x] Add exhaustive crossed-field and noncanonical-encoding tests for the owner-minted subjects
+  and capability boundaries.
+- [x] Update the storage version dependency ledger for the durable subject-provenance changes.
+- [ ] Bind DEK wrapping, encrypted checksum metadata, and segment AEAD to the canonical subject
+  bytes as part of the Phase 2 durable codec/profile bump. This is deliberately not a remaining
+  Phase 1 item: doing it under the existing profile would reinterpret already-versioned
+  ciphertext without changing its durable profile identity.
 
 Exit: no encryption operation accepts caller-assembled identity fields, and every field needed by
 the eventual reader exists before the first payload effect.

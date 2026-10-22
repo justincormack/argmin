@@ -793,6 +793,177 @@ fn upload_part_stream_sessions_reserve_distinct_payload_generations_and_abort_re
 }
 
 #[test]
+fn upload_part_segment_authority_binds_upload_generation_route_and_atomic_append_state() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let (bucket, key, object_pg, _) = bucket_key_with_distinct_object_and_data_pg(topology);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let upload_id = upload_id_from_label("partsubject");
+    let session_id = crate::tests::stream_session_id("partsubject");
+    let first_plaintext = b"subject-bound multipart payload";
+    let first_encrypted =
+        crate::tests::sse_s3_multipart_segment_test_fixture(first_plaintext, 7, 0);
+    create_test_bucket(&cluster, &bucket);
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("owner"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: first_encrypted.encryption.clone(),
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing| {
+                assert!(existing.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    cluster
+        .create_upload_part_stream_session(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            7,
+            &session_id,
+        )
+        .unwrap();
+
+    let issuer_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let foreign_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let issuer_admission = issuer_handle.admit_current_route().unwrap();
+    let foreign_admission = foreign_handle.admit_current_route().unwrap();
+    let issuer_route = issuer_admission
+        .active_multipart_object_route(&bucket, &key)
+        .unwrap();
+    let foreign_route = foreign_admission
+        .active_multipart_object_route(&bucket, &key)
+        .unwrap();
+
+    let crossed_route = issuer_route
+        .authorize_stream_part_segment(&upload_id, &session_id, 7, 0, first_plaintext.len() as u64)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to authorize UploadPart segment: {:?} {:?}",
+                error.kind(),
+                error.invalid_request_reason()
+            )
+        });
+    assert!(crossed_route.matches_encryption_and_geometry(
+        &first_encrypted.encryption,
+        0,
+        first_plaintext.len() as u64,
+    ));
+    assert!(!crossed_route.matches_encryption_and_geometry(
+        &first_encrypted.encryption,
+        1,
+        first_plaintext.len() as u64,
+    ));
+    let error = foreign_route
+        .append_authorized_stream_part_segment(
+            crossed_route,
+            first_encrypted.payload_crc64,
+            &first_encrypted.storage_bytes,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+
+    let successful = issuer_route
+        .authorize_stream_part_segment(&upload_id, &session_id, 7, 0, first_plaintext.len() as u64)
+        .unwrap();
+    let outcome = issuer_route
+        .append_authorized_stream_part_segment(
+            successful,
+            first_encrypted.payload_crc64,
+            &first_encrypted.storage_bytes,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome.target,
+        crate::StreamUploadTarget::UploadPart {
+            upload_id: upload_id.clone(),
+            part_number: 7,
+        }
+    );
+    assert_eq!(outcome.logical_size, first_plaintext.len() as u64);
+
+    let second_plaintext = b"atomic multipart append authority";
+    let second_encrypted =
+        crate::tests::sse_s3_multipart_segment_test_fixture(second_plaintext, 7, 1);
+    let stale = issuer_route
+        .authorize_stream_part_segment(&upload_id, &session_id, 7, 1, second_plaintext.len() as u64)
+        .unwrap();
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(object_pg))
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(object_pg).unwrap();
+    let before = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
+    drop(primary_pg);
+    let shard_write_guard = crate::test_support::install_payload_shard_write_attempt_hook(
+        &cluster,
+        Arc::new(|_| Ok(())),
+    );
+    let error = issuer_route
+        .test_append_authorized_stream_part_segment_with_before_prepare(
+            stale,
+            second_encrypted.payload_crc64,
+            &second_encrypted.storage_bytes,
+            || {
+                let pg = primary.storage_node().get_pg(object_pg).unwrap();
+                let upload =
+                    crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+                pg.test_force_multipart_upload_object_generation(
+                    &upload_id,
+                    crate::GenerationId::new(upload.object_generation_id.get() + 1).unwrap(),
+                )
+                .unwrap();
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::StreamUploadFailureKind::InvalidRequest);
+    assert_eq!(
+        error.invalid_request_reason(),
+        Some(
+            "stream UploadPart segment authority no longer matches the durable upload or payload generation"
+        )
+    );
+    let pg = primary.storage_node().get_pg(object_pg).unwrap();
+    let after = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
+    assert_eq!(after.next_segment_vid, before.next_segment_vid);
+    assert_eq!(
+        crate::PgMetadataStore::list_stream_segments(&*pg, &session_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(shard_write_guard.finish().count(), 0);
+}
+
+#[test]
 fn upload_part_payload_generations_do_not_recycle_after_finalize_or_abort_and_restart() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

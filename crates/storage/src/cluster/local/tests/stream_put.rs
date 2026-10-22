@@ -2546,6 +2546,7 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
             target: crate::StreamUploadTarget::PutObject,
             state: crate::StreamUploadState::InProgress,
             created_at: 1_000,
+            bucket_incarnation_generation: 1,
             encryption: crate::tests::metadata_only_test_encryption(),
         },
         initial_next_segment_vid: crate::GenerationId::MIN,

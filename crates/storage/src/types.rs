@@ -1442,6 +1442,7 @@ const SEGMENT_AES_256_GCM_V1_PROFILE_TAG: u8 = 1;
 const OBJECT_ENCRYPTION_INSTANCE_ID_LEN: usize = 1 + OBJECT_ENCRYPTION_WRAP_NONCE_LEN;
 const SEGMENT_ENCRYPTION_SUBJECT_VERSION: u8 = 1;
 const STANDARD_OBJECT_SEGMENT_PROVENANCE_TAG: u8 = 1;
+const MULTIPART_PART_SEGMENT_PROVENANCE_TAG: u8 = 2;
 
 /// Opaque canonical identity authenticated by one object's payload encryption.
 ///
@@ -1676,8 +1677,15 @@ impl std::fmt::Debug for ObjectEncryptionSubject {
 pub struct SegmentEncryptionSubject {
     object: ObjectEncryptionSubject,
     canonical: Box<[u8]>,
+    provenance: SegmentEncryptionProvenance,
     segment_index: u32,
     logical_plaintext_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentEncryptionProvenance {
+    StandardObject,
+    MultipartPart,
 }
 
 impl SegmentEncryptionSubject {
@@ -1695,6 +1703,38 @@ impl SegmentEncryptionSubject {
         Self {
             object,
             canonical: canonical.into_boxed_slice(),
+            provenance: SegmentEncryptionProvenance::StandardObject,
+            segment_index,
+            logical_plaintext_len,
+        }
+    }
+
+    pub(crate) fn multipart_part(
+        object: ObjectEncryptionSubject,
+        upload_id: &UploadId,
+        part_number: u32,
+        part_generation_id: GenerationId,
+        segment_index: u32,
+        logical_plaintext_len: u64,
+    ) -> Self {
+        let upload_id_len = u16::try_from(upload_id.as_str().len())
+            .expect("validated multipart upload ID length must fit u16");
+        let mut canonical = Vec::with_capacity(
+            object.canonical.len() + 1 + 1 + 2 + usize::from(upload_id_len) + 4 + 8 + 4 + 8,
+        );
+        canonical.extend_from_slice(&object.canonical);
+        canonical.push(SEGMENT_ENCRYPTION_SUBJECT_VERSION);
+        canonical.push(MULTIPART_PART_SEGMENT_PROVENANCE_TAG);
+        canonical.extend_from_slice(&upload_id_len.to_be_bytes());
+        canonical.extend_from_slice(upload_id.as_str().as_bytes());
+        canonical.extend_from_slice(&part_number.to_be_bytes());
+        canonical.extend_from_slice(&part_generation_id.get().to_be_bytes());
+        canonical.extend_from_slice(&segment_index.to_be_bytes());
+        canonical.extend_from_slice(&logical_plaintext_len.to_be_bytes());
+        Self {
+            object,
+            canonical: canonical.into_boxed_slice(),
+            provenance: SegmentEncryptionProvenance::MultipartPart,
             segment_index,
             logical_plaintext_len,
         }
@@ -1709,9 +1749,47 @@ impl SegmentEncryptionSubject {
         segment_index: u32,
         logical_plaintext_len: u64,
     ) -> bool {
-        self.object.matches_encryption(encryption)
+        self.provenance == SegmentEncryptionProvenance::StandardObject
+            && self.object.matches_encryption(encryption)
             && self.segment_index == segment_index
             && self.logical_plaintext_len == logical_plaintext_len
+    }
+
+    /// Returns whether this subject was minted for the exact multipart part,
+    /// immutable part payload generation, encryption state, and segment
+    /// geometry supplied by the caller.
+    #[must_use]
+    pub fn matches_multipart_part_segment(
+        &self,
+        encryption: &ObjectEncryption,
+        upload_id: &UploadId,
+        part_number: u32,
+        part_generation_id: GenerationId,
+        segment_index: u32,
+        logical_plaintext_len: u64,
+    ) -> bool {
+        if self.provenance != SegmentEncryptionProvenance::MultipartPart
+            || !self.object.matches_encryption(encryption)
+            || self.segment_index != segment_index
+            || self.logical_plaintext_len != logical_plaintext_len
+        {
+            return false;
+        }
+        let upload_id_len = match u16::try_from(upload_id.as_str().len()) {
+            Ok(len) => len,
+            Err(_) => return false,
+        };
+        let mut expected = Vec::with_capacity(self.canonical.len());
+        expected.extend_from_slice(&self.object.canonical);
+        expected.push(SEGMENT_ENCRYPTION_SUBJECT_VERSION);
+        expected.push(MULTIPART_PART_SEGMENT_PROVENANCE_TAG);
+        expected.extend_from_slice(&upload_id_len.to_be_bytes());
+        expected.extend_from_slice(upload_id.as_str().as_bytes());
+        expected.extend_from_slice(&part_number.to_be_bytes());
+        expected.extend_from_slice(&part_generation_id.get().to_be_bytes());
+        expected.extend_from_slice(&segment_index.to_be_bytes());
+        expected.extend_from_slice(&logical_plaintext_len.to_be_bytes());
+        self.canonical.as_ref() == expected
     }
 
     pub(crate) fn logical_plaintext_len(&self) -> u64 {
@@ -6965,6 +7043,8 @@ pub struct StreamUploadRecord {
     pub target: StreamUploadTarget,
     pub state: StreamUploadState,
     pub created_at: u64,
+    /// Bucket incarnation in which this staging session was authorized.
+    pub bucket_incarnation_generation: u64,
     /// Fixed authority deadline after which an unfinished frontend stream is
     /// durably eligible for cleanup by a later runtime-map generation.
     pub cleanup_after: Option<u64>,
@@ -6998,6 +7078,7 @@ impl StreamUploadRecord {
             && self.target == current.target
             && self.state == current.state
             && self.created_at == current.created_at
+            && self.bucket_incarnation_generation == current.bucket_incarnation_generation
             && self.cleanup_after == current.cleanup_after
             && self.encryption == current.encryption
             && reservation_matches
@@ -7010,9 +7091,16 @@ impl StreamUploadRecord {
 /// authority: the storage node must match it against the session and object
 /// generation while holding the object-PG mutation lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExpectedStreamPutAppendState {
-    pub(crate) session: StreamUploadRecord,
-    pub(crate) generation_id: GenerationId,
+pub(crate) enum ExpectedStreamAppendState {
+    PutObject {
+        session: StreamUploadRecord,
+        generation_id: GenerationId,
+    },
+    UploadPart {
+        session: StreamUploadRecord,
+        upload: Box<MultipartUploadRecord>,
+        part_generation_id: GenerationId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7034,6 +7122,7 @@ pub(crate) struct StreamUploadCommandRecord {
     pub(crate) target: StreamUploadTarget,
     pub(crate) state: StreamUploadState,
     pub(crate) created_at: u64,
+    pub(crate) bucket_incarnation_generation: u64,
     pub(crate) encryption: ObjectEncryption,
 }
 
@@ -7046,6 +7135,7 @@ impl From<&StreamUploadRecord> for StreamUploadCommandRecord {
             target: record.target.clone(),
             state: record.state,
             created_at: record.created_at,
+            bucket_incarnation_generation: record.bucket_incarnation_generation,
             encryption: record.encryption.clone(),
         }
     }
@@ -7064,6 +7154,7 @@ pub(crate) struct TerminalStreamCleanupRecord {
     pub(crate) target: StreamUploadTarget,
     pub(crate) state: StreamUploadState,
     pub(crate) created_at: u64,
+    pub(crate) bucket_incarnation_generation: u64,
     pub(crate) encryption: ObjectEncryption,
 }
 
@@ -7076,6 +7167,7 @@ impl From<&StreamUploadRecord> for TerminalStreamCleanupRecord {
             target: record.target.clone(),
             state: record.state,
             created_at: record.created_at,
+            bucket_incarnation_generation: record.bucket_incarnation_generation,
             encryption: record.encryption.clone(),
         }
     }
@@ -8131,6 +8223,22 @@ mod tests {
         ));
         assert!(!subject.matches_standard_object_segment(&same_nonce_other_wrapped_dek, 3, 65_537,));
 
+        let multipart_subject = SegmentEncryptionSubject::multipart_part(
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &encryption,
+            ),
+            &UploadId::try_from("01".repeat(UPLOAD_ID_LEN / 2)).unwrap(),
+            7,
+            GenerationId::new(29).unwrap(),
+            3,
+            65_537,
+        );
+        assert!(!multipart_subject.matches_standard_object_segment(&encryption, 3, 65_537));
+
         for crossed in [
             SegmentEncryptionSubject::standard_object(
                 ObjectEncryptionSubject::standard_object(
@@ -8157,6 +8265,132 @@ mod tests {
         ] {
             assert_ne!(crossed, subject);
         }
+    }
+
+    #[test]
+    fn multipart_part_segment_subject_extends_exact_upload_part_generation_and_geometry() {
+        let bucket = BucketName::try_from("multipart-subject-bucket").unwrap();
+        let key = ObjectKey::try_from("path/to/multipart").unwrap();
+        let upload_id = UploadId::try_from("01".repeat(UPLOAD_ID_LEN / 2)).unwrap();
+        let other_upload_id = UploadId::try_from("fe".repeat(UPLOAD_ID_LEN / 2)).unwrap();
+        let encryption = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        let object = ObjectEncryptionSubject::standard_object(
+            17,
+            &bucket,
+            &key,
+            GenerationId::new(23).unwrap(),
+            &encryption,
+        );
+        let mut expected = object.canonical_bytes().to_vec();
+        expected.push(SEGMENT_ENCRYPTION_SUBJECT_VERSION);
+        expected.push(MULTIPART_PART_SEGMENT_PROVENANCE_TAG);
+        expected.extend_from_slice(
+            &u16::try_from(UPLOAD_ID_LEN)
+                .expect("upload ID length fits u16")
+                .to_be_bytes(),
+        );
+        expected.extend_from_slice(upload_id.as_str().as_bytes());
+        expected.extend_from_slice(&7_u32.to_be_bytes());
+        expected.extend_from_slice(&29_u64.to_be_bytes());
+        expected.extend_from_slice(&3_u32.to_be_bytes());
+        expected.extend_from_slice(&65_537_u64.to_be_bytes());
+        let subject = SegmentEncryptionSubject::multipart_part(
+            object,
+            &upload_id,
+            7,
+            GenerationId::new(29).unwrap(),
+            3,
+            65_537,
+        );
+
+        assert_eq!(subject.canonical_bytes(), expected);
+        assert!(subject.matches_multipart_part_segment(
+            &encryption,
+            &upload_id,
+            7,
+            GenerationId::new(29).unwrap(),
+            3,
+            65_537,
+        ));
+        assert!(!subject.matches_multipart_part_segment(
+            &encryption,
+            &other_upload_id,
+            7,
+            GenerationId::new(29).unwrap(),
+            3,
+            65_537,
+        ));
+        assert!(!subject.matches_multipart_part_segment(
+            &encryption,
+            &upload_id,
+            8,
+            GenerationId::new(29).unwrap(),
+            3,
+            65_537,
+        ));
+        assert!(!subject.matches_multipart_part_segment(
+            &encryption,
+            &upload_id,
+            7,
+            GenerationId::new(30).unwrap(),
+            3,
+            65_537,
+        ));
+        assert!(!subject.matches_multipart_part_segment(
+            &encryption,
+            &upload_id,
+            7,
+            GenerationId::new(29).unwrap(),
+            4,
+            65_537,
+        ));
+        assert!(!subject.matches_multipart_part_segment(
+            &encryption,
+            &upload_id,
+            7,
+            GenerationId::new(29).unwrap(),
+            3,
+            65_536,
+        ));
+        let same_nonce_other_wrapped_dek = ObjectEncryption::SseS3(SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [14; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ));
+        assert!(!subject.matches_multipart_part_segment(
+            &same_nonce_other_wrapped_dek,
+            &upload_id,
+            7,
+            GenerationId::new(29).unwrap(),
+            3,
+            65_537,
+        ));
+
+        let standard_subject = SegmentEncryptionSubject::standard_object(
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &encryption,
+            ),
+            3,
+            65_537,
+        );
+        assert!(!standard_subject.matches_multipart_part_segment(
+            &encryption,
+            &upload_id,
+            7,
+            GenerationId::new(29).unwrap(),
+            3,
+            65_537,
+        ));
     }
 
     #[test]

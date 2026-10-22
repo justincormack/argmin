@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 7;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 8;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -305,6 +305,7 @@ CREATE TABLE stream_uploads (
     part_number   INTEGER,
     state         INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
+    bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation > 0),
     cleanup_after INTEGER CHECK (cleanup_after > 0),
     encryption_type INTEGER NOT NULL CHECK (encryption_type IN (1, 2)),
     encryption_state BLOB NOT NULL,
@@ -810,8 +811,8 @@ CREATE TABLE metadata_command_replica_state (
     applied_log_hash_encoding_version INTEGER NOT NULL DEFAULT 1 \
         CHECK (applied_log_hash_encoding_version = 1),
     applied_log_hash  INTEGER NOT NULL DEFAULT 0,
-    state_digest_encoding_version INTEGER NOT NULL DEFAULT 6 \
-        CHECK (state_digest_encoding_version = 6),
+    state_digest_encoding_version INTEGER NOT NULL DEFAULT 7 \
+        CHECK (state_digest_encoding_version = 7),
     state_digest      INTEGER NOT NULL DEFAULT 0
 ) STRICT";
 
@@ -1295,6 +1296,10 @@ mod tests {
             version: 7,
             catalogue: include_str!("schema_manifests/pg_schema_v7.catalogue"),
         },
+        FrozenPgSchemaManifest {
+            version: 8,
+            catalogue: include_str!("schema_manifests/pg_schema_v8.catalogue"),
+        },
     ];
 
     fn canonical_pg_schema_catalogue(conn: &Connection) -> String {
@@ -1419,7 +1424,7 @@ mod tests {
             .iter()
             .map(|manifest| manifest.version)
             .collect::<Vec<_>>();
-        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7, 8]);
         for manifest in FROZEN_PG_SCHEMA_MANIFESTS {
             validate_frozen_pg_schema_catalogue(manifest.catalogue);
         }
@@ -1548,7 +1553,7 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        for version in [1, 2, 3, 4, 5, 6, 8] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 9] {
             let conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "user_version", version).unwrap();
 

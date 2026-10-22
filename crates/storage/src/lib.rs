@@ -94,9 +94,9 @@ pub(crate) use cluster::DurableReclaimScanOutcome;
 pub use cluster::{
     ActiveBucketMetadataScan, ActiveBucketRoute, ActiveMultipartObjectRoute,
     ActiveObjectMetadataMutationRoute, ActiveObjectMetadataScan, ActiveObjectPayloadRead,
-    ActiveObjectReadRoute, ActivePutObjectRoute, AuthorizedStreamPutFinalization,
-    AuthorizedStreamPutSegment, BucketIdentityGenerations, BucketWriteSnapshotAction,
-    DirectPutEncryptionReservation, DirectPutGenerationReservation,
+    ActiveObjectReadRoute, ActivePutObjectRoute, AuthorizedStreamPartSegment,
+    AuthorizedStreamPutFinalization, AuthorizedStreamPutSegment, BucketIdentityGenerations,
+    BucketWriteSnapshotAction, DirectPutEncryptionReservation, DirectPutGenerationReservation,
     DirectPutSegmentEncryptionReservation, LeasedObjectReadSnapshot,
     LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
@@ -2109,7 +2109,10 @@ pub mod test_support {
     pub use static_topology::StaticInitialControlPlaneTopologyTestSupport;
 
     mod stream_route;
-    pub use stream_route::{ActiveStreamRouteTestSupport, StorageClusterStreamSessionTestSupport};
+    pub use stream_route::{
+        ActiveMultipartStreamRouteTestSupport, ActiveStreamRouteTestSupport,
+        StorageClusterStreamSessionTestSupport,
+    };
 
     mod topology;
     #[cfg(test)]
@@ -3974,7 +3977,7 @@ pub(crate) use traits::PgMetadataStore;
 pub(crate) use types::BucketSubresourceAux;
 #[cfg(test)]
 pub(crate) use types::DirectPutWrittenSegment;
-pub(crate) use types::ExpectedStreamPutAppendState;
+pub(crate) use types::ExpectedStreamAppendState;
 pub(crate) use types::MultipartUploadIdKey;
 #[cfg(test)]
 pub(crate) use types::SegmentStoredBytesRequest;

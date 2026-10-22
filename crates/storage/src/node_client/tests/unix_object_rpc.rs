@@ -1134,6 +1134,7 @@ fn unix_object_mutation_scan_route_rejects_foreign_response_subjects() {
         target: StreamUploadTarget::PutObject,
         state: StreamUploadState::InProgress,
         created_at: 1,
+        bucket_incarnation_generation: 1,
         cleanup_after: None,
         encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::new(10).unwrap(),
@@ -2647,9 +2648,9 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         payload_crc64: 99,
     };
     let (target, _) = correct_stream_session_route
-        .prepare_segment_append_with_expected_put_state(
+        .prepare_segment_append_with_expected_append_state(
             &append,
-            Some(&crate::ExpectedStreamPutAppendState {
+            Some(&crate::ExpectedStreamAppendState::PutObject {
                 session: session.clone(),
                 generation_id: snapshot.generation_id,
             }),
@@ -2661,7 +2662,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     crossed_append.session_id = part_session_id.clone();
     assert!(matches!(
         correct_stream_session_route
-            .prepare_segment_append_with_expected_put_state(&crossed_append, None, effect_fence)
+            .prepare_segment_append_with_expected_append_state(&crossed_append, None, effect_fence)
             .unwrap_err(),
         ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
             operation: "prepare stream segment append",
@@ -2670,7 +2671,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     let append_rpc_request = crate::storage_rpc::StorageRpcStreamSegmentAppendPrepareRequest {
         object: client.object_request(wrong_pg.pg_id(), &bucket, &key),
         request: append,
-        expected_put_state: None,
+        expected_append_state: None,
         effect_deadline: None,
     };
     let wrong_append_error = client
@@ -5546,6 +5547,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
         target: StreamUploadTarget::PutObject,
         state: StreamUploadState::InProgress,
         created_at: 1,
+        bucket_incarnation_generation: 1,
         cleanup_after: None,
         encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::new(2).unwrap(),
@@ -5752,6 +5754,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
             target: StreamUploadTarget::PutObject,
             state: StreamUploadState::InProgress,
             created_at: 1,
+            bucket_incarnation_generation: 1,
             cleanup_after: None,
             encryption: metadata_only_test_encryption(),
             next_segment_vid: GenerationId::new(11).unwrap(),
@@ -5995,6 +5998,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
                 },
                 state: StreamUploadState::InProgress,
                 created_at: 1,
+                bucket_incarnation_generation: 1,
                 cleanup_after: None,
                 encryption: metadata_only_test_encryption(),
                 next_segment_vid: GenerationId::new(31).unwrap(),
@@ -6158,6 +6162,7 @@ fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() 
                 },
                 state: StreamUploadState::InProgress,
                 created_at: 1,
+                bucket_incarnation_generation: 1,
                 cleanup_after: None,
                 encryption: metadata_only_test_encryption(),
                 next_segment_vid: GenerationId::new(31).unwrap(),

@@ -880,6 +880,7 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "part_number",
             "state",
             "created_at",
+            "bucket_incarnation_generation",
             "encryption_type",
             "encryption_state",
         ],
@@ -927,6 +928,7 @@ pub(super) const STREAM_UPLOAD_CHECKPOINT_COLUMNS: &[&str] = &[
     "part_number",
     "state",
     "created_at",
+    "bucket_incarnation_generation",
     "cleanup_after",
     "encryption_type",
     "encryption_state",
@@ -7680,7 +7682,7 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn canonical_metadata_state_v6_digests_are_stable() {
+    fn canonical_metadata_state_v7_digests_are_stable() {
         let table = &METADATA_DIGEST_TABLES[0];
         assert_eq!(table.name, "bucket_subresources");
         let values = vec![
@@ -7717,13 +7719,13 @@ mod canonical_format_baseline_tests {
             (
                 0x8e12_8dbf_237c_be5e,
                 0x64a9_e3d9_b3ad_266d,
-                0xb0ef_93dd_134e_269e,
+                0xf675_efe2_de15_be87,
             )
         );
     }
 
     #[test]
-    fn current_checksum_tags_match_frozen_canonical_state_v6_and_checkpoint_v4_evidence_and_require_version_bumps(
+    fn current_checksum_tags_match_frozen_canonical_state_v7_and_checkpoint_v5_evidence_and_require_version_bumps(
     ) {
         // Immutable checkpoint-v2 evidence produced with canonical-state v5 and the former
         // plaintext encryption tag. This tuple is rejection evidence only and must never be
@@ -7746,8 +7748,17 @@ mod canonical_format_baseline_tests {
                 60, 48, 33, 2, 153, 255, 59, 18, 244, 132, 67, 107, 214, 60,
             ],
         );
-        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 6);
-        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 4);
+        const HISTORICAL_CHECKPOINT_V4_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
+            0x7a1c_7ac9_e135_9fc5,
+            0x8ccc_c515_6f99_c704,
+            7_652,
+            [
+                123, 25, 100, 228, 221, 28, 84, 116, 91, 214, 116, 220, 6, 200, 79, 95, 122, 6, 31,
+                140, 160, 245, 127, 254, 69, 129, 170, 143, 2, 56, 63, 53,
+            ],
+        );
+        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 7);
+        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 5);
 
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -7833,17 +7844,18 @@ mod canonical_format_baseline_tests {
         assert_eq!(
             current_evidence,
             (
-                0x7a1c_7ac9_e135_9fc5,
-                0x8ccc_c515_6f99_c704,
-                7_652,
+                0x17e6_53d3_559e_e4a4,
+                0x8959_c98c_48ee_126c,
+                7_685,
                 [
-                    123, 25, 100, 228, 221, 28, 84, 116, 91, 214, 116, 220, 6, 200, 79, 95, 122, 6,
-                    31, 140, 160, 245, 127, 254, 69, 129, 170, 143, 2, 56, 63, 53,
+                    251, 112, 7, 3, 89, 151, 7, 38, 64, 204, 227, 237, 188, 141, 60, 10, 158, 162,
+                    76, 244, 126, 88, 44, 90, 177, 230, 51, 53, 157, 251, 179, 222,
                 ],
             )
         );
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V2_EVIDENCE);
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V3_EVIDENCE);
+        assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V4_EVIDENCE);
 
         let mut checkpoint_v2 = checkpoint.clone();
         for (table, block) in METADATA_DIGEST_TABLES
@@ -7858,7 +7870,7 @@ mod canonical_format_baseline_tests {
                         .columns
                         .iter()
                         .position(|candidate| candidate == column)
-                        .expect("v4 checkpoint must contain every v2 canonical column")
+                        .expect("v5 checkpoint must contain every v2 canonical column")
                 })
                 .collect::<Vec<_>>();
             for row in &mut block.rows {
@@ -7889,12 +7901,12 @@ mod canonical_format_baseline_tests {
                 encoded_v2_sha256.bytes(),
             ),
             (
-                0x7a1c_7ac9_e135_9fc5,
-                0x46ef_9335_040a_8d95,
-                7_266,
+                0x17e6_53d3_559e_e4a4,
+                0xd21b_4928_24ce_13d7,
+                7_299,
                 &[
-                    103, 226, 132, 243, 42, 254, 65, 8, 17, 97, 83, 118, 112, 7, 20, 188, 231, 247,
-                    140, 253, 242, 34, 141, 125, 130, 180, 158, 204, 182, 20, 121, 53,
+                    125, 242, 88, 39, 26, 54, 229, 27, 224, 148, 114, 18, 177, 177, 217, 101, 167,
+                    184, 92, 59, 245, 130, 144, 105, 124, 149, 89, 173, 84, 179, 198, 140,
                 ][..],
             )
         );

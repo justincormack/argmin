@@ -731,6 +731,7 @@ fn put_stream_upload_command_record(
     put_stream_upload_target(out, &record.target);
     put_u8(out, record.state as u8);
     put_u64(out, record.created_at);
+    put_u64(out, record.bucket_incarnation_generation);
     put_object_encryption(out, &record.encryption);
 }
 
@@ -741,6 +742,7 @@ fn put_stream_upload_record(out: &mut Vec<u8>, record: &StreamUploadRecord) {
     put_stream_upload_target(out, &record.target);
     put_u8(out, record.state as u8);
     put_u64(out, record.created_at);
+    put_u64(out, record.bucket_incarnation_generation);
     put_optional_u64(out, record.cleanup_after);
     put_object_encryption(out, &record.encryption);
     put_u64(out, record.next_segment_vid.get());
@@ -781,6 +783,7 @@ fn put_terminal_stream_cleanup_record(out: &mut Vec<u8>, stream: &TerminalStream
     put_stream_upload_target(out, &stream.target);
     put_u8(out, stream.state as u8);
     put_u64(out, stream.created_at);
+    put_u64(out, stream.bucket_incarnation_generation);
     put_object_encryption(out, &stream.encryption);
 }
 

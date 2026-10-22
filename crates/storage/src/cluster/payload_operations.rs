@@ -6912,27 +6912,41 @@ impl StorageCluster {
                 &request.session_id,
             )?;
         let session = stream_route.load_session()?;
-        let expected_put_state = if matches!(session.target, StreamUploadTarget::PutObject) {
-            let generation_route = self
-                .object_generation_metadata_primary_client(bucket, key)?
-                .open_object_generation_metadata_route(
-                    self.operation_epoch(),
-                    object_pg_id,
-                    bucket,
-                    key,
-                )?;
-            Some(crate::ExpectedStreamPutAppendState {
-                generation_id: generation_route
-                    .object_generation_reservation(&request.session_id)?,
+        let generation_route = self
+            .object_generation_metadata_primary_client(bucket, key)?
+            .open_object_generation_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+            )?;
+        let generation_id =
+            generation_route.object_generation_reservation(&request.session_id)?;
+        let expected_append_state = match &session.target {
+            StreamUploadTarget::PutObject => crate::ExpectedStreamAppendState::PutObject {
+                generation_id,
                 session,
-            })
-        } else {
-            None
+            },
+            StreamUploadTarget::UploadPart { upload_id, .. } => {
+                let upload = mutation_client
+                    .open_multipart_upload_lookup_metadata_route(
+                        self.operation_epoch(),
+                        object_pg_id,
+                        bucket,
+                        key,
+                    )?
+                    .load_in_progress_multipart_upload(upload_id)?;
+                crate::ExpectedStreamAppendState::UploadPart {
+                    session,
+                    upload: Box::new(upload),
+                    part_generation_id: generation_id,
+                }
+            }
         };
         let (target, mut segment_record) = stream_route
-            .prepare_segment_append_with_expected_put_state(
+            .prepare_segment_append_with_expected_append_state(
                 request,
-                expected_put_state.as_ref(),
+                Some(&expected_append_state),
                 AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             )?;
         segment_record.placement_cluster_epoch = self.operation_epoch();
@@ -6956,27 +6970,41 @@ impl StorageCluster {
                 effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             };
         let session = self.load_stream_upload_session_on_route(route, input.session_id)?;
-        let expected_put_state = if matches!(session.target, StreamUploadTarget::PutObject) {
-            let generation_route = self
-                .object_generation_metadata_primary_client(bucket, key)?
-                .open_object_generation_metadata_route(
-                    self.operation_epoch(),
-                    route.object_pg_id,
-                    bucket,
-                    key,
-                )?;
-            Some(crate::ExpectedStreamPutAppendState {
-                generation_id: generation_route
-                    .object_generation_reservation(input.session_id)?,
+        let generation_route = self
+            .object_generation_metadata_primary_client(bucket, key)?
+            .open_object_generation_metadata_route(
+                self.operation_epoch(),
+                route.object_pg_id,
+                bucket,
+                key,
+            )?;
+        let generation_id = generation_route.object_generation_reservation(input.session_id)?;
+        let expected_append_state = match &session.target {
+            StreamUploadTarget::PutObject => crate::ExpectedStreamAppendState::PutObject {
+                generation_id,
                 session,
-            })
-        } else {
-            None
+            },
+            StreamUploadTarget::UploadPart { upload_id, .. } => {
+                let upload = self
+                    .object_mutation_metadata_primary_client(bucket, key)?
+                    .open_multipart_upload_lookup_metadata_route(
+                        self.operation_epoch(),
+                        route.object_pg_id,
+                        bucket,
+                        key,
+                    )?
+                    .load_in_progress_multipart_upload(upload_id)?;
+                crate::ExpectedStreamAppendState::UploadPart {
+                    session,
+                    upload: Box::new(upload),
+                    part_generation_id: generation_id,
+                }
+            }
         };
         self.append_stream_segment_with_route_validation(
             route,
             input,
-            expected_put_state,
+            Some(expected_append_state),
             StreamAppendCallbacks {
                 validate_session: |_: &StreamUploadRecord| Ok(()),
                 before_prepare: || {},
@@ -6991,7 +7019,7 @@ impl StorageCluster {
         &self,
         route: PutObjectMutationEffectRoute<'_>,
         input: StreamSegmentAppendInput<'_>,
-        expected_put_state: Option<crate::ExpectedStreamPutAppendState>,
+        expected_append_state: Option<crate::ExpectedStreamAppendState>,
         mut callbacks: StreamAppendCallbacks<
             Validate,
             BeforePrepare,
@@ -7038,7 +7066,7 @@ impl StorageCluster {
                     segment_crc64: checksum::crc64::checksum(input.storage_bytes),
                     payload_crc64: input.payload_crc64,
                 },
-                expected_put_state.as_ref(),
+                expected_append_state.as_ref(),
                 &mut callbacks.require_valid_route,
             )
             .map_err(E::from)?;
@@ -7087,7 +7115,7 @@ impl StorageCluster {
         &self,
         route: PutObjectMutationEffectRoute<'_>,
         request: &PrepareStreamUploadSegmentAppendReq,
-        expected_put_state: Option<&crate::ExpectedStreamPutAppendState>,
+        expected_append_state: Option<&crate::ExpectedStreamAppendState>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let pg_id = route.object_pg_id.pg_id();
@@ -7152,9 +7180,9 @@ impl StorageCluster {
                     route.key,
                     &request.session_id,
                 )?
-                .prepare_segment_append_with_expected_put_state(
+                .prepare_segment_append_with_expected_append_state(
                     request,
-                    expected_put_state,
+                    expected_append_state,
                     route.effect_fence,
                 )?;
             segment_record.placement_cluster_epoch = self.operation_epoch();

@@ -1407,8 +1407,8 @@ fn runtime_map_current_state_digest_v3_is_stable() {
     assert_eq!(
         runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
         [
-            232, 52, 216, 115, 47, 14, 94, 158, 69, 253, 76, 25, 117, 154, 232, 190, 112, 1, 105,
-            169, 209, 49, 105, 152, 232, 83, 182, 28, 113, 130, 106, 5,
+            250, 90, 60, 73, 37, 11, 20, 248, 66, 219, 74, 79, 150, 51, 21, 124, 221, 248, 221, 5,
+            234, 237, 17, 161, 120, 48, 27, 64, 28, 61, 124, 120,
         ]
     );
 }
@@ -2366,7 +2366,7 @@ fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
         ),
         (
             11_041,
-            "8f5ea09073640f8bd127bc834bb3b636a135353bfd02b714706c8ab082b037ee".to_owned()
+            "6200833f80f0cb25674a1c0062a264b3e4c808cf9f445d97dc8822e4c24afcce".to_owned()
         )
     );
 }

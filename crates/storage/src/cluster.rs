@@ -96,8 +96,6 @@ use crate::storage_rpc::{
 };
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
-#[cfg(any(test, feature = "test-hooks"))]
-use crate::types::MultipartUploadRecord;
 #[cfg(test)]
 use crate::types::PlacedSegmentShardBackfillRecord;
 use crate::types::{
@@ -111,24 +109,24 @@ use crate::types::{
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPartOutcome,
     FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
     ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
-    ListedMultipartParts, ObjectEncryption, ObjectEncryptionSubject, ObjectKey, ObjectLayout,
-    ObjectPayloadSegment, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention,
-    ObjectSegmentRecord, OwnerIdentity, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
-    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
-    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
-    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
-    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-    PrepareStreamUploadSegmentAppendReq, PreparedDirectPutObjectCommit, PreparedStreamPartCommit,
-    PreparedStreamPutCommit, PublicAccessBlockConfig, RouteMapValidity, SegmentEncryptionSubject,
-    SegmentStoredBytesRequest, SerializedBucketTagSet, SerializedTagSet, SessionId, ShardIndex,
-    ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-    ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
-    ShardScavengerReferenceCursor, StoredLegalHoldStatus, StoredObject, StreamPartFinalizeInput,
-    StreamPartFinalizeSnapshot, StreamPutFinalizeSnapshot, StreamSegmentAppendInput,
-    StreamSegmentAppendOutcome, StreamUploadCommandRecord, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, VersionId,
-    WriteAck, WrittenShardAck, SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT,
+    ListedMultipartParts, MultipartUploadRecord, ObjectEncryption, ObjectEncryptionSubject,
+    ObjectKey, ObjectLayout, ObjectPayloadSegment, ObjectReadSnapshotMode,
+    ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
+    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
+    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillWorkItem,
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
+    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
+    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
+    PreparedDirectPutObjectCommit, PreparedStreamPartCommit, PreparedStreamPutCommit,
+    PublicAccessBlockConfig, RouteMapValidity, SegmentEncryptionSubject, SegmentStoredBytesRequest,
+    SerializedBucketTagSet, SerializedTagSet, SessionId, ShardIndex, ShardKey,
+    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
+    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
+    ShardScavengerPlacedShardSetReference, ShardScavengerReferenceCursor, StoredLegalHoldStatus,
+    StoredObject, StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutFinalizeSnapshot,
+    StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadCommandRecord,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
+    UploadState, VersionId, WriteAck, WrittenShardAck, SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT,
 };
 #[cfg(test)]
 use crate::types::{

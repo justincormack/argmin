@@ -3245,6 +3245,7 @@ fn upload_part_stream_upload_match_accepts_existing_row_without_create_proof() {
         },
         state: StreamUploadState::InProgress,
         created_at: command.session.created_at,
+        bucket_incarnation_generation: 1,
         cleanup_after: command.cleanup_after,
         encryption: metadata_only_test_encryption(),
         next_segment_vid: command.initial_next_segment_vid,
@@ -3311,6 +3312,7 @@ fn stream_upload_match_binds_cleanup_deadline_for_put_and_upload_part() {
             target,
             state: StreamUploadState::InProgress,
             created_at: command.session.created_at,
+            bucket_incarnation_generation: 1,
             cleanup_after: command.cleanup_after,
             encryption: metadata_only_test_encryption(),
             next_segment_vid: command.initial_next_segment_vid,
@@ -3408,9 +3410,9 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
     )
     .unwrap();
     let (_, prepared) = route
-        .prepare_segment_append_with_expected_put_state(
+        .prepare_segment_append_with_expected_append_state(
             &append,
-            Some(&crate::ExpectedStreamPutAppendState {
+            Some(&crate::ExpectedStreamAppendState::PutObject {
                 session: loaded_first,
                 generation_id: first_generation,
             }),
@@ -3427,9 +3429,9 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
     };
     assert!(matches!(
         route
-            .prepare_segment_append_with_expected_put_state(
+            .prepare_segment_append_with_expected_append_state(
                 &next_append,
-                Some(&crate::ExpectedStreamPutAppendState {
+                Some(&crate::ExpectedStreamAppendState::PutObject {
                     session: first_before_crossed_generation.clone(),
                     generation_id: crossed_generation,
                 }),
@@ -3453,7 +3455,7 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
     crossed_append.session_id = second_session.clone();
     assert!(matches!(
         route
-            .prepare_segment_append_with_expected_put_state(
+            .prepare_segment_append_with_expected_append_state(
                 &crossed_append,
                 None,
                 AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),

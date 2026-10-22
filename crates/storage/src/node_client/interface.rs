@@ -724,10 +724,10 @@ pub(crate) trait StreamUploadSessionMetadataRoute: Send {
 
     fn load_segments(&self) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError>;
 
-    fn prepare_segment_append_with_expected_put_state(
+    fn prepare_segment_append_with_expected_append_state(
         &self,
         request: &PrepareStreamUploadSegmentAppendReq,
-        expected: Option<&crate::ExpectedStreamPutAppendState>,
+        expected: Option<&crate::ExpectedStreamAppendState>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
 

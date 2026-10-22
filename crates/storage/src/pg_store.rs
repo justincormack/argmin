@@ -171,7 +171,7 @@ pub(crate) use scavenger::{ScavengerShardFile, ScavengerShardFileScan, Scavenger
 
 const LIFECYCLE_SUBRESOURCE_KIND_SQL: i64 = BucketSubresourceKind::Lifecycle as u8 as i64;
 pub(crate) const METADATA_COMMAND_CHECKPOINT_MAGIC: &[u8; 8] = b"ARGMCPKT";
-pub(crate) const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u16 = 4;
+pub(crate) const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u16 = 5;
 const BUCKET_INFO_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
@@ -199,7 +199,8 @@ FROM buckets WHERE name = ?1";
 const STREAM_UPLOAD_SELECT: &str = "\
 SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, cleanup_after, encryption_type, encryption_state, next_segment_vid, \
        bucket_write_reservation_id, bucket_write_owner_token, bucket_write_cluster_epoch, bucket_write_execution_generation, \
-       bucket_write_incarnation_generation, bucket_write_operation_kind, bucket_write_created_at, bucket_write_lease_deadline, bucket_write_target_context \
+       bucket_write_incarnation_generation, bucket_write_operation_kind, bucket_write_created_at, bucket_write_lease_deadline, bucket_write_target_context, \
+       bucket_incarnation_generation \
 FROM stream_uploads";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -488,6 +489,13 @@ fn parse_stream_upload_record(row: &Row<'_>) -> rusqlite::Result<StreamUploadRec
             )
         })?,
         created_at: row.get::<_, i64>(7)? as u64,
+        bucket_incarnation_generation: u64::try_from(row.get::<_, i64>(21)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                21,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
         cleanup_after: row
             .get::<_, Option<i64>>(8)?
             .map(|value| {

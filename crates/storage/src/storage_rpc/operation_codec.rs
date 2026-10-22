@@ -1854,11 +1854,24 @@ pub(crate) fn encode_stream_segment_append_prepare_request(
 ) -> Vec<u8> {
     let mut out = encode_object_request(&request.object);
     put_prepare_stream_segment_append_req(&mut out, &request.request);
-    match &request.expected_put_state {
-        Some(expected) => {
+    match &request.expected_append_state {
+        Some(crate::ExpectedStreamAppendState::PutObject {
+            session,
+            generation_id,
+        }) => {
             put_u8(&mut out, 1);
-            put_stream_upload_record(&mut out, &expected.session);
-            put_u64(&mut out, expected.generation_id.get());
+            put_stream_upload_record(&mut out, session);
+            put_u64(&mut out, generation_id.get());
+        }
+        Some(crate::ExpectedStreamAppendState::UploadPart {
+            session,
+            upload,
+            part_generation_id,
+        }) => {
+            put_u8(&mut out, 2);
+            put_stream_upload_record(&mut out, session);
+            put_multipart_upload_record(&mut out, upload);
+            put_u64(&mut out, part_generation_id.get());
         }
         None => put_u8(&mut out, 0),
     }
@@ -1879,13 +1892,22 @@ pub(crate) fn decode_stream_segment_append_prepare_request(
     let mut decoder = StorageRpcDecoder::new(bytes);
     let object = decoder.read_rpc_object_request()?;
     let request = decoder.read_prepare_stream_segment_append_req()?;
-    let expected_put_state = match decoder.read_u8()? {
+    let expected_append_state = match decoder.read_u8()? {
         0 => None,
-        1 => Some(crate::ExpectedStreamPutAppendState {
+        1 => Some(crate::ExpectedStreamAppendState::PutObject {
             session: decoder.read_stream_upload_record()?,
             generation_id: crate::GenerationId::new(decoder.read_u64()?).ok_or(
                 StorageRpcPayloadError::InvalidObjectMetadataRequest(
                     "invalid expected stream PutObject generation",
+                ),
+            )?,
+        }),
+        2 => Some(crate::ExpectedStreamAppendState::UploadPart {
+            session: decoder.read_stream_upload_record()?,
+            upload: Box::new(decoder.read_multipart_upload_record()?),
+            part_generation_id: crate::GenerationId::new(decoder.read_u64()?).ok_or(
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid expected stream UploadPart generation",
                 ),
             )?,
         }),
@@ -1895,14 +1917,34 @@ pub(crate) fn decode_stream_segment_append_prepare_request(
             ));
         }
     };
-    if expected_put_state.as_ref().is_some_and(|expected| {
-        expected.session.session_id != request.session_id
-            || expected.session.bucket != object.bucket
-            || expected.session.key != object.key
-            || !matches!(expected.session.target, crate::StreamUploadTarget::PutObject)
-    }) {
+    let expected_subject_mismatch = match expected_append_state.as_ref() {
+        Some(crate::ExpectedStreamAppendState::PutObject { session, .. }) => {
+            session.session_id != request.session_id
+                || session.bucket != object.bucket
+                || session.key != object.key
+                || !matches!(session.target, crate::StreamUploadTarget::PutObject)
+        }
+        Some(crate::ExpectedStreamAppendState::UploadPart {
+            session, upload, ..
+        }) => {
+            session.session_id != request.session_id
+                || session.bucket != object.bucket
+                || session.key != object.key
+                || upload.bucket != object.bucket
+                || upload.key != object.key
+                || !matches!(
+                    &session.target,
+                    crate::StreamUploadTarget::UploadPart {
+                        upload_id,
+                        part_number: _,
+                    } if upload_id == &upload.upload_id
+                )
+        }
+        None => false,
+    };
+    if expected_subject_mismatch {
         return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
-            "expected stream PutObject state does not match request subject",
+            "expected stream append state does not match request subject",
         ));
     }
     let effect_deadline = match decoder.read_u8()? {
@@ -1928,7 +1970,7 @@ pub(crate) fn decode_stream_segment_append_prepare_request(
     Ok(StorageRpcStreamSegmentAppendPrepareRequest {
         object,
         request,
-        expected_put_state,
+        expected_append_state,
         effect_deadline,
     })
 }

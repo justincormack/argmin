@@ -4829,7 +4829,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
         payload_crc64: 123,
     };
     let missing_authority = stream_route
-        .prepare_segment_append_with_expected_put_state(
+        .prepare_segment_append_with_expected_append_state(
             &append,
             None,
             AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
@@ -4846,9 +4846,9 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
         "unexpected missing-authority error: {missing_authority:?}"
     );
     let (target, segment) = stream_route
-        .prepare_segment_append_with_expected_put_state(
+        .prepare_segment_append_with_expected_append_state(
             &append,
-            Some(&crate::ExpectedStreamPutAppendState {
+            Some(&crate::ExpectedStreamAppendState::PutObject {
                 session: loaded.clone(),
                 generation_id: GenerationId::new(1).unwrap(),
             }),

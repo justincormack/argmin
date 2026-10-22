@@ -720,6 +720,17 @@ impl<'a> StorageRpcDecoder<'a> {
         }
     }
 
+    fn read_nonzero_u64(
+        &mut self,
+        message: &'static str,
+    ) -> Result<u64, StorageRpcPayloadError> {
+        let value = self.read_u64()?;
+        if value == 0 {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(message));
+        }
+        Ok(value)
+    }
+
     fn read_optional_u32(&mut self) -> Result<Option<u32>, StorageRpcPayloadError> {
         match self.read_u8()? {
             0 => Ok(None),
@@ -1657,6 +1668,9 @@ impl<'a> StorageRpcDecoder<'a> {
                 StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid stream upload state"),
             )?,
             created_at: self.read_u64()?,
+            bucket_incarnation_generation: self.read_nonzero_u64(
+                "stream upload bucket incarnation generation",
+            )?,
             encryption: self.read_object_encryption()?,
         })
     }
@@ -1671,6 +1685,9 @@ impl<'a> StorageRpcDecoder<'a> {
                 StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid stream upload state"),
             )?,
             created_at: self.read_u64()?,
+            bucket_incarnation_generation: self.read_nonzero_u64(
+                "stream upload bucket incarnation generation",
+            )?,
             cleanup_after: self.read_optional_u64()?,
             encryption: self.read_object_encryption()?,
             next_segment_vid: self.read_generation_id()?,
@@ -1719,6 +1736,9 @@ impl<'a> StorageRpcDecoder<'a> {
                 ),
             )?,
             created_at: self.read_u64()?,
+            bucket_incarnation_generation: self.read_nonzero_u64(
+                "stream cleanup bucket incarnation generation",
+            )?,
             encryption: self.read_object_encryption()?,
         })
     }

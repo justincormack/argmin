@@ -86,7 +86,7 @@ fn multipart_upload_schema_rejects_invalid_identity_values() {
 }
 
 #[test]
-fn current_pg_schema_v7_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
+fn current_pg_schema_v8_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
     assert_eq!(
@@ -94,7 +94,7 @@ fn current_pg_schema_v7_checksum_tags_match_frozen_owner_encoding_and_require_ve
             .conn
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        7
+        8
     );
     let bucket = trusted_bucket_name("checksum-tag-schema-bucket");
     let upload_id = crate::tests::multipart_upload_id("checksum-tag-schema-upload");
@@ -3748,6 +3748,7 @@ fn metadata_state_digest_and_checkpoint_table_inventories_are_explicit() {
             "part_number",
             "state",
             "created_at",
+            "bucket_incarnation_generation",
             "cleanup_after",
             "encryption_type",
             "encryption_state",
@@ -4693,7 +4694,8 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
         "framed-v1",
         "framed-v2",
         "framed-v3",
-        "framed-v5",
+        "framed-v4",
+        "framed-v6",
     ] {
         let (checkpoint_crc64, checkpoint_bytes) = if format == "corrupt" {
             (second_checkpoint.checkpoint_crc64, vec![0])
@@ -4701,7 +4703,8 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
             let encoding_version = match format {
                 "framed-v2" => 2,
                 "framed-v3" => 3,
-                "framed-v5" => 5,
+                "framed-v4" => 4,
+                "framed-v6" => 6,
                 _ => 1,
             };
             let mut unsupported = second_checkpoint.clone();
@@ -5363,6 +5366,7 @@ fn install_metadata_transfer_checkpoint_base_restores_complete_stream_session() 
         target: StreamUploadTarget::PutObject,
         state: StreamUploadState::InProgress,
         created_at: 123,
+        bucket_incarnation_generation: 1,
         cleanup_after: Some(456),
         encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::new(7).unwrap(),
@@ -5579,7 +5583,7 @@ fn metadata_command_replica_state_rejects_unsupported_carrier_encodings() {
         (
             "state_digest_encoding_version",
             "state-digest",
-            [5_u8, 7_u8],
+            [6_u8, 8_u8],
         ),
     ] {
         for version in versions {
@@ -6827,7 +6831,7 @@ fn recovery_rejects_resealed_unsupported_abandoned_command_versions_before_mutat
 
 #[test]
 fn recovery_rejects_resealed_unsupported_pending_command_versions_before_mutation() {
-    for version in [7_u16, 8, 10] {
+    for version in [7_u16, 8, 9, 11] {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let command = create_bucket_probe_command(
@@ -6920,7 +6924,7 @@ fn recovery_rejects_resealed_unsupported_pending_command_versions_before_mutatio
 
 #[test]
 fn recovery_rejects_resealed_unsupported_applied_command_versions_before_mutation() {
-    for version in [7_u16, 8, 10] {
+    for version in [7_u16, 8, 9, 11] {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let command = create_bucket_probe_command(
@@ -7827,6 +7831,7 @@ fn terminal_stream_upload_cleanup_record_excludes_allocator_floor() {
         },
         state: StreamUploadState::InProgress,
         created_at: 123,
+        bucket_incarnation_generation: 1,
         cleanup_after: None,
         encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::new(2).unwrap(),
@@ -7866,6 +7871,7 @@ fn abort_stream_upload_command_binds_stable_reservation_identity() {
         target: StreamUploadTarget::PutObject,
         state: StreamUploadState::InProgress,
         created_at: 123,
+        bucket_incarnation_generation: 1,
         cleanup_after: None,
         encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::MIN,
@@ -7945,6 +7951,7 @@ fn abort_multipart_command_validates_cleanup_before_accepting_lagging_stream_all
         },
         state: StreamUploadState::InProgress,
         created_at: 456,
+        bucket_incarnation_generation: 1,
         cleanup_after: None,
         encryption: metadata_only_test_encryption(),
         next_segment_vid: GenerationId::MIN,
@@ -8079,8 +8086,8 @@ fn metadata_state_digest_covers_stream_upload_state() {
                 .execute(
                     "INSERT INTO stream_uploads \
                      (session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                      created_at, encryption_type, encryption_state) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                      created_at, bucket_incarnation_generation, encryption_type, encryption_state) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         "session",
                         bucket.as_str(),
@@ -8090,6 +8097,7 @@ fn metadata_state_digest_covers_stream_upload_state() {
                         Option::<i64>::None,
                         StreamUploadState::InProgress as u8,
                         104_i64,
+                        1_i64,
                         encryption.encryption_type() as u8,
                         encryption_state.as_deref(),
                     ],
@@ -8119,8 +8127,8 @@ fn metadata_state_digest_covers_stream_upload_state() {
                 .execute(
                     "INSERT INTO stream_uploads \
                      (session_id, bucket, key, op_kind, upload_id, part_number, state, \
-                      created_at, encryption_type, encryption_state) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                      created_at, bucket_incarnation_generation, encryption_type, encryption_state) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         "seg-session",
                         bucket.as_str(),
@@ -8130,6 +8138,7 @@ fn metadata_state_digest_covers_stream_upload_state() {
                         Option::<i64>::None,
                         StreamUploadState::InProgress as u8,
                         105_i64,
+                        1_i64,
                         encryption.encryption_type() as u8,
                         encryption_state.as_deref(),
                     ],
@@ -9478,13 +9487,13 @@ fn insert_direct_put_terminal_staging(
         .execute(
             "INSERT INTO stream_uploads \
              (session_id, bucket, key, op_kind, upload_id, part_number, state, \
-              created_at, encryption_type, encryption_state, bucket_write_reservation_id, \
+              created_at, bucket_incarnation_generation, encryption_type, encryption_state, bucket_write_reservation_id, \
               bucket_write_owner_token, bucket_write_cluster_epoch, \
               bucket_write_execution_generation, bucket_write_incarnation_generation, \
               bucket_write_operation_kind, bucket_write_created_at, \
               bucket_write_lease_deadline, bucket_write_target_context) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-                     ?14, ?15, ?16, ?17, ?18, ?19)",
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 reservation_id.as_str(),
                 bucket.as_str(),
@@ -9494,6 +9503,7 @@ fn insert_direct_put_terminal_staging(
                 Option::<i64>::None,
                 StreamUploadState::InProgress as u8,
                 1_i64,
+                proof.bucket_incarnation_generation as i64,
                 encryption.encryption_type() as u8,
                 encryption_state.as_deref(),
                 proof.reservation_id,

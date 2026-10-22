@@ -304,4 +304,28 @@ impl ActiveWriteEncryption {
         }
         self.encrypt_segment(segment_index, data)
     }
+
+    pub(super) fn encrypt_multipart_part_segment(
+        &self,
+        authorization: &storage::AuthorizedStreamPartSegment<'_, '_>,
+        segment_index: u32,
+        data: &[u8],
+    ) -> Result<Vec<u8>, ServerError> {
+        let logical_plaintext_len =
+            u64::try_from(data.len()).map_err(|_| ServerError::InternalError {
+                reason: "multipart segment length does not fit the encryption subject".to_string(),
+            })?;
+        if !authorization.matches_encryption_and_geometry(
+            &self.object_encryption(),
+            segment_index,
+            logical_plaintext_len,
+        ) {
+            return Err(ServerError::InternalError {
+                reason:
+                    "multipart segment subject does not match the write encryption instance, part, generation, or geometry"
+                        .to_string(),
+            });
+        }
+        self.encrypt_segment(segment_index, data)
+    }
 }
