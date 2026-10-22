@@ -4844,7 +4844,13 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
     let fixture = sse_s3_segment_test_fixture(plaintext, 0);
     assert_eq!(
         fixture.storage_bytes.len(),
-        plaintext.len() + fixture.encryption.segment_ciphertext_extra_len()
+        usize::try_from(
+            fixture
+                .encryption
+                .segment_stored_size(plaintext.len() as u64)
+                .unwrap(),
+        )
+        .unwrap()
     );
 
     store

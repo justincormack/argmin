@@ -6,14 +6,13 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
-use storage::EcShape;
+use storage::{EcShape, SegmentPayloadCodec};
 
 use super::lock_mutex_unpoisoned;
 #[cfg(test)]
 use super::read_core::PayloadLease;
 use super::read_core::ReadChunk;
 use super::INTERNAL_SEGMENT_SIZE;
-use crate::sse::SSE_C_SEGMENT_TAG_LEN;
 
 #[derive(Debug)]
 pub(super) struct PayloadBufferPool {
@@ -217,9 +216,15 @@ pub(super) fn segment_payload_buffer_capacity(ec_shape: EcShape) -> usize {
 }
 
 pub(super) fn max_stored_segment_size() -> usize {
-    // Encrypted objects store an authentication tag alongside the largest
-    // logical segment.
-    INTERNAL_SEGMENT_SIZE.saturating_add(SSE_C_SEGMENT_TAG_LEN)
+    [
+        SegmentPayloadCodec::SegmentAes256GcmV1,
+        SegmentPayloadCodec::Cobblestone256SegmentV1,
+    ]
+    .into_iter()
+    .filter_map(|codec| codec.stored_size(INTERNAL_SEGMENT_SIZE as u64))
+    .filter_map(|size| usize::try_from(size).ok())
+    .max()
+    .expect("at least one payload codec supports the internal segment size")
 }
 
 #[cfg(test)]

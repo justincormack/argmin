@@ -1,6 +1,7 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::payload::max_stored_segment_size;
 use super::test_helpers;
 use super::test_support::*;
 use super::*;
@@ -908,11 +909,11 @@ fn buffered_put_exact_segment_skips_stream_session_rows() {
 }
 
 #[test]
-fn encode_parity_scratch_covers_max_sse_c_segment() {
+fn encode_parity_scratch_covers_largest_supported_segment_profile() {
     let ec_config = EcConfig::default();
     let k = ec_config.data_shards() as usize;
     let m = ec_config.parity_shards() as usize;
-    let padded = (INTERNAL_SEGMENT_SIZE + SSE_C_SEGMENT_TAG_LEN).div_ceil(k) * k;
+    let padded = max_stored_segment_size().div_ceil(k) * k;
     let expected = (padded / k) * m;
     assert_eq!(
         encode_parity_scratch_len(storage::EcShape {

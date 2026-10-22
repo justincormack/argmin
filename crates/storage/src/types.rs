@@ -1336,6 +1336,8 @@ pub(crate) enum ObjectEncryptionDecodeError {
     InvalidSseS3StateLength { actual: usize, minimum: usize },
     #[error("unsupported SSE-S3 state version {version}")]
     UnsupportedSseS3StateVersion { version: u8 },
+    #[error("unsupported segment payload codec {codec}")]
+    UnsupportedSegmentPayloadCodec { codec: u8 },
     #[error("invalid SSE-S3 checksum metadata length {declared} (remaining {remaining})")]
     InvalidSseS3ChecksumMetadataLength { declared: usize, remaining: usize },
     #[error("SSE-S3 empty checksum metadata requires a zero nonce")]
@@ -1438,11 +1440,73 @@ pub const SSE_S3_CHECKSUM_NONCE_LEN: usize = OBJECT_ENCRYPTION_CHECKSUM_NONCE_LE
 
 const OBJECT_ENCRYPTION_SUBJECT_DOMAIN: &[u8] = b"argmin:object-encryption-subject";
 const OBJECT_ENCRYPTION_SUBJECT_VERSION: u8 = 1;
-const SEGMENT_AES_256_GCM_V1_PROFILE_TAG: u8 = 1;
 const OBJECT_ENCRYPTION_INSTANCE_ID_LEN: usize = 1 + OBJECT_ENCRYPTION_WRAP_NONCE_LEN;
 const SEGMENT_ENCRYPTION_SUBJECT_VERSION: u8 = 1;
 const STANDARD_OBJECT_SEGMENT_PROVENANCE_TAG: u8 = 1;
 const MULTIPART_PART_SEGMENT_PROVENANCE_TAG: u8 = 2;
+
+/// Durable codec used to protect encrypted payload segments.
+///
+/// The codec is independent of the AWS-visible SSE mode: either codec can be
+/// paired with SSE-C or SSE-S3 key state. It is carried by the self-describing
+/// object-encryption state so objects, multipart uploads, and stream sessions
+/// retain one exact codec choice.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentPayloadCodec {
+    SegmentAes256GcmV1 = 1,
+    Cobblestone256SegmentV1 = 2,
+}
+
+impl SegmentPayloadCodec {
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::SegmentAes256GcmV1),
+            2 => Some(Self::Cobblestone256SegmentV1),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    /// Return the canonical stored length for one logical segment.
+    #[must_use]
+    pub fn stored_size(self, logical_size: u64) -> Option<u64> {
+        match self {
+            Self::SegmentAes256GcmV1 => {
+                logical_size.checked_add(OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64)
+            }
+            Self::Cobblestone256SegmentV1 => {
+                argmin_crypto::cobblestone::Cobblestone256MessageLayout::from_plaintext_len(
+                    logical_size,
+                )
+                .ok()
+                .map(|layout| layout.ciphertext_len())
+            }
+        }
+    }
+
+    /// Recover the logical length from a canonical stored segment length.
+    #[must_use]
+    pub fn logical_size(self, stored_size: u64) -> Option<u64> {
+        match self {
+            Self::SegmentAes256GcmV1 => {
+                stored_size.checked_sub(OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64)
+            }
+            Self::Cobblestone256SegmentV1 => {
+                argmin_crypto::cobblestone::Cobblestone256MessageLayout::from_ciphertext_len(
+                    stored_size,
+                )
+                .ok()
+                .map(|layout| layout.plaintext_len())
+            }
+        }
+    }
+}
 
 /// Opaque canonical identity authenticated by one object's payload encryption.
 ///
@@ -1460,6 +1524,7 @@ pub struct ObjectEncryptionSubject {
 #[derive(PartialEq, Eq)]
 enum ObjectEncryptionImmutableBinding {
     SseCustomer {
+        payload_codec: SegmentPayloadCodec,
         validator_key_id: u32,
         validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
         validator_hmac: [u8; SSE_C_VALIDATOR_HMAC_LEN],
@@ -1469,6 +1534,7 @@ enum ObjectEncryptionImmutableBinding {
         segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
     },
     SseS3 {
+        payload_codec: SegmentPayloadCodec,
         wrapping_key_id: u32,
         wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
         wrapped_dek: [u8; SSE_S3_WRAPPED_DEK_LEN],
@@ -1480,6 +1546,7 @@ impl ObjectEncryptionImmutableBinding {
     fn from_encryption(encryption: &ObjectEncryption) -> Self {
         match encryption {
             ObjectEncryption::SseCustomer(state) => Self::SseCustomer {
+                payload_codec: state.payload_codec(),
                 validator_key_id: state.validator_key_id(),
                 validator_salt: *state.validator_salt(),
                 validator_hmac: *state.validator_hmac(),
@@ -1489,6 +1556,7 @@ impl ObjectEncryptionImmutableBinding {
                 segment_nonce_prefix: *state.segment_nonce_prefix(),
             },
             ObjectEncryption::SseS3(state) => Self::SseS3 {
+                payload_codec: state.payload_codec(),
                 wrapping_key_id: state.wrapping_key_id(),
                 wrap_nonce: *state.wrap_nonce(),
                 wrapped_dek: *state.wrapped_dek(),
@@ -1529,7 +1597,7 @@ impl ObjectEncryptionSubject {
         canonical.push(domain_len);
         canonical.extend_from_slice(OBJECT_ENCRYPTION_SUBJECT_DOMAIN);
         canonical.push(OBJECT_ENCRYPTION_SUBJECT_VERSION);
-        canonical.push(SEGMENT_AES_256_GCM_V1_PROFILE_TAG);
+        canonical.push(encryption.payload_codec().tag());
         canonical.push(
             u8::try_from(OBJECT_ENCRYPTION_INSTANCE_ID_LEN)
                 .expect("object encryption instance identifier length must fit u8"),
@@ -1590,7 +1658,10 @@ impl ObjectEncryptionSubject {
         if take(canonical, &mut cursor, 1)? != [OBJECT_ENCRYPTION_SUBJECT_VERSION] {
             return Err("unsupported version");
         }
-        if take(canonical, &mut cursor, 1)? != [SEGMENT_AES_256_GCM_V1_PROFILE_TAG] {
+        let profile = *take(canonical, &mut cursor, 1)?
+            .first()
+            .ok_or("missing profile")?;
+        if SegmentPayloadCodec::from_u8(profile).is_none() {
             return Err("unsupported profile");
         }
         let instance_len = usize::from(
@@ -1821,6 +1892,7 @@ impl std::fmt::Debug for SegmentEncryptionSubject {
 /// Stored per-object `SSE-C` state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerObjectState {
+    payload_codec: SegmentPayloadCodec,
     validator_key_id: u32,
     validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
     validator_hmac: [u8; SSE_C_VALIDATOR_HMAC_LEN],
@@ -1835,6 +1907,7 @@ pub struct SseCustomerObjectState {
 impl std::fmt::Debug for SseCustomerObjectState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SseCustomerObjectState")
+            .field("payload_codec", &self.payload_codec)
             .field("validator_key_id", &self.validator_key_id)
             .field(
                 "encrypted_checksum_metadata_len",
@@ -1849,8 +1922,9 @@ impl std::fmt::Debug for SseCustomerObjectState {
 }
 
 impl SseCustomerObjectState {
-    const VERSION: u8 = 3;
+    const VERSION: u8 = 4;
     const FIXED_ENCODED_LEN: usize = 1
+        + 1
         + 4
         + SSE_C_VALIDATOR_SALT_LEN
         + SSE_C_VALIDATOR_HMAC_LEN
@@ -1872,6 +1946,7 @@ impl SseCustomerObjectState {
         segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
     ) -> Self {
         Self {
+            payload_codec: SegmentPayloadCodec::SegmentAes256GcmV1,
             validator_key_id,
             validator_salt,
             validator_hmac,
@@ -1900,6 +1975,20 @@ impl SseCustomerObjectState {
             )?,
             ..self.clone()
         })
+    }
+
+    #[must_use]
+    pub const fn payload_codec(&self) -> SegmentPayloadCodec {
+        self.payload_codec
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_payload_codec_for_test(
+        mut self,
+        payload_codec: SegmentPayloadCodec,
+    ) -> Self {
+        self.payload_codec = payload_codec;
+        self
     }
 
     #[must_use]
@@ -1952,6 +2041,7 @@ impl SseCustomerObjectState {
         let checksum_len = self.encrypted_checksum_metadata.encoded_len();
         let mut out = Vec::with_capacity(Self::FIXED_ENCODED_LEN + usize::from(checksum_len));
         out.push(Self::VERSION);
+        out.push(self.payload_codec.tag());
         out.extend_from_slice(&self.validator_key_id.to_be_bytes());
         out.extend_from_slice(&self.validator_salt);
         out.extend_from_slice(&self.validator_hmac);
@@ -1980,7 +2070,10 @@ impl SseCustomerObjectState {
             );
         }
 
-        let mut cursor = 1;
+        let payload_codec = SegmentPayloadCodec::from_u8(bytes[1]).ok_or(
+            ObjectEncryptionDecodeError::UnsupportedSegmentPayloadCodec { codec: bytes[1] },
+        )?;
+        let mut cursor = 2;
         let take = |cursor: &mut usize, len: usize| {
             let start = *cursor;
             let end = start + len;
@@ -2038,6 +2131,7 @@ impl SseCustomerObjectState {
         }
 
         Ok(Self {
+            payload_codec,
             validator_key_id,
             validator_salt,
             validator_hmac,
@@ -2054,6 +2148,7 @@ impl SseCustomerObjectState {
 /// Stored per-object `SSE-S3` state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseS3ObjectState {
+    payload_codec: SegmentPayloadCodec,
     wrapping_key_id: u32,
     wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
     wrapped_dek: [u8; SSE_S3_WRAPPED_DEK_LEN],
@@ -2065,6 +2160,7 @@ pub struct SseS3ObjectState {
 impl std::fmt::Debug for SseS3ObjectState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SseS3ObjectState")
+            .field("payload_codec", &self.payload_codec)
             .field("wrapping_key_id", &self.wrapping_key_id)
             .field(
                 "encrypted_checksum_metadata_len",
@@ -2076,8 +2172,9 @@ impl std::fmt::Debug for SseS3ObjectState {
 }
 
 impl SseS3ObjectState {
-    const VERSION: u8 = 1;
+    const VERSION: u8 = 2;
     const FIXED_ENCODED_LEN: usize = 1
+        + 1
         + 4
         + SSE_S3_WRAP_NONCE_LEN
         + SSE_S3_WRAPPED_DEK_LEN
@@ -2093,6 +2190,7 @@ impl SseS3ObjectState {
         segment_nonce_prefix: [u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
     ) -> Self {
         Self {
+            payload_codec: SegmentPayloadCodec::SegmentAes256GcmV1,
             wrapping_key_id,
             wrap_nonce,
             wrapped_dek,
@@ -2119,6 +2217,20 @@ impl SseS3ObjectState {
             )?,
             ..self.clone()
         })
+    }
+
+    #[must_use]
+    pub const fn payload_codec(&self) -> SegmentPayloadCodec {
+        self.payload_codec
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_payload_codec_for_test(
+        mut self,
+        payload_codec: SegmentPayloadCodec,
+    ) -> Self {
+        self.payload_codec = payload_codec;
+        self
     }
 
     #[must_use]
@@ -2156,6 +2268,7 @@ impl SseS3ObjectState {
         let checksum_len = self.encrypted_checksum_metadata.encoded_len();
         let mut out = Vec::with_capacity(Self::FIXED_ENCODED_LEN + usize::from(checksum_len));
         out.push(Self::VERSION);
+        out.push(self.payload_codec.tag());
         out.extend_from_slice(&self.wrapping_key_id.to_be_bytes());
         out.extend_from_slice(&self.wrap_nonce);
         out.extend_from_slice(&self.wrapped_dek);
@@ -2179,7 +2292,10 @@ impl SseS3ObjectState {
             });
         }
 
-        let mut cursor = 1;
+        let payload_codec = SegmentPayloadCodec::from_u8(bytes[1]).ok_or(
+            ObjectEncryptionDecodeError::UnsupportedSegmentPayloadCodec { codec: bytes[1] },
+        )?;
+        let mut cursor = 2;
         let take = |cursor: &mut usize, len: usize| {
             let start = *cursor;
             let end = start + len;
@@ -2229,6 +2345,7 @@ impl SseS3ObjectState {
         }
 
         Ok(Self {
+            payload_codec,
             wrapping_key_id,
             wrap_nonce,
             wrapped_dek,
@@ -2284,8 +2401,21 @@ impl ObjectEncryption {
     }
 
     #[must_use]
-    pub const fn segment_ciphertext_extra_len(&self) -> usize {
-        OBJECT_ENCRYPTION_SEGMENT_TAG_LEN
+    pub const fn payload_codec(&self) -> SegmentPayloadCodec {
+        match self {
+            Self::SseCustomer(state) => state.payload_codec(),
+            Self::SseS3(state) => state.payload_codec(),
+        }
+    }
+
+    #[must_use]
+    pub fn segment_stored_size(&self, logical_size: u64) -> Option<u64> {
+        self.payload_codec().stored_size(logical_size)
+    }
+
+    #[must_use]
+    pub fn segment_logical_size(&self, stored_size: u64) -> Option<u64> {
+        self.payload_codec().logical_size(stored_size)
     }
 
     #[must_use]
@@ -2671,7 +2801,7 @@ pub(crate) struct SegmentStoredBytesRequest {
 pub struct ObjectPayloadSegment {
     subject: ObjectPayloadSubject,
     record: ObjectPayloadSegmentRecord,
-    stored_size_extra: usize,
+    stored_size: usize,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2700,25 +2830,33 @@ impl ObjectPayloadSegment {
     fn from_object_record(
         subject: &ObjectPayloadSubject,
         record: ObjectSegmentRecord,
-        stored_size_extra: usize,
-    ) -> Self {
-        Self {
+        payload_codec: SegmentPayloadCodec,
+    ) -> Result<Self, &'static str> {
+        let stored_size = payload_codec
+            .stored_size(record.size)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or("object segment has invalid stored codec geometry")?;
+        Ok(Self {
             subject: subject.clone(),
             record: ObjectPayloadSegmentRecord::Object(record),
-            stored_size_extra,
-        }
+            stored_size,
+        })
     }
 
     fn from_multipart_record(
         subject: &ObjectPayloadSubject,
         record: MultipartPartSegmentRecord,
-        stored_size_extra: usize,
-    ) -> Self {
-        Self {
+        payload_codec: SegmentPayloadCodec,
+    ) -> Result<Self, &'static str> {
+        let stored_size = payload_codec
+            .stored_size(record.size)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or("multipart segment has invalid stored codec geometry")?;
+        Ok(Self {
             subject: subject.clone(),
             record: ObjectPayloadSegmentRecord::Multipart(record),
-            stored_size_extra,
-        }
+            stored_size,
+        })
     }
 
     pub fn segment_index(&self) -> u32 {
@@ -2766,7 +2904,7 @@ impl ObjectPayloadSegment {
                 data_pg_id: record.data_pg_id,
                 segment_okh: record.segment_okh,
                 segment_vid: record.segment_vid,
-                stored_size: record.size as usize + self.stored_size_extra,
+                stored_size: self.stored_size,
                 segment_crc64: record.segment_crc64,
                 ec: EcShape {
                     k: record.ec_k,
@@ -2777,7 +2915,7 @@ impl ObjectPayloadSegment {
                 data_pg_id: record.data_pg_id,
                 segment_okh: record.segment_okh,
                 segment_vid: record.segment_vid,
-                stored_size: record.size as usize + self.stored_size_extra,
+                stored_size: self.stored_size,
                 segment_crc64: record.segment_crc64,
                 ec: EcShape {
                     k: record.ec_k,
@@ -5210,7 +5348,7 @@ impl ObjectReadSnapshot {
                 multipart_part_segments: Vec::new(),
             });
         };
-        let stored_size_extra = live.encryption.segment_ciphertext_extra_len();
+        let payload_codec = live.encryption.payload_codec();
         let subject = ObjectPayloadSubject {
             bucket: live.bucket.clone(),
             key: live.key.clone(),
@@ -5221,9 +5359,9 @@ impl ObjectReadSnapshot {
             object_segments: object_segments
                 .into_iter()
                 .map(|record| {
-                    ObjectPayloadSegment::from_object_record(&subject, record, stored_size_extra)
+                    ObjectPayloadSegment::from_object_record(&subject, record, payload_codec)
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             multipart_parts: multipart_parts
                 .into_iter()
                 .map(ObjectReadMultipartPart::from_record)
@@ -5231,9 +5369,9 @@ impl ObjectReadSnapshot {
             multipart_part_segments: multipart_part_segments
                 .into_iter()
                 .map(|record| {
-                    ObjectPayloadSegment::from_multipart_record(&subject, record, stored_size_extra)
+                    ObjectPayloadSegment::from_multipart_record(&subject, record, payload_codec)
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 
@@ -7746,7 +7884,12 @@ mod tests {
             ec_k: 4,
             ec_m: 2,
         };
-        let segment = ObjectPayloadSegment::from_object_record(&subject, segment, 16);
+        let segment = ObjectPayloadSegment::from_object_record(
+            &subject,
+            segment,
+            SegmentPayloadCodec::SegmentAes256GcmV1,
+        )
+        .unwrap();
 
         assert_eq!(segment.segment_index(), 3);
         assert_eq!(segment.size(), 9);
@@ -7796,8 +7939,9 @@ mod tests {
             ec_k: 4,
             ec_m: 2,
         };
-        let snapshot = ObjectReadSnapshot::from_records(stored, vec![segment], vec![], vec![])
-            .expect("matching payload snapshot");
+        let snapshot =
+            ObjectReadSnapshot::from_records(stored.clone(), vec![segment.clone()], vec![], vec![])
+                .expect("matching payload snapshot");
 
         assert_eq!(
             snapshot.payload_placement_diagnostic().unwrap(),
@@ -7806,6 +7950,28 @@ mod tests {
                 "segment_count=1\n",
                 "segment_index=3 data_pg_id=31 placement_cluster_epoch=37\n",
             )
+        );
+
+        let StoredObject::Live(mut invalid_live) = stored else {
+            panic!("fixture must be a live object");
+        };
+        let ObjectEncryption::SseS3(state) = invalid_live.encryption else {
+            panic!("fixture must use SSE-S3");
+        };
+        invalid_live.encryption = ObjectEncryption::SseS3(
+            state.with_payload_codec_for_test(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let mut invalid_segment = segment;
+        invalid_segment.size = 1_u64 << 52;
+        assert_eq!(
+            ObjectReadSnapshot::from_records(
+                StoredObject::Live(invalid_live),
+                vec![invalid_segment],
+                vec![],
+                vec![],
+            )
+            .unwrap_err(),
+            "object segment has invalid stored codec geometry"
         );
     }
 
@@ -7937,7 +8103,17 @@ mod tests {
                 .with_encrypted_checksum_metadata([7; 12], vec![8, 9, 10, 11])
                 .unwrap();
         let customer = ObjectEncryption::SseCustomer(customer_state);
-        let mut customer_golden = vec![3, 0, 0, 0, 7];
+        let mut historical_customer_v3 = vec![3, 0, 0, 0, 7];
+        historical_customer_v3.extend_from_slice(&[1; 16]);
+        historical_customer_v3.extend_from_slice(&[2; 32]);
+        historical_customer_v3.extend_from_slice(&[3; 16]);
+        historical_customer_v3.extend_from_slice(&[4; 12]);
+        historical_customer_v3.extend_from_slice(&[5; 48]);
+        historical_customer_v3.extend_from_slice(&[6; 6]);
+        historical_customer_v3.extend_from_slice(&[7; 12]);
+        historical_customer_v3.extend_from_slice(&[0, 4, 8, 9, 10, 11]);
+        let mut customer_golden =
+            vec![4, SegmentPayloadCodec::SegmentAes256GcmV1.tag(), 0, 0, 0, 7];
         customer_golden.extend_from_slice(&[1; 16]);
         customer_golden.extend_from_slice(&[2; 32]);
         customer_golden.extend_from_slice(&[3; 16]);
@@ -7948,6 +8124,13 @@ mod tests {
         customer_golden.extend_from_slice(&[0, 4, 8, 9, 10, 11]);
         assert_eq!(customer.encryption_type() as u8, 1);
         assert_eq!(customer.encode_state().unwrap(), customer_golden);
+        assert!(matches!(
+            ObjectEncryption::decode(
+                ObjectEncryptionType::SseCustomer,
+                Some(historical_customer_v3),
+            ),
+            Err(ObjectEncryptionDecodeError::UnsupportedSseCustomerStateVersion { version: 3 })
+        ));
         assert_eq!(
             ObjectEncryption::decode(
                 ObjectEncryptionType::from_u8(1).unwrap(),
@@ -7958,10 +8141,24 @@ mod tests {
         );
 
         let managed_state = SseS3ObjectState::new(9, [10; 12], [11; 48], [12; 6])
+            .with_payload_codec_for_test(SegmentPayloadCodec::Cobblestone256SegmentV1)
             .with_encrypted_checksum_metadata([13; 12], vec![14, 15, 16])
             .unwrap();
         let managed = ObjectEncryption::SseS3(managed_state);
-        let mut managed_golden = vec![1, 0, 0, 0, 9];
+        let mut historical_managed_v1 = vec![1, 0, 0, 0, 9];
+        historical_managed_v1.extend_from_slice(&[10; 12]);
+        historical_managed_v1.extend_from_slice(&[11; 48]);
+        historical_managed_v1.extend_from_slice(&[12; 6]);
+        historical_managed_v1.extend_from_slice(&[13; 12]);
+        historical_managed_v1.extend_from_slice(&[0, 3, 14, 15, 16]);
+        let mut managed_golden = vec![
+            2,
+            SegmentPayloadCodec::Cobblestone256SegmentV1.tag(),
+            0,
+            0,
+            0,
+            9,
+        ];
         managed_golden.extend_from_slice(&[10; 12]);
         managed_golden.extend_from_slice(&[11; 48]);
         managed_golden.extend_from_slice(&[12; 6]);
@@ -7969,6 +8166,10 @@ mod tests {
         managed_golden.extend_from_slice(&[0, 3, 14, 15, 16]);
         assert_eq!(managed.encryption_type() as u8, 2);
         assert_eq!(managed.encode_state().unwrap(), managed_golden);
+        assert!(matches!(
+            ObjectEncryption::decode(ObjectEncryptionType::SseS3, Some(historical_managed_v1)),
+            Err(ObjectEncryptionDecodeError::UnsupportedSseS3StateVersion { version: 1 })
+        ));
         assert_eq!(
             ObjectEncryption::decode(
                 ObjectEncryptionType::from_u8(2).unwrap(),
@@ -7977,6 +8178,62 @@ mod tests {
             .unwrap(),
             managed
         );
+    }
+
+    #[test]
+    fn segment_payload_codec_cross_product_and_geometry_is_exhaustive() {
+        let customer = |codec| {
+            ObjectEncryption::SseCustomer(
+                SseCustomerObjectState::new(7, [1; 16], [2; 32], [3; 16], [4; 12], [5; 48], [6; 6])
+                    .with_payload_codec_for_test(codec),
+            )
+        };
+        let managed = |codec| {
+            ObjectEncryption::SseS3(
+                SseS3ObjectState::new(9, [10; 12], [11; 48], [12; 6])
+                    .with_payload_codec_for_test(codec),
+            )
+        };
+
+        for encryption in [
+            customer(SegmentPayloadCodec::SegmentAes256GcmV1),
+            customer(SegmentPayloadCodec::Cobblestone256SegmentV1),
+            managed(SegmentPayloadCodec::SegmentAes256GcmV1),
+            managed(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        ] {
+            let encoded = encryption.encode_state().unwrap();
+            assert_eq!(
+                ObjectEncryption::decode(encryption.encryption_type(), Some(encoded)).unwrap(),
+                encryption
+            );
+        }
+
+        for logical_size in [0, 1, 16_383, 16_384, 16_385, 8 * 1024 * 1024] {
+            for codec in [
+                SegmentPayloadCodec::SegmentAes256GcmV1,
+                SegmentPayloadCodec::Cobblestone256SegmentV1,
+            ] {
+                let stored_size = codec.stored_size(logical_size).unwrap();
+                assert_eq!(codec.logical_size(stored_size), Some(logical_size));
+            }
+        }
+
+        let mut invalid_customer = customer(SegmentPayloadCodec::SegmentAes256GcmV1)
+            .encode_state()
+            .unwrap();
+        invalid_customer[1] = 0;
+        assert!(matches!(
+            ObjectEncryption::decode(ObjectEncryptionType::SseCustomer, Some(invalid_customer)),
+            Err(ObjectEncryptionDecodeError::UnsupportedSegmentPayloadCodec { codec: 0 })
+        ));
+        let mut invalid_managed = managed(SegmentPayloadCodec::SegmentAes256GcmV1)
+            .encode_state()
+            .unwrap();
+        invalid_managed[1] = 3;
+        assert!(matches!(
+            ObjectEncryption::decode(ObjectEncryptionType::SseS3, Some(invalid_managed)),
+            Err(ObjectEncryptionDecodeError::UnsupportedSegmentPayloadCodec { codec: 3 })
+        ));
     }
 
     #[test]
@@ -8025,6 +8282,15 @@ mod tests {
             .with_encrypted_checksum_metadata([16; SSE_S3_CHECKSUM_NONCE_LEN], vec![17, 18, 19])
             .unwrap(),
         );
+        let crossed_payload_codec = ObjectEncryption::SseS3(
+            SseS3ObjectState::new(
+                9,
+                [10; SSE_S3_WRAP_NONCE_LEN],
+                [11; SSE_S3_WRAPPED_DEK_LEN],
+                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_payload_codec_for_test(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
         let crossed_mode_encryption = ObjectEncryption::SseCustomer(SseCustomerObjectState::new(
             9,
             [1; SSE_C_VALIDATOR_SALT_LEN],
@@ -8060,11 +8326,23 @@ mod tests {
         );
         assert!(subject.matches_encryption(&encryption));
         assert!(subject.matches_encryption(&checksum_enriched_encryption));
+        assert!(!subject.matches_encryption(&crossed_payload_codec));
         assert!(!subject.matches_encryption(&other_encryption));
         assert!(!subject.matches_encryption(&same_nonce_other_wrapping_key));
         assert!(!subject.matches_encryption(&same_nonce_other_wrapped_dek));
         assert!(!subject.matches_encryption(&same_nonce_other_segment_nonce_prefix));
         assert!(!subject.matches_encryption(&crossed_mode_encryption));
+        assert_ne!(
+            subject.canonical_bytes(),
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &key,
+                GenerationId::new(23).unwrap(),
+                &crossed_payload_codec,
+            )
+            .canonical_bytes(),
+        );
 
         for crossed in [
             ObjectEncryptionSubject::standard_object(
@@ -8136,6 +8414,77 @@ mod tests {
     }
 
     #[test]
+    fn cobblestone_segment_profile_has_exact_argmin_context_vector() {
+        let bucket = BucketName::try_from("context-bucket").unwrap();
+        let key = ObjectKey::try_from("path/to/object").unwrap();
+        let encryption = ObjectEncryption::SseS3(
+            SseS3ObjectState::new(
+                9,
+                [10; SSE_S3_WRAP_NONCE_LEN],
+                [11; SSE_S3_WRAPPED_DEK_LEN],
+                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_payload_codec_for_test(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let object = ObjectEncryptionSubject::standard_object(
+            17,
+            &bucket,
+            &key,
+            GenerationId::new(23).unwrap(),
+            &encryption,
+        );
+        let subject = SegmentEncryptionSubject::standard_object(object, 3, 29);
+        let plaintext = b"argmin segment context vector";
+        let key = argmin_crypto::cobblestone::Cobblestone256Key::new(&[0x42; 32]).unwrap();
+        let ciphertext = argmin_crypto::cobblestone::seal(
+            &key,
+            [0x24; argmin_crypto::cobblestone::COBBLESTONE_SALT_LEN],
+            subject.canonical_bytes(),
+            plaintext,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ciphertext,
+            [
+                36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36, 36,
+                36, 36, 36, 171, 176, 171, 249, 64, 227, 60, 208, 170, 99, 22, 105, 185, 161, 189,
+                177, 193, 53, 101, 36, 112, 163, 238, 48, 85, 101, 81, 240, 226, 212, 44, 21, 214,
+                12, 182, 223, 158, 239, 64, 196, 84, 14, 197, 228, 22, 243, 140, 188, 226, 32, 75,
+                114, 49, 38, 248, 129, 88, 24, 185, 181, 34, 32, 170, 170, 181, 193, 183, 147, 247,
+                188, 155, 23, 12, 69, 234, 108, 25,
+            ]
+        );
+        assert_eq!(
+            argmin_crypto::cobblestone::open(
+                argmin_crypto::cobblestone::Cobblestone256Key::new(&[0x42; 32]).unwrap(),
+                subject.canonical_bytes(),
+                &ciphertext,
+            )
+            .unwrap(),
+            plaintext,
+        );
+
+        let crossed = SegmentEncryptionSubject::standard_object(
+            ObjectEncryptionSubject::standard_object(
+                17,
+                &bucket,
+                &ObjectKey::try_from("path/to/crossed").unwrap(),
+                GenerationId::new(23).unwrap(),
+                &encryption,
+            ),
+            3,
+            29,
+        );
+        assert!(argmin_crypto::cobblestone::open(
+            argmin_crypto::cobblestone::Cobblestone256Key::new(&[0x42; 32]).unwrap(),
+            crossed.canonical_bytes(),
+            &ciphertext,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn object_encryption_subject_rejects_noncanonical_encodings() {
         let encryption = ObjectEncryption::SseS3(SseS3ObjectState::new(
             9,
@@ -8156,7 +8505,7 @@ mod tests {
         let mut unsupported_version = canonical.to_vec();
         unsupported_version[domain_end] = 2;
         let mut unsupported_profile = canonical.to_vec();
-        unsupported_profile[domain_end + 1] = 2;
+        unsupported_profile[domain_end + 1] = 3;
         let mut invalid_instance_len = canonical.to_vec();
         invalid_instance_len[domain_end + 2] = 12;
         let mut invalid_incarnation = canonical.to_vec();

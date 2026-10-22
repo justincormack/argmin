@@ -5184,6 +5184,38 @@ mod tests {
     const V8_PLAINTEXT_ALL_VARIANT_INDICES: [usize; 14] =
         [3, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 27];
     const V9_STREAM_SESSION_VARIANT_INDICES: [usize; 5] = [5, 18, 19, 20, 21];
+    const IMMUTABLE_V10_SSE_S3_V1_ALL_VARIANT_CHECKSUMS: [u64; 30] = [
+        0x3eede9801cfe1e42,
+        0x5887280c05dc5025,
+        0xdc6be059754dfe06,
+        0xf8b0e7b21f92730a,
+        0xb8eff0fa52f168d3,
+        0x41d09b39d9189d8a,
+        0x5d29c0afcc45220c,
+        0x16745a273ed1ef92,
+        0x369f01d04afce477,
+        0x5fe993c65ea86d35,
+        0xcbbb2b5ceee021a6,
+        0x8c7e41d4df870088,
+        0x1fff77945fc492d1,
+        0xb20aff9aa7c196d7,
+        0xac6a53153bdf3c01,
+        0x50aae01517ec29e5,
+        0x5ff7aefea9d7c581,
+        0x808236379c74e1f7,
+        0xed41ae2b9b0e0d5a,
+        0xf6450668c308d33f,
+        0x8c6503dad056ef7a,
+        0x6a1c8716af07d6ae,
+        0x473a32e3c2033fa1,
+        0x5ee27805f424e980,
+        0x94236a1a1c2d80f8,
+        0x81b17507f847496b,
+        0xe8bfaf63eb60bb7f,
+        0xdae1309f04cd62fb,
+        0xcb893da40e89340a,
+        0x516867c8eb5e791d,
+    ];
 
     fn decode_metadata_command_envelope_for_test(
         bytes: &[u8],
@@ -5218,11 +5250,47 @@ mod tests {
         );
     }
 
+    fn command_bytes_with_historical_sse_s3_v1(
+        current: &MetadataCommandEnvelope,
+        encoding_version: u16,
+        current_encryption: &ObjectEncryption,
+    ) -> Vec<u8> {
+        let current_state = current_encryption.encode_state().unwrap();
+        assert_eq!(current_state[0], 2, "fixture must use SSE-S3 state v2");
+        let mut historical_state = Vec::with_capacity(current_state.len() - 1);
+        historical_state.push(1);
+        historical_state.extend_from_slice(&current_state[2..]);
+
+        let mut current_framed_state = vec![ObjectEncryptionType::SseS3 as u8, 1];
+        current_framed_state
+            .extend_from_slice(&u32::try_from(current_state.len()).unwrap().to_le_bytes());
+        current_framed_state.extend_from_slice(&current_state);
+        let mut historical_framed_state = vec![ObjectEncryptionType::SseS3 as u8, 1];
+        historical_framed_state
+            .extend_from_slice(&u32::try_from(historical_state.len()).unwrap().to_le_bytes());
+        historical_framed_state.extend_from_slice(&historical_state);
+
+        let current_bytes = current.command_bytes_with_encoding_version_for_test(encoding_version);
+        let mut historical_bytes = Vec::with_capacity(current_bytes.len());
+        let mut remaining = current_bytes.as_slice();
+        while let Some(offset) = remaining
+            .windows(current_framed_state.len())
+            .position(|window| window == current_framed_state)
+        {
+            historical_bytes.extend_from_slice(&remaining[..offset]);
+            historical_bytes.extend_from_slice(&historical_framed_state);
+            remaining = &remaining[offset + current_framed_state.len()..];
+        }
+        historical_bytes.extend_from_slice(remaining);
+        historical_bytes
+    }
+
     fn assert_immutable_v9_command_is_rejected(
         current: &MetadataCommandEnvelope,
         expected_v9_checksum: u64,
+        current_encryption: &ObjectEncryption,
     ) {
-        let v9_bytes = current.command_bytes_with_encoding_version_for_test(9);
+        let v9_bytes = command_bytes_with_historical_sse_s3_v1(current, 9, current_encryption);
         assert_eq!(
             checksum::crc64::checksum(&v9_bytes),
             expected_v9_checksum,
@@ -5244,6 +5312,32 @@ mod tests {
             decode_metadata_command_envelope_for_test(bytes),
             Err(expected)
         );
+    }
+
+    fn assert_immutable_v10_sse_s3_v1_command_is_rejected(
+        current: &MetadataCommandEnvelope,
+        expected_checksum: u64,
+        current_encryption: &ObjectEncryption,
+    ) {
+        let historical_bytes =
+            command_bytes_with_historical_sse_s3_v1(current, 10, current_encryption);
+        assert_eq!(
+            checksum::crc64::checksum(&historical_bytes),
+            expected_checksum,
+            "the historical v10/SSE-S3-v1 command specimen changed"
+        );
+        assert!(decode_metadata_command_log_entry_header(&historical_bytes).is_ok());
+        if historical_bytes == current.command_bytes() {
+            assert_eq!(
+                decode_metadata_command_envelope_for_test(&historical_bytes).unwrap(),
+                current.clone()
+            );
+        } else {
+            assert!(matches!(
+                decode_metadata_command_envelope_for_test(&historical_bytes),
+                Err(MetadataCommandFormatError::InvalidPayload(_))
+            ));
+        }
     }
 
     fn decode_fixture_hex(encoded: &str) -> Vec<u8> {
@@ -7107,7 +7201,7 @@ mod tests {
                         bucket: bucket.clone(),
                         key: key.clone(),
                         target: StreamUploadTarget::PutObject,
-                        encryption: sse_s3_encryption,
+                        encryption: sse_s3_encryption.clone(),
                     },
                     563,
                     bucket_write_reservation.clone(),
@@ -7194,10 +7288,16 @@ mod tests {
             assert!(envelope.verify_checksum());
             assert_applied_log_decoder_accepts(&envelope);
             assert_full_envelope_decoder_round_trips(&envelope);
+            assert_immutable_v10_sse_s3_v1_command_is_rejected(
+                &envelope,
+                IMMUTABLE_V10_SSE_S3_V1_ALL_VARIANT_CHECKSUMS[offset],
+                &sse_s3_encryption,
+            );
             if !V9_STREAM_SESSION_VARIANT_INDICES.contains(&offset) {
                 assert_immutable_v9_command_is_rejected(
                     &envelope,
                     IMMUTABLE_V9_ALL_VARIANT_CHECKSUMS[offset],
+                    &sse_s3_encryption,
                 );
             }
             if !V8_PLAINTEXT_ALL_VARIANT_INDICES.contains(&offset)
@@ -7216,31 +7316,31 @@ mod tests {
                 0x3eede9801cfe1e42,
                 0x5887280c05dc5025,
                 0xdc6be059754dfe06,
-                0xf8b0e7b21f92730a,
-                0xb8eff0fa52f168d3,
-                0x41d09b39d9189d8a,
+                0x23ad880c4c37da5c,
+                0x09834e6859fc7d69,
+                0xc05eeb64dde66e14,
                 0x5d29c0afcc45220c,
                 0x16745a273ed1ef92,
                 0x369f01d04afce477,
                 0x5fe993c65ea86d35,
                 0xcbbb2b5ceee021a6,
                 0x8c7e41d4df870088,
-                0x1fff77945fc492d1,
-                0xb20aff9aa7c196d7,
-                0xac6a53153bdf3c01,
-                0x50aae01517ec29e5,
-                0x5ff7aefea9d7c581,
-                0x808236379c74e1f7,
-                0xed41ae2b9b0e0d5a,
-                0xf6450668c308d33f,
-                0x8c6503dad056ef7a,
-                0x6a1c8716af07d6ae,
+                0x908fc9b46db02704,
+                0xa79d38df9b62867d,
+                0xa5eaea3fb24fb7f1,
+                0xd083781ced7b09b3,
+                0x3f75e4ebf59676bd,
+                0x566e4e612725ec08,
+                0x52f759a002e49760,
+                0xfd12b387bac66285,
+                0xea7f08581041d736,
+                0x162d22001ae4bbdb,
                 0x473a32e3c2033fa1,
                 0x5ee27805f424e980,
-                0x94236a1a1c2d80f8,
+                0x301f8cae1a9de624,
                 0x81b17507f847496b,
                 0xe8bfaf63eb60bb7f,
-                0xdae1309f04cd62fb,
+                0x394a24a07fe81d71,
                 0xcb893da40e89340a,
                 0x516867c8eb5e791d,
             ]
@@ -7248,12 +7348,20 @@ mod tests {
 
         assert_eq!(IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS.len(), checksums.len());
         assert_eq!(IMMUTABLE_V9_ALL_VARIANT_CHECKSUMS.len(), checksums.len());
+        assert_eq!(
+            IMMUTABLE_V10_SSE_S3_V1_ALL_VARIANT_CHECKSUMS.len(),
+            checksums.len()
+        );
         assert_ne!(
             IMMUTABLE_V8_ALL_VARIANT_CHECKSUMS.as_slice(),
             checksums.as_slice()
         );
         assert_ne!(
             IMMUTABLE_V9_ALL_VARIANT_CHECKSUMS.as_slice(),
+            checksums.as_slice()
+        );
+        assert_ne!(
+            IMMUTABLE_V10_SSE_S3_V1_ALL_VARIANT_CHECKSUMS.as_slice(),
             checksums.as_slice()
         );
 

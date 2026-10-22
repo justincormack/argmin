@@ -3737,7 +3737,7 @@ pub mod test_support {
     #[derive(Clone)]
     pub struct TestObjectPayloadSnapshot {
         segments: Vec<types::ObjectSegmentRecord>,
-        stored_size_extra: usize,
+        payload_codec: SegmentPayloadCodec,
         generation_id: Option<GenerationId>,
     }
 
@@ -3755,12 +3755,12 @@ pub mod test_support {
     impl TestObjectPayloadSnapshot {
         pub(crate) fn new(
             segments: Vec<types::ObjectSegmentRecord>,
-            stored_size_extra: usize,
+            payload_codec: SegmentPayloadCodec,
             generation_id: Option<GenerationId>,
         ) -> Self {
             Self {
                 segments,
-                stored_size_extra,
+                payload_codec,
                 generation_id,
             }
         }
@@ -3773,9 +3773,7 @@ pub mod test_support {
             &self,
             segment: &types::ObjectSegmentRecord,
         ) -> Option<usize> {
-            usize::try_from(segment.size)
-                .ok()?
-                .checked_add(self.stored_size_extra)
+            usize::try_from(self.payload_codec.stored_size(segment.size)?).ok()
         }
 
         pub(crate) fn generation_id(&self) -> Option<GenerationId> {
@@ -4027,9 +4025,9 @@ pub use types::{
     PrepareStreamUploadSegmentAppendReq, PreparedDirectPutObjectCommit, PreparedStreamPartCommit,
     PreparedStreamPutCommit, PublicAccessBlockConfig, PutBucketSubresource, PutDeleteMarkerReq,
     PutLiveObjectReq, PutLiveObjectValidationError, PutObjectReq, RawChecksum, RetentionPeriod,
-    RouteMapValidUntilMs, RouteMapValidity, SegmentEncryptionSubject, SerializedBucketTagSet,
-    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
-    SessionIdError, ShardData, ShardIndex, ShardKey, ShardStat, ShardStatus,
+    RouteMapValidUntilMs, RouteMapValidity, SegmentEncryptionSubject, SegmentPayloadCodec,
+    SerializedBucketTagSet, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
+    SessionId, SessionIdError, ShardData, ShardIndex, ShardKey, ShardStat, ShardStatus,
     SseCustomerObjectState, SseS3ObjectState, StorageClass, StoredLegalHoldStatus, StoredObject,
     StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutCommitInput,
     StreamPutFinalizeSnapshot, StreamPutFinalizeStorageSnapshot, StreamSegmentAppendInput,

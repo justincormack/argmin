@@ -664,8 +664,8 @@ authenticated chunks can be withdrawn.
 
 ## Durable Representation And Versioning
 
-Persist an explicit segment payload-codec profile alongside the independently modeled
-`ObjectEncryption` key/mode state, for example:
+Persist an explicit segment payload-codec profile as an independently typed field in the
+self-describing `ObjectEncryption` key/mode state, for example:
 
 - `SegmentAes256GcmV1` for the current encrypted representation;
 - `Cobblestone256SegmentV1` for the proposed representation.
@@ -955,7 +955,7 @@ the eventual reader exists before the first payload effect.
 
 - [x] Implement the reviewed Cobblestone-256 primitive behind `argmin-crypto`.
 - [x] Import the pinned official/Wycheproof vectors verbatim and verify their immutable digest.
-- [ ] Add exact Argmin context vectors with the durable profile discriminator and canonical
+- [x] Add exact Argmin context vectors with the durable profile discriminator and canonical
   subject bytes; do not freeze a vector using the Phase 1 subject's current whole-segment profile
   tag.
 - [x] Run every official vector under both supported `argmin-crypto` provider builds.
@@ -966,7 +966,7 @@ the eventual reader exists before the first payload effect.
   final-chunk validation.
 - [ ] Persist the complete storage-owned per-shard integrity witness through segment schema, terminal
   commands, apply/recovery, snapshots, RPC, retained reads, repair, and route-history retention.
-- [ ] Add the durable profile discriminator and profile-aware stored-size calculations.
+- [x] Add the durable profile discriminator and profile-aware stored-size calculations.
 - [ ] Implement one compiler-exhaustive codec/encryption-state compatibility registry and exercise its
   complete valid and invalid cross-product at construction, decoding, apply/recovery, and restart.
 - [ ] Integrate the codec with every encrypted write path while retaining the old reader if required by
@@ -995,10 +995,38 @@ Implementation update (2026-10-22):
   salt, context, and plaintext produce identical headers, commitments, records, tags, and terminal
   encodings; each provider opens the other's bytes for empty, one-byte, boundary-minus/at/plus-one,
   multi-chunk, and NUL-containing context cases.
-- Exact Argmin subject vectors intentionally remain open until the durable
-  `Cobblestone256SegmentV1` profile tag exists. Freezing the current Phase 1 canonical bytes would
-  incorrectly bind the vector to `SegmentAes256GcmV1`. Storage integration, durable witness work,
-  and the exhaustive persisted-profile cross-product remain separate Phase 2 slices.
+- Exact Argmin subject vectors were intentionally deferred from the primitive slice until the
+  durable `Cobblestone256SegmentV1` profile tag existed. The following durable-profile slice now
+  supplies that vector. Storage integration, durable witness work, and the exhaustive persisted-
+  profile apply/recovery/restart matrix remain separate Phase 2 slices.
+
+Implementation update (2026-10-22, durable profile identity):
+
+- Storage now owns the exhaustive `SegmentPayloadCodec` discriminator. SSE-C state advances from
+  v3 to v4 and SSE-S3 state from v1 to v2; both self-describing states carry the independent codec
+  tag. Constructors continue to select `SegmentAes256GcmV1` until write-path integration selects
+  Cobblestone, while decoding recognizes exactly the two planned encrypted codecs and rejects all
+  other tags.
+- `ObjectEncryptionSubject` binds the durable codec in both its canonical bytes and immutable
+  encryption binding. A fixed Cobblestone vector seals a canonical Argmin standard-object segment
+  subject with fixed key, salt, and plaintext, opens byte-identically, and rejects a crossed object
+  context.
+- Stored/logical geometry is codec-owned. Stream append authorization and preparation, retained
+  payload snapshots, scavenger/backfill references, and server buffer sizing no longer assume one
+  16-byte tag per segment. Persisted geometry is validated while constructing read snapshots and
+  scavenger references, so an unrepresentable codec/size pair fails closed instead of reaching a
+  later infallible read or diagnostic path. The buffer pool takes the maximum supported profile
+  geometry rather than privileging the current writer.
+- The four valid codec/SSE-mode state encodings round-trip and unknown tags fail closed. Complete
+  constructor, command apply/recovery, restart, and crossed-byte-format coverage remains open under
+  the explicit exhaustive cross-product item; recognizing the durable pair is not yet permission
+  for the production writer to emit Cobblestone payloads.
+- PG schema 8, metadata-command 10, storage-RPC 26, canonical-state 7, and checkpoint 5 remain
+  unchanged because their grammar contains a self-describing encryption-state blob. Append-only
+  RPC, metadata-command, and checkpoint composites retain the previous SSE-C-v3/SSE-S3-v1 evidence
+  and pin the current SSE-C-v4/SSE-S3-v2 bytes. The exact historical append-preparation SSE-S3-v1
+  payload remains a rejection specimen beside the current v2 version-vector fixture. No predecessor
+  encryption-state reader was added.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.

@@ -7043,18 +7043,13 @@ impl StorageCluster {
             .load_stream_upload_session_on_route(route, input.session_id)
             .map_err(E::from)?;
         (callbacks.validate_session)(&session).map_err(E::from)?;
-        let logical_size = if input.storage_bytes.is_empty() {
-            0
-        } else {
-            input
-                .storage_bytes
-                .len()
-                .checked_sub(session.encryption.segment_ciphertext_extra_len())
-                .ok_or_else(|| ObjectPgActionError::InvalidRequest {
-                    reason: "encrypted stream segment shorter than authentication tag".to_string(),
-                })
-                .map_err(E::from)? as u64
-        };
+        let logical_size = session
+            .encryption
+            .segment_logical_size(input.storage_bytes.len() as u64)
+            .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+                reason: "stream segment has invalid stored codec geometry".to_string(),
+            })
+            .map_err(E::from)?;
         (callbacks.before_prepare)();
         let (target, segment_record) = self
             .prepare_stream_segment_append_with_route_validation(

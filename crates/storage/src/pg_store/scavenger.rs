@@ -1483,13 +1483,13 @@ impl PgStore {
                 };
                 self.query_row_cached_optional(
                     "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                            s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                            s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
                      FROM object_segments s \
                      JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
                      WHERE s.bucket = ?1 AND s.key = ?2 AND s.version_id = ?3 AND s.segment_index = ?4",
                     params![bucket, key, version_id, i64::from(*segment_index)],
                     "load exact object segment shard scavenger reference",
-                    |row| self.placed_segment_backfill_reference_from_row(row, 0, 8),
+                    |row| self.placed_segment_backfill_reference_from_row(row, 0, 8, 9),
                 )?
             }
             ShardScavengerReferenceCursor::StreamUploadSegment {
@@ -1497,13 +1497,13 @@ impl PgStore {
                 segment_index,
             } => self.query_row_cached_optional(
                 "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type, u.encryption_state \
                  FROM stream_upload_segments s \
                  JOIN stream_uploads u ON u.session_id = s.session_id \
                  WHERE s.session_id = ?1 AND s.segment_index = ?2",
                 params![session_id, i64::from(*segment_index)],
                 "load exact stream segment shard scavenger reference",
-                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8),
+                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8, 9),
             )?,
             ShardScavengerReferenceCursor::MultipartPartSegment {
                 bucket,
@@ -1513,7 +1513,7 @@ impl PgStore {
                 segment_index,
             } => self.query_row_cached_optional(
                 "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
                  FROM multipart_part_segments s \
                  JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
                  WHERE s.bucket = ?1 AND s.key = ?2 AND s.upload_id = ?3 \
@@ -1526,7 +1526,7 @@ impl PgStore {
                     i64::from(*segment_index)
                 ],
                 "load exact multipart segment shard scavenger reference",
-                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8),
+                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8, 9),
             )?,
             ShardScavengerReferenceCursor::PendingPlacedCommand {
                 cluster_epoch,
@@ -1795,7 +1795,7 @@ impl PgStore {
             .prepare_cached(
                 "SELECT s.bucket, s.key, s.version_id, s.segment_index, \
                         s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
                  FROM object_segments s \
                  JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
                  WHERE (s.bucket, s.key, s.version_id, s.segment_index) > (?1, ?2, ?3, ?4) \
@@ -1826,7 +1826,7 @@ impl PgStore {
                             segment_index,
                         },
                         reference: ShardScavengerPayloadReference::Placed(
-                            self.placed_segment_backfill_reference_from_row(row, 4, 12)?,
+                            self.placed_segment_backfill_reference_from_row(row, 4, 12, 13)?,
                         ),
                     })
                 },
@@ -1858,7 +1858,7 @@ impl PgStore {
             .prepare_cached(
                 "SELECT s.session_id, s.segment_index, \
                         s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type, u.encryption_state \
                  FROM stream_upload_segments s \
                  JOIN stream_uploads u ON u.session_id = s.session_id \
                  WHERE (s.session_id, s.segment_index) > (?1, ?2) \
@@ -1879,7 +1879,7 @@ impl PgStore {
                         segment_index: row.get(1)?,
                     },
                     reference: ShardScavengerPayloadReference::Placed(
-                        self.placed_segment_backfill_reference_from_row(row, 2, 10)?,
+                        self.placed_segment_backfill_reference_from_row(row, 2, 10, 11)?,
                     ),
                 })
             })
@@ -1910,7 +1910,7 @@ impl PgStore {
             .prepare_cached(
                 "SELECT s.bucket, s.key, s.upload_id, s.part_number, s.segment_index, \
                         s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
                  FROM multipart_part_segments s \
                  JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
                  WHERE (s.bucket, s.key, s.upload_id, s.part_number, s.segment_index) \
@@ -1944,7 +1944,7 @@ impl PgStore {
                             segment_index: row.get(4)?,
                         },
                         reference: ShardScavengerPayloadReference::Placed(
-                            self.placed_segment_backfill_reference_from_row(row, 5, 13)?,
+                            self.placed_segment_backfill_reference_from_row(row, 5, 13, 14)?,
                         ),
                     })
                 },
@@ -2398,13 +2398,26 @@ impl PgStore {
         }
     }
 
+    fn invalid_pending_placed_reference_geometry(reason: &str) -> StoreError {
+        StoreError::ShardScavengerScanIncomplete {
+            context: "derive pending command shard scavenger reference geometry",
+            errors: reason.to_owned(),
+        }
+    }
+
     fn placed_segment_backfill_reference_from_row(
         &self,
         row: &rusqlite::Row<'_>,
         reference_start: usize,
         encryption_type_index: usize,
+        encryption_state_index: usize,
     ) -> rusqlite::Result<ShardScavengerPlacedShardSetReference> {
         let okh_blob: Vec<u8> = row.get(reference_start + 1)?;
+        let encryption = Self::decode_scavenger_encryption(
+            row.get(encryption_type_index)?,
+            row.get(encryption_state_index)?,
+            encryption_type_index,
+        )?;
         Ok(ShardScavengerPlacedShardSetReference {
             data_pg_id: row.get(reference_start)?,
             okh: Self::parse_okh_blob(&okh_blob, reference_start + 1)?,
@@ -2413,10 +2426,17 @@ impl PgStore {
                 reference_start + 2,
                 "backfill reference generation",
             )?,
-            stored_size: Self::stored_segment_size_for_encryption_type(
+            stored_size: Self::stored_segment_size_for_encryption(
                 row.get::<_, i64>(reference_start + 3)? as u64,
-                row.get(encryption_type_index)?,
-            )?,
+                &encryption,
+            )
+            .map_err(|reason| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    reference_start + 3,
+                    rusqlite::types::Type::Integer,
+                    Box::from(reason),
+                )
+            })?,
             crc64: row.get::<_, i64>(reference_start + 4)? as u64,
             placement_cluster_epoch: Self::parse_cluster_epoch(
                 row.get(reference_start + 5)?,
@@ -2437,7 +2457,7 @@ impl PgStore {
         self.extend_scavenger_encrypted_placed_references(
             &mut references,
             "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                    s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                    s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
              FROM object_segments s \
              JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id",
             "list object segment shard scavenger references",
@@ -2445,7 +2465,7 @@ impl PgStore {
         self.extend_scavenger_encrypted_placed_references(
             &mut references,
             "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                    s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type \
+                    s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type, u.encryption_state \
              FROM stream_upload_segments s \
              JOIN stream_uploads u ON u.session_id = s.session_id",
             "list stream upload segment shard scavenger references",
@@ -2453,7 +2473,7 @@ impl PgStore {
         self.extend_scavenger_encrypted_placed_references(
             &mut references,
             "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                    s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                    s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
              FROM multipart_part_segments s \
              JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id",
             "list multipart part segment shard scavenger references",
@@ -2509,7 +2529,7 @@ impl PgStore {
                     references,
                     &command.segments,
                     &command.object.encryption,
-                );
+                )?;
                 if let Some(stale_payload) = &command.stale_payload {
                     Self::extend_reclaim_payload_references(references, stale_payload);
                 }
@@ -2519,17 +2539,17 @@ impl PgStore {
                     references,
                     &command.selected_streaming_segments,
                     &command.object.encryption,
-                );
+                )?;
                 Self::extend_multipart_part_segment_references(
                     references,
                     &command.omitted_streaming_segments,
                     &command.object.encryption,
-                );
+                )?;
                 Self::extend_terminal_stream_segment_references(
                     references,
                     &command.stream_upload_segments,
                     &command.stream_uploads,
-                );
+                )?;
                 if let Some(stale_payload) = &command.stale_payload {
                     Self::extend_reclaim_payload_references(references, stale_payload);
                 }
@@ -2552,7 +2572,7 @@ impl PgStore {
                         references,
                         &command.segment,
                         &encryption,
-                    );
+                    )?;
                 }
             }
             MetadataCommandPayload::AbortStreamUpload(command) => {
@@ -2563,7 +2583,7 @@ impl PgStore {
                         references,
                         &command.staged_segments,
                         &encryption,
-                    );
+                    )?;
                 }
             }
             MetadataCommandPayload::CommitStreamPart(command) => {
@@ -2571,24 +2591,24 @@ impl PgStore {
                     references,
                     &command.segments,
                     &command.upload.encryption,
-                );
+                )?;
                 Self::extend_multipart_part_segment_references(
                     references,
                     &command.displaced_segments,
                     &command.upload.encryption,
-                );
+                )?;
             }
             MetadataCommandPayload::AbortMultipartUpload(command) => {
                 Self::extend_multipart_part_segment_references(
                     references,
                     &command.cleanup.streaming_segments,
                     &command.cleanup.upload.encryption,
-                );
+                )?;
                 Self::extend_terminal_stream_segment_references(
                     references,
                     &command.cleanup.stream_upload_segments,
                     &command.cleanup.stream_uploads,
-                );
+                )?;
             }
             MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
                 Self::extend_reclaim_payload_references(references, &command.payload);
@@ -2615,8 +2635,10 @@ impl PgStore {
         references: &mut Vec<ShardScavengerPayloadReference>,
         segments: &[ObjectSegmentRecord],
         encryption: &ObjectEncryption,
-    ) {
+    ) -> Result<(), StoreError> {
         for segment in segments {
+            let stored_size = Self::stored_segment_size_for_encryption(segment.size, encryption)
+                .map_err(Self::invalid_pending_placed_reference_geometry)?;
             Self::push_placed_reference(
                 references,
                 ShardScavengerPlacedShardSetReference {
@@ -2624,7 +2646,7 @@ impl PgStore {
                     okh: segment.segment_okh,
                     generation_id: segment.segment_vid,
                     placement_cluster_epoch: segment.placement_cluster_epoch,
-                    stored_size: Self::stored_segment_size_for_encryption(segment.size, encryption),
+                    stored_size,
                     crc64: segment.segment_crc64,
                     ec: EcShape {
                         k: segment.ec_k,
@@ -2633,23 +2655,27 @@ impl PgStore {
                 },
             );
         }
+        Ok(())
     }
 
     fn extend_stream_segment_references(
         references: &mut Vec<ShardScavengerPayloadReference>,
         segments: &[StreamUploadSegmentRecord],
         encryption: &ObjectEncryption,
-    ) {
+    ) -> Result<(), StoreError> {
         for segment in segments {
-            Self::extend_stream_segment_reference(references, segment, encryption);
+            Self::extend_stream_segment_reference(references, segment, encryption)?;
         }
+        Ok(())
     }
 
     fn extend_stream_segment_reference(
         references: &mut Vec<ShardScavengerPayloadReference>,
         segment: &StreamUploadSegmentRecord,
         encryption: &ObjectEncryption,
-    ) {
+    ) -> Result<(), StoreError> {
+        let stored_size = Self::stored_segment_size_for_encryption(segment.size, encryption)
+            .map_err(Self::invalid_pending_placed_reference_geometry)?;
         Self::push_placed_reference(
             references,
             ShardScavengerPlacedShardSetReference {
@@ -2657,7 +2683,7 @@ impl PgStore {
                 okh: segment.segment_okh,
                 generation_id: segment.segment_vid,
                 placement_cluster_epoch: segment.placement_cluster_epoch,
-                stored_size: Self::stored_segment_size_for_encryption(segment.size, encryption),
+                stored_size,
                 crc64: segment.segment_crc64,
                 ec: EcShape {
                     k: segment.ec_k,
@@ -2665,13 +2691,14 @@ impl PgStore {
                 },
             },
         );
+        Ok(())
     }
 
     fn extend_terminal_stream_segment_references(
         references: &mut Vec<ShardScavengerPayloadReference>,
         segments: &[StreamUploadSegmentRecord],
         stream_uploads: &[TerminalStreamCleanupRecord],
-    ) {
+    ) -> Result<(), StoreError> {
         for segment in segments {
             let Some(stream_upload) = stream_uploads
                 .iter()
@@ -2679,16 +2706,19 @@ impl PgStore {
             else {
                 continue;
             };
-            Self::extend_stream_segment_reference(references, segment, &stream_upload.encryption);
+            Self::extend_stream_segment_reference(references, segment, &stream_upload.encryption)?;
         }
+        Ok(())
     }
 
     fn extend_multipart_part_segment_references(
         references: &mut Vec<ShardScavengerPayloadReference>,
         segments: &[MultipartPartSegmentRecord],
         encryption: &ObjectEncryption,
-    ) {
+    ) -> Result<(), StoreError> {
         for segment in segments {
+            let stored_size = Self::stored_segment_size_for_encryption(segment.size, encryption)
+                .map_err(Self::invalid_pending_placed_reference_geometry)?;
             Self::push_placed_reference(
                 references,
                 ShardScavengerPlacedShardSetReference {
@@ -2696,7 +2726,7 @@ impl PgStore {
                     okh: segment.segment_okh,
                     generation_id: segment.segment_vid,
                     placement_cluster_epoch: segment.placement_cluster_epoch,
-                    stored_size: Self::stored_segment_size_for_encryption(segment.size, encryption),
+                    stored_size,
                     crc64: segment.segment_crc64,
                     ec: EcShape {
                         k: segment.ec_k,
@@ -2705,6 +2735,7 @@ impl PgStore {
                 },
             );
         }
+        Ok(())
     }
 
     fn extend_reclaim_payload_references(
@@ -2840,6 +2871,7 @@ impl PgStore {
         let rows = stmt
             .query_map([], |row| {
                 let okh_blob: Vec<u8> = row.get(1)?;
+                let encryption = Self::decode_scavenger_encryption(row.get(8)?, row.get(9)?, 8)?;
                 Ok(ShardScavengerPayloadReference::Placed(
                     ShardScavengerPlacedShardSetReference {
                         data_pg_id: row.get(0)?,
@@ -2854,10 +2886,17 @@ impl PgStore {
                             5,
                             "placement_cluster_epoch",
                         )?,
-                        stored_size: Self::stored_segment_size_for_encryption_type(
+                        stored_size: Self::stored_segment_size_for_encryption(
                             row.get::<_, i64>(3)? as u64,
-                            row.get(8)?,
-                        )?,
+                            &encryption,
+                        )
+                        .map_err(|reason| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Integer,
+                                Box::from(reason),
+                            )
+                        })?,
                         crc64: row.get::<_, i64>(4)? as u64,
                         ec: EcShape {
                             k: row.get(6)?,
@@ -2879,30 +2918,32 @@ impl PgStore {
         Ok(())
     }
 
-    fn stored_segment_size_for_encryption(logical_size: u64, encryption: &ObjectEncryption) -> u64 {
-        logical_size
-            .checked_add(encryption.segment_ciphertext_extra_len() as u64)
-            .expect("stored segment size overflow")
+    fn stored_segment_size_for_encryption(
+        logical_size: u64,
+        encryption: &ObjectEncryption,
+    ) -> Result<u64, &'static str> {
+        encryption
+            .segment_stored_size(logical_size)
+            .ok_or("segment has invalid stored codec geometry")
     }
 
-    fn stored_segment_size_for_encryption_type(
-        logical_size: u64,
+    fn decode_scavenger_encryption(
         encryption_type: u8,
-    ) -> rusqlite::Result<u64> {
+        encryption_state: Vec<u8>,
+        column_index: usize,
+    ) -> rusqlite::Result<ObjectEncryption> {
         let encryption_type = ObjectEncryptionType::from_u8(encryption_type).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
-                8,
+                column_index,
                 rusqlite::types::Type::Integer,
                 Box::from(format!("invalid object encryption type: {encryption_type}")),
             )
         })?;
-        let _ = encryption_type;
-        let extra = OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64;
-        logical_size.checked_add(extra).ok_or_else(|| {
+        ObjectEncryption::decode(encryption_type, Some(encryption_state)).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                3,
-                rusqlite::types::Type::Integer,
-                Box::from("stored segment size overflow"),
+                column_index,
+                rusqlite::types::Type::Blob,
+                Box::new(error),
             )
         })
     }
@@ -3628,6 +3669,44 @@ mod tests {
             lease_deadline,
             now,
         }
+    }
+
+    #[test]
+    fn shard_scavenger_rejects_invalid_persisted_codec_geometry_without_partial_results() {
+        let ObjectEncryption::SseS3(state) = crate::tests::metadata_only_test_encryption() else {
+            panic!("fixture must use SSE-S3");
+        };
+        let encryption = ObjectEncryption::SseS3(
+            state.with_payload_codec_for_test(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
+        );
+        let segment = ObjectSegmentRecord {
+            bucket: BucketName::try_from("bucket").unwrap(),
+            key: ObjectKey::try_from("key").unwrap(),
+            version_id: VersionId::Null,
+            segment_index: 0,
+            size: 1_u64 << 52,
+            segment_crc64: 17,
+            segment_okh: [23; 16],
+            segment_vid: GenerationId::new(29).unwrap(),
+            data_pg_id: 31,
+            placement_cluster_epoch: ClusterEpoch::new(37).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+        };
+        let mut references = Vec::new();
+
+        let error =
+            PgStore::extend_object_segment_references(&mut references, &[segment], &encryption)
+                .unwrap_err();
+
+        assert!(references.is_empty());
+        assert!(matches!(
+            error,
+            StoreError::ShardScavengerScanIncomplete {
+                context: "derive pending command shard scavenger reference geometry",
+                ..
+            }
+        ));
     }
 
     #[test]

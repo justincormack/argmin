@@ -7725,8 +7725,7 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn current_checksum_tags_match_frozen_canonical_state_v7_and_checkpoint_v5_evidence_and_require_version_bumps(
-    ) {
+    fn current_encryption_and_checksum_tags_match_frozen_canonical_v7_checkpoint_v5_composite() {
         // Immutable checkpoint-v2 evidence produced with canonical-state v5 and the former
         // plaintext encryption tag. This tuple is rejection evidence only and must never be
         // regenerated from current structs.
@@ -7755,6 +7754,15 @@ mod canonical_format_baseline_tests {
             [
                 123, 25, 100, 228, 221, 28, 84, 116, 91, 214, 116, 220, 6, 200, 79, 95, 122, 6, 31,
                 140, 160, 245, 127, 254, 69, 129, 170, 143, 2, 56, 63, 53,
+            ],
+        );
+        const HISTORICAL_CHECKPOINT_V5_SSE_C_V3_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
+            0x17e6_53d3_559e_e4a4,
+            0x8959_c98c_48ee_126c,
+            7_685,
+            [
+                251, 112, 7, 3, 89, 151, 7, 38, 64, 204, 227, 237, 188, 141, 60, 10, 158, 162, 76,
+                244, 126, 88, 44, 90, 177, 230, 51, 53, 157, 251, 179, 222,
             ],
         );
         assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 7);
@@ -7844,18 +7852,19 @@ mod canonical_format_baseline_tests {
         assert_eq!(
             current_evidence,
             (
-                0x17e6_53d3_559e_e4a4,
-                0x8959_c98c_48ee_126c,
-                7_685,
+                0x9821_a064_3b6f_2fc8,
+                0x2631_61f3_4a08_0377,
+                7_686,
                 [
-                    251, 112, 7, 3, 89, 151, 7, 38, 64, 204, 227, 237, 188, 141, 60, 10, 158, 162,
-                    76, 244, 126, 88, 44, 90, 177, 230, 51, 53, 157, 251, 179, 222,
+                    193, 244, 196, 205, 107, 87, 6, 194, 56, 193, 22, 106, 88, 128, 52, 50, 31, 57,
+                    141, 137, 42, 52, 250, 135, 142, 243, 104, 127, 107, 4, 45, 14,
                 ],
             )
         );
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V2_EVIDENCE);
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V3_EVIDENCE);
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V4_EVIDENCE);
+        assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V5_SSE_C_V3_EVIDENCE);
 
         let mut checkpoint_v2 = checkpoint.clone();
         for (table, block) in METADATA_DIGEST_TABLES
@@ -7893,23 +7902,34 @@ mod canonical_format_baseline_tests {
         let mut encoded_v2 = encode_metadata_command_checkpoint_payload(&checkpoint_v2).unwrap();
         encoded_v2[8..10].copy_from_slice(&2_u16.to_be_bytes());
         let encoded_v2_sha256 = checksum::compute_checksum(ChecksumAlgorithm::Sha256, &encoded_v2);
+        const HISTORICAL_DERIVED_V2_SSE_C_V3_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
+            0x17e6_53d3_559e_e4a4,
+            0xd21b_4928_24ce_13d7,
+            7_299,
+            [
+                125, 242, 88, 39, 26, 54, 229, 27, 224, 148, 114, 18, 177, 177, 217, 101, 167, 184,
+                92, 59, 245, 130, 144, 105, 124, 149, 89, 173, 84, 179, 198, 140,
+            ],
+        );
+        let derived_v2_evidence = (
+            checkpoint_v2.state_digest.value(),
+            checkpoint_v2.checkpoint_crc64,
+            encoded_v2.len(),
+            <[u8; 32]>::try_from(encoded_v2_sha256.bytes()).unwrap(),
+        );
         assert_eq!(
+            derived_v2_evidence,
             (
-                checkpoint_v2.state_digest.value(),
-                checkpoint_v2.checkpoint_crc64,
-                encoded_v2.len(),
-                encoded_v2_sha256.bytes(),
-            ),
-            (
-                0x17e6_53d3_559e_e4a4,
-                0xd21b_4928_24ce_13d7,
-                7_299,
-                &[
-                    125, 242, 88, 39, 26, 54, 229, 27, 224, 148, 114, 18, 177, 177, 217, 101, 167,
-                    184, 92, 59, 245, 130, 144, 105, 124, 149, 89, 173, 84, 179, 198, 140,
-                ][..],
+                0x9821_a064_3b6f_2fc8,
+                0x4f50_49e4_84bb_9888,
+                7_300,
+                [
+                    82, 74, 31, 34, 99, 93, 121, 14, 248, 152, 191, 156, 225, 63, 99, 163, 196,
+                    124, 251, 41, 6, 76, 97, 141, 251, 242, 196, 18, 108, 147, 248, 179,
+                ],
             )
         );
+        assert_ne!(derived_v2_evidence, HISTORICAL_DERIVED_V2_SSE_C_V3_EVIDENCE);
         assert!(matches!(
             decode_metadata_command_checkpoint_payload(&encoded_v2),
             Err(crate::storage_rpc::StorageRpcPayloadError::UnsupportedMetadataCheckpointEncodingVersion {

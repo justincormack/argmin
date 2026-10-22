@@ -167,8 +167,6 @@ fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 use crate::etag::format_etag;
 #[cfg(test)]
 use crate::metadata_blob::MetadataBlob;
-#[cfg(test)]
-use crate::sse::SSE_C_SEGMENT_TAG_LEN;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
 use crate::system_metadata::SystemMetadata;

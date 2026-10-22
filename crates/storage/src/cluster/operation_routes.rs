@@ -1224,14 +1224,10 @@ impl<'admission> ActiveMultipartObjectRoute<'admission> {
         authorization: &AuthorizedStreamPartSegment<'_, '_>,
         storage_bytes: &[u8],
     ) -> Result<(), crate::StreamUploadFailure> {
-        let logical_size = storage_bytes
-            .len()
-            .checked_sub(
-                authorization
-                    .session
-                    .encryption
-                    .segment_ciphertext_extra_len(),
-            )
+        let logical_size = authorization
+            .session
+            .encryption
+            .segment_logical_size(storage_bytes.len() as u64)
             .ok_or_else(|| {
                 crate::StreamUploadFailure::from_object_pg_action(
                     ObjectPgActionError::InvalidRequest {
@@ -1239,7 +1235,7 @@ impl<'admission> ActiveMultipartObjectRoute<'admission> {
                             .to_string(),
                     },
                 )
-            })? as u64;
+            })?;
         let StreamUploadTarget::UploadPart {
             upload_id,
             part_number,
@@ -1516,26 +1512,17 @@ impl<'admission> ActivePutObjectRoute<'admission> {
         authorization: &AuthorizedStreamPutSegment<'_, '_>,
         storage_bytes: &[u8],
     ) -> Result<(), crate::StreamUploadFailure> {
-        let logical_size = if storage_bytes.is_empty() {
-            0
-        } else {
-            storage_bytes
-                .len()
-                .checked_sub(
-                    authorization
-                        .session
-                        .encryption
-                        .segment_ciphertext_extra_len(),
+        let logical_size = authorization
+            .session
+            .encryption
+            .segment_logical_size(storage_bytes.len() as u64)
+            .ok_or_else(|| {
+                crate::StreamUploadFailure::from_object_pg_action(
+                    ObjectPgActionError::InvalidRequest {
+                        reason: "stream segment has invalid stored codec geometry".to_string(),
+                    },
                 )
-                .ok_or_else(|| {
-                    crate::StreamUploadFailure::from_object_pg_action(
-                        ObjectPgActionError::InvalidRequest {
-                            reason: "encrypted stream segment shorter than authentication tag"
-                                .to_string(),
-                        },
-                    )
-                })? as u64
-        };
+            })?;
         if !std::ptr::eq(self, authorization.route)
             || authorization.session.bucket != self.bucket
             || authorization.session.key != self.key
