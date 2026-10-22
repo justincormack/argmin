@@ -80,6 +80,12 @@ impl Aes256GcmKey {
         }
     }
 
+    /// Authenticate and decrypt in place.
+    ///
+    /// On failure, the complete caller-supplied buffer is zeroed. Some crypto
+    /// providers write unauthenticated plaintext before checking the tag, so
+    /// leaving the buffer unchanged on the error path would expose plaintext
+    /// which the caller must not use.
     pub fn open_in_place<'a>(
         &self,
         nonce: [u8; AES_GCM_NONCE_LEN],
@@ -91,40 +97,58 @@ impl Aes256GcmKey {
             use openssl::cipher::Cipher;
             use openssl::cipher_ctx::CipherCtx;
 
-            let ciphertext_len = ciphertext_and_tag
-                .len()
-                .checked_sub(AES_GCM_TAG_LEN)
-                .ok_or(CryptoError)?;
-            let (ciphertext, tag) = ciphertext_and_tag.split_at_mut(ciphertext_len);
-            let mut context = CipherCtx::new().map_err(|_| CryptoError)?;
-            context
-                .decrypt_init(Some(Cipher::aes_256_gcm()), Some(&self.0), Some(&nonce))
-                .map_err(|_| CryptoError)?;
-            context
-                .cipher_update(associated_data, None)
-                .map_err(|_| CryptoError)?;
-            context.set_tag(tag).map_err(|_| CryptoError)?;
-            let written = context
-                .cipher_update_inplace(ciphertext, ciphertext_len)
-                .map_err(|_| CryptoError)?;
-            if written != ciphertext_len {
-                return Err(CryptoError);
+            let result = (|| {
+                let ciphertext_len = ciphertext_and_tag
+                    .len()
+                    .checked_sub(AES_GCM_TAG_LEN)
+                    .ok_or(CryptoError)?;
+                let (ciphertext, tag) = ciphertext_and_tag.split_at_mut(ciphertext_len);
+                let mut context = CipherCtx::new().map_err(|_| CryptoError)?;
+                context
+                    .decrypt_init(Some(Cipher::aes_256_gcm()), Some(&self.0), Some(&nonce))
+                    .map_err(|_| CryptoError)?;
+                context
+                    .cipher_update(associated_data, None)
+                    .map_err(|_| CryptoError)?;
+                context.set_tag(tag).map_err(|_| CryptoError)?;
+                let written = context
+                    .cipher_update_inplace(ciphertext, ciphertext_len)
+                    .map_err(|_| CryptoError)?;
+                if written != ciphertext_len {
+                    return Err(CryptoError);
+                }
+                let finalized = context.cipher_final(&mut []).map_err(|_| CryptoError)?;
+                if finalized != 0 {
+                    return Err(CryptoError);
+                }
+                Ok(ciphertext_len)
+            })();
+            match result {
+                Ok(ciphertext_len) => Ok(&mut ciphertext_and_tag[..ciphertext_len]),
+                Err(error) => {
+                    ciphertext_and_tag.fill(0);
+                    Err(error)
+                }
             }
-            let finalized = context.cipher_final(&mut []).map_err(|_| CryptoError)?;
-            if finalized != 0 {
-                return Err(CryptoError);
-            }
-            Ok(ciphertext)
         }
         #[cfg(all(feature = "ring", not(feature = "openssl")))]
         {
-            self.0
+            let result = self
+                .0
                 .open_in_place(
                     ring::aead::Nonce::assume_unique_for_key(nonce),
                     ring::aead::Aad::from(associated_data),
                     ciphertext_and_tag,
                 )
-                .map_err(|_| CryptoError)
+                .map(|plaintext| plaintext.len())
+                .map_err(|_| CryptoError);
+            match result {
+                Ok(plaintext_len) => Ok(&mut ciphertext_and_tag[..plaintext_len]),
+                Err(error) => {
+                    ciphertext_and_tag.fill(0);
+                    Err(error)
+                }
+            }
         }
     }
 }
@@ -171,5 +195,22 @@ mod tests {
         assert!(key
             .open_in_place(different_nonce, b"wrong", &mut ciphertext)
             .is_err());
+        assert!(ciphertext.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn authentication_failure_clears_unauthenticated_plaintext() {
+        let key = Aes256GcmKey::new(&[0x42; AES_256_GCM_KEY_LEN]).unwrap();
+        let nonce = [0x24; AES_GCM_NONCE_LEN];
+        let plaintext = b"plaintext exposed before tag verification";
+        let mut ciphertext = plaintext.to_vec();
+        key.seal_in_place_append_tag(nonce, b"associated data", &mut ciphertext)
+            .unwrap();
+        *ciphertext.last_mut().unwrap() ^= 1;
+
+        assert!(key
+            .open_in_place(nonce, b"associated data", &mut ciphertext)
+            .is_err());
+        assert!(ciphertext.iter().all(|byte| *byte == 0));
     }
 }

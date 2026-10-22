@@ -7,6 +7,11 @@ use md5_legacy::Digest as _;
 use proptest::prelude::*;
 
 use argmin_crypto::aead::{Aes256GcmKey, AES_256_GCM_KEY_LEN, AES_GCM_NONCE_LEN};
+use argmin_crypto::cobblestone::{
+    self, Cobblestone256Key, Cobblestone256MessageLayout, COBBLESTONE_CHUNK_LEN,
+    COBBLESTONE_COMMITMENT_LEN, COBBLESTONE_FULL_ENCRYPTED_CHUNK_LEN, COBBLESTONE_HEADER_LEN,
+    COBBLESTONE_SALT_LEN,
+};
 use argmin_crypto::digest::{Md5, Sha1, Sha512};
 use argmin_crypto::hmac::{self, Sha256Key};
 use argmin_crypto::sha256::Sha256;
@@ -27,6 +32,115 @@ fn ring_hkdf(salt: &[u8], key_material: &[u8], info: &[u8], output: &mut [u8]) {
         .unwrap()
         .fill(output)
         .unwrap();
+}
+
+fn ring_hkdf_expand_sha512(key_material: &[u8], info: &[u8], output: &mut [u8]) {
+    let key = ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA512, key_material);
+    let info = [info];
+    key.expand(&info, HkdfLength(output.len()))
+        .unwrap()
+        .fill(output)
+        .unwrap();
+}
+
+fn ring_cobblestone_material(
+    input_key: &[u8; AES_256_GCM_KEY_LEN],
+    salt: &[u8; COBBLESTONE_SALT_LEN],
+    context: &[u8],
+) -> ([u8; 32], [u8; 12], [u8; COBBLESTONE_COMMITMENT_LEN]) {
+    let mut info = b"c2sp.org/chunked-encryption@v1+AEAD_AES_256_GCM\0".to_vec();
+    info.extend_from_slice(salt);
+    info.extend_from_slice(context);
+    let mut material = [0_u8; 32 + 12 + COBBLESTONE_COMMITMENT_LEN];
+    ring_hkdf_expand_sha512(input_key, &info, &mut material);
+    (
+        material[..32].try_into().unwrap(),
+        material[32..44].try_into().unwrap(),
+        material[44..].try_into().unwrap(),
+    )
+}
+
+fn ring_cobblestone_nonce(mut base_nonce: [u8; 12], chunk_index: u64) -> [u8; 12] {
+    let counter = chunk_index.to_be_bytes();
+    for (nonce_byte, counter_byte) in base_nonce[7..].iter_mut().zip(&counter[3..]) {
+        *nonce_byte ^= counter_byte;
+    }
+    base_nonce
+}
+
+fn ring_cobblestone_seal(
+    input_key: &[u8; AES_256_GCM_KEY_LEN],
+    salt: [u8; COBBLESTONE_SALT_LEN],
+    context: &[u8],
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let (aead_key, base_nonce, commitment) = ring_cobblestone_material(input_key, &salt, context);
+    let key = ring::aead::LessSafeKey::new(
+        ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &aead_key).unwrap(),
+    );
+    let layout = Cobblestone256MessageLayout::from_plaintext_len(plaintext.len() as u64).unwrap();
+    let mut ciphertext = Vec::with_capacity(layout.ciphertext_len() as usize);
+    ciphertext.extend_from_slice(&salt);
+    ciphertext.extend_from_slice(&commitment);
+    let (chunks, final_plaintext) = plaintext.as_chunks::<COBBLESTONE_CHUNK_LEN>();
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        let mut encrypted = chunk.to_vec();
+        key.seal_in_place_append_tag(
+            ring::aead::Nonce::assume_unique_for_key(ring_cobblestone_nonce(
+                base_nonce,
+                chunk_index as u64,
+            )),
+            ring::aead::Aad::empty(),
+            &mut encrypted,
+        )
+        .unwrap();
+        ciphertext.extend_from_slice(&encrypted);
+    }
+    let mut final_chunk = final_plaintext.to_vec();
+    let final_index = (plaintext.len() / COBBLESTONE_CHUNK_LEN) as u64;
+    key.seal_in_place_append_tag(
+        ring::aead::Nonce::assume_unique_for_key(ring_cobblestone_nonce(base_nonce, final_index)),
+        ring::aead::Aad::empty(),
+        &mut final_chunk,
+    )
+    .unwrap();
+    ciphertext.extend_from_slice(&final_chunk);
+    assert_eq!(ciphertext.len(), layout.ciphertext_len() as usize);
+    ciphertext
+}
+
+fn ring_cobblestone_open(
+    input_key: &[u8; AES_256_GCM_KEY_LEN],
+    context: &[u8],
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let layout = Cobblestone256MessageLayout::from_ciphertext_len(ciphertext.len() as u64).unwrap();
+    let salt: [u8; COBBLESTONE_SALT_LEN] = ciphertext[..COBBLESTONE_SALT_LEN].try_into().unwrap();
+    let (aead_key, base_nonce, commitment) = ring_cobblestone_material(input_key, &salt, context);
+    assert_eq!(
+        &ciphertext[COBBLESTONE_SALT_LEN..COBBLESTONE_HEADER_LEN],
+        commitment
+    );
+    let key = ring::aead::LessSafeKey::new(
+        ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &aead_key).unwrap(),
+    );
+    let mut plaintext = Vec::with_capacity(layout.plaintext_len() as usize);
+    for chunk_index in 0..layout.chunk_count() {
+        let range = layout.ciphertext_range_for_chunk(chunk_index).unwrap();
+        let mut encrypted = ciphertext[range.start as usize..range.end as usize].to_vec();
+        let opened = key
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(ring_cobblestone_nonce(
+                    base_nonce,
+                    chunk_index,
+                )),
+                ring::aead::Aad::empty(),
+                &mut encrypted,
+            )
+            .unwrap();
+        plaintext.extend_from_slice(opened);
+    }
+    plaintext
 }
 
 fn update_in_chunks(mut update: impl FnMut(&[u8]), data: &[u8], chunk_size: usize) {
@@ -148,6 +262,17 @@ proptest! {
         ring_hkdf(&salt, &input_key_material, &info, &mut expected);
         prop_assert_eq!(actual, expected);
     }
+
+    #[test]
+    fn hkdf_expand_sha512_matches_ring_for_arbitrary_inputs(
+        pseudorandom_key in proptest::collection::vec(any::<u8>(), 0..1024),
+        info in proptest::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let actual = argmin_crypto::hkdf::expand_sha512::<76>(&pseudorandom_key, &info).unwrap();
+        let mut expected = [0; 76];
+        ring_hkdf_expand_sha512(&pseudorandom_key, &info, &mut expected);
+        prop_assert_eq!(actual, expected);
+    }
 }
 
 #[test]
@@ -172,4 +297,60 @@ fn hkdf_sha256_matches_ring_across_output_boundaries() {
     compare_length!(32);
     compare_length!(33);
     compare_length!(255);
+}
+
+#[test]
+fn cobblestone_256_persisted_bytes_interoperate_in_both_directions() {
+    assert_eq!(argmin_crypto::provider_name(), "openssl");
+    let input_key = [0x59; AES_256_GCM_KEY_LEN];
+    let salt = [0xa7; COBBLESTONE_SALT_LEN];
+    let cases = [
+        (Vec::new(), Vec::new()),
+        (vec![0x01], b"one-byte context".to_vec()),
+        (vec![0x7f; COBBLESTONE_CHUNK_LEN - 1], Vec::new()),
+        (vec![0x81; COBBLESTONE_CHUNK_LEN], b"boundary".to_vec()),
+        (vec![0x42; COBBLESTONE_CHUNK_LEN + 1], Vec::new()),
+        (
+            vec![0x24; COBBLESTONE_CHUNK_LEN * 2 + 97],
+            b"multi-chunk subject context\0with-null".to_vec(),
+        ),
+    ];
+
+    for (plaintext, context) in cases {
+        let openssl_ciphertext = cobblestone::seal(
+            &Cobblestone256Key::new(&input_key).unwrap(),
+            salt,
+            &context,
+            &plaintext,
+        )
+        .unwrap();
+        assert_eq!(
+            openssl_ciphertext.len(),
+            COBBLESTONE_HEADER_LEN
+                + plaintext.len()
+                + (plaintext.len() / COBBLESTONE_CHUNK_LEN + 1) * 16
+        );
+        assert!(
+            openssl_ciphertext.len()
+                < COBBLESTONE_HEADER_LEN
+                    + (plaintext.len() / COBBLESTONE_CHUNK_LEN + 1)
+                        * COBBLESTONE_FULL_ENCRYPTED_CHUNK_LEN
+        );
+        assert_eq!(
+            ring_cobblestone_open(&input_key, &context, &openssl_ciphertext),
+            plaintext
+        );
+
+        let ring_ciphertext = ring_cobblestone_seal(&input_key, salt, &context, &plaintext);
+        assert_eq!(ring_ciphertext, openssl_ciphertext);
+        assert_eq!(
+            cobblestone::open(
+                Cobblestone256Key::new(&input_key).unwrap(),
+                &context,
+                &ring_ciphertext,
+            )
+            .unwrap(),
+            plaintext
+        );
+    }
 }

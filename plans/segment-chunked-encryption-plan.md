@@ -953,23 +953,52 @@ the eventual reader exists before the first payload effect.
 
 ### Phase 2: Cobblestone segment codec
 
-- Implement or integrate the reviewed Cobblestone-256 profile behind `argmin-crypto`.
-- Import the official/Wycheproof vectors and add exact Argmin context vectors.
-- Run every official and Argmin vector under both supported `argmin-crypto` provider builds.
-- Add deterministic bidirectional interoperability tests: seal with Ring and open with OpenSSL,
+- [x] Implement the reviewed Cobblestone-256 primitive behind `argmin-crypto`.
+- [x] Import the pinned official/Wycheproof vectors verbatim and verify their immutable digest.
+- [ ] Add exact Argmin context vectors with the durable profile discriminator and canonical
+  subject bytes; do not freeze a vector using the Phase 1 subject's current whole-segment profile
+  tag.
+- [x] Run every official vector under both supported `argmin-crypto` provider builds.
+- [x] Add deterministic bidirectional interoperability tests: seal with Ring and open with OpenSSL,
   then seal with OpenSSL and open with Ring, across empty, boundary, multi-chunk, and context-bound
   messages. Fixed key/salt/context inputs must produce the same persisted bytes in both builds.
-- Implement streaming seal/open, header/commitment validation, selected-chunk opening, and exact
+- [x] Implement streaming seal/open, header/commitment validation, selected-chunk opening, and exact
   final-chunk validation.
-- Persist the complete storage-owned per-shard integrity witness through segment schema, terminal
+- [ ] Persist the complete storage-owned per-shard integrity witness through segment schema, terminal
   commands, apply/recovery, snapshots, RPC, retained reads, repair, and route-history retention.
-- Add the durable profile discriminator and profile-aware stored-size calculations.
-- Implement one compiler-exhaustive codec/encryption-state compatibility registry and exercise its
+- [ ] Add the durable profile discriminator and profile-aware stored-size calculations.
+- [ ] Implement one compiler-exhaustive codec/encryption-state compatibility registry and exercise its
   complete valid and invalid cross-product at construction, decoding, apply/recovery, and restart.
-- Integrate the codec with every encrypted write path while retaining the old reader if required by
+- [ ] Integrate the codec with every encrypted write path while retaining the old reader if required by
   the selected format transition.
-- Put the current and proposed encrypted representations behind the common profile contract; the
+- [ ] Put the current and proposed encrypted representations behind the common profile contract; the
   completed prerequisite leaves no plaintext bypass in write, read, range, or copy paths.
+
+Implementation update (2026-10-22):
+
+- `argmin-crypto` now implements the pinned C2SP
+  `d757bb90e5966d92d17353a3964ca1af776b63e0` Cobblestone-256 construction over the existing
+  provider-neutral AES-256-GCM API and a new HKDF-Expand-SHA-512 primitive. No production
+  dependency was added.
+- `Cobblestone256Key` rejects non-256-bit input keys. The incremental sealer owns canonical
+  chunking and always emits the required short terminal record, including the empty terminal
+  record for an exact multiple. The incremental opener validates the complete ciphertext geometry
+  up front, verifies the key commitment before opening any record, and appends plaintext only
+  after that record authenticates. A checked layout and commitment-verified opener provide the
+  selected-chunk seam without allowing a caller to supply its own nonce or record length.
+- The unmodified 68,644-byte Cobblestone-256 Wycheproof corpus is committed with its upstream
+  commit and SHA-256 provenance. Both Ring and OpenSSL builds pass all 35 valid and invalid cases,
+  including commitment/header failures, context and key crossing, canonical terminal lengths,
+  truncation, extension, reordering, trailing data, authenticated prefixes, and the counter rollover
+  beyond one byte.
+- The OpenSSL-provider test target contains an independent Ring construction. Fixed input key,
+  salt, context, and plaintext produce identical headers, commitments, records, tags, and terminal
+  encodings; each provider opens the other's bytes for empty, one-byte, boundary-minus/at/plus-one,
+  multi-chunk, and NUL-containing context cases.
+- Exact Argmin subject vectors intentionally remain open until the durable
+  `Cobblestone256SegmentV1` profile tag exists. Freezing the current Phase 1 canonical bytes would
+  incorrectly bind the vector to `SegmentAes256GcmV1`. Storage integration, durable witness work,
+  and the exhaustive persisted-profile cross-product remain separate Phase 2 slices.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.

@@ -11,6 +11,7 @@
 compile_error!("argmin-crypto requires either the `ring` or `openssl` feature");
 
 pub mod aead;
+pub mod cobblestone;
 pub mod digest;
 pub mod hkdf;
 pub mod hmac;
