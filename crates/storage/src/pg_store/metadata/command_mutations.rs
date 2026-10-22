@@ -304,8 +304,8 @@ impl PgStore {
                         context: "append stream segment command payload-codec geometry",
                         reason: "metadata state does not satisfy the operation invariant".into(),
                     })?;
-                validate_segment_shard_integrity_for_codec(
-                    session.encryption.payload_codec(),
+                validate_segment_shard_integrity_for_profile(
+                    session.encryption.payload_profile(),
                     command.segment.shard_integrity.as_ref(),
                     EcShape {
                         k: command.segment.ec_k,
@@ -490,8 +490,8 @@ impl PgStore {
                     context: "commit stream part command payload-codec geometry",
                     reason: "metadata state does not satisfy the operation invariant".into(),
                 })?;
-            validate_segment_shard_integrity_for_codec(
-                command.upload.encryption.payload_codec(),
+            validate_segment_shard_integrity_for_profile(
+                command.upload.encryption.payload_profile(),
                 segment.shard_integrity.as_ref(),
                 EcShape {
                     k: segment.ec_k,

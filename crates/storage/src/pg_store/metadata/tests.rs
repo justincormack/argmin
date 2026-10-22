@@ -4,8 +4,8 @@
 use super::*;
 use crate::control_plane::{CanonicalStateDigest, MetadataCommandLogHash};
 use crate::metadata_command::{
-    MetadataCommandId, MetadataCommandLogIndex, MetadataTransferCommand,
-    PendingMetadataCommandInspection,
+    decode_metadata_command_envelope, MetadataCommandId, MetadataCommandLogIndex,
+    MetadataTransferCommand, PendingMetadataCommandInspection,
 };
 use crate::node_runtime::traits::PgMetadataStore;
 use crate::tests::metadata_only_test_encryption;
@@ -2389,8 +2389,73 @@ fn cobblestone_test_encryption() -> ObjectEncryption {
         panic!("metadata fixture must use SSE-S3");
     };
     ObjectEncryption::SseS3(
-        state.with_payload_codec_for_test(SegmentPayloadCodec::Cobblestone256SegmentV1),
+        SseS3ObjectState::new(
+            state.wrapping_key_id(),
+            *state.wrap_nonce(),
+            *state.wrapped_dek(),
+            *state.segment_nonce_prefix(),
+        )
+        .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
     )
+}
+
+fn test_encryption_profiles() -> [(SegmentPayloadProfile, ObjectEncryption); 4] {
+    [
+        (
+            SegmentPayloadProfile::SseCustomerSegmentAes256GcmV1,
+            ObjectEncryption::SseCustomer(
+                SseCustomerObjectState::new(
+                    1,
+                    [2; SSE_C_VALIDATOR_SALT_LEN],
+                    [3; SSE_C_VALIDATOR_HMAC_LEN],
+                    [4; SSE_C_WRAP_SALT_LEN],
+                    [5; SSE_C_WRAP_NONCE_LEN],
+                    [6; SSE_C_WRAPPED_DEK_LEN],
+                    [7; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+                )
+                .with_payload_codec(SegmentPayloadCodec::SegmentAes256GcmV1),
+            ),
+        ),
+        (
+            SegmentPayloadProfile::SseCustomerCobblestone256SegmentV1,
+            ObjectEncryption::SseCustomer(
+                SseCustomerObjectState::new(
+                    8,
+                    [9; SSE_C_VALIDATOR_SALT_LEN],
+                    [10; SSE_C_VALIDATOR_HMAC_LEN],
+                    [11; SSE_C_WRAP_SALT_LEN],
+                    [12; SSE_C_WRAP_NONCE_LEN],
+                    [13; SSE_C_WRAPPED_DEK_LEN],
+                    [14; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+                )
+                .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
+            ),
+        ),
+        (
+            SegmentPayloadProfile::SseS3SegmentAes256GcmV1,
+            ObjectEncryption::SseS3(
+                SseS3ObjectState::new(
+                    15,
+                    [16; SSE_S3_WRAP_NONCE_LEN],
+                    [17; SSE_S3_WRAPPED_DEK_LEN],
+                    [18; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+                )
+                .with_payload_codec(SegmentPayloadCodec::SegmentAes256GcmV1),
+            ),
+        ),
+        (
+            SegmentPayloadProfile::SseS3Cobblestone256SegmentV1,
+            ObjectEncryption::SseS3(
+                SseS3ObjectState::new(
+                    19,
+                    [20; SSE_S3_WRAP_NONCE_LEN],
+                    [21; SSE_S3_WRAPPED_DEK_LEN],
+                    [22; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+                )
+                .with_payload_codec(SegmentPayloadCodec::Cobblestone256SegmentV1),
+            ),
+        ),
+    ]
 }
 
 fn test_segment_integrity_record(
@@ -2423,44 +2488,123 @@ fn cobblestone_direct_put_apply_rejects_missing_or_crossed_shard_integrity_witho
     let bucket = trusted_bucket_name("cobblestone-witness-apply");
     let key = trusted_object_key("object");
     let ec = EcShape { k: 2, m: 1 };
-    let encryption = cobblestone_test_encryption();
-    let (segment_crc64, shard_integrity) =
-        test_segment_integrity_record(encryption.payload_codec(), 64, ec);
-    let base_segment = ObjectSegmentRecord {
-        shard_integrity: Some(shard_integrity),
-        bucket: bucket.clone(),
-        key: key.clone(),
-        version_id: VersionId::Null,
-        segment_index: 0,
-        size: 64,
-        segment_crc64,
-        segment_okh: [0x61; 16],
-        segment_vid: GenerationId::MIN,
-        data_pg_id: 1,
-        placement_cluster_epoch: ClusterEpoch::INITIAL,
-        ec_k: ec.k,
-        ec_m: ec.m,
-    };
+    for (profile, encryption) in test_encryption_profiles()
+        .into_iter()
+        .filter(|(profile, _)| profile.requires_shard_integrity_witness())
+    {
+        let (segment_crc64, shard_integrity) =
+            test_segment_integrity_record(encryption.payload_codec(), 64, ec);
+        let base_segment = ObjectSegmentRecord {
+            shard_integrity: Some(shard_integrity),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            segment_index: 0,
+            size: 64,
+            segment_crc64,
+            segment_okh: [0x61; 16],
+            segment_vid: GenerationId::MIN,
+            data_pg_id: 1,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
+            ec_k: ec.k,
+            ec_m: ec.m,
+        };
 
-    for (case, segment) in [
-        (
-            "missing",
-            ObjectSegmentRecord {
-                shard_integrity: None,
-                ..base_segment.clone()
-            },
-        ),
-        (
-            "crossed",
-            ObjectSegmentRecord {
-                segment_crc64: segment_crc64.wrapping_add(1),
-                ..base_segment
-            },
-        ),
-    ] {
+        for (case, segment) in [
+            (
+                "missing",
+                ObjectSegmentRecord {
+                    shard_integrity: None,
+                    ..base_segment.clone()
+                },
+            ),
+            (
+                "crossed",
+                ObjectSegmentRecord {
+                    segment_crc64: segment_crc64.wrapping_add(1),
+                    ..base_segment.clone()
+                },
+            ),
+        ] {
+            let tmp = test_util::tempdir();
+            let store = PgStore::open(tmp.path(), 1).unwrap();
+            let reservation_id = SessionId::try_from("93".repeat(16)).unwrap();
+            let command = MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    ClusterEpoch::INITIAL,
+                    PgId::new(1),
+                    MetadataCommandLogIndex::new(1).unwrap(),
+                ),
+                MetadataCommandPayload::CommitDirectPutObject(Box::new(
+                    CommitDirectPutObjectCommand {
+                        object: PutLiveObjectReq {
+                            bucket: bucket.clone(),
+                            key: key.clone(),
+                            version_id: VersionId::Null,
+                            owner: test_owner(),
+                            acl_grants: AclGrants::default(),
+                            public_read: false,
+                            generation_id: GenerationId::MIN,
+                            size: 64,
+                            etag: ObjectEtag::single_part(1),
+                            ec,
+                            layout: ObjectLayout::Standard,
+                            tags: None,
+                            metadata_blob: Some(SerializedMetadataBlob::default()),
+                            system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                            object_lock: ObjectLockState::default(),
+                            encryption: encryption.clone(),
+                        },
+                        segments: vec![segment],
+                        generation_reservation_id: reservation_id,
+                        write_sequence: 1,
+                        last_modified_millis: 1,
+                        stale_payload: None,
+                        bucket_write_reservation: direct_put_terminal_cleanup_proof(&bucket, &key),
+                    },
+                )),
+            );
+
+            let error = store.apply_metadata_command(&command).unwrap_err();
+            assert!(matches!(
+                error,
+                MetadataError::InvariantViolation {
+                    context: "commit direct put command shard integrity witness",
+                    ..
+                }
+            ));
+            let row_count: i64 = store
+                .conn
+                .query_row("SELECT count(*) FROM objects", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                row_count, 0,
+                "{profile:?} {case} witness mutated object state"
+            );
+            assert_eq!(
+                store
+                    .metadata_command_replica_state()
+                    .unwrap()
+                    .applied_log_index,
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn payload_profile_cross_product_survives_command_decode_apply_and_restart() {
+    let ec = EcShape { k: 2, m: 1 };
+    let logical_size = 64;
+
+    for (ordinal, (profile, encryption)) in test_encryption_profiles().into_iter().enumerate() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
-        let reservation_id = SessionId::try_from("93".repeat(16)).unwrap();
+        let bucket = trusted_bucket_name(format!("profile-restart-{ordinal}"));
+        let key = trusted_object_key("object");
+        let reservation_id = SessionId::try_from(format!("{:032}", ordinal + 1)).unwrap();
+        let (segment_crc64, shard_integrity) =
+            test_segment_integrity_record(profile.payload_codec(), logical_size, ec);
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
@@ -2476,8 +2620,8 @@ fn cobblestone_direct_put_apply_rejects_missing_or_crossed_shard_integrity_witho
                     acl_grants: AclGrants::default(),
                     public_read: false,
                     generation_id: GenerationId::MIN,
-                    size: 64,
-                    etag: ObjectEtag::single_part(1),
+                    size: logical_size,
+                    etag: ObjectEtag::single_part(u64::try_from(ordinal + 1).unwrap()),
                     ec,
                     layout: ObjectLayout::Standard,
                     tags: None,
@@ -2486,34 +2630,65 @@ fn cobblestone_direct_put_apply_rejects_missing_or_crossed_shard_integrity_witho
                     object_lock: ObjectLockState::default(),
                     encryption: encryption.clone(),
                 },
-                segments: vec![segment],
-                generation_reservation_id: reservation_id,
+                segments: vec![ObjectSegmentRecord {
+                    shard_integrity: Some(shard_integrity),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    segment_index: 0,
+                    size: logical_size,
+                    segment_crc64,
+                    segment_okh: [u8::try_from(ordinal + 1).unwrap(); 16],
+                    segment_vid: GenerationId::MIN,
+                    data_pg_id: 1,
+                    placement_cluster_epoch: ClusterEpoch::INITIAL,
+                    ec_k: ec.k,
+                    ec_m: ec.m,
+                }],
+                generation_reservation_id: reservation_id.clone(),
                 write_sequence: 1,
                 last_modified_millis: 1,
                 stale_payload: None,
                 bucket_write_reservation: direct_put_terminal_cleanup_proof(&bucket, &key),
             })),
         );
-
-        let error = store.apply_metadata_command(&command).unwrap_err();
-        assert!(matches!(
-            error,
-            MetadataError::InvariantViolation {
-                context: "commit direct put command shard integrity witness",
-                ..
-            }
-        ));
-        let row_count: i64 = store
-            .conn
-            .query_row("SELECT count(*) FROM objects", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(row_count, 0, "{case} witness mutated object state");
+        let decoded = decode_metadata_command_envelope(
+            &command.command_bytes(),
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+        )
+        .unwrap();
         assert_eq!(
-            store
-                .metadata_command_replica_state()
+            decoded, command,
+            "{profile:?} command codec changed profile"
+        );
+        insert_direct_put_terminal_staging_with_encryption(
+            &store,
+            &bucket,
+            &key,
+            &reservation_id,
+            &encryption,
+        );
+        store.apply_metadata_command(&decoded).unwrap();
+        drop(store);
+
+        let recovered = PgStore::open(tmp.path(), 1).unwrap();
+        let stored = recovered
+            .get_object_version(&bucket, &key, VersionId::Null)
+            .unwrap();
+        assert_eq!(stored.as_live().unwrap().encryption, encryption);
+        let segments = recovered
+            .get_object_segments(&bucket, &key, VersionId::Null)
+            .unwrap();
+        let snapshot = ObjectReadSnapshot::from_records(stored, segments, Vec::new(), Vec::new())
+            .unwrap_or_else(|error| panic!("{profile:?} failed snapshot construction: {error}"));
+        assert_eq!(
+            snapshot
+                .stored
+                .as_live()
                 .unwrap()
-                .applied_log_index,
-            0
+                .encryption
+                .payload_profile(),
+            profile
         );
     }
 }
@@ -9603,8 +9778,23 @@ fn insert_direct_put_terminal_staging(
     key: &ObjectKey,
     reservation_id: &SessionId,
 ) {
+    insert_direct_put_terminal_staging_with_encryption(
+        store,
+        bucket,
+        key,
+        reservation_id,
+        &metadata_only_test_encryption(),
+    );
+}
+
+fn insert_direct_put_terminal_staging_with_encryption(
+    store: &PgStore,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    reservation_id: &SessionId,
+    encryption: &ObjectEncryption,
+) {
     let proof = direct_put_terminal_cleanup_proof(bucket, key);
-    let encryption = metadata_only_test_encryption();
     let encryption_state = encryption.encode_state();
     store
         .conn

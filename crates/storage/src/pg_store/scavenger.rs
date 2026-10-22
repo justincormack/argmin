@@ -3705,7 +3705,13 @@ mod tests {
             panic!("fixture must use SSE-S3");
         };
         let encryption = ObjectEncryption::SseS3(
-            state.with_payload_codec_for_test(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
+            crate::SseS3ObjectState::new(
+                state.wrapping_key_id(),
+                *state.wrap_nonce(),
+                *state.wrapped_dek(),
+                *state.segment_nonce_prefix(),
+            )
+            .with_payload_codec(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
         );
         let segment = ObjectSegmentRecord {
             shard_integrity: None,

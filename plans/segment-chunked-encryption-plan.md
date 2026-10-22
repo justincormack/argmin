@@ -1087,6 +1087,25 @@ Implementation update (2026-10-22, durable per-shard integrity witness):
   route needed to read every derived shard. The Unix cross-epoch regression now loads the persisted
   segment witness from metadata and reads through the retained historical route with it.
 
+Implementation update (2026-10-22, payload-profile compatibility registry foundation):
+
+- `SegmentPayloadProfile` is now the compiler-exhaustive compatibility registry for the two
+  durable payload codecs and the SSE-C/SSE-S3 state variants. It has no wildcard arms: adding a
+  codec or encryption state requires an explicit decision for profile identity, key mode, codec,
+  geometry, and durable-witness policy. Object encryption decoding and the consuming production
+  codec selectors pass through that registry; the old test-only codec mutators were removed so
+  fixtures cannot bypass it.
+- Snapshot construction, Direct PUT command construction, and every metadata-command apply path
+  validate geometry and per-shard evidence through the complete profile rather than branching on
+  an independently supplied codec. The four valid pairs round-trip through their encryption-state
+  and metadata-command codecs, pass replica apply, survive SQLite close/reopen, and construct an
+  active read snapshot with the exact profile intact. Both Cobblestone key modes independently
+  reject missing or crossed integrity evidence before object or replica-state mutation.
+- The combined cross-product checklist remains open. A later slice must add immutable malformed
+  pair evidence for every containing command/RPC/checkpoint carrier, authorized recovery/replay
+  and restart rejection with effect sentinels, and real encrypted write/read positive canaries for
+  both key modes. This foundation does not enable a Cobblestone production writer.
+
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.
 

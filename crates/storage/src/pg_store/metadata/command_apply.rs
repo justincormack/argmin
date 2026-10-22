@@ -940,8 +940,8 @@ impl PgStore {
                     context: "commit direct put command payload-codec geometry",
                     reason: "metadata state does not satisfy the operation invariant".into(),
                 })?;
-            validate_segment_shard_integrity_for_codec(
-                command.object.encryption.payload_codec(),
+            validate_segment_shard_integrity_for_profile(
+                command.object.encryption.payload_profile(),
                 segment.shard_integrity.as_ref(),
                 EcShape {
                     k: segment.ec_k,
@@ -1187,8 +1187,8 @@ impl PgStore {
                     context: "commit multipart object command payload-codec geometry",
                     reason: "metadata state does not satisfy the operation invariant".into(),
                 })?;
-            validate_segment_shard_integrity_for_codec(
-                command.object.encryption.payload_codec(),
+            validate_segment_shard_integrity_for_profile(
+                command.object.encryption.payload_profile(),
                 segment.shard_integrity.as_ref(),
                 EcShape {
                     k: segment.ec_k,

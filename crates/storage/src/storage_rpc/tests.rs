@@ -5912,9 +5912,15 @@ mod tests {
             metadata_blob: Some(SerializedMetadataBlob::new(vec![1, 2, 3])),
             system_metadata_blob: Some(SerializedSystemMetadataBlob::new(vec![4, 5, 6])),
             object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::SseS3(encryption.with_payload_codec_for_test(
-                crate::SegmentPayloadCodec::Cobblestone256SegmentV1,
-            )),
+            encryption: ObjectEncryption::SseS3(
+                crate::SseS3ObjectState::new(
+                    encryption.wrapping_key_id(),
+                    *encryption.wrap_nonce(),
+                    *encryption.wrapped_dek(),
+                    *encryption.segment_nonce_prefix(),
+                )
+                .with_payload_codec(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
+            ),
         });
         let request = StorageRpcObjectReadAuthSubjectRequest {
             object: StorageRpcObjectRequest {

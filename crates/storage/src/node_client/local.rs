@@ -3069,24 +3069,16 @@ impl LocalDirectPutMetadataRoute<'_> {
                 reason: "direct PUT segment has invalid payload-codec geometry".to_string(),
             });
         };
-        if let Some(shard_integrity) = request.shard_integrity {
-            shard_integrity
-                .validate(
-                    request.request.ec,
-                    stored_segment_size,
-                    request.request.segment_crc64,
-                )
-                .map_err(|error| ObjectPgActionError::InvalidRequest {
-                    reason: format!("invalid direct PUT shard integrity witness: {error}"),
-                })?;
-        } else if request.request.encryption.payload_codec()
-            == crate::SegmentPayloadCodec::Cobblestone256SegmentV1
-        {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "Cobblestone direct PUT segment is missing its shard integrity witness"
-                    .to_string(),
-            });
-        }
+        crate::types::validate_segment_shard_integrity_for_profile(
+            request.request.encryption.payload_profile(),
+            request.shard_integrity,
+            request.request.ec,
+            stored_segment_size,
+            request.request.segment_crc64,
+        )
+        .map_err(|reason| ObjectPgActionError::InvalidRequest {
+            reason: format!("invalid direct PUT shard integrity witness: {reason}"),
+        })?;
 
         let last_modified_millis = crate::clock::current_time_millis();
         let write_sequence = pg.next_object_write_sequence(
