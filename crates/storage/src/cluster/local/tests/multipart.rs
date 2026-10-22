@@ -4135,6 +4135,7 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
             let segments = staging_segments
                 .iter()
                 .map(|staged| crate::MultipartPartSegmentRecord {
+                    shard_integrity: staged.shard_integrity.clone(),
                     bucket: bucket_for_hook.clone(),
                     key: key_for_hook.clone(),
                     upload_id: upload_for_hook.clone(),

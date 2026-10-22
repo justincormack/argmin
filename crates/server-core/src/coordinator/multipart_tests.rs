@@ -9772,20 +9772,20 @@ fn get_object_rejects_bad_segment_crc64() {
         .test_inject_object_payload_first_segment_checksum_mismatch(&payload)
         .unwrap();
 
-    let result = coord
-        .get_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                "bucket",
-                "bad-segment-crc",
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: NO_READ,
-        })
-        .unwrap();
-    let err = result.body.read_all().unwrap_err();
+    let err = match coord.get_object(&GetObjectRequest {
+        sse_customer: None,
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "bad-segment-crc",
+            None,
+            test_requester(),
+            None,
+        ),
+        cond: NO_READ,
+    }) {
+        Err(error) => error,
+        Ok(_) => panic!("incoherent segment checksum and shard witness were accepted"),
+    };
     assert!(matches!(
         err,
         ServerError::ObjectRead(ref failure)

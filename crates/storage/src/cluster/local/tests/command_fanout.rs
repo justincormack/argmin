@@ -2730,6 +2730,11 @@ fn stream_put_staging_commands_apply_to_all_acting_object_pg_nodes() {
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
         .iter()
         .map(|written| (&written.key, written.ack))

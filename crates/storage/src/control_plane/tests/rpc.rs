@@ -1615,7 +1615,7 @@ fn control_plane_rpc_v18_operation_catalogue_is_exact() {
         ),
         (
             14_125,
-            "51991decdf38feaca6e6fc0c7aaaeb770a22bcba98553166bf109af9af3128e0".to_owned()
+            "7ada47fdef6056671b93695678a9bcb417b1b31d96f317f869f227e3e0870206".to_owned()
         )
     );
 }

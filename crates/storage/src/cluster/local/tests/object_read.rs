@@ -603,6 +603,124 @@ fn retained_read_healthy_path_reads_only_the_data_shards() {
 }
 
 #[test]
+fn retained_read_uses_persisted_witness_without_ack_rows_and_identifies_multiple_corrupt_shards() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("retained-witness-bucket");
+    let key = crate::tests::object_key("retained-witness-key");
+    let committed = write_committed_direct_segment_for(
+        &cluster,
+        &bucket,
+        &key,
+        b"persisted integrity identifies two independently corrupted data shards",
+    );
+    let shard_keys = committed
+        .written
+        .written_shards
+        .iter()
+        .map(|written| written.key.clone())
+        .collect::<Vec<_>>();
+    cluster
+        .test_delete_metadata_primary_payload_shard_acks(committed.written.data_pg_id, &shard_keys)
+        .unwrap();
+    let shard_size = committed
+        .encrypted
+        .storage_bytes
+        .len()
+        .div_ceil(usize::from(committed.written.ec.k));
+    for shard_index in [0_u8, 1] {
+        let path = cluster
+            .test_payload_shard_file_path(
+                committed.written.data_pg_id,
+                committed.written.ec,
+                &committed.segment_okh,
+                committed.generation_id,
+                shard_index,
+            )
+            .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), shard_size);
+        bytes[0] ^= 0x80;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_object_read_route(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+        )
+        .unwrap();
+    let outcome = route
+        .load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(()))
+        .unwrap()
+        .unwrap();
+    let segment = outcome.snapshot().object_segments[0].clone();
+    assert!(segment.shard_integrity().is_some());
+    let (_, _, leased_snapshot) = outcome.into_parts();
+    let retained = route
+        .retain_object_payload_read(leased_snapshot)
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    retained
+        .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, committed.encrypted.storage_bytes);
+
+    let repairs = cluster
+        .list_placed_segment_shard_repairs(committed.written.data_pg_id)
+        .unwrap();
+    assert_eq!(repairs.len(), 2);
+    assert_eq!(
+        repairs
+            .iter()
+            .map(|repair| repair.work_item.shard_index.get())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1])
+    );
+    assert!(repairs
+        .iter()
+        .all(|repair| repair.work_item.shard_integrity.is_some()));
+
+    drop(retained);
+    let repair_work = repairs[0].work_item.clone();
+    let repaired = cluster
+        .repair_placed_segment_payload_shards_if_needed_preserving_repair_rows(&repair_work)
+        .expect("witness-backed repair must converge after loss of acknowledgement rows");
+    assert_eq!(
+        repaired
+            .iter()
+            .map(|written| written.key.shard_index().get())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1]),
+        "repair must replace both shards identified by the durable witness"
+    );
+    assert!(
+        cluster
+            .placed_segment_payload_shard_repair_targets_with_integrity(
+                repair_work.request,
+                repair_work.shard_integrity.as_ref(),
+            )
+            .expect("witness-backed post-repair verification must succeed")
+            .is_empty(),
+        "completed witness-backed repair must leave no unhealthy shard targets"
+    );
+}
+
+#[test]
 fn retained_read_reconstructs_from_exact_successfully_leased_node_subset() {
     let outcome =
         retained_read_with_unavailable_lease_nodes(&[NodeId::new(0), NodeId::new(1)]).unwrap();

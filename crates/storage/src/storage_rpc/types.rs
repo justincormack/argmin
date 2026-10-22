@@ -1149,6 +1149,7 @@ pub(crate) struct StorageRpcDirectPutCommitSnapshotRequest {
 pub(crate) struct StorageRpcDirectPutCommandBuildRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) request: CommitDirectPutObjectReq,
+    pub(crate) shard_integrity: Option<SegmentShardIntegrityRecord>,
     pub(crate) version_id: VersionId,
     pub(crate) expected_snapshot: DirectPutCommitStorageSnapshot,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,

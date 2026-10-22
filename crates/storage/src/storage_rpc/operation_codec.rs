@@ -2684,6 +2684,10 @@ pub(crate) fn encode_direct_put_command_build_request(
     }
     let mut out = encode_object_request(&request.object);
     put_commit_direct_put_object_req(&mut out, &request.request);
+    put_optional_bytes(
+        &mut out,
+        request.shard_integrity.as_ref().map(|witness| witness.encode()).as_deref(),
+    );
     put_u64(&mut out, request.version_id.to_u64());
     put_direct_put_commit_storage_snapshot(&mut out, &request.expected_snapshot);
     put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
@@ -2696,6 +2700,16 @@ pub(crate) fn decode_direct_put_command_build_request(
     let mut decoder = StorageRpcDecoder::new(bytes);
     let object = decoder.read_rpc_object_request()?;
     let request = decoder.read_commit_direct_put_object_req()?;
+    let shard_integrity = decoder
+        .read_optional_bytes_value()?
+        .map(|bytes| {
+            SegmentShardIntegrityRecord::decode(&bytes).map_err(|_| {
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid direct PUT segment shard integrity witness",
+                )
+            })
+        })
+        .transpose()?;
     let version_id = VersionId::from_u64(decoder.read_u64()?);
     let expected_snapshot = decoder.read_direct_put_commit_storage_snapshot()?;
     let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
@@ -2715,6 +2729,7 @@ pub(crate) fn decode_direct_put_command_build_request(
     Ok(StorageRpcDirectPutCommandBuildRequest {
         object,
         request,
+        shard_integrity,
         version_id,
         expected_snapshot,
         bucket_write_reservation,

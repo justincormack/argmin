@@ -73,6 +73,28 @@ mod systematic_data_shard_crc_tests {
 }
 
 impl StorageCluster {
+    fn merge_placed_segment_repair_work_item(
+        existing: &mut PlacedSegmentShardRepairWorkItem,
+        candidate: &PlacedSegmentShardRepairWorkItem,
+    ) -> Result<(), StoreError> {
+        if existing.request != candidate.request || existing.shard_index != candidate.shard_index {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "one physical shard identity has conflicting repair metadata".to_owned(),
+            });
+        }
+        match (&existing.shard_integrity, &candidate.shard_integrity) {
+            (Some(existing), Some(candidate)) if existing != candidate => {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: "one physical shard identity has conflicting integrity witnesses"
+                        .to_owned(),
+                });
+            }
+            (None, Some(candidate)) => existing.shard_integrity = Some(candidate.clone()),
+            (Some(_), None) | (Some(_), Some(_)) | (None, None) => {}
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn audit_shard_storage_for_scavenger(
         &self,
@@ -344,6 +366,7 @@ impl StorageCluster {
                             self.schedule_placed_segment_shard_repair(
                                 candidate.work_item.request,
                                 candidate.work_item.shard_index,
+                                candidate.work_item.shard_integrity.clone(),
                             )?;
                         }
                     }
@@ -465,6 +488,16 @@ impl StorageCluster {
         cursor: &ShardScavengerReferenceCursor,
         reference: &ShardScavengerPlacedShardSetReference,
     ) -> Result<(), StoreError> {
+        if reference.shard_integrity.as_ref().is_some_and(|witness| {
+            witness
+                .validate(reference.ec, reference.stored_size, reference.crc64)
+                .is_err()
+        }) {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "invalid durable shard integrity witness in scavenger reference"
+                    .to_owned(),
+            });
+        }
         let scan = scans.entry(reference.data_pg_id).or_default();
         self.extend_referenced_shard_locations(
             scan,
@@ -488,6 +521,7 @@ impl StorageCluster {
             let work_item = PlacedSegmentShardRepairWorkItem {
                 request,
                 shard_index: key.shard_index(),
+                shard_integrity: reference.shard_integrity.clone(),
             };
             let authority = ShardScavengerRepairAuthority {
                 source_pg_id,
@@ -502,12 +536,10 @@ impl StorageCluster {
                     });
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    if entry.get().work_item != work_item {
-                        return Err(StoreError::PayloadShardSetMismatch {
-                            reason: "one physical shard identity has conflicting repair metadata"
-                                .to_owned(),
-                        });
-                    }
+                    Self::merge_placed_segment_repair_work_item(
+                        &mut entry.get_mut().work_item,
+                        &work_item,
+                    )?;
                     if !entry.get().authorities.contains(&authority) {
                         entry.get_mut().authorities.push(authority);
                     }
@@ -950,29 +982,51 @@ impl StorageCluster {
         segment: &ObjectPayloadSegment,
         dst: &mut Vec<u8>,
     ) -> Result<(), ObjectReadFailure> {
-        self.read_segment_payload_stored_bytes_at_placement_epoch_into(
+        self.read_segment_payload_stored_bytes_with_integrity_at_placement_epoch_into(
             segment.placement_cluster_epoch(),
             segment.stored_bytes_request(),
+            segment.shard_integrity(),
             dst,
         )
         .map_err(ObjectReadFailure::from_store)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_segment_payload_stored_bytes_at_placement_epoch_into(
         &self,
         placement_cluster_epoch: ClusterEpoch,
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
+        self.read_segment_payload_stored_bytes_with_integrity_at_placement_epoch_into(
+            placement_cluster_epoch,
+            req,
+            None,
+            dst,
+        )
+    }
+
+    fn read_segment_payload_stored_bytes_with_integrity_at_placement_epoch_into(
+        &self,
+        placement_cluster_epoch: ClusterEpoch,
+        req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
         let found = if placement_cluster_epoch == self.operation_epoch() {
-            self.try_read_placed_segment_stored_bytes_into(req, dst, true)?
+            self.try_read_placed_segment_stored_bytes_into(req, shard_integrity, dst, true)?
         } else {
             let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
             let route =
                 self.reconstructed_pg_route_at_epoch(data_pg.pg_id(), placement_cluster_epoch)?;
             self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(
-                &route, req, dst, None, None,
+                &route,
+                req,
+                shard_integrity,
+                dst,
+                None,
+                None,
             )?
         };
         match found {
@@ -988,6 +1042,7 @@ impl StorageCluster {
         &self,
         placement_cluster_epoch: ClusterEpoch,
         req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         dst: &mut Vec<u8>,
         leased_node_ids: &BTreeSet<NodeId>,
         repair_fence: Option<&RetainedActiveRouteRepairFence>,
@@ -1000,6 +1055,7 @@ impl StorageCluster {
         match self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(
             &route,
             req,
+            shard_integrity,
             dst,
             Some(leased_node_ids),
             Some(&mut repair_targets),
@@ -1027,7 +1083,11 @@ impl StorageCluster {
                     ) {
                         break;
                     }
-                    if let Err(error) = self.schedule_placed_segment_shard_repair(req, shard_index)
+                    if let Err(error) = self.schedule_placed_segment_shard_repair(
+                        req,
+                        shard_index,
+                        shard_integrity.cloned(),
+                    )
                     {
                         self.emit_best_effort_payload_repair_error(
                             "record recovered payload shard repair",
@@ -1677,15 +1737,12 @@ impl StorageCluster {
                 continue;
             };
             for (shard_key, candidate) in &page_scan.repair_work_by_shard {
-                if scan
-                    .repair_work_by_shard
-                    .get(shard_key)
-                    .is_some_and(|existing| existing.work_item != candidate.work_item)
-                {
-                    return Err(StoreError::PayloadShardSetMismatch {
-                        reason: "one physical shard identity has conflicting repair metadata"
-                            .to_owned(),
-                    });
+                if let Some(existing) = scan.repair_work_by_shard.get(shard_key) {
+                    let mut merged = existing.work_item.clone();
+                    Self::merge_placed_segment_repair_work_item(
+                        &mut merged,
+                        &candidate.work_item,
+                    )?;
                 }
             }
         }
@@ -1698,6 +1755,10 @@ impl StorageCluster {
                         entry.insert(candidate);
                     }
                     std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        Self::merge_placed_segment_repair_work_item(
+                            &mut entry.get_mut().work_item,
+                            &candidate.work_item,
+                        )?;
                         for authority in candidate.authorities {
                             if !entry.get().authorities.contains(&authority) {
                                 entry.get_mut().authorities.push(authority);
@@ -1768,23 +1829,53 @@ impl StorageCluster {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn placed_segment_payload_shard_repair_targets(
         &self,
         req: SegmentStoredBytesRequest,
     ) -> Result<Vec<ShardIndex>, StoreError> {
-        let health = self.placed_segment_payload_shard_health(req)?;
+        self.placed_segment_payload_shard_repair_targets_with_integrity(req, None)
+    }
+
+    fn placed_segment_payload_shard_repair_targets_with_integrity(
+        &self,
+        req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
+    ) -> Result<Vec<ShardIndex>, StoreError> {
+        let health = self.placed_segment_payload_shard_health_with_integrity(
+            req,
+            shard_integrity,
+        )?;
         if matches!(health.risk, PlacedSegmentShardSetRisk::Unrecoverable) {
             return Err(StoreError::NotFound);
         }
         Ok(health.repair_targets())
     }
 
+    #[cfg(test)]
     pub(crate) fn placed_segment_payload_shard_health(
         &self,
         req: SegmentStoredBytesRequest,
     ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
+        self.placed_segment_payload_shard_health_with_integrity(req, None)
+    }
+
+    fn placed_segment_payload_shard_health_with_integrity(
+        &self,
+        req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
+    ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
         validate_placed_segment_repair_ec_shape(req.ec)?;
+        if let Some(shard_integrity) = shard_integrity {
+            shard_integrity
+                .validate(req.ec, req.stored_size as u64, req.segment_crc64)
+                .map_err(|error| StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "invalid durable shard integrity witness during repair health selection: {error}"
+                    ),
+                })?;
+        }
         let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
         let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
         let locations = self
@@ -1795,6 +1886,7 @@ impl StorageCluster {
             &locations,
             PlacedSegmentShardHealthReadMode::CurrentRoute,
             None,
+            shard_integrity,
         )
     }
 
@@ -1814,6 +1906,7 @@ impl StorageCluster {
             &locations,
             PlacedSegmentShardHealthReadMode::HistoricalInspection,
             Some(route),
+            None,
         )
     }
 
@@ -1971,6 +2064,7 @@ impl StorageCluster {
             if !self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(
                 source_route,
                 req,
+                None,
                 &mut segment,
                 None,
                 None,
@@ -2140,6 +2234,7 @@ impl StorageCluster {
         locations: &[ShardLocation],
         read_mode: PlacedSegmentShardHealthReadMode,
         historical_route: Option<&PgRouteSnapshot>,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
     ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
         let ec_config = validate_placed_segment_repair_ec_shape(req.ec)?;
         let k = usize::from(req.ec.k);
@@ -2178,13 +2273,22 @@ impl StorageCluster {
                         locations.len()
                     ),
                 })?;
-            let ack_result = match historical_route {
-                Some(route) => self.load_payload_shard_ack_for_pg_route_snapshot(
-                    route,
-                    req.data_pg_id,
-                    &shard_key,
-                ),
-                None => self.load_payload_shard_ack(req.data_pg_id, &shard_key),
+            let ack_result = match shard_integrity {
+                Some(shard_integrity) => shard_integrity
+                    .expected_ack(usize::from(shard_index))
+                    .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "durable shard integrity witness omits shard index {shard_index}"
+                        ),
+                    }),
+                None => match historical_route {
+                    Some(route) => self.load_payload_shard_ack_for_pg_route_snapshot(
+                        route,
+                        req.data_pg_id,
+                        &shard_key,
+                    ),
+                    None => self.load_payload_shard_ack(req.data_pg_id, &shard_key),
+                },
             };
             let validation = match ack_result {
                 Ok(ack) if ack.stored_size == shard_size as u64 => {
@@ -2252,15 +2356,24 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
         let repair_targets = self.placed_segment_payload_shard_repair_targets(req)?;
-        self.repair_placed_segment_payload_shards_inner(req, &repair_targets, true)
+        self.repair_placed_segment_payload_shards_inner(req, None, &repair_targets, true)
     }
 
     pub(crate) fn repair_placed_segment_payload_shards_if_needed_preserving_repair_rows(
         &self,
-        req: SegmentStoredBytesRequest,
+        work_item: &PlacedSegmentShardRepairWorkItem,
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
-        let repair_targets = self.placed_segment_payload_shard_repair_targets(req)?;
-        self.repair_placed_segment_payload_shards_inner(req, &repair_targets, false)
+        let req = work_item.request;
+        let repair_targets = self.placed_segment_payload_shard_repair_targets_with_integrity(
+            req,
+            work_item.shard_integrity.as_ref(),
+        )?;
+        self.repair_placed_segment_payload_shards_inner(
+            req,
+            work_item.shard_integrity.as_ref(),
+            &repair_targets,
+            false,
+        )
     }
 
     #[cfg(test)]
@@ -2269,12 +2382,13 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         shard_indices: &[ShardIndex],
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
-        self.repair_placed_segment_payload_shards_inner(req, shard_indices, true)
+        self.repair_placed_segment_payload_shards_inner(req, None, shard_indices, true)
     }
 
     fn repair_placed_segment_payload_shards_inner(
         &self,
         req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         shard_indices: &[ShardIndex],
         resolve_repair_rows: bool,
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
@@ -2319,7 +2433,12 @@ impl StorageCluster {
         }
 
         let mut recovered_segment = Vec::new();
-        match self.try_read_placed_segment_stored_bytes_into(req, &mut recovered_segment, false)? {
+        match self.try_read_placed_segment_stored_bytes_into(
+            req,
+            shard_integrity,
+            &mut recovered_segment,
+            false,
+        )? {
             true => {}
             false => return Err(StoreError::NotFound),
         }
@@ -2383,10 +2502,18 @@ impl StorageCluster {
                     source: io::Error::other(other.to_string()),
                 },
             })?;
-        self.verify_repaired_placed_segment_payload_shards(req, shard_indices)?;
+        self.verify_repaired_placed_segment_payload_shards(
+            req,
+            shard_integrity,
+            shard_indices,
+        )?;
         if resolve_repair_rows {
             for shard_index in shard_indices {
-                self.resolve_placed_segment_shard_repair(req, *shard_index)?;
+                self.resolve_placed_segment_shard_repair(
+                    req,
+                    *shard_index,
+                    shard_integrity.cloned(),
+                )?;
             }
         }
         Ok(repaired)
@@ -2395,9 +2522,13 @@ impl StorageCluster {
     fn verify_repaired_placed_segment_payload_shards(
         &self,
         req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         repaired_shard_indices: &[ShardIndex],
     ) -> Result<(), StoreError> {
-        let remaining_targets = self.placed_segment_payload_shard_repair_targets(req)?;
+        let remaining_targets = self.placed_segment_payload_shard_repair_targets_with_integrity(
+            req,
+            shard_integrity,
+        )?;
         let repaired: HashSet<_> = repaired_shard_indices
             .iter()
             .map(|shard_index| shard_index.get())
@@ -2413,7 +2544,11 @@ impl StorageCluster {
             }
         }
         for shard_index in remaining_targets {
-            self.schedule_placed_segment_shard_repair(req, shard_index)?;
+            self.schedule_placed_segment_shard_repair(
+                req,
+                shard_index,
+                shard_integrity.cloned(),
+            )?;
         }
         Ok(())
     }
@@ -2421,6 +2556,7 @@ impl StorageCluster {
     fn try_read_placed_segment_stored_bytes_into(
         &self,
         req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         dst: &mut Vec<u8>,
         schedule_repair_on_recovery: bool,
     ) -> Result<bool, StoreError> {
@@ -2433,7 +2569,8 @@ impl StorageCluster {
             return Ok(true);
         }
 
-        let temporarily_unavailable = match self.try_read_placed_segment_direct_into(req, dst)? {
+        let temporarily_unavailable =
+            match self.try_read_placed_segment_direct_into(req, shard_integrity, dst)? {
             PlacedSegmentDirectReadOutcome::Complete => return Ok(true),
             PlacedSegmentDirectReadOutcome::Recover {
                 temporarily_unavailable,
@@ -2446,6 +2583,7 @@ impl StorageCluster {
 
         self.try_read_placed_segment_recovery_into(
             req,
+            shard_integrity,
             dst,
             schedule_repair_on_recovery,
             temporarily_unavailable,
@@ -2456,6 +2594,7 @@ impl StorageCluster {
         &self,
         route: &PgRouteSnapshot,
         req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         dst: &mut Vec<u8>,
         leased_node_ids: Option<&BTreeSet<NodeId>>,
         mut repair_targets: Option<&mut Vec<ShardIndex>>,
@@ -2479,6 +2618,7 @@ impl StorageCluster {
         let temporarily_unavailable =
             match self.try_read_placed_segment_direct_for_pg_route_snapshot_into(
                 req,
+                shard_integrity,
                 &locations,
                 leased_node_ids,
                 shard_size,
@@ -2501,6 +2641,7 @@ impl StorageCluster {
             self.try_load_placed_segment_shard_for_historical_inspection(
                 &req.segment_okh,
                 req.segment_vid,
+                shard_integrity,
                 &locations,
                 leased_node_ids,
                 shard_index,
@@ -2580,6 +2721,7 @@ impl StorageCluster {
     fn try_read_placed_segment_direct_for_pg_route_snapshot_into(
         &self,
         req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         locations: &[ShardLocation],
         leased_node_ids: Option<&BTreeSet<NodeId>>,
         shard_size: usize,
@@ -2627,7 +2769,18 @@ impl StorageCluster {
                 &mut dst[start..end],
             );
             match read {
-                Ok(ack) => direct_acks.push(ack),
+                Ok(ack)
+                    if shard_integrity
+                        .and_then(|witness| witness.expected_ack(shard_index))
+                        .is_none_or(|expected| expected == ack) =>
+                {
+                    direct_acks.push(ack);
+                }
+                Ok(_) => {
+                    return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                        temporarily_unavailable: None,
+                    });
+                }
                 Err(error) => {
                     let temporarily_unavailable =
                         match placed_segment_recoverable_shard_error(error)? {
@@ -2799,6 +2952,7 @@ impl StorageCluster {
     fn try_read_placed_segment_direct_into(
         &self,
         req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         dst: &mut Vec<u8>,
     ) -> Result<PlacedSegmentDirectReadOutcome, StoreError> {
         let reader = self.current_placed_segment_shard_reader(
@@ -2820,14 +2974,17 @@ impl StorageCluster {
                         "direct read shard index {shard_index} is outside installed placement"
                     ),
                 })?;
-            let ack = match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
-                Ok(ack) => ack,
-                Err(StoreError::NotFound) => {
-                    return Ok(PlacedSegmentDirectReadOutcome::Recover {
-                        temporarily_unavailable: None,
-                    });
-                }
-                Err(error) => return Err(error),
+            let ack = match shard_integrity.and_then(|witness| witness.expected_ack(shard_index)) {
+                Some(ack) => ack,
+                None => match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
+                    Ok(ack) => ack,
+                    Err(StoreError::NotFound) => {
+                        return Ok(PlacedSegmentDirectReadOutcome::Recover {
+                            temporarily_unavailable: None,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                },
             };
             if ack.stored_size != shard_size as u64 {
                 return Ok(PlacedSegmentDirectReadOutcome::Recover {
@@ -2913,6 +3070,7 @@ impl StorageCluster {
     fn try_read_placed_segment_recovery_into(
         &self,
         req: SegmentStoredBytesRequest,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         dst: &mut Vec<u8>,
         schedule_repair_on_recovery: bool,
         mut temporarily_unavailable: Option<StoreError>,
@@ -2935,6 +3093,7 @@ impl StorageCluster {
                 req.data_pg_id,
                 &reader,
                 shard_index,
+                shard_integrity,
                 shard_size,
                 &mut all_shards,
                 &mut present_count,
@@ -2952,6 +3111,7 @@ impl StorageCluster {
                     req.data_pg_id,
                     &reader,
                     shard_index,
+                    shard_integrity,
                     shard_size,
                     &mut all_shards,
                     &mut present_count,
@@ -3065,7 +3225,11 @@ impl StorageCluster {
         }
         if schedule_repair_on_recovery {
             for shard_index in repair_targets {
-                self.schedule_placed_segment_shard_repair(req, shard_index)?;
+                self.schedule_placed_segment_shard_repair(
+                    req,
+                    shard_index,
+                    shard_integrity.cloned(),
+                )?;
             }
         }
         Ok(true)
@@ -3077,6 +3241,7 @@ impl StorageCluster {
         data_pg_id: u32,
         reader: &LocalPlacedSegmentShardReader<'_>,
         shard_index: usize,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         shard_size: usize,
         all_shards: &mut [Option<Vec<u8>>],
         present_count: &mut usize,
@@ -3089,13 +3254,16 @@ impl StorageCluster {
         let Some(shard_key) = reader.shard_key(shard_index) else {
             return Ok(());
         };
-        let ack = match self.load_payload_shard_ack(data_pg_id, &shard_key) {
-            Ok(ack) => ack,
-            Err(StoreError::NotFound) => {
-                Self::record_placed_segment_repair_target(repair_targets, shard_index);
-                return Ok(());
-            }
-            Err(error) => return Err(error),
+        let ack = match shard_integrity.and_then(|witness| witness.expected_ack(shard_index)) {
+            Some(ack) => ack,
+            None => match self.load_payload_shard_ack(data_pg_id, &shard_key) {
+                Ok(ack) => ack,
+                Err(StoreError::NotFound) => {
+                    Self::record_placed_segment_repair_target(repair_targets, shard_index);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            },
         };
         if ack.stored_size != shard_size as u64 {
             Self::record_placed_segment_repair_target(repair_targets, shard_index);
@@ -3138,6 +3306,7 @@ impl StorageCluster {
         &self,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         locations: &[ShardLocation],
         leased_node_ids: Option<&BTreeSet<NodeId>>,
         shard_index: usize,
@@ -3170,7 +3339,12 @@ impl StorageCluster {
         match self
             .read_payload_shard_for_historical_inspection_self_validating(location, &shard_key)
         {
-            Ok((shard, ack)) if ack.stored_size == shard_size as u64 => {
+            Ok((shard, ack))
+                if ack.stored_size == shard_size as u64
+                    && shard_integrity
+                        .and_then(|witness| witness.expected_ack(shard_index))
+                        .is_none_or(|expected| expected == ack) =>
+            {
                 all_shards[shard_index] = Some(shard);
                 *present_count += 1;
             }
@@ -3199,6 +3373,7 @@ impl StorageCluster {
             .enqueue_placed_segment_shard_repair(PlacedSegmentShardRepairWorkItem {
                 request,
                 shard_index,
+                shard_integrity: None,
             })
     }
 
@@ -3216,15 +3391,19 @@ impl StorageCluster {
         &self,
         request: SegmentStoredBytesRequest,
         shard_index: ShardIndex,
+        shard_integrity: Option<crate::types::SegmentShardIntegrityRecord>,
     ) -> Result<(), StoreError> {
         let data_pg_id = self.validated_data_pg(PgId::new(request.data_pg_id))?;
         let work_item = PlacedSegmentShardRepairWorkItem {
             request,
             shard_index,
+            shard_integrity,
         };
         self.metadata_pg_primary_shard_ack_route(data_pg_id)?
             .record_placed_segment_shard_repair(&work_item, None)?;
-        self.enqueue_placed_segment_shard_repair(request, shard_index);
+        self.local_map
+            .runtime_state()
+            .enqueue_placed_segment_shard_repair(work_item);
         Ok(())
     }
 
@@ -3232,11 +3411,13 @@ impl StorageCluster {
         &self,
         request: SegmentStoredBytesRequest,
         shard_index: ShardIndex,
+        shard_integrity: Option<crate::types::SegmentShardIntegrityRecord>,
     ) -> Result<(), StoreError> {
         let data_pg_id = self.validated_data_pg(PgId::new(request.data_pg_id))?;
         let work_item = PlacedSegmentShardRepairWorkItem {
             request,
             shard_index,
+            shard_integrity,
         };
         self.metadata_pg_primary_shard_ack_route(data_pg_id)?
             .resolve_placed_segment_shard_repair(&work_item)
@@ -3532,6 +3713,15 @@ impl StorageCluster {
             shard_ack_route.delete_shard_ack(shard_key)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_delete_metadata_primary_payload_shard_acks(
+        &self,
+        data_pg_id: u32,
+        shard_keys: &[ShardKey],
+    ) -> Result<(), ObjectPgActionError> {
+        self.delete_metadata_primary_payload_shard_keys(data_pg_id, shard_keys)
     }
 
     fn delete_metadata_primary_payload_shard_keys_best_effort_at_epoch(

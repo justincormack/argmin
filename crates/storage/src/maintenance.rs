@@ -1677,9 +1677,9 @@ fn process_shard_repair_work_item(
     };
 
     emit_shard_repair_event(Some(claim.work_item.request.data_pg_id), "started", None);
-    match storage_cluster.repair_placed_segment_payload_shards_if_needed_preserving_repair_rows(
-        claim.work_item.request,
-    ) {
+    match storage_cluster
+        .repair_placed_segment_payload_shards_if_needed_preserving_repair_rows(&claim.work_item)
+    {
         Ok(repaired_acks) => {
             let event = if repaired_acks.is_empty() {
                 "resolved_clean"

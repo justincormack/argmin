@@ -964,7 +964,7 @@ the eventual reader exists before the first payload effect.
   messages. Fixed key/salt/context inputs must produce the same persisted bytes in both builds.
 - [x] Implement streaming seal/open, header/commitment validation, selected-chunk opening, and exact
   final-chunk validation.
-- [ ] Persist the complete storage-owned per-shard integrity witness through segment schema, terminal
+- [x] Persist the complete storage-owned per-shard integrity witness through segment schema, terminal
   commands, apply/recovery, snapshots, RPC, retained reads, repair, and route-history retention.
 - [x] Add the durable profile discriminator and profile-aware stored-size calculations.
 - [ ] Implement one compiler-exhaustive codec/encryption-state compatibility registry and exercise its
@@ -1021,8 +1021,9 @@ Implementation update (2026-10-22, durable profile identity):
   constructor, command apply/recovery, restart, and crossed-byte-format coverage remains open under
   the explicit exhaustive cross-product item; recognizing the durable pair is not yet permission
   for the production writer to emit Cobblestone payloads.
-- PG schema 8, metadata-command 10, storage-RPC 26, canonical-state 7, and checkpoint 5 remain
-  unchanged because their grammar contains a self-describing encryption-state blob. Append-only
+- At this durable-profile-identity sub-slice, PG schema 8, metadata-command 10, storage-RPC 26,
+  canonical-state 7, and checkpoint 5 remained unchanged because their grammar contained a
+  self-describing encryption-state blob. Append-only
   RPC, metadata-command, and checkpoint composites retain the previous SSE-C-v3/SSE-S3-v1 evidence
   and pin the current SSE-C-v4/SSE-S3-v2 bytes. The exact historical append-preparation SSE-S3-v1
   payload remains a rejection specimen beside the current v2 version-vector fixture. No predecessor
@@ -1047,10 +1048,44 @@ Implementation update (2026-10-22, integrity-witness construction boundary):
   acknowledgement-row and shard-byte validation still follows witness construction. The Direct
   PUT regression also installs a registration-boundary sentinel and proves invalid evidence never
   reaches the first durable acknowledgement write; post-cleanup row absence is not its only proof.
-- This is deliberately the construction/pre-publication slice of the still-open witness item.
-  Persisting the witness in segment records and terminal commands, validating it during replica
-  apply/recovery, exposing it through snapshots/RPC/retained reads, and using it for repair and
-  route-history retention remain the next format-versioned slice.
+- This was deliberately the construction/pre-publication slice of the then-open witness item. The
+  following format-versioned slice persists and consumes the evidence end to end.
+
+Implementation update (2026-10-22, durable per-shard integrity witness):
+
+- The witness now has one exact storage-owned durable representation: version 1, canonical shard
+  size, canonical `k+m` count, and ordered CRC64 values whose positions are the derived shard
+  indices. Decoding rejects truncation, trailing bytes, unknown versions, noncanonical geometry,
+  count changes, and CRC reorder/substitution before the value can become read or repair authority.
+- Object, multipart-part, and stream-upload segment rows persist the witness. Direct-PUT, append,
+  UploadPart finalization, and multipart completion commands carry it, and replica apply/recovery
+  validates it against the command's codec, EC shape, stored size, and segment CRC before any
+  object-PG mutation. Cobblestone segments require a witness; the old whole-segment codec permits
+  its historical absent form while all newly staged segments already record one.
+- PG schema 9, metadata-command 11, storage-RPC 27, canonical-state 8, and metadata-checkpoint 6
+  advance together. The schema catalogue and current command/RPC/checkpoint/digest evidence are
+  frozen, while the exact v8/v10/v26/v7/v5 predecessors remain immutable rejection evidence. V10
+  command reconstruction deliberately uses the former grammar rather than serializing an absent
+  v11 option tag.
+- Object snapshots and Unix responses retain and validate the witness. Healthy and degraded active
+  reads use it instead of mutable shard-ack rows; historical reads compare each storage node's
+  self-validating acknowledgement with the same evidence. A retained-read regression deletes all
+  acknowledgement rows, corrupts two data shards, reconstructs from the surviving `k` shards, and
+  proves both corrupt indices are independently identified.
+- Committed segment discovery carries the witness through paged scavenger/backfill RPC and into
+  repair scheduling. When a compact pending-command reference and committed metadata name the
+  same physical shard, their repair evidence merges monotonically and retains the committed
+  witness; two different nonempty witnesses fail closed. Durable repair rows then carry that
+  witness through RPC, claim, restart, and retry. The repair worker reconstructs and verifies
+  against the retained evidence rather than reloading mutable acknowledgement rows. Repair target
+  selection and post-write health verification use the same witness, so loss of every mutable
+  acknowledgement row cannot prevent queued repairs from converging. Malformed persisted witness
+  bytes fail during row decoding, before shard IO. Exact RPC round trips and response validation
+  reject malformed or crossed evidence.
+- No new route-history reference is embedded in the witness: the containing segment already owns
+  the exact data PG and placement epoch. Existing history retention therefore pins precisely the
+  route needed to read every derived shard. The Unix cross-epoch regression now loads the persisted
+  segment witness from metadata and reads through the retained historical route with it.
 
 Exit: full writes and full reads use one segment codec across all operations and pass adversarial
 format tests, but the new profile is not yet selected solely for an unmeasured range benefit.

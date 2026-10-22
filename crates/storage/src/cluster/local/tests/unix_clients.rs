@@ -3814,6 +3814,7 @@ fn frontend_unix_cluster_map_history_reference_summary_reads_storage_node_owned_
         .unwrap();
         let pg = remote.get_pg(0).unwrap();
         pg.test_insert_object_segment(&crate::ObjectSegmentRecord {
+            shard_integrity: None,
             bucket: crate::BucketName::try_from("remote-history-summary-bucket").unwrap(),
             key: crate::ObjectKey::try_from("object").unwrap(),
             version_id: crate::VersionId::from_u64(1),
@@ -8928,6 +8929,8 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
     let written = source_cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment =
+        stream_segment_with_shard_integrity(segment, encrypted.storage_bytes.len(), &written);
     let placement_key = super::super::super::segment_payload_placement_key(
         &segment.segment_okh,
         segment.segment_vid,
@@ -9373,6 +9376,8 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
     let written = source_cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment =
+        stream_segment_with_shard_integrity(segment, encrypted.storage_bytes.len(), &written);
     let placement_key = super::super::super::segment_payload_placement_key(
         &segment.segment_okh,
         segment.segment_vid,
@@ -11924,6 +11929,21 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
         crate::StorageCluster::from_static_local_map(Arc::new(current_map)).unwrap();
     let committed =
         write_committed_direct_segment(&current_cluster, b"cross epoch historical unix read");
+    let bucket = crate::tests::bucket_name("bucket");
+    let key = crate::tests::object_key("key");
+    let snapshot = current_cluster
+        .load_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::StandardSegments,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let segment = snapshot.object_segments[0].clone();
+    assert!(segment.shard_integrity().is_some());
     let request = crate::SegmentStoredBytesRequest {
         data_pg_id: committed.written.data_pg_id,
         segment_okh: committed.segment_okh,
@@ -11962,11 +11982,7 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
 
     let mut historical_read = Vec::new();
     next_cluster
-        .read_segment_payload_stored_bytes_at_placement_epoch_into(
-            current_epoch,
-            request,
-            &mut historical_read,
-        )
+        .read_object_payload_segment_stored_bytes_into(&segment, &mut historical_read)
         .unwrap();
     assert_eq!(historical_read, committed.encrypted.storage_bytes);
 

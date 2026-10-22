@@ -130,6 +130,7 @@ fn replay(state: &State) -> Result<(), String> {
                             &encrypted.storage_bytes,
                         )
                         .map_err(diagnostic)?;
+                    fixture.record_payload_integrity(actor, &payload)?;
                     identities[actor] = Some(direct_payload_test_identity(&payload));
                     payloads[actor] = Some(payload);
                     ownership[actor] = Ownership::Caller;

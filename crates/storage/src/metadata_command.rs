@@ -23,10 +23,10 @@ use crate::types::{
     ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
     ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
     OwnerIdentity, PgId, PublicAccessBlockConfig, PutBucketSubresource, PutLiveObjectReq,
-    SerializedBucketTagSet, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
-    SessionId, StorageClass, StreamUploadCommandRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
-    VersionId, MULTIPART_UPLOAD_ID_KEY_LEN,
+    SegmentShardIntegrityRecord, SerializedBucketTagSet, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass,
+    StreamUploadCommandRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+    TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, MULTIPART_UPLOAD_ID_KEY_LEN,
 };
 
 /// Unforgeable authority for hash values produced by the metadata-command
@@ -40,7 +40,7 @@ impl MetadataCommandLogHashIssuer {
 }
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 10;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 11;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 
@@ -2161,10 +2161,7 @@ impl MetadataCommandEnvelope {
 
     #[cfg(test)]
     pub(crate) fn command_bytes_with_encoding_version_for_test(&self, version: u16) -> Vec<u8> {
-        let mut bytes = self.command_bytes();
-        let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_le_bytes());
-        bytes
+        canonical_command_bytes_with_version(self.id, &self.payload, version)
     }
 
     pub(crate) fn abandoned_log_bytes(&self) -> Vec<u8> {
@@ -2396,9 +2393,17 @@ pub(crate) fn decode_metadata_command_envelope(
 }
 
 fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPayload) -> Vec<u8> {
+    canonical_command_bytes_with_version(id, payload, METADATA_COMMAND_ENCODING_VERSION)
+}
+
+fn canonical_command_bytes_with_version(
+    id: MetadataCommandId,
+    payload: &MetadataCommandPayload,
+    encoding_version: u16,
+) -> Vec<u8> {
     let mut out = Vec::new();
     put_bytes(&mut out, METADATA_COMMAND_MAGIC);
-    put_u16(&mut out, METADATA_COMMAND_ENCODING_VERSION);
+    put_u16(&mut out, encoding_version);
     put_u64(&mut out, id.cluster_epoch().get());
     put_u32(&mut out, id.pg_id().get());
     put_u64(&mut out, id.log_index().get());
@@ -2433,10 +2438,10 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
             encode_reserve_object_version(&mut out, command);
         }
         MetadataCommandPayload::CommitDirectPutObject(command) => {
-            encode_commit_direct_put_object(&mut out, command);
+            encode_commit_direct_put_object(&mut out, command, encoding_version);
         }
         MetadataCommandPayload::CommitMultipartObject(command) => {
-            encode_commit_multipart_object(&mut out, command);
+            encode_commit_multipart_object(&mut out, command, encoding_version);
         }
         MetadataCommandPayload::DeleteObjectVersion(command) => {
             encode_delete_object_version(&mut out, command);
@@ -2451,19 +2456,19 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
             encode_create_stream_upload(&mut out, command);
         }
         MetadataCommandPayload::AppendStreamSegment(command) => {
-            encode_append_stream_segment(&mut out, command);
+            encode_append_stream_segment(&mut out, command, encoding_version);
         }
         MetadataCommandPayload::AbortStreamUpload(command) => {
-            encode_abort_stream_upload(&mut out, command);
+            encode_abort_stream_upload(&mut out, command, encoding_version);
         }
         MetadataCommandPayload::CommitStreamPart(command) => {
-            encode_commit_stream_part(&mut out, command);
+            encode_commit_stream_part(&mut out, command, encoding_version);
         }
         MetadataCommandPayload::CreateMultipartUpload(command) => {
             encode_create_multipart_upload(&mut out, command);
         }
         MetadataCommandPayload::AbortMultipartUpload(command) => {
-            encode_abort_multipart_upload(&mut out, command);
+            encode_abort_multipart_upload(&mut out, command, encoding_version);
         }
         MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
             encode_delete_object_payload_reclaim(&mut out, command);
@@ -3059,6 +3064,17 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_optional(|decoder| decoder.read_bytes().map(<[u8]>::to_vec))
     }
 
+    fn read_optional_segment_shard_integrity(
+        &mut self,
+    ) -> Result<Option<SegmentShardIntegrityRecord>, String> {
+        self.read_optional_bytes_value()?
+            .map(|bytes| {
+                SegmentShardIntegrityRecord::decode(&bytes)
+                    .map_err(|error| format!("invalid segment shard integrity witness: {error}"))
+            })
+            .transpose()
+    }
+
     fn read_optional_u64_value(&mut self) -> Result<Option<u64>, String> {
         self.read_optional(Self::read_u64)
     }
@@ -3302,6 +3318,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_cluster_epoch("object segment placement epoch")?;
         self.read_u8()?;
         self.read_u8()?;
+        self.skip_optional_bytes()?;
         Ok(())
     }
 
@@ -3319,6 +3336,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             placement_cluster_epoch: self.read_cluster_epoch("object segment placement epoch")?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
+            shard_integrity: self.read_optional_segment_shard_integrity()?,
         })
     }
 
@@ -3413,6 +3431,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_cluster_epoch("multipart part segment placement epoch")?;
         self.read_u8()?;
         self.read_u8()?;
+        self.skip_optional_bytes()?;
         Ok(())
     }
 
@@ -3433,6 +3452,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 .read_cluster_epoch("multipart part segment placement epoch")?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
+            shard_integrity: self.read_optional_segment_shard_integrity()?,
         })
     }
 
@@ -3539,6 +3559,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_cluster_epoch("stream upload segment placement epoch")?;
         self.read_u8()?;
         self.read_u8()?;
+        self.skip_optional_bytes()?;
         Ok(())
     }
 
@@ -3556,6 +3577,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 .read_cluster_epoch("stream upload segment placement epoch")?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
+            shard_integrity: self.read_optional_segment_shard_integrity()?,
         })
     }
 
@@ -4268,11 +4290,15 @@ fn encode_reserve_object_version(out: &mut Vec<u8>, command: &ReserveObjectVersi
     encode_version_id(out, command.version_id);
 }
 
-fn encode_commit_direct_put_object(out: &mut Vec<u8>, command: &CommitDirectPutObjectCommand) {
+fn encode_commit_direct_put_object(
+    out: &mut Vec<u8>,
+    command: &CommitDirectPutObjectCommand,
+    encoding_version: u16,
+) {
     encode_put_live_object(out, &command.object);
     put_u32(out, command.segments.len() as u32);
     for segment in &command.segments {
-        encode_object_segment(out, segment);
+        encode_object_segment(out, segment, encoding_version);
     }
     put_str(out, command.generation_reservation_id.as_str());
     put_u64(out, command.write_sequence);
@@ -4291,7 +4317,11 @@ fn encode_commit_direct_put_object(out: &mut Vec<u8>, command: &CommitDirectPutO
     encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
-fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartObjectCommand) {
+fn encode_commit_multipart_object(
+    out: &mut Vec<u8>,
+    command: &CommitMultipartObjectCommand,
+    encoding_version: u16,
+) {
     put_str(out, command.upload_id.as_str());
     put_bytes(out, command.completion_fingerprint.as_bytes());
     encode_put_live_object(out, &command.object);
@@ -4301,7 +4331,7 @@ fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartOb
     }
     put_u32(out, command.selected_streaming_segments.len() as u32);
     for segment in &command.selected_streaming_segments {
-        encode_multipart_part_segment(out, segment);
+        encode_multipart_part_segment(out, segment, encoding_version);
     }
     put_u32(out, command.omitted_parts.len() as u32);
     for part in &command.omitted_parts {
@@ -4309,7 +4339,7 @@ fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartOb
     }
     put_u32(out, command.omitted_streaming_segments.len() as u32);
     for segment in &command.omitted_streaming_segments {
-        encode_multipart_part_segment(out, segment);
+        encode_multipart_part_segment(out, segment, encoding_version);
     }
     put_u32(out, command.stream_uploads.len() as u32);
     for session in &command.stream_uploads {
@@ -4317,7 +4347,7 @@ fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartOb
     }
     put_u32(out, command.stream_upload_segments.len() as u32);
     for segment in &command.stream_upload_segments {
-        encode_stream_upload_segment(out, segment);
+        encode_stream_upload_segment(out, segment, encoding_version);
     }
     put_u64(out, command.write_sequence);
     put_u64(out, command.last_modified_millis);
@@ -4408,20 +4438,28 @@ fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCo
     encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
-fn encode_append_stream_segment(out: &mut Vec<u8>, command: &AppendStreamSegmentCommand) {
+fn encode_append_stream_segment(
+    out: &mut Vec<u8>,
+    command: &AppendStreamSegmentCommand,
+    encoding_version: u16,
+) {
     put_str(out, command.bucket.as_str());
     put_str(out, command.key.as_str());
     encode_stream_upload_target(out, &command.target);
-    encode_stream_upload_segment(out, &command.segment);
+    encode_stream_upload_segment(out, &command.segment, encoding_version);
 }
 
-fn encode_abort_stream_upload(out: &mut Vec<u8>, command: &AbortStreamUploadCommand) {
+fn encode_abort_stream_upload(
+    out: &mut Vec<u8>,
+    command: &AbortStreamUploadCommand,
+    encoding_version: u16,
+) {
     put_str(out, command.bucket.as_str());
     put_str(out, command.key.as_str());
     put_str(out, command.session_id.as_str());
     put_u32(out, command.staged_segments.len() as u32);
     for segment in &command.staged_segments {
-        encode_stream_upload_segment(out, segment);
+        encode_stream_upload_segment(out, segment, encoding_version);
     }
     encode_optional_bucket_write_reservation_proof(
         out,
@@ -4429,7 +4467,11 @@ fn encode_abort_stream_upload(out: &mut Vec<u8>, command: &AbortStreamUploadComm
     );
 }
 
-fn encode_commit_stream_part(out: &mut Vec<u8>, command: &CommitStreamPartCommand) {
+fn encode_commit_stream_part(
+    out: &mut Vec<u8>,
+    command: &CommitStreamPartCommand,
+    encoding_version: u16,
+) {
     put_str(out, command.bucket.as_str());
     put_str(out, command.key.as_str());
     put_str(out, command.session_id.as_str());
@@ -4437,7 +4479,7 @@ fn encode_commit_stream_part(out: &mut Vec<u8>, command: &CommitStreamPartComman
     encode_multipart_part(out, &command.part);
     put_u32(out, command.segments.len() as u32);
     for segment in &command.segments {
-        encode_multipart_part_segment(out, segment);
+        encode_multipart_part_segment(out, segment, encoding_version);
     }
     match &command.existing_part {
         None => put_u8(out, 0),
@@ -4448,7 +4490,7 @@ fn encode_commit_stream_part(out: &mut Vec<u8>, command: &CommitStreamPartComman
     }
     put_u32(out, command.displaced_segments.len() as u32);
     for segment in &command.displaced_segments {
-        encode_multipart_part_segment(out, segment);
+        encode_multipart_part_segment(out, segment, encoding_version);
     }
     encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
@@ -4458,11 +4500,15 @@ fn encode_create_multipart_upload(out: &mut Vec<u8>, command: &CreateMultipartUp
     encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
-fn encode_abort_multipart_upload(out: &mut Vec<u8>, command: &AbortMultipartUploadCommand) {
+fn encode_abort_multipart_upload(
+    out: &mut Vec<u8>,
+    command: &AbortMultipartUploadCommand,
+    encoding_version: u16,
+) {
     put_str(out, command.bucket.as_str());
     put_str(out, command.key.as_str());
     put_str(out, command.upload_id.as_str());
-    encode_abort_multipart_upload_cleanup(out, &command.cleanup);
+    encode_abort_multipart_upload_cleanup(out, &command.cleanup, encoding_version);
     encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
@@ -4498,7 +4544,11 @@ fn encode_object_payload_reclaim(out: &mut Vec<u8>, reclaim: &ObjectPayloadRecla
     }
 }
 
-fn encode_abort_multipart_upload_cleanup(out: &mut Vec<u8>, cleanup: &AbortMultipartUploadCleanup) {
+fn encode_abort_multipart_upload_cleanup(
+    out: &mut Vec<u8>,
+    cleanup: &AbortMultipartUploadCleanup,
+    encoding_version: u16,
+) {
     encode_multipart_upload(out, &cleanup.upload);
     put_u32(out, cleanup.parts.len() as u32);
     for part in &cleanup.parts {
@@ -4506,7 +4556,7 @@ fn encode_abort_multipart_upload_cleanup(out: &mut Vec<u8>, cleanup: &AbortMulti
     }
     put_u32(out, cleanup.streaming_segments.len() as u32);
     for segment in &cleanup.streaming_segments {
-        encode_multipart_part_segment(out, segment);
+        encode_multipart_part_segment(out, segment, encoding_version);
     }
     put_u32(out, cleanup.stream_uploads.len() as u32);
     for session in &cleanup.stream_uploads {
@@ -4514,7 +4564,7 @@ fn encode_abort_multipart_upload_cleanup(out: &mut Vec<u8>, cleanup: &AbortMulti
     }
     put_u32(out, cleanup.stream_upload_segments.len() as u32);
     for segment in &cleanup.stream_upload_segments {
-        encode_stream_upload_segment(out, segment);
+        encode_stream_upload_segment(out, segment, encoding_version);
     }
 }
 
@@ -4672,7 +4722,7 @@ fn encode_bucket_record(out: &mut Vec<u8>, bucket: &BucketRecord) {
     encode_bucket_encryption(out, bucket.encryption);
 }
 
-fn encode_object_segment(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
+fn encode_object_segment(out: &mut Vec<u8>, segment: &ObjectSegmentRecord, encoding_version: u16) {
     put_str(out, segment.bucket.as_str());
     put_str(out, segment.key.as_str());
     encode_version_id(out, segment.version_id);
@@ -4685,6 +4735,16 @@ fn encode_object_segment(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
     put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
+    if encoding_version >= 11 {
+        encode_optional_bytes(
+            out,
+            segment
+                .shard_integrity
+                .as_ref()
+                .map(|witness| witness.encode())
+                .as_deref(),
+        );
+    }
 }
 
 fn encode_object_part(out: &mut Vec<u8>, part: &ObjectPartRecord) {
@@ -4726,7 +4786,11 @@ fn encode_multipart_part(out: &mut Vec<u8>, part: &MultipartPartRecord) {
     );
 }
 
-fn encode_multipart_part_segment(out: &mut Vec<u8>, segment: &MultipartPartSegmentRecord) {
+fn encode_multipart_part_segment(
+    out: &mut Vec<u8>,
+    segment: &MultipartPartSegmentRecord,
+    encoding_version: u16,
+) {
     put_str(out, segment.bucket.as_str());
     put_str(out, segment.key.as_str());
     put_str(out, segment.upload_id.as_str());
@@ -4741,6 +4805,16 @@ fn encode_multipart_part_segment(out: &mut Vec<u8>, segment: &MultipartPartSegme
     put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
+    if encoding_version >= 11 {
+        encode_optional_bytes(
+            out,
+            segment
+                .shard_integrity
+                .as_ref()
+                .map(|witness| witness.encode())
+                .as_deref(),
+        );
+    }
 }
 
 fn encode_stream_upload_target(out: &mut Vec<u8>, target: &StreamUploadTarget) {
@@ -4757,7 +4831,11 @@ fn encode_stream_upload_target(out: &mut Vec<u8>, target: &StreamUploadTarget) {
     }
 }
 
-fn encode_stream_upload_segment(out: &mut Vec<u8>, segment: &StreamUploadSegmentRecord) {
+fn encode_stream_upload_segment(
+    out: &mut Vec<u8>,
+    segment: &StreamUploadSegmentRecord,
+    encoding_version: u16,
+) {
     put_str(out, segment.session_id.as_str());
     put_u32(out, segment.segment_index);
     put_u64(out, segment.size);
@@ -4769,6 +4847,16 @@ fn encode_stream_upload_segment(out: &mut Vec<u8>, segment: &StreamUploadSegment
     put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
+    if encoding_version >= 11 {
+        encode_optional_bytes(
+            out,
+            segment
+                .shard_integrity
+                .as_ref()
+                .map(|witness| witness.encode())
+                .as_deref(),
+        );
+    }
 }
 
 fn encode_object_segments_reclaim(out: &mut Vec<u8>, reclaim: &ObjectSegmentsReclaimRecord) {
@@ -5326,18 +5414,7 @@ mod tests {
             expected_checksum,
             "the historical v10/SSE-S3-v1 command specimen changed"
         );
-        assert!(decode_metadata_command_log_entry_header(&historical_bytes).is_ok());
-        if historical_bytes == current.command_bytes() {
-            assert_eq!(
-                decode_metadata_command_envelope_for_test(&historical_bytes).unwrap(),
-                current.clone()
-            );
-        } else {
-            assert!(matches!(
-                decode_metadata_command_envelope_for_test(&historical_bytes),
-                Err(MetadataCommandFormatError::InvalidPayload(_))
-            ));
-        }
+        assert_unsupported_applied_command(&historical_bytes, 10);
     }
 
     fn decode_fixture_hex(encoded: &str) -> Vec<u8> {
@@ -6130,14 +6207,14 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0x0ec7_6f0b_a2c2_1db3);
+        assert_eq!(envelope.checksum_crc64(), 9_984_392_612_141_401_546);
         assert_immutable_v8_command_is_rejected(&envelope, 0x328ff7137ea3be2a);
     }
 
     #[test]
-    fn current_metadata_command_v10_checksum_tags_match_frozen_owner_encoding_and_require_version_bump(
+    fn current_metadata_command_v11_checksum_tags_match_frozen_owner_encoding_and_require_version_bump(
     ) {
-        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 10);
+        assert_eq!(METADATA_COMMAND_ENCODING_VERSION, 11);
 
         let cases = [
             (None, &[0_u8][..]),
@@ -6295,7 +6372,7 @@ mod tests {
         assert_eq!(applied_header.command_kind_name(), Some("CreateBucket"));
 
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        for version in [6_u16, 7_u16, 8_u16, 9_u16, 11_u16] {
+        for version in [6_u16, 7_u16, 8_u16, 9_u16, 10_u16, 12_u16] {
             let mut unsupported_version = envelope.command_bytes();
             unsupported_version[version_offset..version_offset + 2]
                 .copy_from_slice(&version.to_le_bytes());
@@ -6434,7 +6511,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x596e871f919e1c44);
+        assert_eq!(envelope.checksum_crc64(), 15_935_521_339_035_943_997);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -6463,7 +6540,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xd4799906245bce28);
+        assert_eq!(envelope.checksum_crc64(), 5_778_476_916_891_768_401);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -6529,7 +6606,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x8c0deaf2c0a27353);
+        assert_eq!(envelope.checksum_crc64(), 595_941_723_278_502_698);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -6609,13 +6686,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xc8c2ed216d985e16,
-                0xb045a41909009421,
-                0xe795eb9bdb069bb8,
-                0x607c39fd5c222530,
-                0xb4b69203bf953f54,
-                0x3f914a4c9aeb6188,
-                0x1ff32ef6c71e7c75,
+                15_502_722_064_325_344_209,
+                15_188_827_325_252_596_124,
+                5_311_061_317_790_959_643,
+                16_713_340_558_146_122_952,
+                3_691_576_553_857_789_612,
+                13_536_014_434_728_704_497,
+                10_988_397_868_075_838_861,
             ]
         );
     }
@@ -6697,14 +6774,14 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x64ab7fbb371e6669,
-                0x914c5248228a85b6,
-                0x0cf497116cac8b2a,
-                0xcdd72ea89b47a079,
-                0x181fe509a5800a3e,
-                0x5e108fe65f8b69e7,
-                0x818b46b9c3afd6f5,
-                0xa0761269b2379619,
+                12_933_831_130_824_656_095,
+                11_594_063_224_019_010_126,
+                16_592_609_381_666_078_469,
+                18_193_733_201_319_421_825,
+                16_543_295_276_200_127_386,
+                8_050_957_004_951_465_503,
+                8_658_000_718_020_969_719,
+                10_510_314_330_509_005_281,
             ]
         );
     }
@@ -6721,6 +6798,7 @@ mod tests {
         );
         let generation_id = GenerationId::MIN;
         let segment = ObjectSegmentRecord {
+            shard_integrity: None,
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: VersionId::Null,
@@ -6853,6 +6931,7 @@ mod tests {
         };
         let stream_session_id = SessionId::try_from("31".repeat(16)).unwrap();
         let stream_segment = StreamUploadSegmentRecord {
+            shard_integrity: None,
             session_id: stream_session_id.clone(),
             segment_index: 3,
             size: 17,
@@ -6866,6 +6945,7 @@ mod tests {
             ec_m: 1,
         };
         let selected_streaming_segment = MultipartPartSegmentRecord {
+            shard_integrity: None,
             bucket: bucket.clone(),
             key: key.clone(),
             upload_id: upload_id.clone(),
@@ -6882,6 +6962,7 @@ mod tests {
             ec_m: 1,
         };
         let omitted_streaming_segment = MultipartPartSegmentRecord {
+            shard_integrity: None,
             version_id: u64::MAX,
             part_number: 3,
             segment_index: 1,
@@ -7313,36 +7394,36 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x3eede9801cfe1e42,
-                0x5887280c05dc5025,
-                0xdc6be059754dfe06,
-                0x23ad880c4c37da5c,
-                0x09834e6859fc7d69,
-                0xc05eeb64dde66e14,
-                0x5d29c0afcc45220c,
-                0x16745a273ed1ef92,
-                0x369f01d04afce477,
-                0x5fe993c65ea86d35,
-                0xcbbb2b5ceee021a6,
-                0x8c7e41d4df870088,
-                0x908fc9b46db02704,
-                0xa79d38df9b62867d,
-                0xa5eaea3fb24fb7f1,
-                0xd083781ced7b09b3,
-                0x3f75e4ebf59676bd,
-                0x566e4e612725ec08,
-                0x52f759a002e49760,
-                0xfd12b387bac66285,
-                0xea7f08581041d736,
-                0x162d22001ae4bbdb,
-                0x473a32e3c2033fa1,
-                0x5ee27805f424e980,
-                0x301f8cae1a9de624,
-                0x81b17507f847496b,
-                0xe8bfaf63eb60bb7f,
-                0x394a24a07fe81d71,
-                0xcb893da40e89340a,
-                0x516867c8eb5e791d,
+                1_823_888_188_837_738_123,
+                12_530_097_086_218_595_292,
+                1_783_846_759_543_017_215,
+                10_050_672_025_233_015_300,
+                16_534_724_818_661_857_159,
+                2_700_264_224_357_224_519,
+                13_610_686_504_679_361_641,
+                6_621_870_101_727_758_425,
+                9_413_645_625_304_074_522,
+                2_588_941_653_116_204_339,
+                13_728_027_982_590_338_563,
+                8_953_971_771_838_591_472,
+                3_839_912_953_839_916_107,
+                17_270_698_009_279_100_277,
+                18_217_185_878_674_340_207,
+                11_003_306_087_498_250_939,
+                13_020_660_153_053_595_592,
+                15_764_866_958_061_579_827,
+                10_940_282_028_130_375_869,
+                17_764_028_679_422_752_289,
+                11_189_014_126_277_639_198,
+                10_341_524_258_151_998_188,
+                17_598_587_499_391_051_976,
+                15_555_201_368_631_162_286,
+                1_081_647_283_440_392_892,
+                16_379_006_855_824_226_457,
+                6_183_517_103_309_104_107,
+                8_177_063_759_163_616_889,
+                15_431_799_212_681_859_503,
+                585_700_342_204_918_605,
             ]
         );
 
@@ -7379,7 +7460,7 @@ mod tests {
         put_u16(&mut v7_append, METADATA_COMMAND_APPEND_STREAM_SEGMENT);
         put_str(&mut v7_append, bucket.as_str());
         put_str(&mut v7_append, key.as_str());
-        encode_stream_upload_segment(&mut v7_append, &stream_segment);
+        encode_stream_upload_segment(&mut v7_append, &stream_segment, 7);
         assert_eq!(checksum::crc64::checksum(&v7_append), 0x90918496a8aa4bc2);
         let expected_error = MetadataCommandFormatError::UnsupportedVersion {
             format: MetadataCommandRecordFormat::Applied,

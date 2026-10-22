@@ -5196,10 +5196,12 @@ impl StorageCluster {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
+                    let durable_shard_integrity = integrity_witness.durable_record();
                     let command = match direct_put_metadata_route
                         .build_direct_put_commit_command_until(
                             BuildDirectPutCommitCommandReq {
                                 request: req,
+                                shard_integrity: Some(&durable_shard_integrity),
                                 version_id,
                                 expected_snapshot: &snapshot,
                                 bucket_write_reservation: &effective_bucket_write_reservation,
@@ -6446,6 +6448,7 @@ impl StorageCluster {
         };
 
         let segment_record = ObjectSegmentRecord {
+            shard_integrity: None,
             bucket: req.bucket.clone(),
             key: req.key.clone(),
             version_id,
@@ -7520,6 +7523,26 @@ impl StorageCluster {
                 stored_segment_size
             }
         };
+        let integrity_witness = match Self::build_payload_shard_integrity_witness(
+            segment_record.data_pg_id,
+            ec,
+            &segment_record.segment_okh,
+            segment_record.segment_vid,
+            stored_segment_size,
+            segment_record.segment_crc64,
+            shard_batch,
+        ) {
+            Ok(witness) => witness,
+            Err(error) => {
+                cleanup_stream_append_payload!();
+                return Err(error);
+            }
+        };
+        let witnessed_segment_record = StreamUploadSegmentRecord {
+            shard_integrity: Some(integrity_witness.durable_record()),
+            ..segment_record.clone()
+        };
+        let segment_record = &witnessed_segment_record;
         loop {
             if let Err(error) = require_valid_route() {
                 cleanup_stream_append_payload!();
@@ -7648,21 +7671,6 @@ impl StorageCluster {
                 cleanup_stream_append_payload!();
                 return Err(ObjectPgActionError::Store(error));
             }
-            let integrity_witness = match Self::build_payload_shard_integrity_witness(
-                segment_record.data_pg_id,
-                ec,
-                &segment_record.segment_okh,
-                segment_record.segment_vid,
-                stored_segment_size,
-                segment_record.segment_crc64,
-                shard_batch,
-            ) {
-                Ok(witness) => witness,
-                Err(error) => {
-                    cleanup_stream_append_payload!();
-                    return Err(error);
-                }
-            };
             if let Err(error) = self.register_validated_payload_shard_acks(&integrity_witness) {
                 cleanup_stream_append_payload!();
                 return Err(error);

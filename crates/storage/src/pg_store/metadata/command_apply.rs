@@ -931,6 +931,30 @@ impl PgStore {
         &self,
         command: &CommitDirectPutObjectCommand,
     ) -> Result<(), MetadataError> {
+        for segment in &command.segments {
+            let stored_size = command
+                .object
+                .encryption
+                .segment_stored_size(segment.size)
+                .ok_or(MetadataError::InvariantViolation {
+                    context: "commit direct put command payload-codec geometry",
+                    reason: "metadata state does not satisfy the operation invariant".into(),
+                })?;
+            validate_segment_shard_integrity_for_codec(
+                command.object.encryption.payload_codec(),
+                segment.shard_integrity.as_ref(),
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+                stored_size,
+                segment.segment_crc64,
+            )
+            .map_err(|_| MetadataError::InvariantViolation {
+                context: "commit direct put command shard integrity witness",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            })?;
+        }
         self.validate_direct_put_stream_session_proof(command)?;
         if self.direct_put_command_already_applied(command)? {
             return self.cleanup_direct_put_terminal_staging(command);
@@ -1154,6 +1178,30 @@ impl PgStore {
         &self,
         command: &CommitMultipartObjectCommand,
     ) -> Result<(), MetadataError> {
+        for segment in &command.selected_streaming_segments {
+            let stored_size = command
+                .object
+                .encryption
+                .segment_stored_size(segment.size)
+                .ok_or(MetadataError::InvariantViolation {
+                    context: "commit multipart object command payload-codec geometry",
+                    reason: "metadata state does not satisfy the operation invariant".into(),
+                })?;
+            validate_segment_shard_integrity_for_codec(
+                command.object.encryption.payload_codec(),
+                segment.shard_integrity.as_ref(),
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+                stored_size,
+                segment.segment_crc64,
+            )
+            .map_err(|_| MetadataError::InvariantViolation {
+                context: "commit multipart object command shard integrity witness",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            })?;
+        }
         if self.multipart_object_command_already_applied(command)? {
             return Ok(());
         }
@@ -1420,8 +1468,8 @@ impl PgStore {
             .prepare_cached(
                 "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                  segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )
             .map_err(|e| MetadataError::Db { context: "commit multipart object command (prepare insert part segments)",
                 source: e.into(),
@@ -1456,6 +1504,7 @@ impl PgStore {
                 segment.placement_cluster_epoch.get() as i64,
                 segment.ec_k,
                 segment.ec_m,
+                segment.shard_integrity.as_ref().map(|witness| witness.encode()),
             ])
             .map_err(|e| MetadataError::Db {
                 context: "commit multipart object command (insert part segment)",

@@ -4021,6 +4021,7 @@ impl StorageNodeConnectionHandler {
         };
         match route.build_direct_put_commit_command(
             &request.request,
+            request.shard_integrity.as_ref(),
             request.version_id,
             &request.expected_snapshot,
         ) {

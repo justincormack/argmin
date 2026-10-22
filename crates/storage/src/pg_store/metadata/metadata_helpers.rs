@@ -929,8 +929,8 @@ impl PgStore {
             .prepare_cached(
                 "INSERT INTO object_segments \
                  (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                  data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )
             .map_err(|e| MetadataError::Db {
                 context: "put explicit segment object (prepare insert segments)",
@@ -963,6 +963,7 @@ impl PgStore {
                 segment.placement_cluster_epoch.get() as i64,
                 segment.ec_k,
                 segment.ec_m,
+                segment.shard_integrity.as_ref().map(|witness| witness.encode()),
             ])
             .map_err(|e| MetadataError::Db {
                 context: "put explicit segment object (insert segment)",

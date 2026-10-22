@@ -870,6 +870,7 @@ impl super::StorageCluster {
                 },
             },
             ShardIndex::new(shard_index),
+            None,
         )
     }
 

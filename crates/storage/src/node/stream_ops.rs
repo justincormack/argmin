@@ -214,6 +214,7 @@ impl SharedStorageNode {
             }
         };
         let segment_record = StreamUploadSegmentRecord {
+            shard_integrity: None,
             session_id: request.session_id.clone(),
             segment_index: request.segment_index,
             size: request.size,

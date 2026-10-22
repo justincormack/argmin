@@ -73,14 +73,16 @@ impl PgStore {
             .execute(
                 "INSERT INTO placed_segment_shard_repairs \
                  (data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, ec_k, ec_m, \
-                  shard_index, first_seen_at, last_seen_at, observation_count, last_error) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 1, ?10) \
+                  shard_integrity, shard_index, first_seen_at, last_seen_at, observation_count, \
+                  last_error) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, 1, ?11) \
                  ON CONFLICT(segment_okh, segment_vid, shard_index) DO UPDATE SET \
                   data_pg_id = excluded.data_pg_id, \
                   stored_size = excluded.stored_size, \
                   segment_crc64 = excluded.segment_crc64, \
                   ec_k = excluded.ec_k, \
                   ec_m = excluded.ec_m, \
+                  shard_integrity = excluded.shard_integrity, \
                   last_seen_at = excluded.last_seen_at, \
                   observation_count = placed_segment_shard_repairs.observation_count + 1, \
                   last_error = COALESCE(excluded.last_error, placed_segment_shard_repairs.last_error)",
@@ -92,6 +94,10 @@ impl PgStore {
                     work_item.request.segment_crc64 as i64,
                     work_item.request.ec.k as i64,
                     work_item.request.ec.m as i64,
+                    work_item
+                        .shard_integrity
+                        .as_ref()
+                        .map(SegmentShardIntegrityRecord::encode),
                     work_item.shard_index.get() as i64,
                     now as i64,
                     last_error,
@@ -111,8 +117,8 @@ impl PgStore {
             .conn
             .prepare_cached(
                 "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
-                        ec_k, ec_m, shard_index, first_seen_at, last_seen_at, observation_count, \
-                        last_error \
+                        ec_k, ec_m, shard_integrity, shard_index, first_seen_at, last_seen_at, \
+                        observation_count, last_error \
                  FROM placed_segment_shard_repairs \
                  ORDER BY last_seen_at, segment_okh, segment_vid, shard_index \
                  LIMIT ?1",
@@ -127,10 +133,10 @@ impl PgStore {
                 |row| {
                     Ok((
                         placed_segment_shard_repair_work_item_from_row(row)?,
-                        row.get::<_, i64>(8)?,
                         row.get::<_, i64>(9)?,
                         row.get::<_, i64>(10)?,
-                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, Option<String>>(12)?,
                     ))
                 },
             )
@@ -672,7 +678,7 @@ impl PgStore {
                     .conn
                     .query_row(
                         "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
-                                ec_k, ec_m, shard_index \
+                                ec_k, ec_m, shard_integrity, shard_index \
                          FROM placed_segment_shard_repairs \
                          WHERE next_attempt_after <= ?1 \
                            AND (claim_id IS NULL OR (lease_deadline IS NOT NULL AND lease_deadline <= ?1)) \
@@ -1483,13 +1489,14 @@ impl PgStore {
                 };
                 self.query_row_cached_optional(
                     "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                            s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
+                            s.placement_cluster_epoch, s.ec_k, s.ec_m, s.shard_integrity, \
+                            o.encryption_type, o.encryption_state \
                      FROM object_segments s \
                      JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
                      WHERE s.bucket = ?1 AND s.key = ?2 AND s.version_id = ?3 AND s.segment_index = ?4",
                     params![bucket, key, version_id, i64::from(*segment_index)],
                     "load exact object segment shard scavenger reference",
-                    |row| self.placed_segment_backfill_reference_from_row(row, 0, 8, 9),
+                    |row| self.placed_segment_backfill_reference_from_row(row, 0, 8, 9, 10),
                 )?
             }
             ShardScavengerReferenceCursor::StreamUploadSegment {
@@ -1497,13 +1504,14 @@ impl PgStore {
                 segment_index,
             } => self.query_row_cached_optional(
                 "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type, u.encryption_state \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, s.shard_integrity, \
+                        u.encryption_type, u.encryption_state \
                  FROM stream_upload_segments s \
                  JOIN stream_uploads u ON u.session_id = s.session_id \
                  WHERE s.session_id = ?1 AND s.segment_index = ?2",
                 params![session_id, i64::from(*segment_index)],
                 "load exact stream segment shard scavenger reference",
-                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8, 9),
+                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8, 9, 10),
             )?,
             ShardScavengerReferenceCursor::MultipartPartSegment {
                 bucket,
@@ -1513,7 +1521,8 @@ impl PgStore {
                 segment_index,
             } => self.query_row_cached_optional(
                 "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, s.shard_integrity, \
+                        o.encryption_type, o.encryption_state \
                  FROM multipart_part_segments s \
                  JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
                  WHERE s.bucket = ?1 AND s.key = ?2 AND s.upload_id = ?3 \
@@ -1526,7 +1535,7 @@ impl PgStore {
                     i64::from(*segment_index)
                 ],
                 "load exact multipart segment shard scavenger reference",
-                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8, 9),
+                |row| self.placed_segment_backfill_reference_from_row(row, 0, 8, 9, 10),
             )?,
             ShardScavengerReferenceCursor::PendingPlacedCommand {
                 cluster_epoch,
@@ -1795,7 +1804,8 @@ impl PgStore {
             .prepare_cached(
                 "SELECT s.bucket, s.key, s.version_id, s.segment_index, \
                         s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, s.shard_integrity, \
+                        o.encryption_type, o.encryption_state \
                  FROM object_segments s \
                  JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
                  WHERE (s.bucket, s.key, s.version_id, s.segment_index) > (?1, ?2, ?3, ?4) \
@@ -1826,7 +1836,7 @@ impl PgStore {
                             segment_index,
                         },
                         reference: ShardScavengerPayloadReference::Placed(
-                            self.placed_segment_backfill_reference_from_row(row, 4, 12, 13)?,
+                            self.placed_segment_backfill_reference_from_row(row, 4, 12, 13, 14)?,
                         ),
                     })
                 },
@@ -1858,7 +1868,8 @@ impl PgStore {
             .prepare_cached(
                 "SELECT s.session_id, s.segment_index, \
                         s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type, u.encryption_state \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, s.shard_integrity, \
+                        u.encryption_type, u.encryption_state \
                  FROM stream_upload_segments s \
                  JOIN stream_uploads u ON u.session_id = s.session_id \
                  WHERE (s.session_id, s.segment_index) > (?1, ?2) \
@@ -1879,7 +1890,7 @@ impl PgStore {
                         segment_index: row.get(1)?,
                     },
                     reference: ShardScavengerPayloadReference::Placed(
-                        self.placed_segment_backfill_reference_from_row(row, 2, 10, 11)?,
+                        self.placed_segment_backfill_reference_from_row(row, 2, 10, 11, 12)?,
                     ),
                 })
             })
@@ -1910,7 +1921,8 @@ impl PgStore {
             .prepare_cached(
                 "SELECT s.bucket, s.key, s.upload_id, s.part_number, s.segment_index, \
                         s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, s.shard_integrity, \
+                        o.encryption_type, o.encryption_state \
                  FROM multipart_part_segments s \
                  JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
                  WHERE (s.bucket, s.key, s.upload_id, s.part_number, s.segment_index) \
@@ -1944,7 +1956,7 @@ impl PgStore {
                             segment_index: row.get(4)?,
                         },
                         reference: ShardScavengerPayloadReference::Placed(
-                            self.placed_segment_backfill_reference_from_row(row, 5, 13, 14)?,
+                            self.placed_segment_backfill_reference_from_row(row, 5, 13, 14, 15)?,
                         ),
                     })
                 },
@@ -2367,6 +2379,10 @@ impl PgStore {
                 k: encoded[52],
                 m: encoded[53],
             },
+            // Pending-reference pages intentionally remain a compact index.
+            // The exact command retains the authoritative witness; committed
+            // segment rows carry it into durable scavenger/backfill work.
+            shard_integrity: None,
         })
     }
 
@@ -2409,6 +2425,7 @@ impl PgStore {
         &self,
         row: &rusqlite::Row<'_>,
         reference_start: usize,
+        shard_integrity_index: usize,
         encryption_type_index: usize,
         encryption_state_index: usize,
     ) -> rusqlite::Result<ShardScavengerPlacedShardSetReference> {
@@ -2447,6 +2464,18 @@ impl PgStore {
                 k: row.get(reference_start + 6)?,
                 m: row.get(reference_start + 7)?,
             },
+            shard_integrity: row
+                .get::<_, Option<Vec<u8>>>(shard_integrity_index)?
+                .map(|encoded| {
+                    SegmentShardIntegrityRecord::decode(&encoded).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            shard_integrity_index,
+                            rusqlite::types::Type::Blob,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?,
         })
     }
 
@@ -2457,7 +2486,8 @@ impl PgStore {
         self.extend_scavenger_encrypted_placed_references(
             &mut references,
             "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                    s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
+                    s.placement_cluster_epoch, s.ec_k, s.ec_m, s.shard_integrity, \
+                    o.encryption_type, o.encryption_state \
              FROM object_segments s \
              JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id",
             "list object segment shard scavenger references",
@@ -2465,7 +2495,8 @@ impl PgStore {
         self.extend_scavenger_encrypted_placed_references(
             &mut references,
             "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                    s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type, u.encryption_state \
+                    s.placement_cluster_epoch, s.ec_k, s.ec_m, s.shard_integrity, \
+                    u.encryption_type, u.encryption_state \
              FROM stream_upload_segments s \
              JOIN stream_uploads u ON u.session_id = s.session_id",
             "list stream upload segment shard scavenger references",
@@ -2473,7 +2504,8 @@ impl PgStore {
         self.extend_scavenger_encrypted_placed_references(
             &mut references,
             "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
-                    s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type, o.encryption_state \
+                    s.placement_cluster_epoch, s.ec_k, s.ec_m, s.shard_integrity, \
+                    o.encryption_type, o.encryption_state \
              FROM multipart_part_segments s \
              JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id",
             "list multipart part segment shard scavenger references",
@@ -2652,6 +2684,7 @@ impl PgStore {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
+                    shard_integrity: segment.shard_integrity.clone(),
                 },
             );
         }
@@ -2689,6 +2722,7 @@ impl PgStore {
                     k: segment.ec_k,
                     m: segment.ec_m,
                 },
+                shard_integrity: segment.shard_integrity.clone(),
             },
         );
         Ok(())
@@ -2732,6 +2766,7 @@ impl PgStore {
                         k: segment.ec_k,
                         m: segment.ec_m,
                     },
+                    shard_integrity: segment.shard_integrity.clone(),
                 },
             );
         }
@@ -2870,39 +2905,8 @@ impl PgStore {
             })?;
         let rows = stmt
             .query_map([], |row| {
-                let okh_blob: Vec<u8> = row.get(1)?;
-                let encryption = Self::decode_scavenger_encryption(row.get(8)?, row.get(9)?, 8)?;
                 Ok(ShardScavengerPayloadReference::Placed(
-                    ShardScavengerPlacedShardSetReference {
-                        data_pg_id: row.get(0)?,
-                        okh: PgStore::parse_okh_blob(&okh_blob, 1)?,
-                        generation_id: PgStore::parse_generation_id(
-                            row.get::<_, i64>(2)?,
-                            2,
-                            "shard scavenger reference generation",
-                        )?,
-                        placement_cluster_epoch: PgStore::parse_cluster_epoch(
-                            row.get::<_, i64>(5)?,
-                            5,
-                            "placement_cluster_epoch",
-                        )?,
-                        stored_size: Self::stored_segment_size_for_encryption(
-                            row.get::<_, i64>(3)? as u64,
-                            &encryption,
-                        )
-                        .map_err(|reason| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                rusqlite::types::Type::Integer,
-                                Box::from(reason),
-                            )
-                        })?,
-                        crc64: row.get::<_, i64>(4)? as u64,
-                        ec: EcShape {
-                            k: row.get(6)?,
-                            m: row.get(7)?,
-                        },
-                    },
+                    self.placed_segment_backfill_reference_from_row(row, 0, 8, 9, 10)?,
                 ))
             })
             .map_err(|source| StoreError::Db {
@@ -3218,6 +3222,17 @@ fn validate_placed_segment_shard_repair_work_item(
             ),
         });
     }
+    if let Some(shard_integrity) = work_item.shard_integrity.as_ref() {
+        shard_integrity
+            .validate(
+                work_item.request.ec,
+                work_item.request.stored_size as u64,
+                work_item.request.segment_crc64,
+            )
+            .map_err(|error| StoreError::PayloadShardSetMismatch {
+                reason: format!("invalid durable repair shard integrity witness: {error}"),
+            })?;
+    }
     Ok(())
 }
 
@@ -3415,7 +3430,7 @@ fn durable_repair_u64_to_i64(value: u64, context: &'static str) -> Result<i64, S
 fn durable_repair_claim_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
-                ec_k, ec_m, shard_index, claim_id, owner_token, cluster_epoch, claimed_at, \
+                ec_k, ec_m, shard_integrity, shard_index, claim_id, owner_token, cluster_epoch, claimed_at, \
                 lease_deadline, attempt_count, last_error \
          FROM placed_segment_shard_repairs \
          WHERE {where_clause} \
@@ -3442,10 +3457,10 @@ fn placed_segment_shard_repair_claim_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<PlacedSegmentShardRepairClaimRecord, rusqlite::Error> {
     let work_item = placed_segment_shard_repair_work_item_from_row(row)?;
-    let cluster_epoch = row.get::<_, i64>(10)?;
+    let cluster_epoch = row.get::<_, i64>(11)?;
     let cluster_epoch = ClusterEpoch::new(cluster_epoch as u64).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            10,
+            11,
             rusqlite::types::Type::Integer,
             Box::new(std::io::Error::other(
                 "durable repair claim row has invalid cluster epoch",
@@ -3454,15 +3469,15 @@ fn placed_segment_shard_repair_claim_from_row(
     })?;
     Ok(PlacedSegmentShardRepairClaimRecord {
         work_item,
-        claim_id: row.get(8)?,
-        owner_token: row.get(9)?,
+        claim_id: row.get(9)?,
+        owner_token: row.get(10)?,
         cluster_epoch,
-        claimed_at: row.get::<_, i64>(11)? as u64,
+        claimed_at: row.get::<_, i64>(12)? as u64,
         lease_deadline: row
-            .get::<_, Option<i64>>(12)?
+            .get::<_, Option<i64>>(13)?
             .map(|deadline| deadline as u64),
-        attempt_count: row.get::<_, i64>(13)? as u64,
-        last_error: row.get(14)?,
+        attempt_count: row.get::<_, i64>(14)? as u64,
+        last_error: row.get(15)?,
     })
 }
 
@@ -3536,6 +3551,18 @@ fn placed_segment_shard_repair_work_item_from_row(
             )),
         )
     })?;
+    let shard_integrity = row
+        .get::<_, Option<Vec<u8>>>(7)?
+        .map(|encoded| {
+            SegmentShardIntegrityRecord::decode(&encoded).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(error.to_string())),
+                )
+            })
+        })
+        .transpose()?;
     let work_item = PlacedSegmentShardRepairWorkItem {
         request: SegmentStoredBytesRequest {
             data_pg_id: row.get::<_, i64>(0)? as u32,
@@ -3548,7 +3575,8 @@ fn placed_segment_shard_repair_work_item_from_row(
                 m: row.get::<_, i64>(6)? as u8,
             },
         },
-        shard_index: ShardIndex::new(row.get::<_, i64>(7)? as u8),
+        shard_index: ShardIndex::new(row.get::<_, i64>(8)? as u8),
+        shard_integrity,
     };
     validate_placed_segment_shard_repair_work_item(&work_item).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -3680,6 +3708,7 @@ mod tests {
             state.with_payload_codec_for_test(crate::SegmentPayloadCodec::Cobblestone256SegmentV1),
         );
         let segment = ObjectSegmentRecord {
+            shard_integrity: None,
             bucket: BucketName::try_from("bucket").unwrap(),
             key: ObjectKey::try_from("key").unwrap(),
             version_id: VersionId::Null,
@@ -3713,16 +3742,36 @@ mod tests {
     fn placed_segment_shard_repair_rows_are_durable_and_coalesced() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 7).unwrap();
+        let payload = b"durable repair witness";
+        let segment_okh = [0xA7; 16];
+        let segment_vid = GenerationId::new(42).unwrap();
+        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), 0);
+        let shard_ack = WriteAck {
+            crc64: checksum::crc64::checksum(payload),
+            stored_size: payload.len() as u64,
+        };
+        let shard_integrity = SegmentShardIntegrityWitness::from_ordered_shard_acks(
+            7,
+            EcShape { k: 1, m: 0 },
+            &segment_okh,
+            segment_vid,
+            payload.len() as u64,
+            shard_ack.crc64,
+            &[(&shard_key, shard_ack)],
+        )
+        .unwrap()
+        .durable_record();
         let work_item = PlacedSegmentShardRepairWorkItem {
             request: SegmentStoredBytesRequest {
                 data_pg_id: 7,
-                segment_okh: [0xA7; 16],
-                segment_vid: GenerationId::new(42).unwrap(),
-                stored_size: 1024,
-                segment_crc64: 0x1234,
-                ec: EcShape { k: 4, m: 2 },
+                segment_okh,
+                segment_vid,
+                stored_size: payload.len(),
+                segment_crc64: shard_ack.crc64,
+                ec: EcShape { k: 1, m: 0 },
             },
-            shard_index: ShardIndex::new(5),
+            shard_index: ShardIndex::new(0),
+            shard_integrity: Some(shard_integrity),
         };
 
         store
@@ -3750,6 +3799,42 @@ mod tests {
             .list_placed_segment_shard_repairs()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn placed_segment_shard_repair_rejects_malformed_persisted_integrity_witness() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardRepairWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xA8; 16],
+                segment_vid: GenerationId::new(43).unwrap(),
+                stored_size: 1024,
+                segment_crc64: 0x1234,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            shard_index: ShardIndex::new(5),
+            shard_integrity: None,
+        };
+        store
+            .record_placed_segment_shard_repair(&work_item, None)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE placed_segment_shard_repairs SET shard_integrity = X'02'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.list_placed_segment_shard_repairs(),
+            Err(StoreError::Db {
+                context: "read placed segment shard repair",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3960,6 +4045,31 @@ mod tests {
         let store = PgStore::open(tmp.path(), 7).unwrap();
         let encryption = crate::tests::metadata_only_test_encryption();
         let encryption_state = encryption.encode_state().unwrap();
+        let integrity_fixture = |logical_size: u64| {
+            let ec = EcShape { k: 4, m: 2 };
+            let stored_size = encryption
+                .payload_codec()
+                .stored_size(logical_size)
+                .unwrap();
+            let mut stored_bytes = vec![0_u8; usize::try_from(stored_size).unwrap()];
+            let segment_crc64 = checksum::crc64::checksum(&stored_bytes);
+            let shard_size = stored_size.div_ceil(u64::from(ec.k));
+            stored_bytes.resize(usize::try_from(shard_size * u64::from(ec.k)).unwrap(), 0);
+            let mut encoded = vec![1];
+            encoded.extend_from_slice(&shard_size.to_be_bytes());
+            encoded.extend_from_slice(&u16::from(ec.k + ec.m).to_be_bytes());
+            for shard in stored_bytes.chunks_exact(usize::try_from(shard_size).unwrap()) {
+                encoded.extend_from_slice(&checksum::crc64::checksum(shard).to_be_bytes());
+            }
+            for _ in 0..ec.m {
+                encoded.extend_from_slice(&0_u64.to_be_bytes());
+            }
+            let witness = SegmentShardIntegrityRecord::decode(&encoded).unwrap();
+            witness.validate(ec, stored_size, segment_crc64).unwrap();
+            (segment_crc64, witness.encode())
+        };
+        let (multipart_segment_crc64, multipart_shard_integrity) = integrity_fixture(1234);
+        let (object_segment_crc64, object_shard_integrity) = integrity_fixture(1000);
 
         store
             .conn
@@ -4021,8 +4131,8 @@ mod tests {
             .execute(
                 "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
-                  segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     "bucket",
                     "object",
@@ -4031,13 +4141,14 @@ mod tests {
                     1i64,
                     0i64,
                     1234i64,
-                    0xAABB_i64,
+                    multipart_segment_crc64 as i64,
                     [0x11u8; 16].as_slice(),
                     9i64,
                     7i64,
                     3i64,
                     4i64,
                     2i64,
+                    multipart_shard_integrity,
                 ],
             )
             .unwrap();
@@ -4075,21 +4186,22 @@ mod tests {
             .execute(
                 "INSERT INTO object_segments \
                  (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
-                  segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     "bucket",
                     "segment-object",
                     0i64,
                     0i64,
                     1000i64,
-                    0xDDDD_i64,
+                    object_segment_crc64 as i64,
                     [0x44u8; 16].as_slice(),
                     12i64,
                     7i64,
                     6i64,
                     4i64,
                     2i64,
+                    object_shard_integrity,
                 ],
             )
             .unwrap();
@@ -4152,7 +4264,8 @@ mod tests {
             object_segment.stored_size,
             1000 + OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64
         );
-        assert_eq!(object_segment.crc64, 0xDDDD);
+        assert_eq!(object_segment.crc64, object_segment_crc64);
+        assert!(object_segment.shard_integrity.is_some());
         assert_eq!(
             object_segment.placement_cluster_epoch,
             ClusterEpoch::new(6).unwrap()
@@ -4173,7 +4286,8 @@ mod tests {
             object_part.stored_size,
             1234 + OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64
         );
-        assert_eq!(object_part.crc64, 0xAABB);
+        assert_eq!(object_part.crc64, multipart_segment_crc64);
+        assert!(object_part.shard_integrity.is_some());
         assert_eq!(
             object_part.placement_cluster_epoch,
             ClusterEpoch::new(3).unwrap()
@@ -4234,6 +4348,7 @@ mod tests {
                 let mut okh = [0u8; 16];
                 okh[..8].copy_from_slice(&(index as u64).to_be_bytes());
                 ObjectSegmentRecord {
+                    shard_integrity: None,
                     bucket: bucket.clone(),
                     key: key.clone(),
                     version_id: VersionId::Null,
@@ -4581,6 +4696,7 @@ mod tests {
         assert_eq!(page.items.len(), 2);
 
         let placed_segment = ObjectSegmentRecord {
+            shard_integrity: None,
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: VersionId::Null,
@@ -4726,6 +4842,7 @@ mod tests {
                     ec: EcShape { k: 4, m: 2 },
                 },
                 shard_index: ShardIndex::new(5),
+                shard_integrity: None,
             };
             store
                 .record_placed_segment_shard_repair(&work_item, None)
@@ -4787,6 +4904,7 @@ mod tests {
                 ec: EcShape { k: 4, m: 2 },
             },
             shard_index: ShardIndex::new(5),
+            shard_integrity: None,
         };
 
         assert!(matches!(
@@ -5139,6 +5257,7 @@ mod tests {
                 ec: EcShape { k: 4, m: 2 },
             },
             shard_index: ShardIndex::new(5),
+            shard_integrity: None,
         };
         let epoch = ClusterEpoch::new(7).unwrap();
 
@@ -5231,6 +5350,7 @@ mod tests {
                 ec: EcShape { k: 4, m: 2 },
             },
             shard_index: ShardIndex::new(5),
+            shard_integrity: None,
         };
         let epoch = ClusterEpoch::new(7).unwrap();
         store
@@ -5276,6 +5396,7 @@ mod tests {
                 ec: EcShape { k: 4, m: 2 },
             },
             shard_index: ShardIndex::new(5),
+            shard_integrity: None,
         };
         let epoch = ClusterEpoch::new(7).unwrap();
         store

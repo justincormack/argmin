@@ -2191,7 +2191,7 @@ mod tests {
             decode_binding(&old_request),
             Err(StorageRpcAuthBindingError::Malformed)
         );
-        let request = encode_binding_with_encoded_frame(
+        let old_request = encode_binding_with_encoded_frame(
             0x0102_0304_0506_0708,
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
@@ -2200,13 +2200,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
+            decode_binding(&old_request),
+            Err(StorageRpcAuthBindingError::Malformed)
+        );
+        let current_frame = crate::storage_rpc::encode_storage_rpc_frame(
+            0x0102_0304_0506_0708,
+            StorageRpcMessageKind::ShardWrite,
+            b"abc",
+        )
+        .unwrap();
+        let request = encode_binding_with_encoded_frame(
+            0x0102_0304_0506_0708,
+            TOPOLOGY_DIGEST,
+            NodeId::new(0x1122_3344),
+            None,
+            &current_frame,
+        )
+        .unwrap();
+        assert_eq!(
             hex_bytes(&request),
             concat!(
                 "4152475352504342000201020304050607080000004030313233343536373839",
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "6162636465663031323334353637383961626364656611223344000000003718",
-                "0000006172676d696e2d73746f726167652d7270632d6672616d651a00080706",
-                "0504030201030003000000aa53891efb5b4635616263"
+                "0000006172676d696e2d73746f726167652d7270632d6672616d651b00080706",
+                "0504030201030003000000bba0b68ac0eb3fc2616263"
             )
         );
 
@@ -2220,7 +2238,7 @@ mod tests {
             TOPOLOGY_DIGEST,
             NodeId::new(0x1122_3344),
             Some(&transcript),
-            V26_FRAME,
+            &current_frame,
         )
         .unwrap();
         assert_eq!(
@@ -2230,8 +2248,8 @@ mod tests {
                 "6162636465663031323334353637383961626364656630313233343536373839",
                 "616263646566303132333435363738396162636465661122334401673e6f836a",
                 "950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037",
-                "180000006172676d696e2d73746f726167652d7270632d6672616d651a000807",
-                "060504030201030003000000aa53891efb5b4635616263"
+                "180000006172676d696e2d73746f726167652d7270632d6672616d651b000807",
+                "060504030201030003000000bba0b68ac0eb3fc2616263"
             )
         );
 

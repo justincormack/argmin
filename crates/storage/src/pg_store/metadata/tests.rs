@@ -86,7 +86,7 @@ fn multipart_upload_schema_rejects_invalid_identity_values() {
 }
 
 #[test]
-fn current_pg_schema_v8_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
+fn current_pg_schema_v9_checksum_tags_match_frozen_owner_encoding_and_require_version_bump() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
     assert_eq!(
@@ -94,7 +94,7 @@ fn current_pg_schema_v8_checksum_tags_match_frozen_owner_encoding_and_require_ve
             .conn
             .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
             .unwrap(),
-        8
+        9
     );
     let bucket = trusted_bucket_name("checksum-tag-schema-bucket");
     let upload_id = crate::tests::multipart_upload_id("checksum-tag-schema-upload");
@@ -2368,6 +2368,7 @@ fn test_object_segment(
     segment_index: u32,
 ) -> ObjectSegmentRecord {
     ObjectSegmentRecord {
+        shard_integrity: None,
         bucket,
         key,
         version_id,
@@ -2380,6 +2381,140 @@ fn test_object_segment(
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 2,
         ec_m: 1,
+    }
+}
+
+fn cobblestone_test_encryption() -> ObjectEncryption {
+    let ObjectEncryption::SseS3(state) = metadata_only_test_encryption() else {
+        panic!("metadata fixture must use SSE-S3");
+    };
+    ObjectEncryption::SseS3(
+        state.with_payload_codec_for_test(SegmentPayloadCodec::Cobblestone256SegmentV1),
+    )
+}
+
+fn test_segment_integrity_record(
+    codec: SegmentPayloadCodec,
+    logical_size: u64,
+    ec: EcShape,
+) -> (u64, SegmentShardIntegrityRecord) {
+    let stored_size = codec.stored_size(logical_size).unwrap();
+    let bytes = vec![0; usize::try_from(stored_size).unwrap()];
+    let segment_crc64 = checksum::crc64::checksum(&bytes);
+    let shard_size = stored_size.div_ceil(u64::from(ec.k));
+    let mut padded = bytes;
+    padded.resize(usize::try_from(shard_size * u64::from(ec.k)).unwrap(), 0);
+    let mut encoded = vec![1];
+    encoded.extend_from_slice(&shard_size.to_be_bytes());
+    encoded.extend_from_slice(&u16::from(ec.k + ec.m).to_be_bytes());
+    for shard in padded.chunks_exact(usize::try_from(shard_size).unwrap()) {
+        encoded.extend_from_slice(&checksum::crc64::checksum(shard).to_be_bytes());
+    }
+    for _ in 0..ec.m {
+        encoded.extend_from_slice(&0_u64.to_be_bytes());
+    }
+    let record = SegmentShardIntegrityRecord::decode(&encoded).unwrap();
+    record.validate(ec, stored_size, segment_crc64).unwrap();
+    (segment_crc64, record)
+}
+
+#[test]
+fn cobblestone_direct_put_apply_rejects_missing_or_crossed_shard_integrity_without_mutation() {
+    let bucket = trusted_bucket_name("cobblestone-witness-apply");
+    let key = trusted_object_key("object");
+    let ec = EcShape { k: 2, m: 1 };
+    let encryption = cobblestone_test_encryption();
+    let (segment_crc64, shard_integrity) =
+        test_segment_integrity_record(encryption.payload_codec(), 64, ec);
+    let base_segment = ObjectSegmentRecord {
+        shard_integrity: Some(shard_integrity),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: VersionId::Null,
+        segment_index: 0,
+        size: 64,
+        segment_crc64,
+        segment_okh: [0x61; 16],
+        segment_vid: GenerationId::MIN,
+        data_pg_id: 1,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: ec.k,
+        ec_m: ec.m,
+    };
+
+    for (case, segment) in [
+        (
+            "missing",
+            ObjectSegmentRecord {
+                shard_integrity: None,
+                ..base_segment.clone()
+            },
+        ),
+        (
+            "crossed",
+            ObjectSegmentRecord {
+                segment_crc64: segment_crc64.wrapping_add(1),
+                ..base_segment
+            },
+        ),
+    ] {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let reservation_id = SessionId::try_from("93".repeat(16)).unwrap();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 64,
+                    etag: ObjectEtag::single_part(1),
+                    ec,
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: encryption.clone(),
+                },
+                segments: vec![segment],
+                generation_reservation_id: reservation_id,
+                write_sequence: 1,
+                last_modified_millis: 1,
+                stale_payload: None,
+                bucket_write_reservation: direct_put_terminal_cleanup_proof(&bucket, &key),
+            })),
+        );
+
+        let error = store.apply_metadata_command(&command).unwrap_err();
+        assert!(matches!(
+            error,
+            MetadataError::InvariantViolation {
+                context: "commit direct put command shard integrity witness",
+                ..
+            }
+        ));
+        let row_count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM objects", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0, "{case} witness mutated object state");
+        assert_eq!(
+            store
+                .metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            0
+        );
     }
 }
 
@@ -2453,6 +2588,7 @@ fn test_multipart_part_segment(
     segment_index: u32,
 ) -> MultipartPartSegmentRecord {
     MultipartPartSegmentRecord {
+        shard_integrity: None,
         bucket,
         key,
         upload_id,
@@ -4695,7 +4831,8 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
         "framed-v2",
         "framed-v3",
         "framed-v4",
-        "framed-v6",
+        "framed-v5",
+        "framed-v7",
     ] {
         let (checkpoint_crc64, checkpoint_bytes) = if format == "corrupt" {
             (second_checkpoint.checkpoint_crc64, vec![0])
@@ -4704,7 +4841,8 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
                 "framed-v2" => 2,
                 "framed-v3" => 3,
                 "framed-v4" => 4,
-                "framed-v6" => 6,
+                "framed-v5" => 5,
+                "framed-v7" => 7,
                 _ => 1,
             };
             let mut unsupported = second_checkpoint.clone();
@@ -5578,15 +5716,15 @@ fn metadata_command_replica_state_rejects_unsupported_carrier_encodings() {
         (
             "applied_log_hash_encoding_version",
             "log-hash",
-            [0_u8, 2_u8],
+            &[0_u8, 2_u8][..],
         ),
         (
             "state_digest_encoding_version",
             "state-digest",
-            [6_u8, 8_u8],
+            &[6_u8, 7_u8, 9_u8][..],
         ),
     ] {
-        for version in versions {
+        for &version in versions {
             let tmp = test_util::tempdir();
             let store = PgStore::open(tmp.path(), 1).unwrap();
             store
@@ -6831,7 +6969,7 @@ fn recovery_rejects_resealed_unsupported_abandoned_command_versions_before_mutat
 
 #[test]
 fn recovery_rejects_resealed_unsupported_pending_command_versions_before_mutation() {
-    for version in [7_u16, 8, 9, 11] {
+    for version in [7_u16, 8, 9, 10, 12] {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let command = create_bucket_probe_command(
@@ -6924,7 +7062,7 @@ fn recovery_rejects_resealed_unsupported_pending_command_versions_before_mutatio
 
 #[test]
 fn recovery_rejects_resealed_unsupported_applied_command_versions_before_mutation() {
-    for version in [7_u16, 8, 9, 11] {
+    for version in [7_u16, 8, 9, 10, 12] {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
         let command = create_bucket_probe_command(
@@ -8029,6 +8167,7 @@ fn abort_multipart_command_validates_cleanup_before_accepting_lagging_stream_all
         .cleanup
         .streaming_segments
         .push(MultipartPartSegmentRecord {
+            shard_integrity: None,
             bucket: command.bucket.clone(),
             key: command.key.clone(),
             upload_id: upload_id.clone(),

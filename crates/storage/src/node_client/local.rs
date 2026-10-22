@@ -430,6 +430,7 @@ impl LocalStorageNodeClient {
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: ec.k,
             ec_m: ec.m,
+            shard_integrity: None,
         };
         Ok((session.target, segment_record))
     }
@@ -3059,6 +3060,34 @@ impl LocalDirectPutMetadataRoute<'_> {
             });
         }
 
+        let Some(stored_segment_size) = request
+            .request
+            .encryption
+            .segment_stored_size(request.request.size)
+        else {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "direct PUT segment has invalid payload-codec geometry".to_string(),
+            });
+        };
+        if let Some(shard_integrity) = request.shard_integrity {
+            shard_integrity
+                .validate(
+                    request.request.ec,
+                    stored_segment_size,
+                    request.request.segment_crc64,
+                )
+                .map_err(|error| ObjectPgActionError::InvalidRequest {
+                    reason: format!("invalid direct PUT shard integrity witness: {error}"),
+                })?;
+        } else if request.request.encryption.payload_codec()
+            == crate::SegmentPayloadCodec::Cobblestone256SegmentV1
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "Cobblestone direct PUT segment is missing its shard integrity witness"
+                    .to_string(),
+            });
+        }
+
         let last_modified_millis = crate::clock::current_time_millis();
         let write_sequence = pg.next_object_write_sequence(
             request.request.bucket.as_str(),
@@ -3088,6 +3117,7 @@ impl LocalDirectPutMetadataRoute<'_> {
             placement_cluster_epoch: self.route_cluster_epoch,
             ec_k: request.request.ec.k,
             ec_m: request.request.ec.m,
+            shard_integrity: request.shard_integrity.cloned(),
         };
         let object = PutLiveObjectReq {
             bucket: request.request.bucket.clone(),
@@ -5586,6 +5616,7 @@ impl LocalStorageNodeClient {
                 placement_cluster_epoch: segment.placement_cluster_epoch,
                 ec_k: segment.ec_k,
                 ec_m: segment.ec_m,
+                shard_integrity: segment.shard_integrity.clone(),
             })
             .collect();
         let object = PutLiveObjectReq {
@@ -5712,6 +5743,7 @@ impl LocalStorageNodeClient {
                 placement_cluster_epoch: segment.placement_cluster_epoch,
                 ec_k: segment.ec_k,
                 ec_m: segment.ec_m,
+                shard_integrity: segment.shard_integrity.clone(),
             })
             .collect();
         if committed_segments != request.segments {

@@ -4710,7 +4710,7 @@ impl PgMetadataStore for PgStore {
 
                 let mut prev_stmt = self.conn.prepare_cached(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                 segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m \
+                 segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity \
                  FROM multipart_part_segments \
                  WHERE upload_id = ?1 AND version_id = ?2 AND part_number = ?3 \
                  ORDER BY segment_index ASC",
@@ -4747,6 +4747,10 @@ impl PgMetadataStore for PgStore {
                             )?,
                             ec_k: row.get(12)?,
                             ec_m: row.get(13)?,
+                            shard_integrity: PgStore::parse_optional_segment_shard_integrity(
+                                row.get(14)?,
+                                14,
+                            )?,
                         })
                     },
                 )?;
@@ -4787,8 +4791,8 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self.conn.prepare_cached(
                     "INSERT INTO multipart_part_segments \
                  (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-                  segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 )?;
                 for segment in segments {
                     if segment.upload_id != part.upload_id
@@ -4816,6 +4820,7 @@ impl PgMetadataStore for PgStore {
                         segment.placement_cluster_epoch.get() as i64,
                         segment.ec_k,
                         segment.ec_m,
+                        segment.shard_integrity.as_ref().map(|witness| witness.encode()),
                     ])?;
                 }
 
@@ -5285,7 +5290,7 @@ impl PgMetadataStore for PgStore {
             let (omitted_streaming_segments, omitted_streaming_part_numbers) = {
                 let mut stmt = self.conn.prepare_cached(
                     "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                     size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m \
+                     size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity \
                      FROM multipart_part_segments \
                      WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND version_id = ?4 \
                      ORDER BY part_number, segment_index",
@@ -5323,6 +5328,10 @@ impl PgMetadataStore for PgStore {
                             )?,
                             ec_k: row.get(12)?,
                             ec_m: row.get(13)?,
+                            shard_integrity: PgStore::parse_optional_segment_shard_integrity(
+                                row.get(14)?,
+                                14,
+                            )?,
                         })
                     },
                 )?;
@@ -5863,7 +5872,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT session_id, segment_index, size, segment_okh, segment_vid, data_pg_id, \
-                 placement_cluster_epoch, segment_crc64, payload_crc64, ec_k, ec_m FROM stream_upload_segments \
+                 placement_cluster_epoch, segment_crc64, payload_crc64, ec_k, ec_m, shard_integrity FROM stream_upload_segments \
                  WHERE session_id = ?1 ORDER BY segment_index ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -5895,6 +5904,10 @@ impl PgMetadataStore for PgStore {
                     )?,
                     ec_k: row.get(9)?,
                     ec_m: row.get(10)?,
+                    shard_integrity: PgStore::parse_optional_segment_shard_integrity(
+                        row.get(11)?,
+                        11,
+                    )?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -6044,8 +6057,8 @@ impl PgMetadataStore for PgStore {
                 .prepare_cached(
                     "INSERT INTO object_segments \
                      (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                      data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                      data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (prepare insert segments)",
@@ -6078,6 +6091,7 @@ impl PgMetadataStore for PgStore {
                     segment.placement_cluster_epoch.get() as i64,
                     segment.ec_k,
                     segment.ec_m,
+                    segment.shard_integrity.as_ref().map(|witness| witness.encode()),
                 ])
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (insert segment)",
@@ -6200,7 +6214,7 @@ impl PgMetadataStore for PgStore {
                     .conn
                     .prepare_cached(
                         "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                         segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m FROM multipart_part_segments \
+                         segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity FROM multipart_part_segments \
                          WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4 \
                          ORDER BY segment_index ASC",
                     )
@@ -6238,6 +6252,10 @@ impl PgMetadataStore for PgStore {
                                 )?,
                                 ec_k: row.get(12)?,
                                 ec_m: row.get(13)?,
+                                shard_integrity: PgStore::parse_optional_segment_shard_integrity(
+                                    row.get(14)?,
+                                    14,
+                                )?,
                             })
                         },
                     )
@@ -6277,8 +6295,8 @@ impl PgMetadataStore for PgStore {
                     .prepare_cached(
                         "INSERT INTO multipart_part_segments \
                          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                          segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                          segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (prepare insert segments)",
@@ -6310,6 +6328,7 @@ impl PgMetadataStore for PgStore {
                         segment.placement_cluster_epoch.get() as i64,
                         segment.ec_k,
                         segment.ec_m,
+                        segment.shard_integrity.as_ref().map(|witness| witness.encode()),
                     ])
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (insert segment)",
@@ -6354,7 +6373,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, \
-                 data_pg_id, placement_cluster_epoch, ec_k, ec_m FROM object_segments \
+                 data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity FROM object_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                  ORDER BY segment_index ASC",
             )
@@ -6388,6 +6407,10 @@ impl PgMetadataStore for PgStore {
                     )?,
                     ec_k: row.get(10)?,
                     ec_m: row.get(11)?,
+                    shard_integrity: PgStore::parse_optional_segment_shard_integrity(
+                        row.get(12)?,
+                        12,
+                    )?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -6426,7 +6449,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
-                 segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m FROM multipart_part_segments \
+                 segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4 \
                  ORDER BY segment_index ASC",
             )
@@ -6464,6 +6487,10 @@ impl PgMetadataStore for PgStore {
                         )?,
                         ec_k: row.get(12)?,
                         ec_m: row.get(13)?,
+                        shard_integrity: PgStore::parse_optional_segment_shard_integrity(
+                            row.get(14)?,
+                            14,
+                        )?,
                     })
                 },
             )
@@ -6493,7 +6520,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m \
+                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity \
                  FROM multipart_part_segments \
                  WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4 \
                  ORDER BY segment_index ASC",
@@ -6530,6 +6557,10 @@ impl PgMetadataStore for PgStore {
                     )?,
                     ec_k: row.get(12)?,
                     ec_m: row.get(13)?,
+                    shard_integrity: PgStore::parse_optional_segment_shard_integrity(
+                        row.get(14)?,
+                        14,
+                    )?,
                 })
             })
             .map_err(|e| MetadataError::Db {
@@ -6562,7 +6593,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, upload_id, version_id, part_number, segment_index, \
-                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m \
+                 size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m, shard_integrity \
                  FROM multipart_part_segments \
                  WHERE upload_id = ?1 \
                  ORDER BY part_number, segment_index",
@@ -6598,6 +6629,10 @@ impl PgMetadataStore for PgStore {
                     )?,
                     ec_k: row.get(12)?,
                     ec_m: row.get(13)?,
+                    shard_integrity: PgStore::parse_optional_segment_shard_integrity(
+                        row.get(14)?,
+                        14,
+                    )?,
                 })
             })
             .map_err(|e| MetadataError::Db {

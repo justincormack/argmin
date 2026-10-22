@@ -4802,6 +4802,7 @@ fn stream_segment_append_and_list() {
     for i in 0..3u32 {
         store
             .append_stream_segment(&StreamUploadSegmentRecord {
+                shard_integrity: None,
                 session_id: stream_session_id("sess-segments"),
                 segment_index: i,
                 size: (i as u64 + 1) * 1000,
@@ -4874,6 +4875,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
     ));
 
     let segment = StreamUploadSegmentRecord {
+        shard_integrity: None,
         session_id: stream_session_id("sess-publish"),
         segment_index: 0,
         size: fixture.logical_size,
@@ -4925,6 +4927,7 @@ fn stream_segment_cascade_delete() {
 
     store
         .append_stream_segment(&StreamUploadSegmentRecord {
+            shard_integrity: None,
             session_id: stream_session_id("sess-cascade"),
             segment_index: 0,
             size: 4096,
@@ -4976,6 +4979,7 @@ fn put_object_with_segments_persists_manifest() {
             },
             &[
                 ObjectSegmentRecord {
+                    shard_integrity: None,
                     bucket: bucket_name("bucket"),
                     key: object_key("k"),
                     version_id: VersionId::Null,
@@ -4990,6 +4994,7 @@ fn put_object_with_segments_persists_manifest() {
                     ec_m: 2,
                 },
                 ObjectSegmentRecord {
+                    shard_integrity: None,
                     bucket: bucket_name("bucket"),
                     key: object_key("k"),
                     version_id: VersionId::Null,
@@ -5047,6 +5052,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 encryption: metadata_only_test_encryption(),
             },
             &[ObjectSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
                 version_id: VersionId::Null,
@@ -5084,6 +5090,7 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 encryption: metadata_only_test_encryption(),
             },
             &[ObjectSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
                 version_id: VersionId::Null,
@@ -5142,6 +5149,7 @@ fn delete_object_segments_cleanup() {
                 encryption: metadata_only_test_encryption(),
             },
             &[ObjectSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
                 version_id: VersionId::Null,
@@ -5180,6 +5188,7 @@ fn multipart_part_segments_crud() {
     store
         .test_insert_multipart_part_segments(&[
             MultipartPartSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
                 upload_id: multipart_upload_id("uid-1"),
@@ -5196,6 +5205,7 @@ fn multipart_part_segments_crud() {
                 ec_m: 2,
             },
             MultipartPartSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
                 upload_id: multipart_upload_id("uid-1"),
@@ -5293,6 +5303,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         checksum: None,
     };
     let make_segment = |segment_index, size, fill| MultipartPartSegmentRecord {
+        shard_integrity: None,
         bucket: bucket_name("bucket"),
         key: object_key("k"),
         upload_id: multipart_upload_id("mpu-1"),
@@ -5397,6 +5408,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
 
     let segments_v1: Vec<MultipartPartSegmentRecord> = (0..3)
         .map(|i| MultipartPartSegmentRecord {
+            shard_integrity: None,
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             upload_id: multipart_upload_id("mpu-1"),
@@ -5447,6 +5459,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         .unwrap();
 
     let segments_v2 = vec![MultipartPartSegmentRecord {
+        shard_integrity: None,
         bucket: bucket_name("bucket"),
         key: object_key("k"),
         upload_id: multipart_upload_id("mpu-1"),
@@ -5612,6 +5625,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
             },
             &[
                 MultipartPartSegmentRecord {
+                    shard_integrity: None,
                     bucket: bucket_name("bucket"),
                     key: object_key("k"),
                     upload_id: multipart_upload_id("mpu-zc"),
@@ -5628,6 +5642,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     ec_m: 2,
                 },
                 MultipartPartSegmentRecord {
+                    shard_integrity: None,
                     bucket: bucket_name("bucket"),
                     key: object_key("k"),
                     upload_id: multipart_upload_id("mpu-zc"),
@@ -6168,6 +6183,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 checksum: None,
             },
             &[MultipartPartSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
                 upload_id: multipart_upload_id("mpu-cpc"),
@@ -6250,6 +6266,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 checksum: None,
             },
             &[MultipartPartSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
                 upload_id: multipart_upload_id("mpu-vid"),
@@ -7496,6 +7513,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
 
     store
         .test_insert_multipart_part_segments(&[MultipartPartSegmentRecord {
+            shard_integrity: None,
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             upload_id: multipart_upload_id("mpu-seg"),

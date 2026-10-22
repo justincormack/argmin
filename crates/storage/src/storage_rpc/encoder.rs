@@ -774,6 +774,10 @@ fn put_stream_upload_segment_record(out: &mut Vec<u8>, segment: &StreamUploadSeg
     put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
+    put_optional_bytes(
+        out,
+        segment.shard_integrity.as_ref().map(|witness| witness.encode()).as_deref(),
+    );
 }
 
 fn put_terminal_stream_cleanup_record(out: &mut Vec<u8>, stream: &TerminalStreamCleanupRecord) {
@@ -1285,6 +1289,10 @@ fn put_object_segment_record(out: &mut Vec<u8>, segment: &ObjectSegmentRecord) {
     put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
+    put_optional_bytes(
+        out,
+        segment.shard_integrity.as_ref().map(|witness| witness.encode()).as_deref(),
+    );
 }
 
 fn put_object_part_record(out: &mut Vec<u8>, part: &ObjectPartRecord) {
@@ -1322,6 +1330,10 @@ fn put_multipart_part_segment_record(out: &mut Vec<u8>, segment: &MultipartPartS
     put_u64(out, segment.placement_cluster_epoch.get());
     put_u8(out, segment.ec_k);
     put_u8(out, segment.ec_m);
+    put_optional_bytes(
+        out,
+        segment.shard_integrity.as_ref().map(|witness| witness.encode()).as_deref(),
+    );
 }
 
 fn put_optional_version_id(out: &mut Vec<u8>, version_id: Option<VersionId>) {
@@ -1443,6 +1455,14 @@ fn put_placed_segment_shard_repair_work_item(
     work_item: &PlacedSegmentShardRepairWorkItem,
 ) {
     put_segment_stored_bytes_request(out, &work_item.request);
+    put_optional_bytes(
+        out,
+        work_item
+            .shard_integrity
+            .as_ref()
+            .map(SegmentShardIntegrityRecord::encode)
+            .as_deref(),
+    );
     put_u8(out, work_item.shard_index.get());
 }
 
@@ -1518,6 +1538,14 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
             put_u64(out, reference.stored_size);
             put_u64(out, reference.crc64);
             put_ec_shape(out, reference.ec);
+            put_optional_bytes(
+                out,
+                reference
+                    .shard_integrity
+                    .as_ref()
+                    .map(SegmentShardIntegrityRecord::encode)
+                    .as_deref(),
+            );
         }
         ShardScavengerPayloadReference::ReclaimOnly(reference) => {
             put_u8(out, 1);
@@ -1540,6 +1568,14 @@ fn put_placed_scavenger_reference(
     put_u64(out, reference.stored_size);
     put_u64(out, reference.crc64);
     put_ec_shape(out, reference.ec);
+    put_optional_bytes(
+        out,
+        reference
+            .shard_integrity
+            .as_ref()
+            .map(SegmentShardIntegrityRecord::encode)
+            .as_deref(),
+    );
 }
 
 fn put_shard_scavenger_reference_cursor(

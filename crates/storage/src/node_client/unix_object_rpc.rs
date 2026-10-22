@@ -2793,6 +2793,7 @@ impl UnixDirectPutMetadataRoute<'_> {
                 key: self.key.clone(),
             },
             request: request.request.clone(),
+            shard_integrity: request.shard_integrity.cloned(),
             version_id: request.version_id,
             expected_snapshot: request.expected_snapshot.clone(),
             bucket_write_reservation: request.bucket_write_reservation.clone(),

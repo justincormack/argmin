@@ -2176,6 +2176,7 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
 
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     let expected_segments = vec![crate::MultipartPartSegmentRecord {
+        shard_integrity: segment.shard_integrity.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),

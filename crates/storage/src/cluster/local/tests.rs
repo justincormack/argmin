@@ -149,6 +149,7 @@ fn placed_segment_shard_repair_work_item(index: usize) -> PlacedSegmentShardRepa
             ec: EcShape { k: 4, m: 2 },
         },
         shard_index: ShardIndex::new((index % 6) as u8),
+        shard_integrity: None,
     }
 }
 
@@ -1149,6 +1150,7 @@ fn assert_direct_put_metadata_on_acting_nodes(
     outcome: &crate::FinalizeDirectPutObjectOutcome,
 ) {
     let expected_segment = crate::ObjectSegmentRecord {
+        shard_integrity: None,
         bucket: commit_req.bucket.clone(),
         key: commit_req.key.clone(),
         version_id: outcome.version_id,
@@ -1185,16 +1187,17 @@ fn assert_direct_put_metadata_on_acting_nodes(
         );
         assert_eq!(live.object_lock, commit_req.object_lock);
         assert_eq!(live.encryption, commit_req.encryption);
-        assert_eq!(
-            crate::PgMetadataStore::get_object_segments(
-                &*pg,
-                &commit_req.bucket,
-                &commit_req.key,
-                outcome.version_id,
-            )
-            .unwrap(),
-            vec![expected_segment.clone()]
-        );
+        let segments = crate::PgMetadataStore::get_object_segments(
+            &*pg,
+            &commit_req.bucket,
+            &commit_req.key,
+            outcome.version_id,
+        )
+        .unwrap();
+        assert_eq!(segments.len(), 1);
+        let mut expected_segment = expected_segment.clone();
+        expected_segment.shard_integrity = segments[0].shard_integrity.clone();
+        assert_eq!(segments, vec![expected_segment]);
         assert!(matches!(
             crate::PgMetadataStore::get_object_generation_reservation(
                 &*pg,
@@ -1544,7 +1547,7 @@ fn append_encrypted_test_multipart_stream_segment(
     segment_index: u32,
     encrypted: &crate::tests::SseS3SegmentTestFixture,
 ) -> crate::StreamUploadSegmentRecord {
-    let (_target, segment) = cluster
+    let (_target, mut segment) = cluster
         .prepare_stream_segment_append(
             bucket,
             key,
@@ -1564,6 +1567,20 @@ fn append_encrypted_test_multipart_stream_segment(
         .iter()
         .map(|written| (&written.key, written.ack))
         .collect::<Vec<_>>();
+    let shard_integrity = crate::types::SegmentShardIntegrityWitness::from_ordered_shard_acks(
+        segment.data_pg_id,
+        crate::EcShape {
+            k: segment.ec_k,
+            m: segment.ec_m,
+        },
+        &segment.segment_okh,
+        segment.segment_vid,
+        encrypted.storage_bytes.len() as u64,
+        segment.segment_crc64,
+        &shard_batch,
+    )
+    .unwrap()
+    .durable_record();
     cluster
         .commit_stream_segment_append(
             bucket,
@@ -1574,6 +1591,35 @@ fn append_encrypted_test_multipart_stream_segment(
             &shard_batch,
         )
         .unwrap();
+    segment.shard_integrity = Some(shard_integrity);
+    segment
+}
+
+fn stream_segment_with_shard_integrity(
+    mut segment: crate::StreamUploadSegmentRecord,
+    stored_segment_size: usize,
+    written_shards: &[crate::WrittenShardAck],
+) -> crate::StreamUploadSegmentRecord {
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    segment.shard_integrity = Some(
+        crate::types::SegmentShardIntegrityWitness::from_ordered_shard_acks(
+            segment.data_pg_id,
+            crate::EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+            stored_segment_size as u64,
+            segment.segment_crc64,
+            &shard_batch,
+        )
+        .unwrap()
+        .durable_record(),
+    );
     segment
 }
 
@@ -1724,6 +1770,20 @@ fn upload_streamed_test_multipart_part(
         .iter()
         .map(|written| (&written.key, written.ack))
         .collect::<Vec<_>>();
+    let shard_integrity = crate::types::SegmentShardIntegrityWitness::from_ordered_shard_acks(
+        segment.data_pg_id,
+        crate::EcShape {
+            k: segment.ec_k,
+            m: segment.ec_m,
+        },
+        &segment.segment_okh,
+        segment.segment_vid,
+        encrypted.storage_bytes.len() as u64,
+        segment.segment_crc64,
+        &shard_batch,
+    )
+    .unwrap()
+    .durable_record();
     cluster
         .commit_stream_segment_append(
             bucket,
@@ -1765,6 +1825,7 @@ fn upload_streamed_test_multipart_part(
     let part = completion_snapshot.part_records.remove(0);
 
     let uploaded_segment = crate::MultipartPartSegmentRecord {
+        shard_integrity: Some(shard_integrity),
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),

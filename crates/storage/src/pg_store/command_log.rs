@@ -625,6 +625,7 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "placement_cluster_epoch",
             "ec_k",
             "ec_m",
+            "shard_integrity",
         ],
         order_columns: &["bucket", "key", "upload_id", "part_number", "segment_index"],
         filter: MetadataDigestFilter::AllRows,
@@ -798,6 +799,7 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "placement_cluster_epoch",
             "ec_k",
             "ec_m",
+            "shard_integrity",
         ],
         order_columns: &["bucket", "key", "version_id", "segment_index"],
         filter: MetadataDigestFilter::AllRows,
@@ -865,6 +867,7 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "placement_cluster_epoch",
             "ec_k",
             "ec_m",
+            "shard_integrity",
         ],
         order_columns: &["session_id", "segment_index"],
         filter: MetadataDigestFilter::AllRows,
@@ -7682,7 +7685,7 @@ mod canonical_format_baseline_tests {
     }
 
     #[test]
-    fn canonical_metadata_state_v7_digests_are_stable() {
+    fn canonical_metadata_state_v8_digests_are_stable() {
         let table = &METADATA_DIGEST_TABLES[0];
         assert_eq!(table.name, "bucket_subresources");
         let values = vec![
@@ -7719,13 +7722,13 @@ mod canonical_format_baseline_tests {
             (
                 0x8e12_8dbf_237c_be5e,
                 0x64a9_e3d9_b3ad_266d,
-                0xf675_efe2_de15_be87,
+                5_623_325_047_351_608_253,
             )
         );
     }
 
     #[test]
-    fn current_encryption_and_checksum_tags_match_frozen_canonical_v7_checkpoint_v5_composite() {
+    fn current_encryption_and_checksum_tags_match_frozen_canonical_v8_checkpoint_v6_composite() {
         // Immutable checkpoint-v2 evidence produced with canonical-state v5 and the former
         // plaintext encryption tag. This tuple is rejection evidence only and must never be
         // regenerated from current structs.
@@ -7765,8 +7768,17 @@ mod canonical_format_baseline_tests {
                 244, 126, 88, 44, 90, 177, 230, 51, 53, 157, 251, 179, 222,
             ],
         );
-        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 7);
-        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 5);
+        const HISTORICAL_CHECKPOINT_V5_SSE_C_V4_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
+            0x9821_a064_3b6f_2fc8,
+            0x2631_61f3_4a08_0377,
+            7_686,
+            [
+                193, 244, 196, 205, 107, 87, 6, 194, 56, 193, 22, 106, 88, 128, 52, 50, 31, 57,
+                141, 137, 42, 52, 250, 135, 142, 243, 104, 127, 107, 4, 45, 14,
+            ],
+        );
+        assert_eq!(METADATA_CANONICAL_STATE_ENCODING_VERSION, 8);
+        assert_eq!(METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, 6);
 
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -7852,12 +7864,12 @@ mod canonical_format_baseline_tests {
         assert_eq!(
             current_evidence,
             (
-                0x9821_a064_3b6f_2fc8,
-                0x2631_61f3_4a08_0377,
-                7_686,
+                2_104_238_779_976_229_658,
+                2_261_605_160_278_323_663,
+                7_743,
                 [
-                    193, 244, 196, 205, 107, 87, 6, 194, 56, 193, 22, 106, 88, 128, 52, 50, 31, 57,
-                    141, 137, 42, 52, 250, 135, 142, 243, 104, 127, 107, 4, 45, 14,
+                    62, 30, 24, 67, 115, 74, 217, 8, 174, 205, 139, 143, 2, 107, 31, 185, 65, 130,
+                    96, 41, 195, 64, 48, 40, 99, 85, 80, 43, 0, 17, 227, 26,
                 ],
             )
         );
@@ -7865,6 +7877,7 @@ mod canonical_format_baseline_tests {
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V3_EVIDENCE);
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V4_EVIDENCE);
         assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V5_SSE_C_V3_EVIDENCE);
+        assert_ne!(current_evidence, HISTORICAL_CHECKPOINT_V5_SSE_C_V4_EVIDENCE);
 
         let mut checkpoint_v2 = checkpoint.clone();
         for (table, block) in METADATA_DIGEST_TABLES
@@ -7911,6 +7924,15 @@ mod canonical_format_baseline_tests {
                 92, 59, 245, 130, 144, 105, 124, 149, 89, 173, 84, 179, 198, 140,
             ],
         );
+        const HISTORICAL_DERIVED_V2_SSE_C_V4_EVIDENCE: (u64, u64, usize, [u8; 32]) = (
+            0x9821_a064_3b6f_2fc8,
+            0x4f50_49e4_84bb_9888,
+            7_300,
+            [
+                82, 74, 31, 34, 99, 93, 121, 14, 248, 152, 191, 156, 225, 63, 99, 163, 196, 124,
+                251, 41, 6, 76, 97, 141, 251, 242, 196, 18, 108, 147, 248, 179,
+            ],
+        );
         let derived_v2_evidence = (
             checkpoint_v2.state_digest.value(),
             checkpoint_v2.checkpoint_crc64,
@@ -7920,16 +7942,17 @@ mod canonical_format_baseline_tests {
         assert_eq!(
             derived_v2_evidence,
             (
-                0x9821_a064_3b6f_2fc8,
-                0x4f50_49e4_84bb_9888,
-                7_300,
+                2_104_238_779_976_229_658,
+                3_449_103_087_039_756_377,
+                7_357,
                 [
-                    82, 74, 31, 34, 99, 93, 121, 14, 248, 152, 191, 156, 225, 63, 99, 163, 196,
-                    124, 251, 41, 6, 76, 97, 141, 251, 242, 196, 18, 108, 147, 248, 179,
+                    213, 167, 172, 159, 144, 75, 78, 197, 125, 135, 30, 5, 160, 54, 90, 95, 135, 3,
+                    71, 122, 45, 220, 12, 60, 2, 48, 216, 217, 14, 216, 116, 206,
                 ],
             )
         );
         assert_ne!(derived_v2_evidence, HISTORICAL_DERIVED_V2_SSE_C_V3_EVIDENCE);
+        assert_ne!(derived_v2_evidence, HISTORICAL_DERIVED_V2_SSE_C_V4_EVIDENCE);
         assert!(matches!(
             decode_metadata_command_checkpoint_payload(&encoded_v2),
             Err(crate::storage_rpc::StorageRpcPayloadError::UnsupportedMetadataCheckpointEncodingVersion {

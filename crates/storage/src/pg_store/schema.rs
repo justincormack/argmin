@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 8;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 9;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -53,6 +53,7 @@ CREATE TABLE placed_segment_shard_repairs (
     segment_crc64       INTEGER NOT NULL,
     ec_k                INTEGER NOT NULL CHECK (ec_k > 0),
     ec_m                INTEGER NOT NULL CHECK (ec_m >= 0),
+    shard_integrity     BLOB,
     shard_index         INTEGER NOT NULL CHECK (shard_index >= 0 AND shard_index <= 255),
     first_seen_at       INTEGER NOT NULL CHECK (first_seen_at >= 0),
     last_seen_at        INTEGER NOT NULL CHECK (last_seen_at >= 0),
@@ -362,6 +363,7 @@ CREATE TABLE stream_upload_segments (
     placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
+    shard_integrity BLOB,
     PRIMARY KEY (session_id, segment_index),
     FOREIGN KEY (session_id) REFERENCES stream_uploads(session_id) ON DELETE CASCADE
 ) STRICT";
@@ -381,6 +383,7 @@ CREATE TABLE object_segments (
     placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
+    shard_integrity BLOB,
     PRIMARY KEY (bucket, key, version_id, segment_index)
 ) STRICT";
 
@@ -536,6 +539,7 @@ CREATE TABLE multipart_part_segments (
     placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
+    shard_integrity BLOB,
     PRIMARY KEY (bucket, key, upload_id, part_number, segment_index)
 ) STRICT";
 
@@ -811,8 +815,8 @@ CREATE TABLE metadata_command_replica_state (
     applied_log_hash_encoding_version INTEGER NOT NULL DEFAULT 1 \
         CHECK (applied_log_hash_encoding_version = 1),
     applied_log_hash  INTEGER NOT NULL DEFAULT 0,
-    state_digest_encoding_version INTEGER NOT NULL DEFAULT 7 \
-        CHECK (state_digest_encoding_version = 7),
+    state_digest_encoding_version INTEGER NOT NULL DEFAULT 8 \
+        CHECK (state_digest_encoding_version = 8),
     state_digest      INTEGER NOT NULL DEFAULT 0
 ) STRICT";
 
@@ -1300,6 +1304,10 @@ mod tests {
             version: 8,
             catalogue: include_str!("schema_manifests/pg_schema_v8.catalogue"),
         },
+        FrozenPgSchemaManifest {
+            version: 9,
+            catalogue: include_str!("schema_manifests/pg_schema_v9.catalogue"),
+        },
     ];
 
     fn canonical_pg_schema_catalogue(conn: &Connection) -> String {
@@ -1424,7 +1432,7 @@ mod tests {
             .iter()
             .map(|manifest| manifest.version)
             .collect::<Vec<_>>();
-        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(frozen_versions, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
         for manifest in FROZEN_PG_SCHEMA_MANIFESTS {
             validate_frozen_pg_schema_catalogue(manifest.catalogue);
         }
@@ -1553,7 +1561,7 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        for version in [1, 2, 3, 4, 5, 6, 7, 9] {
+        for version in [1, 2, 3, 4, 5, 6, 7, 8, 10] {
             let conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "user_version", version).unwrap();
 

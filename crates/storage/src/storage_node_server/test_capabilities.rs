@@ -294,7 +294,12 @@
             );
             assert!(snapshot.current.is_some());
             let command = primary_route
-                .build_direct_put_commit_command(&direct_put_request, VersionId::Null, &snapshot)
+                .build_direct_put_commit_command(
+                    &direct_put_request,
+                    None,
+                    VersionId::Null,
+                    &snapshot,
+                )
                 .unwrap();
             let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
                 panic!("active object route must build a direct PUT command");
@@ -308,6 +313,7 @@
         let capability_mismatch = crate::clock::with_time_override(1_000, || {
             primary_route.build_direct_put_commit_command(
                 &mismatched_direct_put_request,
+                None,
                 VersionId::Null,
                 &direct_put_snapshot,
             )
@@ -326,6 +332,7 @@
         let proof_mismatch = crate::clock::with_time_override(1_000, || {
             primary_route.build_direct_put_commit_command(
                 &mismatched_proof_request,
+                None,
                 VersionId::Null,
                 &direct_put_snapshot,
             )
@@ -355,6 +362,7 @@
             let result = crate::clock::with_time_override(1_000, || {
                 primary_route.build_direct_put_commit_command(
                     &mismatched_proof_request,
+                    None,
                     VersionId::Null,
                     &direct_put_snapshot,
                 )
@@ -379,6 +387,7 @@
                 .direct_put_commit_command_build_response(
                     &active_permit,
                     StorageRpcDirectPutCommandBuildRequest {
+                        shard_integrity: None,
                         object: mismatched_object,
                         request: direct_put_request.clone(),
                         version_id: VersionId::Null,
@@ -1783,6 +1792,7 @@
                     primary_route
                         .build_direct_put_commit_command(
                             &direct_put_request,
+                            None,
                             VersionId::Null,
                             &direct_put_snapshot,
                         )

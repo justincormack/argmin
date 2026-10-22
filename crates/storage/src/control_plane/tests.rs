@@ -1407,8 +1407,8 @@ fn runtime_map_current_state_digest_v3_is_stable() {
     assert_eq!(
         runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
         [
-            250, 90, 60, 73, 37, 11, 20, 248, 66, 219, 74, 79, 150, 51, 21, 124, 221, 248, 221, 5,
-            234, 237, 17, 161, 120, 48, 27, 64, 28, 61, 124, 120,
+            122, 23, 230, 153, 140, 165, 1, 61, 132, 101, 90, 83, 106, 114, 177, 144, 107, 128, 61,
+            211, 179, 111, 196, 63, 160, 2, 97, 96, 185, 134, 124, 80,
         ]
     );
 }
@@ -2366,7 +2366,7 @@ fn canonical_control_plane_state_v32_representative_aggregate_is_stable() {
         ),
         (
             11_041,
-            "6200833f80f0cb25674a1c0062a264b3e4c808cf9f445d97dc8822e4c24afcce".to_owned()
+            "f6fa4a69526df67b1793a3b72500b5cde92e8b227a0eeb4fb7098eb3946971ed".to_owned()
         )
     );
 }
@@ -3169,6 +3169,7 @@ fn placed_segment_shard_repair_work_item_for_runtime_refresh(
             ec: crate::EcShape { k: 1, m: 0 },
         },
         shard_index: crate::ShardIndex::new(0),
+        shard_integrity: None,
     }
 }
 

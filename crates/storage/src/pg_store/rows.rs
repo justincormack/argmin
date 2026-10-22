@@ -158,6 +158,22 @@ impl PgStore {
         })
     }
 
+    pub(super) fn parse_optional_segment_shard_integrity(
+        blob: Option<Vec<u8>>,
+        col_idx: usize,
+    ) -> Result<Option<SegmentShardIntegrityRecord>, rusqlite::Error> {
+        blob.map(|bytes| {
+            SegmentShardIntegrityRecord::decode(&bytes).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    col_idx,
+                    rusqlite::types::Type::Blob,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+    }
+
     pub(super) fn parse_generation_id(
         raw: i64,
         col_idx: usize,

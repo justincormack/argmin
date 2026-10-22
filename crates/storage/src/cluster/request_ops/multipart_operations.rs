@@ -4141,6 +4141,7 @@ impl super::StorageCluster {
                     placement_cluster_epoch: segment.placement_cluster_epoch,
                     ec_k: segment.ec_k,
                     ec_m: segment.ec_m,
+                    shard_integrity: segment.shard_integrity.clone(),
                 })
                 .collect::<Vec<_>>();
 

@@ -2495,6 +2495,7 @@ mod tests {
             .get_pg(node.pg_topology().object_pg_for(bucket, key))
             .unwrap();
         let segment = ObjectSegmentRecord {
+            shard_integrity: None,
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: VersionId::Null,

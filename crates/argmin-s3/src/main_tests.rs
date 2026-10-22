@@ -5770,12 +5770,12 @@ mod tests {
             active_proof.test_applied_log_index(),
             1,
             active_proof.test_applied_log_hash(),
-            7,
+            8,
             active_proof.test_state_digest(),
             active_proof.test_applied_log_index(),
             1,
             active_proof.test_applied_log_hash(),
-            7,
+            8,
             active_proof.test_state_digest(),
         )
         .unwrap();
@@ -6104,12 +6104,12 @@ mod tests {
             active_proof.test_applied_log_index(),
             1,
             active_proof.test_applied_log_hash(),
-            7,
+            8,
             active_proof.test_state_digest(),
             active_proof.test_applied_log_index(),
             1,
             active_proof.test_applied_log_hash(),
-            7,
+            8,
             active_proof.test_state_digest(),
         )
         .unwrap();
@@ -6147,7 +6147,7 @@ mod tests {
     #[test]
     fn metadata_transfer_admin_args_parse_source_and_imported_proofs() {
         let args = [
-            "7", "12", "13", "20", "1", "30", "7", "40", "20", "1", "31", "7", "40",
+            "7", "12", "13", "20", "1", "30", "8", "40", "20", "1", "31", "8", "40",
             "2", "3",
         ]
         .into_iter()

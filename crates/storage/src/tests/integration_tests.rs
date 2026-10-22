@@ -318,6 +318,7 @@ fn multipart_upload_lifecycle() {
         (2, part2_fixture, [0x22; 16], GenerationId::new(2).unwrap()),
     ] {
         let segment = MultipartPartSegmentRecord {
+            shard_integrity: None,
             bucket: bucket.clone(),
             key: key.clone(),
             upload_id: upload_id.clone(),
@@ -336,6 +337,7 @@ fn multipart_upload_lifecycle() {
         let written = cluster
             .write_stream_segment_payload_shards(
                 &StreamUploadSegmentRecord {
+                    shard_integrity: None,
                     session_id: stream_session_id(format!("mpu-part-{part_number}")),
                     segment_index: 0,
                     size: fixture.logical_size,
@@ -536,6 +538,7 @@ fn streaming_upload_part_lifecycle() {
     // Append staging segment.
     store
         .append_stream_segment(&StreamUploadSegmentRecord {
+            shard_integrity: None,
             session_id: stream_session_id("ss-part"),
             segment_index: 0,
             size: fixture.logical_size,
@@ -552,6 +555,7 @@ fn streaming_upload_part_lifecycle() {
 
     // Commit stream part.
     let part_segments = vec![MultipartPartSegmentRecord {
+        shard_integrity: None,
         bucket: bucket_name("bucket"),
         key: object_key("k"),
         upload_id: multipart_upload_id("mpu-sp"),
@@ -1049,6 +1053,7 @@ fn multipart_abort_cleanup() {
         checksum: None,
     };
     let segments = vec![MultipartPartSegmentRecord {
+        shard_integrity: None,
         bucket: bucket_name("bucket"),
         key: object_key("k"),
         upload_id: multipart_upload_id("mpu-abort"),
@@ -1304,6 +1309,7 @@ fn persistence_complex_state_through_reopen() {
         // Append a staging segment.
         store
             .append_stream_segment(&StreamUploadSegmentRecord {
+                shard_integrity: None,
                 session_id: persisted_session_id.clone(),
                 segment_index: 0,
                 size: 100,

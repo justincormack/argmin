@@ -1072,6 +1072,11 @@ fn stream_put_append_published_log_gap_keeps_payload_for_pending_retry() {
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
         .iter()
         .map(|written| (&written.key, written.ack))
@@ -1492,6 +1497,11 @@ fn stream_append_command_id_race_accepts_matching_applied_contender() {
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     let shard_batch: Vec<(&crate::ShardKey, crate::WriteAck)> = written_shards
         .iter()
         .map(|written| (&written.key, written.ack))
@@ -1727,6 +1737,11 @@ fn stream_append_command_id_race_authorized_abandonment_requires_payload_restart
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     let shard_batch = written_shards
         .iter()
         .map(|written| (&written.key, written.ack))
@@ -2028,6 +2043,11 @@ fn stream_append_commit_retries_awaiting_authorized_recovery() {
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     let shard_batch = written_shards
         .iter()
         .map(|written| (&written.key, written.ack))
@@ -2112,6 +2132,11 @@ fn stream_append_commit_waits_for_relinquished_unrelated_recovery() {
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
 
     let pg_id = PgId::new(object_pg);
     let pending = pending_release_command(&cluster, &map, pg_id, &bucket, &key, "78");
@@ -2341,6 +2366,11 @@ fn stream_append_matching_competing_publish_succeeds_without_payload_cleanup() {
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     let shard_batch = written_shards
         .iter()
         .map(|written| (&written.key, written.ack))
@@ -2876,6 +2906,11 @@ fn stream_append_unrelated_pending_duplicate_cleans_staged_payload() {
     let published_shards = cluster
         .write_stream_segment_payload_shards(&published_segment, &published_encrypted.storage_bytes)
         .unwrap();
+    let published_segment = stream_segment_with_shard_integrity(
+        published_segment,
+        published_encrypted.storage_bytes.len(),
+        &published_shards,
+    );
     let published_shard_batch = published_shards
         .iter()
         .map(|written| (&written.key, written.ack))
@@ -5496,6 +5531,11 @@ fn control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preser
     let written_shards = source_cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     let shard_batch = written_shards
         .iter()
         .map(|written| (&written.key, written.ack))
@@ -6732,6 +6772,7 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
         encryption: encrypted.encryption.clone(),
     };
     let segments = vec![crate::ObjectSegmentRecord {
+        shard_integrity: segment.shard_integrity.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
         version_id: crate::VersionId::Null,
@@ -7160,6 +7201,7 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
         checksum: None,
     };
     let expected_segments = vec![crate::MultipartPartSegmentRecord {
+        shard_integrity: segment.shard_integrity.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),
@@ -7291,6 +7333,7 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
         checksum: None,
     };
     let expected_segments = vec![crate::MultipartPartSegmentRecord {
+        shard_integrity: segment.shard_integrity.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),
@@ -7454,6 +7497,7 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
         checksum: None,
     };
     let expected_segments = vec![crate::MultipartPartSegmentRecord {
+        shard_integrity: segment.shard_integrity.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),
@@ -7788,6 +7832,7 @@ fn upload_part_stream_create_does_not_expose_foreign_terminal_pending_upload() {
         part_number: 2,
     };
     let terminal_segment = crate::StreamUploadSegmentRecord {
+        shard_integrity: None,
         session_id: terminal_session_id.clone(),
         segment_index: 0,
         size: 1,
@@ -7875,6 +7920,7 @@ fn upload_part_stream_create_does_not_expose_foreign_terminal_pending_upload() {
             key: target_key,
             target: terminal_target,
             segment: crate::StreamUploadSegmentRecord {
+                shard_integrity: None,
                 session_id: terminal_state_session_id,
                 ..terminal_segment
             },
@@ -7978,6 +8024,7 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
         checksum: None,
     };
     let segments = vec![crate::MultipartPartSegmentRecord {
+        shard_integrity: segment.shard_integrity.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),
@@ -8348,6 +8395,11 @@ fn upload_part_stream_finalize_committed_response_loss_retry_sees_terminal_part(
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, &encrypted.storage_bytes)
         .unwrap();
+    let segment = stream_segment_with_shard_integrity(
+        segment,
+        encrypted.storage_bytes.len(),
+        &written_shards,
+    );
     let shard_batch = written_shards
         .iter()
         .map(|written| (&written.key, written.ack))
@@ -8385,6 +8437,7 @@ fn upload_part_stream_finalize_committed_response_loss_retry_sees_terminal_part(
         checksum: None,
     };
     let expected_segments = vec![crate::MultipartPartSegmentRecord {
+        shard_integrity: segment.shard_integrity.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),

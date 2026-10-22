@@ -145,6 +145,7 @@ struct Fixture {
     key: crate::ObjectKey,
     reservations: [crate::SessionId; 2],
     encrypted: [crate::tests::SseS3SegmentTestFixture; 2],
+    shard_integrity: RefCell<[Option<crate::types::SegmentShardIntegrityRecord>; 2]>,
     _directory: test_util::TempDir,
 }
 
@@ -177,8 +178,37 @@ impl Fixture {
                 crate::tests::sse_s3_segment_test_fixture(DATA[0], 0),
                 crate::tests::sse_s3_segment_test_fixture(DATA[1], 0),
             ],
+            shard_integrity: RefCell::new([None, None]),
             _directory: directory,
         }
+    }
+
+    fn record_payload_integrity(
+        &self,
+        owner: usize,
+        payload: &crate::DirectPutPayloadWrite<'_>,
+    ) -> Result<(), String> {
+        let encrypted = &self.encrypted[owner];
+        let shard_batch = payload
+            .written
+            .written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        self.shard_integrity.borrow_mut()[owner] = Some(
+            crate::types::SegmentShardIntegrityWitness::from_ordered_shard_acks(
+                payload.written.data_pg_id,
+                payload.written.ec,
+                &payload.segment_okh,
+                payload.segment_vid,
+                encrypted.storage_bytes.len() as u64,
+                encrypted.storage_crc64,
+                &shard_batch,
+            )
+            .map_err(diagnostic)?
+            .durable_record(),
+        );
+        Ok(())
     }
 
     fn prepared(&self, owner: usize) -> crate::PreparedDirectPutObjectCommit {
@@ -237,6 +267,15 @@ impl Fixture {
             )
             .map_err(diagnostic)?;
         drop(pg);
+        let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
+            return Err("direct PUT preparation returned the wrong command kind".into());
+        };
+        let mut commit = commit.as_ref().clone();
+        commit.segments[0].shard_integrity = self.shard_integrity.borrow()[owner].clone();
+        let command = MetadataCommandEnvelope::new(
+            command.id(),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(commit)),
+        );
         insert_pending_metadata_command_for_test(&self.map, PgId::new(0), &self.bucket, &command);
         Ok(command)
     }
@@ -247,6 +286,7 @@ impl Fixture {
         identities: &[Option<DirectPayloadTestIdentity>; 2],
         pending: Option<&MetadataCommandEnvelope>,
     ) -> Result<(), String> {
+        let shard_integrity = self.shard_integrity.borrow();
         equal(
             pending_metadata_command_for_test(&self.map, PgId::new(0), &self.bucket).as_ref(),
             pending,
@@ -341,6 +381,7 @@ impl Fixture {
                     equal(
                         segments,
                         vec![crate::ObjectSegmentRecord {
+                            shard_integrity: shard_integrity[owner].clone(),
                             bucket: self.bucket.clone(),
                             key: self.key.clone(),
                             version_id: crate::VersionId::Null,
@@ -483,6 +524,7 @@ fn replay(state: &State) -> Result<(), String> {
                             &encrypted.storage_bytes,
                         )
                         .map_err(diagnostic)?;
+                    fixture.record_payload_integrity(owner, &payload)?;
                     identities[owner] = Some(direct_payload_test_identity(&payload));
                     payloads[owner] = Some(payload);
                     ownership[owner] = Ownership::Caller;

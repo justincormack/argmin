@@ -188,6 +188,7 @@
         let repair_work_item = PlacedSegmentShardRepairWorkItem {
             request,
             shard_index: ShardIndex::new(5),
+            shard_integrity: None,
         };
         let backfill_work_item = PlacedSegmentShardBackfillWorkItem {
             request,
@@ -251,7 +252,7 @@
                 encode_placed_segment_shard_repair_record_request(
                     &StorageRpcPlacedSegmentShardRepairRecordRequest {
                         route: route.clone(),
-                        work_item: repair_work_item,
+                        work_item: repair_work_item.clone(),
                         last_error: None,
                     },
                 )
@@ -1066,6 +1067,7 @@
                         part_number: 1,
                     },
                     segment: StreamUploadSegmentRecord {
+                        shard_integrity: None,
                         session_id: session_id.clone(),
                         segment_index: 0,
                         size: 1,

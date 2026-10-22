@@ -578,7 +578,7 @@ impl UnixStorageNodeClient {
     ) -> Result<(), StoreError> {
         let request = StorageRpcPlacedSegmentShardRepairRecordRequest {
             route: self.bucket_pg_request(data_pg_id.pg_id()),
-            work_item: *work_item,
+            work_item: work_item.clone(),
             last_error: last_error.map(ToOwned::to_owned),
         };
         let payload =
@@ -729,7 +729,7 @@ impl UnixStorageNodeClient {
     ) -> Result<(), StoreError> {
         let request = StorageRpcPlacedSegmentShardRepairItemRequest {
             route: self.bucket_pg_request(data_pg_id.pg_id()),
-            work_item: *work_item,
+            work_item: work_item.clone(),
         };
         let payload =
             encode_placed_segment_shard_repair_item_request(&request).map_err(|error| {

@@ -2592,21 +2592,39 @@ pub struct WriteAck {
 #[derive(PartialEq, Eq)]
 pub(crate) struct SegmentShardIntegrityWitness {
     data_pg_id: u32,
-    shard_size: u64,
+    durable: SegmentShardIntegrityRecord,
     ordered_shard_acks: Box<[(ShardKey, WriteAck)]>,
 }
 
 impl std::fmt::Debug for SegmentShardIntegrityWitness {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SegmentShardIntegrityWitness")
-            .field("shard_size", &self.shard_size)
+            .field("shard_size", &self.durable.shard_size)
             .field("shard_count", &self.ordered_shard_acks.len())
             .finish_non_exhaustive()
     }
 }
 
+/// Durable physical-integrity evidence for one complete segment shard set.
+///
+/// Shard identities are derived from the containing segment record. The
+/// position of each CRC is its shard index, and every shard has the one
+/// canonical stored size recorded here. Construction remains storage-owned so
+/// callers cannot persist a partial or reordered acknowledgement projection.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SegmentShardIntegrityRecord {
+    shard_size: u64,
+    ordered_crc64s: Box<[u64]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SegmentShardIntegrityWitnessError {
+    #[error("segment shard integrity witness encoding is truncated")]
+    TruncatedEncoding,
+    #[error("unsupported segment shard integrity witness version {version}")]
+    UnsupportedVersion { version: u8 },
+    #[error("segment shard integrity witness has trailing bytes")]
+    TrailingEncoding,
     #[error("EC shape must contain at least one data shard")]
     MissingDataShard,
     #[error("EC shape {data_shards}+{parity_shards} overflows its shard index space")]
@@ -2707,7 +2725,14 @@ impl SegmentShardIntegrityWitness {
 
         Ok(Self {
             data_pg_id,
-            shard_size,
+            durable: SegmentShardIntegrityRecord {
+                shard_size,
+                ordered_crc64s: ordered_shard_acks
+                    .iter()
+                    .map(|(_, ack)| ack.crc64)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            },
             ordered_shard_acks: ordered_shard_acks.into_boxed_slice(),
         })
     }
@@ -2721,6 +2746,139 @@ impl SegmentShardIntegrityWitness {
             .iter()
             .map(|(key, ack)| (key, *ack))
             .collect()
+    }
+
+    pub(crate) fn durable_record(&self) -> SegmentShardIntegrityRecord {
+        self.durable.clone()
+    }
+}
+
+impl SegmentShardIntegrityRecord {
+    const ENCODING_VERSION: u8 = 1;
+
+    pub(crate) fn validate(
+        &self,
+        ec: EcShape,
+        stored_segment_size: u64,
+        segment_crc64: u64,
+    ) -> Result<(), SegmentShardIntegrityWitnessError> {
+        if ec.k == 0 {
+            return Err(SegmentShardIntegrityWitnessError::MissingDataShard);
+        }
+        let expected_count = usize::from(ec.k).checked_add(usize::from(ec.m)).ok_or(
+            SegmentShardIntegrityWitnessError::InvalidShardCount {
+                data_shards: ec.k,
+                parity_shards: ec.m,
+            },
+        )?;
+        if expected_count > usize::from(u8::MAX) + 1 {
+            return Err(SegmentShardIntegrityWitnessError::InvalidShardCount {
+                data_shards: ec.k,
+                parity_shards: ec.m,
+            });
+        }
+        if self.ordered_crc64s.len() != expected_count {
+            return Err(SegmentShardIntegrityWitnessError::ShardCount {
+                expected: expected_count,
+                actual: self.ordered_crc64s.len(),
+            });
+        }
+
+        let expected_shard_size = stored_segment_size.div_ceil(u64::from(ec.k));
+        if self.shard_size != expected_shard_size {
+            return Err(SegmentShardIntegrityWitnessError::NoncanonicalShardSize {
+                shard_index: 0,
+                expected: expected_shard_size,
+                actual: self.shard_size,
+            });
+        }
+        let systematic_acks = self
+            .ordered_crc64s
+            .iter()
+            .take(usize::from(ec.k))
+            .map(|crc64| WriteAck {
+                crc64: *crc64,
+                stored_size: self.shard_size,
+            })
+            .collect::<Vec<_>>();
+        if !systematic_data_shard_acks_match_segment(
+            &systematic_acks,
+            stored_segment_size,
+            segment_crc64,
+        ) {
+            return Err(SegmentShardIntegrityWitnessError::SystematicChecksumMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn expected_ack(&self, shard_index: usize) -> Option<WriteAck> {
+        self.ordered_crc64s
+            .get(shard_index)
+            .copied()
+            .map(|crc64| WriteAck {
+                crc64,
+                stored_size: self.shard_size,
+            })
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let count = u16::try_from(self.ordered_crc64s.len())
+            .expect("validated segment witness shard count fits u16");
+        let mut bytes = Vec::with_capacity(1 + 8 + 2 + self.ordered_crc64s.len() * 8);
+        bytes.push(Self::ENCODING_VERSION);
+        bytes.extend_from_slice(&self.shard_size.to_be_bytes());
+        bytes.extend_from_slice(&count.to_be_bytes());
+        for crc64 in &self.ordered_crc64s {
+            bytes.extend_from_slice(&crc64.to_be_bytes());
+        }
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, SegmentShardIntegrityWitnessError> {
+        let Some((&version, remainder)) = bytes.split_first() else {
+            return Err(SegmentShardIntegrityWitnessError::TruncatedEncoding);
+        };
+        if version != Self::ENCODING_VERSION {
+            return Err(SegmentShardIntegrityWitnessError::UnsupportedVersion { version });
+        }
+        let Some(shard_size_bytes) = remainder.get(..8) else {
+            return Err(SegmentShardIntegrityWitnessError::TruncatedEncoding);
+        };
+        let shard_size = u64::from_be_bytes(
+            shard_size_bytes
+                .try_into()
+                .expect("checked witness shard-size width"),
+        );
+        let Some(count_bytes) = remainder.get(8..10) else {
+            return Err(SegmentShardIntegrityWitnessError::TruncatedEncoding);
+        };
+        let count = usize::from(u16::from_be_bytes(
+            count_bytes
+                .try_into()
+                .expect("checked witness shard-count width"),
+        ));
+        let expected_len = 1usize
+            .checked_add(8)
+            .and_then(|len| len.checked_add(2))
+            .and_then(|len| len.checked_add(count.checked_mul(8)?))
+            .ok_or(SegmentShardIntegrityWitnessError::TrailingEncoding)?;
+        if bytes.len() < expected_len {
+            return Err(SegmentShardIntegrityWitnessError::TruncatedEncoding);
+        }
+        if bytes.len() != expected_len {
+            return Err(SegmentShardIntegrityWitnessError::TrailingEncoding);
+        }
+        let ordered_crc64s = bytes[11..]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_be_bytes(*chunk))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            shard_size,
+            ordered_crc64s,
+        })
     }
 }
 
@@ -3009,16 +3167,46 @@ impl std::fmt::Debug for ObjectPayloadSegment {
     }
 }
 
+pub(crate) fn validate_segment_shard_integrity_for_codec(
+    payload_codec: SegmentPayloadCodec,
+    shard_integrity: Option<&SegmentShardIntegrityRecord>,
+    ec: EcShape,
+    stored_size: u64,
+    segment_crc64: u64,
+) -> Result<(), &'static str> {
+    let Some(shard_integrity) = shard_integrity else {
+        return if payload_codec == SegmentPayloadCodec::SegmentAes256GcmV1 {
+            Ok(())
+        } else {
+            Err("Cobblestone segment is missing its shard integrity witness")
+        };
+    };
+    shard_integrity
+        .validate(ec, stored_size, segment_crc64)
+        .map_err(|_| "segment shard integrity witness does not match segment geometry")
+}
+
 impl ObjectPayloadSegment {
     fn from_object_record(
         subject: &ObjectPayloadSubject,
         record: ObjectSegmentRecord,
         payload_codec: SegmentPayloadCodec,
     ) -> Result<Self, &'static str> {
-        let stored_size = payload_codec
+        let stored_size_u64 = payload_codec
             .stored_size(record.size)
-            .and_then(|size| usize::try_from(size).ok())
             .ok_or("object segment has invalid stored codec geometry")?;
+        validate_segment_shard_integrity_for_codec(
+            payload_codec,
+            record.shard_integrity.as_ref(),
+            EcShape {
+                k: record.ec_k,
+                m: record.ec_m,
+            },
+            stored_size_u64,
+            record.segment_crc64,
+        )?;
+        let stored_size = usize::try_from(stored_size_u64)
+            .map_err(|_| "object segment stored size exceeds platform limits")?;
         Ok(Self {
             subject: subject.clone(),
             record: ObjectPayloadSegmentRecord::Object(record),
@@ -3031,10 +3219,21 @@ impl ObjectPayloadSegment {
         record: MultipartPartSegmentRecord,
         payload_codec: SegmentPayloadCodec,
     ) -> Result<Self, &'static str> {
-        let stored_size = payload_codec
+        let stored_size_u64 = payload_codec
             .stored_size(record.size)
-            .and_then(|size| usize::try_from(size).ok())
             .ok_or("multipart segment has invalid stored codec geometry")?;
+        validate_segment_shard_integrity_for_codec(
+            payload_codec,
+            record.shard_integrity.as_ref(),
+            EcShape {
+                k: record.ec_k,
+                m: record.ec_m,
+            },
+            stored_size_u64,
+            record.segment_crc64,
+        )?;
+        let stored_size = usize::try_from(stored_size_u64)
+            .map_err(|_| "multipart segment stored size exceeds platform limits")?;
         Ok(Self {
             subject: subject.clone(),
             record: ObjectPayloadSegmentRecord::Multipart(record),
@@ -3046,6 +3245,13 @@ impl ObjectPayloadSegment {
         match &self.record {
             ObjectPayloadSegmentRecord::Object(record) => record.segment_index,
             ObjectPayloadSegmentRecord::Multipart(record) => record.segment_index,
+        }
+    }
+
+    pub(crate) fn shard_integrity(&self) -> Option<&SegmentShardIntegrityRecord> {
+        match &self.record {
+            ObjectPayloadSegmentRecord::Object(record) => record.shard_integrity.as_ref(),
+            ObjectPayloadSegmentRecord::Multipart(record) => record.shard_integrity.as_ref(),
         }
     }
 
@@ -3133,10 +3339,11 @@ impl ObjectPayloadSegment {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct PlacedSegmentShardRepairWorkItem {
     pub(crate) request: SegmentStoredBytesRequest,
     pub(crate) shard_index: ShardIndex,
+    pub(crate) shard_integrity: Option<SegmentShardIntegrityRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3784,6 +3991,7 @@ pub(crate) struct ShardScavengerPlacedShardSetReference {
     pub stored_size: u64,
     pub crc64: u64,
     pub ec: EcShape,
+    pub shard_integrity: Option<SegmentShardIntegrityRecord>,
 }
 
 pub(crate) const SHARD_SCAVENGER_REFERENCE_PAGE_LIMIT: u16 = 64;
@@ -7568,6 +7776,7 @@ pub struct StreamUploadSegmentRecord {
     pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,
     pub ec_m: u8,
+    pub(crate) shard_integrity: Option<SegmentShardIntegrityRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7682,6 +7891,7 @@ pub struct ObjectSegmentRecord {
     pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,
     pub ec_m: u8,
+    pub(crate) shard_integrity: Option<SegmentShardIntegrityRecord>,
 }
 
 /// Committed segment record for a multipart part.
@@ -7703,6 +7913,7 @@ pub(crate) struct MultipartPartSegmentRecord {
     pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,
     pub ec_m: u8,
+    pub(crate) shard_integrity: Option<SegmentShardIntegrityRecord>,
 }
 
 #[cfg(test)]
@@ -7760,7 +7971,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(witness.data_pg_id(), 5);
-        assert_eq!(witness.shard_size, payload.len().div_ceil(3) as u64);
+        assert_eq!(witness.durable.shard_size, payload.len().div_ceil(3) as u64);
         assert_eq!(
             witness
                 .ordered_shard_acks
@@ -7774,6 +7985,68 @@ mod tests {
                 acks[3].crc64,
                 acks[4].crc64,
             ]
+        );
+        let encoded = witness.durable_record().encode();
+        const EXPECTED_ENCODING: &[u8] = &[
+            1, 0, 0, 0, 0, 0, 0, 0, 15, 0, 5, 196, 48, 218, 3, 230, 243, 188, 219, 216, 45, 131,
+            143, 247, 70, 25, 76, 211, 145, 109, 245, 99, 18, 223, 152, 62, 187, 83, 197, 193, 135,
+            182, 9, 97, 105, 190, 4, 118, 14, 108, 176,
+        ];
+        assert_eq!(encoded, EXPECTED_ENCODING);
+        assert_eq!(
+            SegmentShardIntegrityRecord::decode(EXPECTED_ENCODING).unwrap(),
+            witness.durable
+        );
+        for truncated_len in 0..EXPECTED_ENCODING.len() {
+            assert_eq!(
+                SegmentShardIntegrityRecord::decode(&EXPECTED_ENCODING[..truncated_len]),
+                Err(SegmentShardIntegrityWitnessError::TruncatedEncoding)
+            );
+        }
+        let mut unsupported = EXPECTED_ENCODING.to_vec();
+        unsupported[0] = 2;
+        assert_eq!(
+            SegmentShardIntegrityRecord::decode(&unsupported),
+            Err(SegmentShardIntegrityWitnessError::UnsupportedVersion { version: 2 })
+        );
+        let mut trailing = EXPECTED_ENCODING.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            SegmentShardIntegrityRecord::decode(&trailing),
+            Err(SegmentShardIntegrityWitnessError::TrailingEncoding)
+        );
+
+        let mut missing_crc = EXPECTED_ENCODING[..EXPECTED_ENCODING.len() - 8].to_vec();
+        missing_crc[9..11].copy_from_slice(&4_u16.to_be_bytes());
+        assert_eq!(
+            SegmentShardIntegrityRecord::decode(&missing_crc)
+                .unwrap()
+                .validate(ec, payload.len() as u64, checksum::crc64::checksum(payload)),
+            Err(SegmentShardIntegrityWitnessError::ShardCount {
+                expected: 5,
+                actual: 4,
+            })
+        );
+
+        let mut noncanonical_size = EXPECTED_ENCODING.to_vec();
+        noncanonical_size[1..9].copy_from_slice(&16_u64.to_be_bytes());
+        assert!(matches!(
+            SegmentShardIntegrityRecord::decode(&noncanonical_size)
+                .unwrap()
+                .validate(ec, payload.len() as u64, checksum::crc64::checksum(payload)),
+            Err(SegmentShardIntegrityWitnessError::NoncanonicalShardSize { .. })
+        ));
+
+        let mut reordered_crc = EXPECTED_ENCODING.to_vec();
+        let first_crc = reordered_crc[11..19].to_vec();
+        let second_crc = reordered_crc[19..27].to_vec();
+        reordered_crc[11..19].copy_from_slice(&second_crc);
+        reordered_crc[19..27].copy_from_slice(&first_crc);
+        assert_eq!(
+            SegmentShardIntegrityRecord::decode(&reordered_crc)
+                .unwrap()
+                .validate(ec, payload.len() as u64, checksum::crc64::checksum(payload)),
+            Err(SegmentShardIntegrityWitnessError::SystematicChecksumMismatch)
         );
 
         let mut crossed_keys = keys.clone();
@@ -8181,6 +8454,7 @@ mod tests {
             generation_id: GenerationId::new(29).unwrap(),
         };
         let segment = ObjectSegmentRecord {
+            shard_integrity: None,
             bucket,
             key,
             version_id: VersionId::Null,
@@ -8236,6 +8510,7 @@ mod tests {
             encryption: crate::tests::metadata_only_test_encryption(),
         });
         let segment = ObjectSegmentRecord {
+            shard_integrity: None,
             bucket,
             key,
             version_id: VersionId::Null,

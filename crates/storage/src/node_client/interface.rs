@@ -924,6 +924,7 @@ pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
 
 pub(crate) struct BuildDirectPutCommitCommandReq<'a> {
     pub(crate) request: &'a CommitDirectPutObjectReq,
+    pub(crate) shard_integrity: Option<&'a crate::types::SegmentShardIntegrityRecord>,
     pub(crate) version_id: VersionId,
     pub(crate) expected_snapshot: &'a DirectPutCommitStorageSnapshot,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,

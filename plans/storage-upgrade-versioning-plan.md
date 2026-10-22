@@ -92,6 +92,13 @@ Compatibility is defined over a complete version vector, not one integer. A rele
 independent SQL, checkpoint, RPC, authentication, Raft, nested-codec, identity, and payload
 versions.
 
+The authoritative in-tree vector remains the inventory in `guides/storage-format-ledger.md`; this
+plan does not maintain a second competing table. The 2026-10-22 per-shard integrity-witness change
+advances its coupled storage components to PG schema 9, metadata-command 11, storage-RPC 27,
+canonical-state 8, and metadata-checkpoint 6. Their exact schema/codec fixtures preserve the
+v8/v10/v26/v7/v5 vector as immutable rejection evidence for the future adjacent-release migration
+work.
+
 ## Initial Policy Decisions
 
 Phase 0 must turn the following proposed defaults into explicit accepted decisions before code is

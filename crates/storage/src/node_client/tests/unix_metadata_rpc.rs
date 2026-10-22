@@ -28,6 +28,7 @@ fn append_stream_segment_command_for_rpc_test(
                 key: crate::tests::object_key("append-rpc-key"),
                 target,
                 segment: StreamUploadSegmentRecord {
+                    shard_integrity: None,
                     session_id,
                     segment_index: 0,
                     size: 1,
@@ -331,6 +332,7 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
         .unwrap();
         let pg = node.get_pg(0).unwrap();
         pg.test_insert_object_segment(&crate::ObjectSegmentRecord {
+            shard_integrity: None,
             bucket: crate::BucketName::try_from("unix-history-floor-bucket").unwrap(),
             key: crate::ObjectKey::try_from("segment-object").unwrap(),
             version_id: VersionId::from_u64(1),
@@ -1698,6 +1700,7 @@ fn authenticated_unix_shard_scavenger_exact_reference_match_reaches_storage() {
         stored_size: 1,
         crc64: 2,
         ec: config.default_ec_shape,
+        shard_integrity: None,
     };
 
     assert!(!route

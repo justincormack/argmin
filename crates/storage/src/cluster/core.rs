@@ -1957,6 +1957,7 @@ impl RetainedObjectPayloadRead {
             .read_retained_segment_payload_stored_bytes_at_placement_epoch_into(
                 segment.placement_cluster_epoch(),
                 segment.stored_bytes_request(),
+                segment.shard_integrity(),
                 dst,
                 &self.leased_node_ids,
                 self.repair_fence.as_ref(),

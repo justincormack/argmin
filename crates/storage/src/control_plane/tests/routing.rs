@@ -2318,7 +2318,7 @@ fn storage_cluster_refresh_preserves_process_local_shard_repair_queue() {
     )
     .unwrap();
     let repair = placed_segment_shard_repair_work_item_for_runtime_refresh(1);
-    assert!(cluster.test_enqueue_placed_segment_shard_repair(repair));
+    assert!(cluster.test_enqueue_placed_segment_shard_repair(repair.clone()));
 
     authority
         .complete_pg_peering(
@@ -2423,7 +2423,7 @@ fn storage_cluster_unix_refresh_preserves_process_local_runtime_state() {
     };
     cluster.enqueue_bucket_delete_finalize(root.clone());
     let repair = placed_segment_shard_repair_work_item_for_runtime_refresh(2);
-    assert!(cluster.test_enqueue_placed_segment_shard_repair(repair));
+    assert!(cluster.test_enqueue_placed_segment_shard_repair(repair.clone()));
 
     authority
         .complete_pg_peering(

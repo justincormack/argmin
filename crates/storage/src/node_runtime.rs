@@ -284,6 +284,7 @@ mod prepared_retained_stream_upload_abort_tests {
         let key = crate::tests::object_key("prepared-retained-abort-key");
         let session_id = crate::tests::stream_session_id("prepared-abort");
         let segment = StreamUploadSegmentRecord {
+            shard_integrity: None,
             session_id: session_id.clone(),
             segment_index: 0,
             size: 17,
@@ -376,6 +377,7 @@ mod prepared_retained_stream_upload_abort_tests {
             &key,
             &session_id,
             vec![StreamUploadSegmentRecord {
+                shard_integrity: None,
                 session_id: wrong_session,
                 ..segment
             }],

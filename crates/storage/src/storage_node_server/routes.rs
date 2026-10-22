@@ -2763,6 +2763,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
     fn build_direct_put_commit_command(
         &self,
         request: &crate::CommitDirectPutObjectReq,
+        shard_integrity: Option<&crate::types::SegmentShardIntegrityRecord>,
         version_id: s3_types::VersionId,
         expected_snapshot: &crate::DirectPutCommitStorageSnapshot,
     ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
@@ -2798,6 +2799,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .and_then(|route| {
             route.build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
                 request,
+                shard_integrity,
                 version_id,
                 expected_snapshot,
                 bucket_write_reservation: &request.bucket_write_reservation,

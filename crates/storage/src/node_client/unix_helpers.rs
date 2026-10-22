@@ -1865,6 +1865,7 @@ impl UnixStorageNodeClient {
             || segment.placement_cluster_epoch != route_cluster_epoch
             || segment.ec_k != request.request.ec.k
             || segment.ec_m != request.request.ec.m
+            || segment.shard_integrity.as_ref() != request.shard_integrity
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "validate direct PUT commit command build response",

@@ -2923,9 +2923,10 @@ impl LocalClusterRuntimeState {
             );
             return false;
         }
-        state.queued.insert(work_item);
+        state.queued.insert(work_item.clone());
         state.work_queue.push_back(work_item);
-        Self::emit_shard_repair_queue_event(&state, Some(work_item.request.data_pg_id), "queued");
+        let data_pg_id = state.work_queue.back().map(|item| item.request.data_pg_id);
+        Self::emit_shard_repair_queue_event(&state, data_pg_id, "queued");
         cv.notify_one();
         true
     }

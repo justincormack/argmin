@@ -75,6 +75,7 @@ fn shard_scavenger_reference_page_failure_does_not_commit_cursor_or_partition() 
         b"reference page progress must be transactional",
     );
     let segment = crate::ObjectSegmentRecord {
+        shard_integrity: None,
         bucket,
         key,
         version_id: committed.version_id,
@@ -135,6 +136,7 @@ fn shard_scavenger_conflicting_page_retry_does_not_duplicate_authorities_or_part
         stored_size: 16,
         crc64: 17,
         ec: EcShape { k: 1, m: 0 },
+        shard_integrity: None,
     };
     let authority = ShardScavengerRepairAuthority {
         source_pg_id: PgId::new(0),
@@ -156,12 +158,13 @@ fn shard_scavenger_conflicting_page_retry_does_not_duplicate_authorities_or_part
             ec: reference.ec,
         },
         shard_index: shard_key.shard_index(),
+        shard_integrity: None,
     };
     let mut existing = ShardScavengerReferenceScan::default();
     existing.repair_work_by_shard.insert(
         shard_key.clone(),
         ShardScavengerRepairCandidate {
-            work_item,
+            work_item: work_item.clone(),
             authorities: vec![authority.clone()],
         },
     );
@@ -177,6 +180,7 @@ fn shard_scavenger_conflicting_page_retry_does_not_duplicate_authorities_or_part
                 work_item: PlacedSegmentShardRepairWorkItem {
                     request: conflicting_request,
                     shard_index: work_item.shard_index,
+                    shard_integrity: None,
                 },
                 authorities: vec![authority.clone()],
             },
@@ -797,6 +801,22 @@ fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
         .list_placed_segment_shard_repairs(written.data_pg_id)
         .unwrap();
     assert_eq!(repair_rows.len(), 1);
+    let shard_batch = written
+        .written_shards
+        .iter()
+        .map(|shard| (&shard.key, shard.ack))
+        .collect::<Vec<_>>();
+    let shard_integrity = crate::types::SegmentShardIntegrityWitness::from_ordered_shard_acks(
+        written.data_pg_id,
+        written.ec,
+        &segment_okh,
+        generation_id,
+        written.encrypted.storage_bytes.len() as u64,
+        written.encrypted.storage_crc64,
+        &shard_batch,
+    )
+    .unwrap()
+    .durable_record();
     let expected_work = crate::types::PlacedSegmentShardRepairWorkItem {
         request: crate::SegmentStoredBytesRequest {
             data_pg_id: written.data_pg_id,
@@ -807,6 +827,7 @@ fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
             ec: written.ec,
         },
         shard_index: misplaced_shard.shard_index(),
+        shard_integrity: Some(shard_integrity),
     };
     assert_eq!(repair_rows[0].work_item, expected_work);
     assert_eq!(repair_rows[0].observation_count, 2);
@@ -964,6 +985,7 @@ fn cluster_shard_scavenger_accepts_any_live_exact_repair_authority() {
                 encryption: committed.encrypted.encryption.clone(),
             },
             segments: vec![crate::ObjectSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: committed.version_id,

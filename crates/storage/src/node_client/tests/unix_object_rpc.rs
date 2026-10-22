@@ -467,6 +467,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
     let wrong_pg_id = if correct_pg_id == 0 { 1 } else { 0 };
     let session_id = crate::tests::stream_session_id("retained-abort");
     let segment = StreamUploadSegmentRecord {
+        shard_integrity: None,
         session_id: session_id.clone(),
         segment_index: 0,
         size: 17,
@@ -523,6 +524,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
     let part_upload_id = crate::tests::multipart_upload_id("retained-abort-upload");
     let part_session_id = crate::tests::stream_session_id("retained-part");
     let part_segment = StreamUploadSegmentRecord {
+        shard_integrity: None,
         session_id: part_session_id.clone(),
         segment_index: 0,
         size: 23,
@@ -2143,6 +2145,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     };
     let command_error = wrong_direct_put_route
         .build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
+            shard_integrity: None,
             request: &direct_put_request,
             version_id: VersionId::Null,
             expected_snapshot: &snapshot,
@@ -3445,6 +3448,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
     let generation_id = GenerationId::new(9).unwrap();
     let segment_vid = GenerationId::new(10).unwrap();
     let segment = ObjectSegmentRecord {
+        shard_integrity: None,
         bucket: bucket.clone(),
         key: key.clone(),
         version_id: VersionId::Null,
@@ -3565,6 +3569,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let generation_id = GenerationId::new(19).unwrap();
     let reclaim_generation_id = GenerationId::new(21).unwrap();
     let segment = ObjectSegmentRecord {
+        shard_integrity: None,
         bucket: bucket.clone(),
         key: key.clone(),
         version_id: VersionId::Null,
@@ -5417,6 +5422,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
     let command = route
         .build_direct_put_commit_command_until(
             BuildDirectPutCommitCommandReq {
+                shard_integrity: None,
                 request: &request,
                 version_id: VersionId::Null,
                 expected_snapshot: &snapshot,
@@ -5437,6 +5443,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
     crossed_request.key = crate::tests::object_key("direct-put-crossed-route-key");
     let crossed_error = route
         .build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
+            shard_integrity: None,
             request: &crossed_request,
             version_id: VersionId::Null,
             expected_snapshot: &snapshot,
@@ -5466,6 +5473,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         crossed_proof_request.bucket_write_reservation = crossed_proof.clone();
         let crossed_error = route
             .build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
+                shard_integrity: None,
                 request: &crossed_proof_request,
                 version_id: VersionId::Null,
                 expected_snapshot: &snapshot,
@@ -5511,6 +5519,45 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
             &bucket,
             &key,
             &BuildDirectPutCommitCommandReq {
+                shard_integrity: None,
+                request: &request,
+                version_id: VersionId::Null,
+                expected_snapshot: &snapshot,
+                bucket_write_reservation: &proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            operation: "validate direct PUT commit command build response",
+            ..
+        })
+    ));
+
+    let mut crossed_witness_payload = command.payload().clone();
+    let MetadataCommandPayload::CommitDirectPutObject(crossed_witness_commit) =
+        &mut crossed_witness_payload
+    else {
+        panic!("expected direct PUT commit command");
+    };
+    let mut encoded_witness = vec![1];
+    encoded_witness.extend_from_slice(&1_u64.to_be_bytes());
+    encoded_witness.extend_from_slice(&1_u16.to_be_bytes());
+    encoded_witness.extend_from_slice(&0_u64.to_be_bytes());
+    crossed_witness_commit.segments[0].shard_integrity =
+        Some(crate::types::SegmentShardIntegrityRecord::decode(&encoded_witness).unwrap());
+    let crossed_witness_command =
+        MetadataCommandEnvelope::new(command.id(), crossed_witness_payload);
+    let err = client
+        .validate_direct_put_command_build_response(
+            &crossed_witness_command,
+            ClusterEpoch::INITIAL,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            &BuildDirectPutCommitCommandReq {
+                shard_integrity: None,
                 request: &request,
                 version_id: VersionId::Null,
                 expected_snapshot: &snapshot,
@@ -5589,6 +5636,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
         payload_crc64: 44,
     };
     let segment = StreamUploadSegmentRecord {
+        shard_integrity: None,
         session_id: session_id.clone(),
         segment_index: 0,
         size: request.size,
@@ -5689,6 +5737,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
             &[
                 segment.clone(),
                 StreamUploadSegmentRecord {
+                    shard_integrity: None,
                     segment_index: 1,
                     segment_vid: GenerationId::new(2).unwrap(),
                     ..segment.clone()
@@ -5702,6 +5751,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
         .validate_stream_upload_segments_response(
             &[
                 StreamUploadSegmentRecord {
+                    shard_integrity: None,
                     segment_index: 1,
                     segment_vid: GenerationId::new(2).unwrap(),
                     ..segment.clone()
@@ -5734,6 +5784,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
     let session_id = crate::tests::stream_session_id("stream-put-rpc");
     let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
     let segment = StreamUploadSegmentRecord {
+        shard_integrity: None,
         session_id: session_id.clone(),
         segment_index: 0,
         size: 12,
@@ -5805,6 +5856,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
                 encryption: commit_input.encryption.clone(),
             },
             segments: vec![ObjectSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::Null,
@@ -6007,6 +6059,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
             upload: upload.clone(),
             existing_part_generation: None,
             staging_segments: vec![StreamUploadSegmentRecord {
+                shard_integrity: None,
                 session_id: session_id.clone(),
                 segment_index: 0,
                 size: 12,
@@ -6040,6 +6093,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
         checksum: None,
     };
     let segments = vec![MultipartPartSegmentRecord {
+        shard_integrity: None,
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),
@@ -6192,6 +6246,7 @@ fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() 
         checksum: None,
     };
     let segments = vec![MultipartPartSegmentRecord {
+        shard_integrity: None,
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),

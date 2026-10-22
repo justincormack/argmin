@@ -2084,6 +2084,7 @@ fn stream_put_reissue_confirmation_checks_published_replacement_before_trailing_
                 encryption: encrypted.encryption.clone(),
             },
             segments: vec![crate::ObjectSegmentRecord {
+                shard_integrity: None,
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: crate::VersionId::Null,

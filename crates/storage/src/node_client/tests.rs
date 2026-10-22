@@ -875,6 +875,7 @@ fn test_shard_repair_work_item(data_pg_id: u32, seed: u8) -> PlacedSegmentShardR
             ec: EcShape { k: 4, m: 2 },
         },
         shard_index: ShardIndex::new(seed % 6),
+        shard_integrity: None,
     }
 }
 
@@ -3627,6 +3628,7 @@ fn test_object_read_multipart_segment(
     part_number: u32,
 ) -> MultipartPartSegmentRecord {
     MultipartPartSegmentRecord {
+        shard_integrity: None,
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: UploadId::try_from("u".repeat(128)).unwrap(),

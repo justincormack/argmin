@@ -1719,6 +1719,7 @@ impl<'a> StorageRpcDecoder<'a> {
             placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
+            shard_integrity: self.read_optional_segment_shard_integrity()?,
         })
     }
 
@@ -2185,6 +2186,7 @@ impl<'a> StorageRpcDecoder<'a> {
             placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
+            shard_integrity: self.read_optional_segment_shard_integrity()?,
         })
     }
 
@@ -2227,6 +2229,7 @@ impl<'a> StorageRpcDecoder<'a> {
             placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
             ec_m: self.read_u8()?,
+            shard_integrity: self.read_optional_segment_shard_integrity()?,
         })
     }
 
@@ -2584,10 +2587,12 @@ impl<'a> StorageRpcDecoder<'a> {
         &mut self,
     ) -> Result<PlacedSegmentShardRepairWorkItem, StorageRpcPayloadError> {
         let request = self.read_segment_stored_bytes_request()?;
+        let shard_integrity = self.read_optional_segment_shard_integrity()?;
         let shard_index = ShardIndex::new(self.read_u8()?);
         let work_item = PlacedSegmentShardRepairWorkItem {
             request,
             shard_index,
+            shard_integrity,
         };
         validate_placed_segment_shard_repair_work_item(&work_item)?;
         Ok(work_item)
@@ -2729,6 +2734,7 @@ impl<'a> StorageRpcDecoder<'a> {
                     stored_size: self.read_u64()?,
                     crc64: self.read_u64()?,
                     ec: self.read_ec_shape()?,
+                    shard_integrity: self.read_optional_segment_shard_integrity()?,
                 },
             )),
             1 => Ok(ShardScavengerPayloadReference::ReclaimOnly(
@@ -2756,6 +2762,7 @@ impl<'a> StorageRpcDecoder<'a> {
             stored_size: self.read_u64()?,
             crc64: self.read_u64()?,
             ec: self.read_ec_shape()?,
+            shard_integrity: self.read_optional_segment_shard_integrity()?,
         })
     }
 
@@ -2967,6 +2974,20 @@ impl<'a> StorageRpcDecoder<'a> {
                 "invalid optional bytes tag",
             )),
         }
+    }
+
+    fn read_optional_segment_shard_integrity(
+        &mut self,
+    ) -> Result<Option<SegmentShardIntegrityRecord>, StorageRpcPayloadError> {
+        self.read_optional_bytes_value()?
+            .map(|bytes| {
+                SegmentShardIntegrityRecord::decode(&bytes).map_err(|_| {
+                    StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                        "invalid segment shard integrity witness",
+                    )
+                })
+            })
+            .transpose()
     }
 
     fn read_optional_public_access_block_config(

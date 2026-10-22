@@ -2716,6 +2716,7 @@ fn record_backfill_scavenger_object_segment_reference_on_pg(
             encryption,
         },
         &[crate::ObjectSegmentRecord {
+            shard_integrity: None,
             bucket,
             key,
             version_id: crate::VersionId::Null,
@@ -3139,6 +3140,7 @@ fn local_cluster_map_history_reference_summary_merges_node_pg_references() {
             .get_pg(0)
             .unwrap();
         pg.test_insert_object_segment(&crate::ObjectSegmentRecord {
+            shard_integrity: None,
             bucket: crate::BucketName::try_from("history-floor-bucket").unwrap(),
             key: crate::ObjectKey::try_from("node-zero-object").unwrap(),
             version_id: crate::VersionId::from_u64(1),

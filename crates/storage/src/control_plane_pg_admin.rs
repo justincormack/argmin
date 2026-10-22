@@ -466,7 +466,7 @@ mod tests {
             (1, 0, "expected destination epoch must be nonzero"),
         ] {
             let error = ControlPlanePgMetadataTransferInstall::new(
-                7,
+                8,
                 vec![1],
                 source_epoch,
                 destination_epoch,
@@ -475,9 +475,9 @@ mod tests {
                 4,
                 CanonicalStateDigest::CURRENT_ENCODING_VERSION,
                 5,
-                7,
+                8,
                 1,
-                7,
+                8,
                 CanonicalStateDigest::CURRENT_ENCODING_VERSION,
                 8,
             )
@@ -494,28 +494,28 @@ mod tests {
         ) in [
             (
                 2,
-                7,
+                8,
                 1,
-                7,
+                8,
                 "source metadata-command log-hash version is unsupported",
             ),
             (
                 1,
                 5,
                 1,
-                7,
+                8,
                 "source canonical-state digest version is unsupported",
             ),
             (
                 1,
-                7,
+                8,
                 2,
-                7,
+                8,
                 "imported metadata-command log-hash version is unsupported",
             ),
             (
                 1,
-                7,
+                8,
                 1,
                 5,
                 "imported canonical-state digest version is unsupported",

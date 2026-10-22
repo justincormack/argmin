@@ -607,7 +607,11 @@ pub(crate) fn decode_scavenger_payload_references_response(
     }
     let mut references = Vec::with_capacity(count);
     for _ in 0..count {
-        references.push(decoder.read_scavenger_payload_reference()?);
+        let reference = decoder.read_scavenger_payload_reference()?;
+        if let ShardScavengerPayloadReference::Placed(placed) = &reference {
+            validate_placed_scavenger_reference(placed)?;
+        }
+        references.push(reference);
     }
     decoder.finish()?;
     Ok(references)
@@ -703,9 +707,14 @@ pub(crate) fn decode_shard_scavenger_reference_page_response(
     }
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
+        let cursor = decoder.read_shard_scavenger_reference_cursor()?;
+        let reference = decoder.read_scavenger_payload_reference()?;
+        if let ShardScavengerPayloadReference::Placed(placed) = &reference {
+            validate_placed_scavenger_reference(placed)?;
+        }
         items.push(ShardScavengerReferencePageItem {
-            cursor: decoder.read_shard_scavenger_reference_cursor()?,
-            reference: decoder.read_scavenger_payload_reference()?,
+            cursor,
+            reference,
         });
     }
     decoder.finish()?;
@@ -728,12 +737,35 @@ pub(crate) fn decode_shard_scavenger_reference_match_request(
     let route = decoder.read_bucket_pg_request()?;
     let cursor = decoder.read_shard_scavenger_reference_cursor()?;
     let expected = decoder.read_placed_scavenger_reference()?;
+    validate_placed_scavenger_reference(&expected)?;
     decoder.finish()?;
     Ok(StorageRpcShardScavengerReferenceMatchRequest {
         route,
         cursor,
         expected,
     })
+}
+
+fn validate_placed_scavenger_reference(
+    reference: &ShardScavengerPlacedShardSetReference,
+) -> Result<(), StorageRpcPayloadError> {
+    if reference.ec.k == 0
+        || reference
+            .ec
+            .k
+            .checked_add(reference.ec.m)
+            .is_none()
+        || reference.shard_integrity.as_ref().is_some_and(|witness| {
+            witness
+                .validate(reference.ec, reference.stored_size, reference.crc64)
+                .is_err()
+        })
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "invalid placed shard scavenger reference",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn encode_shard_scavenger_reference_match_response(matches: bool) -> Vec<u8> {
@@ -2855,6 +2887,23 @@ fn validate_placed_segment_shard_repair_work_item(
     if work_item.request.ec.k == 0 || work_item.shard_index.get() >= total {
         return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
             "invalid placed segment shard repair work item",
+        ));
+    }
+    if work_item
+        .shard_integrity
+        .as_ref()
+        .is_some_and(|witness| {
+            witness
+                .validate(
+                    work_item.request.ec,
+                    work_item.request.stored_size as u64,
+                    work_item.request.segment_crc64,
+                )
+                .is_err()
+        })
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "invalid placed segment shard repair integrity witness",
         ));
     }
     Ok(())
